@@ -49,8 +49,8 @@ fn a_site_re_registering_what_it_already_declared_is_not_a_conflict() {
     let layout = &[(0, true, "head", 8, false), (8, false, "size", 8, true)][..];
     // Two access sites on one struct, each re-declaring the whole layout —
     // the shape `#[jit_interp]` emits, one call per getfield/setfield.
-    builder.register_struct_layout(16, TID_AGREE, false, false, layout);
-    builder.register_struct_layout(16, TID_AGREE, false, false, layout);
+    builder.register_struct_layout(16, TID_AGREE, false, false, layout, "");
+    builder.register_struct_layout(16, TID_AGREE, false, false, layout, "");
     let _ = builder.finish();
 
     assert!(
@@ -79,6 +79,8 @@ fn one_word_declared_a_pointer_and_a_scalar_is_a_conflict() {
         false,
         false,
         &[(0, true, "head", 8, false)],
+        // these tests are about offset disagreement; nothing is declared
+        "",
     );
     builder.register_struct_layout(
         16,
@@ -86,6 +88,8 @@ fn one_word_declared_a_pointer_and_a_scalar_is_a_conflict() {
         false,
         false,
         &[(0, false, "head", 8, true)],
+        // these tests are about offset disagreement; nothing is declared
+        "",
     );
     let _ = builder.finish();
 
@@ -109,13 +113,22 @@ fn one_word_declared_a_pointer_and_a_scalar_is_a_conflict() {
 #[test]
 fn a_sibling_at_an_occupied_offset_is_reported_as_dropped() {
     let mut builder = JitCodeBuilder::new();
-    builder.register_struct_layout(24, TID_SIBLING, false, false, &[(8, false, "agg", 8, true)]);
+    builder.register_struct_layout(
+        24,
+        TID_SIBLING,
+        false,
+        false,
+        &[(8, false, "agg", 8, true)],
+        "",
+    );
     builder.register_struct_layout(
         24,
         TID_SIBLING,
         false,
         false,
         &[(8, true, "leaf", 8, false)],
+        // these tests are about offset disagreement; nothing is declared
+        "",
     );
     let jitcode = builder.finish();
     let _ = jitcode;
@@ -140,8 +153,8 @@ fn a_sibling_at_an_occupied_offset_is_reported_as_dropped() {
 fn the_gate_reports_a_conflict_rather_than_passing_on_it() {
     let mut builder = JitCodeBuilder::new();
     const TID: u64 = 0x4741_5445_4441;
-    builder.register_struct_layout(16, TID, false, false, &[(0, true, "head", 8, false)]);
-    builder.register_struct_layout(16, TID, false, false, &[(0, false, "head", 8, true)]);
+    builder.register_struct_layout(16, TID, false, false, &[(0, true, "head", 8, false)], "");
+    builder.register_struct_layout(16, TID, false, false, &[(0, false, "head", 8, true)], "");
     let _ = builder.finish();
 
     let failure = std::panic::catch_unwind(majit_metainterp::assert_no_struct_layout_conflicts)

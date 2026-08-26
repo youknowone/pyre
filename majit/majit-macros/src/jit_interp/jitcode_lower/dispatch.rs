@@ -1662,7 +1662,7 @@ pub(super) fn find_dispatch_loop_body<'b>(
 }
 
 /// Returns `true` if `stmt` is a `jit_merge_point!()` macro invocation.
-pub(super) fn is_jit_merge_point_macro(stmt: &Stmt) -> bool {
+pub(crate) fn is_jit_merge_point_macro(stmt: &Stmt) -> bool {
     let Stmt::Macro(mac_stmt) = stmt else {
         return false;
     };
@@ -2437,6 +2437,70 @@ pub(super) enum InlineArmOutcome {
     InlinedTerminal,
 }
 
+/// Where the dispatch chain's unmatched-opcode edge goes.
+///
+/// The edge used to be one thing: `default_label`, bound at the portal
+/// function's trailing return (`lower_dispatch_body`). That is right for
+/// `_ => break`, which is what almost every machine here writes — 55 of the
+/// corpus's default arms, plus 30 more that end in a divergent macro. It is
+/// wrong for the other two spellings, and wrongly in the worst way: the walk
+/// reports a finished frame, `take_single_pass_finish` breaks the native loop,
+/// and the portal returns a partial answer while `degraded_dispatch_arms()`
+/// and the arm census both read healthy.
+enum DefaultEdge {
+    /// `_ => break` and the divergent macros: the loop is over, take the
+    /// function's typed return.
+    Return,
+    /// `_ => {}`: fall out of the match and run the next iteration.
+    NextIteration,
+    /// A default arm with a body. It is an arm like any other, just with no
+    /// opcode test in front of it, so lower it as one — a body that cannot
+    /// lower then degrades to an abort stub, which is the fail-closed path
+    /// every other arm already has.
+    LowerAsArm,
+}
+
+fn classify_default_edge(body: &Expr) -> DefaultEdge {
+    fn leaves_the_loop(body: &Expr) -> bool {
+        match body {
+            Expr::Break(_) | Expr::Return(_) => true,
+            Expr::Macro(m) => is_divergent_macro(&m.mac.path),
+            // Only when that is the whole body: an exit preceded by work
+            // would leave the work out of the trace, which is the same loss
+            // one level down.
+            Expr::Block(b) => match b.block.stmts.as_slice() {
+                [Stmt::Expr(expr, _)] => leaves_the_loop(expr),
+                [Stmt::Macro(m)] => is_divergent_macro(&m.mac.path),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+    if leaves_the_loop(body) {
+        return DefaultEdge::Return;
+    }
+    match body {
+        Expr::Block(b) if b.block.stmts.is_empty() => DefaultEdge::NextIteration,
+        _ => DefaultEdge::LowerAsArm,
+    }
+}
+
+/// Macros that never return, so an arm ending in one cannot fall through.
+fn is_divergent_macro(path: &syn::Path) -> bool {
+    path.segments.last().is_some_and(|seg| {
+        matches!(
+            seg.ident.to_string().as_str(),
+            "panic" | "unreachable" | "todo" | "unimplemented" | "compile_error"
+        )
+    })
+}
+
+/// True for the arm the dispatch chain falls through to: `_`, or a lower-case
+/// binding.
+fn is_default_dispatch_arm(arm: &crate::jit_interp::classify::ClassifiedArm) -> bool {
+    matches!(arm.pat, Pat::Wild(_)) || is_lowercase_binding_pat(&arm.pat)
+}
+
 pub(super) fn lower_dispatch_chain(
     lowerer: &mut Lowerer,
     classified_arms: &[crate::jit_interp::classify::ClassifiedArm],
@@ -2447,6 +2511,31 @@ pub(super) fn lower_dispatch_chain(
     // Allocated before the opcode-reg guard so we always have a label to return.
     let default_label = lowerer.alloc_label();
     lowerer.emit_aux(quote::quote! { let #default_label = __builder.new_label(); });
+
+    // Where the unmatched-opcode edge goes. A match over `u8` needs a default
+    // arm to be exhaustive, so `None` here means this is not a dispatch shape;
+    // leave that case at the return edge it already had.
+    let default_kind = classified_arms
+        .iter()
+        .find(|arm| is_default_dispatch_arm(arm))
+        .map_or(DefaultEdge::Return, |arm| {
+            classify_default_edge(&arm.original_body)
+        });
+    let lower_default_as_arm = matches!(default_kind, DefaultEdge::LowerAsArm);
+    // Bound at the default arm's own body below; the switch's default and the
+    // guard chain's fall-through both target it.
+    let default_body_label = lower_default_as_arm.then(|| {
+        let label = lowerer.alloc_label();
+        lowerer.emit_aux(quote::quote! { let #label = __builder.new_label(); });
+        label
+    });
+    let default_edge = match &default_kind {
+        DefaultEdge::Return => default_label.clone(),
+        DefaultEdge::NextIteration => loop_start_label.clone(),
+        DefaultEdge::LowerAsArm => default_body_label
+            .clone()
+            .expect("allocated on this arm of the same match"),
+    };
 
     // Retrieve the opcode register installed by the opcode-fetch lowerer.
     // Slice ε.1: prefer the consumer's chosen opcode-result name (set by
@@ -2469,7 +2558,7 @@ pub(super) fn lower_dispatch_chain(
     if config.switch_dispatch {
         let mut switch_case_emitters = Vec::new();
         for (arm_idx, arm) in classified_arms.iter().enumerate() {
-            if matches!(arm.pat, Pat::Wild(_)) || is_lowercase_binding_pat(&arm.pat) {
+            if is_default_dispatch_arm(arm) {
                 continue;
             }
             let arm_label = lowerer.alloc_label();
@@ -2503,7 +2592,7 @@ pub(super) fn lower_dispatch_chain(
                 __builder.switch(#opcode_reg as u16, &__switch_cases);
             },
         );
-        lowerer.emit_jump(&default_label);
+        lowerer.emit_jump(&default_edge);
     }
 
     // The denominator for `record_degraded_dispatch_arm` below, staged from the
@@ -2515,7 +2604,7 @@ pub(super) fn lower_dispatch_chain(
         let census_interp = config.state_type_name.clone();
         let census_arms = classified_arms
             .iter()
-            .filter(|arm| !matches!(arm.pat, Pat::Wild(_)) && !is_lowercase_binding_pat(&arm.pat))
+            .filter(|arm| !is_default_dispatch_arm(arm) || lower_default_as_arm)
             .count();
         lowerer.emit_aux(quote::quote! {
             majit_metainterp::record_dispatch_arm_census(#census_interp, #census_arms);
@@ -2526,12 +2615,23 @@ pub(super) fn lower_dispatch_chain(
         // `_` wildcard: skip here; handled by the default GOTO below.
         // All other patterns (including Pat::Ident like `OP_NOP`) are
         // treated as constant tests and emitted as goto_if_not_int_eq.
-        if matches!(arm.pat, Pat::Wild(_)) || is_lowercase_binding_pat(&arm.pat) {
+        let is_default_arm = is_default_dispatch_arm(arm);
+        if is_default_arm && !lower_default_as_arm {
             continue;
         }
 
         let mut skip_label = None;
-        if let Some(match_label) = switch_arm_labels[arm_idx].as_ref() {
+        if is_default_arm {
+            // No opcode test in front of it: this is where every opcode no arm
+            // matched arrives. Rust puts the default arm last, so the previous
+            // arm's skip label falls straight into this body, and the switch
+            // dispatch jumps here explicitly.
+            lowerer.emit_label_def(
+                default_body_label
+                    .as_ref()
+                    .expect("allocated whenever the default arm is lowered as one"),
+            );
+        } else if let Some(match_label) = switch_arm_labels[arm_idx].as_ref() {
             lowerer.emit_label_def(match_label);
         } else if config.switch_dispatch {
             continue;
@@ -3089,25 +3189,13 @@ pub(super) fn lower_dispatch_chain(
 
     // After all arm guards, the default/exit path: unconditional GOTO.
     // default_label is bound at the typed-return emission site in
-    // lower_dispatch_body (Task 1.7).
-    if !config.switch_dispatch {
-        lowerer.emit_jump(&default_label);
+    // lower_dispatch_body (Task 1.7).  `Halt` arms keep jumping there
+    // whatever the default arm says: a `break` arm carries no operand and
+    // reaches the function's typed return for one.
+    if !config.switch_dispatch && !lower_default_as_arm {
+        lowerer.emit_jump(&default_edge);
     }
     default_label
-}
-
-fn is_lowercase_binding_pat(pat: &Pat) -> bool {
-    let Pat::Ident(pi) = pat else {
-        return false;
-    };
-    if pi.subpat.is_some() || pi.mutability.is_some() || pi.by_ref.is_some() {
-        return false;
-    }
-    pi.ident
-        .to_string()
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase())
 }
 
 fn pat_contains_range(pat: &Pat) -> bool {

@@ -6867,16 +6867,20 @@ where
                 let pc = self.frames.current_mut().pc;
                 // RPython `blackhole.py:150-157` — `j` argcode resolves
                 // via `self.descrs[idx]` asserted to be a `JitCode`.
+                // `as_jitcode_owned`, so a recursive helper's back edge resolves
+                // to the same callee an owning edge would.  By the time anything
+                // executes this operand the callee is published, so the `Weak`
+                // upgrades; the `None` window is confined to the helper's own
+                // assembly, which never runs code.
                 let sub_jitcode = self
                     .frames
                     .current_mut()
                     .jitcode
                     .descr_at(sub_idx)
-                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned)
                     .unwrap_or_else(|| {
                         panic!("BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry")
-                    })
-                    .clone();
+                    });
                 let mut sub_frame = MIFrame::setup(sub_jitcode, 0, None, Some(ctx));
                 ctx.push_inline_frame((sub_idx, pc), u32::MAX);
                 sub_frame.inline_frame = true;
@@ -12447,7 +12451,7 @@ mod tests {
         // SizeDescr (size from the per-jitcode descr pool) and binds the
         // allocation pointer to the destination ref register.
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(0, 16, 0xCD, false, &[]);
+        builder.new_struct(0, 16, 0xCD, false, &[], "");
         let jitcode = builder.finish();
 
         let mut ctx = TraceCtx::for_test(0);
@@ -12572,6 +12576,7 @@ mod tests {
             0xCD,
             false,
             &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            "",
         ); // ref reg 0 = Node*
         builder.load_const_i_value(0, 99); // int reg 0 = 99
         builder.setfield_gc_i(0, 0, 0, 0xCD, "value"); // Node.value = 99
@@ -12644,6 +12649,7 @@ mod tests {
             0xCD,
             false,
             &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            "",
         );
         builder.load_const_i_value(0, 99);
         builder.setfield_gc_i(0, 0, 0, 0xCD, "value");
@@ -12682,6 +12688,7 @@ mod tests {
             0xCE,
             false,
             &[(0, false, "value", 8, true), (8, true, "next", 8, false)],
+            "",
         );
         builder.setfield_gc_i_c(0, -7, 0, 0xCE, "value"); // Node.value = -7 (inline const)
         let jitcode = builder.finish();

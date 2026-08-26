@@ -11145,7 +11145,7 @@ fn read_inline_call_jitcode(
         .jitcode
         .descr_at(idx)
         .unwrap_or_else(|| panic!("inline_call: descrs[{idx}] is absent from both descr pools"));
-    if let Some(jitcode) = entry.as_jitcode() {
+    if let Some(jitcode) = entry.as_jitcode_owned() {
         return (
             jitcode.try_index().unwrap_or(0),
             jitcode.fnaddr,
@@ -11714,7 +11714,7 @@ fn handler_inline_call_nested_ext(
         .exec
         .descrs
         .get(sub_idx)
-        .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)
+        .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned)
         .unwrap_or_else(|| {
             panic!(
                 "BC_INLINE_CALL: descrs[{sub_idx}] is not a JitCode entry \

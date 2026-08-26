@@ -9,6 +9,7 @@ use std::cmp::max;
 use majit_backend::JitCellToken;
 use majit_ir::OpCode;
 use majit_translate::jitcode::{BhFieldSpec, BhSizeSpec, HEADERLESS_SIZE_OWNER_MARKER};
+use majit_translate::model::ImmutableRank;
 
 use crate::jitcode;
 
@@ -570,6 +571,7 @@ impl JitCodeBuilder {
         type_id: u64,
         headerless: bool,
         fields: &[(usize, bool, &str, usize, bool)],
+        immutable_fields: &str,
     ) {
         self.touch_ref_reg(dest);
         // descr.py get_size_descr + init_size_descr: cache the
@@ -580,7 +582,7 @@ impl JitCodeBuilder {
         // traced.  It just carries no GcHeader, so it must never be
         // subject to GUARD_GC_TYPE (which reads at `ref - GcHeader::SIZE`).
         // `StructPtrInfo.make_guards` gates that guard on `!sd.headerless()`.
-        self.register_struct_layout(size, type_id, true, headerless, fields);
+        self.register_struct_layout(size, type_id, true, headerless, fields, immutable_fields);
         let all_fielddescrs = self
             .struct_size_specs
             .get(&type_id)
@@ -628,8 +630,13 @@ impl JitCodeBuilder {
         is_gc_managed: bool,
         headerless: bool,
         fields: &[(usize, bool, &str, usize, bool)],
+        immutable_fields: &str,
     ) {
         crate::note_struct_layout_registration(fields.len());
+        // `rclass.py _parse_field_list` splits the declaration once per class,
+        // not once per field.  Parsing here lets the merge path and the insert
+        // path below read the same ranks.
+        let ranks = Self::immutable_ranks(immutable_fields);
         // Every emit site re-registers the layout it accesses, so the same few
         // type_ids arrive hundreds of times.  When the spec already lists an
         // offset for each incoming field the merge below pushes nothing, and
@@ -642,7 +649,15 @@ impl JitCodeBuilder {
         // The same walk answers whether the offset that made a field redundant
         // was really *this* field's, so `Self::record_layout_conflicts` runs
         // off it rather than repeating it.
-        if let Some(existing) = self.struct_size_specs.get(&type_id) {
+        if let Some(existing) = self.struct_size_specs.get_mut(&type_id) {
+            // Apply the declaration before the early return decides there is
+            // nothing to do.  A struct's layout accumulates across emit sites
+            // in whatever order they lower, and not every site carries the
+            // declaration — a `new_struct` for a transient allocation names no
+            // struct to read it off.  Deciding on offsets alone would keep
+            // whichever site happened to arrive first.
+            Self::apply_immutable_ranks(&mut existing.all_fielddescrs, &ranks);
+            let existing = &*existing;
             let mut every_offset_known = true;
             for &field in fields {
                 if !Self::record_layout_conflicts(existing, type_id, field) {
@@ -653,7 +668,7 @@ impl JitCodeBuilder {
                 return;
             }
         }
-        let new_fields = Self::field_specs_from_layout(fields);
+        let new_fields = Self::field_specs_from_layout(fields, &ranks);
         // Merge into existing spec if present — each getfield/setfield
         // site registers only the field it accesses, so the complete
         // layout accumulates across multiple register_struct_layout
@@ -790,7 +805,58 @@ impl JitCodeBuilder {
     /// literal of the same struct an identical, deterministic
     /// `all_fielddescrs` order so the `type_id`-keyed cache is not polluted
     /// and the optimizer's `FieldDescr.n()` indexing stays consistent.
-    fn field_specs_from_layout(fields: &[(usize, bool, &str, usize, bool)]) -> Vec<BhFieldSpec> {
+    /// The merged layout recorded for `type_id`, or `None` when no emit site
+    /// has registered one.
+    ///
+    /// A struct's layout accumulates across every site that touches it, so this
+    /// answers what the *last* registration left, not what any single site
+    /// declared.
+    pub fn struct_size_spec(&self, type_id: u64) -> Option<&BhSizeSpec> {
+        self.struct_size_specs.get(&type_id)
+    }
+
+    /// The declared `(field name, rank)` pairs.
+    ///
+    /// The declaration travels from `#[jit_immutable_fields]` to here verbatim
+    /// and is split in exactly one place: `ImmutableRank::parse`, the port of
+    /// `rclass.py _parse_field_list`'s suffix grammar.
+    fn immutable_ranks(immutable_fields: &str) -> Vec<(String, ImmutableRank)> {
+        immutable_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(ImmutableRank::parse)
+            .collect()
+    }
+
+    /// The rank declared for `name`, or `None` when the declaration omits it.
+    fn rank_of(ranks: &[(String, ImmutableRank)], name: &str) -> Option<ImmutableRank> {
+        ranks
+            .iter()
+            .find(|(declared, _)| declared == name)
+            .map(|&(_, rank)| rank)
+    }
+
+    /// Raise already-recorded fields to a declaration that arrived with a
+    /// later emit site.
+    ///
+    /// It only raises.  A field the declaration omits keeps what it has: an
+    /// omission means this site named no declaration, not that the field is
+    /// mutable — and the site that did name one may already have run.
+    fn apply_immutable_ranks(fields: &mut [BhFieldSpec], ranks: &[(String, ImmutableRank)]) {
+        for field in fields.iter_mut() {
+            let Some(rank) = Self::rank_of(ranks, &field.name) else {
+                continue;
+            };
+            field.is_immutable |= rank.is_immutable();
+            field.is_quasi_immutable |= rank.is_quasi_immutable();
+        }
+    }
+
+    fn field_specs_from_layout(
+        fields: &[(usize, bool, &str, usize, bool)],
+        ranks: &[(String, ImmutableRank)],
+    ) -> Vec<BhFieldSpec> {
         let mut ordered: Vec<(usize, bool, &str, usize, bool)> = fields.to_vec();
         ordered.sort_by_key(|&(offset, _, _, _, _)| offset);
         ordered
@@ -829,8 +895,10 @@ impl JitCodeBuilder {
                     field_type,
                     field_flag,
                     is_field_signed,
-                    is_immutable: false,
-                    is_quasi_immutable: false,
+                    is_immutable: Self::rank_of(ranks, name)
+                        .is_some_and(ImmutableRank::is_immutable),
+                    is_quasi_immutable: Self::rank_of(ranks, name)
+                        .is_some_and(ImmutableRank::is_quasi_immutable),
                     index_in_parent: idx,
                     // The emit-site layout table names fields but declares no
                     // header row, so the rebuilding side falls back to the
@@ -936,12 +1004,30 @@ impl JitCodeBuilder {
         // its own width and signedness.  The IR bank the access lands in
         // cannot: every integer read arrives here as `Type::Int` whether the
         // field is a byte or a word.
-        let (field_size, field_flag, is_field_signed) = slot
+        //
+        // Immutability rides the same lookup.  `rclass.py` attaches the
+        // `_immutable_fields_` rank to the field, so the registered layout is
+        // where it lives and this is the only place the emitted access can
+        // read it back.  A miss stays mutable: a field the layout does not
+        // name has no declaration to honour.
+        let (field_size, field_flag, is_field_signed, is_immutable, is_quasi_immutable) = slot
             .map(|idx| {
                 let f = &parent_spec.all_fielddescrs[idx];
-                (f.field_size, f.field_flag, f.is_field_signed)
+                (
+                    f.field_size,
+                    f.field_flag,
+                    f.is_field_signed,
+                    f.is_immutable,
+                    f.is_quasi_immutable,
+                )
             })
-            .unwrap_or((scalar_size(field_type), field_flag, is_field_signed));
+            .unwrap_or((
+                scalar_size(field_type),
+                field_flag,
+                is_field_signed,
+                false,
+                false,
+            ));
         // Carry the scalars only.  `patch_field_descr_parents`, called
         // unconditionally from `try_finish` after the decline early-return,
         // replaces this snapshot with `struct_size_specs`' final merged spec
@@ -964,8 +1050,8 @@ impl JitCodeBuilder {
             field_type,
             field_flag,
             is_field_signed,
-            is_immutable: false,
-            is_quasi_immutable: false,
+            is_immutable,
+            is_quasi_immutable,
             index_in_parent,
             parent: parent.map(std::sync::Arc::new),
             name,
@@ -2052,6 +2138,9 @@ impl JitCodeBuilder {
                     false,
                 ),
             ],
+            // The JIT synthesizes this header; there is no declaring struct to
+            // read a `_immutable_fields_` list off.
+            "",
         );
         let all_fielddescrs = self
             .struct_size_specs
@@ -3461,10 +3550,16 @@ impl JitCodeBuilder {
     /// so an empty declaration reads as "not stated" rather than "takes
     /// nothing", and a genuinely nullary callee is indistinguishable from it.
     fn check_inline_call_arg_classes(&self, sub_jitcode_idx: u16, args: &[(JitArgKind, u16, u16)]) {
+        // `as_jitcode_owned`, so a recursive helper's back edge is checked
+        // like any other callee once it can be — and `let ... else` rather than
+        // an unwrap because it cannot be during the helper's own assembly: the
+        // `Weak` handed out by `Arc::new_cyclic` does not upgrade until the
+        // value is published.  Declining there costs nothing; the callee is
+        // this same jitcode and its own emit sites are checked.
         let Some(callee) = self
             .descrs
             .get(sub_jitcode_idx as usize)
-            .and_then(RuntimeBhDescr::as_jitcode)
+            .and_then(RuntimeBhDescr::as_jitcode_owned)
         else {
             return;
         };
@@ -5214,7 +5309,43 @@ impl JitCodeBuilder {
     /// that already hold a shared handle (e.g. a re-export from
     /// `MetaInterpStaticData::indirectcalltargets`).
     pub fn add_sub_jitcode_arc(&mut self, jitcode: std::sync::Arc<JitCode>) -> u16 {
+        // `assembler.py Assembler._encode_descr` memoises every descr through
+        // `_descr_dict`, and upstream's `JitCode` IS an `AbstractDescr`, so a
+        // jitcode operand goes through that memo like any other.  This was the
+        // one descr kind here that never got it: every other `add_*` on this
+        // builder already dedups by a linear scan.  It matters now because a
+        // helper that names itself twice would otherwise claim two slots for
+        // one callee.
+        if let Some(existing) = self.descrs.iter().position(|entry| {
+            matches!(entry, RuntimeBhDescr::JitCode(arc) if std::sync::Arc::ptr_eq(arc, &jitcode))
+        }) {
+            return existing as u16;
+        }
         self.push_descr_entry(RuntimeBhDescr::JitCode(jitcode))
+    }
+
+    /// Record whichever `j` edge an inline call site resolved.
+    ///
+    /// A back edge is deduped by the address it names rather than by `Arc`
+    /// identity: two `Weak`s cloned from one `Arc::new_cyclic` are distinct
+    /// values naming one allocation, and `Weak::ptr_eq` on an
+    /// under-construction target is the only comparison available — the
+    /// upgrade that `Arc::ptr_eq` would need returns `None` until assembly
+    /// finishes.
+    pub fn add_sub_jitcode_ref(&mut self, edge: crate::jitcode::InlineJitCodeRef) -> u16 {
+        match edge {
+            crate::jitcode::InlineJitCodeRef::Strong(arc) => self.add_sub_jitcode_arc(arc),
+            crate::jitcode::InlineJitCodeRef::BackEdge(weak) => {
+                let target = std::sync::Weak::as_ptr(&weak);
+                if let Some(existing) = self.descrs.iter().position(|entry| {
+                    matches!(entry, RuntimeBhDescr::JitCodeBackEdge(seen)
+                             if std::sync::Weak::as_ptr(seen) == target)
+                }) {
+                    return existing as u16;
+                }
+                self.push_descr_entry(RuntimeBhDescr::JitCodeBackEdge(weak))
+            }
+        }
     }
 
     pub fn add_fn_ptr(&mut self, ptr: *const ()) -> u16 {
@@ -6486,10 +6617,10 @@ mod tests {
         const TID: u64 = 0x5747_5F49_4458;
         let mut builder = JitCodeBuilder::new();
         // Site 1 registers only the HIGH offset, so the mint ranks it 0.
-        builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi", 8, true)]);
+        builder.register_struct_layout(24, TID, false, false, &[(16, false, "hi", 8, true)], "");
         builder.getfield_gc_i(0, 1, 16, TID, "hi");
         // Site 2 registers the LOW offset; the merge re-indexes to {8→0, 16→1}.
-        builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo", 8, true)]);
+        builder.register_struct_layout(24, TID, false, false, &[(8, false, "lo", 8, true)], "");
         builder.getfield_gc_i(2, 1, 8, TID, "lo");
         let jitcode = builder.finish();
 
@@ -6562,6 +6693,7 @@ mod tests {
                 false,
                 false,
                 &[(8, false, "agg", 8, true), (8, true, "leaf", 8, false)],
+                "",
             );
             builder.getfield_gc_i(0, 1, 8, TID, name);
             // `finish` runs the postcondition under `jit_strict_mode`; a
@@ -6620,17 +6752,29 @@ mod tests {
             (8, true, "leaf", 8, false),
         ];
         assert_eq!(
-            super::field_slot_in(&JitCodeBuilder::field_specs_from_layout(&fields), "leaf", 8,),
+            super::field_slot_in(
+                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                "leaf",
+                8,
+            ),
             Some(2),
             "the name names the field; the shared offset does not",
         );
         assert_eq!(
-            super::field_slot_in(&JitCodeBuilder::field_specs_from_layout(&fields), "", 8),
+            super::field_slot_in(
+                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                "",
+                8
+            ),
             None,
             "without a name the shared offset arbitrates nothing",
         );
         assert_eq!(
-            super::field_slot_in(&JitCodeBuilder::field_specs_from_layout(&fields), "", 0),
+            super::field_slot_in(
+                &JitCodeBuilder::field_specs_from_layout(&fields, &[]),
+                "",
+                0
+            ),
             Some(0),
             "an unambiguous offset still resolves",
         );
@@ -6703,7 +6847,7 @@ mod tests {
     #[test]
     fn canonical_new_struct_emit_uses_size_descr_without_vtable() {
         let mut builder = JitCodeBuilder::new();
-        builder.new_struct(3, 16, 0xCD, false, &[]);
+        builder.new_struct(3, 16, 0xCD, false, &[], "");
         let jitcode = builder.finish();
         let opcode = jitcode::insn_byte("new/d>r");
         assert_eq!(jitcode.code, vec![opcode, 0, 0, 3]);

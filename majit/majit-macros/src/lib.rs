@@ -1805,6 +1805,14 @@ fn parse_release_gil_save_err(attr: proc_macro2::TokenStream) -> syn::Result<i32
 /// harvest_immutable_fields_from_llbcs` reads it back into
 /// `SemanticProgram.immutable_fields` — the analog of RPython's
 /// translator reading `cls._immutable_fields_` off the class object.
+///
+/// The proc-macro front end has no such extraction step, so the same
+/// list is published a second way: an inherent associated const
+/// `__MAJIT_IMMUTABLE_FIELDS`, shadowing the empty default on
+/// `majit_metainterp::MajitImmutableFields`.  `jitcode_lower` reads it
+/// at each `register_struct_layout` emit site.  Both publications carry
+/// the entry list verbatim and neither splits it, so the suffix grammar
+/// stays in one place (`majit_translate::model::ImmutableRank::parse`).
 #[proc_macro_attribute]
 pub fn jit_immutable_fields(attr: TokenStream, item: TokenStream) -> TokenStream {
     let entries = parse_macro_input!(attr as ImmutableFieldList);
@@ -1816,12 +1824,25 @@ pub fn jit_immutable_fields(attr: TokenStream, item: TokenStream) -> TokenStream
     // harvester does the splitting, so the suffix grammar stays in one
     // place (`majit_translate::model::ImmutableRank::parse`).
     let joined = entries.0.join(",");
+    // The same declaration, published a second way for the proc-macro front
+    // end.  That path has no Charon extraction to harvest the marker const, so
+    // it reads the ranks straight off the type at the layout emit site;
+    // `majit_metainterp::MajitImmutableFields` supplies the empty default this
+    // shadows, which is what lets a site name a struct that declared nothing.
+    let ident = &item_struct.ident;
+    let (impl_generics, ty_generics, where_clause) = item_struct.generics.split_for_impl();
     quote! {
         #item_struct
 
         #[doc(hidden)]
         #[allow(non_upper_case_globals, dead_code)]
         #vis const #const_name: &'static str = #joined;
+
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals, dead_code)]
+            pub const __MAJIT_IMMUTABLE_FIELDS: &'static str = #joined;
+        }
     }
     .into()
 }
@@ -2595,6 +2616,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         &args.inlined_prefix,
     );
     let helper_with_asm_name = format_ident!("__majit_inline_jitcode_{}_with_asm", sig.ident);
+    let helper_shared_name = format_ident!("__majit_inline_jitcode_{}_shared", sig.ident);
+    let helper_id_name = format_ident!("__majit_inline_jitcode_{}_id", sig.ident);
     let helper_prebuild_name = format_ident!("__majit_inline_jitcode_{}_prebuild", sig.ident);
     let policy_name = format_ident!("__majit_call_policy_{}", sig.ident);
     let helper_source_name = sig.ident.to_string();
@@ -2619,7 +2642,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
     let inferred_inline_builder = match helper.return_kind {
-        InlineReturnKind::Int => quote! { #helper_with_asm_name as *const () },
+        InlineReturnKind::Int => quote! { #helper_shared_name as *const () },
         InlineReturnKind::Ref | InlineReturnKind::Float | InlineReturnKind::Void => {
             quote! { std::ptr::null() }
         }
@@ -2694,7 +2717,61 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         #vis fn #helper_prebuild_name(
             __asm: &mut majit_metainterp::Assembler,
         ) {
+            // `call.py CallControl.unfinished_graphs`: this walk descends into
+            // every statically resolved callee's prebuild, so a helper that
+            // reaches itself would recurse with nothing to stop it and no
+            // `JitCodeBuilder` in scope to decline.  Visiting once is also
+            // semantically free — the body only registers liveness triples,
+            // which `all_liveness_positions` already dedups.
+            if !__asm.enter_inline_prebuild(&#helper_id_name as *const _ as usize) {
+                return;
+            }
             #helper_liveness_prebuild
+        }
+
+        /// The helper's identity, as an address.
+        ///
+        /// `call.py CallControl.jitcodes` keys its cache by the graph object;
+        /// there is no graph object here, so a per-helper static stands in.
+        /// It carries a value so it cannot be merged with another helper's
+        /// marker by identical-code folding, which would silently make two
+        /// helpers share one jitcode.
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #vis static #helper_id_name: std::sync::atomic::AtomicU8 =
+            std::sync::atomic::AtomicU8::new(0);
+
+        /// `call.py CallControl.get_jitcode` — cache first, then mint the
+        /// identity BEFORE assembling the body.
+        ///
+        /// That order is the whole point.  Upstream registers an empty JitCode
+        /// under the graph and fills it afterwards, so a graph that calls
+        /// itself links to the object it is already registered under.  Here the
+        /// identity comes from `Arc::new_cyclic`, which supplies a `Weak` to the
+        /// allocation before the value exists: the body assembles inside that
+        /// closure, and a self-call re-entering this function finds the
+        /// under-construction slot and takes a back edge instead of assembling
+        /// a second copy.
+        ///
+        /// Nothing inside the closure may upgrade that `Weak` — it does not
+        /// resolve until the value is published.
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        #vis fn #helper_shared_name(
+            __asm: &mut majit_metainterp::Assembler,
+        ) -> majit_metainterp::jitcode::InlineJitCodeRef {
+            let __key = &#helper_id_name as *const _ as usize;
+            if let Some(__hit) = majit_metainterp::jitcode::lookup_inline_jitcode(__asm, __key) {
+                return __hit;
+            }
+            let __arc = std::sync::Arc::new_cyclic(
+                |__weak: &std::sync::Weak<majit_metainterp::JitCode>| {
+                    majit_metainterp::jitcode::begin_inline_jitcode(__asm, __key, __weak.clone());
+                    #helper_with_asm_name(__asm)
+                },
+            );
+            majit_metainterp::jitcode::finish_inline_jitcode(__asm, __key, __arc.clone());
+            majit_metainterp::jitcode::InlineJitCodeRef::Strong(__arc)
         }
 
         #[doc(hidden)]

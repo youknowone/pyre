@@ -669,6 +669,17 @@ impl<'c> Lowerer<'c> {
                     #type_id,
                     #headerless,
                     &[ #(#field_layout),* ],
+                    {
+                        // The struct's own `_immutable_fields_` declaration.  Read through
+                        // an in-scope trait rather than a qualified
+                        // `<T as MajitImmutableFields>::...`, which would select the blanket
+                        // empty default and never see a struct's own declaration.  The import
+                        // is unused exactly when the inherent const wins, which is the common
+                        // case.
+                        #[allow(unused_imports)]
+                        use majit_metainterp::MajitImmutableFields as _;
+                        <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                    },
                 );
             },
         );
@@ -936,6 +947,20 @@ impl<'c> Lowerer<'c> {
         Some(binding)
     }
 
+    /// The struct `call_returns` declares for `func`'s result.
+    ///
+    /// A ref-returning call produces a ref binding, and the `result.field`
+    /// after it needs a struct to resolve the field against —
+    /// `lower_ref_binding_getfield` reads exactly this and bails without it,
+    /// which takes the whole dispatch arm down. The concrete path reads the
+    /// same declaration through `RefFieldRewriter`, so a binding that misses
+    /// it still computes the right answer and the loss shows up only as a
+    /// degraded arm.
+    fn declared_return_struct(&self, func: &Expr) -> Option<syn::Path> {
+        let segments = canonical_expr_segments(func)?;
+        self.config?.call_returns.get(&segments).cloned()
+    }
+
     pub(super) fn lower_call_value(&mut self, call: &ExprCall) -> Option<Binding> {
         let policy = self.resolve_call_policy(&call.func)?;
         if call.args.len() > MAX_HELPER_CALL_ARITY {
@@ -1143,18 +1168,11 @@ impl<'c> Lowerer<'c> {
                             quote! { let _ = __builder.live_placeholder(); },
                         );
                     }
-                    // Check `call_returns` config for a declared return
-                    // struct type, enabling subsequent `result.field`
-                    // access to resolve through `ref_fields`.
-                    let func_segments = canonical_expr_segments(func);
-                    let struct_type = func_segments.and_then(|segs| {
-                        self.config.and_then(|c| c.call_returns.get(&segs).cloned())
-                    });
                     return Some(Binding {
                         reg,
                         kind: BindingKind::Ref,
                         depends_on_stack: false,
-                        struct_type,
+                        struct_type: self.declared_return_struct(func),
                     });
                 }
                 crate::jit_interp::CallPolicyKind::NurseryAllocRef => {
@@ -1182,18 +1200,11 @@ impl<'c> Lowerer<'c> {
                             quote! { let _ = __builder.live_placeholder(); },
                         );
                     }
-                    // Check `call_returns` config for a declared return
-                    // struct type, enabling subsequent `result.field`
-                    // access to resolve through `ref_fields`.
-                    let func_segments = canonical_expr_segments(func);
-                    let struct_type = func_segments.and_then(|segs| {
-                        self.config.and_then(|c| c.call_returns.get(&segs).cloned())
-                    });
                     return Some(Binding {
                         reg,
                         kind: BindingKind::Ref,
                         depends_on_stack: false,
-                        struct_type,
+                        struct_type: self.declared_return_struct(func),
                     });
                 }
                 crate::jit_interp::CallPolicyKind::ResidualIntWrapped
@@ -1370,7 +1381,8 @@ impl<'c> Lowerer<'c> {
                 | crate::jit_interp::CallPolicyKind::InlineRef
                 | crate::jit_interp::CallPolicyKind::InlineFloat => {
                     result_kind = binding_kind_for_inline_policy(kind).unwrap();
-                    let builder_path = inline_builder_path(&call.func)?;
+                    let shared_path = inline_shared_path(&call.func)?;
+                    let sub_return_kind = jit_arg_kind_tokens(result_kind);
                     let prebuild_path = inline_prebuild_path(&call.func)?;
                     let (inline_call, post_live) = inline_call_tokens(&arg_bindings, reg);
                     let __arg_regs: Vec<Register> =
@@ -1394,12 +1406,9 @@ impl<'c> Lowerer<'c> {
                             vec![Register::new(result_kind, reg)],
                         ),
                         quote! {
-                            use majit_metainterp::jitcode::JitCodeRuntimeExt as _;
-                            let __sub_jitcode = #builder_path(__asm);
-                            let (__sub_return_kind, _) = __sub_jitcode
-                                .trailing_return_info()
-                                .expect("inline helper jitcode must end in a typed return opcode");
-                            let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                            let __sub_edge = #shared_path(__asm);
+                            let __sub_return_kind = #sub_return_kind;
+                            let __sub_idx = __builder.add_sub_jitcode_ref(__sub_edge);
                             #inline_call
                         },
                     );
@@ -1541,13 +1550,14 @@ impl<'c> Lowerer<'c> {
                                     __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
                                 }
                                 #INT_INLINE => {
-                                    let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
+                                    // The policy byte hands over `_shared`, not `_with_asm`:
+                                    // the cache probe is what a recursive helper needs.
+                                    let __builder_fn: fn(&mut majit_metainterp::Assembler)
+                                        -> majit_metainterp::jitcode::InlineJitCodeRef =
                                         unsafe { std::mem::transmute(__inline_builder) };
-                                    let __sub_jitcode = __builder_fn(__asm);
-                                    let (__sub_return_kind, _) =
-                                        <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
-                                        .expect("inline helper jitcode must end in a typed return opcode");
-                                    let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                                    let __sub_edge = __builder_fn(__asm);
+                                    let __sub_return_kind = majit_metainterp::JitArgKind::Int;
+                                    let __sub_idx = __builder.add_sub_jitcode_ref(__sub_edge);
                                     #inline_call
                                 }
                                 #INT_MAY_FORCE => {
@@ -1639,13 +1649,14 @@ impl<'c> Lowerer<'c> {
                                     __builder.call_pure_int_canonical_via_target_or_memerror(__fn_idx, #typed_args, #reg);
                                 }
                                 #INT_INLINE => {
-                                let __builder_fn: fn(&mut majit_metainterp::Assembler) -> majit_metainterp::JitCode =
+                                // The policy byte hands over `_shared`, not `_with_asm`:
+                                // the cache probe is what a recursive helper needs.
+                                let __builder_fn: fn(&mut majit_metainterp::Assembler)
+                                    -> majit_metainterp::jitcode::InlineJitCodeRef =
                                     unsafe { std::mem::transmute(__inline_builder) };
-                                let __sub_jitcode = __builder_fn(__asm);
-                                let (__sub_return_kind, _) =
-                                    <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
-                                    .expect("inline helper jitcode must end in a typed return opcode");
-                                let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
+                                let __sub_edge = __builder_fn(__asm);
+                                let __sub_return_kind = majit_metainterp::JitArgKind::Int;
+                                let __sub_idx = __builder.add_sub_jitcode_ref(__sub_edge);
                                 #inline_call
                             }
                             #INT_MAY_FORCE => {
@@ -1690,11 +1701,18 @@ impl<'c> Lowerer<'c> {
             );
         }
 
+        // Every `*_ref_wrapped` policy lands here rather than returning
+        // early above, and its result is a ref like theirs.
+        let struct_type = match result_kind {
+            BindingKind::Ref => self.declared_return_struct(func),
+            BindingKind::Int | BindingKind::Float => None,
+        };
+
         Some(Binding {
             reg,
             kind: result_kind,
             depends_on_stack,
-            struct_type: None,
+            struct_type,
         })
     }
 

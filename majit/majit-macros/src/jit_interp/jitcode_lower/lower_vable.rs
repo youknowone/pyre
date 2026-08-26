@@ -1036,7 +1036,7 @@ impl<'c> Lowerer<'c> {
         }
         // ref(T) scalar: read into the ref register bank so a subsequent
         // getfield_gc reads its struct base from a real ref value.
-        if let Some((field_index, _)) = config.state_ref_scalars.get(&member_name) {
+        if let Some((field_index, struct_path)) = config.state_ref_scalars.get(&member_name) {
             let fi = *field_index as u16;
             let reg = self.alloc_reg();
             // Declare the ref identity slot as a read so the backward
@@ -1059,7 +1059,11 @@ impl<'c> Lowerer<'c> {
                 reg,
                 kind: BindingKind::Ref,
                 depends_on_stack: false,
-                struct_type: None,
+                // The `ref(T)` declaration's own `T`. `state.<ref>.<member>`
+                // resolves it from this same map one level up, so leaving it
+                // off here is what made the read stop lowering as soon as the
+                // ref was bound to a local first.
+                struct_type: Some(struct_path.clone()),
             });
         }
         if let Some(&field_index) = config.state_float_scalars.get(&member_name) {
@@ -1174,6 +1178,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.getfield_gc_r(
                         #result_reg,
@@ -1213,6 +1228,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.getfield_gc_i(
                         #result_reg,
@@ -1305,6 +1331,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.getfield_gc_r(
                         #result_reg,
@@ -1343,6 +1380,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.getfield_gc_i(
                         #result_reg,
@@ -1521,6 +1569,17 @@ impl<'c> Lowerer<'c> {
                         ::core::mem::size_of::<usize>(),
                         false,
                     )],
+                    {
+                        // The struct's own `_immutable_fields_` declaration.  Read through
+                        // an in-scope trait rather than a qualified
+                        // `<T as MajitImmutableFields>::...`, which would select the blanket
+                        // empty default and never see a struct's own declaration.  The import
+                        // is unused exactly when the inherent const wins, which is the common
+                        // case.
+                        #[allow(unused_imports)]
+                        use majit_metainterp::MajitImmutableFields as _;
+                        <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                    },
                 );
                 __builder.getfield_gc_r(
                     #buffer_reg,
@@ -1833,6 +1892,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.setfield_gc_r(
                         #base_reg,
@@ -1870,6 +1940,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.setfield_gc_i(
                         #base_reg,
@@ -1961,6 +2042,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.setfield_gc_r(
                         #base_reg,
@@ -1997,6 +2089,17 @@ impl<'c> Lowerer<'c> {
                             #__fsize,
                             #__fsigned,
                         )],
+                        {
+                            // The struct's own `_immutable_fields_` declaration.  Read through
+                            // an in-scope trait rather than a qualified
+                            // `<T as MajitImmutableFields>::...`, which would select the blanket
+                            // empty default and never see a struct's own declaration.  The import
+                            // is unused exactly when the inherent const wins, which is the common
+                            // case.
+                            #[allow(unused_imports)]
+                            use majit_metainterp::MajitImmutableFields as _;
+                            <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
+                        },
                     );
                     __builder.setfield_gc_i(
                         #base_reg,

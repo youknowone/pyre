@@ -109,14 +109,8 @@ impl<'c> Lowerer<'c> {
                 Pat::Wild(_) => {
                     default_arm = Some(&arm.body);
                 }
-                Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
-                    let name = pat_ident.ident.to_string();
-                    if name.starts_with(|c: char| c.is_lowercase()) {
-                        default_arm = Some(&arm.body);
-                    } else {
-                        let tokens = extract_pat_value_tokens(&arm.pat)?;
-                        guarded_arms.push((tokens, &arm.body));
-                    }
+                _ if is_lowercase_binding_pat(&arm.pat) => {
+                    default_arm = Some(&arm.body);
                 }
                 _ => {
                     let tokens = extract_pat_value_tokens(&arm.pat)?;
@@ -597,12 +591,15 @@ impl<'c> Lowerer<'c> {
                 Pat::Wild(_) => {
                     default_arm = Some(&arm.body);
                 }
-                Pat::Ident(pat_ident) if pat_ident.subpat.is_none() => {
+                // syn parses `OP_NOP => ..` and `other => ..` identically, so
+                // the name is all there is to go on, and `is_lowercase_binding_pat`
+                // is the one place that decides it.
+                _ if is_lowercase_binding_pat(&arm.pat) => {
                     default_arm = Some(&arm.body);
                 }
                 _ => {
-                    let literals = extract_pat_literals(&arm.pat)?;
-                    guarded_arms.push((literals, &arm.body));
+                    let values = extract_pat_value_tokens(&arm.pat)?;
+                    guarded_arms.push((values, &arm.body));
                 }
             }
         }
@@ -616,12 +613,12 @@ impl<'c> Lowerer<'c> {
 
         let disc_reg = discriminant.reg;
 
-        for (literals, body) in &guarded_arms {
+        for (values, body) in &guarded_arms {
             let next_label = self.alloc_label();
             self.emit_aux(quote! { let #next_label = __builder.new_label(); });
 
-            if literals.len() == 1 {
-                let value = literals[0];
+            if values.len() == 1 {
+                let value = &values[0];
                 let const_reg = self.alloc_reg();
                 let eq_reg = self.alloc_reg();
                 self.emit_op(
@@ -642,7 +639,7 @@ impl<'c> Lowerer<'c> {
                 );
                 self.emit_conditional_guard(eq_reg, &next_label);
             } else {
-                let first_val = literals[0];
+                let first_val = &values[0];
                 let first_const_reg = self.alloc_reg();
                 let mut or_reg = self.alloc_reg();
                 self.emit_op(
@@ -661,7 +658,7 @@ impl<'c> Lowerer<'c> {
                     ),
                     quote! { __builder.record_binop_i(#or_reg, majit_ir::OpCode::IntEq, #disc_reg, #first_const_reg); },
                 );
-                for &lit_val in &literals[1..] {
+                for lit_val in &values[1..] {
                     let const_reg = self.alloc_reg();
                     let eq_reg = self.alloc_reg();
                     let new_or_reg = self.alloc_reg();

@@ -62,29 +62,6 @@ fn pat_lit_int_value(lit: &Lit) -> Option<i64> {
     }
 }
 
-/// Extract integer literal values from a match arm pattern.
-///
-/// Supports `Pat::Lit` (integer, byte and char literals — see
-/// [`pat_lit_int_value`]), `Pat::Or` (multiple patterns like `1 | 2 | 3`), and
-/// `Pat::Path` (constant paths — evaluated at compile time via `#pat as i64`).
-///
-/// Returns `None` if the pattern contains unsupported constructs.
-pub(super) fn extract_pat_literals(pat: &Pat) -> Option<Vec<i64>> {
-    match pat {
-        Pat::Lit(expr_lit) => Some(vec![pat_lit_int_value(&expr_lit.lit)?]),
-        Pat::Or(pat_or) => {
-            let mut values = Vec::new();
-            for case in &pat_or.cases {
-                values.extend(extract_pat_literals(case)?);
-            }
-            Some(values)
-        }
-        // Constant path pattern (e.g., `MY_CONST`): we cannot evaluate
-        // this at proc-macro time, so return None to bail out.
-        _ => None,
-    }
-}
-
 /// Extract pattern values as token expressions for use in generated code.
 ///
 /// Unlike `extract_pat_literals`, this accepts constant paths (`Pat::Path`)
@@ -123,6 +100,37 @@ pub(super) fn extract_pat_value_tokens(pat: &Pat) -> Option<Vec<TokenStream>> {
         }
         _ => None,
     }
+}
+
+/// True when a match arm's pattern binds a name rather than naming a constant.
+///
+/// syn parses `OP_NOP => ..` and `other => ..` as the same `Pat::Ident`, and
+/// nothing at proc-macro time can resolve which one it is. Rust's own
+/// convention decides it: a binding is `snake_case`, so a pattern whose first
+/// character is a lower-case ASCII letter is one and everything else names a
+/// constant.
+///
+/// The two mistakes are not symmetric, which is why the ambiguous cases resolve
+/// toward "constant". Reading a constant as a binding makes the arm the
+/// catch-all: its guard is never emitted and the jitcode computes one arm for
+/// every discriminant, while the concrete path — real Rust — stays right, so
+/// only a warm-versus-cold answer can see it. Reading a binding as a constant
+/// emits `#name as i64` into the generated builder, which does not compile.
+///
+/// This is the single answer for every arm classifier here: the dispatch
+/// chain, `lower_match_stmt` and `lower_match_value` all consult it.
+pub(super) fn is_lowercase_binding_pat(pat: &Pat) -> bool {
+    let Pat::Ident(pi) = pat else {
+        return false;
+    };
+    if pi.subpat.is_some() || pi.mutability.is_some() || pi.by_ref.is_some() {
+        return false;
+    }
+    pi.ident
+        .to_string()
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase())
 }
 
 /// Case emitters for `switch_dispatch`.
@@ -469,14 +477,34 @@ pub(super) fn extract_branch_int(expr: &Expr) -> Option<i64> {
     }
 }
 
-pub(super) fn inline_builder_path(expr: &Expr) -> Option<Path> {
+/// The memoizing entry point `#[jit_inline]` generates beside `_with_asm`.
+///
+/// `_with_asm` assembles unconditionally; this one is `CallControl.get_jitcode`
+/// — it consults the driver-shared cache first and registers the helper's
+/// identity before assembling, so a helper that calls itself resolves to the
+/// jitcode it is already being built under instead of recursing.
+pub(super) fn inline_shared_path(expr: &Expr) -> Option<Path> {
     let Expr::Path(ExprPath { path, .. }) = expr else {
         return None;
     };
     let mut path = path.clone();
     let last = path.segments.last_mut()?;
-    last.ident = format_ident!("__majit_inline_jitcode_{}_with_asm", last.ident);
+    last.ident = format_ident!("__majit_inline_jitcode_{}_shared", last.ident);
     Some(path)
+}
+
+/// The callee's return kind, as a token.
+///
+/// It used to be read back off the assembled jitcode's trailing return opcode.
+/// A recursive call has no assembled jitcode to read — the callee is the caller,
+/// still under construction — and the kind is a static property of the emit site
+/// anyway, so it is spelled rather than recovered.
+pub(super) fn jit_arg_kind_tokens(kind: BindingKind) -> TokenStream {
+    match kind {
+        BindingKind::Int => quote! { majit_metainterp::JitArgKind::Int },
+        BindingKind::Ref => quote! { majit_metainterp::JitArgKind::Ref },
+        BindingKind::Float => quote! { majit_metainterp::JitArgKind::Float },
+    }
 }
 
 /// Construct the path of the per-helper liveness prebuild fn that

@@ -995,6 +995,29 @@ pub fn record_struct_layout_conflict(conflict: StructLayoutConflict) {
     conflicts.push(conflict);
 }
 
+/// A struct's `_immutable_fields_` declaration, readable by name.
+///
+/// `rclass.py InstanceRepr` reads `cls._immutable_fields_` off the class
+/// object, and every consumer goes through that one read. The proc-macro front
+/// end has no class object to read: `#[majit_macros::jit_immutable_fields]`
+/// publishes the declaration as an inherent associated const of the same name,
+/// which shadows the empty default below.
+///
+/// The blanket impl is what makes the read unconditional. A layout emit site
+/// names its struct without knowing whether that struct declared anything, and
+/// stable Rust cannot ask; a struct that never opted in answers `""` here
+/// instead of failing to resolve.
+///
+/// Generated code must bring this trait into scope with `use ... as _` and read
+/// `<T>::__MAJIT_IMMUTABLE_FIELDS`. Spelling it
+/// `<T as MajitImmutableFields>::__MAJIT_IMMUTABLE_FIELDS` would select this
+/// default even for a struct that declared one.
+pub trait MajitImmutableFields {
+    const __MAJIT_IMMUTABLE_FIELDS: &'static str = "";
+}
+
+impl<T: ?Sized> MajitImmutableFields for T {}
+
 /// Count `fields` submitted field descriptions.
 pub fn note_struct_layout_registration(fields: usize) {
     STRUCT_LAYOUT_REGISTRATIONS.fetch_add(fields, std::sync::atomic::Ordering::Relaxed);

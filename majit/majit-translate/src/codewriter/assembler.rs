@@ -305,6 +305,30 @@ pub struct Assembler {
     /// the `MAJIT_COVERAGE_PANIC=1` diagnostic so the missing-coloring
     /// panic can cite the offending op.
     current_flatop_debug: Option<String>,
+    /// `call.py CallControl.jitcodes` — the per-graph cache `get_jitcode`
+    /// consults before assembling anything.
+    ///
+    /// Upstream mints an empty JitCode and registers it under the graph
+    /// BEFORE the body is written, so a graph that calls itself links to the
+    /// object it is already registered under instead of assembling a second
+    /// copy.  This is the same cache, keyed by a per-helper identity address,
+    /// and it is what stops a self-recursive `#[jit_inline]` helper from
+    /// recursing forever while its jitcode is being built.
+    ///
+    /// Type-erased because `majit-metainterp` depends on this crate and not the
+    /// other way round; every value is an
+    /// `Arc<majit_metainterp::jitcode::InlineJitCodeSlot>`.  It sits beside
+    /// `indirectcalltargets`, which upstream also keeps as a JitCode-identity
+    /// set on this object.
+    inline_jitcodes: indexmap::IndexMap<usize, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// `call.py CallControl.unfinished_graphs` membership, for the install-time
+    /// liveness prebuild walk.
+    ///
+    /// That walk is a second recursion with no `JitCodeBuilder` anywhere in
+    /// scope: a helper's prebuild body calls its callees' prebuilds directly,
+    /// so a recursive helper overflows there too, earlier and with nothing to
+    /// catch it.  Membership here is what makes the walk visit each helper once.
+    inline_prebuild_seen: indexmap::IndexSet<usize>,
 }
 
 impl Assembler {
@@ -328,7 +352,40 @@ impl Assembler {
             canonical_liveness_offset: None,
             current_graph_name: None,
             current_flatop_debug: None,
+            inline_jitcodes: indexmap::IndexMap::new(),
+            inline_prebuild_seen: indexmap::IndexSet::new(),
         }
+    }
+
+    /// `call.py CallControl.jitcodes.get(graph)` — the slot registered for
+    /// `key`, or `None` if this helper has not been entered yet.
+    ///
+    /// The caller downcasts; this object cannot name the slot type without
+    /// depending on the crate above it.
+    pub fn inline_jitcode_slot(
+        &self,
+        key: usize,
+    ) -> Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.inline_jitcodes.get(&key)
+    }
+
+    /// `call.py CallControl.jitcodes[graph] = jitcode`.
+    ///
+    /// Called twice per helper: once with the under-construction slot before
+    /// the body is assembled, once with the finished one after.
+    pub fn inline_jitcode_insert(
+        &mut self,
+        key: usize,
+        slot: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    ) {
+        self.inline_jitcodes.insert(key, slot);
+    }
+
+    /// Whether this is the first time the liveness prebuild walk has reached
+    /// `key`.  `false` means the walk is already inside this helper and must
+    /// not descend again.
+    pub fn enter_inline_prebuild(&mut self, key: usize) -> bool {
+        self.inline_prebuild_seen.insert(key)
     }
 
     /// Stage the state-field JIT canonical "all-live" triple for lazy
