@@ -2,6 +2,15 @@
 //!
 //! Partial port of `interp_gc.py`. Explicit collection runs the complete
 //! RPython collection, then drains the finalizer queue synchronously.
+//!
+//! Part of this module answers to 3.14 alone. `moduledef.py` binds no
+//! `get_count`, `set_threshold`/`get_threshold`, `set_debug`/`get_debug` or
+//! `freeze`/`unfreeze`/`get_freeze_count`, so those have no implementation to
+//! follow and each one below states what it answers and why. Nothing grades
+//! them either: `test_gc` is an implementation-detail module on both axes —
+//! `lib-python/conftest.py`'s testmap skips it and `cpython_tests/run.py`
+//! carries that skip forward — so the assertions that would pin these live in
+//! `extra_tests/snippets/` instead.
 
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
@@ -17,18 +26,38 @@ pub mod hook;
 /// call so callers that toggle and re-read the state stay consistent.
 static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// The collector debug word.  PyPy does not expose this frontend knob, but
-/// the 3.14 observable contract requires the value to be interpreter-owned and
-/// shared by all threads.  The moving collector has no
-/// refcount-cycle diagnostic stream to toggle; the word is nevertheless kept
-/// exactly so callers can bracket a collection and restore the prior flags.
+/// The collector debug word.
+///
+/// `[3.14-spec]` PyPy exposes no such knob, and 3.14 requires the value to be
+/// interpreter-owned and shared by all threads, so the word is kept exactly:
+/// a caller can bracket a collection and restore the prior flags.  It drives
+/// nothing, and `DEBUG_SAVEALL` is the flag that shows why.  3.14 retains what
+/// the *cyclic* collector found unreachable, which is a small set precisely
+/// because refcounting already reclaimed the acyclic garbage before it ran.
+/// Here there is no refcount, so the population reaching the sweep's
+/// free-or-keep callback is everything that died since the last major —
+/// hundreds of objects across a dozen type ids inside the single collection
+/// `test_saveall` brackets, where it expects one — and no filter at that
+/// callback can recover the distinction, because a would-this-have-died-by-
+/// refcount answer is never computed.  The remaining flags describe a
+/// per-object cycle report this collector likewise does not produce.
 static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
 
-/// The collection thresholds `gc.get_threshold()` reports.  pyre's collector
-/// has no generational allocation counters to drive, so the values are only
-/// remembered: `set_threshold` stores what it was given and `get_threshold`
-/// hands the same tuple back, which is the part of the pair's behaviour a
-/// caller can observe.  All three are kept, including the third, whose round
+/// The collection thresholds `gc.get_threshold()` reports.
+///
+/// `[3.14-spec]` A remembered round trip, where PyPy binds no threshold
+/// surface at all.  The values drive nothing, and the reason is a unit
+/// mismatch rather than an absence: what schedules a collection here is a byte
+/// reading — `get_total_memory_used` against `next_major_collection_threshold`
+/// — while `threshold0` is a count of container allocations, and the only
+/// knob retunable after construction, `set_max_heap_size`, is a byte ceiling
+/// too.  An old-gen live-*object* count does exist (`live_objects`, kept by
+/// the arena collection), so the honest statement is that no knob shares
+/// `threshold0`'s unit, not that nothing is counted.  Pointing a count at a
+/// byte knob would silently mean something neither 3.14 nor PyPy means.  So
+/// `set_threshold` stores what it was given and `get_threshold` hands the same
+/// tuple back, which is the part of the pair's behaviour a caller can
+/// observe.  All three are kept, including the third, whose round
 /// trip 3.14 preserves even though its own incremental collector sizes no
 /// third generation.  The initial values are the ones a fresh interpreter
 /// starts with.
@@ -1727,11 +1756,18 @@ crate::py_module! {
         "is_finalized"  / 1 = |args| Ok(w_bool_from(
             majit_gc::gc_finalizer_has_run(args[0] as usize),
         )),
-        // CPython 3.14 `gc.freeze()` moves the surviving objects into a
+        // `[3.14-spec]` `gc.freeze()` moves the surviving objects into a
         // permanent generation that later collections skip; it is a pre-fork
-        // hint, not a semantic guarantee. The collector has no permanent
-        // generation, so freezing and unfreezing are no-ops and the frozen
-        // count is always the truthful zero.
+        // hint, not a semantic guarantee.  PyPy binds none of the three.  The
+        // collector has no permanent generation, so freezing and unfreezing
+        // are no-ops and the frozen count is the truthful zero.
+        //
+        // Rooting the live set instead would not be that operation under
+        // another name: a frozen object in 3.14 is skipped by the cyclic
+        // collector but still reclaimed by refcount, while a rooted one is
+        // immortal until `unfreeze` and has its `__del__` deferred until then.
+        // That is a third behaviour, matching neither side, and the whole live
+        // set is what it would apply to.
         "freeze"           / 0 = |_| Ok(w_none()),
         "unfreeze"         / 0 = |_| Ok(w_none()),
         "get_freeze_count" / 0 = |_| Ok(w_int_new(0)),
