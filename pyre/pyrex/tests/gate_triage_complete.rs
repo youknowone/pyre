@@ -417,8 +417,16 @@ fn pyre_triage_live_history_split_holds_at_both_anchors() {
          gate-triage.md's headings"
     );
     assert!(
+        documented.contains("PYRE_WALKABORT_OFF"),
+        "PYRE_WALKABORT_OFF is listed live in §6a but did not count as \
+         documented — is_history_heading is excluding a live section"
+    );
+    // §6a2 is a sibling subsection and inherits §6 the same way, so it needs
+    // its own anchor: a heading filter that swallowed only §6a2 would leave
+    // the §6a probe above green.
+    assert!(
         documented.contains("PYRE_JD1"),
-        "PYRE_JD1 is listed live in §6a but did not count as documented — \
+        "PYRE_JD1 is listed live in §6a2 but did not count as documented — \
          is_history_heading is excluding a live section"
     );
 }

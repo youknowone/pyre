@@ -1488,7 +1488,7 @@ pub const MC_DIAG_SLOTS: usize = 83;
 /// optimizer deferred an `InvalidLoop` on the root trace, 48 = the root
 /// `compile_loop` returned `Err`, 49 = a bridge compile came back `Aborted`.
 ///
-/// 70 completes that decomposition from the other end: the abort where *no*
+/// 71 completes that decomposition from the other end: the abort where *no*
 /// reason was staged at all and the code fell back to `AbortReason::Generic`,
 /// counted where the fallback is chosen (`pyjitpl.rs abort_trace`,
 /// `jitdriver.rs`'s reason ladder). Slot 41 is the total of every
@@ -1496,7 +1496,7 @@ pub const MC_DIAG_SLOTS: usize = 83;
 /// from that default, which is what made `abrt_bridge=1` read as evidence of
 /// bridge activity that was not there.
 ///
-/// 70 is NOT `41 - (47+48+49)`, and that subtraction must not be used:
+/// 71 is NOT `41 - (47+48+49)`, and that subtraction must not be used:
 /// 47-49 are bumped at the RAISE, immediately before
 /// `return Err(SwitchToBlackhole::giveup())`, while 41 is bumped at the CATCH
 /// inside `aborted_tracing`. A giveup raised on a path that never reaches a

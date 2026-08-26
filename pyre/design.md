@@ -34,7 +34,7 @@ Rust, and a PyPy-equivalent (pyre) on top of that.**
 | RPython translator (flowspace → annotator → rtyper) | **majit-translate** (`front/ast` → `flowspace/` → `annotator/` → `rtyper/`) over **Charon LLBC** artifacts | Same pipeline, same module names, run at `cargo build` time over extracted `.ullbc` instead of live bytecode. |
 | `jtransform`/codewriter → JitCode | **majit-translate `codewriter/`** → JitCode | Same role, at `cargo build` time. pyre additionally runs a *second*, hand-written codewriter over user `CodeObject`s at runtime; see §3.7. |
 | `warmspot` — translation-time portal generator | **split**: build-time derivation in majit-translate, hand-written warm entry in pyre-jit | Not a port. `apply_jit` is unwired and `warmspot.rs` is a `pub use` namespace; see §3.7. |
-| metainterp, optimizer, resume, blackhole | **majit-metainterp / majit-trace** | Line-by-line port of the *tracing* JIT (pyjitpl5 lineage), not the 2007 PE JIT. |
+| metainterp, optimizer, resume, blackhole | **majit-metainterp / majit-trace** | Line-by-line port of the *tracing* JIT (pyjitpl5 lineage), not the 2007 PE JIT. The history, optimizer, resume and blackhole halves are what production runs; the `pyjitpl` MIFrame *tracer* is not — `mod pyjitpl` is private, `cpu.rs` calls that tracer retired, and pyre records through the hand-written full-body walker in `pyre-jit-trace/src/jitcode_dispatch/`. That walker is A1 debt of the same class §3.7 tracks. |
 | x86/ARM/… hand-written backends (~300k LOC) | **majit-backend-dynasm / -cranelift / -wasm** | Three thin backends behind one trait, current primary dynasm; see §3.4. |
 | incminimark GC | **majit-gc** (nursery + oldgen + incremental + card marking) | Port of the winner, not of Boehm/refcount/mark-sweep. |
 | sandbox transform | **rsandbox** | Compile-time sandbox aspect. |
@@ -293,9 +293,14 @@ configuration. pyre keeps:
 
 - **One blessed default configuration** that is always green and always
   benchmarked (this is what CI and check.py gate).
-- Experimental behavior behind `PYRE_*` env gates or features, default-off,
-  each with an owner-issue and an intended flip-or-delete decision. A gate is
-  a staging area, not a home.
+- Experimental behavior behind `PYRE_*` / `MAJIT_*` env gates or features.
+  Default-off is the norm; a gate may be default-**ON** where its reason for
+  existing is to keep the switched-off arm reachable as a one-binary A/B, and
+  then its registry row has to name the trigger that retires it. Either
+  polarity carries an owner-issue and an intended flip-or-delete decision. A
+  gate is a staging area, not a home. The registries are `pyre/gate-triage.md`
+  and `majit/gate-triage.md`; a gate read from the environment with no row
+  there fails `gate_triage_complete`.
 - Aspect combinations (e.g. wasm × JIT × GC modes) are individually declared
   supported or unsupported; silence means unsupported.
 
@@ -318,12 +323,36 @@ layers, unevenly:
   driven from `pyre-jit-trace/build.rs`. The derived green/red layout is
   asserted against the real MIR operands and a mismatch fails the build. This
   half is at the right layer and is not debt.
-- **`apply_jit` itself is unported.** `task_pyjitpl_lltype` assembles every
-  upstream-shaped argument and then returns `TaskError`, because majit-translate
-  does not depend on majit-metainterp; `warmspot.rs` is a `pub use` namespace,
-  not an implementation. Seven `missing_task_leaf` sites exist across that
-  driver, so the stub is not unique — it is named here because the fields it
-  would fill are instead written by hand from consumer source.
+- **`apply_jit` itself is unported**, but not for the reason first recorded
+  here. `task_pyjitpl_lltype` assembles every upstream-shaped argument and then
+  returns `TaskError`; majit-metainterp's `warmspot.rs` is a `pub use`
+  namespace, not an implementation. The blocker was written down as
+  "majit-translate does not depend on majit-metainterp", which reads as though
+  adding that edge is the fix. It is not: majit-metainterp already depends on
+  majit-translate, so the reverse edge is a direct cycle and Cargo rejects it.
+  Upstream has the same cycle — `warmspot` imports `removenoops` and
+  `call_final_function` from the translator at module level — and breaks it by
+  importing `apply_jit` *inside* `task_pyjitpl_lltype` rather than at module
+  level. pyre's crate split is a faithful split of a cycle Python papers over,
+  so the seam is the port, not a workaround: `VirtualizableInfoHandle` and
+  `VirtualRefInfoHandle` already invert exactly this direction for the two
+  objects `apply_jit` builds out of metainterp, and a third seam for
+  `MetaInterpStaticData` needs no new edge. Seven `missing_task_leaf` sites
+  exist across that driver and only two are JIT-related.
+
+  What is genuinely missing is narrower than the stub suggests. The heaviest
+  part of `apply_jit` — the generated `portal_runner` / `ll_portal_runner` — is
+  already ported, by hand and with per-line citations, into pyre-jit's
+  `call_jit.rs`; `make_args_specifications`, `make_jitcodes`,
+  `make_virtualizable_infos`, `build_meta_interp` and `finish_setup_descrs` all
+  have covered counterparts. The gap is the graph-rewrite family
+  (`rewrite_can_enter_jits`, `rewrite_jitcell_accesses`,
+  `rewrite_set_param_and_get_stats`, `rewrite_force_virtual`,
+  `rewrite_force_quasi_immutable`, `add_finish`, `make_driverhook_graphs`,
+  `create_jit_entry_points`) together with `inline_inlineable_portals` and
+  `prejit_optimizations` — and those are blocked by pyre having no mutable
+  graph-rewriting stage over the interpreter's own graphs at that point in the
+  pipeline, which is the A1 debt the next bullet names, not by crate layering.
 - **A second codewriter runs at runtime.** majit-translate's
   `transform_graph_to_jitcode` consumes a `FunctionGraph` once per build;
   pyre-jit's `transform_graph_to_jitcode` consumes a user `CodeObject`, is
@@ -336,35 +365,127 @@ layers, unevenly:
   tracked generation defect whose convergence target is majit-translate's
   codewriter.
 
-**Measured cost, 2026-08-22.** Installing `sys.setprofile`, `sys.settrace` or
-`cProfile` costs **1168–2836×** on a hot loop where PyPy 7.3.20 pays
-**1.1–4.6×** and stays compiled. It is a total outage, not a reuse failure:
-warming *under* the profiler never compiles at all. Event counts match CPython
-exactly, so this is a cliff and not a wrong answer. Stated plainly: **a profile
-taken on pyre measures the interpreter, not the JIT**, and pdb and coverage.py
-are in the same position.
+**Measured cost, re-measured 2026-08-26** (dynasm release binary, best-of-3
+`time.process_time()`, one million iterations, both loop shapes run against
+CPython 3.14 and PyPy 7.3.20 on the same machine). The cliff moved rather than
+vanished. On a **call-free** hot loop pyre now pays nothing for either hook —
+0.0042 s profiled against 0.0042 s bare. On a loop that **calls** a small
+function every iteration it still pays two orders of magnitude: 272–328× for
+`sys.setprofile` and 178–215× for `sys.settrace` across runs, where CPython
+pays 2.5–3.3× and PyPy about 1× and stays compiled. The charge is therefore
+per *call event*, not per profiled frame, and the earlier 1168–2836× figure is
+superseded — it was taken before the bracket below landed.
 
-**The root is a missing bracket, not the folded green.** Upstream brackets the
-portal itself: `PyFrame.execute_frame` wraps `dispatch` — the function that
-carries the merge point and nothing else — in `ExecutionContext.enter`,
-`call_trace`, then `return_trace` and `leave` in `finally` clauses. pyre put
-that bracket *inside* the plain dispatch body (`eval_frame_plain_with_resume`)
-and left the JIT dispatch body bare: `eval_with_jit_inner` substitutes
-`install_current_frame`, which performs only `enter`'s topframeref/f_backref
-half, and `CurrentFrameGuard`'s drop, which performs only `leave`'s
-topframeref half. Neither emits an event, and `pyre-jit` contains no
-`call_trace` or `return_trace` call at all.
+Event counts still match, which is what licenses the comparison: at a million
+iterations all three runtimes report the same `call` / `return` / `c_call`
+multiset. pyre additionally reports 28 `importlib._bootstrap` weakref-callback
+frames that reference counting had already reclaimed before the profiled
+window opened — a collector-timing difference outside the loop body, 0.003% of
+the events, and not JIT-attributable, since it survives `PYRE_NO_JIT=1`.
 
-A JIT-activated frame therefore emits no `call` and no `return` event, and the
-only thing hiding that is the refusal itself — `frame_tracing_active` sends
-every traced or profiled frame down `execute_frame_plain`, which is the
-bracketed path. `run_with_jit` states the dependency in the affirmative: it
-routes non-JIT-eligible frames through `execute_frame` "so `call_trace` /
-`return_trace` frame events still fire". **The gate is not a performance
-concession; it is the whole implementation of frame events for JIT-eligible
-frames**, and the measured event parity above is produced by it. Restoring the
-bracket above the portal is a prerequisite for touching the gate, and it needs
-no green.
+**The missing bracket is restored, and the falsification below came back
+clean.** Upstream brackets the portal itself: `PyFrame.execute_frame` wraps
+`dispatch` — the function that carries the merge point and nothing else — in
+`ExecutionContext.enter`, `call_trace`, then `return_trace` and `leave` in
+`finally` clauses. pyre had put that bracket *inside* the plain dispatch body
+(`eval_frame_plain_with_resume`) and left the JIT dispatch body bare. It no
+longer does: `eval_with_jit_inner` now calls `call_trace` and `return_trace`
+around the portal, and `frame_tracing_active` — the gate that had been sending
+every traced or profiled frame down `execute_frame_plain` — is narrowed to the
+per-frame `!frame.get_w_f_trace().is_null()`. The global `profilefunc` and
+tracefunc disjuncts are gone and no events went missing, which is exactly what
+this entry predicted. **The gate is no longer the implementation of frame
+events for JIT-eligible frames**, and a profiled call-free loop now measures
+the JIT.
+
+**The two hooks fail for different reasons, and the obvious repair of the
+second one is unsound.** Under `MAJIT_STATS=1` on the call-bearing loop,
+`sys.settrace` keeps its compilation — `loops_compiled=4`, `loops_aborted=0`,
+`guard_failures=3`, a summary line byte-identical to the bare arm's — so its
+whole cost is executed per-call dispatch inside compiled code. `sys.setprofile`
+instead *loses* the compilation: `loops_compiled` falls 4 → 1 and
+`loops_aborted` rises 0 → 5, and after the fifth the green key is banned
+(`abort_ceiling_banned=1`), so the next 174,776 attempts are refused outright
+and the loop runs interpreted for the rest of the run.
+
+Those five are reported as `abrt_bridge` with all three `giveup_*` splits
+reading 0, i.e. they take the reason ladder's fourth rung — nothing staged,
+fall back to `AbortReason::Generic`, whose integer *is* `ABORT_BRIDGE`. That
+rung has no upstream counterpart: every `SwitchToBlackhole` upstream takes its
+`Counters.ABORT_*` as a constructor argument, so a reason cannot be absent
+there. `PYRE_FBW_DEBUG_ABORT` supplies the name the counters cannot:
+`DispatchError::ProfiledResidualCall`.
+
+The walker declines a residual call made from a profiled frame because a
+builtin callee owes `c_call` / `c_return`, and the walker *decides* that call —
+folding or residualising it — rather than tracing through the arm that reports
+it, so a trace taken there would run its tail silently. That is right for a
+builtin, and it is applied to every callee; the site's own comment records the
+widening as known: a `CallFn` naming a Python callee "owes no `c_call` either,
+but the fold gives the walker no way to tell".
+
+**Narrowing it to upstream's line was tried on 2026-08-26 and reverted.**
+`call_valuestack` diverts only `is_builtin_code(w_func)`, the plain `CallFn`
+shape carries the callable as operand 0, and a `GuardValue` pins the
+recording-time answer so that a later builtin at that site side-exits. All of
+that works: with it, the three arms compile identically and the fixture's own
+event multiset is unchanged. It is still wrong, and
+`profile_hook_armed_before_a_hot_loop` fails on all three backends because of
+it. Admitting the trace for the Python call also admits every **folded**
+builtin in the same loop body, and a fold never reaches that dispatcher at
+all — so `len`'s `c_call` / `c_return` stop firing while `callee`'s `call` /
+`return` keep coming. The decline on the Python call was what protected the
+folded builtin. That fixture says so in advance, and it is right: the gate can
+only narrow "with the reporting to back it up".
+
+So the ordering is fixed, and it is the opposite of the tempting one. The
+reporting has to be **recorded into the trace** before the decline can narrow.
+Until that exists, declining is the correct answer and the cliff is the price.
+
+What that costs is now scoped rather than guessed. It is not one insertion per
+fold: `dispatch_residual_call_iRd_kind` sits ahead of every fold, every
+descent and the generic residual emit, so the reporting has one entry point.
+The pair is `ExecutionContext::c_call_trace` / `c_return_trace`, and since
+both funnel into a path that reads the arguments only through `firstarg`, a
+bridge needs `(frame, w_func, first_arg)` and no `Arguments` reconstruction.
+Two `extern "C"` bridges are required rather than raw Rust fns, per the
+residual-fnaddr ABI rule. The effect has to be `MOST_GENERAL` — the hook is
+arbitrary Python — which is mintable at trace time precisely because its raw
+sets are `None` rather than empty, and it has to be emitted through the
+residual path's `CallMayForceN` + `GuardNotForced` rather than a plain
+recorded call, or the declaration lies to the optimizer. The frame is
+reachable per level through `walker_executing_frame_box`, which resolves to
+the portal's virtualizable at the root and to the callee shadow inside an
+inline sub-walk — the split
+`profile_hook_c_call_is_bytecode_level_only` already pins.
+
+The hard part is the exit, not the entry: the choke point has one entrance and
+many early returns, one per fold, and `c_return` is owed on all of them
+including the raising one. And the payoff is not yet established — every
+folded builtin in a profiled loop would be bracketed by two forcing calls, so
+the first measurement to run is whether such a compiled loop actually beats
+the interpreted one it replaces. If it does not, the decline is not merely
+safe but right, and this entry's remaining half closes rather than lands.
+
+One claim examined along the way did not survive: that the method-form
+dispatcher carries no profiled decline and so already drops events for a bound
+builtin. Measured on `lst.append` / `lst.pop` in a hot profiled loop, pyre
+reports 5000 of each, and so does CPython, and both
+`profile_hook_armed_before_a_hot_loop` and
+`profile_hook_c_call_is_bytecode_level_only` pass.
+
+Two smaller defects fell out of the same investigation and are fixed.
+`function.py`'s `is_builtin_code` — unwrap a `_Method`, take the function's
+code, ask whether that code is a `BuiltinCode` — had been ported as a
+forwarder to the gateway predicate, which answers a different question about a
+different object; it was dead code, and reviving it as the real port is what
+lets any of the tests above be written correctly. And `PyFrame::call` gated
+its whole `_flat_pycall`-shaped fast path on `!get_is_being_profiled()`, where
+`call_valuestack` diverts only `is_builtin_code(w_func)` and lets a `Function`
+keep `funccall_valuestack`; that conjunct is now upstream's. Narrowing it
+changed nothing about the cliff — `loops_compiled=1 loops_aborted=5` identical
+before and after — so it is recorded as parity, and as a refuted hypothesis
+rather than a fix.
 
 **What upstream does not do.** It does not fold the tracing state away.
 `ExecutionContext` declares `_immutable_fields_` with `profilefunc?` and
@@ -382,13 +503,90 @@ Where the green does pay is the profiled-call dispatch: `call_valuestack` and
 its keyword/ex siblings branch on `get_is_being_profiled()` before
 `call_args_and_c_profile`, and a real green folds those branches to nothing in
 the unprofiled trace while giving the profiled state its own cell, counter and
-procedure token. That is the last step of the repair, not the first.
+procedure token. With the bracket landed and the call-free shape flat, this is
+now the remaining step rather than the last one, and the measurement above says
+which half to take first: `settrace` keeps its compilation, so its cost is
+entirely in that unfolded branch; `setprofile` aborts the recording before the
+branch can matter.
 
-**Falsification.** Restoring the activation bracket should leave event counts
-unchanged with the gate still in place, and should let the gate's
-`profilefunc`/global-tracefunc disjuncts be dropped without losing events. If
-events go missing once the bracket is above the portal, the bracket is not what
-the gate was standing in for and this entry is wrong.
+**Falsification, run 2026-08-26 — passed.** The prediction was that restoring
+the activation bracket would leave event counts unchanged with the gate still
+in place, and would then let the gate's `profilefunc`/global-tracefunc
+disjuncts be dropped without losing events. Both held: the gate now reads only
+the per-frame `w_f_trace` and the `call`/`return`/`c_call` multisets are
+unchanged, so the bracket was what the gate was standing in for.
+
+The successor claim, which this entry now stands or falls by: the two
+remaining costs are the unrecorded profile reporting and the unfolded per-call
+dispatch, in that order. The first is now bounded rather than guessed — the
+`setprofile` aborts DO survive a recorder that admits the profiled call, and
+`profile_hook_armed_before_a_hot_loop` is the instrument that says so. It is
+wrong if recording `c_call` / `c_return` into the builtin folds still leaves
+`setprofile` short of `settrace`'s regime, or if folding
+`get_is_being_profiled()` out of the unprofiled trace still leaves the
+call-bearing loop more than an order of magnitude off its bare arm — either
+would mean a third mechanism is in play that none of the bracket, the
+recorder, or the green accounts for.
+
+
+### 3.8 The fold layer: hand-written compensation for an opaque objspace
+
+pyre records traces through 74 `try_walker_specialize_*` functions — 72 in
+`jitcode_dispatch/specialize.rs`, one each in `residual_call.rs` and
+`inline_call.rs` — 10,858 lines of body inside `specialize.rs`'s 17,349,
+described by the 76 rows of `SPEC_FOLD_ROWS` (one fold can back several rows,
+and one row-less fold exists). Nothing in this charter named that layer before
+2026-08-26, which is itself the finding: it is the largest single adaptation
+in the tree.
+
+**Why it exists.** PyPy's objspace is RPython, so the tracer walks into it and
+`optimizeopt/` only ever sees ordinary recorded operations. pyre's objspace is
+compiled Rust reached through an opaque residual call, so every fold's first
+job is to *recognise* that residual and answer in its place. Upstream has no
+equivalent job, which means the obvious convergence — "retire the folds in
+favour of the ported optimizer" — is not available as stated. Group by group:
+
+| group | n | nearest upstream |
+|---|---|---|
+| unbox → raw int/float/bigint arithmetic, compare, truth | 17 | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
+| opaque builtin call → pure elidable call | 19 | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
+| residual → `new_with_vtable` / `new_array` so it stays virtual | 10 | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
+| guarded heap field / array / mapdict read and write | 19 | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
+| type-identity shortcut | 3 | `OptRewrite._optimize_oois_ooisnot` plus `Optimizer.constant_fold` — a real pass |
+| frame / execution-context introspection | 6 | none at any layer; PyPy forces the virtualizable instead |
+| function-object construction | 2 | none |
+
+Four groups have only downstream cleanup upstream, two have nothing at all,
+and exactly one has a counterpart that is a pass rather than a consumer. So
+the convergence target for this layer is **descent reach into the
+interpreter** — making the objspace walkable — and not the porting of an
+optimizer pass. A1 is not weakened by this; the layer stays hand-written
+generation debt, but its stated repair is now the right one.
+
+**What was tried.** A gateway-wrapper pilot gave `math.sqrt` its own jitcode
+and a published `fnaddr`; the descent still declined on 433 transitive
+blockers and retired zero folds. A separate census over the synthetic corpus
+found no fold with `consulted=0`, so the layer is not merely carrying dead
+arms — `load_deref` alone never fired.
+
+**What does not hold it in place.** Only 15 fixtures carry a `spec-folds=`
+header and they name 25 distinct folds between them, so 51 of the 76 rows have
+no fixture coupling at all. Retirement is blocked by reach, not by headers.
+
+**The bounded first step** is the type-identity group — `builtin_type`,
+`builtin_isinstance`, `builtin_issubclass`, 291 lines — because it is the
+smallest group that is entirely fixture-free *and* whose upstream counterpart
+is a pass that pyre has already ported (`PtrEq | InstancePtrEq` is registered
+in `executor.rs` and reached through `OptPure`). Its go/no-go is a
+measurement, not a design question: whether the descent declines on those
+three callables and on which blocker. Until that is run, the step is proposed
+and not accepted.
+
+**Falsification.** If making those three callables descendable does not let
+their folds be retired with the corpus unchanged, then reach is not the
+binding constraint and this entry is wrong — the layer would then be
+compensating for something the descent cannot reach in principle, and the
+right response is to say what that is rather than to widen the descent again.
 
 ---
 

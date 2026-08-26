@@ -5204,15 +5204,22 @@ impl OpcodeStepExecutor for PyFrame {
         // lets the translated interpreter expose an ordinary `_flat_pycall`
         // to the meta-tracer for `obj.method(...)`, just like PyPy.
         //
-        // baseobjspace.py:1243 — skip fast path when profiling is active
-        // and the function wraps a builtin code (c_call/c_return events).
-        // Conservative: skip entire fast path if profiled, since
-        // funccall_valuestack's builtin dispatch also bypasses profiling.
-        //
         // Guard: only enter when the value stack has at least nargs + 2
         // items above stack_base (callable + null_or_self + args).
         let stack_items = self.valuestackdepth.saturating_sub(self.stack_base());
-        if stack_items >= nargs + 2 && !self.get_is_being_profiled() {
+        // `call_valuestack` diverts to `call_args_and_c_profile` only when the
+        // frame is profiled AND the callable wraps a builtin code, so that the
+        // `c_call` / `c_return` events a builtin owes are not skipped.  A
+        // `Function` keeps `funccall_valuestack` under a profiler; its own
+        // `call` / `return` events come from the `call_trace` / `return_trace`
+        // bracket at the callee's activation, not from this dispatch.  The
+        // test reads the raw callable, before the `_Method` unwrap below,
+        // because upstream tests `w_func` at that same point.
+        let profiled_builtin = stack_items >= nargs + 2 && self.get_is_being_profiled() && {
+            let w_func = self.peekvalue_maybe_none(nargs + 1);
+            crate::function::is_builtin_code(w_func)
+        };
+        if stack_items >= nargs + 2 && !profiled_builtin {
             let mut null_or_self = self.peekvalue_maybe_none(nargs);
             let mut callable = self.peekvalue_maybe_none(nargs + 1);
             // baseobjspace.py: `_Method` is not a generic callable
