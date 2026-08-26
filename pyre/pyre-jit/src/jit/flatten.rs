@@ -2671,7 +2671,6 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "import_from"
             | "load_from_dict_or_globals"
             | "load_super_attr"
-            | "super_attr_unwrap"
             | "delete_subscr"
             | "delete_attr"
             | "list_extend"
@@ -6937,7 +6936,16 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // Tag the LOAD_SUPER_ATTR helper calldescr so the full-body walker's callee
+    // replay scan can classify the call.  Untagged it reads as
+    // `RuntimeHelperKind::None`, which the scan poisons as an unprovable
+    // live-heap write, and a poisoned pc declines the whole enclosing callee to
+    // a residual — so every method containing `super()` lost its inline.  The
+    // standing is `LoadAttr`'s (deferred, not clean): the proxy's
+    // `__getattribute__` binds a descriptor whose `__get__` may run Python, and
+    // an unfolded residual still reaches the nested-residual backstop.
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::LoadSuperAttr;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![
@@ -6997,7 +7005,16 @@ where
         Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
         _ => return None,
     };
-    let effect_info = effect_info_for_call_flavor(CallFlavor::MayForce);
+    // `bh_super_attr_unwrap_fn` is an `is_method` class test plus one of two
+    // field reads — no allocation, no raise, no Python — so `MayForce` (which
+    // resolves to `EffectInfo::MOST_GENERAL`) asserted something false about it
+    // and bought a `ForceToken`, a `Setfield last_instr`, a `GuardNotForced` and
+    // a `GuardNoException` per call, twice per method-form LOAD_SUPER_ATTR.
+    // `PlainCannotRaise` is the flavor its sibling
+    // `build_load_method_self_fn_residual_call_ir_r_insn` already uses for the
+    // same shape (reads heap, never raises).
+    let mut effect_info = effect_info_for_call_flavor(CallFlavor::PlainCannotRaise);
+    effect_info.runtime_helper = majit_ir::RuntimeHelperKind::SuperAttrUnwrap;
     let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Int],
@@ -13965,6 +13982,28 @@ mod tests {
                     }
                     other => panic!("expected ListR, got {other:?}"),
                 }
+                match &args[3] {
+                    Operand::Descr(descr) => match &**descr {
+                        DescrOperand::CallDescrStub(stub) => {
+                            // The proxy's `__getattribute__` binds a descriptor
+                            // whose `__get__` may run Python, so the call keeps
+                            // the may-force shape.  The tag is what lets the
+                            // full-body walker classify it; untagged it reads as
+                            // an unprovable live-heap write and poisons the
+                            // enclosing callee out of its inline.
+                            assert_eq!(
+                                stub.effect_info.extraeffect,
+                                majit_ir::ExtraEffect::RandomEffects
+                            );
+                            assert_eq!(
+                                stub.effect_info.runtime_helper,
+                                majit_ir::RuntimeHelperKind::LoadSuperAttr
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Descr, got {other:?}"),
+                }
                 assert_eq!(
                     result,
                     Some(Register {
@@ -14145,6 +14184,29 @@ mod tests {
                         );
                     }
                     other => panic!("expected ListR, got {other:?}"),
+                }
+                match &args[3] {
+                    Operand::Descr(descr) => match &**descr {
+                        DescrOperand::CallDescrStub(stub) => {
+                            // An `is_method` class test and one of two field
+                            // reads: no allocation, no raise, no Python.  A
+                            // may-force shape here would buy a `ForceToken`, a
+                            // `Setfield last_instr`, a `GuardNotForced` and a
+                            // `GuardNoException` per call, twice per method-form
+                            // LOAD_SUPER_ATTR, and would wipe the trace's
+                            // heap-field cache.
+                            assert_eq!(
+                                stub.effect_info.extraeffect,
+                                majit_ir::ExtraEffect::CannotRaise
+                            );
+                            assert_eq!(
+                                stub.effect_info.runtime_helper,
+                                majit_ir::RuntimeHelperKind::SuperAttrUnwrap
+                            );
+                        }
+                        other => panic!("expected CallDescrStub, got {other:?}"),
+                    },
+                    other => panic!("expected Descr, got {other:?}"),
                 }
                 assert_eq!(
                     result,

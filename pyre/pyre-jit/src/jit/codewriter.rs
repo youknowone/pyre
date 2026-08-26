@@ -3935,9 +3935,11 @@ fn register_helper_fn_pointers(
         CallFlavor::MayForce,
     );
     // `bh_load_super_attr_fn` runs `getattr` on the super proxy (descriptor
-    // `__get__` may run Python) → `MayForce`.  `bh_super_attr_unwrap_fn` is
-    // pure but routes through the proven MayForce ir_r path.  Appended last
-    // to preserve fn_ptr indices.
+    // `__get__` may run Python) → `MayForce`.  `bh_super_attr_unwrap_fn` is an
+    // `is_method` class test plus one of two field reads — no allocation, no
+    // raise, no Python — so it takes `PlainCannotRaise`, the flavor its sibling
+    // `bh_load_method_self_fn` already carries for the same shape.  Appended
+    // last to preserve fn_ptr indices.
     let load_super_attr_fn = bind(
         assembler,
         cpu.load_super_attr_fn as *const (),
@@ -3946,7 +3948,7 @@ fn register_helper_fn_pointers(
     let super_attr_unwrap_fn = bind(
         assembler,
         cpu.super_attr_unwrap_fn as *const (),
-        CallFlavor::MayForce,
+        CallFlavor::PlainCannotRaise,
     );
     // `bh_load_deref_value_fn` reads a cell's contents (mutable heap) and
     // raises on an unbound free variable; it runs no user code, so `Plain`
