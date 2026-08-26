@@ -1098,22 +1098,23 @@ fn boxed_from_int_or_float(values: &[i64]) -> Vec<PyObjectRef> {
         };
         let _ = crate::gc_roots::pin_root(item);
     }
-    (0..values.len())
-        .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(crate::gc_roots::shadow_stack_get(root_base + i));
+    }
+    items
 }
 
 /// listobject.py IntegerListStrategy.switch_to_int_or_float_strategy.
 unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
-    let Some(values) = list
-        .int_items
-        .as_slice()
-        .iter()
-        .map(|&value| int_or_float_encode_int(value))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
+    let source = list.int_items.as_slice();
+    let mut values = Vec::with_capacity(source.len());
+    for &value in source {
+        let Some(encoded) = int_or_float_encode_int(value) else {
+            return false;
+        };
+        values.push(encoded);
+    }
     list.int_items.install(IntArray::from_vec(values));
     list.strategy = ListStrategy::IntOrFloat;
     true
@@ -1121,15 +1122,14 @@ unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
 
 /// listobject.py FloatListStrategy.switch_to_int_or_float_strategy.
 unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
-    let Some(values) = list
-        .float_items
-        .as_slice()
-        .iter()
-        .map(|&value| int_or_float_encode_float(value))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
+    let source = list.float_items.as_slice();
+    let mut values = Vec::with_capacity(source.len());
+    for &value in source {
+        let Some(encoded) = int_or_float_encode_float(value) else {
+            return false;
+        };
+        values.push(encoded);
+    }
     list.int_items.install(IntArray::from_vec(values));
     list.float_items.install(FloatArray::from_vec(Vec::new()));
     list.strategy = ListStrategy::IntOrFloat;
@@ -1142,9 +1142,11 @@ fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
     for &value in values {
         let _ = crate::gc_roots::pin_root(w_int_new(value));
     }
-    (0..values.len())
-        .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(crate::gc_roots::shadow_stack_get(root_base + i));
+    }
+    items
 }
 
 fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
@@ -1153,9 +1155,11 @@ fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
     for &value in values {
         let _ = crate::gc_roots::pin_root(w_float_new(value));
     }
-    (0..values.len())
-        .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(crate::gc_roots::shadow_stack_get(root_base + i));
+    }
+    items
 }
 
 #[inline]
@@ -1223,9 +1227,7 @@ unsafe fn boxed_from_ascii(obj_slot: usize) -> Vec<PyObjectRef> {
 /// non-numeric element, so its unboxed backing storage is bulk re-boxed into
 /// an Object-strategy items block one time.
 ///
-/// `dont_look_inside`: the transition drives Vec/collect allocation the tracer
-/// cannot model — `boxed_from_ints` / `boxed_from_floats` build a fresh
-/// `Vec<PyObjectRef>` via `.map(...).collect()`, and
+/// `dont_look_inside`: the transition drives bulk backing-storage replacement;
 /// `set_object_items_from_vec` / `IntArray::from_vec` / `FloatArray::from_vec`
 /// tear down the typed storage through raw-Vec construction. Residualize the
 /// whole cold transition via the registered fnaddr so the hot append/setitem

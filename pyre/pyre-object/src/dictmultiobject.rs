@@ -5544,16 +5544,16 @@ pub unsafe fn w_module_dict_values_inner(obj: PyObjectRef) -> Vec<PyObjectRef> {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)> {
-    w_dict_items(obj)
-        .into_iter()
-        .filter_map(|(k, v)| {
-            if crate::is_str(k) {
-                crate::w_str_get_value_opt(k).map(|s| (s.to_string(), v))
-            } else {
-                None
+    let source = w_dict_items(obj);
+    let mut entries = Vec::with_capacity(source.len());
+    for (key, value) in source {
+        if crate::is_str(key) {
+            if let Some(key) = crate::w_str_get_value_opt(key) {
+                entries.push((key.to_string(), value));
             }
-        })
-        .collect()
+        }
+    }
+    entries
 }
 
 /// Iterate over (key_wtf8, value) pairs, preserving lone-surrogate keys.
@@ -5576,16 +5576,14 @@ pub unsafe fn w_dict_str_entries(obj: PyObjectRef) -> Vec<(String, PyObjectRef)>
 pub unsafe fn w_dict_str_entries_wtf8(
     obj: PyObjectRef,
 ) -> Vec<(rustpython_wtf8::Wtf8Buf, PyObjectRef)> {
-    w_dict_items(obj)
-        .into_iter()
-        .filter_map(|(k, v)| {
-            if crate::is_str(k) {
-                Some((crate::w_str_get_wtf8(k).to_owned(), v))
-            } else {
-                None
-            }
-        })
-        .collect()
+    let source = w_dict_items(obj);
+    let mut entries = Vec::with_capacity(source.len());
+    for (key, value) in source {
+        if crate::is_str(key) {
+            entries.push((crate::w_str_get_wtf8(key).to_owned(), value));
+        }
+    }
+    entries
 }
 
 // ____________________________________________________________

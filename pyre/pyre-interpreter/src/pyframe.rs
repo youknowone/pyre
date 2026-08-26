@@ -535,7 +535,10 @@ pub mod frame_locals_proxy {
                     roots.get(pairs_base + index * 2 + 1),
                 ]));
             }
-            let out: Vec<PyObjectRef> = (0..items.len()).map(|i| roots.get(out_base + i)).collect();
+            let mut out = Vec::with_capacity(items.len());
+            for i in 0..items.len() {
+                out.push(roots.get(out_base + i));
+            }
             Ok(pyre_object::w_list_new(out))
         }
 
@@ -647,8 +650,10 @@ pub mod frame_locals_proxy {
             }
             let extra_slot = args_base + nargs;
             let _ = roots.pin_root(extra);
-            let call_args: Vec<PyObjectRef> =
-                (0..nargs).map(|i| roots.get(args_base + i)).collect();
+            let mut call_args = Vec::with_capacity(nargs);
+            for i in 0..nargs {
+                call_args.push(roots.get(args_base + i));
+            }
             let result = crate::baseobjspace::call_method(roots.get(extra_slot), "pop", &call_args);
             if result.is_null() {
                 Err(crate::call::take_call_error()

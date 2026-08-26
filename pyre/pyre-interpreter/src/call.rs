@@ -2026,9 +2026,12 @@ fn call_non_function_callable_with_mode(
         user_call_slot(pyre_object::gc_roots::shadow_stack_get(user_call_root_base))?
     {
         let current_callable = pyre_object::gc_roots::shadow_stack_get(user_call_root_base);
-        let current_args: Vec<PyObjectRef> = (0..args.len())
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(user_call_root_base + 1 + i))
-            .collect();
+        let mut current_args = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            current_args.push(pyre_object::gc_roots::shadow_stack_get(
+                user_call_root_base + 1 + i,
+            ));
+        }
         if prepend_receiver {
             let mut call_args = Vec::with_capacity(1 + current_args.len());
             call_args.push(current_callable);

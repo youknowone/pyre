@@ -1211,7 +1211,11 @@ pub unsafe fn w_set_key_at(
 pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let _set_guard = w_set_lock(obj);
     let s = &*(obj as *const W_SetObject);
-    (*s.items).keys().map(|key| key.obj).collect()
+    let mut items = Vec::with_capacity((*s.items).len());
+    for key in (*s.items).keys() {
+        items.push(key.obj);
+    }
+    items
 }
 
 /// Walk, in place, every element `PyObjectRef` slot of a set for GC root

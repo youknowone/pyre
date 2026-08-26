@@ -696,7 +696,11 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(dict);
             let entries = pyre_object::w_dict_items(source);
-            let flat: Vec<PyObjectRef> = entries.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let mut flat = Vec::with_capacity(entries.len() * 2);
+            for &(key, value) in &entries {
+                flat.push(key);
+                flat.push(value);
+            }
             let pair_base = pyre_object::gc_roots::pin_roots(&flat);
             for index in 0..entries.len() {
                 pyre_object::w_dict_store(
