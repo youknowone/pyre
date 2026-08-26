@@ -164,10 +164,12 @@ impl CodeWriter {
         // `"not registered in CallRegistry"`).  Unknown errors
         // panic immediately so parity bugs surface here rather than
         // silently shifting downstream behind a Skip mask.
-        // Metadata-only stubs for `unsafe fn` callees that
-        // `populate_call_registry_from_call_graphs` could not see
-        // (`build_flow.rs:215` rejects unsafe bodies, so they never enter
-        // `callcontrol.function_graphs()`).  The specs are registered
+        // Metadata-only stubs for the call-site spellings
+        // `populate_call_registry_from_call_graphs` does not register: a
+        // stub key is the crate-included `name_path()` verbatim, where the
+        // `function_graphs` pass keys on the crate-stripped
+        // `{module_path, name}` plus its alias fan-out (see
+        // `CallControl::unsafe_fn_stubs`).  The specs are registered
         // INSIDE populate, between its Pass 1 (alias explosion) and Pass 2
         // (callee lift), so a safe-fn body lifted in Pass 2 that references
         // an unsafe callee (`is_cell`, `is_exception`, …) resolves it

@@ -16087,16 +16087,15 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// `(path-segments, Signature, FUNC.RESULT token)` for every local `unsafe
 /// fn` / unsafe impl-method whose return type projects to a token
 /// [`crate::translator::rtyper::cutover::residual_return_shell`] can model.
-/// These callees cannot lower their bodies (raw-pointer access the
-/// flowspace adapter does not model), but downstream
-/// `OpKind::Call::FunctionPath` sites still need their signature
-/// registered so the dual gate does not Skip with "not registered in
-/// CallRegistry".
+/// Being `unsafe` does not hold a body back from lowering — no gate reads
+/// `signature.is_unsafe` outside this collector.  What an unsafe callee is
+/// missing is a registry key under the spelling its
+/// `OpKind::Call::FunctionPath` sites emit; without one the dual gate Skips
+/// with "not registered in CallRegistry".
 ///
-/// An `unsafe fn` is never lowered, so it never enters
-/// `CallControl::function_graphs` and its call sites already residualize
-/// whether or not it is registered here — registration changes only
-/// whether the *caller* can annotate past the call.  That is why the
+/// A stub supplies that key and nothing else: the entry's graph is a
+/// one-link return shell carrying the declared result, so what registration
+/// changes is whether the *caller* can annotate past the call.  That is why the
 /// result token is projected through the same
 /// [`dont_look_inside_return_token`] the `@jit.dont_look_inside` residual
 /// path uses: both describe one residual boundary's declared result, and

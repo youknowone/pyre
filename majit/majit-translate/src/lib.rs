@@ -1116,10 +1116,9 @@ fn analyze_pipeline_from_module_paths(
     // `dual_gate_registry` register every `unsafe fn` / unsafe
     // impl-method as a stub-pygraph entry in CallRegistry, covering
     // the bulk of the "not registered in CallRegistry" Skip cluster
-    // dominated by `pyre_object::is_*` predicates whose body lowering is
-    // intentionally rejected (raw-pointer access the flowspace adapter
-    // does not model — only a typed signature stub is registered).
-    // Sourced from Charon via
+    // dominated by `pyre_object::is_*` predicates.  What a stub adds is the
+    // registry key those call sites spell, not a body the lowering refused
+    // — see `CallControl::unsafe_fn_stubs`.  Sourced from Charon via
     // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();

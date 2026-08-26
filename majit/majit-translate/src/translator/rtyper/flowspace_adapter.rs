@@ -485,11 +485,10 @@ fn normalize_unary_op_name(source_name: &str) -> Result<String, TyperError> {
         // `operation.py add_operator('bool', 1, ..)` and emitted
         // by `flowcontext.py UNARY_NOT` /
         // `:766-777 JUMP_IF_*_OR_POP` as the discriminator before a
-        // `guessbool` fork.  Pyre's frontend emits
-        // `OpKind::UnaryOp { op: "bool", .. }` from the `&&` / `||`
-        // short-circuit desugar,
-        // mirroring `build_flow.rs` `lower_short_circuit`.
-        // Pass through unchanged.
+        // `guessbool` fork.  Pyre emits it from
+        // `model::FunctionGraph::set_branch`, which wraps every branch
+        // condition in `OpKind::UnaryOp { op: "bool", .. }` before
+        // installing it as the exitswitch.  Pass through unchanged.
         "bool" => Ok("bool".to_string()),
         // `invert` — PyPy `add_operator('invert', 1, .., pure=True)` at
         // `operation.py:474`, emitted by `flowcontext.py:188-191

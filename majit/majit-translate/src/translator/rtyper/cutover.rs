@@ -2017,11 +2017,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // fail nor what each computes — only the attribution determinism.
     pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
     // Register `unsafe fn` stubs between Pass 1 (alias explosion) and
-    // Pass 2 (callee lift).  `build_flow.rs:215` rejects unsafe bodies so
-    // they never enter `function_graphs`; without a stub a safe-fn body
-    // lifted in Pass 2 that calls an unsafe callee (`is_cell`,
-    // `is_exception`, …) records a "not registered" lift error and the
-    // caller Skips.  Seeding here — not before Pass 1 — keeps Pass 1's
+    // Pass 2 (callee lift).  A stub carries the crate-included
+    // `name_path()` spelling that the pass above does not register; without
+    // it a safe-fn body lifted in Pass 2 that calls an unsafe callee
+    // (`is_cell`, `is_exception`, …) records a "not registered" lift error
+    // and the caller Skips.  Seeding here — not before Pass 1 — keeps Pass 1's
     // `registry.alias()` invariant ("alias key already a canonical entry")
     // intact: the alias explosion has already landed, and neither Pass 2
     // (lift) nor Pass 3 (class-member binding) calls `alias()`, so a
@@ -2570,33 +2570,27 @@ fn declared_funcptr_type_from_legacy(
 /// upstream "not registered" Skip path then absorbs that specific fn
 /// while the rest of the batch lands.
 ///
-/// Mirrors `populate_call_registry_from_call_graphs`'s
-/// "register and prefill" contract (`cutover.rs:856-875`) but feeds
-/// from the LLBC-sourced stub-spec list (`collect_unsafe_fn_stubs_from_llbc`)
-/// instead of pyre's
-/// `function_graphs: HashMap<CallPath, LegacyGraph>` (which excludes
-/// unsafe fns by validate_signature rejection).
+/// Mirrors `populate_call_registry_from_call_graphs`'s "register and
+/// prefill" contract but feeds from `collect_unsafe_fn_stubs_from_llbc`
+/// rather than from the `function_graphs` `GraphStore`.  The two key
+/// differently, so both can hold the same fn; `CallControl::unsafe_fn_stubs`
+/// carries the measured split.
 ///
 /// **Annotator-only carrier — never reaches the codewriter.**
 /// The stub graph carries a single return link holding a pre-annotated
 /// Variable, suitable for `RPythonAnnotator` return-type inference via
-/// `cachedgraph` (see `call_registry::prefill_default_cache`).
-/// Because `CallControl::function_graphs` is populated exclusively
-/// by lowered safe-fn bodies (unsafe fns never produce a flow graph —
-/// they only get a metadata-only stub key), the unsafe stub key
-/// is never present in `function_graphs`.  `CallControl::
-/// find_all_graphs` walks `function_graphs.keys()` only and resolves
-/// each call target via `target_to_path_and_graph`
-/// (`codewriter/call.rs:2601`) which returns `None` for any
-/// path absent from `function_graphs` — so an unsafe-stub target
-/// triggers `continue` and is never added to `candidate_graphs`,
-/// never reaches `transform_graph_to_jitcode`, and never compiles
-/// into executable JITCode.  The actual unsafe-fn body executes
-/// through the residual-call / direct-call fnaddr lowering that
-/// the codewriter emits for the call op whose target resolves
-/// to the host-evaluator entry point.  The synthetic return shell is
-/// safe by virtue of the `function_graphs` gate, not by any
-/// `look_inside_graph` policy on the stub itself.
+/// `cachedgraph` (see `call_registry::prefill_default_cache`).  It
+/// cannot become a compile candidate because it never lands in the
+/// container the codewriter reads: `build_stub_pygraph_with_result_shell`
+/// builds a `flowspace::model::FunctionGraph`, which
+/// `PyreFunctionEntry::prefill_default_cache` parks in the entry's
+/// `FunctionDesc.cache`, while `CallControl::find_all_graphs` and
+/// `CallControl::target_to_path_and_graph` resolve candidates out of
+/// `function_graphs` and hand `CodeWriter::transform_graph_to_jitcode` a
+/// `crate::model::FunctionGraph`.  Nothing on this path can put a stub
+/// there: this function takes only `&CallRegistry`, its caller holds
+/// `function_graphs` by shared reference, and `GraphStore::insert` needs
+/// `&mut self`.
 pub(crate) fn register_unsafe_fn_stubs(
     registry: &CallRegistry,
     specs: &[(Vec<String>, Signature, Option<String>)],
