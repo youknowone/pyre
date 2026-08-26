@@ -2958,15 +2958,20 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
         }
         if is_exact_type(obj, &pyre_object::bytesobject::BYTES_TYPE) {
             // `W_AbstractBytesObject.immutable_unique_id`
-            // (bytesobject.py): `len(s) > 1` is address-based
-            // (`compute_unique_id(s)`) so returning `None` falls back to the
-            // object address (invariant-preserving — distinct `bytes` never
-            // share storage). `len(s) <= 1` is unique-ified:
-            // `base = ord(s[0])` (0..255) for one byte, `base = 256` for the
-            // empty bytes, `uid = (base << IDTAG_SHIFT) | IDTAG_SPECIAL`.
+            // (bytesobject.py): `len(s) > 1` is `compute_unique_id(s)` — the
+            // id of the STORAGE, which is what `is_w` compares at that length.
+            // BytesListStrategy re-wraps one erased rpython string, so the
+            // wrapper address would answer a fresh value per read and make
+            // `id(a) == id(b)` disagree with `a is b`. `len(s) <= 1` is
+            // unique-ified: `base = ord(s[0])` (0..255) for one byte,
+            // `base = 256` for the empty bytes,
+            // `uid = (base << IDTAG_SHIFT) | IDTAG_SPECIAL`.
             let len = pyre_object::bytesobject::w_bytes_len(obj);
             if len > 1 {
-                return None;
+                let block = pyre_object::bytesobject::w_bytes_block(obj);
+                return Some(pyre_object::intobject::w_int_new(
+                    pyre_object::gc_hook::gc_identity_hash(block as usize) as i64,
+                ));
             }
             let base: i64 = if len == 1 {
                 pyre_object::bytesobject::w_bytes_getitem(obj, 0) as i64

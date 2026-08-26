@@ -116,6 +116,12 @@ pub struct W_Pickler {
 /// `gc_identity_hash` to the list positions sharing that hash, resolved by
 /// pointer identity against a freshly-read list element.  The memo index
 /// (the PUT/GET argument) is the object's position in that list.
+///
+/// That list must carry the Object strategy: an unboxing strategy keeps the
+/// payload rather than the reference and wraps a fresh object per read, which
+/// the pointer-identity resolution below reads as a different object.  A memo
+/// whose entries were all `bytes` then missed on every lookup and wrote the
+/// object again where CPython emits a GET.
 struct PickleCtx {
     proto: i64,
     bin: bool,
@@ -446,7 +452,7 @@ impl W_Pickler {
             framing: false,
             fix_imports: true,
             buffer_callback: pyre_object::w_none(),
-            w_memo: pyre_object::listobject::w_list_new(Vec::new()),
+            w_memo: pyre_object::listobject::w_list_new_empty(),
             fast: 0,
             w_dispatch_table: pyre_object::PY_NULL,
             w_pers_func: pyre_object::PY_NULL,
@@ -506,7 +512,7 @@ impl W_Pickler {
         let fix_imports = crate::baseobjspace::is_true(pyre_object::gc_roots::shadow_stack_get(
             fix_imports_slot,
         ))?;
-        let memo = pyre_object::listobject::w_list_new(Vec::new());
+        let memo = pyre_object::listobject::w_list_new_empty();
         let current = cur_pickler(self_slot);
         current.w_file = pyre_object::gc_roots::shadow_stack_get(file_slot);
         current.w_write = pyre_object::gc_roots::shadow_stack_get(write_slot);
@@ -534,7 +540,7 @@ impl W_Pickler {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let empty = pyre_object::listobject::w_list_new(Vec::new());
+        let empty = pyre_object::listobject::w_list_new_empty();
         let me = cur_pickler(slot);
         me.w_memo = empty;
         pickler_write_barrier(me as *mut W_Pickler as PyObjectRef);
@@ -954,7 +960,7 @@ mod memo_proxy {
             let _roots = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(w_pickler);
             let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            let empty = pyre_object::listobject::w_list_new(Vec::new());
+            let empty = pyre_object::listobject::w_list_new_empty();
             let p =
                 unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(slot) as *mut W_Pickler) };
             p.w_memo = empty;
@@ -2176,12 +2182,18 @@ fn save_raw_bytearray(buf: &mut Framer, data: &[u8]) -> Result<(), PyError> {
 }
 
 /// Build a Python `list` from `items` and pin it in the shadow stack,
-/// returning its slot.  `w_list_new` pins each element across its own
+/// returning its slot.  `w_list_new_object` pins each element across its own
 /// allocation, so the snapshot is captured safely; thereafter the GC walks
 /// the list and rewrites its entries, so `pinned_get` reads the relocated
 /// element even after the recursive `save` calls below trigger collections.
+///
+/// The Object strategy is what makes `pinned_get` answer the SAME object it
+/// was handed: an unboxing strategy stores the payload and wraps a fresh
+/// object per read, and `memo_get` resolves its hash bucket by pointer
+/// identity, so a container of unboxable elements would miss the memo and
+/// write each element again instead of a GET.
 fn pin_items(items: Vec<PyObjectRef>) -> usize {
-    let w_list = pyre_object::listobject::w_list_new(items);
+    let w_list = pyre_object::listobject::w_list_new_object(items);
     let _ = pyre_object::gc_roots::pin_root(w_list);
     pyre_object::gc_roots::shadow_stack_len() - 1
 }
