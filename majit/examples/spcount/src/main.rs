@@ -489,9 +489,9 @@ mod tests {
         // is also a failure — the prompt to re-measure `ops_after` above.
         embed::assert_degraded_dispatch_arms("StackState", &["PUSHARG"]);
 
-        // The CAUSE, which the name set above cannot see: the comment on the
-        // name pin says PUSHARG degrades because the lowerer cannot express the
-        // store of a loop-external input. That was prose; these assert it.
+        // The CAUSE, which the name set above cannot see. The name pin records
+        // that PUSHARG degrades because the lowerer cannot express the store of
+        // a loop-external input; this asserts that reason rather than the name.
         // `RefusalKind::Unclassified` here means majit grew a refusal family the
         // classifier does not know — add it there, do not re-record this pin.
         embed::assert_degraded_dispatch_arm_causes(

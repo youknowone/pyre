@@ -198,8 +198,8 @@ pub fn majit_uint_le(a: i64, b: i64) -> i64 {
 /// Unsigned `/` over the int bank — `rint.py` `ll_uint_py_div`.
 ///
 /// This lowers to the `int.udiv` oopspec residual call rather than to a trace
-/// opcode: `UINT_FLOORDIV` was removed from the resop set, and unsigned
-/// division routes through that elidable call instead.
+/// opcode: the resop set carries no `UINT_FLOORDIV`, so unsigned division
+/// routes through that elidable call.
 ///
 /// The caller must guarantee `b != 0`, exactly the precondition
 /// `ll_uint_py_div_zer` wraps: this body divides unconditionally and the

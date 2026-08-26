@@ -346,13 +346,12 @@ pub fn host_registry_dispatch_optional(reg: &HostRegistry, x: i64) -> i64 {
 // front end can collapse to its inner bank (`tyref_transparent_inner_value_type`,
 // `tyref_is_fieldless_enum_free`).
 //
-// That question is now answered, in the negative: the fallback bank is
-// `ValueType::Ref(None)`, the `Vec` leg ships no `array_type_id`, and
-// `arraydescrof_concrete` therefore hands the read a one-word `item_size`.
-// The index spelling is UNSOUND over this element type — see
-// `an_aggregate_element_array_read_is_given_a_one_word_item_size` in
+// The fallback bank is `ValueType::Ref(None)`, the `Vec` leg ships no
+// `array_type_id`, and `arraydescrof_concrete` therefore hands the read a
+// one-word `item_size`. The index spelling is UNSOUND over this element type —
+// see `an_aggregate_element_array_read_is_given_a_one_word_item_size` in
 // `majit-translate/tests/test_mir_frontend.rs` for the full chain. These four
-// functions stay as they are because they are what witnesses it.
+// functions are what witnesses it.
 pub enum SlotValue {
     Int(i64),
     Object(*const ObjectHeader),

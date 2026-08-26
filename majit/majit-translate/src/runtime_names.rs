@@ -53,15 +53,14 @@
 //! itself; its `gates_read_by` says outright that a gate held in a Rust const
 //! does not count as live. Routing one through a constant here would not
 //! rename anything — it would drop the gate out of the completeness check
-//! while leaving it live, the same silent direction the shim names moved here
-//! to escape.
+//! while leaving it live — the same silent direction the shim names in this
+//! module exist to escape.
 //!
-//! Rust item names are not on that list because they are no longer this
-//! crate's to police. `scripts/check-majit-boundary.py` rejects a
-//! `pyre`-spelled identifier or path component anywhere under `majit/`, which
-//! is a check rather than a convention — the jitcode keys this module once
-//! argued to leave alone were renamed `*_ext/P` on both sides of the wire
-//! format under it.
+//! Rust item names are not on that list because this crate does not police
+//! them: `scripts/check-majit-boundary.py` rejects a `pyre`-spelled identifier
+//! or path component anywhere under `majit/`. That is a check rather than a
+//! convention, and it reaches further than this module could — the jitcode keys
+//! are spelled `*_ext/P` on both sides of the wire format because of it.
 
 /// LLBC artefacts the fixtures load.
 ///

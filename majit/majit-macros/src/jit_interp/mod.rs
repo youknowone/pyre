@@ -1801,14 +1801,13 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
 /// interpreter files under, for a caller OUTSIDE the mainloop.
 ///
 /// A door that wants to ask whether some position is already compiled has to
-/// name that position the way the merge point names it, and until this existed
-/// the only way to do that was to write the layout out again by hand: seed,
-/// one `green_uhash_step` per slot, in the order `[target, ..greens]` with the
-/// pc substituted into the greens. `majit_ir::pypyjit_greenkey` is the same
-/// function hard-coded for one consumer's three greens, and its own
-/// documentation says why open-coding it is a hazard — "a swapped slot still
-/// hashes to something, just not to the same cell". A second consumer with a
-/// different green list could not use it and wrote the layout out again.
+/// name that position the way the merge point names it. Without this builder
+/// the door has to write the layout out by hand: seed, one `green_uhash_step`
+/// per slot, in the order `[target, ..greens]` with the pc substituted into the
+/// greens. `majit_ir::pypyjit_greenkey` is the same function hard-coded for one
+/// consumer's three greens, so a consumer with a different green list cannot
+/// reach it; its own documentation says why open-coding the layout is a hazard
+/// — "a swapped slot still hashes to something, just not to the same cell".
 ///
 /// The failure is silent and total: the door files under a key nothing else
 /// can name, so its probe answers no forever and the artifact it was guarding

@@ -138,11 +138,11 @@ fn mainloop(program: &Code, num_regs: usize, threshold: u32) -> i64 {
                 state.ret = state.regs[r];
                 return state.ret;
             }
-            // Was `_ => break` with the panic below the loop. The loop now has a
-            // second way out — the merge point's own `break` on a walk that
-            // reached a terminal return — so falling out of it no longer
-            // identifies a bad opcode, and the panic moves into the arm that
-            // actually saw one.
+            // The panic sits in the arm rather than below the loop. The loop
+            // has two ways out — this dispatch and the merge point's own
+            // `break` on a walk that reached a terminal return — so falling out
+            // of it does not identify a bad opcode; only reaching this arm
+            // does.
             _ => panic!("fell off end of code"),
         }
     }
@@ -513,9 +513,8 @@ fn time_ns<F: Fn() -> i64>(n: i64, f: F) -> f64 {
 /// cannot see the unroll stop happening — which is the property these two
 /// regimes exist to compare.
 ///
-/// The `pass-rate` line moved here from below the timing loop with it: it
-/// reports the gate's own `on`, and is now printed before the timing rather than
-/// after.
+/// The `pass-rate` line reports the gate's own `on` run, so it is printed here,
+/// before the timing loop rather than after it.
 fn gate_regime(name: &str, prog: &[i64], n: i64, expect_compiles: usize) {
     COMPILES.store(0, Ordering::Relaxed);
     let clean = clean_interp(prog, NUM_REGS);

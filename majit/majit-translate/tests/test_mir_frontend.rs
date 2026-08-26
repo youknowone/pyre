@@ -1273,32 +1273,31 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
     shape
 }
 
-/// The closure of the defect this pair was written to witness. `&v[i]` on a
-/// `Vec<T>` whose `T` is a multi-word by-value ADT stored inline used to lower
-/// to an `ArrayRead` whose descr strides by **one word**: every index > 0
-/// addressed the wrong element, and even index 0 loaded the element's first
-/// word — whichever of the tag or a payload field `repr(Rust)` put there — and
-/// banked it as a GC reference.
+/// `&v[i]` on a `Vec<T>` whose `T` is a multi-word by-value ADT stored inline
+/// declines rather than lowering to an `ArrayRead`. An `ArrayRead` here would
+/// carry a descr that strides by **one word**: every index > 0 would address
+/// the wrong element, and even index 0 would load the element's first word —
+/// whichever of the tag or a payload field `repr(Rust)` puts there — and bank
+/// it as a GC reference.
 ///
-/// `front::mir`'s index arm now declines that element instead of emitting the
-/// read. It admits only an element whose true width reaches the descr, by one
-/// of two proofs: an ARRAY identity minted from the receiver spelling
-/// (`narrow_item_array_type_id`, the narrow-int case), or an addressable
-/// element — a scalar naming its own spelling, or a thin pointer, which IS the
-/// one target word the identity-less descr assumes. A multi-word ADT answers
-/// neither, so the call stays residual and real Rust computes the element
-/// address at the real `size_of::<SlotValue>()` stride.
+/// `front::mir`'s index arm admits only an element whose true width reaches the
+/// descr, by one of two proofs: an ARRAY identity minted from the receiver
+/// spelling (`narrow_item_array_type_id`, the narrow-int case), or an
+/// addressable element — a scalar naming its own spelling, or a thin pointer,
+/// which IS the one target word the identity-less descr assumes. A multi-word
+/// ADT answers neither, so the call stays residual and real Rust computes the
+/// element address at the real `size_of::<SlotValue>()` stride.
 ///
-/// The descr behind the declined shape is still minted below, from the key the
-/// leg would have carried. It is unchanged and still one word wide; that is
-/// the whole reason the decline is required, and asserting it is what keeps
-/// the two facts tied together.
+/// The descr behind the declined shape is minted below, from the key the leg
+/// would have carried, and asserted to be one word wide. That width is the
+/// whole reason the decline is required, so asserting it keeps the two facts
+/// tied together.
 ///
-/// `aggregate_slot_get` remains the control. Both spellings are now residual,
-/// so the pair no longer separates a lowered read from a residual one — what
-/// it separates is *which* call survives, and the sibling
-/// `a_scalar_element_indexes_to_an_int_banked_array_read` supplies the
-/// positive case where the index arm still emits its `ArrayRead`.
+/// `aggregate_slot_get` is the control. Both spellings are residual, so the
+/// pair separates *which* call survives rather than a lowered read from a
+/// residual one; the sibling
+/// `a_scalar_element_indexes_to_an_int_banked_array_read` supplies the positive
+/// case where the index arm does emit its `ArrayRead`.
 #[test]
 fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
     use majit_translate::model::ValueType;
@@ -1392,9 +1391,8 @@ fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
          ref bank",
     );
 
-    // The control. It was already residual before the index arm gained its
-    // width proof, and it is unchanged — so the safe lowering the pair named
-    // is now what both spellings get.
+    // The control: the `get` spelling is residual independently of the index
+    // arm's width proof, so it pins the same safe lowering from the other side.
     let got = slot_read_shape("aggregate_slot_get");
     assert_eq!(
         got.residual_gets, 1,

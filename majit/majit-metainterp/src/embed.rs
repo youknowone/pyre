@@ -200,9 +200,10 @@ impl Census {
     /// The six hooks are `set_on_compile_loop`, `set_on_compile_bridge`,
     /// `set_on_guard_failure`, `set_on_trace_abort`, `set_on_compiled_entry`
     /// and `set_on_internal_compile_panic`. Each holds ONE
-    /// closure, so this replaces whatever was installed before it; an embedder
-    /// that was recording the compiled body's shape by hand reads
-    /// [`CensusCounts::last_loop_body_shape`] instead of installing its own.
+    /// closure, so this replaces whatever was installed before it. An embedder
+    /// that needs the compiled body's shape reads
+    /// [`CensusCounts::last_loop_body_shape`] rather than installing its own
+    /// `set_on_compile_loop`, which this would then displace.
     ///
     /// Install it on every driver whose activity should be counted — the
     /// counters are shared, the callbacks are not.

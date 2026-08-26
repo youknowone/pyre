@@ -3,14 +3,12 @@
 //! Loads, arithmetic, index updates, and branches use separate opcodes so the
 //! interpreter and generated JIT execute the same dispatch structure.
 //!
-//! The per-op structure is deliberate, and this probe has already been fooled
-//! once without it. An earlier version fused raw_load+add+i++ into a single
-//! opcode, which left the clean interpreter a one-op, memory-bandwidth-bound
-//! loop with no dispatch for the JIT to remove; the JIT then read 0.62x, a
-//! loss. That figure measured the kernel rather than the float JIT, and
-//! re-fusing these opcodes reproduces it. The shape kept here is the `column`
-//! probe's: a clean interpreter that pays real dispatch cost, so a win is
-//! attributable to compilation.
+//! The per-op structure is what makes the figure attributable. Fusing
+//! raw_load+add+i++ into a single opcode leaves the clean interpreter a one-op,
+//! memory-bandwidth-bound loop with no dispatch for the JIT to remove, and the
+//! JIT then reads 0.62x — a loss that describes the kernel rather than the
+//! float JIT. The shape here is the `column` probe's: a clean interpreter that
+//! pays real dispatch cost, so a win is attributable to compilation.
 //!
 //! Addressing (i, n, base_a, base_b) lives in SCALAR int state fields; values
 //! (column reads, accumulator) live in a `[float; virt]` register bank. Three

@@ -233,11 +233,10 @@ pub fn record_named(gate: &'static str, reason: &'static str, subject: &str) {
 /// Record one decline that already carries a formatted reason string,
 /// against a named subject.
 ///
-/// `class` is the bounded count key; `reason` is the gate's own message,
-/// which is printed at [`Level::Counters`] — unconditionally, i.e. without
-/// consulting whatever narrower switch the gate's own logging used to sit
-/// behind.  Use this only for per-graph gates: it formats on every call
-/// once the census is on.
+/// `class` is the bounded count key; `reason` is the gate's own message, which
+/// is printed at [`Level::Counters`] — unconditionally, i.e. without consulting
+/// any narrower switch the gate's own logging sits behind. Use this only for
+/// per-graph gates: it formats on every call once the census is on.
 #[inline]
 pub fn record_reason(gate: &'static str, class: &'static str, reason: &str, subject: &str) {
     let level = level();

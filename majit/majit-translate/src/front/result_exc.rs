@@ -1225,12 +1225,11 @@ fn rewire_one_call_site(
         match try_fuse_drain_match(graph, a, r) {
             Ok(()) => return Ok(SiteOutcome::Fused),
             Err(msg) => {
-                // The one refusal in this file that discards a fully
-                // formed reason string: `is_ok()` threw the message away,
-                // so a site that ALMOST matched the drain shape and a site
-                // that never resembled it produced identical evidence —
-                // none.  The fail-safe fallthrough to `catch_and_rewrap` is
-                // deliberate and unchanged; only the reason is now kept.
+                // The fusion's reason string, which reaches the census rather
+                // than being dropped by `is_ok()`. Without it a site that ALMOST
+                // matched the drain shape and a site that never resembled it
+                // leave identical evidence — none. The fallthrough to
+                // `catch_and_rewrap` below is the fail-safe either way.
                 crate::decline::record_reason(
                     RESULT_EXC_CALLER_GATE,
                     "drain-match-fusion-declined",

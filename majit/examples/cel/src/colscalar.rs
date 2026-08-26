@@ -127,11 +127,11 @@ fn mainloop(program: &Code, num_regs: usize, col_base: i64, threshold: u32) -> i
                 state.ret = state.regs[r];
                 return state.ret;
             }
-            // Was `_ => break` with the panic below the loop. The loop now has a
-            // second way out — the merge point's own `break` on a walk that
-            // reached a terminal return — so falling out of it no longer
-            // identifies a bad opcode, and the panic moves into the arm that
-            // actually saw one.
+            // The panic sits in the arm rather than below the loop. The loop
+            // has two ways out — this dispatch and the merge point's own
+            // `break` on a walk that reached a terminal return — so falling out
+            // of it does not identify a bad opcode; only reaching this arm
+            // does.
             _ => panic!("fell off end of code"),
         }
     }
