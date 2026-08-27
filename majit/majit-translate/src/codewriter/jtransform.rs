@@ -4243,6 +4243,27 @@ impl<'a> Transformer<'a> {
 
         // jtransform.py:487-511 — oopspec dispatch by prefix.
         if let Some(base) = user_oopspec.as_deref() {
+            // jtransform.py:495-496 — `virtual_ref*` → `_handle_virtual_ref_call`,
+            // whose whole body is
+            // `return SpaceOperation(oopspec_name, list(args), op.result)`:
+            // the call becomes the `virtual_ref` / `virtual_ref_finish`
+            // OPERATION, so it carries no calldescr and therefore no
+            // `oopspecindex` at all.
+            //
+            // majit-translate has no `OpKind` for either opname and no
+            // `insns.rs` byte to assemble one, so the port stops here instead
+            // of continuing down the call path. It used to fall through to
+            // `map_user_oopspec_to_index`, which answered
+            // `JitForceVirtualizable` — the one index whose
+            // `optimizeopt/virtualize.rs` `CALL_N` arm removes the call
+            // unconditionally, whatever `is_virtual` says. Nothing registers
+            // this oopspec today, so the wrong answer was unreachable rather
+            // than wrong on a live trace.
+            if base.starts_with("virtual_ref") {
+                unimplemented!(
+                    "_handle_virtual_ref_call: {base:?} has no OpKind (jtransform.py:495)"
+                );
+            }
             // jtransform.py:497 — jit.* oopspecs → __handle_jit_call
             if base.starts_with("jit.") {
                 // `jit.not_in_trace` discards the decoded args (see
@@ -7858,8 +7879,10 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
     let base = spec.split('(').next().unwrap_or(spec).trim();
     match base {
         // All jit.* oopspecs are intercepted by _handle_jit_call() before
-        // reaching this function. Remaining oopspecs map to OS_* indices.
-        "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
+        // reaching this function, and `virtual_ref*` by the
+        // `_handle_virtual_ref_call` arm beside it — upstream gives those two
+        // no `oopspecindex`, because it turns them into operations rather than
+        // calls. Remaining oopspecs map to OS_* indices.
         "raw_free" => OopSpecIndex::RawFree,
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
