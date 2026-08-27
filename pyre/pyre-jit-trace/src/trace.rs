@@ -1092,6 +1092,33 @@ fn try_commit_midbody_abort_inner(
     }
 }
 
+/// Whether `code` carries a backward jump — the loop a reconstructed callee
+/// can reach.
+///
+/// `drive_bridge_carrier_walk` keeps its sub-walk only on a clean
+/// `SubReturn`; every other outcome falls through to the journal-rollback tail,
+/// which hands the guard back to a resume from `rd_numb`.  By then the sub-walk
+/// has concrete-executed the callee's residual calls — a `STORE_ATTR` runs
+/// through a residual helper, outside the store journal's reach — so the
+/// replayed region reads fields it has already written.  A callee that reaches
+/// its own loop header while a compiled token exists for it surfaces
+/// `SubLoopCalleeCallAssembler`, one such outcome, and that is only decidable
+/// after the prologue has run.  Decide on the code instead and decline before
+/// driving anything: the effect odometer has not moved at that point, so the
+/// rollback the decline falls into is sound.  The test is a superset — a loop
+/// whose header has no compiled token would have walked through — so it costs
+/// bridges rather than answers.
+fn code_has_backward_jump(code: &pyre_interpreter::CodeObject) -> bool {
+    use pyre_interpreter::Instruction as I;
+    let mut arg_state = pyre_interpreter::OpArgState::default();
+    code.instructions.iter().copied().any(|unit| {
+        matches!(
+            arg_state.get(unit).0,
+            I::JumpBackward { .. } | I::JumpBackwardNoInterrupt { .. }
+        )
+    })
+}
+
 fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -1866,6 +1893,16 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
         return p2_drain_abort();
     };
+    // Before anything runs in the callee: a loop-bearing one can stop the
+    // sub-walk at an outcome this drain does not keep, and the rollback that
+    // follows does not reach what the sub-walk has already executed by then.
+    // See `code_has_backward_jump`.
+    let raw_callee_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
+    if raw_callee_code.is_null() || code_has_backward_jump(unsafe { &*raw_callee_code }) {
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        crate::jitcode_dispatch::census_record("P2Drain::LoopBearingCallee");
+        return p2_drain_abort();
+    }
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
     // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
