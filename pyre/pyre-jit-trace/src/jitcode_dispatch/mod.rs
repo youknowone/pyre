@@ -12532,15 +12532,45 @@ fn handle<Sym: WalkSym>(
             // loop against the caller's frame — publishing the header pc over the
             // caller's post-loop operand stack, which `FOR_ITER` then advances as
             // if it were the iterator (`loop_callee_for_header_resume`).
-            let callee_code = (!ctx.is_top_level)
-                .then(|| {
+            //
+            // A transparent helper walk is NOT such a portal frame: it is a
+            // Rust helper body descended into, and `framestack.last()` there
+            // describes the helper's own entry (or, for a root helper walk that
+            // pushes none, an unrelated caller). The arm is reachable from one:
+            // `_unpackiterable_unknown_length` is a second jit driver and the
+            // only helper jitcode in the build that carries a
+            // `jit_merge_point` -- 2 of 2939 do, and the other is the portal
+            // `eval_loop_jit` itself. So exclude it explicitly rather than
+            // relying on the token lookup to miss.
+            //
+            // No corpus program reaches the arm this way today: over the 491
+            // synthetic fixtures the print below never fires while its control
+            // in `inline_call.rs` does, on one fixture and one helper. The
+            // exclusion is the invariant, not a repair of an observed answer.
+            if fbw_debug_abort_enabled() && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+            {
+                eprintln!(
+                    "[fbw-mergepoint-in-helper] jitcode_index={:?} is_top_level={} \
+                     framestack_top_w_code={:?}",
+                    ctx.fbw_mode.transparent_helper_jitcode_index,
+                    ctx.is_top_level,
                     ctx.session
                         .borrow()
                         .framestack
                         .last()
-                        .map(|frame| frame.w_code)
-                })
-                .flatten();
+                        .map(|frame| frame.w_code),
+                );
+            }
+            let callee_code = (!ctx.is_top_level
+                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
+            .then(|| {
+                ctx.session
+                    .borrow()
+                    .framestack
+                    .last()
+                    .map(|frame| frame.w_code)
+            })
+            .flatten();
             if let Some(callee_code) = callee_code {
                 let callee_key = crate::driver::make_green_key(
                     callee_code as *const (),
