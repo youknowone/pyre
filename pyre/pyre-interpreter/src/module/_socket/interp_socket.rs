@@ -1739,12 +1739,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "if_indextoname",
                 |args| {
-                    if args.is_empty() || !unsafe { pyre_object::is_int(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "if_indextoname: index must be an integer",
-                        ));
+                    // PyPy `if_indextoname` receives an unsigned interface
+                    // index through its gateway.  CPython 3.14 exposes the
+                    // negative leaf as ValueError (`testInvalidInterfaceIndexToName`),
+                    // while PyPy spells it OverflowError; the public 3.14
+                    // result governs this conversion, with the same unsigned
+                    // storage owner as PyPy.
+                    let w_index = crate::baseobjspace::space_index(args[0])?;
+                    let index = crate::builtins::space_index_w(w_index)?;
+                    if index < 0 {
+                        return Err(crate::PyError::value_error("Cannot convert negative int"));
                     }
-                    let idx = unsafe { pyre_object::w_int_get_value(args[0]) } as libc::c_uint;
+                    let idx = libc::c_uint::try_from(index).map_err(|_| {
+                        crate::PyError::overflow_error(
+                            "Python int too large for C unsigned int",
+                        )
+                    })?;
                     let mut buf = [0u8; libc::IF_NAMESIZE];
                     let p =
                         unsafe { libc::if_indextoname(idx, buf.as_mut_ptr() as *mut libc::c_char) };
@@ -1845,19 +1855,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "CMSG_SPACE",
                 |args| {
-                    if args.is_empty() || !unsafe { pyre_object::is_int(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "CMSG_SPACE: size must be an integer",
-                        ));
-                    }
-                    let raw = unsafe { pyre_object::w_int_get_value(args[0]) };
-                    if raw < 0 {
+                    let raw = crate::builtins::space_index_w(
+                        crate::baseobjspace::space_index(args[0])?,
+                    )?;
+                    let max_payload = i64::from(libc::c_int::MAX)
+                        - i64::from(unsafe { libc::CMSG_SPACE(1) });
+                    if raw < 0 || raw > max_payload {
                         return Err(crate::PyError::overflow_error(
                             "CMSG_SPACE() argument out of range",
                         ));
                     }
                     let n = unsafe { libc::CMSG_SPACE(raw as libc::c_uint) };
-                    if n == 0 {
+                    if n == 0 || u64::from(n) > libc::c_int::MAX as u64 {
                         return Err(crate::PyError::overflow_error(
                             "CMSG_SPACE() argument out of range",
                         ));
@@ -1873,19 +1882,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "CMSG_LEN",
                 |args| {
-                    if args.is_empty() || !unsafe { pyre_object::is_int(args[0]) } {
-                        return Err(crate::PyError::type_error(
-                            "CMSG_LEN: length must be an integer",
-                        ));
-                    }
-                    let raw = unsafe { pyre_object::w_int_get_value(args[0]) };
-                    if raw < 0 {
+                    let raw = crate::builtins::space_index_w(
+                        crate::baseobjspace::space_index(args[0])?,
+                    )?;
+                    if raw < 0 || raw > i64::from(libc::c_int::MAX) {
                         return Err(crate::PyError::overflow_error(
                             "CMSG_LEN() argument out of range",
                         ));
                     }
                     let n = unsafe { libc::CMSG_LEN(raw as libc::c_uint) };
-                    if n == 0 {
+                    if n == 0 || u64::from(n) > libc::c_int::MAX as u64 {
                         return Err(crate::PyError::overflow_error(
                             "CMSG_LEN() argument out of range",
                         ));
@@ -1962,8 +1968,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
                 }
                 Ok(pyre_object::w_tuple_new(vec![
-                    socket_from_fd(fds[0], family, ty, proto),
-                    socket_from_fd(fds[1], family, ty, proto),
+                    socket_from_fd(fds[0], family, ty, proto)?,
+                    socket_from_fd(fds[1], family, ty, proto)?,
                 ]))
             }),
         );
@@ -2038,7 +2044,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 unsafe {
                     libc::fcntl(new_fd, libc::F_SETFD, libc::FD_CLOEXEC);
                 }
-                Ok(socket_from_fd(new_fd, family, ty, proto))
+                socket_from_fd(new_fd, family, ty, proto)
             }),
         );
     }
@@ -2504,9 +2510,10 @@ fn socket_type() -> pyre_object::PyObjectRef {
     static SOCKET_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SOCKET_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
-        // CPython 3.14 Modules/socketmodule.c:sock_exec creates sock_type from
-        // a mutable module heap spec.
-        crate::typedef::mark_cpython_heap_type(tp, false);
+        // PyPy's `W_Socket.typedef` is a builtin immutable type. CPython
+        // exposes the same immutable public type while constructing it from a
+        // module heap spec, so retain HEAPTYPE and set IMMUTABLETYPE as well.
+        crate::typedef::mark_cpython_heap_type(tp, true);
         unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
         unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
         tp as usize
@@ -2628,8 +2635,40 @@ fn socket_wait_readable(
         }
         // poll's resolution is one millisecond; a shorter remainder must still
         // wait rather than degenerate into a busy loop.
-        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        // Darwin may restart poll after a signal instead of returning EINTR.
+        // Slice the wait so pending handlers run before the deadline.
+        let timeout_ms = remaining.as_millis().max(1).min(50) as i32;
         let (ready, errno) = rffi::poll_readable(fd, timeout_ms);
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready == 0 {
+            crate::module::signal::interp_signal::checksignals_now()?;
+            continue;
+        }
+        if !rffi::error_is_interrupted(errno) {
+            return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
+        }
+        crate::module::signal::interp_signal::checksignals_now()?;
+    }
+}
+
+/// Writable half of `RSocket.wait_for_data`, bounded by one absolute
+/// deadline.  `RSocket.sendall` retries EINTR, but the timeout belongs to the
+/// operation rather than to each retry; otherwise a steady stream of handled
+/// signals can keep a finite send alive forever.
+#[cfg(any(unix, windows))]
+fn socket_wait_writable_until(
+    fd: rffi::Socket,
+    deadline: std::time::Instant,
+) -> Result<(), crate::PyError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(socket_converted_error("timeout", None, "timed out"));
+        }
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let (ready, errno) = rffi::poll_writable(fd, timeout_ms);
         if ready > 0 {
             return Ok(());
         }
@@ -2849,7 +2888,7 @@ fn socket_from_fd(
     family: libc::c_int,
     ty: libc::c_int,
     proto: libc::c_int,
-) -> pyre_object::PyObjectRef {
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     socket_from_fd_with_class(fd, family, ty, proto, socket_type())
 }
 
@@ -2860,14 +2899,14 @@ fn socket_from_fd_with_class(
     ty: libc::c_int,
     proto: libc::c_int,
     cls: pyre_object::PyObjectRef,
-) -> pyre_object::PyObjectRef {
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     // PyPy's typeobject.py allocate_instance preserves the requested
     // W_TypeObject when W_Socket.descr_init initialises a user subclass.
     // The stdlib relies on this for `class socket(_socket.socket)`: losing
     // `cls` here also loses its Python-level makefile() and lifecycle state.
     let obj = pyre_object::w_instance_new(cls);
-    socket_init_state(obj, fd, family, ty, proto);
-    obj
+    socket_init_state(obj, fd, family, ty, proto)?;
+    Ok(obj)
 }
 
 #[cfg(any(unix, windows))]
@@ -2877,12 +2916,25 @@ fn socket_init_state(
     family: libc::c_int,
     ty: libc::c_int,
     proto: libc::c_int,
-) {
+) -> Result<(), crate::PyError> {
     socket_set_attr(obj, "_fd", pyre_object::w_int_new(rffi::socket_to_i64(fd)));
     socket_set_attr(obj, "_family", pyre_object::w_int_new(family as i64));
     socket_set_attr(obj, "_type", pyre_object::w_int_new(ty as i64));
     socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64));
-    socket_set_attr(obj, "_timeout", pyre_object::w_none());
+    // `rsocket.py:RSocket.__init__` calls `settimeout(defaults.timeout)` for
+    // every new or wrapped descriptor, and `make_socket` copies that same
+    // process-wide value.  Applying it here (not merely reporting it from
+    // getdefaulttimeout) is what makes a newly constructed socket inherit the
+    // default in both blocking mode and its public `gettimeout()` result.
+    let bits = DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
+    let (native_timeout, stored_timeout) = if bits == SOCKET_TIMEOUT_NONE {
+        (-1.0, pyre_object::w_none())
+    } else {
+        let timeout = f64::from_bits(bits);
+        (timeout, pyre_object::floatobject::w_float_new(timeout))
+    };
+    socket_set_attr(obj, "_timeout", stored_timeout);
+    socket_apply_timeout(fd, native_timeout)?;
     // `sock_new` starts this at 0 on every socket object, and only
     // `setsockopt` moves it: `SIO_TCP_SET_ACK_FREQUENCY` has no counterpart to
     // read the live setting back with, so what was written is the answer.
@@ -2892,6 +2944,7 @@ fn socket_init_state(
     // `_drop` followed by no `_reuse` closes the underlying fd exactly
     // once.
     socket_set_attr(obj, "_usecount", pyre_object::w_int_new(1));
+    Ok(())
 }
 
 /// `rsocket.py get_socket_family` — the family of an existing fd,
@@ -3593,9 +3646,13 @@ fn pack_inet_addr(
     }
 
     if !unsafe { pyre_object::is_tuple(addr) } {
-        return Err(crate::PyError::type_error(
-            "AF_INET address must be a (host, port) tuple",
-        ));
+        // [3.14-spec] PyPy's tuple unpacking exposes its generic iterable
+        // error here; CPython 3.14 names the operation and rejected type
+        // (`testSendtoErrors`).  Packing still follows PyPy's owner.
+        return Err(crate::PyError::type_error(format!(
+            "{caller}(): AF_INET address must be tuple, not {}",
+            crate::type_methods::arg_type_name(addr)
+        )));
     }
     // `getsockaddrarg` parses the AF_INET form with `"O&i"` — exactly two
     // items — and the AF_INET6 form with `"O&i|II"` — two to four.
@@ -3639,12 +3696,29 @@ fn pack_inet_addr(
     // The resolver below releases the GIL, so read what is left of the tuple
     // out of it first; `addr` is a bare reference and a collection that runs
     // meanwhile can leave it behind.
-    let tuple_int = |index: i64| -> Option<u32> {
-        unsafe { pyre_object::w_tuple_getitem(addr, index) }
-            .map(|v| unsafe { pyre_object::w_int_get_value(v) } as u32)
+    let tuple_unsigned =
+        |index: i64, field: &str, max: i64| -> Result<Option<u32>, crate::PyError> {
+            let Some(value) = (unsafe { pyre_object::w_tuple_getitem(addr, index) }) else {
+                return Ok(None);
+            };
+            let value = crate::builtins::space_index_w(crate::baseobjspace::space_index(value)?)?;
+            if value < 0 || value > max {
+                return Err(crate::PyError::overflow_error(format!(
+                    "{caller}(): {field} must be 0-{max}."
+                )));
+            }
+            Ok(Some(value as u32))
     };
-    let flowinfo = if len >= 3 { tuple_int(2) } else { None };
-    let scope_id = if len >= 4 { tuple_int(3) } else { None };
+    let flowinfo = if len >= 3 {
+        tuple_unsigned(2, "flowinfo", 0xfffff)?
+    } else {
+        None
+    };
+    let scope_id = if len >= 4 {
+        tuple_unsigned(3, "scope id", i64::from(u32::MAX))?
+    } else {
+        None
+    };
 
     // `socket_idna_converter` already refused every null.
     let c_host = std::ffi::CString::new(host).unwrap();
@@ -3703,7 +3777,9 @@ fn pack_inet_addr(
         }
         rffi::sockaddr_in6_set_addr(sin6, buf);
         if let Some(v) = flowinfo {
-            sin6.sin6_flowinfo = v;
+            // `rsocket.py:INET6Address.__init__` stores flowinfo in network
+            // byte order just like the port.
+            sin6.sin6_flowinfo = v.to_be();
         }
         if let Some(v) = scope_id {
             rffi::sockaddr_in6_set_scope_id(sin6, v);
@@ -3766,7 +3842,7 @@ fn unpack_inet_addr(
         pyre_object::w_tuple_new(vec![
             pyre_object::w_str_new(&host),
             pyre_object::w_int_new(port),
-            pyre_object::w_int_new(sin6.sin6_flowinfo as i64),
+            pyre_object::w_int_new(u32::from_be(sin6.sin6_flowinfo) as i64),
             pyre_object::w_int_new(rffi::sockaddr_in6_get_scope_id(sin6) as i64),
         ])
     } else {
@@ -3936,7 +4012,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // `rsocket.py:RSocket.__init__` keeps every newly created
                 // socket out of an exec'd child (PEP 446).
                 rffi::set_cloexec(fd);
-                socket_init_state(obj, fd, family, ty, proto);
+                socket_init_state(obj, fd, family, ty, proto)?;
                 return Ok(pyre_object::w_none());
             }
             let fileno_obj = fileno_obj.unwrap();
@@ -3968,7 +4044,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     shared.family,
                     shared.socket_type,
                     shared.protocol,
-                );
+                )?;
                 return Ok(pyre_object::w_none());
             }
             // `interp_socket.py:253-265` — wrap an existing fd.  A float
@@ -3986,16 +4062,24 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 return Err(crate::PyError::value_error("negative file descriptor"));
             }
             let fd = rffi::socket_from_i64(fd);
+            // [3.14-spec] PyPy `W_Socket.descr_init` only probes SO_TYPE when
+            // `type == -1`, and consequently accepts a regular-file fd when
+            // the caller supplies family/type.  CPython 3.14's public
+            // `test_socket_fileno_requires_socket_fd` requires ENOTSOCK for
+            // both forms.  No JIT/immutability hint covers `descr_init`, so
+            // validate the descriptor once while keeping PyPy's field-owner
+            // and subsequent inference order unchanged.
+            let detected_type = socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE)?;
             if family == -1 {
                 family = socket_detect_family(fd)?;
             }
             if ty == -1 {
-                ty = socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_TYPE)?;
+                ty = detected_type;
             }
             if proto == -1 {
                 proto = socket_get_so_protocol(fd)?;
             }
-            socket_init_state(obj, fd, family, ty, proto);
+            socket_init_state(obj, fd, family, ty, proto)?;
             Ok(pyre_object::w_none())
         }),
     ) };
@@ -4084,8 +4168,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
                 if !rffi::is_invalid(fd) {
-                    let _ = unsafe { rffi::close(fd) };
+                    // `rsocket.py:RSocket.close` drops ownership before the
+                    // syscall and still reports its failure.  This prevents a
+                    // later double close while preserving EBADF/ENOTSOCK.
                     socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                    if unsafe { rffi::close(fd) } != 0 {
+                        return Err(socket_last_error());
+                    }
                 }
                 Ok(pyre_object::w_none())
             },
@@ -4234,7 +4323,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // already closed over an exec (rsocket uses
                 // accept4(SOCK_CLOEXEC) on Linux; this is the portable path).
                 rffi::set_cloexec(cfd);
-                let new_sock = socket_from_fd(cfd, family, ty, proto);
+                let new_sock = socket_from_fd(cfd, family, ty, proto)?;
                 let addr = unpack_inet_addr(&storage, slen);
                 Ok(pyre_object::w_tuple_new(vec![new_sock, addr]))
             },
@@ -4439,12 +4528,24 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 0
             };
+            // CPython's public sendall timeout is one operation-wide deadline;
+            // PyPy's `RSocket.wait_for_data(True)` supplies the writable wait.
+            // Compute it once so handled EINTR cannot restart the full period.
+            let deadline = socket_positive_timeout(obj).map(|timeout| {
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs_f64(
+                        timeout.min(i32::MAX as f64 / 1000.0),
+                    )
+            });
             // See `send` above: the export is released once the borrow of
             // `buffer` ends, on the error path as well.
             let result = (|| -> Result<(), crate::PyError> {
                 let buf = buffer.as_bytes();
                 let mut off = 0usize;
                 while off < buf.len() {
+                    if let Some(deadline) = deadline {
+                        socket_wait_writable_until(fd, deadline)?;
+                    }
                     let (n, errno) = socket_call(|| unsafe {
                         rffi::send(
                             fd,
@@ -4453,11 +4554,13 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             flags,
                         )
                     });
+                    // `rsocket.py:RSocket.sendall` invokes its
+                    // `signal_checker` after every attempt, not only after an
+                    // EINTR.  SA_RESTART can defer the syscall return until a
+                    // socket timeout, but the handler still owns the result.
+                    crate::module::signal::interp_signal::checksignals_now()?;
                     if n < 0 {
                         if rffi::error_is_interrupted(errno) {
-                            // `rsocket.py:1132` signal_checker — deliver a
-                            // pending signal, then retry the remaining bytes.
-                            crate::module::signal::interp_signal::checksignals_now()?;
                             continue;
                         }
                         return Err(socket_io_err_for_operation(
@@ -4512,15 +4615,19 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
         "sendto",
         crate::make_builtin_function("sendto", |args| {
             // sendto(buffer, [flags,] address)
-            if args.len() < 3 {
-                return Err(crate::PyError::type_error(
-                    "sendto() needs buffer + address",
-                ));
+            if !(3..=4).contains(&args.len()) {
+                return Err(crate::PyError::type_error(format!(
+                    "sendto() takes 2 or 3 arguments ({} given)",
+                    args.len().saturating_sub(1)
+                )));
             }
             let obj = args[0];
             let fd = socket_fd(obj)?;
             let buffer = crate::baseobjspace::simple_buffer_bytes(args[1])?.ok_or_else(|| {
-                crate::PyError::type_error("sendto: buffer must be bytes-like")
+                crate::PyError::type_error(format!(
+                    "a bytes-like object is required, not '{}'",
+                    crate::type_methods::arg_type_name(args[1])
+                ))
             })?;
             // 3-arg form: (buf, flags, addr).  4-arg form: (self, buf, flags, addr).
             // We always take self-as-args[0], so 3 args = (self, buf, addr) [no flags]
@@ -4528,10 +4635,11 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let (flags, addr_obj) = if args.len() == 3 {
                 (0, args[2])
             } else {
-                (
-                    (unsafe { pyre_object::w_int_get_value(args[2]) }) as libc::c_int,
-                    args[3],
-                )
+                let flags = libc::c_int::try_from(crate::baseobjspace::int_w(args[2])?)
+                    .map_err(|_| {
+                        crate::PyError::overflow_error("Python int too large to convert to C int")
+                    })?;
+                (flags, args[3])
             };
             // See `send` above: the export is released once the borrow of
             // `buffer` ends, on the error path as well. `pack_inet_addr` runs
@@ -5156,48 +5264,40 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // Build ancillary control buffer from args[2] (optional).
             let mut cmsgs: Vec<(libc::c_int, libc::c_int, Vec<u8>)> = Vec::new();
             if args.len() >= 3 && !unsafe { pyre_object::is_none(args[2]) } {
-                if !unsafe { pyre_object::is_list(args[2]) || pyre_object::is_tuple(args[2]) } {
-                    return Err(crate::PyError::type_error(
-                        "sendmsg: ancillary must be a sequence",
-                    ));
-                }
-                let n = unsafe {
-                    if pyre_object::is_list(args[2]) {
-                        pyre_object::w_list_len(args[2])
-                    } else {
-                        pyre_object::w_tuple_len(args[2])
-                    }
-                };
-                for i in 0..n {
-                    let item = unsafe {
-                        if pyre_object::is_list(args[2]) {
-                            pyre_object::w_list_getitem(args[2], i as i64)
-                                .unwrap_or(pyre_object::PY_NULL)
-                        } else {
-                            pyre_object::w_tuple_getitem(args[2], i as i64)
-                                .unwrap_or(pyre_object::PY_NULL)
-                        }
-                    };
-                    if !unsafe { pyre_object::is_tuple(item) }
-                        || unsafe { pyre_object::w_tuple_len(item) } != 3
-                    {
+                // PyPy `W_Socket.sendmsg_w` snapshots both iterable levels
+                // with `space.unpackiterable` before converting their fields.
+                // That order is semantic: `__index__` may mutate the original
+                // ancillary list, but it cannot rewrite the captured message.
+                let ancillary_slot = pyre_object::gc_roots::pin_roots(&[args[2]]);
+                let ancillary_items = crate::baseobjspace::unpackiterable(
+                    pyre_object::gc_roots::shadow_stack_get(ancillary_slot),
+                    -1,
+                )?;
+                let ancillary_base = pyre_object::gc_roots::pin_roots(&ancillary_items);
+                for i in 0..ancillary_items.len() {
+                    let item = pyre_object::gc_roots::shadow_stack_get(ancillary_base + i);
+                    let fields = crate::baseobjspace::unpackiterable(item, -1)?;
+                    if fields.len() != 3 {
                         return Err(crate::PyError::type_error(
                             "sendmsg: ancillary items must be 3-tuples",
                         ));
                     }
-                    let level_o = unsafe { pyre_object::w_tuple_getitem(item, 0) }
-                        .ok_or_else(|| crate::PyError::value_error("ancillary level missing"))?;
-                    let type_o = unsafe { pyre_object::w_tuple_getitem(item, 1) }
-                        .ok_or_else(|| crate::PyError::value_error("ancillary type missing"))?;
-                    let data_o = unsafe { pyre_object::w_tuple_getitem(item, 2) }
-                        .ok_or_else(|| crate::PyError::value_error("ancillary data missing"))?;
-                    if !unsafe { pyre_object::is_int(level_o) }
-                        || !unsafe { pyre_object::is_int(type_o) }
-                    {
-                        return Err(crate::PyError::type_error(
-                            "sendmsg: ancillary level/type must be integers",
-                        ));
-                    }
+                    let fields_base = pyre_object::gc_roots::pin_roots(&fields);
+                    let level_o = pyre_object::gc_roots::shadow_stack_get(fields_base);
+                    let level = libc::c_int::try_from(crate::baseobjspace::int_w(level_o)?)
+                        .map_err(|_| {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C int",
+                            )
+                        })?;
+                    let type_o = pyre_object::gc_roots::shadow_stack_get(fields_base + 1);
+                    let ty = libc::c_int::try_from(crate::baseobjspace::int_w(type_o)?)
+                        .map_err(|_| {
+                            crate::PyError::overflow_error(
+                                "Python int too large to convert to C int",
+                            )
+                        })?;
+                    let data_o = pyre_object::gc_roots::shadow_stack_get(fields_base + 2);
                     // interp_socket.py:811-816 acquires a BUF_SIMPLE view,
                     // just like the ordinary data items above.  This includes
                     // array.array payloads used by multiprocessing's
@@ -5207,8 +5307,6 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                             "sendmsg: ancillary data must be bytes-like",
                         ));
                     };
-                    let level = unsafe { pyre_object::w_int_get_value(level_o) } as libc::c_int;
-                    let ty = unsafe { pyre_object::w_int_get_value(type_o) } as libc::c_int;
                     let data = buffer.as_bytes().to_vec();
                     buffer.release();
                     cmsgs.push((level, ty, data));

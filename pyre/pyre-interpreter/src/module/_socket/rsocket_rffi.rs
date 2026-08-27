@@ -455,6 +455,22 @@ pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
         libc::poll(&mut pollfd, 1, timeout_ms)
     })
 }
+
+/// Writable half of `RSocket._select(True)`.  Keep this beside
+/// [`poll_readable`]: both are the host spelling of `wait_for_data`, and a
+/// finite `sendall` deadline must survive handled signals instead of starting
+/// a fresh kernel timeout after every EINTR.
+#[cfg(unix)]
+pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    let mut pollfd = libc::pollfd {
+        fd: s,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    crate::module::thread::call_external_function(|| unsafe {
+        libc::poll(&mut pollfd, 1, timeout_ms)
+    })
+}
 #[cfg(windows)]
 pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     poll_one(s, ws::POLLIN, timeout_ms)
