@@ -7,10 +7,16 @@
 /// native embedder (wasmi / wasmtime) supplies. On native targets,
 /// compile_loop succeeds but execute_token requires a wasm host
 /// (unreachable natively).
+///
+/// Which binding a build has is a feature, not a target OS: `host-import` is
+/// satisfied by an embedder, and an embedder is exactly what a WASI command
+/// runs under. So the split below is wasm32 against native, and a wasm32 build
+/// with no binding selected keeps `glue`'s stubs rather than being routed to
+/// the native arm.
 pub mod codegen;
 pub mod failguard;
 
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 mod glue;
 
 use std::cell::RefCell;
@@ -476,19 +482,19 @@ pub fn bridge_diag(i: usize) -> u64 {
 }
 
 /// Number of JIT trace entries made from the guest.
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 pub fn jit_execute_count() -> u64 {
     glue::jit_execute_count()
 }
 
 /// Number of host modules materialized after the lazy-install gate.
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 pub fn jit_compile_count() -> u64 {
     glue::jit_compile_count()
 }
 
 /// Number of materializations served by the byte-identical module cache.
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 pub fn jit_compile_cache_hits() -> u64 {
     glue::jit_compile_cache_hits()
 }
@@ -2323,7 +2329,7 @@ impl WasmBackend {
             return;
         };
         let _ = (cells_base, slot);
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if cells_base != 0 {
             let cell = (cells_base as usize + source_fail_index as usize * 4) as *mut u32;
             unsafe { core::ptr::write(cell, slot) };
@@ -2396,7 +2402,7 @@ impl WasmBackend {
             .bridge_slots
             .borrow_mut()
             .remove(&source_fail_index);
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if source_cells_base != 0 {
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
             unsafe { core::ptr::write(cell, 0) };
@@ -2427,7 +2433,7 @@ impl WasmBackend {
                         .bridge_slots
                         .borrow_mut()
                         .insert(source_fail_index, slot);
-                    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                    #[cfg(target_arch = "wasm32")]
                     if source_cells_base != 0 {
                         let cell = (source_cells_base as usize + source_fail_index as usize * 4)
                             as *mut u32;
@@ -2507,13 +2513,13 @@ impl WasmBackend {
             })
             .collect();
 
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if glue::replace_module(old_handle, &wasm_bytes) != old_handle {
             return Err(BackendError::Unsupported(
                 "wasm host rejected the re-emitted trace module".into(),
             ));
         }
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = wasm_bytes;
             return Err(BackendError::Unsupported(
@@ -2542,7 +2548,7 @@ impl WasmBackend {
                 *start += guard_growth;
             }
         }
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if new_cells_base != 0 {
             for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
                 let cell = (new_cells_base as usize + fail_index as usize * 4) as *mut u32;
@@ -2565,7 +2571,7 @@ impl WasmBackend {
                 // them has lost its dispatch entry. Unreplayed, that guard
                 // deopts to the tracer on every failure and retraces a bridge
                 // it can never reach.
-                #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                #[cfg(target_arch = "wasm32")]
                 if new_cells_base != 0 {
                     for (&(trace_id, fail_index), &bridge_slot) in
                         compiled.chained_bridge_slots.borrow().iter()
@@ -3482,13 +3488,13 @@ impl majit_backend::Backend for WasmBackend {
 
         // Instantiate via the host binding on wasm32, or store bytes for
         // testing on native (no wasm host available).
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         let func_handle = if defer_host_compile {
             0
         } else {
             glue::compile_module_cached(&wasm_bytes)
         };
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         let func_handle = 0u32; // Placeholder — no wasm host available
 
         // `jit_compile_wasm` returns 0 when the host runtime rejects the emitted
@@ -3499,7 +3505,7 @@ impl majit_backend::Backend for WasmBackend {
         // a trace), leaving `frame[0]` unwritten and resolving a wrong exit descr.
         // Decline the compile so the metainterp keeps the interpreter fallback —
         // a backend capability limit, reported like any other unsupported shape.
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if !defer_host_compile && func_handle == 0 {
             diag_bump(26);
             return Err(BackendError::Unsupported(
@@ -4300,15 +4306,15 @@ impl majit_backend::Backend for WasmBackend {
         // descrs and flip the source guard's cell. Order matters: the descrs
         // must be resolvable (appended) before the cell makes the guard dispatch
         // into the bridge.
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         let bridge_slot = glue::compile_module(&wasm_bytes);
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         let bridge_slot = 0u32;
         // A 0 handle means the host rejected the bridge module (see the
         // `compile_loop` decline). Flipping the source guard's cell to dispatch
         // into slot 0 would tail-call a non-trace; decline instead so the guard
         // keeps its host round-trip (correct, unaccelerated).
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if bridge_slot == 0 {
             return Err(BackendError::Unsupported(
                 "wasm host rejected the compiled bridge module (oversized function body \
@@ -4430,7 +4436,7 @@ impl majit_backend::Backend for WasmBackend {
         } else {
             diag_bump(28);
         }
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if source_cells_base != 0 && bridge_slot != 0 {
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
             if unsafe { core::ptr::read(cell) } != 0 {
@@ -4461,7 +4467,7 @@ impl majit_backend::Backend for WasmBackend {
                 }
             }
         }
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = (source_cells_base, bridge_slot);
 
         let code_size = wasm_bytes.len();
@@ -4673,7 +4679,7 @@ impl majit_backend::Backend for WasmBackend {
             .expect("no compiled code")
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         let func_handle = compiled
             .materialize_func_handle()
             .expect("wasm backend failed to materialize a runnable trace");
@@ -4682,12 +4688,12 @@ impl majit_backend::Backend for WasmBackend {
         // call area. Chained bridges share these exact offsets; only CA callee
         // frames use the smaller homes prefix (`ca_frame_bytes`).
         let frame_size = (compiled.frame.frame_bytes as usize).div_ceil(8);
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = (frame_size, args);
             panic!("wasm backend execute_token requires a wasm host");
         }
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         {
             // The pending-exception cell is global, unlike the native
             // per-jitframe `jf_guard_exc`. A residual raise on a blackhole
@@ -4943,7 +4949,7 @@ impl majit_backend::Backend for WasmBackend {
                     .expect("published CALL_ASSEMBLER target has a live compiled loop")
             };
             let handle = new_loop.materialize_func_handle()?;
-            #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+            #[cfg(target_arch = "wasm32")]
             if handle == 0 {
                 return Err(BackendError::Unsupported(format!(
                     "call-assembler redirect to token {} could not materialize wasm code",

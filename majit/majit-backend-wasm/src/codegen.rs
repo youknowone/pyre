@@ -201,10 +201,22 @@ impl ValueLocals {
 }
 
 /// Call area layout in the historical fixed frame geometry.
-const CALL_RESULT_OFS: u64 = 2000;
-const CALL_FUNC_OFS: u64 = 2008;
-const CALL_NARGS_OFS: u64 = 2016;
-const CALL_ARGS_OFS: u64 = 2024;
+///
+/// These offsets are the host trampoline's ABI, not a private detail: a caller
+/// writes the callee's function-table index, the argument count and the
+/// arguments into this block, invokes the import, and reads the callee's
+/// result back from it. Whoever satisfies that import reads the same block
+/// from the other side, so both ends name these constants instead of each
+/// restating the numbers.
+pub const CALL_RESULT_OFS: u64 = 2000;
+pub const CALL_FUNC_OFS: u64 = 2008;
+pub const CALL_NARGS_OFS: u64 = 2016;
+pub const CALL_ARGS_OFS: u64 = 2024;
+
+/// Arguments the call area has room for. A residual call with more arguments
+/// than this has nowhere to put them, so a caller checks its arity against
+/// this bound rather than writing past the end of the frame.
+pub const MAX_CALL_ARGS: usize = 16;
 
 const STATIC_CALL_RESULT_OFS: u64 = 0;
 const STATIC_CALL_FUNC_OFS: u64 = SLOT_SIZE;
@@ -212,7 +224,11 @@ const STATIC_CALL_NARGS_OFS: u64 = 2 * SLOT_SIZE;
 const STATIC_CALL_ARGS_OFS: u64 = 3 * SLOT_SIZE;
 
 /// Minimum frame allocation size in bytes to accommodate the call area.
-pub const MIN_FRAME_BYTES: usize = 2024 + 16 * 8; // 16 max call args
+///
+/// Derived from where the arguments start and how many fit, so raising
+/// [`MAX_CALL_ARGS`] cannot leave the frame one argument short of the area it
+/// is sized to hold.
+pub const MIN_FRAME_BYTES: usize = CALL_ARGS_OFS as usize + MAX_CALL_ARGS * 8;
 
 /// Per-token layout of a wasm execution frame. Every frozen geometry retains
 /// the historical host-trampoline call area even though emitted code uses the
@@ -248,7 +264,8 @@ pub struct FrameGeometry {
 }
 
 impl FrameGeometry {
-    pub const CALL_AREA_SLOTS: usize = 3 + 16; // result, function, nargs, args
+    /// result, function, nargs, then one slot per argument.
+    pub const CALL_AREA_SLOTS: usize = 3 + MAX_CALL_ARGS;
 
     /// Historical fixed geometry, used by direct codegen tests and by callers
     /// that deliberately need the arena-compatible layout.
@@ -1769,13 +1786,34 @@ pub struct GuardGcTypeInfo {
 }
 
 /// Check if any op in the trace is a CALL variant.
-/// Lower an eligible residual CALL to a direct in-module `call_indirect` into
-/// the callee's `__indirect_function_table` slot, instead of routing through the
-/// `jit_call` host trampoline (guest→host→guest reflection + arg marshalling).
-/// The residual-call ABI is uniformly `(i64×n) -> i64` for Int/Ref args+result
-/// (verified: every fib residual call is `(i64,…)->i64`), so the static type is
-/// fixed by the arity alone. `false` = byte-identical jit_call baseline.
-const WASM_DIRECT_RESIDUAL_CALL: bool = true;
+/// Whether an eligible residual CALL may be lowered to a direct in-module
+/// `call_indirect` into the callee's `__indirect_function_table` slot, instead
+/// of routing through the `jit_call` host trampoline (guest→host→guest
+/// reflection + arg marshalling).
+///
+/// The lowering takes the callee's wasm type from the IR alone: word-typed
+/// arguments and result become `(i64×n) -> i64`, so the static type is fixed by
+/// the arity. That is a claim about the embedding language's residual helpers,
+/// and one the IR cannot check — a helper declared to take a pointer has an
+/// `i32` parameter on wasm32, and `call_indirect` type-checks its callee on
+/// every call, so a call lowered this way traps instead of reaching a helper
+/// whose real signature is narrower. Only an embedder whose residual helpers
+/// are uniformly word-wide may leave this on; clearing it returns every call to
+/// the trampoline, which reads the callee's declared type before calling it.
+///
+/// Read once per emitted call, so it must be set before the first compile.
+static DIRECT_RESIDUAL_CALL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Set the direct-residual-call policy. See [`DIRECT_RESIDUAL_CALL`] for the
+/// ABI the enabled form assumes of the embedder's residual helpers.
+pub fn set_direct_residual_calls(enabled: bool) {
+    DIRECT_RESIDUAL_CALL.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn direct_residual_calls() -> bool {
+    DIRECT_RESIDUAL_CALL.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
 /// an Int/Ref result), return its argument count — eligible for a direct
@@ -2042,7 +2080,7 @@ fn has_call_ops(ops: &[Op]) -> bool {
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64, typed float, and true-void residual families, `New*`, and write barriers
-/// are direct under `WASM_DIRECT_RESIDUAL_CALL`; non-uniform CALLs and string
+/// are direct under [`DIRECT_RESIDUAL_CALL`]; non-uniform CALLs and string
 /// allocation retain the trampoline. When the direct family is disabled, all
 /// of the existing call-area users return to the trampoline baseline.
 fn has_trampoline_calls(
@@ -2052,7 +2090,7 @@ fn has_trampoline_calls(
     emit_ca: bool,
 ) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
-    if !WASM_DIRECT_RESIDUAL_CALL {
+    if !direct_residual_calls() {
         return has_call_ops(ops) || has_ref_store_op(ops, &ref_values);
     }
 
@@ -3019,13 +3057,13 @@ pub fn build_wasm_module(
     // keeps the tail call area for future bridges.
     let needs_call =
         has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
-    // In-module residual calls (`WASM_DIRECT_RESIDUAL_CALL`): the largest
+    // In-module residual calls ([`DIRECT_RESIDUAL_CALL`]): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
     // targets, which share the same uniform-i64 ABI — or `None` if there
     // are none. Each distinct arity `0..=max` gets its own function type
     // (declared below) so those arms can `call_indirect` with a static type.
-    let residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
+    let residual_max_arity = if direct_residual_calls() {
         let scanned = analysis_ops
             .iter()
             .filter_map(|op| direct_helper_i64_arity(op, &ref_values))
@@ -3051,7 +3089,7 @@ pub fn build_wasm_module(
     // of the uniform i64 helper family. Preserve first-use order so a given
     // trace gets stable type indices while declaring each signature once.
     let mut typed_residual_sigs = Vec::new();
-    if WASM_DIRECT_RESIDUAL_CALL {
+    if direct_residual_calls() {
         for op in analysis_ops {
             if let Some(sig) = residual_call_typed_sig(op, constants)
                 && !typed_residual_sigs.contains(&sig)
@@ -3063,7 +3101,7 @@ pub fn build_wasm_module(
     // True-void residual calls use `(i64×n) -> ()`, a separate family from the
     // i64- and f64-result types. As with the uniform i64 family, declaring
     // `0..=max` makes each type index a base plus the call arity.
-    let true_void_residual_max_arity = if WASM_DIRECT_RESIDUAL_CALL {
+    let true_void_residual_max_arity = if direct_residual_calls() {
         analysis_ops
             .iter()
             .filter_map(residual_call_void_true_arity)
@@ -3421,7 +3459,7 @@ fn build_function(
     inline_trip: Option<(InlineTripProbe, u32)>,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
-    // while `WASM_DIRECT_RESIDUAL_CALL` is enabled). Its `jit_call` fallback
+    // while [`DIRECT_RESIDUAL_CALL`] is enabled). Its `jit_call` fallback
     // branches are retained solely for the direct-family-disabled baseline.
     debug_assert!(!ca.emit_ca || residual_type_base.is_some());
     let value_locals_end = value_types.end_local();

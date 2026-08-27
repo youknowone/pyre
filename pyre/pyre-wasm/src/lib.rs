@@ -155,13 +155,17 @@ mod residual_host {
 
     // Call-area layout shared with `majit-backend-wasm` codegen and the host
     // runner's `jit_call_trampoline`; offsets are relative to the frame-pointer
-    // base passed to the import.
-    const CALL_RESULT_OFS: usize = 2000;
-    const CALL_FUNC_OFS: usize = 2008;
-    const CALL_NARGS_OFS: usize = 2016;
-    const CALL_ARGS_OFS: usize = 2024;
-    const MAX_ARGS: usize = 16;
-    const SCRATCH_LEN: usize = CALL_ARGS_OFS + MAX_ARGS * 8;
+    // base passed to the import. Taken from the backend that defines the ABI
+    // rather than restated, so a layout change reaches this scratch buffer.
+    use majit_backend_wasm::codegen::{
+        CALL_ARGS_OFS as CALL_ARGS_OFS_U64, CALL_FUNC_OFS as CALL_FUNC_OFS_U64,
+        CALL_NARGS_OFS as CALL_NARGS_OFS_U64, CALL_RESULT_OFS as CALL_RESULT_OFS_U64,
+        MAX_CALL_ARGS as MAX_ARGS, MIN_FRAME_BYTES as SCRATCH_LEN,
+    };
+    const CALL_RESULT_OFS: usize = CALL_RESULT_OFS_U64 as usize;
+    const CALL_FUNC_OFS: usize = CALL_FUNC_OFS_U64 as usize;
+    const CALL_NARGS_OFS: usize = CALL_NARGS_OFS_U64 as usize;
+    const CALL_ARGS_OFS: usize = CALL_ARGS_OFS_U64 as usize;
 
     #[link(wasm_import_module = "majit_host")]
     unsafe extern "C" {

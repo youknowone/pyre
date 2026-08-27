@@ -733,7 +733,7 @@ pub struct CompiledWasmLoop {
     /// backend assembler state, not metainterpreter state: the optimized trace
     /// and all per-token descriptors have already been installed exactly as
     /// in the eager path.
-    #[cfg_attr(any(not(target_arch = "wasm32"), target_os = "wasi"), allow(dead_code))]
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub(crate) pending_wasm_bytes: RefCell<Option<Vec<u8>>>,
     /// This loop's own guard/finish exit descriptors (positions `[0,
     /// num_guard_cells)`, per-trace order), followed by the descr slices of
@@ -870,11 +870,11 @@ impl CompiledWasmLoop {
         if current != 0 {
             return Ok(current);
         }
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             Ok(0)
         }
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         {
             let pending = self.pending_wasm_bytes.borrow();
             let Some(bytes) = pending.as_deref() else {
