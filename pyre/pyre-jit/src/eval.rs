@@ -4836,8 +4836,9 @@ fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 }
 
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
-/// mapdict side table, etc.).  Called on first eval entry, after the
-/// interpreter is initialized.
+/// mapdict side table, etc.).  Registration stores fn pointers only, so it
+/// runs at the tail of `init_gc_subsystem`, before anything the walkers
+/// answer for has been allocated.
 fn install_gc_root_walkers() {
     pyre_interpreter::eval::register_interpreter_global_root_walker();
     majit_gc::shadow_stack::register_extra_root_walker(walk_parked_exception_roots);
@@ -5112,6 +5113,16 @@ pub fn init_gc_subsystem() {
     // because it allocates and so needs this thread to hold the GIL.
     majit_rlib::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
+    // The root walkers belong to the same bootstrap as the collector they feed:
+    // interpreter startup builds every builtin type object and its namespace
+    // dict before the first Python frame exists, and `walk_builtin_type_dicts_gc`
+    // is the only path to those young dicts. Installed at first eval instead,
+    // a collection in that window reclaims a namespace dict whose type object
+    // still points at it — measured under `MAJIT_GC_STRESS=1`, which faults in
+    // `w_dict_items` while `retag_classmethod_descriptors` sweeps the registry.
+    // Placed after `initialize_rbigint_parts_cache` so the first walk finds
+    // that cache built rather than manufacturing it from inside the walker.
+    init_gc_root_walkers();
 }
 
 /// Guards the one-time install of the process-global pyre-object GC hooks.
@@ -5122,8 +5133,9 @@ thread_local! {
 }
 
 /// Phase B of GC init: register root walkers that touch interpreter
-/// state (immortal dicts, mapdict side table, etc.).  Must run after
-/// the interpreter is initialized — called on first eval entry.
+/// state (immortal dicts, mapdict side table, etc.).  Called from
+/// `init_gc_subsystem` once the collector is installed, and again on the
+/// first eval entry for the paths that reach an eval loop without it.
 /// Idempotent.
 pub fn init_gc_root_walkers() {
     if GC_ROOT_WALKERS_INSTALLED.with(|c| c.get()) {
@@ -8503,9 +8515,10 @@ fn eval_with_jit_inner(
     // through the frame — compiled, JIT eval loop, or declined to the plain
     // evaluator — passes exactly once.
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
-    // Phase B of GC init: register root walkers that reference
-    // interpreter state.  Safe here — the interpreter is initialized.
-    // Phase A (GC build + backend install) ran at boot in init_jit_hooks.
+    // Phase B of GC init: register root walkers that reference interpreter
+    // state.  `init_gc_subsystem` already installs them on the path that
+    // builds the collector; this covers a thread that reaches an eval loop
+    // without having run that bootstrap itself.
     init_gc_root_walkers();
     // PYRE_JIT=0 disables JIT entirely, falling back to plain interpreter.
     static PYRE_JIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -8624,43 +8637,41 @@ fn eval_with_jit_inner(
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    // `pyframe.py execute_frame` brackets the eval loop with
-    // `ec.call_trace(self)` and `ec.return_trace(self, w_exitvalue)`, and
-    // upstream's merge point sits inside that bracket: the jitdriver is
-    // applied to `PyFrame.dispatch` (`interp_jit.py`), which `execute_frame`
-    // calls between the two hooks.  pyre's portal is this function instead,
-    // one level up, so the arms below enter the frame at its first bytecode,
-    // past the bracket, and a frame the JIT took over reported neither its
-    // `call` nor its `return` event.  Every declining path above returns
-    // through `execute_frame_plain`, which reaches the bracket in
-    // `eval::eval_frame_plain_with_resume`, so these two arms are the only
-    // ones that owe one.
-    //
-    // Both hooks carry their own test — `call_trace` fires on
-    // `gettrace() is not None or profilefunc is not None`, `return_trace` on
-    // `gettrace() is not None` — so an untraced activation pays one null read
-    // per hook.  Both run application-level Python and may move the frame, so
-    // each takes its argument from the root rather than from a saved word.
-    //
-    // The bracket is two nested `try`s under one `finally`, and the nesting is
-    // what decides which hook still runs after another one raised:
-    // `call_trace` sits in the outer `try`, `return_trace` in the inner
-    // `finally`, and `leave` in the outer one.  So a `call_trace` that raises
-    // skips the eval body AND `return_trace` yet still owes the leave hook,
-    // `return_trace` runs on the raising path too — with `w_exitvalue` still
-    // the `None` the bracket opened with — and each hook that raises replaces
-    // whatever was pending, in that order.  `?` on any of the three would
-    // flatten the nesting and drop the hooks after it.
-    fn portal_body(frame_root: &mut FrameRoot) -> PyResult {
-        match try_function_entry_jit(frame_root.frame()) {
-            Some(result) => result,
-            None => handle_jitexception(frame_root.frame()),
-        }
-    }
+    portal_activation_bracketed(&mut frame_root)
+}
+
+/// `pyframe.py execute_frame`'s hook bracket around [`portal_runner_dispatch`],
+/// for the entries that BEGIN an activation.
+///
+/// Upstream's merge point sits inside that bracket: the jitdriver is applied to
+/// `PyFrame.dispatch` (`interp_jit.py`), which `execute_frame` calls between the
+/// two hooks.  pyre's portal is one level up, at `execute_frame`'s own level, so
+/// the dispatch below enters the frame at its first bytecode, past the bracket,
+/// and a frame the JIT took over reported neither its `call` nor its `return`
+/// event.  Every declining path returns through `execute_frame_plain`, which
+/// reaches the bracket in `eval::eval_frame_plain_with_resume`, so only the
+/// portal arms owe one.
+///
+/// Both hooks carry their own test — `call_trace` fires on
+/// `gettrace() is not None or profilefunc is not None`, `return_trace` on
+/// `gettrace() is not None` — so an untraced activation pays one null read per
+/// hook.  Both run application-level Python and may move the frame, so each
+/// takes its argument from the root rather than from a saved word.
+///
+/// The bracket is two nested `try`s under one `finally`, and the nesting is what
+/// decides which hook still runs after another one raised: `call_trace` sits in
+/// the outer `try`, `return_trace` in the inner `finally`, and `leave` in the
+/// outer one.  So a `call_trace` that raises skips the eval body AND
+/// `return_trace` yet still owes the leave hook, `return_trace` runs on the
+/// raising path too — with `w_exitvalue` still the `None` the bracket opened
+/// with — and each hook that raises replaces whatever was pending, in that
+/// order.  `?` on any of the three would flatten the nesting and drop the hooks
+/// after it.
+fn portal_activation_bracketed(frame_root: &mut FrameRoot) -> PyResult {
     let ec = frame_root.frame().execution_context as *mut PyExecutionContext;
     if ec.is_null() {
         // No execution context is no hook to owe, and no `leave` either.
-        return portal_body(&mut frame_root);
+        return portal_runner_dispatch(frame_root);
     }
     // `w_exitvalue` is `execute_frame`'s own local, not a re-read of the result
     // word: it opens as the `None` the bracket opened with, takes the body's
@@ -8673,7 +8684,7 @@ fn eval_with_jit_inner(
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
-            let result = portal_body(&mut frame_root);
+            let result = portal_runner_dispatch(frame_root);
             if let Ok(value) = &result {
                 w_exitvalue = *value;
             }
@@ -8689,9 +8700,30 @@ fn eval_with_jit_inner(
     // `setprofile`'s `return` is not `return_trace`'s — that one tests
     // `gettrace() is not None`.  It comes from `executioncontext.py leave`,
     // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
-    // this arm never reaches `leave`: the declining paths above return through
-    // `execute_frame_plain`, which does, and these two do not.
-    let live = unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)? };
+    // this arm never reaches `leave`: the declining paths return through
+    // `execute_frame_plain`, which does, and the portal arms do not.
+    let leave_result =
+        unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) };
+    // `leave`'s frame-chain half, which the portal owed as much as the hook.  It
+    // is the `finally` of `leave`'s own `try`, so a profile hook that raised
+    // does not skip it, and it runs while `topframeref` still names this frame.
+    //
+    // The narrow form, not `leave`'s own: this closes a scope whose body ran as
+    // compiled code, so it is the same situation as a blackhole resume and is
+    // shared with it.  `leave_compiled_frame_chain` states why the identity
+    // guard and the absence of a force are load-bearing there.
+    //
+    // `got_exception` is `execute_frame`'s flag: false only when the body AND
+    // `return_trace` both completed, which is exactly `outer_result.is_ok()`.
+    // Without this a compiled frame that left escaped, or with an exception,
+    // returns to a caller that was never marked escaped — and `escaped()` is
+    // what the walker reads to decide whether that caller has to be
+    // materialised.
+    crate::call_jit::leave_portal_frame_chain(
+        frame_root.frame() as *mut PyFrame,
+        outer_result.is_err(),
+    );
+    let live = leave_result?;
     outer_result.map(|_| live)
 }
 
@@ -8945,25 +8977,50 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 ///
 /// warmspot.py:997-1005: ExitFrameWithExceptionRef → re-raise.
 pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
-    // warmspot.py ll_portal_runner:
-    //   maybe_compile_and_run(state.increment_function_threshold, *args)
-    //   return portal_ptr(*args)
-    //
-    // portal_ptr is the JIT-aware interpreter (jit_merge_point +
-    // can_enter_jit). pyre's equivalent is handle_jitexception →
-    // eval_loop_jit, NOT eval_frame_plain. Routing through
-    // eval_frame_plain here would skip maybe_enter_jit at every
-    // opcode of the recursive portal frame, which breaks parity for
-    // bhimpl_recursive_call_* paths.
-    // `ll_portal_runner` is an activation entry in its own right: recursive
-    // portal calls can reach it without the ordinary `eval_with_jit_inner`
-    // wrapper.  Account before constructing `FrameRoot`, because a moving GC
-    // may change the frame's address while the activation remains the same.
+    enter_portal(frame, portal_runner_dispatch)
+}
+
+/// [`portal_runner_result`] for an entry that BEGINS the activation rather than
+/// continuing one, so it owes `pyframe.py execute_frame`'s hook bracket.
+///
+/// The two are separated because pyre's portal is re-entered for reasons
+/// upstream's is not.  A `ContinueRunningNormally` handoff and a
+/// CALL_ASSEMBLER completion resume a frame whose activation already began, and
+/// upstream reaches those through `portal_ptr` — `PyFrame.dispatch`, INSIDE
+/// `execute_frame`'s bracket — so they must not report a second `call` event.
+/// Every other portal entry is handed a callee frame that was just constructed
+/// (`create_callee_frame_in_ctx`, `create_self_recursive_callee_frame_impl_1_boxed`,
+/// `emit_new_pyframe_inline_with_params`) and is the only bracket that frame
+/// will ever get.
+///
+/// Measured with `sys.setprofile` over a self-recursive callee driven from a
+/// compiled loop: 4 activations per iteration are owed and 1 was reported —
+/// exactly the outermost one, which reaches the interpreter's own
+/// `execute_frame` — for every tail from 10 000 iterations up.
+pub(crate) fn portal_activation_result(frame: &mut PyFrame) -> PyResult {
+    enter_portal(frame, portal_activation_bracketed)
+}
+
+/// warmspot.py ll_portal_runner:
+///   maybe_compile_and_run(state.increment_function_threshold, *args)
+///   return portal_ptr(*args)
+///
+/// portal_ptr is the JIT-aware interpreter (jit_merge_point + can_enter_jit).
+/// pyre's equivalent is handle_jitexception → eval_loop_jit, NOT
+/// eval_frame_plain. Routing through eval_frame_plain here would skip
+/// maybe_enter_jit at every opcode of the recursive portal frame, which breaks
+/// parity for bhimpl_recursive_call_* paths.
+///
+/// `ll_portal_runner` is an activation entry in its own right: recursive portal
+/// calls can reach it without the ordinary `eval_with_jit_inner` wrapper.
+/// Account before constructing `FrameRoot`, because a moving GC may change the
+/// frame's address while the activation remains the same.
+fn enter_portal(frame: &mut PyFrame, body: fn(&mut FrameRoot) -> PyResult) -> PyResult {
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     let mut frame_root = FrameRoot::new(frame);
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
-    portal_runner_dispatch(&mut frame_root)
+    body(&mut frame_root)
 }
 
 /// The dispatch half of `portal_runner_result`, taking the caller's
@@ -8986,8 +9043,15 @@ fn portal_runner_dispatch(frame_root: &mut FrameRoot) -> PyResult {
     }
 }
 
+/// The raw-ref spelling of [`portal_activation_result`], for the compiled-code
+/// force helpers whose ABI returns a `PyObjectRef` and stashes the exception.
+///
+/// Every caller builds the callee frame immediately before calling
+/// (`run_frame_through_portal` receives the one the trace emitted; the
+/// `jit_force_*_recursive_call_*` helpers construct theirs a line above), so
+/// this entry always begins an activation.
 pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
-    match portal_runner_result(frame) {
+    match portal_activation_result(frame) {
         Ok(r) => r,
         Err(mut err) => {
             crate::call_jit::store_jit_exception(err.to_exc_object() as i64);
@@ -9557,6 +9621,49 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     true
 }
 
+thread_local! {
+    /// Green keys whose cell `WarmEnterState::maybe_compile_decision` refuses
+    /// at the abort ceiling, against the `cell_generation` the refusal was
+    /// observed at.
+    ///
+    /// A loop that a profiler forces to decline — `is_being_profiled` is a
+    /// portal green, and a loop whose body calls anything declines with
+    /// `DispatchError::ProfiledResidualCall` — can never trace, so its cell
+    /// latches and every later back edge re-derives the same refusal. Measured
+    /// with `sys.setprofile` over a warm loop: `abort_ceiling_refused` tracks
+    /// the iteration count one-for-one (194776 at 200k iterations, 794776 at
+    /// 800k), while a loop with no call in its body reads exactly 0. The
+    /// re-derivation costs a green-key mint, three per-code gate lookups and a
+    /// bucket-chain walk per iteration.  Graded as the same tree built twice —
+    /// the only valid control, since `PYRE_JIT=0` is read by
+    /// `eval_with_jit_inner` and routes the frame to `execute_frame_plain`, a
+    /// different eval loop, rather than isolating this door — the profiled arm
+    /// runs 2.3% faster with the cache, faster in 5 of 5 rounds, and
+    /// `abort_ceiling_refused` falls from 194776 to 1.
+    ///
+    /// Caching it is behaviour-preserving: the refusal bumps a diagnostic slot
+    /// and returns `NotHot` above `decay_all_counters`, which
+    /// `maybe_compile_decision` documents as deliberate, so a latched cell
+    /// already contributes no decay. The generation is what keeps the cache
+    /// honest — `WarmEnterState` moves it whenever a cell is installed or a
+    /// procedure token attached, the two mutations that can make a refused key
+    /// runnable again.
+    static CEILING_LATCHED: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether `green_key` was already refused at the abort ceiling, and nothing
+/// has happened since that could change the answer.
+fn ceiling_latch_is_current(green_key: u64, generation: u64) -> bool {
+    CEILING_LATCHED.with(|latched| latched.borrow().get(&green_key) == Some(&generation))
+}
+
+fn record_ceiling_latch(green_key: u64, generation: u64) {
+    CEILING_LATCHED.with(|latched| {
+        latched.borrow_mut().insert(green_key, generation);
+    });
+}
+
 /// RPython warmstate.py maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
@@ -9581,6 +9688,14 @@ fn maybe_compile_and_run(
     // TODO: remove when JIT is stable enough to not need a kill switch.
     static NO_JIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *NO_JIT.get_or_init(|| std::env::var_os("PYRE_NO_JIT").is_some()) {
+        return None;
+    }
+    // The gates below and the decision at the end answer `None` for a green
+    // key whose cell has latched at the abort ceiling, and go on answering it
+    // for every back edge of a loop that can no longer trace. Take the cached
+    // answer instead; `CEILING_LATCHED` documents why that is the same answer.
+    let cell_generation = driver.meta_interp_mut().warm_state_mut().cell_generation();
+    if ceiling_latch_is_current(green_key, cell_generation) {
         return None;
     }
     // Not every back-edge reaching this helper passed `eval_with_jit_inner`'s
@@ -9705,8 +9820,17 @@ fn maybe_compile_and_run(
         majit_metainterp::warmstate::HotResult::RunCompiled => {
             execute_assembler(frame, green_key, loop_header_pc, driver, info, env)
         }
-        majit_metainterp::warmstate::HotResult::NotHot
-        | majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
+        majit_metainterp::warmstate::HotResult::NotHot => {
+            if driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .is_ceiling_latched(green_key)
+            {
+                record_ceiling_latch(green_key, cell_generation);
+            }
+            None
+        }
+        majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
     }
 }
 

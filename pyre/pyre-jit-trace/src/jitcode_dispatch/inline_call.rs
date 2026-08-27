@@ -6352,15 +6352,28 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // behind us and every exit below reads `result`, so the sequence
         // `find_biggest_function` pairs off cannot go out of step.  The green
         // key is the callee's function-entry key, the one
-        // `disable_noninlinable_function` is applied to.
+        // `disable_noninlinable_function` is applied to — `callee_green_key`
+        // above, minted from the `PyCode` object.
+        //
+        // `w_code`, not the inner `CodeObject` `w_code_get_ptr` hands back:
+        // the third green is the code OBJECT (`interp_jit.py` `greens =
+        // ['next_instr', 'is_being_profiled', 'pycode']`), and every other
+        // mint in the tree — the function-entry key, the back-edge merge
+        // point, `can_inline_callable` and `disable_noninlinable_function`
+        // right above — uses it.  Keying the log on the inner pointer put
+        // `find_biggest_function`'s answer in a hash no reader computes, so
+        // `note_root_trace_too_long`'s huge-function arm filed a cell that
+        // `can_inline_callable` never found, the same callee was re-inlined on
+        // the next attempt, and the root took neither the disable nor
+        // `prepare_trace_segmenting`'s permanent stamp.
         let subwalk_jd_no = crate::state::note_inline_subwalk_start(
             (
-                crate::driver::make_green_key(raw_callee_code as *const (), 0, is_being_profiled),
+                callee_green_key,
                 // The callee's greens are in scope here, so the log carries
                 // them: `disable_noninlinable_function` applies to this key,
                 // and it reaches a cell.
                 Some(crate::driver::make_green_key_typed(
-                    raw_callee_code as *const (),
+                    w_code,
                     0,
                     is_being_profiled,
                 )),

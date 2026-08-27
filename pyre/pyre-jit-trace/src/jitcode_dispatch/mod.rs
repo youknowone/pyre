@@ -3419,20 +3419,22 @@ pub fn walk<Sym: WalkSym>(
         pc = next_pc;
         // pyjitpl.py `_interpret`: `blackhole_if_trace_too_long()` runs
         // after every `run_one_step()`. This loop is that loop's counterpart —
-        // `step` is `run_one_step` — and the check came with the per-opcode
-        // tracing loop it replaced (`pyre-jit/src/eval.rs` still runs it on
-        // that path), so nothing bounded a walk that kept recording without
-        // reaching a close. `TraceCtx::is_too_long` is the `history.length() >
+        // `step` is `run_one_step` — and it is the only place the check runs:
+        // the concrete bytecode dispatch loop it replaced deliberately dropped
+        // it (`pyre-jit/src/eval.rs`, whose comment records why), so nothing
+        // else bounds a walk that keeps recording without reaching a close.
+        // `TraceCtx::is_too_long` is the `history.length() >
         // warmrunnerstate.trace_limit` test and `num_ops` is a `Vec::len`, so
         // this is one comparison per step.
         //
         // The walker layer holds `&mut TraceCtx` and cannot reach
         // `MetaInterp::blackhole_if_trace_too_long` for the full bookkeeping;
-        // `note_root_trace_too_long` carries the warm-state half, split into
-        // the loop and bridge arms `prepare_trace_segmenting` (pyjitpl.py)
-        // keeps apart. The `find_biggest_function` →
-        // `disable_noninlinable_function` half (pyjitpl.py) still only
-        // runs on the per-opcode path.
+        // `note_root_trace_too_long` performs it instead — the
+        // `find_biggest_function` → `disable_noninlinable_function` half as well
+        // as the loop and bridge arms `prepare_trace_segmenting` (pyjitpl.py)
+        // keeps apart — and stages `ABORT_TOO_LONG` so the abort handler takes
+        // the staged reason rather than running that bookkeeping a second time
+        // against the log this one has already retired.
         //
         // `blackhole_if_trace_too_long` raises AFTER `run_one_step`, so the
         // forward image must carry `pc`, the already-advanced `next_pc`, rather

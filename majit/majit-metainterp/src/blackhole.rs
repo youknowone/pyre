@@ -1215,6 +1215,24 @@ impl BlackholeInterpreter {
             self.entry_position,
         );
         let result_type = self.jitdrivers_sd[jdindex].result_type;
+        // The portal runner is published behind an `extern "C"` boundary and
+        // cannot unwind, so a raise inside it arrives in `BH_LAST_EXC_VALUE`
+        // instead of out of the call — where `blackhole.py:351-360`'s blanket
+        // `except Exception` catches upstream's real unwind and hands it to
+        // `handle_exception_in_frame`.  Clear the cell before the call and test
+        // it after, the protocol `check_residual_call_exception_after`
+        // documents and every `residual_call_*` / `inline_call_*` /
+        // `call_assembler_*` / `cond_call_*` family follows.  Without it the
+        // call's value is whatever the runner returned on its error path —
+        // `PY_NULL` — the frame leaves with that NULL installed as the result,
+        // and the exception is left unread in the cell for an unrelated
+        // opcode to clear or for `bhimpl_abort_permanent` to deliver at the
+        // wrong bytecode.
+        BH_LAST_EXC_VALUE.with(|c| c.set(0));
+        // The post-call position, where the codewriter put the can-raise
+        // opcode's `-live-` adjacency.  Read before the call: the arms below
+        // do not advance `position`, but the handler search starts here.
+        let post_call_position = self.position;
         match result_type {
             BhReturnType::Void => {
                 self.bhimpl_recursive_call_v(jdindex, gi, gr, gf, ri, rr, rf);
@@ -1236,6 +1254,11 @@ impl BlackholeInterpreter {
                 self.return_type = BhReturnType::Float;
             }
         }
+        // Upstream's raise unwinds out of `bhimpl_jit_merge_point`, so the
+        // frame does not leave on this path: the dispatch loop searches THIS
+        // frame's handlers at the post-call position first, and only a frame
+        // without one propagates.
+        check_residual_call_exception_after(self, post_call_position)?;
         Err(DispatchError::LeaveFrame)
     }
 
@@ -11974,9 +11997,12 @@ fn handler_recursive_call_i(
 ) -> Result<usize, DispatchError> {
     let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
         read_recursive_call_args(bh, code, p);
-    bh.registers_i[code[p] as usize] = bh.bhimpl_recursive_call_i(
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh.bhimpl_recursive_call_i(
         jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
     );
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_i[code[p] as usize] = result;
     Ok(p + 1)
 }
 // blackhole.py bhimpl_recursive_call_r
@@ -11987,11 +12013,14 @@ fn handler_recursive_call_r(
 ) -> Result<usize, DispatchError> {
     let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
         read_recursive_call_args(bh, code, p);
-    bh.registers_r[code[p] as usize] = bh
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh
         .bhimpl_recursive_call_r(
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         )
         .0 as i64;
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_r[code[p] as usize] = result;
     Ok(p + 1)
 }
 // blackhole.py bhimpl_recursive_call_f
@@ -12002,11 +12031,14 @@ fn handler_recursive_call_f(
 ) -> Result<usize, DispatchError> {
     let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
         read_recursive_call_args(bh, code, p);
-    bh.registers_f[code[p] as usize] = bh
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    let result = bh
         .bhimpl_recursive_call_f(
             jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
         )
         .to_bits() as i64;
+    check_residual_call_exception_after(bh, p + 1)?;
+    bh.registers_f[code[p] as usize] = result;
     Ok(p + 1)
 }
 // blackhole.py bhimpl_recursive_call_v
@@ -12017,8 +12049,10 @@ fn handler_recursive_call_v(
 ) -> Result<usize, DispatchError> {
     let (jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f, p) =
         read_recursive_call_args(bh, code, p);
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
     bh.bhimpl_recursive_call_v(
         jdindex, greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
     );
+    check_residual_call_exception_after(bh, p)?;
     Ok(p)
 }

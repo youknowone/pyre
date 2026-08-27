@@ -3900,6 +3900,20 @@ pub(crate) fn note_root_trace_too_long(
     // ever do here.
     let huge_fn = crate::driver::try_driver_pair().and_then(|(driver, _)| {
         let meta = driver.meta_interp_mut();
+        // pyjitpl.py:2831 `raise SwitchToBlackhole(ABORT_TOO_LONG)`: the raise
+        // carries the reason from here to the `_interpret` catch, and the catch
+        // never re-runs the check that produced it.  The walker's counterpart of
+        // that raise is the `DispatchError::TraceTooLong` the caller returns,
+        // which has no room for a `Counters.ABORT_*`, so the reason travels in
+        // the staging slot the abort handler consults FIRST.  Staging it is
+        // therefore not only accounting: it is what stops the handler falling
+        // through to `MetaInterp::blackhole_if_trace_too_long`, whose bookkeeping
+        // this function has just performed.  A second run reads the log this one
+        // retires below, so `find_biggest_function` answers `None` however the
+        // trace overflowed and the root takes `prepare_trace_segmenting`'s
+        // permanent `JC_FORCE_FINISH` + `JC_DONT_TRACE_HERE` even when an inlined
+        // callee was named here and disabled on its own.
+        meta.stage_abort_reason(majit_metainterp::counters::ABORT_TOO_LONG);
         // pyjitpl.py `jd_sd, greenkey_of_huge_function = self.find_biggest_function()`.
         let huge_fn = meta.find_biggest_function();
         // pyjitpl.py `self.portal_trace_positions = None` — the log's `_pos`

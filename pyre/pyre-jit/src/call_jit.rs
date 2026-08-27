@@ -1287,7 +1287,11 @@ pub extern "C" fn bh_portal_runner_c(
         );
     }
     frame.set_last_instr_from_next_instr(next_instr as usize);
-    match crate::eval::portal_runner_result(frame) {
+    // `bhimpl_recursive_call_r` performs a call the traced code made, so the
+    // frame it hands over is entering its body for the first time and owes
+    // `execute_frame`'s hook bracket.  The CRN arms below resume a frame whose
+    // activation already began and take the unbracketed entry instead.
+    match crate::eval::portal_activation_result(frame) {
         Ok(result) => result as i64,
         Err(mut err) => {
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE
@@ -2419,6 +2423,37 @@ fn leave_resumed_blackhole_frame(
     if frame_ptr.is_null() {
         return;
     }
+    leave_compiled_frame_chain(frame_ptr, got_exception);
+}
+
+/// `executioncontext.py ExecutionContext.leave`'s frame-chain half for a frame
+/// whose body ran as compiled code, shared by the blackhole resume above and by
+/// the JIT portal's own activation bracket
+/// (`eval::portal_activation_bracketed`).
+///
+/// Both close a scope whose `enter` ran somewhere the interpreter's `leave`
+/// never reaches, and both run once the compiled frame is gone — which is what
+/// makes this a narrower operation than `leave`'s own escape branch:
+///
+/// * The identity guard. `leave` reads `frame_vref` off `topframeref` and
+///   forces it; that word only names this frame while its scope is the open
+///   one. A walk that materialised an inlined callee can leave a different vref
+///   there, and the caller has no other way to find out.
+/// * No force. The guard has already established that `frame_vref` resolves to
+///   this frame, so `leave`'s `frame_vref()` has nothing left to materialize,
+///   and forcing a vref that was finished with the NULL form is exactly what
+///   `force_pyframe_vref` refuses — measured as
+///   `InvalidVirtualRef: frame-chain vref forced after its frame died` on
+///   `exception_escape_inlined_midframe_tb_node` and
+///   `exception_try_call_inlined_callee_raise`.
+/// * The caller is reached through `vref_referent` rather than `get_f_back`,
+///   which forces, for the same reason.
+///
+/// The `topframeref` restore is idempotent for the portal, whose
+/// `CurrentFrameGuard` writes back the same word from a shadow-stack slot when
+/// it drops: `install_current_frame` seeds `f_backref` from the `topframeref`
+/// it displaces, so the two agree by construction.
+fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     let ec = unsafe { (*frame_ptr).execution_context as *mut pyre_interpreter::PyExecutionContext };
     if ec.is_null() {
         return;
@@ -2435,13 +2470,6 @@ fn leave_resumed_blackhole_frame(
     // `nextblackholeinterp` therefore has to close that still-open scope. The
     // resume-data frame chain itself is not the application frame chain, and
     // releasing a BlackholeInterpreter does not restore `topframeref`.
-    //
-    // Nothing here forces a vref. The guard above already established that
-    // `frame_vref` resolves to this frame, so `leave`'s own `frame_vref()` has
-    // nothing left to materialize, and the caller is reached through
-    // `vref_referent` rather than `get_f_back`: this runs once the compiled
-    // frame is gone, and forcing a vref that was finished with the NULL form
-    // is exactly what `force_pyframe_vref` refuses.
     unsafe {
         (*ec).topframeref = (*frame_ptr).f_backref;
         if (*frame_ptr).escaped() || got_exception {
@@ -2451,6 +2479,15 @@ fn leave_resumed_blackhole_frame(
             }
         }
     }
+}
+
+/// [`leave_compiled_frame_chain`] for the JIT portal, whose frame is a `&mut`
+/// borrow rather than a blackhole's virtualizable word.
+pub(crate) fn leave_portal_frame_chain(frame: *mut PyFrame, got_exception: bool) {
+    if frame.is_null() {
+        return;
+    }
+    leave_compiled_frame_chain(frame, got_exception);
 }
 
 /// resume.py blackhole_from_resumedata parity:
@@ -4982,7 +5019,9 @@ fn bh_call_self_recursive_portal(
     let frame_ptr = create_callee_frame_in_ctx(ec, callable, args);
     let result = {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        crate::eval::portal_runner_result(frame)
+        // The frame was built on the line above, so this entry is the callee's
+        // activation and owes `execute_frame`'s hook bracket.
+        crate::eval::portal_activation_result(frame)
     };
     jit_drop_callee_frame(frame_ptr);
     Some(match result {

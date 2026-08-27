@@ -6385,6 +6385,14 @@ fn type_descr_new_with_metaclass(
         let dict_obj = unsafe { pyre_object::w_dict_copy(class_ns) };
         let dict_obj = pyre_object::gc_roots::pin_root(dict_obj);
         let w_type = pyre_object::w_type_new(name, w_effective_bases, dict_obj as *mut u8);
+        // Nothing refers to a class this young — the classcell is optional and
+        // `weak_subclasses` is weak — while the passes below allocate, so a
+        // major cycle sweeps it out from under `create_all_slots` and the
+        // barrier in `tag_subclass_instance` then writes through a freed
+        // header.  This is the `_entry_roots` scope's reasoning extended back
+        // to the construction; a type does not move, so the local stays a good
+        // address and the root is for liveness only.
+        let _ = pyre_object::gc_roots::pin_root(w_type);
         // The type allocation may have moved the namespace, so the qualname
         // pass receives the forwarded address rather than the word above.
         type_new_take_qualname(w_type, pyre_object::gc_roots::shadow_stack_get(dict_root))?;
@@ -16764,12 +16772,18 @@ type FileioStatAtOpen = ();
 
 #[cfg(unix)]
 fn fileio_store_stat_atopen(self_obj: PyObjectRef, stat: &FileioStatAtOpen) {
+    // `w_int_new` allocates once per slot, so the receiver is read back from
+    // its root between the stores rather than carried in the parameter.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_slot = pyre_object::gc_roots::pin_roots(&[self_obj]);
     for (name, value) in [
         ("__file_stat_mode__", stat.mode as i64),
         ("__file_stat_size__", stat.size as i64),
         ("__file_stat_blksize__", stat.blksize as i64),
     ] {
-        crate::baseobjspace::setdictvalue_native(self_obj, name, w_int_new(value));
+        let value = w_int_new(value);
+        let self_obj = pyre_object::gc_roots::shadow_stack_get(self_slot);
+        crate::baseobjspace::setdictvalue_native(self_obj, name, value);
     }
 }
 
@@ -18745,6 +18759,33 @@ pub fn builtin_open(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     result
 }
 
+/// A new file-wrapper instance, pinned on the shadow stack, returned as its
+/// slot index.
+///
+/// The instance cannot ride a Rust local across the attribute stores that
+/// follow it: every store builds its value by allocating, an allocation is a
+/// collection point, and nothing but this frame names the instance yet, so
+/// the collector is free to move or reclaim it between two stores.  The
+/// caller keeps a `push_roots` scope open and reads the current address back
+/// through [`file_wrapper_store`] or `shadow_stack_get`.
+fn new_rooted_file_wrapper() -> usize {
+    pyre_object::gc_roots::pin_roots(&[pyre_object::w_instance_new(file_wrapper_type())])
+}
+
+/// Store one attribute on the file wrapper rooted at `slot`.
+///
+/// `value` is already built when this runs — the caller's argument expression
+/// is what allocates — so the wrapper is read back here, after that
+/// allocation, rather than passed in.  `value` itself is pinned for the store,
+/// which allocates the attribute name.
+fn file_wrapper_store(slot: usize, name: &str, value: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_slot = pyre_object::gc_roots::pin_roots(&[value]);
+    let wrapper = pyre_object::gc_roots::shadow_stack_get(slot);
+    let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+    let _ = crate::baseobjspace::setattr_str(wrapper, name, value);
+}
+
 /// Low-level storage opener used by `W_FileIO.descr_init`.
 ///
 /// This is pyre's `_open_fd`/raw-storage boundary.  It deliberately does not
@@ -18832,18 +18873,22 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             None => true,
         };
         let binary = mode.contains('b');
-        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_int_new(fd as i64));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(closefd));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        fileio_store_stat_atopen(wrapper, &stat_atopen);
-        return Ok(wrapper);
+        let _wrapper_roots = pyre_object::gc_roots::push_roots();
+        let wrapper_slot = new_rooted_file_wrapper();
+        file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
+        file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
+        file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "encoding", w_str_new(&encoding));
+        file_wrapper_store(wrapper_slot, "errors", w_str_new(&errors));
+        file_wrapper_store(wrapper_slot, "name", w_int_new(fd as i64));
+        file_wrapper_store(wrapper_slot, "mode", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "closefd", w_bool_from(closefd));
+        file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
+        fileio_store_stat_atopen(
+            pyre_object::gc_roots::shadow_stack_get(wrapper_slot),
+            &stat_atopen,
+        );
+        return Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot));
     }
 
     if closefd_obj.map(crate::baseobjspace::is_true).transpose()? == Some(false) {
@@ -18900,17 +18945,21 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // An opener is free to ignore the flags it was handed, so the binary
         // mode `open_flags_for_mode` asked for is only guaranteed here.
         fileio_set_binary_mode(fd);
-        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
-        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        fileio_store_stat_atopen(wrapper, &stat_atopen);
-        return Ok(wrapper);
+        let _wrapper_roots = pyre_object::gc_roots::push_roots();
+        let wrapper_slot = new_rooted_file_wrapper();
+        file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
+        file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
+        file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "encoding", w_str_new(&encoding));
+        file_wrapper_store(wrapper_slot, "errors", w_str_new(&errors));
+        file_wrapper_store(wrapper_slot, "name", path_obj);
+        file_wrapper_store(wrapper_slot, "mode", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
+        fileio_store_stat_atopen(
+            pyre_object::gc_roots::shadow_stack_get(wrapper_slot),
+            &stat_atopen,
+        );
+        return Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot));
     }
 
     // The sandbox routes the whole open→read/write→close chain through the
@@ -18932,18 +18981,22 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 return Err(error);
             }
         };
-        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
-        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(true));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        fileio_store_stat_atopen(wrapper, &stat_atopen);
-        Ok(wrapper)
+        let _wrapper_roots = pyre_object::gc_roots::push_roots();
+        let wrapper_slot = new_rooted_file_wrapper();
+        file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
+        file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
+        file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "encoding", w_str_new(&encoding));
+        file_wrapper_store(wrapper_slot, "errors", w_str_new(&errors));
+        file_wrapper_store(wrapper_slot, "name", path_obj);
+        file_wrapper_store(wrapper_slot, "mode", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "closefd", w_bool_from(true));
+        file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
+        fileio_store_stat_atopen(
+            pyre_object::gc_roots::shadow_stack_get(wrapper_slot),
+            &stat_atopen,
+        );
+        Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot))
     }
     #[cfg(all(not(feature = "sandbox"), unix))]
     {
@@ -18993,18 +19046,22 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 return Err(error);
             }
         };
-        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
-        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(true));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        fileio_store_stat_atopen(wrapper, &stat_atopen);
-        Ok(wrapper)
+        let _wrapper_roots = pyre_object::gc_roots::push_roots();
+        let wrapper_slot = new_rooted_file_wrapper();
+        file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
+        file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
+        file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "encoding", w_str_new(&encoding));
+        file_wrapper_store(wrapper_slot, "errors", w_str_new(&errors));
+        file_wrapper_store(wrapper_slot, "name", path_obj);
+        file_wrapper_store(wrapper_slot, "mode", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "closefd", w_bool_from(true));
+        file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
+        fileio_store_stat_atopen(
+            pyre_object::gc_roots::shadow_stack_get(wrapper_slot),
+            &stat_atopen,
+        );
+        Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot))
     }
     #[cfg(all(not(feature = "sandbox"), windows, feature = "host_env"))]
     {
@@ -19028,19 +19085,20 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             })?
             .into_raw();
 
-        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_fd__", w_int_new(fd as i64));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+        let _wrapper_roots = pyre_object::gc_roots::push_roots();
+        let wrapper_slot = new_rooted_file_wrapper();
+        file_wrapper_store(wrapper_slot, "__file_fd__", w_int_new(fd as i64));
+        file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new(&mode));
         // Carry binary-ness so descriptor reads/readlines wrap their chunks as
         // `bytes` for `rb`; tokenize.detect_encoding relies on that result.
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "name", path_obj);
-        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closefd", w_bool_from(true));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        Ok(wrapper)
+        file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
+        file_wrapper_store(wrapper_slot, "encoding", w_str_new(&encoding));
+        file_wrapper_store(wrapper_slot, "errors", w_str_new(&errors));
+        file_wrapper_store(wrapper_slot, "name", path_obj);
+        file_wrapper_store(wrapper_slot, "mode", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "closefd", w_bool_from(true));
+        file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
+        Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot))
     }
     // Preserve the existing non-Windows fallback (notably wasm) unchanged;
     // the Windows host build above owns a real CRT descriptor instead.
@@ -19121,26 +19179,27 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
 
-        let wrapper = pyre_object::w_instance_new(file_wrapper_type());
-        let _ = crate::baseobjspace::setattr_str(
-            wrapper,
+        let _wrapper_roots = pyre_object::gc_roots::push_roots();
+        let wrapper_slot = new_rooted_file_wrapper();
+        file_wrapper_store(
+            wrapper_slot,
             "__file_data__",
             pyre_object::bytesobject::w_bytes_from_bytes(&data),
         );
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_pos__", w_int_new(0));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_name__", w_str_new(&path));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_mode__", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "__file_pos__", w_int_new(0));
+        file_wrapper_store(wrapper_slot, "__file_name__", w_str_new(&path));
+        file_wrapper_store(wrapper_slot, "__file_mode__", w_str_new(&mode));
         // Carry binary-ness so read/readline wrap their chunks as `bytes` in
         // binary mode (`'rb'`), matching the fd-backed branch above.  Without
         // this a path-backed `open(p, 'rb').readline()` would hand back `str`,
         // breaking `tokenize.detect_encoding` (`first.startswith(BOM_UTF8)`).
-        let _ = crate::baseobjspace::setattr_str(wrapper, "__file_binary__", w_bool_from(binary));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "encoding", w_str_new(&encoding));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "errors", w_str_new(&errors));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "name", w_str_new(&path));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "mode", w_str_new(&mode));
-        let _ = crate::baseobjspace::setattr_str(wrapper, "closed", w_bool_from(false));
-        Ok(wrapper)
+        file_wrapper_store(wrapper_slot, "__file_binary__", w_bool_from(binary));
+        file_wrapper_store(wrapper_slot, "encoding", w_str_new(&encoding));
+        file_wrapper_store(wrapper_slot, "errors", w_str_new(&errors));
+        file_wrapper_store(wrapper_slot, "name", w_str_new(&path));
+        file_wrapper_store(wrapper_slot, "mode", w_str_new(&mode));
+        file_wrapper_store(wrapper_slot, "closed", w_bool_from(false));
+        Ok(pyre_object::gc_roots::shadow_stack_get(wrapper_slot))
     }
 }
 

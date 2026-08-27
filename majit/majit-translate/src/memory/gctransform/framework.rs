@@ -175,6 +175,9 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "eval::portal_runner",
     "eval::portal_runner_dispatch",
     "eval::portal_runner_result",
+    "eval::portal_activation_result",
+    "eval::portal_activation_bracketed",
+    "eval::enter_portal",
     "eval::eval_loop_jit",
     // The space-level helpers most builtins reach Python through.
     "baseobjspace::call_function",
