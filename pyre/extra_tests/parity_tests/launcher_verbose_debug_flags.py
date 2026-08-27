@@ -2,10 +2,11 @@
 # answers 2 for `-dd` where 3.14 saturates `sys.flags.debug` at 1, and its
 # `parse_env` folds on `if v:`, so a `=0` from either variable enables the flag
 # there and leaves it alone here.  Its verbose banner diverges twice more:
-# `app_main.py:1032` reaches `print_banner` under a bare `if verbose:`, with no
-# `quiet` test, so `-q -v` still prints both lines there; and `print_banner`
-# writes through `sys.stderr`, so a `sitecustomize` that rebinds the attribute
-# captures the banner that `fprintf(stderr, ...)` sends to the descriptor.
+# `app_main.py run_command_line` reaches `print_banner` under a bare
+# `if verbose:`, with no `quiet` test, so `-q -v` still prints both lines
+# there; and `print_banner` writes through `sys.stderr`, so a `sitecustomize`
+# that rebinds the attribute captures the banner `fprintf(stderr, ...)` sends
+# to the descriptor.
 #
 # CPython-suite gap: `test_site` and `test_cmd_line` reach `-v` only by running
 # a subprocess with it, and both modules are outside the gated set, so a
