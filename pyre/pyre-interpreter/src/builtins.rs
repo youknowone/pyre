@@ -7252,6 +7252,7 @@ pub(crate) mod wasm_errno {
     pub const ECONNRESET: i32 = 54;
     pub const EEXIST: i32 = 17;
     pub const ENOENT: i32 = 2;
+    pub const ENOTSUP: i32 = 45;
     pub const EISDIR: i32 = 21;
     pub const ENOTDIR: i32 = 20;
     pub const EINTR: i32 = 4;
@@ -7259,6 +7260,38 @@ pub(crate) mod wasm_errno {
     pub const EPERM: i32 = 1;
     pub const ESRCH: i32 = 3;
     pub const ETIMEDOUT: i32 = 60;
+
+    /// The message `strerror` reports for one of the values above.
+    ///
+    /// wasm32 has no `strerror` and no OS error table behind
+    /// `io::Error::from_raw_os_error`, which answers every code with the same
+    /// placeholder — so an `OSError` the guest raises would read
+    /// `[Errno 2] operation successful`.  The texts are the ones the numbers
+    /// were taken from, so an errno and its message keep naming the same
+    /// condition.
+    pub fn strerror(errno: i32) -> Option<&'static str> {
+        Some(match errno {
+            EPERM => "Operation not permitted",
+            ENOENT => "No such file or directory",
+            ESRCH => "No such process",
+            EINTR => "Interrupted system call",
+            ECHILD => "No child processes",
+            EACCES => "Permission denied",
+            EEXIST => "File exists",
+            ENOTDIR => "Not a directory",
+            EISDIR => "Is a directory",
+            EPIPE => "Broken pipe",
+            EAGAIN => "Resource temporarily unavailable",
+            EINPROGRESS => "Operation now in progress",
+            EALREADY => "Operation already in progress",
+            ENOTSUP => "Operation not supported",
+            ECONNABORTED => "Software caused connection abort",
+            ECONNRESET => "Connection reset by peer",
+            ETIMEDOUT => "Operation timed out",
+            ECONNREFUSED => "Connection refused",
+            _ => return None,
+        })
+    }
 }
 
 /// On Windows `ETIMEDOUT` above is the Winsock code, and the runtime's own

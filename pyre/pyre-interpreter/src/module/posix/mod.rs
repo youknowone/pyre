@@ -38,9 +38,9 @@ pub(crate) fn stat_result_seq_type() -> PyObjectRef {
         crate::_structseq::make_struct_seq_with_extra(
             // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
             "os.stat_result",
-            // `app_posix.py:20-37` — slots 7..10 are the hidden integer
-            // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
-            // named-only extras, never indexable.
+            // `app_posix.py` `stat_result` — slots 7..10 are the hidden
+            // integer timestamps; the float `st_atime`/`st_mtime`/`st_ctime`
+            // are named-only extras, never indexable.
             &[
                 "st_mode",
                 "st_ino",
@@ -53,8 +53,8 @@ pub(crate) fn stat_result_seq_type() -> PyObjectRef {
                 "_integer_mtime",
                 "_integer_ctime",
             ],
-            // `app_posix.py:38-69` — named-only extras ordered by their
-            // `structseqfield` index (11..13, 20..23, 40..42, 50..52).
+            // `app_posix.py` `stat_result` — named-only extras ordered by
+            // their `structseqfield` index (11..13, 20..23, 40..42, 50..52).
             // `structseq_descr_new` fills surplus sequence items into
             // this list in order, so the list order must match PyPy's
             // index sort, not the build-time population order.
@@ -63,9 +63,9 @@ pub(crate) fn stat_result_seq_type() -> PyObjectRef {
                 "st_atime",
                 "st_mtime",
                 "st_ctime",
-                // `app_posix.py:45-52` — present where the platform's
-                // `struct stat` carries them (every Unix target),
-                // indices 20..23.
+                // `app_posix.py` `stat_result` — present where the
+                // platform's `struct stat` carries them (every Unix
+                // target), indices 20..23.
                 #[cfg(unix)]
                 "st_blksize",
                 #[cfg(unix)]
@@ -99,6 +99,22 @@ pub(crate) fn stat_result_seq_type() -> PyObjectRef {
             ],
         ) as usize
     }) as PyObjectRef
+}
+
+/// A filesystem name reported back to the caller: `bytes` when the path
+/// argument was `bytes` (`posixmodule.c path_converter`), else `str`.
+///
+/// The name arrives as raw bytes because `readdir`'s `d_name` is handed
+/// back unchanged. Both arms keep it openable: bytes mode returns it
+/// verbatim, and the `str` arm takes the filesystem decoding
+/// (`interp_posix.py space.newfilename(f)`), so a name like
+/// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
+pub(crate) fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
+    if bytes_mode {
+        pyre_object::bytesobject::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(name))
+    } else {
+        crate::gateway::fsdecode_filename_bytes(name)
+    }
 }
 
 /// `posix_fspath` / `PyOS_FSPath` — `str` and `bytes` pass through unchanged

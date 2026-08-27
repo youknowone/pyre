@@ -302,22 +302,9 @@ mod host_fs_provider {
             let p = path.to_string_lossy();
             unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }
         }
-        fn list_dir(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+        fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
             let p = path.to_string_lossy();
-            let size = unsafe { host_list_dir(p.as_ptr(), p.len() as u32, [].as_mut_ptr(), 0) };
-            if size < 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("{}", path.display()),
-                ));
-            }
-            let mut buf = vec![0u8; size as usize];
-            // The sizing call above and this one are two separate host reads of
-            // the same directory, so a name added between them would not fit.
-            // A short second answer is the whole list; a longer one is a
-            // directory that grew, and the names that did fit are still a
-            // valid answer for the moment it was asked.
-            let n = unsafe {
+            let call = |buf: &mut [u8]| unsafe {
                 host_list_dir(
                     p.as_ptr(),
                     p.len() as u32,
@@ -325,20 +312,34 @@ mod host_fs_provider {
                     buf.len() as u32,
                 )
             };
-            if n < 0 {
-                return Err(std::io::Error::other(format!(
-                    "host_list_dir failed: {}",
-                    path.display()
-                )));
+            let not_found =
+                || std::io::Error::new(std::io::ErrorKind::NotFound, format!("{}", path.display()));
+            let mut buf = Vec::new();
+            // The host reports the whole list's length whether or not it fitted
+            // and writes nothing when it did not, so an answer longer than the
+            // buffer is a directory that grew between the two reads and has to
+            // be asked again rather than parsed out of bytes the host never
+            // touched.  Two rounds suffice unless it keeps growing, which is
+            // what the bound is for.
+            for _ in 0..8 {
+                let size = call(&mut buf);
+                if size < 0 {
+                    return Err(not_found());
+                }
+                let size = size as usize;
+                if size <= buf.len() {
+                    buf.truncate(size);
+                    if buf.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    return Ok(buf.split(|byte| *byte == 0).map(<[u8]>::to_vec).collect());
+                }
+                buf = vec![0u8; size];
             }
-            buf.truncate((n as usize).min(buf.len()));
-            if buf.is_empty() {
-                return Ok(Vec::new());
-            }
-            Ok(buf
-                .split(|byte| *byte == 0)
-                .map(|name| std::ffi::OsString::from(String::from_utf8_lossy(name).into_owned()))
-                .collect())
+            Err(std::io::Error::other(format!(
+                "host_list_dir: {} kept growing",
+                path.display()
+            )))
         }
         fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             let p = path.to_string_lossy();

@@ -135,13 +135,18 @@ pub trait SourceProvider: Send + Sync {
         Ok(self.read_to_bytes(path)?.len() as u64)
     }
     /// Entry names of the directory at `path`, in the order the seam reports
-    /// them.
+    /// them, each as the filesystem's own bytes.
+    ///
+    /// Names are bytes rather than text because a directory entry need not
+    /// have a UTF-8 spelling and `listdir` still has to return it: the caller
+    /// decides between `bytes` and a surrogateescape-decoded `str` from the
+    /// type of the path it was given.
     ///
     /// Defaults to refusing: enumeration is the one filesystem question a
     /// provider built to answer `import`'s probes need not be able to answer,
     /// and `posix.listdir` turns the refusal into the OSError its caller
     /// expects rather than inventing an empty directory.
-    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
         let _ = path;
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -200,7 +205,7 @@ pub fn source_file_size(path: &Path) -> std::io::Result<u64> {
 }
 
 #[cfg(feature = "host_env")]
-pub fn source_list_dir(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+pub fn source_list_dir(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
     with_source_provider(|p| p.list_dir(path))
 }
 
@@ -266,9 +271,9 @@ impl SourceProvider for HostFsProvider {
     fn file_size(&self, path: &Path) -> std::io::Result<u64> {
         host_fs::metadata(path).map(|meta| meta.len())
     }
-    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
         host_fs::read_dir(path)?
-            .map(|entry| entry.map(|entry| entry.file_name()))
+            .map(|entry| entry.map(|entry| entry.file_name().as_encoded_bytes().to_vec()))
             .collect()
     }
 }

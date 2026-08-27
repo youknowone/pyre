@@ -2655,21 +2655,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .map_err(|_| crate::PyError::value_error("embedded null in path"))
     }
 
-    /// A filesystem name reported back to the caller: `bytes` when the path
-    /// argument was `bytes` (`posixmodule.c path_converter`), else `str`.
-    ///
-    /// The name arrives as raw bytes because `readdir`'s `d_name` is handed
-    /// back unchanged. Both arms keep it openable: bytes mode returns it
-    /// verbatim, and the `str` arm takes the filesystem decoding
-    /// (`interp_posix.py space.newfilename(f)`), so a name like
-    /// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
-    fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
-        if bytes_mode {
-            pyre_object::bytesobject::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(name))
-        } else {
-            crate::gateway::fsdecode_filename_bytes(name)
-        }
-    }
+    // Both arms name their directory entries the same way, so the one
+    // implementation lives beside the `stat_result` they also share.
+    use super::fs_name_obj;
 
     /// interp_posix.py `unwrap_fd`.
     ///

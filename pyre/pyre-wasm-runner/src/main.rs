@@ -1791,8 +1791,9 @@ fn host_read(
 ///
 /// The length is reported whether or not it fitted, so an undersized buffer is
 /// a retry rather than a truncation — the same protocol `host_stdlib_root`
-/// uses. A name with no UTF-8 spelling is skipped: the guest addresses the
-/// host through `String` paths and could not name it back.
+/// uses. Names travel as the filesystem's own bytes, NUL being the one byte no
+/// name can contain, so one with no UTF-8 spelling still reaches the guest and
+/// is decoded there the way every other target decodes a filename.
 fn host_list_dir(
     caller: &mut Caller<'_, Host>,
     path_ptr: u32,
@@ -1807,14 +1808,17 @@ fn host_list_dir(
         return -1;
     };
     let mut packed: Vec<u8> = Vec::new();
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
+    for entry in entries {
+        // An error raised part-way through the walk leaves a listing that is
+        // short without saying so, which the guest would report as the whole
+        // directory.
+        let Ok(entry) = entry else {
+            return -1;
         };
         if !packed.is_empty() {
             packed.push(0);
         }
-        packed.extend_from_slice(name.as_bytes());
+        packed.extend_from_slice(entry.file_name().as_encoded_bytes());
     }
     if packed.len() > buf_cap as usize {
         return packed.len() as i64;

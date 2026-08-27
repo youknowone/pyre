@@ -7,10 +7,10 @@
 //! This module publishes that seam under the names `os.py` reads.
 //!
 //! The list is exactly what `os.py`'s module body needs to run — `environ`,
-//! `_have_functions`, `stat` and `cpu_count` — plus `lstat` and
-//! `stat_result`.  Everything else `os` normally re-exports stays absent, so
-//! `os._exists` answers False for it and `os` builds the same fallbacks it
-//! builds on a platform whose C library lacks the call.
+//! `_have_functions`, `stat` and `cpu_count` — plus `lstat`, `listdir`,
+//! `fspath` and `stat_result`.  Everything else `os` normally re-exports
+//! stays absent, so `os._exists` answers False for it and `os` builds the
+//! same fallbacks it builds on a platform whose C library lacks the call.
 //!
 //! [`SourceProvider`]: crate::importing::SourceProvider
 
@@ -22,8 +22,9 @@ use pyre_object::{PyObjectRef, is_none};
 const S_IFDIR: i64 = 0o040000;
 const S_IFREG: i64 = 0o100000;
 
-/// `posix.stat(path)` — build a `stat_result` from the two facts the seam
-/// reports.
+/// `posix.stat(path, *, dir_fd=None, follow_symlinks=True)` /
+/// `posix.lstat(path, *, dir_fd=None)` — build a `stat_result` from the two
+/// facts the seam reports.
 ///
 /// `st_mode` carries the file type and a read-only permission set, and
 /// `st_size` the byte length; every other field is zero, including all three
@@ -31,26 +32,78 @@ const S_IFREG: i64 = 0o100000;
 /// self-consistent rather than merely absent: `linecache.checkcache` compares
 /// a cached entry against a fresh `stat` of the same file, so equal values
 /// keep the entry valid instead of invalidating it on every check.
-fn stat(w_path: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    let bytes = crate::gateway::fsencode_bytes_w(w_path)?;
-    // The seam takes a `Path`, which on wasm32 is UTF-8; a path byte with no
-    // UTF-8 spelling cannot address a host file through it either way.
-    let text = String::from_utf8_lossy(&bytes);
-    let path = std::path::Path::new(text.as_ref());
+///
+/// The seam takes a name and nothing else, so it is the platform without
+/// `fstatat` and without `fstat`: `dir_fd` is refused the way
+/// `_DirFD_Unavailable` refuses it, and a descriptor is not one of the types
+/// the argument accepts.  `follow_symlinks` is accepted and has no effect —
+/// the seam resolves a path without reporting whether it went through a
+/// symlink, which is the same reason `lstat` can only answer what `stat`
+/// answers.
+fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate::PyError> {
+    let name = if default_follow { "stat" } else { "lstat" };
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let allowed: &[&str] = if default_follow {
+        &["path", "dir_fd", "follow_symlinks"]
+    } else {
+        &["path", "dir_fd"]
+    };
+    crate::builtins::kwarg_reject_unknown(kwargs, allowed, name)?;
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes at most 1 positional argument ({} given)",
+            pos.len()
+        )));
+    }
+    let Some(w_path) = crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", name, 1)? else {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() missing required argument 'path' (pos 1)"
+        )));
+    };
+    // Unwrapped in signature order, because `__fspath__` for `path` and
+    // `__index__` for `dir_fd` can both raise and both run user code.
+    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, name, false)?;
+    if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
+        return Err(crate::PyError::not_implemented(
+            "dir_fd unavailable on this platform",
+        ));
+    }
+    if let Some(v) = crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+        crate::baseobjspace::is_true(v)?;
+    }
+    let path = std::path::Path::new(path_str(&resolved.as_bytes));
     let (mode, size) = if crate::importing::source_is_dir(path) {
         (S_IFDIR | 0o555, 0)
     } else {
         match crate::importing::source_file_size(path) {
             Ok(size) => (S_IFREG | 0o444, size as i64),
-            Err(_) => {
-                return Err(crate::PyError::os_error_syscall(
-                    crate::builtins::wasm_errno::ENOENT,
-                    pyre_object::w_str_new(&text),
-                ));
-            }
+            // The seam reports why it could not answer, and the path object the
+            // caller passed is what names the failure.
+            Err(e) => return Err(seam_error(&e, resolved.w_path())),
         }
     };
     Ok(make_stat_result(mode, size))
+}
+
+/// The seam takes a `&Path`, which on wasm32 is UTF-8; a path byte with no
+/// UTF-8 spelling cannot address a host file through it either way, so the
+/// lossy spelling is what the seam is asked about and the error it gives back
+/// is reported against the caller's own path object.
+fn path_str(bytes: &[u8]) -> &str {
+    std::str::from_utf8(bytes).unwrap_or("")
+}
+
+/// The seam's `io::Error` as the OSError it stands for, named by the path
+/// object the caller passed rather than by a re-decoded spelling of it.
+///
+/// A provider that answers `import`'s probes need not be able to enumerate a
+/// directory, and refusing is not the same answer as a missing one.
+fn seam_error(e: &std::io::Error, w_path: PyObjectRef) -> crate::PyError {
+    let errno = match e.kind() {
+        std::io::ErrorKind::Unsupported => crate::builtins::wasm_errno::ENOTSUP,
+        _ => crate::builtins::wasm_errno::ENOENT,
+    };
+    crate::PyError::os_error_syscall(crate::builtins::io_error_posix_errno(e, errno), w_path)
 }
 
 /// The `stat_result` layout of [`super::stat_result_seq_type`] with the
@@ -84,37 +137,38 @@ fn make_stat_result(mode: i64, size: i64) -> PyObjectRef {
     crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
 }
 
-/// `posix.listdir(path)` — the entry names the seam reports, in its order.
+/// `posix.listdir(path=None)` — the entry names the seam reports, in its
+/// order.
 ///
-/// `os.listdir` defaults its argument to the current directory, which this
-/// target does not have; a call with no path is refused rather than answered
-/// about some invented one.
-fn listdir(w_path: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-    if w_path.is_null() || unsafe { is_none(w_path) } {
-        return Err(crate::PyError::os_error_syscall(
-            crate::builtins::wasm_errno::ENOENT,
-            pyre_object::PY_NULL,
-        ));
+/// The omitted argument is the `None` the signature names, which resolves to
+/// `"."`; the guest has no `getcwd` to spell that any other way, so what it
+/// stands for is whatever directory the embedder started in.  A `bytes` path
+/// asks for `bytes` names, as it does on every other target.
+fn listdir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["path"], "listdir")?;
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "listdir() takes at most 1 argument ({} given)",
+            pos.len()
+        )));
     }
-    let bytes = crate::gateway::fsencode_bytes_w(w_path)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let path = std::path::Path::new(text.as_ref());
-    let entries = crate::importing::source_list_dir(path).map_err(|_| {
-        crate::PyError::os_error_syscall(
-            crate::builtins::wasm_errno::ENOENT,
-            pyre_object::w_str_new(&text),
-        )
-    })?;
-    let _roots = pyre_object::gc_roots::push_roots();
-    let names: Vec<PyObjectRef> = entries
-        .iter()
-        .map(|name| pyre_object::w_str_new(&name.to_string_lossy()))
-        .collect();
-    let first = pyre_object::gc_roots::pin_roots(&names);
-    let rooted = (0..names.len())
-        .map(|index| pyre_object::gc_roots::shadow_stack_get(first + index))
-        .collect();
-    Ok(pyre_object::w_list_new(rooted))
+    let w_path = crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", "listdir", 1)?
+        .unwrap_or(pyre_object::w_none());
+    // One resolution yields both the path and its bytes-ness, so `__fspath__`
+    // runs exactly once.
+    let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(w_path, "listdir", false)?;
+    let bytes_mode = unsafe { resolved.is_bytes() };
+    let path = std::path::Path::new(path_str(&resolved.as_bytes));
+    let entries =
+        crate::importing::source_list_dir(path).map_err(|e| seam_error(&e, resolved.w_path()))?;
+    // Each name is freshly allocated and the next one allocates again, so they
+    // are pinned as they arrive.
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for name in &entries {
+        items.push(super::fs_name_obj(bytes_mode, name));
+    }
+    Ok(pyre_object::w_list_new(items.take()))
 }
 
 pub fn register_module(ns: PyObjectRef) {
@@ -129,34 +183,22 @@ pub fn register_module(ns: PyObjectRef) {
     // no call here takes a directory or a descriptor argument.
     crate::module_ns_store(ns, "_have_functions", pyre_object::w_list_new(vec![]));
     crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
+    // `follow_symlinks` and `dir_fd` are keyword-only, so neither entry point
+    // can take the fixed-arity carrier that rejects keywords.
     crate::module_ns_store(
         ns,
         "stat",
-        crate::make_builtin_function_with_arity(
-            "stat",
-            |args| stat(args.first().copied().unwrap_or(pyre_object::w_none())),
-            1,
-        ),
+        crate::make_builtin_function("stat", |args| stat(args, true)),
     );
-    // The seam resolves a path without reporting whether it went through a
-    // symlink, so `lstat` can only answer what `stat` answers.
     crate::module_ns_store(
         ns,
         "lstat",
-        crate::make_builtin_function_with_arity(
-            "lstat",
-            |args| stat(args.first().copied().unwrap_or(pyre_object::w_none())),
-            1,
-        ),
+        crate::make_builtin_function("lstat", |args| stat(args, false)),
     );
     crate::module_ns_store(
         ns,
         "listdir",
-        crate::make_builtin_function_with_arity(
-            "listdir",
-            |args| listdir(args.first().copied().unwrap_or(pyre_object::PY_NULL)),
-            1,
-        ),
+        crate::make_builtin_function("listdir", listdir),
     );
     // `_bootstrap_external` reads `_os.fspath`, not `os.fspath`, so the
     // pure-Python fallback `os.py` installs when `posix` lacks it does not
