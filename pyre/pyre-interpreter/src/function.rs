@@ -3459,6 +3459,14 @@ pub fn register_object_class_method(name: &'static str, function: PyObjectRef) {
 }
 
 /// The name `object` publishes `function` under, if it publishes it at all.
+///
+/// This process-global registry is the runtime metadata carrier for the
+/// documented CPython-3.14 METH_CLASS observable above.  It is not a
+/// trace-time constant: keep its mutex and moving-GC root table behind one
+/// residual lookup, just as PyPy keeps host/runtime metadata operations out of
+/// the object-space trace.  The returned static name remains ordinary data to
+/// the caller.
+#[majit_macros::dont_look_inside]
 fn object_class_method_name(function: PyObjectRef) -> Option<&'static str> {
     OBJECT_CLASS_METHODS
         .lock()

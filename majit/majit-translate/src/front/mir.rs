@@ -31888,6 +31888,90 @@ mod tests {
         );
     }
 
+    /// Native lock acquisition and the process-global method metadata lookup
+    /// are genuine runtime boundaries.  PyPy reaches the former through
+    /// `rthread.py`'s `llexternal` calls; none may expose Rust's
+    /// `Result<_, PoisonError<_>>::unwrap_or_else` shell to the source graph.
+    #[test]
+    #[ignore]
+    fn native_lock_and_method_metadata_leaves_are_residual() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let residuals = super::dont_look_inside_set_of(&llbc);
+        for expected in [
+            "module::_queue::queue_lock",
+            "module::_queue::simplequeue_wait_for_item",
+            "module::thread::lock_class::lock_state",
+            "module::thread::lock_class::<Impl>::acquire_timed",
+            "module::thread::rlock_class::lock_state",
+            "module::thread::rlock_class::<Impl>::acquire_timed",
+            "function::object_class_method_name",
+        ] {
+            assert!(
+                residuals.contains(expected),
+                "native/runtime leaf {expected} must remain residual; got {residuals:?}"
+            );
+        }
+    }
+
+    /// PyPy's deque mutation marker is an object-resident `lock` identity:
+    /// `modified` stores None, `getlock` lazily stores a new fieldless object,
+    /// and `checklock` compares that field by identity.  The Rust source graph
+    /// must therefore expose ordinary field traffic, never the former
+    /// counter's `core::ptr::read_volatile` shell.
+    #[test]
+    #[ignore]
+    fn deque_mutation_marker_uses_pypy_lock_identity_fields() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for name in [
+            "pyre_interpreter::module::_collections::modified",
+            "pyre_interpreter::module::_collections::lock_valid",
+        ] {
+            let graph = super::lower_function(&llbc, name)
+                .unwrap_or_else(|error| panic!("lower {name}: {error}"));
+            assert!(
+                !graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if super::fmt_path_ends_with(segments, &["ptr", "read_volatile"])
+                                || super::fmt_path_ends_with(segments, &["ptr", "write_volatile"])
+                        )
+                    }),
+                "{name}: PyPy lock identity must not retain volatile-counter calls"
+            );
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
+                                if field.name == "lock"
+                        )
+                    }),
+                "{name}: expected an object-resident W_Deque.lock access"
+            );
+        }
+    }
+
     /// RPython evaluates `SHIFT`, `HASH_BITS`, `_HASH_SHIFT`, and
     /// `HASH_MODULUS` while building `_hash_long`'s flow graph.  The extracted
     /// Rust graph must likewise contain their integer literals, not synthetic

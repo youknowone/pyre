@@ -518,7 +518,10 @@ mod tests {
                 result: Some(actual),
                 kind:
                     OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                        target:
+                            CallTarget::SyntheticTransparentCtor {
+                                name, owner_path, ..
+                            },
                         result_ty: ValueType::Ref(Some(result_root)),
                         ..
                     },
@@ -553,7 +556,10 @@ mod tests {
                 result: Some(actual),
                 kind:
                     OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                        target:
+                            CallTarget::SyntheticTransparentCtor {
+                                name, owner_path, ..
+                            },
                         result_ty: ValueType::Ref(Some(result_root)),
                         ..
                     },

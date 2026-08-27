@@ -682,15 +682,6 @@ const RPY_LOCK_FAILURE: i64 = 0;
 const RPY_LOCK_ACQUIRED: i64 = 1;
 const RPY_LOCK_INTR: i64 = 2;
 
-/// A `pthread_mutex_t` has no poison state — `thread_pthread.c` inspects only
-/// the status code — so a panic taken while lock bookkeeping was held must not
-/// turn every later acquire into an error.
-fn lock_state<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// `os_lock.py parse_acquire_args`.  The result is the `microseconds`
 /// argument of the `RPyThreadAcquireLockTimed` ABI: negative blocks forever,
 /// zero polls once.
@@ -821,6 +812,18 @@ mod lock_class {
     // would swallow exactly the wakeup that carries the interrupt.
     use std::sync::{Condvar, Mutex};
 
+    /// Native mutex acquisition is the residual `RPyThreadAcquireLock*`
+    /// primitive (`rpython/rlib/rthread.py:60-90,160-200`).  Keep the Python
+    /// lock algorithms visible while hiding Rust's poison-Result ABI inside
+    /// the same external boundary.  A `pthread_mutex_t` has no poison state,
+    /// so recovery returns the guard exactly as the platform primitive does.
+    #[majit_macros::dont_look_inside]
+    fn lock_state(mutex: &Mutex<bool>) -> std::sync::MutexGuard<'_, bool> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     // CPython 3.14 Modules/_threadmodule.c builds lock_type_spec as an
     // immutable module heap type.
     #[crate::pyre_class("_thread.lock", cpython_heaptype)]
@@ -848,6 +851,7 @@ mod lock_class {
         /// `thread_pthread.c:427-485 RPyThreadAcquireLockTimed`, the mutex and
         /// condition-variable build — the shape this lock has — with
         /// `intr_flag=1`, which is what `rthread.py:195` passes.
+        #[majit_macros::dont_look_inside]
         fn acquire_timed(&self, microseconds: i64) -> i64 {
             // A potentially blocking native lock wait leaves the collector's
             // RUNNING census.  This does not serialize Python execution.  The
@@ -968,6 +972,17 @@ mod rlock_class {
         owner: i64,
     }
 
+    /// RLock bookkeeping is visible to the generated JIT, but acquiring its
+    /// native mutex is the same residual `RPyThreadAcquireLock*` primitive as
+    /// the non-recursive lock.  Rust poisoning has no RPython counterpart and
+    /// stays inside this host boundary.
+    #[majit_macros::dont_look_inside]
+    fn lock_state(mutex: &Mutex<RLockState>) -> std::sync::MutexGuard<'_, RLockState> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     // Modules/_threadmodule.c builds rlock_type_spec as immutable heap type.
     #[crate::pyre_class("_thread.RLock", cpython_heaptype)]
     #[derive(Default)]
@@ -1003,6 +1018,7 @@ mod rlock_class {
         /// because the GIL serializes them; free-threaded pyre has no such
         /// serialization, so ownership is claimed under the same mutex the
         /// wait releases — the place `thread_pthread.c:479` sets `locked`.
+        #[majit_macros::dont_look_inside]
         fn acquire_timed(&self, microseconds: i64, ident: i64) -> i64 {
             let _blocked = before_external_block();
             let mut state = lock_state(&self.state);
