@@ -1102,7 +1102,37 @@ fn run_frame_through_portal(frame_ptr: i64) -> i64 {
         "CALL_ASSEMBLER arg 0 must be the callee PyFrame"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let result = crate::eval::portal_runner(frame);
+    // `ll_portal_runner` is an activation entry: it charges recursion,
+    // installs the frame, and consults function-entry warmstate, and that last
+    // step can run the very compiled function whose call arrived here.  When
+    // the frame handed over is the one this thread is already running, that is
+    // a second activation of one frame, and the compiled body reaching this
+    // call again opens a third: the nesting grows until the stack check
+    // raises, leaving the frame's `next_instr` past operands no activation
+    // pushed.  `warmspot.py handle_jitexception` draws the same distinction
+    // when it calls `portal_ptr` instead of `ll_portal_runner`; resume the
+    // body of the activation that already exists.
+    //
+    // `CURRENT_FRAME` is the test, not the `topframeref` chain: the trace
+    // records `ExecutionContext.enter` for the callee frame it builds, so a
+    // legitimately fresh callee IS the chain's top by the time it gets here,
+    // while only an interpreter or portal activation installs `CURRENT_FRAME`.
+    let already_running = std::ptr::eq(
+        pyre_interpreter::eval::current_frame(),
+        frame as *mut PyFrame,
+    );
+    let outcome = if already_running {
+        crate::eval::portal_body_result(frame)
+    } else {
+        crate::eval::portal_activation_result(frame)
+    };
+    let result = match outcome {
+        Ok(r) => r,
+        Err(mut err) => {
+            store_jit_exception(err.to_exc_object() as i64);
+            pyre_object::PY_NULL
+        }
+    };
 
     // warmspot.py:449 result_type=REF: always boxed Ref
     result as i64
