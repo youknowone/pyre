@@ -153,6 +153,15 @@ pub trait SourceProvider: Send + Sync {
             "this source provider cannot list a directory",
         ))
     }
+    /// The directory a relative path is resolved against, as the filesystem's
+    /// own bytes.
+    ///
+    /// Defaults to none: a provider serving an in-memory image has no working
+    /// directory to report, and `posix.getcwd` says so rather than naming a
+    /// directory that does not exist.
+    fn cwd(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 #[cfg(feature = "host_env")]
@@ -207,6 +216,11 @@ pub fn source_file_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(feature = "host_env")]
 pub fn source_list_dir(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
     with_source_provider(|p| p.list_dir(path))
+}
+
+#[cfg(feature = "host_env")]
+pub fn source_cwd() -> Option<Vec<u8>> {
+    with_source_provider(|p| p.cwd())
 }
 
 /// [`read_source_bytes`] decoded as plain UTF-8, for callers that hold a

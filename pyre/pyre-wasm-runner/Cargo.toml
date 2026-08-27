@@ -32,3 +32,6 @@ wasmi = "1.1"
 # Content hash binding the `.cwasm` cache to the exact `.wasm` bytes it was
 # compiled from, so a stale or pre-placed cache is never deserialized.
 sha2 = "0.10"
+# The entropy `pyre_host.host_random` serves the guest. wasm32-unknown-unknown
+# has no OS entropy, so the guest's `os.urandom` and `secrets` are this call.
+getrandom = { workspace = true }

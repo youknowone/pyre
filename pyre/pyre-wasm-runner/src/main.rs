@@ -1749,7 +1749,102 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
          -> i64 { host_list_dir(&mut caller, path_ptr, path_len, buf_ptr, buf_cap) },
     )?;
 
+    linker.func_wrap(
+        "pyre_host",
+        "host_cwd",
+        |mut caller: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> i64 {
+            host_cwd(&mut caller, buf_ptr, buf_cap)
+        },
+    )?;
+    linker.func_wrap(
+        "pyre_host",
+        "host_random",
+        |mut caller: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> i32 {
+            host_random(&mut caller, buf_ptr, buf_cap)
+        },
+    )?;
+
+    // Host clock imports.  wasm32 has neither a `SystemTime` nor an `Instant`,
+    // so `time` -- and every stdlib module that imports it -- reads the clock
+    // here.  See `pyre-wasm`'s `host_clock`.
+    linker.func_wrap("pyre_host", "host_time_ns", || -> i64 { host_time_ns() })?;
+    linker.func_wrap("pyre_host", "host_monotonic_ns", || -> i64 {
+        host_monotonic_ns()
+    })?;
+    linker.func_wrap("pyre_host", "host_sleep_ns", |nanos: i64| {
+        host_sleep_ns(nanos)
+    })?;
+
     Ok(linker)
+}
+
+/// `pyre_host.host_random`: fill the guest buffer with host entropy.
+///
+/// wasm32-unknown-unknown has no OS entropy of its own, so `os.urandom`,
+/// `secrets` and the string hash key all end up here.
+fn host_random(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i32 {
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    let mut bytes = vec![0u8; buf_cap as usize];
+    if getrandom::fill(&mut bytes).is_err() {
+        return -1;
+    }
+    match memory.write(&mut *caller, buf_ptr as usize, &bytes) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// `pyre_host.host_cwd`: write the runner's working directory into the guest
+/// buffer, reporting its length whether or not it fitted.
+fn host_cwd(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i64 {
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return -1;
+    };
+    let bytes = cwd.as_os_str().as_encoded_bytes();
+    if bytes.len() > buf_cap as usize {
+        return bytes.len() as i64;
+    }
+    match memory.write(&mut *caller, buf_ptr as usize, bytes) {
+        Ok(()) => bytes.len() as i64,
+        Err(_) => -1,
+    }
+}
+
+/// `pyre_host.host_time_ns`: nanoseconds since the unix epoch.
+///
+/// The guest has no `SystemTime` of its own -- reading one panics there --
+/// so the wall clock it reports is this one.
+fn host_time_ns() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos().min(i64::MAX as u128) as i64,
+        Err(_) => -1,
+    }
+}
+
+/// `pyre_host.host_monotonic_ns`: nanoseconds since the runner started.
+///
+/// The origin is taken at the first call and kept for the run, which is all
+/// `time.monotonic()` asks of it: only differences are meaningful, and they
+/// have to not go backwards.
+fn host_monotonic_ns() -> i64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+
+/// `pyre_host.host_sleep_ns`: block the guest for `nanos` nanoseconds.
+fn host_sleep_ns(nanos: i64) {
+    if nanos > 0 {
+        std::thread::sleep(std::time::Duration::from_nanos(nanos as u64));
+    }
 }
 
 /// Read a host path argument out of wasm linear memory as the filesystem name

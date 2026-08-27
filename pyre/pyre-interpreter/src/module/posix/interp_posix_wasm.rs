@@ -6,11 +6,13 @@
 //! resolves modules with and traceback rendering reads source lines with.
 //! This module publishes that seam under the names `os.py` reads.
 //!
-//! The list is exactly what `os.py`'s module body needs to run — `environ`,
+//! The list is what `os.py`'s module body needs to run — `environ`,
 //! `_have_functions`, `stat` and `cpu_count` — plus `lstat`, `listdir`,
-//! `fspath` and `stat_result`.  Everything else `os` normally re-exports
-//! stays absent, so `os._exists` answers False for it and `os` builds the
-//! same fallbacks it builds on a platform whose C library lacks the call.
+//! `fspath` and `stat_result`, and the three calls the stdlib reaches for
+//! that the embedder can still answer: `getcwd`, `getcwdb` and `urandom`.
+//! Everything else `os` normally re-exports stays absent, so `os._exists`
+//! answers False for it and `os` builds the same fallbacks it builds on a
+//! platform whose C library lacks the call.
 //!
 //! [`SourceProvider`]: crate::importing::SourceProvider
 
@@ -219,4 +221,61 @@ pub fn register_module(ns: PyObjectRef) {
             0,
         ),
     );
+    // The seam reports the embedder's working directory; without one there is
+    // no directory to name, and `""` is what the syscall arm returns when the
+    // host refuses too.  `posixpath.abspath` is this call, so every relative
+    // path the stdlib resolves goes through it.
+    crate::module_ns_store(
+        ns,
+        "getcwd",
+        crate::make_builtin_function_with_arity(
+            "getcwd",
+            |_args| Ok(crate::gateway::fsdecode_filename_bytes(&cwd_bytes())),
+            0,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "getcwdb",
+        crate::make_builtin_function_with_arity(
+            "getcwdb",
+            |_args| Ok(pyre_object::w_bytes_from_bytes(&cwd_bytes())),
+            0,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "urandom",
+        crate::make_builtin_function_with_arity("urandom", urandom, 1),
+    );
+}
+
+/// The embedder's working directory, or nothing when it reports none.
+fn cwd_bytes() -> Vec<u8> {
+    crate::importing::source_cwd().unwrap_or_default()
+}
+
+/// `posix.urandom(n)` — the same entry point the syscall arm publishes, over
+/// the entropy the embedder supplies.
+///
+/// `random.Random()` and `secrets` are both this call, so a guest without it
+/// cannot import either; the bytes are the host's, not a stream the guest
+/// generates, because that is what the callers are asking for.
+fn urandom(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    crate::gateway::check_declared_arity("urandom", 1, args.len())?;
+    let n = crate::builtins::space_index_w(args[0])?;
+    if n < 0 {
+        return Err(crate::PyError::value_error("negative argument not allowed"));
+    }
+    let n =
+        usize::try_from(n).map_err(|_| crate::PyError::overflow_error("argument out of range"))?;
+    // Reporting an entropy failure rather than absorbing it: the alternative
+    // is handing a caller who asked for unpredictable bytes a buffer of zeros.
+    let buf = crate::importing::host::os::urandom(n).map_err(|e| {
+        crate::PyError::os_error_syscall(
+            crate::builtins::io_error_posix_errno(&e, crate::builtins::wasm_errno::ENOTSUP),
+            pyre_object::w_none(),
+        )
+    })?;
+    Ok(pyre_object::w_bytes_from_bytes(&buf))
 }
