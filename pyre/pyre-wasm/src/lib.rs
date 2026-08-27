@@ -282,13 +282,17 @@ mod host_fs_provider {
 
     struct HostFsProvider;
 
+    /// Every path crosses as the bytes an `OsStr` is on this target, not as a
+    /// text spelling of them, so a name with no UTF-8 spelling reaches the
+    /// host intact -- the direction back, `host_list_dir`, already hands such
+    /// names to the guest.
     impl SourceProvider for HostFsProvider {
         fn is_file(&self, path: &Path) -> bool {
-            let p = path.to_string_lossy();
+            let p = path.as_os_str().as_encoded_bytes();
             unsafe { host_file_size(p.as_ptr(), p.len() as u32) >= 0 }
         }
         fn file_size(&self, path: &Path) -> std::io::Result<u64> {
-            let p = path.to_string_lossy();
+            let p = path.as_os_str().as_encoded_bytes();
             let size = unsafe { host_file_size(p.as_ptr(), p.len() as u32) };
             match size < 0 {
                 true => Err(std::io::Error::new(
@@ -299,11 +303,11 @@ mod host_fs_provider {
             }
         }
         fn is_dir(&self, path: &Path) -> bool {
-            let p = path.to_string_lossy();
+            let p = path.as_os_str().as_encoded_bytes();
             unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }
         }
         fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
-            let p = path.to_string_lossy();
+            let p = path.as_os_str().as_encoded_bytes();
             let call = |buf: &mut [u8]| unsafe {
                 host_list_dir(
                     p.as_ptr(),
@@ -342,7 +346,7 @@ mod host_fs_provider {
             )))
         }
         fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-            let p = path.to_string_lossy();
+            let p = path.as_os_str().as_encoded_bytes();
             let size = unsafe { host_file_size(p.as_ptr(), p.len() as u32) };
             if size < 0 {
                 return Err(std::io::Error::new(

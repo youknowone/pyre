@@ -19165,7 +19165,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // resolves modules with: `open()` reaches exactly the files an
                 // import could, and no others.
                 let _ = binary;
-                match crate::importing::read_source_bytes(std::path::Path::new(&path)) {
+                // The bytes the caller spelled, not a re-decoded copy of them:
+                // a name `listdir` reported is a name `open` can be called
+                // with again, whatever bytes it spells.
+                let seam_path = crate::gateway::os_string_from_fs_bytes(path_bytes);
+                match crate::importing::read_source_bytes(std::path::Path::new(&seam_path)) {
                     Ok(bytes) => bytes,
                     Err(_e) if writing => Vec::new(),
                     Err(e) => {

@@ -71,11 +71,11 @@ fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate
     if let Some(v) = crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
         crate::baseobjspace::is_true(v)?;
     }
-    let path = std::path::Path::new(path_str(&resolved.as_bytes));
-    let (mode, size) = if crate::importing::source_is_dir(path) {
+    let path = seam_path(&resolved.as_bytes);
+    let (mode, size) = if crate::importing::source_is_dir(&path) {
         (S_IFDIR | 0o555, 0)
     } else {
-        match crate::importing::source_file_size(path) {
+        match crate::importing::source_file_size(&path) {
             Ok(size) => (S_IFREG | 0o444, size as i64),
             // The seam reports why it could not answer, and the path object the
             // caller passed is what names the failure.
@@ -85,12 +85,12 @@ fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate
     Ok(make_stat_result(mode, size))
 }
 
-/// The seam takes a `&Path`, which on wasm32 is UTF-8; a path byte with no
-/// UTF-8 spelling cannot address a host file through it either way, so the
-/// lossy spelling is what the seam is asked about and the error it gives back
-/// is reported against the caller's own path object.
-fn path_str(bytes: &[u8]) -> &str {
-    std::str::from_utf8(bytes).unwrap_or("")
+/// The seam takes a `&Path`, and on this target an `OsStr` is the byte string
+/// itself, so the filesystem bytes cross it whole rather than through a text
+/// spelling that a name without one would not survive: an entry `listdir`
+/// reported is an entry `stat` can be called with again.
+fn seam_path(bytes: &[u8]) -> std::path::PathBuf {
+    crate::gateway::os_string_from_fs_bytes(bytes).into()
 }
 
 /// The seam's `io::Error` as the OSError it stands for, named by the path
@@ -159,9 +159,9 @@ fn listdir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // runs exactly once.
     let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(w_path, "listdir", false)?;
     let bytes_mode = unsafe { resolved.is_bytes() };
-    let path = std::path::Path::new(path_str(&resolved.as_bytes));
+    let path = seam_path(&resolved.as_bytes);
     let entries =
-        crate::importing::source_list_dir(path).map_err(|e| seam_error(&e, resolved.w_path()))?;
+        crate::importing::source_list_dir(&path).map_err(|e| seam_error(&e, resolved.w_path()))?;
     // Each name is freshly allocated and the next one allocates again, so they
     // are pinned as they arrive.
     let mut items = pyre_object::gc_roots::RootedItems::new();

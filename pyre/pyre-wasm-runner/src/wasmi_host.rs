@@ -355,12 +355,31 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
     Ok(linker)
 }
 
-/// Read a host path argument out of wasm linear memory as a `String`.
-fn host_path(caller: &mut Caller<'_, Host>, path_ptr: u32, path_len: u32) -> Option<String> {
+/// Read a host path argument out of wasm linear memory as the filesystem name
+/// it spells.
+///
+/// The guest sends the bytes its own `OsStr` is.  On unix those are the bytes
+/// the filesystem takes, and a name with no UTF-8 spelling is one
+/// `host_list_dir` can report -- so it has to be one this can take back.
+fn host_path(
+    caller: &mut Caller<'_, Host>,
+    path_ptr: u32,
+    path_len: u32,
+) -> Option<std::ffi::OsString> {
     let memory = caller.data().memory?;
     let mut bytes = vec![0u8; path_len as usize];
     memory.read(&*caller, path_ptr as usize, &mut bytes).ok()?;
-    String::from_utf8(bytes).ok()
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::ffi::OsString::from_vec(bytes))
+    }
+    // A Windows name is UTF-16, so bytes with no UTF-8 spelling name nothing
+    // there and are refused rather than guessed at.
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(std::ffi::OsString::from)
+    }
 }
 
 /// `pyre_host.host_stdlib_root`: write `$PYRE_STDLIB` into the wasm buffer.

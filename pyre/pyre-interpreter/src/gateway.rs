@@ -1772,9 +1772,12 @@ pub fn os_string_from_fs_bytes(data: &[u8]) -> std::ffi::OsString {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        // No byte spelling on this platform, so the name can only be carried
-        // as the best text representation of these bytes.
-        std::ffi::OsString::from(String::from_utf8_lossy(data).into_owned())
+        // Outside Windows an `OsStr` IS the byte string, on wasm32 as much as
+        // on unix, so these bytes already are its encoding and survive the
+        // round trip `as_encoded_bytes` makes on the way back out.  Carrying
+        // them whole is what lets a name `listdir` reports be a name `stat`
+        // can be called with again.
+        unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(data) }.to_os_string()
     }
 }
 
@@ -2098,12 +2101,12 @@ pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError
 /// Under `surrogatepass` every `str` has a spelling, so the same entry reaches
 /// the host as itself and names a file that is simply not there.
 pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Result<std::path::PathBuf, crate::PyError> {
-    #[cfg(unix)]
+    // Every target outside Windows spells an `OsStr` as the bytes themselves,
+    // so the filesystem bytes are the name and the escapes fold back into it.
+    #[cfg(not(windows))]
     {
-        use std::os::unix::ffi::OsStringExt;
-        let bytes = fsencode(obj)?;
-        Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
-            bytes,
+        Ok(std::path::PathBuf::from(os_string_from_fs_bytes(
+            &fsencode(obj)?,
         )))
     }
     #[cfg(windows)]
@@ -2119,17 +2122,6 @@ pub fn fspath_buf(obj: pyre_object::PyObjectRef) -> Result<std::path::PathBuf, c
         Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
             &units,
         )))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        // No byte spelling on this platform, so the host API receives the text
-        // itself and a surrogate has nowhere to go: `str_utf8_w` reports it as
-        // an encoding error. Encoding to bytes and decoding them back lossily
-        // would substitute U+FFFD, which addresses a different name and makes
-        // distinct entries alias onto one another.
-        Ok(std::path::PathBuf::from(crate::baseobjspace::str_utf8_w(
-            obj,
-        )?))
     }
 }
 
