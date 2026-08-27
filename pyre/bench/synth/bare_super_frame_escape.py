@@ -1,6 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
-# pyre-check: spec-folds=bare_super_call
+# pyre-check: spec-folds=bare_super_call,bare_super_virtual
 # Self-checking guard for zero-argument `super()` bound to a name, which is the
 # spelling that reaches the frame-escape path.
 #
@@ -45,6 +45,14 @@
 #      did (20000 iterations, 1662 distinct).  E also pins that the `__class__`
 #      property runs exactly once per iteration, which a fold that executed the
 #      call and then declined would double.
+#   F  the loop INSIDE the super-bearing method, so the frame the proxy is
+#      built from is the portal's own rather than an inlined callee's.  That
+#      is the other half of the fold split this fixture names: the operands of
+#      A/B/C come out of the callee slot shadow
+#      (`walker_bare_super_frame_slots`) and the call is emitted away, while
+#      the portal's slots reach the walk on a channel that fold does not read,
+#      so F declines to the re-routed residual.  Both labels in the
+#      `spec-folds` header above therefore have a site.
 N = 20000
 
 
@@ -87,6 +95,22 @@ class Tricky:
         raise ValueError(str(Tricky.hits))
 
 
+class Portal(Base):
+    """Site F's own class: the loop is inside the method that calls `super()`.
+
+    A method whose own body carries the loop is the frame the portal traces,
+    not a callee the trace inlines, so the slot shadow the virtual fold reads
+    does not exist here and the re-routed residual owns the call.
+    """
+
+    def run_own_loop(self, n):
+        acc = 0
+        for _ in range(n):
+            s = super()
+            acc += s.val()
+        return acc
+
+
 class ETrap(Base):
     """Site E's own method, reached only with a `Tricky` receiver.
 
@@ -120,6 +144,10 @@ def main():
             site_d.add(str(exc))
         total += 1
 
+    # Site F owns the loop itself, which is what puts `super()` in the portal
+    # frame rather than in an inlined callee.
+    site_f = Portal().run_own_loop(N)
+
     # Site E gets its own loop on purpose.  Sharing the loop above leaves this
     # call on a path the backend never compiles, and an uncompiled site cannot
     # witness a compiled-iteration defect.
@@ -149,6 +177,14 @@ def main():
             return 1
     if total != N:
         print(f"FAIL dropped iteration: total={total}")
+        return 1
+    # `Base.val` answers 1, so the sum is the iteration count.  A proxy built
+    # from the wrong frame reaches `Portal.val` — which does not exist, so the
+    # MRO walk would find `Base.val` anyway; what it would get wrong is the
+    # class the walk starts after, and a `super()` resolved against the CALLER
+    # of `run_own_loop` raises instead of answering.
+    if site_f != N:
+        print(f"FAIL site F {site_f} != {N}")
         return 1
     # Site E's message is the raise count, so one distinct message per
     # iteration is the only answer that has the property running every

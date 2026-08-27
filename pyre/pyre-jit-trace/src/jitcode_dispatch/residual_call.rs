@@ -7195,6 +7195,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
+    // Ahead of the re-route below, which is what a decline here falls back to.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::BareSuperVirtual, || {
+            try_walker_specialize_bare_super_virtual(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn

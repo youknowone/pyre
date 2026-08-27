@@ -2851,6 +2851,210 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// The two operands `builtins.rs super_operands_from_frame` reads off the
+/// frame, resolved as SSA values out of an inlined callee's own slot shadow:
+/// `localsplus[0]` and the `__class__` freevar cell.
+///
+/// Both are seeded by the inline itself.  The argument operands are written
+/// into the shadow from `callee_args`, and the closure cells are read live off
+/// the pinned function (`function_closure_descr` then the items block) and
+/// threaded into the new callee frame -- so this reads what the walk already
+/// holds and records nothing.
+///
+/// `None` for anything the shadow cannot answer for THIS level's frame, which
+/// includes every walk that owns no shadow at all: the portal's own slots come
+/// through `virtualizable_entry_at` instead, a channel this does not read.
+fn walker_bare_super_frame_slots<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(OpRef, OpRef)> {
+    let shadow = ctx.callee_shadow.as_ref()?;
+    // `u16::MAX` is the strict fresh-frame fold switched off and a `NONE`
+    // frame box is a frame register that was never seeded; in neither case is
+    // the shadow the authority for this level's slots.
+    if shadow.fold_frame_reg == u16::MAX || shadow.frame_box.is_none() {
+        return None;
+    }
+    // SAFETY: the code object outlives the walk that resolved it; read-only.
+    let code = unsafe { shadow.code_ptr.as_ref()? };
+    if code.arg_count == 0 {
+        return None;
+    }
+    // `_get_self_location`'s cellvar branch: an argument that is also a
+    // cellvar holds a `Cell` at slot 0, so the receiver takes a second read.
+    // Not modelled -- decline and keep the residual.
+    if code
+        .varnames
+        .first()
+        .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first))
+    {
+        return None;
+    }
+    let class_freevar = code.freevars.iter().position(|name| name == "__class__")?;
+    let class_slot = (code.varnames.len()
+        + pyre_interpreter::pyframe::npure_cellvars(code)
+        + class_freevar) as i64;
+    let slot_op = |slot: i64| -> Option<OpRef> {
+        let op = shadow.opref.get(&slot).copied()?;
+        // Only an entry recorded through THIS level's frame register describes
+        // this frame -- the same per-frame isolation the own-frame vable read
+        // applies.
+        (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
+    };
+    Some((slot_op(0)?, slot_op(class_slot)?))
+}
+
+/// Zero-argument `super()` inside an inlined callee, folded to the proxy
+/// itself rather than re-routed to a may-force residual.
+///
+/// [`try_walker_specialize_bare_super_call`] moves the frame force onto a
+/// channel the walker can see, which is what keeps the loop from aborting; it
+/// does not remove it.  What is left is a `MOST_GENERAL` call that publishes a
+/// vref for the frame, wipes the trace's heap-field cache and is re-checked by
+/// two guards, once per iteration: over 2,000,000 iterations `su = super();
+/// su.m(x)` ran ~76ns each against ~1.8 for `su = super(C, self); su.m(x)`.
+///
+/// The residual reads two frame slots and nothing else, and an inlined
+/// callee's walk holds both as SSA values already
+/// ([`walker_bare_super_frame_slots`]), so the whole call becomes the same
+/// `New` + `SetfieldGc` the two-argument spelling emits.
+///
+/// The class comes out of the `__class__` cell as a baked constant under the
+/// `CellFamily.ever_mutated` quasi-immutable rather than a live read per
+/// iteration: the cell a class body fills is written once, before any method
+/// of that class can run, and `w_cell_set` marks the family the moment a
+/// second write happens -- which retires this trace.  A cell that has already
+/// been rebound declines here and keeps the residual.
+pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // `super()` with no user arguments arrives as `[callable, null_or_self]`.
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
+    {
+        return Ok(None);
+    }
+    let Some((self_op, class_cell_op)) = walker_bare_super_frame_slots(ctx) else {
+        return Ok(None);
+    };
+    let Some(concrete_self) = walker_concrete_ref_object(ctx, self_op) else {
+        return Ok(None);
+    };
+    let Some(concrete_cell) = walker_concrete_ref_object(ctx, class_cell_op) else {
+        return Ok(None);
+    };
+    // `fast2locals` falls back to the raw slot when it does not hold a cell.
+    // That shape is unreachable for an OPTIMIZED frame past its
+    // `COPY_FREE_VARS` prologue, and modelling it would need a second arm with
+    // its own guard.
+    if !unsafe { pyre_object::is_cell(concrete_cell) } {
+        return Ok(None);
+    }
+    let family = unsafe { pyre_object::w_cell_family(concrete_cell) };
+    if family.is_null() || unsafe { (*family).ever_mutated.get() } {
+        return Ok(None);
+    }
+    let concrete_cls = unsafe { pyre_object::w_cell_get(concrete_cell) };
+    if concrete_cls.is_null() || !unsafe { pyre_object::is_type(concrete_cls) } {
+        return Ok(None);
+    }
+    // `descriptor.py:28-30` -- `None` builds the UNBOUND proxy, whose `w_self`
+    // is null and whose attribute reads take a different arm entirely, and a
+    // class receiver binds with a null `descr_obj`.
+    if unsafe { pyre_object::is_none(concrete_self) }
+        || unsafe { pyre_object::is_type(concrete_self) }
+    {
+        return Ok(None);
+    }
+    let Some(objtype) =
+        pyre_interpreter::builtins::super_check_python_free(concrete_cls, concrete_self)
+    else {
+        return Ok(None);
+    };
+    // The receiver's class is read back out of the object below, so the two
+    // must be the same word: an exception instance carrying the generic stub
+    // resolves its class through the kind registry instead.
+    if !std::ptr::eq(objtype, unsafe { (*concrete_self).w_class }) {
+        return Ok(None);
+    }
+
+    // Which callable `super` names is baked into the emitted body.
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[callable_op, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(class_cell_op) {
+        let type_const = ctx.trace_ctx.const_int(cell_type);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardClass,
+            &[class_cell_op, type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(class_cell_op, cell_type);
+    }
+    let owner = ctx.trace_ctx.const_ref(family as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::cell_family_ever_mutated_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op.pc)?;
+    let cls_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        class_cell_op,
+        crate::descr::cell_contents_descr(),
+    );
+    if !matches!(
+        ctx.trace_ctx.box_value(cls_op),
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+    ) {
+        ctx.trace_ctx.set_opref_concrete(
+            cls_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(concrete_cls as usize)),
+        );
+    }
+    let proxy_op = walker_emit_super_proxy(
+        ctx,
+        op.pc,
+        cls_op,
+        self_op,
+        concrete_cls,
+        concrete_self,
+        objtype,
+    )?;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', proxy_op)?;
+    Ok(Some(()))
+}
+
 /// Zero-argument `super()` reached as a call, i.e. the `LOAD_GLOBAL super` +
 /// `CALL` spelling a name binding produces rather than `LOAD_SUPER_ATTR`.
 ///
@@ -4644,9 +4848,42 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
+    let proxy_op = walker_emit_super_proxy(
+        ctx,
+        op.pc,
+        cls_op,
+        obj_op,
+        concrete_cls,
+        concrete_obj,
+        objtype,
+    )?;
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', proxy_op)?;
+    Ok(Some(()))
+}
+
+/// The proxy `descriptor.py super_init_impl` stores, emitted as a virtual.
+///
+/// Shared by the two spellings that reach it with a settled pair: the explicit
+/// `super(cls, obj)` call, and the zero-argument one whose operands come out of
+/// the callee's own frame slots
+/// ([`try_walker_specialize_bare_super_virtual`]).  How each proves its two
+/// operands is the caller's question; from here the guards and the emission are
+/// the same.
+///
+/// Emitting starts here, so a caller that declines does so with the trace
+/// untouched.
+fn walker_emit_super_proxy<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    cls_op: OpRef,
+    obj_op: OpRef,
+    concrete_cls: pyre_object::PyObjectRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    objtype: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
     let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
     if !cls_op.is_constant() {
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[cls_op, cls_const])?;
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
         ctx.trace_ctx
             .heap_cache_mut()
             .replace_box(cls_op, cls_const);
@@ -4657,7 +4894,7 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
         let type_const = ctx.trace_ctx.const_int(phys_type);
         walker_emit_fold_guard_with_snapshot(
             ctx,
-            op.pc,
+            op_pc,
             OpCode::GuardClass,
             &[obj_op, type_const],
         )?;
@@ -4674,14 +4911,14 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
     walker_emit_fold_guard_with_snapshot(
         ctx,
-        op.pc,
+        op_pc,
         OpCode::GuardValue,
         &[w_class_op, objtype_const],
     )?;
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(w_class_op, objtype_const);
-    walker_pin_type_version_tag(ctx, op.pc, objtype_const)?;
+    walker_pin_type_version_tag(ctx, op_pc, objtype_const)?;
 
     let header_w_class = ctx
         .trace_ctx
@@ -4704,8 +4941,7 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
         proxy_op,
         majit_ir::Value::Ref(majit_ir::GcRef(proxy as usize)),
     );
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', proxy_op)?;
-    Ok(Some(()))
+    Ok(proxy_op)
 }
 
 /// Fold `super_attr_unwrap(raw, which)` — the LOAD_SUPER_ATTR method form's

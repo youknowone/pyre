@@ -415,6 +415,7 @@ spec_folds! {
     LoadDeref            => ("load_deref",               "residual_call", "-"),
     FrameLineno          => ("frame_lineno",             "specialize",    "load_attr"),
     BareSuperCall        => ("bare_super_call",          "residual_call", "-"),
+    BareSuperVirtual     => ("bare_super_virtual",       "residual_call", "-"),
     TwoArgSuperCall      => ("two_arg_super_call",       "residual_call", "-"),
     LoadAttrOnSuper      => ("load_attr_on_super",       "specialize",    "load_attr"),
     KwonlyDefaultsInline => ("kwonly_defaults_inline",   "inline_call",   "-"),
