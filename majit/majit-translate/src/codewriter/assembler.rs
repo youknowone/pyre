@@ -3596,7 +3596,7 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for NoStruc
     }
 }
 
-fn bh_size_spec_from_callcontrol(
+pub(crate) fn bh_size_spec_from_callcontrol(
     cc: &CallControl,
     owner: &str,
 ) -> Option<crate::jitcode::BhSizeSpec> {

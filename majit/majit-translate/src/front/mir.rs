@@ -1224,7 +1224,10 @@ fn register_synthetic_positional_metadata(
             .flat_map(|block| &block.operations)
         {
             let OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        name, owner_path, ..
+                    },
                 args,
                 ..
             } = &op.kind
@@ -5152,38 +5155,41 @@ impl<'a> Lowering<'a> {
                 // use `variant_idx = null`, enum variants index into the
                 // `TypeDeclKind::Enum` variant list.
                 let resolved = self.resolve_aggregate_adt(&kind);
-                let (owner_path, ctor_name, field_rows, aggregate_owner_id) = match resolved {
-                    Some((owner_path, ctor_name, field_rows, owner_id)) => {
-                        (owner_path, ctor_name, field_rows, Some(owner_id))
-                    }
-                    None => {
-                        // Synthetic placeholders for non-Adt aggregates
-                        // (`Tuple`, `Array`, `Closure`) — they have no
-                        // user-defined class to resolve into.  A non-empty
-                        // tuple or array carries its per-shape `<…>` suffix
-                        // so its `__pos_N` attrs do not collide with other
-                        // shapes on one global class; the suffix matches
-                        // `positional_aggregate_owner` (Site-A reads) and
-                        // `tyref_positional_aggregate_suffix` (Site-B reads).
-                        // The per-shape `<…>` suffix is rendered from the
-                        // destination place type, not the `AggregateKind` head:
-                        // Charon's `AggregateKind::Adt(Tuple, …)` carries no
-                        // element `types`, so keying off it would spell a bare
-                        // `Tuple` on the write while the `.N` projection reads
-                        // (which do see `place.ty`'s element types) spell the
-                        // suffixed owner — a write/read owner split.  `dest_ty`
-                        // is that same `place.ty`, so both sides agree.
-                        let leaf = format!(
-                            "{}{}",
-                            aggregate_ctor_name(&kind),
-                            tyref_positional_aggregate_suffix(dest_ty, self.llbc)
-                        );
-                        let positional = (0..arg_vars.len())
-                            .map(|i| (format!("__pos_{i}"), String::new()))
-                            .collect();
-                        (Vec::new(), leaf, positional, None)
-                    }
-                };
+                let (owner_path, ctor_name, field_rows, aggregate_owner_id, adt_is_struct) =
+                    match resolved {
+                        Some((owner_path, ctor_name, field_rows, owner_id, is_struct)) => {
+                            (owner_path, ctor_name, field_rows, Some(owner_id), is_struct)
+                        }
+                        None => {
+                            // Synthetic placeholders for non-Adt aggregates
+                            // (`Tuple`, `Array`, `Closure`) — they have no
+                            // user-defined class to resolve into.  A non-empty
+                            // tuple or array carries its per-shape `<…>` suffix
+                            // so its `__pos_N` attrs do not collide with other
+                            // shapes on one global class; the suffix matches
+                            // `positional_aggregate_owner` (Site-A reads) and
+                            // `tyref_positional_aggregate_suffix` (Site-B reads).
+                            // The per-shape `<…>` suffix is rendered from the
+                            // destination place type, not the `AggregateKind` head:
+                            // Charon's `AggregateKind::Adt(Tuple, …)` carries no
+                            // element `types`, so keying off it would spell a bare
+                            // `Tuple` on the write while the `.N` projection reads
+                            // (which do see `place.ty`'s element types) spell the
+                            // suffixed owner — a write/read owner split.  `dest_ty`
+                            // is that same `place.ty`, so both sides agree.
+                            let leaf = format!(
+                                "{}{}",
+                                aggregate_ctor_name(&kind),
+                                tyref_positional_aggregate_suffix(dest_ty, self.llbc)
+                            );
+                            let positional = (0..arg_vars.len())
+                                .map(|i| (format!("__pos_{i}"), String::new()))
+                                .collect();
+                            // Not an Adt at all, so there is no struct decl to
+                            // stand behind an allocation rewrite.
+                            (Vec::new(), leaf, positional, None, false)
+                        }
+                    };
                 let result_ty_owner = if owner_path.is_empty() {
                     ctor_name.clone()
                 } else {
@@ -5203,6 +5209,14 @@ impl<'a> Lowering<'a> {
                 // the underlying `SomeInstance(classdef)`.
                 let ctor_target = if owner_path.is_empty() {
                     CallTarget::synthetic_transparent_ctor(ctor_name.clone())
+                } else if adt_is_struct {
+                    // Resolved to a `TypeDeclKind::Struct`, so the value is
+                    // its field writes and nothing else; `jtransform` may
+                    // lower the constructor to a bare allocation.
+                    CallTarget::synthetic_transparent_struct_ctor(
+                        owner_path.clone(),
+                        ctor_name.clone(),
+                    )
                 } else {
                     CallTarget::synthetic_transparent_ctor_with_owner(
                         owner_path.clone(),
@@ -6395,6 +6409,11 @@ impl<'a> Lowering<'a> {
         variants.get(variant_idx)?.discriminant_i64()
     }
 
+    /// The trailing `bool` is `true` when the decl is a `TypeDeclKind::Struct`.
+    /// A struct's value is its fields; a variant additionally carries a tag
+    /// Charon does not spell as an operand, and the two must stay
+    /// distinguishable downstream — see `CallTarget::SyntheticTransparentCtor`'s
+    /// `is_struct`.
     fn resolve_aggregate_adt(
         &self,
         kind: &serde_json::Value,
@@ -6403,6 +6422,7 @@ impl<'a> Lowering<'a> {
         String,
         Vec<(String, String)>,
         majit_ir::descr::StructId,
+        bool,
     )> {
         let adt = kind.as_object()?.get("Adt")?.as_array()?;
         // `AggregateKind::Adt` head: either a bare `type_id` u64 or a
@@ -6446,6 +6466,7 @@ impl<'a> Lowering<'a> {
                     type_leaf,
                     field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
+                    true,
                 ))
             }
             (TypeDeclKind::Enum(variants), Some(idx)) => {
@@ -6487,6 +6508,7 @@ impl<'a> Lowering<'a> {
                     v.name.clone(),
                     field_rows,
                     concrete_adt_struct_id(template, head_adt, self.llbc),
+                    false,
                 ))
             }
             _ => None,
@@ -23031,10 +23053,7 @@ mod tests {
     #[test]
     fn block_emptied_after_the_head_collapse_is_still_rewired_past() {
         let unit_ctor = || OpKind::Call {
-            target: CallTarget::SyntheticTransparentCtor {
-                name: "Tuple".to_string(),
-                owner_path: Vec::new(),
-            },
+            target: CallTarget::synthetic_transparent_ctor("Tuple"),
             args: Vec::new(),
             result_ty: ValueType::Ref(Some("Tuple".to_string())),
         };
@@ -23808,10 +23827,7 @@ mod tests {
         graph.block_mut(a).operations.push(SpaceOperation {
             result: Some(arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -23873,10 +23889,7 @@ mod tests {
         graph.block_mut(a).operations.push(SpaceOperation {
             result: Some(tuple.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Tuple".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Tuple"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Tuple".to_string())),
             },
@@ -23928,10 +23941,7 @@ mod tests {
         graph.block_mut(b).operations.push(SpaceOperation {
             result: Some(args_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -23949,10 +23959,7 @@ mod tests {
         graph.block_mut(b).operations.push(SpaceOperation {
             result: Some(pieces_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -24027,10 +24034,7 @@ mod tests {
         graph.block_mut(b0).operations.push(SpaceOperation {
             result: Some(tuple.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Tuple".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Tuple"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Tuple".to_string())),
             },
@@ -24078,10 +24082,7 @@ mod tests {
         graph.block_mut(bp).operations.push(SpaceOperation {
             result: Some(args_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -24099,10 +24100,7 @@ mod tests {
         graph.block_mut(bp).operations.push(SpaceOperation {
             result: Some(pieces_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -24247,10 +24245,7 @@ mod tests {
             .push_op_var(
                 bf,
                 OpKind::Call {
-                    target: CallTarget::SyntheticTransparentCtor {
-                        name: "Arguments".to_string(),
-                        owner_path: vec![],
-                    },
+                    target: CallTarget::synthetic_transparent_ctor("Arguments"),
                     args: vec![],
                     result_ty: ValueType::Ref(None),
                 },
@@ -24443,10 +24438,7 @@ mod tests {
         graph.block_mut(b0).operations.push(SpaceOperation {
             result: Some(tuple.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Tuple".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Tuple"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Tuple".to_string())),
             },
@@ -24520,10 +24512,7 @@ mod tests {
         graph.block_mut(bp).operations.push(SpaceOperation {
             result: Some(args_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -24543,10 +24532,7 @@ mod tests {
         graph.block_mut(bp).operations.push(SpaceOperation {
             result: Some(pieces_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -24733,10 +24719,7 @@ mod tests {
         graph.block_mut(b0).operations.push(SpaceOperation {
             result: Some(tuple.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Tuple".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Tuple"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Tuple".to_string())),
             },
@@ -24809,10 +24792,7 @@ mod tests {
         graph.block_mut(bp).operations.push(SpaceOperation {
             result: Some(args_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
@@ -24832,10 +24812,7 @@ mod tests {
         graph.block_mut(bp).operations.push(SpaceOperation {
             result: Some(pieces_arr.clone()),
             kind: OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor {
-                    name: "Array".to_string(),
-                    owner_path: vec![],
-                },
+                target: CallTarget::synthetic_transparent_ctor("Array"),
                 args: vec![],
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },

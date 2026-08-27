@@ -132,7 +132,10 @@ pub fn fold_unit_variant_ctors(graph: &mut FunctionGraph) {
     for block in graph.blocks.iter_mut() {
         for op in block.operations.iter_mut() {
             let OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        name, owner_path, ..
+                    },
                 args,
                 ..
             } = &op.kind

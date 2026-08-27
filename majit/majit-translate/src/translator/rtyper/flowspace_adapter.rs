@@ -616,7 +616,10 @@ fn fmt_op_result(op: &SpaceOperation) -> String {
 /// `op_canraise` is false exactly when `translate_op` emits no op.
 fn is_elided_unit_variant_ctor(kind: &OpKind) -> bool {
     if let OpKind::Call {
-        target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
+        target:
+            crate::model::CallTarget::SyntheticTransparentCtor {
+                name, owner_path, ..
+            },
         args,
         ..
     } = kind
@@ -646,6 +649,7 @@ fn is_array_aggregate_ctor(kind: &OpKind) -> bool {
             target: crate::model::CallTarget::SyntheticTransparentCtor {
                 name,
                 owner_path,
+                ..
             },
             ..
         } if owner_path.is_empty()
@@ -2432,7 +2436,9 @@ pub fn translate_op(
                     call_args.extend(arg_hls);
                     Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
                 }
-                CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+                CallTarget::SyntheticTransparentCtor {
+                    name, owner_path, ..
+                } => {
                     // RPython parity: tagged-union ctor `Foo(x)` annotates as
                     // `SomePBC([ClassDesc(Foo)])` then `pair_simple_call`
                     // constructs `SomeInstance(classdef)` (`bookkeeper.py:
@@ -3190,7 +3196,10 @@ fn legacy_const_define_hlvalue(
         // the same set consulted here — both layers agree on which
         // paths are unit-variant singletons.
         OpKind::Call {
-            target: crate::model::CallTarget::SyntheticTransparentCtor { name, owner_path },
+            target:
+                crate::model::CallTarget::SyntheticTransparentCtor {
+                    name, owner_path, ..
+                },
             args,
             ..
         } if args.is_empty() => {
@@ -5352,10 +5361,7 @@ mod tests {
         let op = SpaceOperation {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
-                target: crate::model::CallTarget::SyntheticTransparentCtor {
-                    name: "Point".into(),
-                    owner_path: Vec::new(),
-                },
+                target: crate::model::CallTarget::synthetic_transparent_ctor("Point"),
                 args: vec![vars[1].clone()],
                 result_ty: ValueType::Ref(None),
             },

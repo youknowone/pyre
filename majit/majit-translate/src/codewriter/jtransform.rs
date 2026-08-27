@@ -3702,7 +3702,9 @@ impl<'a> Transformer<'a> {
         // Keep the owner-path gate: the universal MIR tuple aggregate has no
         // Rust nominal owner, whereas a user ADT whose leaf happens to start
         // with `Tuple` is a different allocation policy.
-        if let CallTarget::SyntheticTransparentCtor { name, owner_path } = target
+        if let CallTarget::SyntheticTransparentCtor {
+            name, owner_path, ..
+        } = target
             && owner_path.is_empty()
             && majit_ir::descr::is_shaped_tuple_name(name)
             && args.is_empty()
@@ -3725,7 +3727,9 @@ impl<'a> Transformer<'a> {
         // Bare `Array` is deliberately excluded: only `Array<T;N>` carries a
         // complete low-level owner identity. The owner-path gate keeps nominal
         // user types out of this builtin aggregate policy.
-        if let CallTarget::SyntheticTransparentCtor { name, owner_path } = target
+        if let CallTarget::SyntheticTransparentCtor {
+            name, owner_path, ..
+        } = target
             && owner_path.is_empty()
             && majit_ir::descr::is_shaped_array_name(name)
             && args.is_empty()
@@ -3734,6 +3738,60 @@ impl<'a> Transformer<'a> {
                 .result
                 .as_ref()
                 .is_none_or(|array| !array_has_nonconstant_index_read(graph, array))
+        {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::New {
+                    owner: owner.clone(),
+                },
+            }]);
+        }
+        // A niladic named-struct ctor is an allocation, exactly like the tuple
+        // and array forms above: `front::mir` emits the constructor with empty
+        // args and the operands follow it as `FieldWrite`s in program order,
+        // which is `rtyper`'s `malloc(GcStruct)` + one `setfield` per field.
+        // Left as a call it has no registered function address and puts its
+        // stable hash in JitCode as though it were executable code, which is
+        // what stops a descent that reaches one.
+        //
+        // `is_struct` is the whole gate, and it is why this cannot be spelled
+        // by inspecting the name. A sum-type variant carries a tag Charon does
+        // not spell as a MIR operand, so allocating one here without stamping
+        // it would leave the discriminant reading whatever the payload wrote;
+        // only `Result` and `Option`, whose variant order the language fixes,
+        // can have one stamped back (below). `front::mir` sets the flag only
+        // where it resolved a `TypeDeclKind::Struct`, and every other
+        // construction path leaves it false.
+        //
+        // `is_struct` alone is not enough to allocate. Charon models a
+        // closure environment as an Adt whose decl is a `Struct`, so the flag
+        // is true for one, and a closure has no registered layout at all. Ask
+        // the assembler's own question instead -- `bh_size_spec_from_callcontrol`
+        // is exactly what `OpKind::New` calls at emit time, and it panics there
+        // rather than declining, so anything it cannot answer must not become a
+        // `New` here.
+        //
+        // A layout answer is still not enough: the spec must also list fields.
+        // A field-less spec is materialized by the bare
+        // `make_size_descr_with_type_and_vtable` mint rather than
+        // `simple_descr_group_from_bh_size`, so it never enters
+        // `gc_cache._cache_size`, `register_unresolved_struct_tids` never walks
+        // it, and its allocation tid stays the structural hash truncated to
+        // u32 -- which the walker refuses as `UnregisteredNewGcType` after the
+        // descent has already run. Registering it here is not the alternative:
+        // an empty field list carries no ref offsets, so the shape a
+        // registration would publish says "no pointers" for a struct whose
+        // size says otherwise, and the collector would stop tracing through it.
+        // The payload-less sum variant below declines for this same reason.
+        if let CallTarget::SyntheticTransparentCtor {
+            is_struct: true, ..
+        } = target
+            && args.is_empty()
+            && let ValueType::Ref(Some(owner)) = result_ty
+            && self.callcontrol.as_deref().is_some_and(|cc| {
+                crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, owner)
+                    .is_some_and(|spec| !spec.all_fielddescrs.is_empty())
+            })
         {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
@@ -6319,6 +6377,7 @@ impl<'a> Transformer<'a> {
         let CallTarget::SyntheticTransparentCtor {
             name,
             owner_path: _,
+            is_struct: _,
         } = target
         else {
             return false;
@@ -6871,7 +6930,9 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
             crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
-        CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+        CallTarget::SyntheticTransparentCtor {
+            name, owner_path, ..
+        } => {
             let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
             segs.push(name.as_str());
             crate::parse::CallPath::from_segments(segs)

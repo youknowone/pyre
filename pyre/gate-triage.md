@@ -350,6 +350,7 @@ under measurement.
 | gate | default polarity | what it gates / retirement condition |
 |---|---|---|
 | `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
+| `PYRE_GC_TYPE_COUNT` | OFF | prints `[gc-type-count] frozen=N max=M` when `freeze_types` runs, so the number to size `TypeRegistry::MAX_TYPES` against can be read instead of guessed -- the `register` assert names the cap it blew but not the total it needed; retire when the registry grows on demand rather than pre-allocating a fixed capacity for a stable base address |
 | `PYRE_GC_SIZE_AUDIT` | OFF | panics when a block is stamped with a type id whose declared payload is larger than the block's own extent, at the allocation that stamps it rather than in whichever later collection reads the neighbouring block as a field (varsize types are exempt); retire when every allocator derives the size from the type id it stamps, so the two cannot disagree |
 
 ## Summary

@@ -30,9 +30,9 @@ const SOME_TAG: i64 = 1;
 /// Splits a `CallTarget::SyntheticTransparentCtor` into `(owner_path, leaf)`.
 fn ctor_parts(target: &CallTarget) -> Option<(&[String], &str)> {
     match target {
-        CallTarget::SyntheticTransparentCtor { name, owner_path } => {
-            Some((owner_path.as_slice(), name.as_str()))
-        }
+        CallTarget::SyntheticTransparentCtor {
+            name, owner_path, ..
+        } => Some((owner_path.as_slice(), name.as_str())),
         _ => None,
     }
 }
