@@ -538,6 +538,10 @@ impl Drop for JitFrameDeadFrame {
     /// traces it at all — and only an owning deadframe, because a `borrowing`
     /// one stands for a frame whose compiled run is still inside the residual
     /// call that pushed the map.
+    ///
+    /// The write is into the collector's heap, so it holds the same rule the
+    /// accessors above hold: this deadframe must not outlive the collector that
+    /// allocated its frame (see [`crate::DeadFrame`]).
     fn drop(&mut self) {
         if let JitFrameRoot::Slot(guard) = &self.jf_root {
             if self.owns_gcmap {
