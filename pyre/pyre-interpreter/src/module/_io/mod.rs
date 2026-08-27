@@ -1609,6 +1609,6 @@ crate::py_module! {
             "_io",
             &["IncrementalNewlineDecoder"],
             &[("_TextIOBase", text_base)],
-        );
+        )?;
     }
 }

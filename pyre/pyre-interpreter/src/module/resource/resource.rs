@@ -41,7 +41,7 @@ fn struct_rusage_type() -> pyre_object::PyObjectRef {
 /// Exposes getrusage / getrlimit / setrlimit plus the standard RUSAGE_*
 /// and RLIMIT_* constants, the `struct_rusage` type attribute, and the
 /// `error = OSError` alias.  Backed by `rustpython_host_env::resource`.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // `lib_pypy/resource.py:13 error = OSError` and
     // `:15-37 class struct_rusage`.
     let w_os_error = crate::builtins::lookup_exc_class("OSError")
@@ -325,4 +325,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             pyre_object::w_int_new(libc::RLIM_INFINITY as i64),
         );
     }
+    Ok(())
 }

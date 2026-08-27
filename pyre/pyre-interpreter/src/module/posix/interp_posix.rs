@@ -1513,7 +1513,7 @@ fn create_environ() -> pyre_object::PyObjectRef {
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(ns, "environ", create_environ());
     crate::module_ns_store(
         ns,
@@ -12723,6 +12723,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     crate::module_ns_store(ns, "error", crate::typedef::w_object());
+    Ok(())
 }
 
 #[cfg(test)]

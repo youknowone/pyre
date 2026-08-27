@@ -1077,7 +1077,7 @@ fn reset_event(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::w_none())
 }
 
-pub fn init(ns: PyObjectRef) {
+pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // PyPy imports `_socket` before resolving the extension-function GUIDs.
     // The host layer exposes the same process-global WSAStartup owner, so the
     // builtin can establish that prerequisite without creating a second
@@ -1157,4 +1157,5 @@ pub fn init(ns: PyObjectRef) {
             ),
         );
     }
+    Ok(())
 }

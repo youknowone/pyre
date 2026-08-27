@@ -523,7 +523,7 @@ thread_local! {
 
 #[derive(Clone, Copy)]
 pub(crate) struct BuiltinModuleDef {
-    init: fn(PyObjectRef),
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
     startup: Option<fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>>,
     /// The module follows ordinary `sys.modules` ownership and may be
     /// collected after a fresh import is removed from that cache. Most of
@@ -558,7 +558,10 @@ struct ImportRootArea {
 /// Register a builtin module initializer.
 ///
 /// PyPy equivalent: Module.install() → space.builtin_modules[name] = mod
-pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
+pub fn register_builtin_module(
+    name: &'static str,
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
+) {
     BUILTIN_MODULES.lock().unwrap().insert(
         name,
         BuiltinModuleDef {
@@ -571,7 +574,10 @@ pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
 
 /// Register a builtin module whose holder has no native/JIT owner beyond the
 /// ordinary Python object graph.
-pub fn register_collectible_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
+pub fn register_collectible_builtin_module(
+    name: &'static str,
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
+) {
     BUILTIN_MODULES.lock().unwrap().insert(
         name,
         BuiltinModuleDef {
@@ -587,7 +593,7 @@ pub fn register_collectible_builtin_module(name: &'static str, init: fn(PyObject
 /// `getbuiltinmodule()` and allowing startup imports without a module cycle.
 pub fn register_builtin_module_with_startup(
     name: &'static str,
-    init: fn(PyObjectRef),
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
     startup: fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>,
 ) {
     BUILTIN_MODULES.lock().unwrap().insert(
@@ -872,7 +878,7 @@ fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(arg)
 }
 
-fn init_string_module(ns: PyObjectRef) {
+fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "formatter_parser",
@@ -974,6 +980,7 @@ fn init_string_module(ns: PyObjectRef) {
             ]))
         }),
     );
+    Ok(())
 }
 
 /// `_sysconfig` — `config_vars()`, the build variables that come from the
@@ -993,7 +1000,7 @@ fn init_string_module(ns: PyObjectRef) {
 /// suffix is built from: `EXT_SUFFIX == "." + SOABI + shared-library
 /// extension`. `_sysconfigdata` publishes the same keys for `_init_posix` but
 /// spells `SOABI` shorter — see [`soabi_tag`].
-fn init_sysconfig_stub(ns: PyObjectRef) {
+fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "config_vars",
@@ -1024,6 +1031,7 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
             Ok(roots.get(vars_slot))
         }),
     );
+    Ok(())
 }
 
 /// The whole middle component of the extension suffix — PEP 3149's "ABI
@@ -1187,7 +1195,7 @@ fn quote_for_cflags(path: &str) -> String {
 /// `sysconfig._get_sysconfigdata` reaches this module by name only after
 /// `_PYTHON_SYSCONFIGDATA_NAME` and `_PYTHON_SYSCONFIGDATA_PATH` have had their
 /// turn, so a cross-compilation snapshot still overrides it.
-fn init_sysconfigdata(ns: PyObjectRef) {
+fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // These take the root slot rather than the dict itself: a word passed by
     // value goes stale the moment the key or the value allocates.
     fn store_str(vars_slot: usize, key: &str, value: &str) {
@@ -1469,12 +1477,13 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         "build_time_vars",
         pyre_object::gc_roots::shadow_stack_get(vars_slot),
     );
+    Ok(())
 }
 
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
 /// tracing primitives are neutral no-ops that let `tracemalloc` import and
 /// report an inactive tracer.
-fn init_tracemalloc(ns: PyObjectRef) {
+fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "start",
@@ -1530,6 +1539,7 @@ fn init_tracemalloc(ns: PyObjectRef) {
         "_get_object_traceback",
         crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
     );
+    Ok(())
 }
 
 /// `_scproxy` — the macOS SystemConfiguration proxy probe that
@@ -1537,7 +1547,7 @@ fn init_tracemalloc(ns: PyObjectRef) {
 /// import.  Report "no system proxy configured" so the import succeeds and
 /// proxy resolution yields an empty mapping.
 #[cfg(target_os = "macos")]
-fn init_scproxy(ns: PyObjectRef) {
+fn init_scproxy(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "_get_proxies",
@@ -1562,6 +1572,7 @@ fn init_scproxy(ns: PyObjectRef) {
             Ok(roots.get(d_slot))
         }),
     );
+    Ok(())
 }
 
 /// Try to load a builtin module by name.
@@ -1573,12 +1584,20 @@ fn init_scproxy(ns: PyObjectRef) {
 /// `W_ModuleDictObject` for every module via
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
-pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
+///
+/// `Ok(None)` is "no builtin by that name"; an `Err` is an initializer that
+/// ran and raised.  A module whose namespace comes from a bundled app-level
+/// source fails the way any module body can -- the source's own imports
+/// resolve through the running `sys.modules`, which the program owns -- and
+/// that belongs to the import which asked for the module, not to the process.
+pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     // The registry key outlives the module, which is what lets the sweep below
     // hand the name to `BuiltinCode.module` without copying it.
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock().unwrap();
-        let (static_name, def) = table.get_key_value(name)?;
+        let Some((static_name, def)) = table.get_key_value(name) else {
+            return Ok(None);
+        };
         (*static_name, *def)
     };
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
@@ -1594,7 +1613,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
         pyre_object::gc_roots::shadow_stack_get(save_point + 1),
     );
     // Run module-specific initializer (PyPy: interpleveldefs)
-    (module_def.init)(w_dict);
+    (module_def.init)(w_dict)?;
     // MixedModule parity: interp-level builtin functions carry the module
     // name as `__module__`, so `pickle` can save them by reference
     // (`save_global`) without guessing via `whichmodule`. Snapshot owned
@@ -1663,7 +1682,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     if name == "builtins" {
         crate::module_ns_store(w_dict, "__builtins__", module);
     }
-    Some(module)
+    Ok(Some(module))
 }
 
 /// Build a builtin module for `_imp.create_builtin`, then run its `startup`
@@ -1688,7 +1707,7 @@ pub(crate) fn create_builtin_module(
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    let Some(module) = load_builtin_module(name) else {
+    let Some(module) = load_builtin_module(name)? else {
         return Ok(None);
     };
     let _ = pyre_object::gc_roots::pin_root(module);
@@ -3934,8 +3953,8 @@ pub fn appleveldef_install(
     filename: &str,
     modname: &str,
     names: &[&str],
-) {
-    appleveldef_install_seeded(ns, source, filename, modname, names, &[]);
+) -> Result<(), crate::PyError> {
+    appleveldef_install_seeded(ns, source, filename, modname, names, &[])
 }
 
 /// [`appleveldef_install`] with `seed` bound into the app namespace before the
@@ -3954,7 +3973,7 @@ pub fn appleveldef_install_seeded(
     modname: &str,
     names: &[&str],
     seed: &[(&str, PyObjectRef)],
-) {
+) -> Result<(), crate::PyError> {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
     let ctx = crate::call::getexecutioncontext();
@@ -3991,15 +4010,19 @@ pub fn appleveldef_install_seeded(
     let w_code = crate::pycode::w_code_new_with_hidden_applevel(code_ptr as *const (), true);
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
-    if let Err(e) = frame.run_with_jit() {
-        panic!("appleveldef `{filename}`: exec — {e:?}");
-    }
+    // The source is a module body, so what it raises is the program's to see:
+    // a `from _operator import eq` in it resolves through the running
+    // `sys.modules`, which the program can have blocked.  Only the failures
+    // that no program can cause -- a bundled file that does not compile, a
+    // name the file never binds -- stay panics.
+    frame.run_with_jit()?;
     for &name in names {
         match unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) } {
             Some(val) => ns.store(name, val),
             None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
         }
     }
+    Ok(())
 }
 
 // ── load_source_module ───────────────────────────────────────────────
@@ -4464,7 +4487,7 @@ fn load_part(
         let m = if modulename == "builtins" && !execution_context.is_null() {
             unsafe { (*execution_context).get_builtin() }
         } else {
-            load_builtin_module(modulename).ok_or_else(|| {
+            load_builtin_module(modulename)?.ok_or_else(|| {
                 crate::PyError::new(
                     crate::PyErrorKind::ImportError,
                     format!("builtin module '{modulename}' failed to initialize"),
@@ -4592,7 +4615,7 @@ fn load_part(
             let m = if partname == "builtins" && !execution_context.is_null() {
                 unsafe { (*execution_context).get_builtin() }
             } else {
-                load_builtin_module(partname).ok_or_else(|| {
+                load_builtin_module(partname)?.ok_or_else(|| {
                     crate::PyError::new(
                         crate::PyErrorKind::ImportError,
                         format!("builtin module '{modulename}' failed to initialize"),

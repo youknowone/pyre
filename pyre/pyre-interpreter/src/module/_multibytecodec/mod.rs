@@ -487,6 +487,6 @@ crate::py_module! {
                 "MultibyteStreamWriter",
             ],
             &[("_encode", encode), ("_decode", decode)],
-        );
+        )?;
     },
 }

@@ -55,7 +55,7 @@ fn handle(which: usize) -> PyObjectRef {
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
     let _ = pyre_object::gc_roots::pin_root(w_app_globals);
-    crate::importing::appleveldef_install(
+    if let Err(e) = crate::importing::appleveldef_install(
         pyre_object::gc_roots::shadow_stack_get(save_point),
         include_str!("reduce_protocol_app.py"),
         "reduce_protocol_app.py",
@@ -65,7 +65,9 @@ fn handle(which: usize) -> PyObjectRef {
         // only as their `__globals__['__name__']`.
         "__builtin__",
         &["reduce_1", "reduce_2", "get_slotvalues"],
-    );
+    ) {
+        panic!("reduce_protocol: reduce_protocol_app.py — {e:?}");
+    }
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
     let get = |name: &str| {
         unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }

@@ -18,7 +18,7 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use sre_engine::engine::{Request, SearchIter, State};
 use sre_engine::string::{StrDrive, StringCursor};
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // Must equal `re/_constants.py:MAGIC` (the bundled stdlib) — `_compiler.py`
     // asserts `_sre.MAGIC == MAGIC` at import time.
     module_ns_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
@@ -129,6 +129,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // other builtin typedefs in `typedef.rs` (W_SRE_Pattern.typedef /
     // W_SRE_Match.typedef, interp_sre.py/:869); instances carry
     // `pyre_object::interp_sre` typed payloads.
+    Ok(())
 }
 
 /// `args[1]` as the typed pattern receiver for getsets registered on

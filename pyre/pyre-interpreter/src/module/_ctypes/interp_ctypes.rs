@@ -18,11 +18,12 @@
 //! `HMODULE` rather than a key into its library cache, so `FreeLibrary` and
 //! [`lookup_symbol`] are the plain Win32 calls that go with one.
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(all(any(unix, windows), feature = "host_env"))]
     register_host_ctypes(ns);
     #[cfg(not(all(any(unix, windows), feature = "host_env")))]
     register_stub_ctypes(ns);
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────

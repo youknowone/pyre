@@ -371,7 +371,7 @@ fn socket_writebuf(
     ))
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // `_rsocket_rffi.py:1150 rwin32.get_wsa_error`'s companion: WinSock has to
     // be started before any of its entry points answers, so the module takes
     // that cost at import rather than leaving the first call to fail with
@@ -2086,6 +2086,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    Ok(())
 }
 
 // ── hostent → (name, aliases, addrs) ──

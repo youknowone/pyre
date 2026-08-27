@@ -31,6 +31,6 @@ crate::py_module! {
                 "_ncallbacks",
             ],
             &[("_sys", w_sys)],
-        );
+        )?;
     },
 }

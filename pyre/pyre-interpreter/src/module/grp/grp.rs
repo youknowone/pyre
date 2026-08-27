@@ -26,7 +26,7 @@ fn struct_group_type() -> pyre_object::PyObjectRef {
 /// structseq (subclass of tuple) with named fields `gr_name`,
 /// `gr_passwd`, `gr_gid`, `gr_mem` per `lib_pypy/grp.py:14-20`.
 #[cfg(unix)]
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(feature = "host_env")]
     fn make_struct_group(g: &rustpython_host_env::grp::Group) -> pyre_object::PyObjectRef {
         let mem_items: Vec<pyre_object::PyObjectRef> =
@@ -216,4 +216,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    Ok(())
 }

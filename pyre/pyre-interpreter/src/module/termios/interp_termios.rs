@@ -43,7 +43,7 @@ fn termios_converted_error(errno: i32) -> crate::PyError {
 /// `cfgetospeed` calls are direct wrappers.  All constants come from
 /// `rustpython_host_env::termios::*` so the values match the platform.
 #[cfg(all(unix, feature = "host_env"))]
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     use rustpython_host_env::termios as host_termios;
 
     fn make_cc_bytes(cc: &[libc::cc_t]) -> pyre_object::PyObjectRef {
@@ -900,7 +900,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         w_exception,
     );
     crate::module_ns_store(ns, "error", w_error);
+    Ok(())
 }
 
 #[cfg(not(all(unix, feature = "host_env")))]
-pub fn register_module(_ns: pyre_object::PyObjectRef) {}
+pub fn register_module(_ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    Ok(())
+}

@@ -205,7 +205,7 @@ fn insort_right(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     insort(args, true, "insort_right")
 }
 
-pub fn init(ns: PyObjectRef) {
+pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
     let left = crate::gateway::with_module(
         "_bisect",
         crate::make_module_builtin_function("bisect_left", bisect_left),
@@ -228,4 +228,5 @@ pub fn init(ns: PyObjectRef) {
     crate::module_ns_store(ns, "insort_left", insert_left);
     crate::module_ns_store(ns, "insort_right", insert_right);
     crate::module_ns_store(ns, "insort", insert_right);
+    Ok(())
 }

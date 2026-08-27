@@ -1356,7 +1356,7 @@ pub fn exc_info_direct() -> PyObjectRef {
     }
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
     module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
     #[cfg(all(
@@ -3266,6 +3266,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `space.fromcache(AuditHolder)` — see [`audit_holder`] for why the holder
     // is built here rather than on the first `addaudithook`.
     audit_holder();
+    Ok(())
 }
 
 /// `pypy/module/sys/vm.py AuditHolder`, which upstream reaches through

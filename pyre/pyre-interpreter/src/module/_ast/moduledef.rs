@@ -903,7 +903,7 @@ fn node_attributes(name: &str) -> Option<&'static [&'static str]> {
 /// (`class Suite(mod)`) and monkeypatch them (`Tuple.dims = property(...)`),
 /// matching CPython where `_ast` types are heap types. Compiler-native Ruff
 /// nodes are converted to instances of these public types by `convert.rs`.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // `type(name, (base,), {"__module__": "ast"})` — a fresh heap type. The
     // generated AST types report `__module__ == "ast"` (astcompiler/ast.py;
     // the host `_ast.Module.__module__` is likewise `'ast'`).
@@ -1114,4 +1114,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     ] {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
+    Ok(())
 }

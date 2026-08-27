@@ -339,7 +339,7 @@ fn faulthandler_get_fileno_and_file(
     Ok((fd, pyre_object::gc_roots::shadow_stack_get(file_slot)))
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "enable",
@@ -767,6 +767,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    Ok(())
 }
 
 #[cfg(all(unix, feature = "host_env"))]

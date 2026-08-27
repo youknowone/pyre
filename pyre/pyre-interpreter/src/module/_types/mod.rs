@@ -51,7 +51,7 @@ fn capsule_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-pub fn init(ns: PyObjectRef) {
+pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
     let function_type = crate::typedef::gettypeobject(&crate::function::FUNCTION_TYPE);
     store(
         ns,
@@ -176,6 +176,7 @@ pub fn init(ns: PyObjectRef) {
         "WrapperDescriptorType",
         crate::typedef::gettypeobject(&crate::function::SLOT_WRAPPER_TYPE),
     );
+    Ok(())
 }
 
 #[cfg(test)]

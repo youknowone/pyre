@@ -496,7 +496,7 @@ crate::py_module! {
             "_contextvars",
             &["Context"],
             &[("ContextVar", context_var)],
-        );
+        )?;
         let context = crate::module_ns_get(ns, "Context")
             .expect("_contextvars.Context must be installed by appleveldefs");
         // [3.14-spec] PyPy keeps Context as the ordinary app-level class in

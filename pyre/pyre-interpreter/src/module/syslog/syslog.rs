@@ -13,7 +13,7 @@ static SYSLOG_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 ///
 /// openlog / syslog / closelog / setlogmask.  Backed by
 /// `rustpython_host_env::syslog`.  Unix-only.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "openlog",
@@ -357,4 +357,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    Ok(())
 }

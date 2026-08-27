@@ -92,7 +92,9 @@ fn handle(which: usize) -> PyObjectRef {
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
     let _ = pyre_object::gc_roots::pin_root(w_app_globals);
-    crate::importing::appleveldef_install(
+    // The source imports nothing, so nothing the program does can make this
+    // fail; a failure here is the bundled file's own.
+    if let Err(e) = crate::importing::appleveldef_install(
         pyre_object::gc_roots::shadow_stack_get(save_point),
         ASYNC_OP_SRC,
         "app_operation.py",
@@ -100,7 +102,9 @@ fn handle(which: usize) -> PyObjectRef {
         // `get_applevel_name` hands to every appleveldef of that module.
         "builtins",
         &["aiter", "anext"],
-    );
+    ) {
+        panic!("async_operation: app_operation.py — {e:?}");
+    }
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
     let get = |name: &str| {
         unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }

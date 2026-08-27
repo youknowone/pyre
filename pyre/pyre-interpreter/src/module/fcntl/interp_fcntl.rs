@@ -10,7 +10,7 @@
 /// `rustpython_host_env::fcntl`.  `ioctl` is still limited to the
 /// integer-argument form; its buffer form needs writable-buffer acquisition
 /// and `mutate_flag` handling from `interp_fcntl.py:252-300`.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "fcntl",
@@ -388,6 +388,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             cst!("F_OFD_SETLKW", libc::F_OFD_SETLKW);
         }
     }
+    Ok(())
 }
 
 /// `fcntl_ioctl_impl`'s `IOCTL_BUFSZ` / `fcntl_fcntl_impl`'s `FCNTL_BUFSZ` —

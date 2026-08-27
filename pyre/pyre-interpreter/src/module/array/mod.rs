@@ -1604,7 +1604,7 @@ pub fn init_array_type(ns: PyObjectRef) {
 }
 
 /// `array` module init — `moduledef.py interpleveldefs`.
-pub fn init_array_module(ns: pyre_object::PyObjectRef) {
+pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let type_obj = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
     module_ns_store(ns, "array", type_obj);
     module_ns_store(ns, "ArrayType", type_obj);
@@ -1614,6 +1614,7 @@ pub fn init_array_module(ns: pyre_object::PyObjectRef) {
         "_array_reconstructor",
         crate::make_builtin_function("_array_reconstructor", array_reconstructor),
     );
+    Ok(())
 }
 
 /// PyPy `pypy/module/array/moduledef.py:Module.startup`: array is a

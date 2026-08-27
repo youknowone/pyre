@@ -750,7 +750,7 @@ fn frozen_data(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
     )
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "is_builtin",
@@ -1340,4 +1340,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "pyc_magic_number_token",
         pyre_object::w_int_new(i64::from(PYC_MAGIC_NUMBER_TOKEN)),
     );
+    Ok(())
 }
