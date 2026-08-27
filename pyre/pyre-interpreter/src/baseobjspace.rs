@@ -5453,9 +5453,12 @@ pub(crate) fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectR
 /// receiver's dictionary is a plain field or mapdict slot, so resolving it
 /// cannot run Python and the read is infallible.
 ///
-/// The probe that can raise needs a stored non-string key whose hash collides
-/// with `name`, which a reserved internal key never has, so the `unwrap_or`
-/// here reports no attribute rather than hiding one.
+/// The probe that can raise needs a *stored* non-string key whose hash collides
+/// with `name` and whose `__eq__` raises -- the key being looked up is a `str`
+/// and cannot be the one that raises.  The only caller reads a `_CFuncPtr`'s
+/// reserved keys, and neither that type nor a Python subclass of it gives an
+/// instance a reachable `__dict__`, so nothing but those `str` keys is ever
+/// stored and the `unwrap_or` here reports no attribute rather than hiding one.
 pub(crate) fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     getdictvalue(obj, name).unwrap_or(None)
 }
