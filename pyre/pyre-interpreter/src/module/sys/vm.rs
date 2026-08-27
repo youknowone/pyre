@@ -1463,11 +1463,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // sys.winver — the "major.minor" tag Windows uses for the per-user site
     // directory and the PythonCore registry keys. site.getusersitepackages
     // reads it to build USER_SITE.  A build without a global interpreter lock
-    // carries a `t` here, which is how Windows spells what `sys.abiflags`
-    // spells elsewhere; `sys._is_gil_enabled()` answers True for this one, so
-    // the tag it carries is the bare version.
+    // carries the `t` here, which is how Windows spells what `sys.abiflags`
+    // spells elsewhere: the tag follows the ABI the build publishes
+    // (`Py_GIL_DISABLED` is 1 and `abi_thread` is `t`), not
+    // `sys._is_gil_enabled()`, which reports whether the lock is on right now.
+    // `venv.EnvBuilder.setup_python` reads the same config var to name
+    // `python3.14t.exe`.
     #[cfg(windows)]
-    module_ns_store(ns, "winver", w_str_new("3.14"));
+    module_ns_store(ns, "winver", w_str_new("3.14t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
     // published beside `winver` because both come from the same `MS_COREDLL`
     // block.  `ctypes/__init__.py:562` builds `pythonapi` out of it with no
