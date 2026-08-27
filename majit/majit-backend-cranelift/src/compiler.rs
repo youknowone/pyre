@@ -231,7 +231,7 @@ fn attached_descr_ptrs_with_fallbacks(
 fn match_metainterp_finish_descr(
     jf_descr_raw: i64,
     attachments: &CpuDescrAttachments,
-) -> Option<(majit_ir::DescrRef, DescrRef)> {
+) -> Option<majit_ir::DescrRef> {
     let ptr = jf_descr_raw as usize;
     fn check(slot: &Option<majit_ir::DescrRef>, expected: usize) -> Option<majit_ir::DescrRef> {
         slot.as_ref().and_then(|arc| {
@@ -242,34 +242,21 @@ fn match_metainterp_finish_descr(
             }
         })
     }
-    for (slot, cl_singleton) in [
-        (
-            &attachments.done_with_this_frame_descr_int,
-            &*DONE_WITH_THIS_FRAME_DESCR_INT,
-        ),
-        (
-            &attachments.done_with_this_frame_descr_float,
-            &*DONE_WITH_THIS_FRAME_DESCR_FLOAT,
-        ),
-        (
-            &attachments.done_with_this_frame_descr_ref,
-            &*DONE_WITH_THIS_FRAME_DESCR_REF,
-        ),
-        (
-            &attachments.done_with_this_frame_descr_void,
-            &*DONE_WITH_THIS_FRAME_DESCR_VOID,
-        ),
-        (
-            &attachments.exit_frame_with_exception_descr_ref,
-            &*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL,
-        ),
+    // The attached descr and nothing beside it. Each of these has a cranelift
+    // singleton twin (`DONE_WITH_THIS_FRAME_DESCR_*`,
+    // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`), but the twin is what the
+    // *unattached* fall-through below reaches for; naming it here read one
+    // `LazyLock` per candidate and cloned an `Arc` the caller dropped unread,
+    // on the arm every finished entry takes.
+    for slot in [
+        &attachments.done_with_this_frame_descr_int,
+        &attachments.done_with_this_frame_descr_float,
+        &attachments.done_with_this_frame_descr_ref,
+        &attachments.done_with_this_frame_descr_void,
+        &attachments.exit_frame_with_exception_descr_ref,
     ] {
         if let Some(arc) = check(slot, ptr) {
-            // cl_singleton is `&DescrRef` (the metainterp's
-            // `Arc<DoneWithThisFrameDescr*>` or
-            // `Arc<ExitFrameWithExceptionDescrRef>` directly — no
-            // CraneliftFailDescr wrapper).
-            return Some((arc, cl_singleton.clone()));
+            return Some(arc);
         }
     }
     None
@@ -8074,7 +8061,13 @@ fn run_compiled_code_inner(
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
     let frame_depth = depth + num_ref_roots;
-    if majit_log_enabled() {
+    // Read once, ahead of the run. Each of these is a `Once`-guarded load of a
+    // flag fixed at process start, and the compiled call between the sites
+    // below is opaque to the optimizer, so asking again after it re-reads.
+    let log_enabled = majit_log_enabled();
+    let debug_prints = majit_ir::debug::have_debug_prints();
+    let verify_enabled = majit_verify_enabled();
+    if log_enabled {
         eprintln!(
             "[jf-alloc] frame_depth={} depth={} max_output={} inputs={} ref_roots={}",
             frame_depth,
@@ -8176,12 +8169,12 @@ fn run_compiled_code_inner(
             std::hint::black_box(&mut scratch);
         }
     }
-    if majit_ir::debug::have_debug_prints() {
+    if debug_prints {
         let preview: Vec<i64> = (0..inputs.len().min(10)).map(|i| inputs.raw(i)).collect();
         majit_ir::debug::log_one("jit-running", &format!("pre-call-inputs {preview:?}"));
     }
     // Debug: verify first input (frame ptr) is valid
-    if majit_verify_enabled() && !inputs.is_empty() {
+    if verify_enabled && !inputs.is_empty() {
         let frame_ptr = inputs.raw(0);
         if frame_ptr != 0 && (frame_ptr < 0x1000 || (frame_ptr as usize & 0x7) != 0) {
             majit_ir::debug::log_one(
@@ -8208,7 +8201,7 @@ fn run_compiled_code_inner(
     // _call_footer_shadowstack are emitted as inline MOVs in compiled
     // code's prologue/epilogue. The caller does NOT touch root_stack_top.
 
-    if majit_ir::debug::have_debug_prints() {
+    if debug_prints {
         majit_ir::debug::log_one(
             "jit-running",
             &format!(
@@ -8218,7 +8211,7 @@ fn run_compiled_code_inner(
         );
     }
     let result_jf = unsafe { func(jf_ptr, dispatch_key as i32) };
-    if majit_ir::debug::have_debug_prints() {
+    if debug_prints {
         majit_ir::debug::log_one("jit-running", &format!("post-call result_jf={result_jf:p}"));
     }
 
@@ -8304,8 +8297,7 @@ fn run_compiled_code_inner(
         } else {
             (0u32, None)
         }
-    } else if let Some((metainterp_finish, _cl_singleton)) =
-        match_metainterp_finish_descr(jf_descr_raw, attachments)
+    } else if let Some(metainterp_finish) = match_metainterp_finish_descr(jf_descr_raw, attachments)
     {
         // `history.py:125` `cpu.get_latest_descr(deadframe)` parity:
         // `jf_descr` carries the metainterp `Arc<DoneWithThisFrameDescr*>`
@@ -8350,7 +8342,7 @@ fn run_compiled_code_inner(
         });
         (fi, arc)
     };
-    if majit_log_enabled() {
+    if log_enabled {
         eprintln!(
             "[post-call-descr] raw={:#x} fail_index={} matched_local={}",
             jf_descr_raw,
@@ -9201,7 +9193,6 @@ impl CraneliftBackend {
         inputs: FrameInputs<'_>,
         dispatch_key: u32,
     ) -> DeadFrame {
-        slice_x2_probe::arm_reporter();
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.code_ptr;
         // Borrowed, not cloned: the dispatch loop only READS this table, and
@@ -9234,7 +9225,7 @@ impl CraneliftBackend {
         let attachments: &CpuDescrAttachments = &attachments_guard;
 
         loop {
-            let exec = run_compiled_code(
+            let mut exec = run_compiled_code(
                 cur_code_ptr,
                 &cur_fail_descrs,
                 cur_num_ref_roots,
@@ -9244,7 +9235,9 @@ impl CraneliftBackend {
                 cur_dispatch_key,
             );
             let fail_index = exec.fail_index;
-            let direct_descr = exec.direct_descr.clone();
+            // Taken, not cloned: this is the field's only reader, and what is
+            // left of `exec` is the frame and its owner.
+            let direct_descr = exec.direct_descr.take();
 
             // CALL_ASSEMBLER deadframe interception.
             if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
@@ -9275,8 +9268,28 @@ impl CraneliftBackend {
                         .unwrap_or_else(|| compiled.fail_descrs[0].clone())
                 })
             };
-            let fail_descr = &fail_descr;
-            let fail_descr_fd = as_fd(fail_descr);
+            // `compile.py` `_DoneWithThisFrameDescr.final_descr = True` is a
+            // class attribute, i.e. a field load after translation. The FINISH
+            // family answers `fail_index()` with `u32::MAX`
+            // (`majit-backend/src/finish_descrs.rs`) and the resolution above
+            // already keyed on that, so the three trait queries below would
+            // ask the descr what this word has already said. The arm is a
+            // SUPERSET of `is_finish()` — a `PropagateExceptionDescr` answers
+            // `u32::MAX` too and is not final — and it is right only because
+            // the fall-through return is byte-identical and
+            // `maybe_increment_fail_count` is inert on both. Anything added
+            // between the two returns below has to be re-checked here.
+            debug_assert!(
+                fail_index != u32::MAX || {
+                    let fd = as_fd(&fail_descr);
+                    !fd.is_external_jump() && !fd.is_resume_guard() && !fd.is_resume_guard_copied()
+                },
+                "a u32::MAX fail_index must be a final or propagate descr, never a guard"
+            );
+            if fail_index == u32::MAX {
+                return deadframe_from_jitframe(exec.jf_gcref, fail_descr, exec.heap_owner);
+            }
+            let fail_descr_fd = as_fd(&fail_descr);
 
             // llgraph/runner.py Jump exception caught by execute():
             // cross-loop JUMP — switch to the target loop trace identified
@@ -9313,7 +9326,7 @@ impl CraneliftBackend {
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 // jf_guard_exc already written by emit_guard_exit.
-                return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
+                return deadframe_from_jitframe(exec.jf_gcref, fail_descr, exec.heap_owner);
             }
 
             maybe_increment_fail_count(fail_descr_fd);
@@ -9335,7 +9348,7 @@ impl CraneliftBackend {
             // production traces; when control reaches this return the
             // descr genuinely has no bridge attached (cache was null at
             // guard exit time → in-code dispatch returned deadframe).
-            return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
+            return deadframe_from_jitframe(exec.jf_gcref, fail_descr, exec.heap_owner);
         } // end loop
     }
 
@@ -16744,6 +16757,12 @@ impl majit_backend::Backend for CraneliftBackend {
         if let Some(clt) = token.compiled_loop_token() {
             majit_backend::record_compiled_loop_token(&self.cpu_tracker, &clt);
         }
+        // Armed here rather than at the entry it reports on. The guard only
+        // has to exist by the time the thread ends, and registering a
+        // thread-local with a destructor is a call — one this thread was
+        // going to make anyway, on a path taken once per compiled loop
+        // instead of once per entry into one.
+        slice_x2_probe::arm_reporter();
         // Deep-clone Op out of OpRc for the internal pipeline (post-optimizer
         // boundary; backend stages do not depend on `_forwarded` sharing).
         let ops_owned: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
