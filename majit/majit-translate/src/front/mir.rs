@@ -3466,6 +3466,31 @@ impl<'a> Lowering<'a> {
             graph.name_value_var(&var, name.clone());
             *slot = Some(var.clone());
             let ty = tyref_to_value_type(&local.ty, llbc);
+            // A parameter with no runtime representation (`Arg<T>`'s
+            // `PhantomData` marker is the case in point — rustc gives it no
+            // ABI slot) has to read as `Void` here, matching upstream's
+            // `getkind(lltype.Void)`: `NON_VOID_ARGS` (the caller's actual
+            // arguments) and `FUNC.ARGS` filtered the same way (this
+            // graph's declared parameters via `graph_non_void_arg_types`)
+            // both filter by the identical is-not-Void test, so a param the
+            // caller's own concretetype tracking already treats as
+            // void-carrying must agree here or `getcalldescr` sees a
+            // caller/callee arity mismatch and hard fails. Scoped to the
+            // declared-parameter fallback only — not
+            // `tyref_to_value_type` itself, which construction sites
+            // (`AggregateKind` lowering et al.) also call, and which must
+            // keep minting a real value for a zero-sized type until they
+            // erase it the way rtyper does everywhere. Guarded on the
+            // generic `Ref(None)` fallback so a real (non-zero-sized) Ref
+            // param is never touched, and a fieldless enum — already
+            // resolved to `Int` above regardless of its own zero-sized
+            // layout — never reaches this arm.
+            let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_zero_sized(&local.ty, llbc)
+            {
+                ValueType::Void
+            } else {
+                ty
+            };
             // `class_root` carries the param's named-ADT leaf so
             // `derive_subject_inputcells` can seed the receiver's
             // `ClassDef`; only `Ref`-typed params consume it there.  A
