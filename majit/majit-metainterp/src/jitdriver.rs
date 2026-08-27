@@ -1681,7 +1681,13 @@ pub struct JitDriver<S: JitState> {
     /// entry finds this slot empty and starts from fresh ones. Nesting
     /// therefore costs what it costs today and never aliases; only the
     /// outermost entry's buffers survive to be reused.
-    entry_scratch: EntryScratch,
+    ///
+    /// Held behind a pointer because the hand-out and the hand-back are moves:
+    /// the struct is five `Vec` headers, so an inline slot moved a hundred and
+    /// twenty bytes out of this field and the same back into it on every entry,
+    /// for buffers whose contents never move at all. `None` is the window
+    /// between the two, which is what a nested entry finds.
+    entry_scratch: Option<Box<EntryScratch>>,
 }
 
 /// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].
@@ -1869,7 +1875,7 @@ impl<S: JitState> JitDriver<S> {
             portal_runner: None,
             portal_jd_index: None,
             state_field_fvc: None,
-            entry_scratch: EntryScratch::default(),
+            entry_scratch: Some(Box::default()),
             #[expect(
                 clippy::arc_with_non_send_sync,
                 reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
@@ -6620,8 +6626,12 @@ impl<S: JitState> JitDriver<S> {
     /// The buffers arrive with their previous contents dropped and their
     /// capacity kept. `vable_arrays` keeps its outer elements so the inner
     /// buffers survive too — see `JitState::export_virtualizable_boxes_into`.
-    fn take_entry_scratch(&mut self) -> EntryScratch {
-        let mut scratch = std::mem::take(&mut self.entry_scratch);
+    ///
+    /// A nested entry finds the slot empty and builds its own set, which is the
+    /// `unwrap_or_default` arm; the allocation it costs is the price of nesting
+    /// and not of the ordinary entry, which finds the box the last one returned.
+    fn take_entry_scratch(&mut self) -> Box<EntryScratch> {
+        let mut scratch = self.entry_scratch.take().unwrap_or_default();
         scratch.live_values.clear();
         scratch.raw.clear();
         scratch.types.clear();
@@ -6633,8 +6643,8 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Return the buffers [`Self::take_entry_scratch`] handed out.
-    fn entry_scratch_out(&mut self, scratch: EntryScratch) {
-        self.entry_scratch = scratch;
+    fn entry_scratch_out(&mut self, scratch: Box<EntryScratch>) {
+        self.entry_scratch = Some(scratch);
     }
 
     /// The driver's static data, resolved once and then shared.
