@@ -2327,10 +2327,10 @@ mod ssl_socket_methods {
                 self.shutdown_started = true;
             }
             flush_transport(self)?;
-            // PyPy `_stdssl._SSLSocket.shutdown` keeps driving shutdown until
-            // it receives the peer close-notify or the transport reports that
-            // the operation would block. `read()` may already have consumed
-            // the alert, so refill only while peer shutdown is outstanding.
+            // `_stdssl._SSLSocket.shutdown` keeps driving shutdown until it
+            // receives the peer close-notify or the transport reports that the
+            // operation would block.  `read()` may already have consumed the
+            // alert, so refill only while peer shutdown is outstanding.
             while !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
                 receive_transport(self)?;
             }

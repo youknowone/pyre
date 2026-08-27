@@ -166,6 +166,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_code": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_code_module": {
@@ -1038,7 +1039,8 @@
       "dynasm": "PASS"
     },
     "test.test_socket": {
-      "dynasm": "IMPORTERROR"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_socketserver": {
       "dynasm": "PASS"
@@ -1053,6 +1055,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_ssl": {
+      "cranelift": "PASS",
       "dynasm": "PASS"
     },
     "test.test_stable_abi_ctypes": {

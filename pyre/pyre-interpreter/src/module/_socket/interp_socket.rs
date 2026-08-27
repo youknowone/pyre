@@ -2406,7 +2406,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 // `flowinfo` is the third item, and its twenty bits are the
                 // only thing checked about it here — the address itself comes
                 // from the lookup below.
-                if let Some(flowinfo_obj) = item(2) {
+                let flowinfo = if let Some(flowinfo_obj) = item(2) {
                     if !unsafe { pyre_object::is_int(flowinfo_obj) } {
                         return Err(illegal_sockaddr());
                     }
@@ -2416,7 +2416,23 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                             "getnameinfo(): flowinfo must be 0-1048575.",
                         ));
                     }
-                }
+                    flowinfo as u32
+                } else {
+                    0
+                };
+                let scope_id = if let Some(scope_obj) = item(3) {
+                    if !unsafe { pyre_object::is_int(scope_obj) } {
+                        return Err(illegal_sockaddr());
+                    }
+                    let scope_id = unsafe { pyre_object::w_int_get_value(scope_obj) };
+                    u32::try_from(scope_id).map_err(|_| {
+                        crate::PyError::overflow_error(
+                            "getnameinfo(): scope id must be an unsigned 32-bit integer",
+                        )
+                    })?
+                } else {
+                    0
+                };
                 let host = crate::baseobjspace::str_utf8_w(host_obj)?.to_string();
                 let port_v = unsafe { pyre_object::w_int_get_value(port_obj) };
 
@@ -2457,6 +2473,27 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                         "IPv4 sockaddr must be 2 tuple",
                     ));
                 }
+                let mut resolved: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let resolved_len = (ai.ai_addrlen as usize)
+                    .min(core::mem::size_of::<rffi::sockaddr_storage>());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ai.ai_addr as *const u8,
+                        &mut resolved as *mut _ as *mut u8,
+                        resolved_len,
+                    );
+                }
+                if ai.ai_family == rffi::AF_INET6 {
+                    // `rsocket.py:INET6Address.__init__` stores both optional
+                    // tuple fields in the sockaddr handed to getnameinfo.  A
+                    // resolver lookup of the bare host cannot recover the
+                    // scope id by itself.
+                    let sin6 = unsafe {
+                        &mut *(&mut resolved as *mut _ as *mut rffi::sockaddr_in6)
+                    };
+                    sin6.sin6_flowinfo = flowinfo.to_be();
+                    rffi::sockaddr_in6_set_scope_id(sin6, scope_id);
+                }
                 let mut host_buf = [0 as libc::c_char; rffi::NI_MAXHOST as usize];
                 let mut serv_buf = [0 as libc::c_char; 32];
                 // A reverse lookup goes to the resolver and can take seconds.
@@ -2464,8 +2501,8 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     let _blocked = crate::module::thread::before_external_block();
                     unsafe {
                         rffi::getnameinfo(
-                            ai.ai_addr,
-                            ai.ai_addrlen as rffi::SockLen,
+                            &resolved as *const _ as *const rffi::sockaddr,
+                            resolved_len as rffi::SockLen,
                             host_buf.as_mut_ptr(),
                             host_buf.len() as rffi::SockLen,
                             serv_buf.as_mut_ptr(),
@@ -2581,17 +2618,12 @@ pub(crate) fn socket_error_for_operation(
 
 #[cfg(any(unix, windows))]
 fn socket_io_err_for_operation(
-    obj: pyre_object::PyObjectRef,
+    _obj: pyre_object::PyObjectRef,
     e: std::io::Error,
 ) -> crate::PyError {
-    let errno = e.raw_os_error().unwrap_or(0);
-    if rffi::error_is_would_block(errno) && socket_positive_timeout(obj).is_some() {
-        // RPython's RSocket._select() turns expiry of a positive timeout
-        // into SocketTimeout, which interp_socket maps to TimeoutError.
-        // This backend uses SO_RCVTIMEO/SO_SNDTIMEO, whose equivalent
-        // expiry signal is EAGAIN/EWOULDBLOCK.
-        return socket_converted_error("timeout", None, "timed out");
-    }
+    // `RSocket.wait_for_data` itself owns SocketTimeout.  Once poll reported
+    // readiness, a raced EAGAIN/EWOULDBLOCK is the ordinary socket error the
+    // syscall returned; it must not be relabelled as an expired wait.
     socket_io_err(e)
 }
 
@@ -2609,14 +2641,14 @@ fn socket_positive_timeout(obj: pyre_object::PyObjectRef) -> Option<f64> {
         .filter(|timeout| *timeout > 0.0)
 }
 
-/// RPython `RSocket._select(False)` used by `RSocket.accept`: a positive
-/// Python timeout is enforced with poll before entering the libc operation.
-/// Darwin does not reliably apply SO_RCVTIMEO to accept(), so relying on that
-/// socket option leaves timeout-driven server loops blocked indefinitely.
+/// RPython `RSocket._select`: a positive Python timeout is enforced with poll
+/// before entering every libc socket operation.  Zero skips the wait and the
+/// descriptor itself answers would-block; a negative timeout is blocking.
 #[cfg(any(unix, windows))]
-fn socket_wait_readable(
+fn socket_wait_for_data(
     obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
+    for_writing: bool,
 ) -> Result<(), crate::PyError> {
     let Some(timeout) = socket_positive_timeout(obj) else {
         return Ok(());
@@ -2635,10 +2667,17 @@ fn socket_wait_readable(
         }
         // poll's resolution is one millisecond; a shorter remainder must still
         // wait rather than degenerate into a busy loop.
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
         // Darwin may restart poll after a signal instead of returning EINTR.
-        // Slice the wait so pending handlers run before the deadline.
-        let timeout_ms = remaining.as_millis().max(1).min(50) as i32;
-        let (ready, errno) = rffi::poll_readable(fd, timeout_ms);
+        // Slicing there keeps Python signal delivery prompt without changing
+        // the ordinary one-poll PyPy path on other hosts.
+        #[cfg(target_os = "macos")]
+        let timeout_ms = timeout_ms.min(50);
+        let (ready, errno) = if for_writing {
+            rffi::poll_writable(fd, timeout_ms)
+        } else {
+            rffi::poll_readable(fd, timeout_ms)
+        };
         if ready > 0 {
             return Ok(());
         }
@@ -2651,6 +2690,22 @@ fn socket_wait_readable(
         }
         crate::module::signal::interp_signal::checksignals_now()?;
     }
+}
+
+#[cfg(any(unix, windows))]
+fn socket_wait_readable(
+    obj: pyre_object::PyObjectRef,
+    fd: rffi::Socket,
+) -> Result<(), crate::PyError> {
+    socket_wait_for_data(obj, fd, false)
+}
+
+#[cfg(any(unix, windows))]
+fn socket_wait_writable(
+    obj: pyre_object::PyObjectRef,
+    fd: rffi::Socket,
+) -> Result<(), crate::PyError> {
+    socket_wait_for_data(obj, fd, true)
 }
 
 /// Writable half of `RSocket.wait_for_data`, bounded by one absolute
@@ -2668,12 +2723,15 @@ fn socket_wait_writable_until(
             return Err(socket_converted_error("timeout", None, "timed out"));
         }
         let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        #[cfg(target_os = "macos")]
+        let timeout_ms = timeout_ms.min(50);
         let (ready, errno) = rffi::poll_writable(fd, timeout_ms);
         if ready > 0 {
             return Ok(());
         }
         if ready == 0 {
-            return Err(socket_converted_error("timeout", None, "timed out"));
+            crate::module::signal::interp_signal::checksignals_now()?;
+            continue;
         }
         if !rffi::error_is_interrupted(errno) {
             return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
@@ -2682,67 +2740,80 @@ fn socket_wait_writable_until(
     }
 }
 
-/// `internal_connect` for a socket carrying a positive timeout.  WinSock does
-/// not apply `SO_SNDTIMEO` to `connect`, so the call runs in non-blocking mode
-/// and the wait for its outcome is explicit; POSIX's `SO_SNDTIMEO` already
-/// bounds the call and keeps the straight-line path.
+/// `RSocket._connect` for a socket carrying a positive timeout.  Positive
+/// timeout descriptors are already non-blocking; connect waits for writable
+/// and then reads `SO_ERROR` on both POSIX and WinSock.
 ///
 /// Returns the code the attempt reported, so both `connect` and `connect_ex`
 /// can shape it the way each one answers.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
+enum SocketConnectFailure {
+    Errno(i32),
+    Timeout(i32),
+    Exception(crate::PyError),
+}
+
+#[cfg(any(unix, windows))]
 fn socket_connect_timed(
     fd: rffi::Socket,
     storage: &rffi::sockaddr_storage,
     slen: rffi::SockLen,
     timeout: f64,
-) -> Result<(), i32> {
-    rffi::apply_timeout(fd, 0.0).map_err(|e| e.raw_os_error().unwrap_or(0))?;
-    let outcome = socket_connect_wait(fd, storage, slen, timeout);
-    // The socket goes back to the mode its own timeout declares whatever the
-    // connect did; failing to restore it is not the answer the caller asked
-    // for.
-    let _ = rffi::apply_timeout(fd, timeout);
-    outcome
+) -> Result<(), SocketConnectFailure> {
+    socket_connect_wait(fd, storage, slen, timeout)
 }
 
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn socket_connect_wait(
     fd: rffi::Socket,
     storage: &rffi::sockaddr_storage,
     slen: rffi::SockLen,
     timeout: f64,
-) -> Result<(), i32> {
+) -> Result<(), SocketConnectFailure> {
     let (started, errno) = socket_call(|| unsafe {
         rffi::connect(fd, storage as *const _ as *const rffi::sockaddr, slen)
     });
     if started == 0 {
         return Ok(());
     }
-    if !rffi::error_is_would_block(errno) {
-        return Err(errno);
+    if !rffi::error_is_connect_in_progress(errno) {
+        return Err(SocketConnectFailure::Errno(errno));
     }
-    // The connection is under way and reports its outcome by making the socket
-    // writable.  A single wait is enough: Windows does not interrupt it.
-    let timeout_ms = (timeout * 1000.0).round().clamp(1.0, i32::MAX as f64) as i32;
-    let (ready, poll_errno) = rffi::poll_writable(fd, timeout_ms);
-    if ready < 0 {
-        return Err(poll_errno);
-    }
-    if ready == 0 {
-        // `_connect` answers the expiry with `WSAEWOULDBLOCK` — the code the
-        // non-blocking connect itself reported — beside a separate timeout
-        // flag.  `connect_ex` returns that code, and `connect` reads it back
-        // through `socket_io_err_for_operation`, which a positive timeout
-        // turns into the `TimeoutError` the flag stands for.
-        return Err(rffi::WSAEWOULDBLOCK);
+    let capped = timeout.min(i32::MAX as f64 / 1000.0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(capped);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            #[cfg(unix)]
+            return Err(SocketConnectFailure::Timeout(libc::EWOULDBLOCK));
+            #[cfg(windows)]
+            return Err(SocketConnectFailure::Timeout(rffi::WSAEWOULDBLOCK));
+        }
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let (ready, poll_errno) = rffi::poll_writable(fd, timeout_ms);
+        if ready > 0 {
+            break;
+        }
+        if ready == 0 {
+            #[cfg(unix)]
+            return Err(SocketConnectFailure::Timeout(libc::EWOULDBLOCK));
+            #[cfg(windows)]
+            return Err(SocketConnectFailure::Timeout(rffi::WSAEWOULDBLOCK));
+        }
+        if !rffi::error_is_interrupted(poll_errno) {
+            return Err(SocketConnectFailure::Errno(poll_errno));
+        }
+        if let Err(error) = crate::module::signal::interp_signal::checksignals_now() {
+            return Err(SocketConnectFailure::Exception(error));
+        }
     }
     // `SO_ERROR` carries the outcome of a connect that finished after its call
     // returned; zero means it succeeded.
     match socket_getsockopt_int(fd, rffi::SOL_SOCKET, rffi::SO_ERROR) {
         Ok(0) => Ok(()),
-        Ok(errno) => Err(errno),
+        Ok(errno) => Err(SocketConnectFailure::Errno(errno)),
         // Reading the option failed; the last-error slot still holds why.
-        Err(_) => Err(rffi::last_error_code()),
+        Err(_) => Err(SocketConnectFailure::Errno(rffi::last_error_code())),
     }
 }
 
@@ -4392,21 +4463,21 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // ASCII `str`, so the socket is read back from its slot
                 // rather than from the native argument slice, which is
                 // only current at entry.
-                #[cfg(windows)]
                 let _roots = pyre_object::gc_roots::push_roots();
-                #[cfg(windows)]
                 let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
                 let (storage, slen) = pack_inet_addr("connect", family, proto, args[1])?;
-                #[cfg(windows)]
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                #[cfg(windows)]
                 if let Some(timeout) = socket_positive_timeout(obj) {
                     return match socket_connect_timed(fd, &storage, slen, timeout) {
                         Ok(()) => Ok(pyre_object::w_none()),
-                        Err(errno) => Err(socket_io_err_for_operation(
+                        Err(SocketConnectFailure::Errno(errno)) => Err(socket_io_err_for_operation(
                             obj,
                             std::io::Error::from_raw_os_error(errno),
                         )),
+                        Err(SocketConnectFailure::Timeout(_)) => {
+                            Err(socket_converted_error("timeout", None, "timed out"))
+                        }
+                        Err(SocketConnectFailure::Exception(error)) => Err(error),
                     };
                 }
                 loop {
@@ -4449,17 +4520,21 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // ASCII `str`, so the socket is read back from its slot
                 // rather than from the native argument slice, which is
                 // only current at entry.
-                #[cfg(windows)]
                 let _roots = pyre_object::gc_roots::push_roots();
-                #[cfg(windows)]
                 let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
                 let (storage, slen) = pack_inet_addr("connect_ex", family, proto, args[1])?;
-                #[cfg(windows)]
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                #[cfg(windows)]
                 if let Some(timeout) = socket_positive_timeout(obj) {
-                    let err = socket_connect_timed(fd, &storage, slen, timeout).err();
-                    return Ok(pyre_object::w_int_new(err.unwrap_or(0) as i64));
+                    return match socket_connect_timed(fd, &storage, slen, timeout) {
+                        Ok(()) => Ok(pyre_object::w_int_new(0)),
+                        Err(SocketConnectFailure::Errno(errno)) => {
+                            Ok(pyre_object::w_int_new(errno as i64))
+                        }
+                        Err(SocketConnectFailure::Timeout(errno)) => {
+                            Ok(pyre_object::w_int_new(errno as i64))
+                        }
+                        Err(SocketConnectFailure::Exception(error)) => Err(error),
+                    };
                 }
                 // `interp_socket.py:387-391` — retry while the call is
                 // interrupted (EINTR), otherwise return the errno.
@@ -4505,7 +4580,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // argument permanently exported and unable to be resized. The
             // result is held rather than propagated so the release covers the
             // error paths too.
-            let result = socket_send_bytes(obj, fd, buffer.as_bytes(), flags);
+            let result = socket_wait_writable(obj, fd)
+                .and_then(|()| socket_send_bytes(obj, fd, buffer.as_bytes(), flags));
             buffer.release();
             Ok(pyre_object::w_int_new(result? as i64))
         }),
@@ -4563,6 +4639,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         if rffi::error_is_interrupted(errno) {
                             continue;
                         }
+                        if deadline.is_some() && rffi::error_is_would_block(errno) {
+                            // Readiness can be consumed between poll and send;
+                            // keep sendall's operation-wide deadline rather
+                            // than exposing the transient race.
+                            continue;
+                        }
                         return Err(socket_io_err_for_operation(
                             obj,
                             std::io::Error::from_raw_os_error(errno),
@@ -4604,6 +4686,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             let mut buf = vec![0u8; n];
+            socket_wait_readable(obj, fd)?;
             let got = socket_recv_bytes(obj, fd, &mut buf, flags)?;
             buf.truncate(got);
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
@@ -4656,6 +4739,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
                 let (storage, slen) = pack_inet_addr("sendto", family, proto, addr_obj)?;
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                socket_wait_writable(obj, fd)?;
                 loop {
                     let (r, errno) = socket_call(|| unsafe {
                         rffi::sendto(
@@ -4720,6 +4804,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut buf = vec![0u8; n];
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+            socket_wait_readable(obj, fd)?;
             let got = loop {
                 let (r, errno) = socket_call(|| unsafe {
                     rffi::recvfrom(
@@ -4802,6 +4887,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             let fd = socket_fd(obj)?;
+            socket_wait_readable(obj, fd)?;
             let got = loop {
                 let (r, errno) = socket_call(|| unsafe {
                     rffi::recv(fd, slot.as_mut_ptr() as *mut libc::c_void, nbytes, flags)
@@ -4874,6 +4960,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = socket_fd(obj)?;
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
             let mut slen = core::mem::size_of::<rffi::sockaddr_storage>() as rffi::SockLen;
+            socket_wait_readable(obj, fd)?;
             let got = loop {
                 let (r, errno) = socket_call(|| unsafe {
                     rffi::recvfrom(
@@ -4964,7 +5051,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let mut data = vec![0u8; bufsize];
             let mut control = vec![0u8; ancbufsize];
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let (got, msg_flags, msg_namelen) = loop {
+            socket_wait_readable(args[0], fd)?;
+            let (got, msg_flags, msg_namelen, controllen) = loop {
                 let mut iov = libc::iovec {
                     iov_base: data.as_mut_ptr() as *mut libc::c_void,
                     iov_len: bufsize,
@@ -4982,7 +5070,12 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     libc::recvmsg(fd, &mut msg, flags)
                 });
                 if r >= 0 {
-                    break (r, msg.msg_flags, msg.msg_namelen);
+                    break (
+                        r,
+                        msg.msg_flags,
+                        msg.msg_namelen,
+                        msg.msg_controllen,
+                    );
                 }
                 if !rffi::error_is_interrupted(errno) {
                     return Err(socket_io_err_for_operation(
@@ -5003,16 +5096,16 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // the field bracket closes before its tuple joins the outer one,
             // because the pins share one stack and must unwind in order.
             let mut anc_items = pyre_object::gc_roots::RootedItems::new();
-            if ancbufsize > 0 {
-                let mut iov = libc::iovec {
-                    iov_base: data.as_mut_ptr() as *mut libc::c_void,
-                    iov_len: bufsize,
+            if ancbufsize > 0 && controllen > 0 {
+                let mut dummy_iov = libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
                 };
                 let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                msg.msg_iov = &mut iov;
+                msg.msg_iov = &mut dummy_iov;
                 msg.msg_iovlen = 1;
                 msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                msg.msg_controllen = ancbufsize as _;
+                msg.msg_controllen = controllen;
                 unsafe {
                     let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
                     while !cmsg.is_null() {
@@ -5022,8 +5115,18 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         if total < hdr_size {
                             break;
                         }
-                        let payload_len = total - hdr_size;
                         let payload_ptr = libc::CMSG_DATA(cmsg);
+                        let control_start = control.as_ptr() as usize;
+                        let data_start = payload_ptr as usize;
+                        let control_end = control_start.saturating_add(controllen as usize);
+                        if data_start < control_start || data_start > control_end {
+                            break;
+                        }
+                        // A truncated cmsg may retain its original cmsg_len.
+                        // `recvmsg.py` returns only bytes the kernel actually
+                        // left inside the final msg_controllen boundary.
+                        let available = control_end - data_start;
+                        let payload_len = (total - hdr_size).min(available);
                         let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
                         let entry = {
                             let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -5062,35 +5165,23 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             if args.len() < 2 {
                 return Err(crate::PyError::type_error("recvmsg_into() missing buffers"));
             }
-            let seq = args[1];
-            let (is_list, is_tuple) =
-                unsafe { (pyre_object::is_list(seq), pyre_object::is_tuple(seq)) };
-            if !is_list && !is_tuple {
-                return Err(crate::PyError::type_error(
-                    "recvmsg_into: buffers must be a list or tuple of writable buffers",
-                ));
-            }
-            let nbufs = unsafe {
-                if is_list {
-                    pyre_object::w_list_len(seq)
-                } else {
-                    pyre_object::w_tuple_len(seq)
-                }
-            };
             // One scope for the whole set: `SocketWritableBuffer` records slot
             // indices into it, and the vector's elements are dropped front to
             // back.
             let _roots = pyre_object::gc_roots::push_roots();
-            let mut buffers: Vec<SocketWritableBuffer> = Vec::with_capacity(nbufs);
-            for i in 0..nbufs {
-                let item = unsafe {
-                    if is_list {
-                        pyre_object::w_list_getitem(seq, i as i64)
-                    } else {
-                        pyre_object::w_tuple_getitem(seq, i as i64)
-                    }
-                }
-                .ok_or_else(|| crate::PyError::type_error("recvmsg_into: buffer item missing"))?;
+            // `W_Socket.recvmsg_into_w` snapshots an arbitrary iterable with
+            // `space.unpackiterable` before acquiring any writable views.  In
+            // particular a generator is part of the public accepted surface.
+            let seq_slot = pyre_object::gc_roots::pin_roots(&[args[1]]);
+            let buffer_items = crate::baseobjspace::unpackiterable(
+                pyre_object::gc_roots::shadow_stack_get(seq_slot),
+                -1,
+            )?;
+            let items_base = pyre_object::gc_roots::pin_roots(&buffer_items);
+            let mut buffers: Vec<SocketWritableBuffer> =
+                Vec::with_capacity(buffer_items.len());
+            for i in 0..buffer_items.len() {
+                let item = pyre_object::gc_roots::shadow_stack_get(items_base + i);
                 buffers.push(unsafe { SocketWritableBuffer::acquire(item) }?);
             }
             let ancbufsize = if args.len() >= 3 {
@@ -5133,6 +5224,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 .collect();
             let mut control = vec![0u8; ancbufsize];
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+            socket_wait_readable(args[0], fd)?;
             let (got, msg_flags, msg_namelen, controllen) = loop {
                 let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
                 msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
@@ -5185,8 +5277,15 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         if total < hdr_size {
                             break;
                         }
-                        let payload_len = total - hdr_size;
                         let payload_ptr = libc::CMSG_DATA(cmsg);
+                        let control_start = control.as_ptr() as usize;
+                        let data_start = payload_ptr as usize;
+                        let control_end = control_start.saturating_add(controllen as usize);
+                        if data_start < control_start || data_start > control_end {
+                            break;
+                        }
+                        let available = control_end - data_start;
+                        let payload_len = (total - hdr_size).min(available);
                         let payload = std::slice::from_raw_parts(payload_ptr, payload_len).to_vec();
                         let entry = {
                             let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -5374,6 +5473,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 }
             }
 
+            socket_wait_writable(obj, fd)?;
             let sent = loop {
                 let (r, errno) = socket_call(|| unsafe {
                     libc::sendmsg(fd, &msg, flags)

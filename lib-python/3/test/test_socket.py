@@ -5720,6 +5720,7 @@ class UnbufferedFileObjectClassTestCase(FileObjectClassTestCase):
 
     @unittest.skipUnless(hasattr(sys, 'getrefcount'),
                          'test needs sys.getrefcount()')
+    @support.refcount_test
     def testMakefileCloseSocketDestroy(self):
         refcount_before = sys.getrefcount(self.cli_conn)
         self.read_file.close()
