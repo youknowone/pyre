@@ -262,6 +262,11 @@ pub const PY_TPFLAGS_STATIC_BUILTIN: std::ffi::c_ulong = 1 << 1;
 pub const PY_TPFLAGS_DISALLOW_INSTANTIATION: std::ffi::c_ulong = 1 << 7;
 pub const PY_TPFLAGS_HEAPTYPE: std::ffi::c_ulong = 1 << 9;
 pub const PY_TPFLAGS_BASETYPE: std::ffi::c_ulong = 1 << 10;
+/// PEP 590 -- the type lends its instances a `vectorcallfunc`, stored in
+/// each of them at `tp_vectorcall_offset`.  A type carrying the bit is
+/// readied with `tp_call` filled and the offset positive, so the two are
+/// read together and never apart.
+pub const PY_TPFLAGS_HAVE_VECTORCALL: std::ffi::c_ulong = 1 << 11;
 pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
 pub const PY_TPFLAGS_READYING: std::ffi::c_ulong = 1 << 13;
 pub const PY_TPFLAGS_HAVE_GC: std::ffi::c_ulong = 1 << 14;
@@ -2397,6 +2402,15 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         if (*tp).tp_vectorcall_offset == 0 {
             (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
         }
+        // A class derived in Python from a C type that lends its instances a
+        // function keeps lending it: the instance is sized by the base's
+        // `tp_basicsize`, which the caller copies for exactly that reason, and
+        // filled by the base's `tp_new`.  `fill_interpreter_slots` runs after
+        // this and installs the trampoline in `tp_call`, so the test for a
+        // `tp_call` of the subclass's own has to happen here.
+        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
+            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        }
     }
 }
 
@@ -3497,13 +3511,31 @@ fn slot_call(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, c
     if slot.is_null() {
         return Err(crate::PyError::type_error("cpyext object is not callable"));
     }
-    super::call_cfunction(
-        slot,
-        super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
-        w_self,
-        &positional,
-        &keywords,
-    )
+    // `_PyObject_VectorcallTstate`: the function the callable's type lends it
+    // answers ahead of `tp_call`, and takes the values as they already lie.
+    // The two routes end in the same function whenever `tp_call` is
+    // `PyVectorcall_Call` -- but reaching it that way builds a tuple, and a
+    // dict for the keywords, only for `_PyStack_UnpackDict` to take both apart
+    // again on the other side.  Cython gives every compiled function and
+    // `cdef` method this shape, so the round trip is most of what calling one
+    // costs.
+    //
+    // `vectorcallfunc` takes the callable, the values, the count and the
+    // keyword names, which is `METH_FASTCALL | METH_KEYWORDS`; the count goes
+    // over without `PY_VECTORCALL_ARGUMENTS_OFFSET`, the bit a caller sets only
+    // to lend the callee the slot in front of the vector.
+    let vectorcall = unsafe { super::object::vectorcall_function(pyobject::as_pyobj(w_self)) };
+    let (function, flags) = match vectorcall {
+        Some(function) => (
+            function as *const c_void,
+            super::methodobject::METH_FASTCALL | super::methodobject::METH_KEYWORDS,
+        ),
+        None => (
+            slot,
+            super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
+        ),
+    };
+    super::call_cfunction(function, flags, w_self, &positional, &keywords)
 }
 
 /// Run a `(self) -> PyObject *` slot.
@@ -4543,6 +4575,23 @@ fn publish(
 fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
     if base.is_null() {
         return;
+    }
+    // The offset always travels, so that `PyVectorcall_Call` -- which reads it
+    // without consulting the flag -- keeps working for a subclass; the flag
+    // travels only to a subclass that leaves `tp_call` alone, and decides
+    // whether the offset is read of its own accord.
+    //
+    // Both have to happen before the copy below fills `tp_call` in, because
+    // afterwards every subclass reads as having declared one.  A subclass that
+    // does declare its own `tp_call` means it, and it is `tp_call` -- not the
+    // function its base lends instances -- that has to answer for it.
+    unsafe {
+        if (*tp).tp_vectorcall_offset == 0 {
+            (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
+        }
+        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
+            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        }
     }
     macro_rules! inherit {
         ($($field:ident),* $(,)?) => {
