@@ -5656,28 +5656,29 @@ fn mapdict_qmut_force_enabled() -> bool {
 /// is deliberately not a mutation).  Dropping the check would fold a wrong
 /// answer, so a null falls through to the live residual read.
 ///
-/// !! THIS FOLD CURRENTLY FIRES NOWHERE, AND THE FIRST GUARD IS WHY.
-/// Re-measured 2026-08-26 on release dynasm with every early return named
-/// through `decline!`: over the whole corpus the census row reads
-/// `consulted=59 fired=0`, and over the 359 `bench/synth` fixtures holding a
-/// nested function every one of the 38 declines reports `cell-not-constant`.
-/// No other reason is reported anywhere.  Its ideal shape — a write-once
-/// freevar read from a hot `while` — reports the same single reason, as does a
-/// closure callee called from a hot loop, so this is not a coverage gap in the
-/// corpus and the later guards are unreached rather than merely quiet.
+/// !! THE CONSTANT ARM FIRES NOWHERE, AND THE FIRST GUARD IS WHY.
+/// Measured 2026-08-26 on release dynasm with every early return named through
+/// `decline!`: over the whole corpus the census row read `consulted=59
+/// fired=0`, and over the 359 `bench/synth` fixtures holding a nested function
+/// every one of the 38 declines reported `cell-not-constant`.  No other reason
+/// was reported anywhere.  Its ideal shape — a write-once freevar read from a
+/// hot `while` — reported the same single reason, as did a closure callee
+/// called from a hot loop, so this was not a coverage gap in the corpus and the
+/// later guards are unreached rather than merely quiet.
 ///
 /// So `jit.isconstant` / [`OpRef::is_constant`] is established, not suspected:
 /// the cell arrives red because it is read out of the frame's own cells
-/// region.  `ever_mutated` was never a candidate — `CellFamily::new` is born
-/// `false` and a write-once binding never sets it — and the `can_move` gate on
-/// the contents is likewise never reached.  A `spec-folds=load_deref`
-/// directive would therefore fail today; the row exists, unguarded, and is
-/// documented here rather than gated.
+/// region.  `ever_mutated` was never a candidate for THAT decline —
+/// `CellFamily::new` is born `false` and a write-once binding never sets it —
+/// and the `can_move` gate on the contents is likewise never reached.
 ///
-/// The one admission that made closure callees inline, and with them their
-/// cells reach a sub-walk as constants, was `RuntimeHelperKind::LoadDeref` in
-/// `fbw_state.rs` `replay_safe_read`.  That listing is out — see the note
-/// there and `bench/synth/_pending/caller_f_lasti_across_residual_call.py`.
+/// What a red cell does with that is what changed: it takes
+/// [`try_walker_read_deref_cell`] instead of declining.  Re-measured over 483
+/// fixtures on 2026-08-27, the row reads `consulted=55 fired=46 suppressed=0`
+/// across the 16 fixtures that consult it, all 46 firings are that arm, and
+/// every one of the 9 declines reports `READ ever-mutated`.  So the row is
+/// covered now, and it is the constant arm that a `spec-folds=load_deref`
+/// directive would still not be covering.
 fn try_walker_specialize_load_deref<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -5693,16 +5694,19 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
             return Ok(None);
         }};
     }
-    // nestedscope.py `if jit.isconstant(self)`.
     let Some(&cell_op) = r_args.first() else {
         decline!("no-cell-operand");
     };
-    if !cell_op.is_constant() {
-        decline!("cell-not-constant");
-    }
     let Some(majit_ir::Value::Ref(cell_ref)) = ctx.trace_ctx.box_value(cell_op) else {
         decline!("cell-box-not-ref");
     };
+    // nestedscope.py `if jit.isconstant(self)`.  A RED cell takes the read arm
+    // below instead of declining: the residual it replaces is one field read
+    // behind a `RandomEffects` call boundary, which is worth removing whether
+    // or not the cell is green.
+    if !cell_op.is_constant() {
+        return try_walker_read_deref_cell(ctx, op_pc, cell_op, cell_ref);
+    }
     // `NO_CONCRETE` is `usize::MAX - 1`, not zero, so `is_null` does not cover
     // it and `is_cell` would dereference it.  It means "this box carries no
     // concrete half", which declines here for the same reason a null does: the
@@ -5751,6 +5755,139 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
+}
+
+/// [`try_walker_specialize_load_deref`]'s arm for a cell the trace holds RED —
+/// the ordinary freevar read from a frame's own cells region, which is every
+/// LOAD_DEREF outside an inlined callee.
+///
+/// Upstream never needs this arm: `nestedscope.py Cell.get` falls back to
+/// `self._elidable_get()` under `jit.isconstant`, and the read it guards is a
+/// plain `getfield` the tracer is already inside.  Pyre reaches the same read
+/// through a residual (`lower_load_deref_value_hlop_to_insn`), and a residual
+/// is not merely a call: `CallFlavor::Plain` resolves to
+/// `EffectInfo::MOST_GENERAL`, so every freevar read also arms
+/// `GUARD_NOT_FORCED`, `GUARD_NO_EXCEPTION` and `has_random_effects()`'s
+/// `clean_caches`.  A loop reading one freevar per iteration therefore loses
+/// the optimizer's whole heap cache once per iteration.
+///
+/// What replaces it is `w_cell_get` spelled out: a class pin on the slot and
+/// one `GETFIELD_GC_R(cell, contents)`, which re-reads on every iteration
+/// exactly as the residual re-read it.  Nothing is baked.
+///
+/// It still takes the `ever_mutated` quasi-immutable the fold above takes, and
+/// that is NOT because the read is elidable — it is not, `contents` is a
+/// mutable field.  It is because a STORE_DEREF cannot invalidate the cached
+/// read.  `lower_store_deref_value_hlop_to_insn` binds its residual
+/// `PlainCannotRaise`, whose `EffectInfo` carries analyzer-EMPTY write-descr
+/// sets — an assertion that the call writes no field at all — so `OptHeap`
+/// neither runs `clean_caches` (that needs `RandomEffects`) nor flushes any
+/// descr, and a `GETFIELD_GC_R(cell, contents)` recorded before the store is
+/// still live after it.  `run_nonlocal` in
+/// `bench/synth/closure_freevar_branch_resume` is the witness: `nonlocal n; n
+/// = n + 1` over 40000 iterations answered 24417 with the read admitted
+/// unconditionally.
+///
+/// The pair of record-time facts below closes that hole without a write set,
+/// which nothing in pyre can mint (`make_call_descr_sized` rejects a non-empty
+/// raw descr set once the bitstrings are computed):
+///
+/// * the contents are BOUND, so the next write to this cell is a
+///   bound-to-bound transition or a delete, and
+/// * `ever_mutated` is false,
+///
+/// and `w_cell_set` / `w_cell_delete` both call `set_ever_mutated(true)` for
+/// exactly those two, ahead of touching `contents`.  So any store that could
+/// stale this read invalidates the quasi-immutable first, and the
+/// `GUARD_NOT_INVALIDATED` below is what a STORE_DEREF's own effect set does
+/// not say.  The write-once freevar — a closed-over constant, and the
+/// `__class__` cell every zero-argument `super()` reads — keeps the read.
+///
+/// The unbound `NameError` becomes a side exit: `bh_load_deref_value_fn`
+/// raises it when the contents are null, so a `GUARD_NONNULL` in that place
+/// resumes the residual, which raises it from the eval loop.  A cell that is
+/// unbound AT RECORDING keeps the residual instead — the fold would otherwise
+/// have to emit a guard it knows fails.
+fn try_walker_read_deref_cell<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    cell_op: OpRef,
+    cell_ref: majit_ir::GcRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    macro_rules! decline {
+        ($why:literal) => {{
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LOAD-DEREF-READ {}", $why);
+            }
+            return Ok(None);
+        }};
+    }
+    let cell = cell_ref.0 as pyre_object::PyObjectRef;
+    if cell.is_null() || cell_ref == majit_ir::GcRef::NO_CONCRETE {
+        decline!("cell-null-or-no-concrete");
+    }
+    if !unsafe { pyre_object::is_cell(cell) } {
+        decline!("not-a-cell");
+    }
+    let family = unsafe { pyre_object::w_cell_family(cell) };
+    if family.is_null() {
+        decline!("family-null");
+    }
+    if unsafe { (*family).ever_mutated.get() } {
+        decline!("ever-mutated");
+    }
+    let contents = unsafe { pyre_object::w_cell_get(cell) };
+    if contents.is_null() {
+        decline!("contents-unbound");
+    }
+    // Under the single-frame collapse a guard here would resume at the
+    // caller's CALL, re-running whatever that callee already did.
+    if ctx.fbw_mode.inline_subwalk
+        && !crate::jitcode_dispatch::walker_inline_guard_resumes_in_callee(ctx)
+    {
+        decline!("subwalk-guard-collapses");
+    }
+    let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(cell_op) {
+        let type_const = ctx.trace_ctx.const_int(cell_type);
+        crate::jitcode_dispatch::walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardClass,
+            &[cell_op, type_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(cell_op, cell_type);
+    }
+    let owner = ctx.trace_ctx.const_ref(family as i64);
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::cell_family_ever_mutated_descr(),
+    );
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    let value = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        cell_op,
+        crate::descr::cell_contents_descr(),
+    );
+    if !matches!(
+        ctx.trace_ctx.box_value(value),
+        Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE
+    ) {
+        ctx.trace_ctx.set_opref_concrete(
+            value,
+            majit_ir::Value::Ref(majit_ir::GcRef(contents as usize)),
+        );
+    }
+    crate::jitcode_dispatch::walker_emit_fold_guard_with_snapshot(
+        ctx,
+        op_pc,
+        OpCode::GuardNonnull,
+        &[value],
+    )?;
+    Ok(Some(value))
 }
 
 fn walker_pin_plain_ever_mutated<Sym: WalkSym>(

@@ -1,8 +1,15 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=2
+# pyre-check: skip-cpython
+# The loop folds to one add per iteration on both JITs, so N has to be in
+# the hundreds of millions before pypy's execution time is a measurement
+# rather than a clock tick — and at that size cpython is minutes behind.
 # `super(C, self).m(x)` in a callee the FOR_ITER-driven trace inlines.
 # `load_super_attr.py` keeps its loop inside the super-bearing method, so the
 # callee replay scan never sees the LOAD_SUPER_ATTR residuals; this shape does.
-N = 200000
+#
+# Sized so pypy's own execution clears the measurement floor: below it the
+# ratio gate divides by the floor and reads startup rather than this loop.
+N = 500000000
 
 
 class Base:

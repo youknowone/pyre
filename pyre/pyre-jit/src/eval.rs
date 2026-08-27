@@ -7595,6 +7595,16 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::LoadDeref { .. }
             // An aborting method call resumes exactly via forward-exc-delivery / CALL-forward.
             | I::LoadAttr { .. }
+            // `LOAD_SUPER_ATTR` is the same read as `LOAD_ATTR` with the MRO
+            // start moved one class along: `codewriter.rs` lowers it to a
+            // single MayForce `load_super_attr` residual (plus, in the method
+            // form, two pure `super_attr_unwrap` residuals over its result),
+            // and it mutates nothing.  The `while`-loop spelling of the same
+            // body already traces — `bench/synth/load_super_attr.py` — so what
+            // this listing decides is only whether the `for` spelling gets the
+            // same trace, and a `for` body holding one ran ~1.3us/iteration
+            // against ~0.015 for the identical body calling `self.plain()`.
+            | I::LoadSuperAttr { .. }
             // function calls and global reads: the Layer 2 dynamic defense
             // (body_effect_candidate + fbw_foriter_inflight_take) handles
             // walk-abort safety, and inline sub-walks are declined when a

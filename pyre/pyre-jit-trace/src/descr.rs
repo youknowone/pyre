@@ -2054,6 +2054,33 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
     )
 });
 
+/// `nestedscope.py Cell.contents` — the freevar / cellvar payload.
+///
+/// MUTABLE: `w_cell_set` rewrites it in place on every rebinding of the
+/// closure variable, and `w_cell_delete` nulls it.  `CellFamily.ever_mutated`
+/// is the quasi-immutable that says whether any such write has EVER happened;
+/// it says nothing about a given read, so this field carries no immutability
+/// of its own.
+static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::nestedscope::{Cell, W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE};
+    build_object_descr_group_with_def_path(
+        W_CELL_OBJECT_SIZE,
+        W_CELL_GC_TYPE_ID,
+        &pyre_object::nestedscope::CELL_TYPE as *const _ as usize,
+        &[(
+            "contents",
+            core::mem::offset_of!(Cell, contents),
+            8,
+            Type::Ref,
+            false,
+            false,
+            false,
+        )],
+        "Cell",
+        "nestedscope::Cell",
+    )
+});
+
 static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // Upstream `rpython/rtyper/lltypesystem/rlist.py:116`
     //     GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))
@@ -3501,6 +3528,13 @@ pub fn w_method_size_descr() -> DescrRef {
 /// payload.
 pub fn object_mutable_cell_value_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
+}
+
+/// `nestedscope.py Cell.contents` — what `w_cell_get` reads.  The modelled
+/// `fast2locals` expansion reads it once per cell slot, in place of the
+/// residual `bh_call_fn(locals)` whose frame force loses the enclosing loop.
+pub fn cell_contents_descr() -> DescrRef {
+    field_descr_from_group(&W_CELL_DESCR_GROUP, 0)
 }
 
 /// `typeobject.py IntMutableCell.intvalue` — the unboxed `Signed`
