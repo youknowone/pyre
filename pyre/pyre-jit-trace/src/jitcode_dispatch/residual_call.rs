@@ -1686,11 +1686,6 @@ fn capture_escape_flush_undo(frame: usize) {
     });
 }
 
-/// Record the locals region as the flush just left it, for the frame the
-/// pending capture holds.  Runs after the flush and before the residual's
-/// user Python can touch the region, so any later difference from this image
-/// is that user code's own write.  A second flush for the same frame supersedes
-/// the image: the restore must undo the flush that is actually standing.
 /// Report what the post-residual shadow refresh left behind, and optionally
 /// import the residual's own fastlocals writes into the shadow.
 ///
@@ -1925,6 +1920,11 @@ fn adopt_residual_locals_writes<Sym: WalkSym>(
     }
 }
 
+/// Record the locals region as the flush just left it, for the frame the
+/// pending capture holds.  Runs after the flush and before the residual's
+/// user Python can touch the region, so any later difference from this image
+/// is that user code's own write.  A second flush for the same frame supersedes
+/// the image: the restore must undo the flush that is actually standing.
 fn record_escape_flush_image(frame: usize) {
     ESCAPE_FLUSH_UNDO.with(|slot| {
         let mut slot = slot.borrow_mut();
