@@ -102,7 +102,9 @@ fn node_fields(name: &str) -> &'static [&'static str] {
         "Compare" => &["left", "ops", "comparators"],
         "Call" => &["func", "args", "keywords"],
         "FormattedValue" => &["value", "conversion", "format_spec"],
+        "Interpolation" => &["value", "str", "conversion", "format_spec"],
         "JoinedStr" => &["values"],
+        "TemplateStr" => &["values"],
         "Constant" => &["value", "kind"],
         "Attribute" => &["value", "attr", "ctx"],
         "Subscript" => &["value", "slice", "ctx"],
@@ -134,7 +136,7 @@ fn node_fields(name: &str) -> &'static [&'static str] {
 }
 
 fn node_has_location(name: &str) -> bool {
-    matches!(name, "FunctionDef" | "AsyncFunctionDef" | "ClassDef" | "Return" | "Delete" | "Assign" | "TypeAlias" | "AugAssign" | "AnnAssign" | "For" | "AsyncFor" | "While" | "If" | "With" | "AsyncWith" | "Match" | "Raise" | "Try" | "TryStar" | "Assert" | "Import" | "ImportFrom" | "Global" | "Nonlocal" | "Expr" | "Pass" | "Break" | "Continue" | "BoolOp" | "NamedExpr" | "BinOp" | "UnaryOp" | "Lambda" | "IfExp" | "Dict" | "Set" | "ListComp" | "SetComp" | "DictComp" | "GeneratorExp" | "Await" | "Yield" | "YieldFrom" | "Compare" | "Call" | "FormattedValue" | "JoinedStr" | "Constant" | "Attribute" | "Subscript" | "Starred" | "Name" | "List" | "Tuple" | "Slice" | "ExceptHandler" | "MatchValue" | "MatchSingleton" | "MatchSequence" | "MatchMapping" | "MatchClass" | "MatchStar" | "MatchAs" | "MatchOr" | "TypeVar" | "ParamSpec" | "TypeVarTuple" | "arg" | "keyword" | "alias")
+    matches!(name, "FunctionDef" | "AsyncFunctionDef" | "ClassDef" | "Return" | "Delete" | "Assign" | "TypeAlias" | "AugAssign" | "AnnAssign" | "For" | "AsyncFor" | "While" | "If" | "With" | "AsyncWith" | "Match" | "Raise" | "Try" | "TryStar" | "Assert" | "Import" | "ImportFrom" | "Global" | "Nonlocal" | "Expr" | "Pass" | "Break" | "Continue" | "BoolOp" | "NamedExpr" | "BinOp" | "UnaryOp" | "Lambda" | "IfExp" | "Dict" | "Set" | "ListComp" | "SetComp" | "DictComp" | "GeneratorExp" | "Await" | "Yield" | "YieldFrom" | "Compare" | "Call" | "FormattedValue" | "JoinedStr" | "Interpolation" | "TemplateStr" | "Constant" | "Attribute" | "Subscript" | "Starred" | "Name" | "List" | "Tuple" | "Slice" | "ExceptHandler" | "MatchValue" | "MatchSingleton" | "MatchSequence" | "MatchMapping" | "MatchClass" | "MatchStar" | "MatchAs" | "MatchOr" | "TypeVar" | "ParamSpec" | "TypeVarTuple" | "arg" | "keyword" | "alias")
 }
 
 /// _ast stub — PyPy: pypy/module/_ast/
@@ -254,8 +256,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             &[
                 "BoolOp", "NamedExpr", "BinOp", "UnaryOp", "Lambda", "IfExp", "Dict", "Set",
                 "ListComp", "SetComp", "DictComp", "GeneratorExp", "Await", "Yield", "YieldFrom",
-                "Compare", "Call", "FormattedValue", "JoinedStr", "Constant", "Attribute",
-                "Subscript", "Starred", "Name", "List", "Tuple", "Slice",
+                "Compare", "Call", "FormattedValue", "Interpolation", "JoinedStr",
+                "TemplateStr", "Constant", "Attribute", "Subscript", "Starred", "Name", "List",
+                "Tuple", "Slice",
             ],
         ),
         ("expr_context", &["Load", "Store", "Del"]),
@@ -284,8 +287,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let g = make(group, ast);
         crate::module_ns_store(ns, group, g);
         for m in *members {
-            let t = make(m, g);
-            crate::module_ns_store(ns, m, t);
+            let roots = pyre_object::gc_roots::push_roots();
+            let type_slot = roots.base();
+            let _ = roots.pin_root(make(m, g));
+            // PyPy's generated `W_FormattedValue` and CPython 3.14's
+            // `make_type` declarations expose an omitted optional format
+            // spec as `None` through the class. `Interpolation` is the 3.14
+            // sibling with the same optional field.
+            if matches!(*m, "FormattedValue" | "Interpolation") {
+                crate::baseobjspace::setattr_str(
+                    roots.get(type_slot),
+                    "format_spec",
+                    pyre_object::w_none(),
+                )
+                .expect("set optional AST format_spec default");
+            }
+            crate::module_ns_store(ns, m, roots.get(type_slot));
         }
     }
 

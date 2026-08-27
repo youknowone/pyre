@@ -6,7 +6,8 @@
 
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_compiler::codegen::{
-    interpolated_string_literal_value, string_literal_part_value, string_literal_value,
+    interpolated_string_literal_value, interpolation_debug_text, string_literal_part_value,
+    string_literal_value,
 };
 use rustpython_compiler::core::{SourceFile, SourceFileBuilder};
 use rustpython_compiler::{ast, parser};
@@ -1563,6 +1564,14 @@ impl ObjectConverter {
         } else if self.is_node(object, "FormattedValue")? {
             let element = self.interpolation(object)?;
             Ok(fstring(vec![element], None))
+        } else if self.is_node(object, "TemplateStr")? {
+            let range = self.location(object, "TemplateStr")?;
+            let values = self.exprs(object, "values", "TemplateStr")?;
+            Ok(tstring(range, Vec::new(), Some(values)))
+        } else if self.is_node(object, "Interpolation")? {
+            let range = self.location(object, "Interpolation")?;
+            let element = self.tstring_interpolation(object)?;
+            Ok(tstring(range, vec![element], None))
         } else {
             Err(crate::PyError::type_error(crate::display::wtf8_format!(
                 "expected some sort of expr, but got ",
@@ -1573,7 +1582,7 @@ impl ObjectConverter {
 
     fn interpolation(&mut self, object: PyObjectRef) -> AstResult<ast::InterpolatedStringElement> {
         let expression = self.req_expr(object, "value", "FormattedValue")?;
-        let conversion = self.conversion(object)?;
+        let conversion = self.conversion(object, "FormattedValue")?;
         let format_spec = self.opt_expr(object, "format_spec")?;
         Ok(ast::InterpolatedStringElement::Interpolation(
             ast::InterpolatedElement {
@@ -1595,11 +1604,40 @@ impl ObjectConverter {
         ))
     }
 
+    /// RustPython `_ast::string::tstring_interpolation_from_object_with_range`:
+    /// the public `Interpolation` is represented by a one-element native
+    /// t-string.  Its `str` and object-form format spec stay in the runtime
+    /// fields consumed by `compile_runtime_interpolation`.
+    fn tstring_interpolation(
+        &mut self,
+        object: PyObjectRef,
+    ) -> AstResult<ast::InterpolatedStringElement> {
+        let range = self.location(object, "Interpolation")?;
+        let expression = self.req_expr(object, "value", "Interpolation")?;
+        let str_value = self.field(object, "str", "Interpolation")?;
+        let runtime_str = Some(self.constant_value(str_value)?);
+        let conversion = self.conversion(object, "Interpolation")?;
+        let format_spec = self.opt_expr(object, "format_spec")?;
+        Ok(ast::InterpolatedStringElement::Interpolation(
+            ast::InterpolatedElement {
+                node_index: Default::default(),
+                range,
+                expression,
+                debug_text: None,
+                conversion,
+                format_spec: None,
+                runtime_str,
+                runtime_interpolation_format_spec: format_spec,
+                runtime_formatted_value_format_spec: None,
+            },
+        ))
+    }
+
     /// `visit_FormattedValue` (codegen.py) matches `s`, `r` and `a` and
     /// leaves anything else at no conversion at all; 3.14 stops instead, so a
     /// character it does not know is an error here.
-    fn conversion(&self, object: PyObjectRef) -> AstResult<ast::ConversionFlag> {
-        match self.int_field(object, "conversion", "FormattedValue")? {
+    fn conversion(&self, object: PyObjectRef, node: &str) -> AstResult<ast::ConversionFlag> {
+        match self.int_field(object, "conversion", node)? {
             -1 => Ok(ast::ConversionFlag::None),
             value if value == i64::from(b's') => Ok(ast::ConversionFlag::Str),
             value if value == i64::from(b'r') => Ok(ast::ConversionFlag::Repr),
@@ -1841,6 +1879,28 @@ fn fstring(
             flags: ast::FStringFlags::empty(),
         }),
         runtime_joined_str,
+        runtime_values: None,
+    })
+}
+
+/// RustPython `_ast::string::template_str_to_expr`: object-form values ride
+/// beside an otherwise empty native t-string, while a standalone public
+/// `Interpolation` is represented by its single native element.
+fn tstring(
+    range: ruff_text_size::TextRange,
+    elements: Vec<ast::InterpolatedStringElement>,
+    runtime_template_str: Option<Vec<ast::Expr>>,
+) -> ast::Expr {
+    ast::Expr::TString(ast::ExprTString {
+        node_index: Default::default(),
+        range,
+        value: ast::TStringValue::single(ast::TString {
+            node_index: Default::default(),
+            range,
+            elements: elements.into(),
+            flags: ast::TStringFlags::empty(),
+        }),
+        runtime_template_str,
         runtime_values: None,
     })
 }
@@ -2669,8 +2729,9 @@ impl Converter<'_> {
                 ],
             ),
             Expr::FString(n) => self.fstring(n),
-            Expr::TString(_) | Expr::IpyEscapeCommand(_) => Err(crate::PyError::not_implemented(
-                "AST conversion for template strings is not implemented",
+            Expr::TString(n) => self.tstring(n),
+            Expr::IpyEscapeCommand(_) => Err(crate::PyError::not_implemented(
+                "AST conversion for IPython escape commands is not implemented",
             )),
         }
     }
@@ -2722,6 +2783,187 @@ impl Converter<'_> {
         )
     }
 
+    /// RustPython `_ast::string::tstring_to_object`: publish the compiler's
+    /// t-string parts as the 3.14 `TemplateStr`/`Interpolation` public nodes.
+    fn tstring(&self, node: &ast::ExprTString) -> RootedResult {
+        if let Some(values) = node.runtime_template_str.as_deref() {
+            return self.node(
+                "TemplateStr",
+                Some(range(node.range)),
+                &[("values", self.expr_list(values)?)],
+            );
+        }
+        if let Some(values) = node.runtime_values.as_deref() {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_ref()
+                        .map(|value| self.expr(value))
+                        .transpose()
+                        .map(|value| self.optional(value))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return self.node(
+                "TemplateStr",
+                Some(range(node.range)),
+                &[("values", self.list(values))],
+            );
+        }
+
+        // RustPython `_ast::string::standalone_tstring_interpolation_to_object`:
+        // an object-form `Interpolation` uses a one-part native t-string as
+        // its carrier and must come back as that node, not as a nested
+        // `TemplateStr`.
+        if let [tstring] = node.value.as_slice() {
+            let mut elements = tstring.elements.iter();
+            if let Some(ast::InterpolatedStringElement::Interpolation(interpolation)) =
+                elements.next()
+                && elements.next().is_none()
+                && interpolation.runtime_str.is_some()
+            {
+                let mut parts = Vec::new();
+                self.template_elements(&tstring.elements, tstring.flags.into(), &mut parts)?;
+                if let [JoinedPart::Value(value)] = parts.as_slice() {
+                    return Ok(*value);
+                }
+            }
+        }
+
+        let mut parts = Vec::new();
+        for tstring in node.value.as_slice() {
+            self.template_elements(&tstring.elements, tstring.flags.into(), &mut parts)?;
+        }
+        let values = self.joined_values(parts)?;
+        self.node(
+            "TemplateStr",
+            Some(range(node.range)),
+            &[("values", self.list(values))],
+        )
+    }
+
+    fn template_elements(
+        &self,
+        elements: &[ast::InterpolatedStringElement],
+        flags: ast::AnyStringFlags,
+        parts: &mut Vec<JoinedPart>,
+    ) -> Result<(), crate::PyError> {
+        use ruff_text_size::Ranged;
+
+        for element in elements {
+            match element {
+                ast::InterpolatedStringElement::Literal(literal) => push_literal(
+                    parts,
+                    range(literal.range),
+                    &interpolated_string_literal_value(&self.source_file, literal, flags),
+                ),
+                ast::InterpolatedStringElement::Interpolation(interpolation) => {
+                    let mut conversion = interpolation.conversion;
+                    let expression_str =
+                        if let Some(runtime_str) = interpolation.runtime_str.as_ref() {
+                            self.constant_value(runtime_str)?
+                        } else if let Some(debug_text) = interpolation.debug_text.as_ref() {
+                            let (text, text_range) = interpolation_debug_text(
+                                &self.source_file,
+                                debug_text,
+                                interpolation.expression.range(),
+                            );
+                            push_literal(parts, range(text_range), Wtf8::new(text.as_str()));
+                            conversion =
+                                debug_conversion(conversion, interpolation.format_spec.is_some());
+                            let expression_range = extend_expr_range_with_wrapping_parens(
+                                self.source,
+                                interpolation.range,
+                                interpolation.expression.range(),
+                            )
+                            .unwrap_or_else(|| interpolation.expression.range());
+                            let (start, end) = range(expression_range);
+                            let expression = self.source[start as usize..end as usize].to_owned();
+                            self.string(&strip_interpolation_expr(
+                                &[
+                                    debug_text.leading.as_str(),
+                                    expression.as_str(),
+                                    debug_text.trailing.as_str(),
+                                ]
+                                .concat(),
+                            ))
+                        } else {
+                            self.string(&self.tstring_interpolation_expr_str(interpolation))
+                        };
+                    let format_spec = if let Some(spec) =
+                        interpolation.runtime_interpolation_format_spec.as_deref()
+                    {
+                        Some(self.expr(spec)?)
+                    } else {
+                        self.format_spec(&interpolation.format_spec, flags)?
+                    };
+                    parts.push(JoinedPart::Value(self.node(
+                        "Interpolation",
+                        Some(range(interpolation.range)),
+                        &[
+                            ("value", self.expr(&interpolation.expression)?),
+                            ("str", expression_str),
+                            (
+                                "conversion",
+                                self.pin(pyre_object::w_int_new(conversion as i8 as i64)),
+                            ),
+                            ("format_spec", self.optional(format_spec)),
+                        ],
+                    )?));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn format_spec(
+        &self,
+        format_spec: &Option<Box<ast::InterpolatedStringFormatSpec>>,
+        flags: ast::AnyStringFlags,
+    ) -> Result<Option<Rooted>, crate::PyError> {
+        format_spec
+            .as_deref()
+            .map(|spec| {
+                let mut spec_parts = Vec::new();
+                self.interpolated_elements(&spec.elements, flags, &mut spec_parts)?;
+                let values = self.joined_values(spec_parts)?;
+                // RustPython `_ast::string::ruff_format_spec_to_joined_str`:
+                // the public `JoinedStr` includes the opening colon while its
+                // constant children begin after it.
+                let (mut start, end) = range(spec.range);
+                if start > 0 && self.source.as_bytes().get(start as usize - 1) == Some(&b':') {
+                    start -= 1;
+                }
+                self.node(
+                    "JoinedStr",
+                    Some((start, end)),
+                    &[("values", self.list(values))],
+                )
+            })
+            .transpose()
+    }
+
+    fn tstring_interpolation_expr_str(&self, interpolation: &ast::InterpolatedElement) -> String {
+        use ruff_text_size::Ranged;
+
+        let interpolation_range = interpolation.range;
+        let expression_range = extend_expr_range_with_wrapping_parens(
+            self.source,
+            interpolation_range,
+            interpolation.expression.range(),
+        )
+        .unwrap_or_else(|| interpolation.expression.range());
+        let after_open_brace = interpolation_range.start() + ruff_text_size::TextSize::from(1);
+        let start = if after_open_brace > expression_range.end() {
+            expression_range.start()
+        } else {
+            after_open_brace
+        };
+        let start = start.to_u32() as usize;
+        let end = expression_range.end().to_u32() as usize;
+        strip_interpolation_expr(&self.source[start..end])
+    }
+
     fn joined_values(&self, parts: Vec<JoinedPart>) -> Result<Vec<Rooted>, crate::PyError> {
         parts
             .into_iter()
@@ -2761,20 +3003,13 @@ impl Converter<'_> {
                             conversion = ast::ConversionFlag::Repr;
                         }
                     }
-                    let format_spec = interpolation
-                        .format_spec
-                        .as_deref()
-                        .map(|spec| {
-                            let mut spec_parts = Vec::new();
-                            self.interpolated_elements(&spec.elements, flags, &mut spec_parts)?;
-                            let values = self.joined_values(spec_parts)?;
-                            self.node(
-                                "JoinedStr",
-                                Some(range(spec.range)),
-                                &[("values", self.list(values))],
-                            )
-                        })
-                        .transpose()?;
+                    let format_spec = if let Some(spec) =
+                        interpolation.runtime_formatted_value_format_spec.as_deref()
+                    {
+                        Some(self.expr(spec)?)
+                    } else {
+                        self.format_spec(&interpolation.format_spec, flags)?
+                    };
                     parts.push(JoinedPart::Value(self.node(
                         "FormattedValue",
                         Some(range(interpolation.range)),
@@ -3401,6 +3636,62 @@ fn strip_debug_comments(text: &str) -> String {
         }
     }
     result
+}
+
+/// RustPython `_ast::string::debug_conversion`, following CPython
+/// `_get_interpolation_conversion` for `{expr=}`.
+fn debug_conversion(conversion: ast::ConversionFlag, has_format_spec: bool) -> ast::ConversionFlag {
+    if matches!(conversion, ast::ConversionFlag::None) && !has_format_spec {
+        ast::ConversionFlag::Repr
+    } else {
+        conversion
+    }
+}
+
+/// RustPython `_ast::string::extend_expr_range_with_wrapping_parens` keeps
+/// parentheses which belong to the spelling stored in `Interpolation.str`.
+fn extend_expr_range_with_wrapping_parens(
+    source: &str,
+    interpolation_range: ruff_text_size::TextRange,
+    expression_range: ruff_text_size::TextRange,
+) -> Option<ruff_text_size::TextRange> {
+    let (interpolation_start, interpolation_end) = range(interpolation_range);
+    let (expression_start, expression_end) = range(expression_range);
+    let left_slice = &source[interpolation_start as usize..expression_start as usize];
+    let (left_index, left_char) = left_slice
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    if left_char != '(' {
+        return None;
+    }
+
+    let right_slice = &source[expression_end as usize..interpolation_end as usize];
+    let (right_index, right_char) = right_slice
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    if right_char != ')' {
+        return None;
+    }
+
+    Some(ruff_text_size::TextRange::new(
+        (interpolation_start + left_index as u32).into(),
+        (expression_end + right_index as u32 + 1).into(),
+    ))
+}
+
+/// CPython `_strip_interpolation_expr`: remove the debug marker and trailing
+/// whitespace from the expression spelling exposed as `Interpolation.str`.
+fn strip_interpolation_expr(expression: &str) -> String {
+    let mut end = expression.len();
+    for (index, ch) in expression.char_indices().rev() {
+        if ch.is_whitespace() || ch == '=' {
+            end = index;
+        } else {
+            break;
+        }
+    }
+    expression[..end].to_owned()
 }
 
 fn range(range: impl RangeParts) -> (u32, u32) {

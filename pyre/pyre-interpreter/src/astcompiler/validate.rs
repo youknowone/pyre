@@ -666,6 +666,7 @@ impl AstValidator {
                 Ok(())
             }
             ast::Expr::FString(node) => self.visit_fstring(node),
+            ast::Expr::TString(node) => self.visit_tstring(node),
             ast::Expr::Named(node) => {
                 if !matches!(node.target.as_ref(), ast::Expr::Name(_)) {
                     return Err(validation_type_error("NamedExpr target must be a Name"));
@@ -682,26 +683,63 @@ impl AstValidator {
             | ast::Expr::BooleanLiteral(_)
             | ast::Expr::NoneLiteral(_)
             | ast::Expr::EllipsisLiteral(_)
-            | ast::Expr::TString(_)
             | ast::Expr::IpyEscapeCommand(_) => Ok(()),
         }
+    }
+
+    /// RustPython `_ast::validate::validate_interpolated_elements`: both
+    /// string forms validate the expression and whichever representation of
+    /// the format spec their object-to-native boundary supplied.
+    fn validate_interpolated_elements<'a>(
+        &self,
+        elements: impl IntoIterator<Item = &'a ast::InterpolatedStringElement>,
+    ) -> ValidateResult {
+        for element in elements {
+            if let ast::InterpolatedStringElement::Interpolation(interpolation) = element {
+                self.validate_expr(&interpolation.expression, ast::ExprContext::Load)?;
+                if let Some(spec) = interpolation.runtime_formatted_value_format_spec.as_deref() {
+                    self.validate_expr(spec, ast::ExprContext::Load)?;
+                } else if let Some(spec) =
+                    interpolation.runtime_interpolation_format_spec.as_deref()
+                {
+                    self.validate_expr(spec, ast::ExprContext::Load)?;
+                } else if let Some(spec) = interpolation.format_spec.as_deref() {
+                    self.validate_interpolated_elements(spec.elements.iter())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_expr_slots(
+        &self,
+        values: Option<&Vec<Option<ast::Expr>>>,
+    ) -> ValidateResult {
+        if let Some(values) = values {
+            for value in values.iter().flatten() {
+                self.validate_expr(value, ast::ExprContext::Load)?;
+            }
+        }
+        Ok(())
     }
 
     /// The values of a `JoinedStr` reach the compiler AST as the parts to
     /// join, and a `FormattedValue` spec as the expression to format with.
     fn visit_fstring(&self, node: &ast::ExprFString) -> ValidateResult {
+        self.validate_runtime_expr_slots(node.runtime_values.as_ref())?;
         if let Some(values) = node.runtime_joined_str.as_deref() {
             return self.validate_exprs(values, ast::ExprContext::Load);
         }
-        for element in node.value.elements() {
-            if let ast::InterpolatedStringElement::Interpolation(interpolation) = element {
-                self.validate_expr(&interpolation.expression, ast::ExprContext::Load)?;
-                if let Some(spec) = interpolation.runtime_formatted_value_format_spec.as_deref() {
-                    self.validate_expr(spec, ast::ExprContext::Load)?;
-                }
-            }
+        self.validate_interpolated_elements(node.value.elements())
+    }
+
+    /// RustPython `_ast::validate::validate_expr` `Expr::TString` arm.
+    fn visit_tstring(&self, node: &ast::ExprTString) -> ValidateResult {
+        self.validate_runtime_expr_slots(node.runtime_values.as_ref())?;
+        if let Some(values) = node.runtime_template_str.as_deref() {
+            return self.validate_exprs(values, ast::ExprContext::Load);
         }
-        Ok(())
+        self.validate_interpolated_elements(node.value.elements())
     }
 
     fn validate_comprehension(&self, generators: &[ast::Comprehension]) -> ValidateResult {

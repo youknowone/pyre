@@ -172,8 +172,14 @@ def _build_template(strings, interpolations):
 
 def _build_interpolation(value, expression, conversion, format_spec):
     # BUILD_INTERPOLATION: `conversion` is the opcode's conversion oparg field.
-    return Interpolation(value, expression, _CONVERSIONS[conversion],
-                         format_spec)
+    # CPython `_PyInterpolation_Build` is an internal unchecked constructor;
+    # keep it separate from the validating public constructor above.
+    interpolation = object.__new__(Interpolation)
+    interpolation._value = value
+    interpolation._expression = expression
+    interpolation._conversion = _CONVERSIONS[conversion]
+    interpolation._format_spec = format_spec
+    return interpolation
 
 
 # Present the types as living in their public home, `string.templatelib`, where
