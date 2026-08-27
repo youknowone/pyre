@@ -13041,7 +13041,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                     {
                         false
                     }
-                    ParseErrorType::OtherError(_) => {
+                    // Whatever else stopped the parse on the last token of a
+                    // source carrying no trailing newline ran out of input
+                    // rather than reading something wrong: the tokenizer sits
+                    // at `E_EOF`, so a further line can still complete it.
+                    // `exec` reads its source the way a file is read, with the
+                    // missing newline supplied for it, so past the shapes above
+                    // its failures are final -- only the `OtherError`
+                    // spellings, the decorator and the line continuation among
+                    // them, still want more input there.
+                    error_type
+                        if matches!(error_type, ParseErrorType::OtherError(_))
+                            || !matches!(mode, crate::compile::Mode::Exec) =>
+                    {
                         error.raw_location.end().to_usize() >= source.len()
                             && !source.ends_with('\n')
                     }
