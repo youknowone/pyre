@@ -164,6 +164,13 @@ pub type ExitValues = smallvec::SmallVec<[Value; EXIT_VALUE_INLINE]>;
 /// so this recovers what a second list built beside [`ExitValues`] would have
 /// held. Its callers are the guard-failure and detailed-run arms, which then
 /// own the buffer; the steady finish exit calls nothing here.
+///
+/// Upstream has no list of this shape to be faithful to: a final descriptor
+/// reads the single slot its own type calls for straight off the deadframe
+/// (`DoneWithThisFrameDescrInt` / `Ref` / `Float`, each with its own
+/// `get_result`), so a machine-word vector covering every slot is a Rust-side
+/// convenience. It therefore belongs with the two readers that want one, not on
+/// the result every entry returns.
 pub fn raw_exit_values(typed: &[Value]) -> ExitRawValues {
     typed.iter().map(Value::as_raw_i64).collect()
 }
