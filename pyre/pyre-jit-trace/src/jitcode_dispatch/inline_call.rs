@@ -8861,9 +8861,9 @@ pub(crate) fn allocate_callee_register_banks(
 /// Apply the non-exceptional frame-exit state transition and return the
 /// callee's value for caller-side shape handling.
 ///
-/// `pyjitpl.py finishframe` clears `last_exc_value` before
-/// `popframe()`. Because the walker stores that state per frame, the caller's
-/// slot is the one that must observe the null after the callee returns.
+/// `pyjitpl.py finishframe` clears `last_exc_value` before `popframe()`. The
+/// slot lives on the `WalkSession`, shared by every frame in the walk, so this
+/// one clear is what the resumed caller observes.
 pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     result: Option<OpRef>,
