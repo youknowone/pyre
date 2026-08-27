@@ -3145,9 +3145,10 @@ fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
     render_rooted_exc_object_wtf8(exc_slot)
 }
 
-const MAX_SUGGESTION_CANDIDATES: usize = 750;
+pub(crate) const MAX_SUGGESTION_CANDIDATES: usize = 750;
 const MAX_SUGGESTION_STRING_SIZE: usize = 40;
 const SUGGESTION_MOVE_COST: usize = 2;
+const SUGGESTION_CASE_COST: usize = 1;
 
 fn dict_string_keys(dict: PyObjectRef, names: &mut Vec<String>) {
     if dict.is_null() || !unsafe { pyre_object::is_dict(dict) } {
@@ -3166,18 +3167,24 @@ fn dict_string_keys(dict: PyObjectRef, names: &mut Vec<String>) {
 }
 
 fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
-    let mut a: Vec<char> = a.chars().collect();
-    let mut b: Vec<char> = b.chars().collect();
+    // `levenshtein_distance` reads each name through `PyUnicode_AsUTF8AndSize`
+    // and indexes the buffer it gets, so every length and every position here
+    // is a UTF-8 byte.  Measuring code points instead moves the ratio cutoff
+    // and the distance itself for any name outside ASCII, which is a different
+    // ranking rather than the same one in other units.
+    let mut a: &[u8] = a.as_bytes();
+    let mut b: &[u8] = b.as_bytes();
     if a == b {
         return 0;
     }
+    // Trim away common affixes.
     while a.first() == b.first() && !a.is_empty() {
-        a.remove(0);
-        b.remove(0);
+        a = &a[1..];
+        b = &b[1..];
     }
     while a.last() == b.last() && !a.is_empty() {
-        a.pop();
-        b.pop();
+        a = &a[..a.len() - 1];
+        b = &b[..b.len() - 1];
     }
     if a.is_empty() || b.is_empty() {
         return SUGGESTION_MOVE_COST * (a.len() + b.len());
@@ -3195,17 +3202,19 @@ fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
         .map(|index| index * SUGGESTION_MOVE_COST)
         .collect();
     let mut result = 0;
-    for (bindex, bchar) in b.iter().enumerate() {
+    for (bindex, bbyte) in b.iter().enumerate() {
         let mut distance = bindex * SUGGESTION_MOVE_COST;
         result = distance;
         let mut minimum = usize::MAX;
-        for (index, achar) in a.iter().enumerate() {
-            let case_equal = achar.to_lowercase().eq(bchar.to_lowercase());
+        for (index, abyte) in a.iter().enumerate() {
+            // `_substitution_cost` folds case over ASCII alone, so a pair that
+            // differs only outside that range costs a full move.
+            let case_equal = abyte.eq_ignore_ascii_case(bbyte);
             let substitute = distance
-                + if achar == bchar {
+                + if abyte == bbyte {
                     0
                 } else if case_equal {
-                    1
+                    SUGGESTION_CASE_COST
                 } else {
                     SUGGESTION_MOVE_COST
                 };
@@ -3225,7 +3234,9 @@ pub(crate) fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option
     if candidates.len() >= MAX_SUGGESTION_CANDIDATES {
         return None;
     }
-    let wrong_len = wrong_name.chars().count();
+    // The ratio cutoff below is `_Py_CalculateSuggestions`', which sizes each
+    // name by the UTF-8 buffer `PyUnicode_AsUTF8AndSize` returned for it.
+    let wrong_len = wrong_name.len();
     // No candidate has been measured yet, so nothing caps the first one but
     // its own ratio test below.  A name longer than `MAX_SUGGESTION_STRING_SIZE`
     // is not rejected here: `suggestion_distance` applies that limit to what is
@@ -3237,7 +3248,7 @@ pub(crate) fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option
         if candidate == wrong_name {
             continue;
         }
-        let candidate_len = candidate.chars().count();
+        let candidate_len = candidate.len();
         // No more than 1/3 of the involved characters should need changed.
         let mut max_distance = (candidate_len + wrong_len + 3) * SUGGESTION_MOVE_COST / 6;
         // Don't take matches we've already beaten.

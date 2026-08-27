@@ -22,28 +22,36 @@ fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             crate::error::type_name_of(item)
         )));
     }
+    // `PyList_CheckExact`, so a list subclass is refused with everything else
+    // that is not a list.
     if !unsafe { is_exact_type(candidates, &LIST_TYPE) } {
         return Err(crate::PyError::type_error("candidates must be a list"));
     }
     let items = unsafe { w_list_items_copy_as_vec(candidates) };
-    let mut names = Vec::with_capacity(items.len());
-    for element in items {
-        if !unsafe { is_str(element) } {
+    for element in &items {
+        if !unsafe { is_str(*element) } {
             return Err(crate::PyError::type_error(
                 "all elements in 'candidates' must be strings",
             ));
         }
-        // A name carrying a lone surrogate has no `&str` view, and the search
-        // compares `char`s.  Drop it from the candidate set rather than
-        // reading it as UTF-8.
-        if let Some(name) = unsafe { w_str_get_value_opt(element) } {
-            names.push(name.to_string());
-        }
     }
-    let Some(wrong_name) = (unsafe { w_str_get_value_opt(item) }) else {
+    // `_Py_CalculateSuggestions` gives up on a set this large before it reads
+    // any name at all, so a candidate that has no UTF-8 encoding is never
+    // reached and never reported here either.
+    if items.len() >= crate::error::MAX_SUGGESTION_CANDIDATES {
         return Ok(w_none());
-    };
-    Ok(match crate::error::best_suggestion(&names, wrong_name) {
+    }
+    // `PyUnicode_AsUTF8AndSize` is what the search reads each name through,
+    // and a lone surrogate has no UTF-8 encoding: the failure is the one the
+    // strict encoder reports, not a name quietly left out of the ranking.
+    // The wrong name is read first, which is the one order in which a
+    // candidate equal to it cannot be the name that reports the failure.
+    let wrong_name = crate::baseobjspace::str_utf8_w(item)?.to_string();
+    let mut names = Vec::with_capacity(items.len());
+    for element in items {
+        names.push(crate::baseobjspace::str_utf8_w(element)?.to_string());
+    }
+    Ok(match crate::error::best_suggestion(&names, &wrong_name) {
         Some(name) => w_str_new(&name),
         None => w_none(),
     })

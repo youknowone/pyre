@@ -2856,9 +2856,25 @@ fn handle_jitexception(
         Err(JitException::ExitFrameWithExceptionRef(exc_ref)) => exc_ref.0 as i64,
         // The bail leaves by the same exit the pre-walk refusal above takes:
         // no level absorbs it, so the chain is released and it propagates to
-        // `_run_forever`'s caller.  The terminal image belongs to the re-entered
-        // portal's own chain, which released it before reporting the bail, so
-        // there is none to publish here.
+        // `_run_forever`'s caller.
+        //
+        // Unlike that exit, this one publishes no terminal image, and `bh` is
+        // not the image to publish: it is the portal level whose callee chain
+        // stopped, so its stamp names its own CALL rather than where the chain
+        // got to.  The image that would answer belongs to the re-entered
+        // portal, and no channel carries it back -- `portal_runner` returns a
+        // result or a `JitException`, nothing else.
+        //
+        // Reaching this arm at all takes a `portal_runner`, because the only
+        // two ways `handle_jitexception_dispatch` answers with a bail are an
+        // `exc` that already was one -- refused ahead of the walk above -- and
+        // a runner that reported one for a `ContinueRunningNormally`.  Every
+        // caller that runs a program passes `None` there (`run_forever` and
+        // `convert_and_run_from_pyjitpl` both do), so today only this module's
+        // own tests supply one, and they read no terminal image.  Wiring a
+        // real runner is what makes the missing image a resume that repeats
+        // the callee's effects; `trace.rs` already logs that shape as `bail
+        // terminal is not the root frame`.
         Err(exc @ JitException::BailToInterpreter) => {
             builder.release_chain(Some(bh));
             return Err(exc);
