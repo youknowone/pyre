@@ -150,29 +150,46 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     // `ExecutionContext::enter` before installing TLS-only state, but
     // the JIT portal path enters through this helper directly.
     let ec = frame.execution_context as *mut PyExecutionContext;
-    let previous_ec_top = if ec.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
+    // `ExecutionContext::enter` refuses a frame that is already the top —
+    // relinking it would make `f_backref` name the frame itself, and
+    // `walk_pyframe_roots` follows `f_backref` with no cycle guard.  This door
+    // owes the same refusal, because the enter is no longer performed only
+    // here: `try_walker_call_assembler_self_recursive`
+    // (`pyre-jit-trace/src/jitcode_dispatch/inline_call.rs`) records it ahead
+    // of its CALL_ASSEMBLER, and the force and deopt legs hand that same,
+    // already-entered frame back to the portal.  Already entered means there
+    // is nothing to link; the guard still has to restore what `leave` would,
+    // which is this frame's own `f_backref`.
+    let already_entered = !ec.is_null()
+        && std::ptr::eq(
+            crate::executioncontext::vref_referent(unsafe { (*ec).topframeref }),
+            frame as *mut PyFrame,
+        );
+    let previous_ec_top = match (ec.is_null(), already_entered) {
+        (true, _) => std::ptr::null_mut(),
+        (false, true) => frame.f_backref,
+        (false, false) => unsafe {
             let top = (*ec).topframeref;
             (*ec).topframeref = frame as *mut PyFrame;
             top
-        }
+        },
     };
-    // Barrier for the same reason as `ExecutionContext::enter`: this is a
-    // traced `Type::Ref` store and `frame` can be an old-generation frame
-    // taking a young predecessor.
-    pyre_object::gc_hook::try_gc_write_barrier(frame as *mut PyFrame as *mut u8);
-    majit_gc::bh_probe_note_store(
-        frame as *mut PyFrame as usize,
-        crate::pyframe::PYFRAME_F_BACKREF_OFFSET,
-        3,
-    );
-    frame.f_backref = if ec.is_null() {
-        previous
-    } else {
-        previous_ec_top
-    };
+    if !already_entered {
+        // Barrier for the same reason as `ExecutionContext::enter`: this is a
+        // traced `Type::Ref` store and `frame` can be an old-generation frame
+        // taking a young predecessor.
+        pyre_object::gc_hook::try_gc_write_barrier(frame as *mut PyFrame as *mut u8);
+        majit_gc::bh_probe_note_store(
+            frame as *mut PyFrame as usize,
+            crate::pyframe::PYFRAME_F_BACKREF_OFFSET,
+            3,
+        );
+        frame.f_backref = if ec.is_null() {
+            previous
+        } else {
+            previous_ec_top
+        };
+    }
     push_current_frame_previous_root(previous, ec, previous_ec_top)
 }
 
