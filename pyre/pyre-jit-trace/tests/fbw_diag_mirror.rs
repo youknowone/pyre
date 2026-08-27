@@ -9,7 +9,7 @@
 //! silently and every tally from the divergence onward is printed under the
 //! wrong key. Hence this test: the authority is LINKED (`fbw_diag::LABELS` is
 //! in scope), the mirror is read out of the runner's source as text, the same
-//! way `majit-metainterp/tests/mc_diag_mirror.rs` does for `MC_DIAG_LABELS`.
+//! way `majit-metainterp/tests/runner_label_mirrors.rs` does for `MC_DIAG_LABELS`.
 
 use std::path::{Path, PathBuf};
 
@@ -98,16 +98,23 @@ fn extract(runner_src: &str) -> (&'static [&'static str], Vec<String>) {
     )
 }
 
-/// The integer literal a `usize`/`u32` constant is declared with.
-fn declared_count(src: &str, anchor: &str, what: &str) -> usize {
+/// The integer literal a constant is declared with, decimal or `0x` hex.
+///
+/// Hex is accepted because the bit-layout half of the mirror is only readable
+/// as masks — a `FIELD_MASK` spelled `65535` to keep a decimal-only parser
+/// happy would trade the thing being guarded for the guard.
+fn declared_int(src: &str, anchor: &str, what: &str) -> u64 {
     let at = src
         .find(anchor)
         .unwrap_or_else(|| panic!("{what}: {anchor:?} declaration not found"));
-    let tail = &src[at + anchor.len()..];
-    let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits
-        .parse()
-        .unwrap_or_else(|e| panic!("{what}: count is not a number ({digits:?}) — {e}"))
+    let tail = src[at + anchor.len()..].trim_start();
+    let (radix, rest) = match tail.strip_prefix("0x") {
+        Some(rest) => (16, rest),
+        None => (10, tail),
+    };
+    let digits: String = rest.chars().take_while(|c| c.is_digit(radix)).collect();
+    u64::from_str_radix(&digits, radix)
+        .unwrap_or_else(|e| panic!("{what}: {anchor:?} is not a number ({digits:?}) — {e}"))
 }
 
 /// The slots whose two spellings disagree, over the shorter of the two.
@@ -308,37 +315,73 @@ fn the_mirror_check_catches_injected_drift() {
     );
 }
 
-/// The ring GEOMETRY is mirrored too, and unlike the labels it is four bare
-/// integers with nothing to derive them from on the runner's side.
+/// The ring GEOMETRY and BIT LAYOUT are mirrored too, and unlike the labels
+/// they are bare integers with nothing to derive them from on the runner's
+/// side.
 ///
-/// `RING_BASE` is now `LABELS.len()` here, so a tally added on the authority
-/// side moves the ring's start — and the runner, which decodes the ring by
-/// arithmetic on its own copy, would keep reading from the old offset and
-/// print the tail of the tallies as if it were a walk's outcome name. The
-/// label comparison above cannot see that: the runner's LABEL array and its
-/// RING constants are independent declarations.
+/// `RING_BASE` is `LABELS.len()` here, so a tally added on the authority side
+/// moves the ring's start — and the runner, which decodes the ring by
+/// arithmetic on its own copies, would keep reading from the old offset and
+/// print the tail of the tallies as if it were a walk's outcome name. Renumber
+/// a `SHIFT_*` instead and every census line reports one field's value under
+/// another field's name. The label comparison above cannot see either: the
+/// runner's LABEL array and its layout constants are independent
+/// declarations.
 #[test]
 fn the_runner_mirrors_the_ring_layout() {
     use pyre_jit_trace::trace::fbw_diag as d;
 
     let runner_src = runner_source();
     for (anchor, authority, name) in [
-        ("const RING_BASE: u32 = ", d::RING_BASE, "RING_BASE"),
+        ("const RING_BASE: u32 = ", d::RING_BASE as u64, "RING_BASE"),
         (
             "const RING_ENTRIES: u32 = ",
-            d::RING_ENTRIES,
+            d::RING_ENTRIES as u64,
             "RING_ENTRIES",
         ),
-        ("const RING_STRIDE: u32 = ", d::RING_STRIDE, "RING_STRIDE"),
-        ("const NAME_SLOTS: u32 = ", d::NAME_SLOTS, "NAME_SLOTS"),
+        (
+            "const RING_STRIDE: u32 = ",
+            d::RING_STRIDE as u64,
+            "RING_STRIDE",
+        ),
+        (
+            "const NAME_SLOTS: u32 = ",
+            d::NAME_SLOTS as u64,
+            "NAME_SLOTS",
+        ),
+        ("const FLAG_VALID: u64 = ", d::FLAG_VALID, "FLAG_VALID"),
+        (
+            "const FLAG_COMMITTED: u64 = ",
+            d::FLAG_COMMITTED,
+            "FLAG_COMMITTED",
+        ),
+        ("const FLAG_BRIDGE: u64 = ", d::FLAG_BRIDGE, "FLAG_BRIDGE"),
+        (
+            "const SHIFT_EFFECTS: u32 = ",
+            d::SHIFT_EFFECTS as u64,
+            "SHIFT_EFFECTS",
+        ),
+        (
+            "const SHIFT_JOURNAL: u32 = ",
+            d::SHIFT_JOURNAL as u64,
+            "SHIFT_JOURNAL",
+        ),
+        (
+            "const SHIFT_EXEC_MF: u32 = ",
+            d::SHIFT_EXEC_MF as u64,
+            "SHIFT_EXEC_MF",
+        ),
+        ("const SHIFT_LEG: u32 = ", d::SHIFT_LEG as u64, "SHIFT_LEG"),
+        ("const FIELD_MASK: u64 = ", d::FIELD_MASK, "FIELD_MASK"),
     ] {
-        let mirrored = declared_count(&runner_src, anchor, "runner");
+        let mirrored = declared_int(&runner_src, anchor, "runner");
         assert_eq!(
             mirrored, authority,
             "pyre-wasm-runner declares {name} = {mirrored} but \
              pyre_jit_trace::trace::fbw_diag::{name} is {authority}. The runner \
              indexes the `pyre_fbw_diag` export with `RING_BASE + entry * \
-             RING_STRIDE`, so a stale copy decodes the wrong words and prints \
+             RING_STRIDE` and unpacks the counter slot with the `SHIFT_*` / \
+             `FLAG_*` set, so a stale copy decodes the wrong words and prints \
              them as a walk outcome rather than failing.",
         );
     }

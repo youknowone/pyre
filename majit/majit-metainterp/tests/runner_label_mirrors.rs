@@ -1,10 +1,16 @@
 //! Keeps `pyre-wasm-runner`'s positional diagnostic labels synchronized with
-//! `MC_DIAG_LABELS`.
+//! the majit-metainterp arrays they mirror: `MC_DIAG_LABELS` and
+//! `jitprof::ABORT_COUNTER_KINDS`.
 //!
 //! The runner intentionally does not depend on the metainterpreter crate, so
-//! its mirror is read out of its source as text. The authority is LINKED, not
-//! parsed — `MC_DIAG_LABELS` is in scope here — so no anchor can select the
-//! wrong array on that side.
+//! its mirrors are read out of its source as text. The authorities are LINKED,
+//! not parsed — both are in scope here — so no anchor can select the wrong
+//! array on that side.
+//!
+//! Two drift shapes are silent without this: a short mirror stops printing the
+//! tail, and a rename prints every tally from the divergence onward under the
+//! wrong key — into a flat `key -> value` map that check.py compares against
+//! the wrong baseline rather than reporting as missing.
 
 use std::path::{Path, PathBuf};
 
@@ -228,5 +234,45 @@ fn a_perturbed_mirror_is_detected() {
         "a trailing deletion is invisible to the element-wise comparison by \
          construction — if this fires, `divergences` is no longer bounded by \
          the shorter side and shape 2 is being caught for the wrong reason",
+    );
+}
+
+/// The `Counters.ABORT_*` split behind `loops_aborted`, mirrored the same way
+/// and by the same runner.
+///
+/// The names live on the authority as the second half of each
+/// `ABORT_COUNTER_KINDS` pair, so unlike `MC_DIAG_LABELS` there is no separate
+/// label array to drift against on this side — only the runner's copy can go
+/// stale, and nothing but this test looks at it.
+#[test]
+fn the_runner_mirror_matches_the_abort_counter_kinds() {
+    let runner_src = runner_source();
+    let authority: Vec<&str> = majit_metainterp::jitprof::ABORT_COUNTER_KINDS
+        .iter()
+        .map(|&(_, name)| name)
+        .collect();
+    let runner = array_after(&runner_src, "\"pyre_jit_abort_diag\"", "runner");
+
+    assert_eq!(
+        runner.len(),
+        authority.len(),
+        "pyre-wasm-runner's abort_diag label array has {} entries but \
+         ABORT_COUNTER_KINDS has {}. The runner reads `pyre_jit_abort_diag(i)` \
+         for each label it holds, so a short mirror drops the trailing abort \
+         reasons from the wasm `[jit-stats] abort_diag` line and a long one \
+         prints a reason the profiler never tallies as a flat 0.",
+        runner.len(),
+        authority.len(),
+    );
+
+    let divergent = divergences(&authority, &runner);
+    assert!(
+        divergent.is_empty(),
+        "the pyre-wasm-runner abort_diag mirror no longer matches \
+         majit_metainterp::jitprof::ABORT_COUNTER_KINDS.\n{}\n\
+         `JitProfiler::abort_diag` resolves the index through that array, so \
+         every reason from the first divergent slot onward is printed under \
+         another reason's name.",
+        divergent.join("\n"),
     );
 }
