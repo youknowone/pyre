@@ -2838,52 +2838,28 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// cannot inline aborts and rewinds to the enclosing CALL, and the FOR_ITER
 /// gate already records why that rewind does not reach a `BINARY_OP` /
 /// `COMPARE_OP` entry: the flush resumes one operand short.
-/// Whether the callee body can hand back `NotImplemented`.
+/// Whether a dunder body at a `BINARY_OP` / `COMPARE_OP` entry is a shape
+/// worth attempting on the strength of the entry's rewind.
 ///
-/// The singleton is a builtin NAME, not a constant -- `return NotImplemented`
-/// compiles to a global load -- so a body whose `co_names` does not hold it
-/// cannot name it, and the only remaining route is a value some call returned,
-/// which app-level code reaches only by calling a dunder itself.  Conservative
-/// in the direction that matters: a body that names it without returning it is
-/// only over-declined.
-/// Whether a dunder body may be admitted at a `BINARY_OP` / `COMPARE_OP`
-/// entry on the strength of the entry's rewind rather than on the whole-body
-/// `Clean` verdict.
+/// This is NOT what makes the rewind sound.  [`BinopRewindInlineGuard`] is:
+/// it refuses the first residual that could commit before it runs, which is
+/// the only form the question has an answer in -- whether a body commits is a
+/// property of the path it walks, and a body that delegates through `+` is
+/// statically indistinguishable from `return self.v + o.v` over ints.
 ///
-/// Two things have to hold, and the second is the one measurement added.
-///
-/// It must not be able to answer `NotImplemented`, because a body that commits
-/// and then answers it has no sound exit: the result goes back to the
-/// protocol, and every route back re-runs the body.
-///
-/// And it must make no nested Python call.  The abort classes this entry has
-/// no carrier for are raised inside a NESTED callee's sub-walk, and a body
-/// that calls nothing never enters one.  Measured: `Fraction.__gt__`, whose
-/// whole body is `return a._richcmp(b, operator.gt)`, put five aborts through
-/// the unstaged-reason fallback (`abrt_unclassified_default` 0 -> 5) on
-/// `synth/inline_freevar_after_mayforce` and each one dropped its iteration's
-/// contribution, so the fixture answered 62675 against 62680.  `self.x + o`,
-/// which calls nothing, raises none.
+/// What this filters is a shape that is admissible and still does not survive
+/// being recorded.  A body making a nested Python call inlines into a trace
+/// whose Phase 2 unroll then dies on `phase2 snapshot remap cache miss`
+/// (`unroll.rs`), measured on `synth/inline_freevar_after_mayforce` with a
+/// `Fraction.__gt__`-shaped body -- `return a._richcmp(b, operator.gt)`.  The
+/// same shape was measured once before, dropping five iterations through the
+/// unstaged-reason abort fallback.  Twice is enough to keep the filter and
+/// record what it costs: this entry does not admit a delegating dunder.
 fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
-    if callee_can_return_not_implemented(w_code) {
-        return false;
-    }
     let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
         return false;
     };
     !facts.exc_override_has_nested_call
-}
-
-fn callee_can_return_not_implemented(w_code: *const ()) -> bool {
-    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
-        as *const pyre_interpreter::CodeObject;
-    if raw.is_null() {
-        return true;
-    }
-    let code = unsafe { &*raw };
-    code.names
-        .iter()
-        .any(|name| name.as_str() == "NotImplemented")
 }
 
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
@@ -8867,27 +8843,39 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // discarded with a bare `Err`, which leaves the walk driver replaying the
     // loop from entry with the body's effects already applied.
     //
-    // The bar does two jobs, and only one of them is about committing.  What
-    // it has to prevent is a body that commits AND then answers
+    // What the bar has to prevent is a body that COMMITS and then answers
     // `NotImplemented`, because there is no exit from that: the result has to
-    // go back to the protocol, and every route back re-runs the body.  A body
-    // that cannot produce the singleton, and calls nothing that could, is
-    // never in that position -- so it is admitted on those grounds instead of
-    // on the whole-body verdict, which is what `return self.x + o` needs, its
-    // `LoadAttr` and `BinaryOp` being deferred helpers that make every such
-    // body `DeferredCall` ([`dunder_body_admissible_on_rewind`]).
+    // go back to the protocol, and every route back re-runs the body.  That is
+    // a property of the path the body walks, and no reading of the code object
+    // has it -- `LoadAttr` and `BinaryOp` are deferred helpers, so the verdict
+    // is `DeferredCall` for `return self.v + o.v` over ints, which commits
+    // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
+    // does.  So the verdict is not asked for the answer.  The descent runs
+    // under [`BinopRewindInlineGuard`], which refuses the first residual that
+    // could commit BEFORE it runs, leaving the cut legal for every path that
+    // reaches the arm below.
     //
-    // The arm below still reads the odometer before cutting.  A body that
-    // names the singleton keeps the old bar, so the arm stays reachable only
-    // for one that commits nothing -- the reading is what proves it for the
-    // path walked, rather than assuming it.
-    if !callee_body_commits_nothing(w_code)
-        && !(binop_rewind_enabled() && dunder_body_admissible_on_rewind(w_code))
-    {
-        decline!(format_args!(
-            "{}.{dunder} commits a replayable effect",
-            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
-        ));
+    // That arm still reads the odometer.  The guard is what makes the reading
+    // come out all-clear; the reading is what proves it for the path walked,
+    // rather than assuming it.
+    let commits_nothing = callee_body_commits_nothing(w_code);
+    // Armed for exactly the bodies admitted on the rewind.  A `Clean` body
+    // commits nothing by the scan that named it, so it keeps the descent it
+    // already had rather than a stricter one.
+    let admitted_on_rewind = !commits_nothing;
+    let refusal = if commits_nothing {
+        None
+    } else if !binop_rewind_enabled() {
+        Some("commits a replayable effect")
+    } else if !dunder_body_admissible_on_rewind(w_code) {
+        Some("delegates through a nested call")
+    } else {
+        None
+    };
+    if let Some(why) = refusal {
+        decline!(format_args!("{}.{dunder} {why}", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
     }
 
     let arg_concretes = vec![
@@ -8902,7 +8890,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let rewind_guard = admitted_on_rewind.then(BinopRewindInlineGuard::enter);
+    let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -8936,8 +8925,22 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         binop_rewind_enabled(),
         false,
         None,
-    )?
-    else {
+    );
+    // The refusal that sets this happens BEFORE the residual runs, so the
+    // region has applied nothing and the cut is the legal exit.  Asking here
+    // rather than at the `NotImplemented` arm below is the whole point: by the
+    // time a result exists, the commit that had to be prevented has happened.
+    let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
+    drop(rewind_guard);
+    if refused_a_residual {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        decline!(format_args!(
+            "{}.{dunder} may commit before its result is known",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    }
+    let Some(inlined) = descent? else {
         decline!(format_args!(
             "callee inline of {}.{dunder} declined",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -9079,23 +9082,27 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // discarded with a bare `Err`, which leaves the walk driver replaying the
     // loop from entry with the body's effects already applied.
     //
-    // The bar does two jobs, and only one of them is about committing.  What
-    // it has to prevent is a body that commits AND then answers
+    // What the bar has to prevent is a body that COMMITS and then answers
     // `NotImplemented`, because there is no exit from that: the result has to
-    // go back to the protocol, and every route back re-runs the body.  A body
-    // that cannot produce the singleton, and calls nothing that could, is
-    // never in that position -- so it is admitted on those grounds instead of
-    // on the whole-body verdict, which is what `return self.x + o` needs, its
-    // `LoadAttr` and `BinaryOp` being deferred helpers that make every such
-    // body `DeferredCall` ([`dunder_body_admissible_on_rewind`]).
+    // go back to the protocol, and every route back re-runs the body.  That is
+    // a property of the path the body walks, and no reading of the code object
+    // has it -- `LoadAttr` and `BinaryOp` are deferred helpers, so the verdict
+    // is `DeferredCall` for `return self.v + o.v` over ints, which commits
+    // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
+    // does.  So the verdict is not asked for the answer.  The descent runs
+    // under [`BinopRewindInlineGuard`], which refuses the first residual that
+    // could commit BEFORE it runs, leaving the cut legal for every path that
+    // reaches the arm below.
     //
-    // The arm below still reads the odometer before cutting.  A body that
-    // names the singleton keeps the old bar, so the arm stays reachable only
-    // for one that commits nothing -- the reading is what proves it for the
-    // path walked, rather than assuming it.
-    if !callee_body_commits_nothing(w_code)
-        && !(binop_rewind_enabled() && dunder_body_admissible_on_rewind(w_code))
-    {
+    // That arm still reads the odometer.  The guard is what makes the reading
+    // come out all-clear; the reading is what proves it for the path walked,
+    // rather than assuming it.
+    let commits_nothing = callee_body_commits_nothing(w_code);
+    // Armed for exactly the bodies admitted on the rewind.  A `Clean` body
+    // commits nothing by the scan that named it, so it keeps the descent it
+    // already had rather than a stricter one.
+    let admitted_on_rewind = !commits_nothing;
+    if !commits_nothing && !(binop_rewind_enabled() && dunder_body_admissible_on_rewind(w_code)) {
         return Ok(None);
     }
 
@@ -9111,7 +9118,8 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let rewind_guard = admitted_on_rewind.then(BinopRewindInlineGuard::enter);
+    let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -9145,8 +9153,19 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         binop_rewind_enabled(),
         false,
         None,
-    )?
-    else {
+    );
+    // The refusal that sets this happens BEFORE the residual runs, so the
+    // region has applied nothing and the cut is the legal exit.  Asking here
+    // rather than at the `NotImplemented` arm below is the whole point: by the
+    // time a result exists, the commit that had to be prevented has happened.
+    let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
+    drop(rewind_guard);
+    if refused_a_residual {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    let Some(inlined) = descent? else {
         return Ok(None);
     };
 

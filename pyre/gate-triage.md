@@ -55,10 +55,21 @@ OFF path is a needed safety net. Retire at the listed trigger (A7).
 | MAJIT_MIR_FRAMESTATE | framestate-threaded MIR lowering | MIR front-end #176/#181/#346 |
 | MAJIT_GC_ITEMSBLOCK, PYRE_GC_PREBUILT_REMEMBER, PYRE_GC_INTERP, PYRE_GC_INTERP_COLLECT | GC-managed items / prebuilt minor-skip / interpreter allocation + collect rollback | WS3 / #355 / F3 GC rework |
 | MAJIT_CL_NO_CLOSING_JUMP | cranelift attached-loop closing jump | #245 cranelift perf (explicit rollback hatch) |
+| PYRE_NO_BINOP_REWIND | rewind at the `BINARY_OP` / `COMPARE_OP` dunder entry | #1526 binop-dunder inline (explicit rollback hatch) |
 
 `PYRE_GC_INTERP` is default-ON on every target. Its OFF path still selects the
 unmanaged `malloc_typed` stepping-stone allocation and remains a rollback hatch
 until translated shadow-stack roots make the ordinary moving-nursery path safe.
+
+`PYRE_NO_BINOP_REWIND` puts that entry's admission back on the whole-body
+`Clean` verdict, which is the only bar it had before it had a rewind. It is the
+control every reading of the entry is taken against, and both wrong answers
+that shaped the admission were attributed with it: the one that showed a
+delegating body aborts inside a nested sub-walk, and the one that showed no
+static test can tell a committing body from the call-free body this entry
+exists to admit. What replaced those tests is a refusal at the first residual
+that could commit, taken before it runs. The gate goes when the #1526 entry
+closes.
 
 ## §5 — Other live gates (not removal targets by the "already-ON" criterion)
 
@@ -365,7 +376,7 @@ under measurement.
 | bucket | count |
 |---|---|
 | not gates (identifiers) | 12 |
-| live default-ON, kept until epic closes | 7 |
+| live default-ON, kept until epic closes | 8 |
 | diagnostics (OFF) | ~35 |
 | default-OFF experiments | 2 |
 | config / value / master | ~17 |
