@@ -1,29 +1,26 @@
 # `comparisons/` — the foreign-language rows
 
 "A JIT for Regular Expression Matching" (PyPy, 2010) ends with a table of seven
-implementations of the same marked-regex matcher on the same benchmark. The
-crate above this directory has three of them: pure Python on CPython, an
-ahead-of-time-compiled matcher (Rust `--release` standing in for the post's
-RPython-translated-to-C), and the JIT. This directory is the rest of the table,
-so the example is not asking anyone to take the missing rows on trust.
+implementations of the same marked-regex matcher on the same benchmark. This
+directory holds the rows that are in scope for this example, so it is not asking
+anyone to take them on trust.
 
 | the post's row | 2010 figure | here |
 |---|---:|---|
 | pure Python | 12,200 chars/s | `marked.py` |
-| Google re2 | 550,000 | `re2.py` — out of scope, never run, see below |
 | RPython translated to C | 720,000 | the crate's `interp.rs` row, via `cargo run` |
 | C++ (Sebastian Fischer) | 750,000 | `marked.cpp` |
-| Java (Baltasar Trancon y Widemann) | 1,920,000 | `Marked.java` — out of scope, never run, see below |
 | CPython `re` module | 2,500,000 | `re_module.py` — **not comparable**, see below |
 | RPython + JIT | 16,500,000 | the crate's `jit_interp.rs` row, via `cargo run` |
 
-**Scope.** The comparison this example owes is between its majit portals and
-the RPython implementation the post describes — same algorithm, same shape,
-read side by side. The foreign-language rows are context for that, not a
-deliverable: the Java and re2 rows are explicitly out of scope and neither has
-ever run on this machine. Their files stay because they document what running
-them would take and which traps a future run would hit, and both sections below
-say plainly that no number may be quoted from them.
+**Scope.** The comparison this example owes is between its majit portals and the
+RPython implementation the post describes — same algorithm, same shape, read side
+by side. That comparison lives one directory over, in `../rpython_original/`,
+which runs the post's own RPython source through RPython's own JIT and diffs the
+traces op by op. The rows here are context for it, not a deliverable. The post's
+other two rows — Google re2 and Java — are out of scope and their files have been
+deleted rather than left as a standing invitation to quote a number nothing ever
+ran.
 
 The 2010 column is from an Intel Core 2 Duo P8400 at 2.26 GHz. It is quoted for
 shape, never as a comparison: sixteen years of hardware sit between it and any
@@ -106,8 +103,9 @@ verify nodes=93 input_fnv1a=… head=… tail=… answers=… marks=…
   FNV-1a-64 digest plus the first and last 64 characters. A port whose LCG is off
   by one wrapping multiply still produces a perfectly plausible `a`/`b` string,
   and a chars/s number taken over different bytes is not a row in the same table.
-  Java's `long` is signed where the generator's is not, so this is what settles
-  whether `>>>` and the wrapping multiply really reproduced the u64 arithmetic.
+  A port whose language has no unsigned 64-bit integer has to reproduce the
+  wrapping multiply and the logical shift by hand, and this field is what settles
+  whether it did.
 * **`answers`** — one bit per case of a fixed battery: the 28 vectors of
   `regex.rs::vectors()`, then four cases at the benchmark's own scale — the
   non-matching input, and the same input with a matching pair of `a`s planted at
@@ -123,9 +121,9 @@ verify nodes=93 input_fnv1a=… head=… tail=… answers=… marks=…
   million characters, so two ports agreeing on it are doing the same work rather
   than merely arriving at the same boolean.
 
-`re` and `re2` have neither marks nor a node tree, so they attest only to the
-three input fields — which is the part that has to match for them to be rows in
-the same table at all.
+`re` has neither marks nor a node tree, so it attests only to the three input
+fields — which is the part that has to match for it to be a row in the same table
+at all.
 
 The gate has been shown to fail when it should, which is the only thing that
 makes a passing gate mean anything. Two negative tests, both run against a
@@ -147,7 +145,7 @@ Two further checks run after timing:
   2.0x, because on a loaded machine the ratio is noisy but "the walk is in the
   timed loop" is not. A ratio near 1 would mean the row is not measuring the
   marked algorithm at all. It is printed for every marked-matcher row (not for
-  `re` or `re2`, which are not this algorithm).
+  `re`, which is not this algorithm).
 * **The compiled code itself.** For the C++ row this was checked directly rather
   than inferred. At `-O2` on this machine `shift` is a real 60-instruction
   function: `ldrb` at offsets 0, 1, 2 and 3 of `Node` (`kind`, `ch`, `empty`,
@@ -284,72 +282,3 @@ it is quadratic — `re_module.py` measures that rather than asserting it
 That is the leading `(a|b)*` being retried from every start position, which is
 precisely the backtracking the marked algorithm exists to avoid, and it is why
 `search` at 2^20 characters would take hours.
-
-## Why re2 is missing (and out of scope)
-
-Google re2 is not installed on the machine this harness was written on: there is
-no `libre2`, no re2 headers, and no importable `re2` Python module, and this
-harness installs nothing. `re2.py` prints
-
-```
-re2 unavailable: pip install google-re2
-```
-
-and exits 0, so the row shows as absent rather than as a zero. That one command
-is the whole fix; rerun `run.sh` afterwards and the row fills itself in.
-
-re2 is the interesting missing row, and the only one of the seven that is
-algorithmically the same *kind* of thing as the marked matcher — an automaton
-engine, bounded work per character, whole string read. Its chars/s would be
-comparable in kind, where `re`'s is not.
-
-(`re2.py` is careful about one trap worth knowing: a file named `re2.py` puts its
-own directory first on `sys.path`, so `import re2` finds *itself*. It imports
-cleanly and fails much later as `module 're2' has no attribute 'compile'` — a
-bogus reason for a skipped row that reads like a broken binding. The file drops
-its own directory from `sys.path` before importing.)
-
-## Java: written, never compiled, never run (and out of scope)
-
-**No number should be quoted from `Marked.java` until it has run once.** The
-machine this harness was written on has no JDK. `/usr/bin/java` and
-`/usr/bin/javac` exist, but they are the macOS stubs — `command -v` finds them
-and `/usr/libexec/java_home` finds nothing behind them — and a filesystem sweep
-for any bundled JVM (Xcode, Android tooling, an app-embedded runtime, SDKMAN,
-Homebrew) found none. Nothing is installed by this harness, so the Java row is
-**unexecuted**: the file has never been through a compiler, and its self-check
-has never run.
-
-What *was* established without a JVM, and what was not:
-
-* The generator's constants and shift operator were extracted mechanically from
-  all six sources and compared, not eyeballed: every one carries
-  `6364136223846793005` and `1442695040888963407`, and Java is the only one
-  spelling the shift `>>> 33` rather than `>> 33`, which is what it must be for
-  a signed `long` to reproduce an unsigned shift.
-* Java's `long` semantics — 64-bit two's-complement wrapping multiply and add,
-  logical `>>>` — were **simulated** and reproduce the Rust generator's digest
-  exactly at 64, 4096 and 1,048,576 characters. That is a simulation of Java's
-  arithmetic, not an execution of this Java file, and it says nothing about
-  whether the file compiles.
-* Everything else about the Java row is unverified.
-
-`run.sh` is built so the first run proves it rather than trusting it: `javac` is
-tested for being a real compiler and not a stub, `--verify` runs before any
-timing, and the row is skipped unless its line matches the other ports character
-for character. One command changes this:
-
-```sh
-brew install --cask temurin
-```
-
-`Marked.java` gives the JVM `WARMUP_ROUNDS = 5` untimed rounds before the first
-timed one. HotSpot decides what to compile from invocation and back-edge
-counters: the first pass through `matches` runs interpreted, the long inner loop
-is then replaced on-stack, and only after `matches` and `shift` have been entered
-enough times does the whole nest get compiled with a settled profile. Timing
-round 1 would report that transition rather than the steady state. Five rounds at
-2^20 characters is on the order of a hundred million `shift` invocations, far
-past every tier threshold — and the per-round rates are printed so a reader can
-confirm they have stopped climbing instead of taking it on trust. If the timed
-rounds are still rising, raise the constant: the number was warm-up.

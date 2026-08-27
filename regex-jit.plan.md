@@ -1870,10 +1870,8 @@ row because it has to be: the same C++ binary reads 8.3M chars/s at load ~10 and
 | the post's row | 2010 figure | here | load |
 |---|---:|---:|---:|
 | pure Python | 12,200 | **119,025** | 9.98→7.86 |
-| Google re2 | 550,000 | not installed — `pip install google-re2` | — |
 | RPython → C | 720,000 | Rust `interp.rs`, `rustc -O`: **7,380,362** | 7.7→8.2 |
 | C++ (Fischer) | 750,000 | `clang++ -O2`: **8,475,048** | 9.98 |
-| Java (Trancon y Widemann) | 1,920,000 | no JDK — `brew install --cask temurin` | — |
 | CPython `re` | 2,500,000 | **12,399,816**, and NOT comparable | 7.86→7.55 |
 | RPython + JIT | 16,500,000 | majit JIT: **37,494,169** | 7.7→8.2 |
 
@@ -1896,11 +1894,11 @@ bounded prefix would show 32x) and that it reads the final byte
 (`reaches_last_char`), which is why the row is kept at all rather than thrown
 out.
 
-The two missing rows both need an install, which is the user's call:
-`pip install google-re2` and `brew install --cask temurin`. `Marked.java` is
-written and `run.sh` gates it on the same cross-port `--verify` line as every
-other row, so the first run proves it rather than trusting it — but it has
-never been through a compiler, and no Java number should be quoted until it has.
+The post's remaining two rows — Google re2 and Java — are out of scope. Neither
+is installed here, this harness installs nothing, and a row nothing ever ran is
+an invitation to quote a number that does not exist, so their files were deleted
+rather than kept. What the example owes is the comparison against RPython, and
+that is `rpython_original/`, below.
 
 The post's other experiments:
 
@@ -1926,3 +1924,65 @@ The post's other experiments:
   went from load 8 to load 34-83; the ratios, taken inside one process, did
   not. The branching portal stays about 400x slower than the same algorithm
   with no JIT under it, which is the verdict the module doc reports.
+
+## The comparison against RPython itself (0827)
+
+The measurements above are chars/s on one machine; they cannot say whether the
+majit portals are the post's program. Only the original can. `rpython_original/`
+holds the post's matcher written in RPython — the class hierarchy,
+`_immutable_fields_ = ['empty']` with `marked` mutable, and a JitDriver whose
+green is the regex — and `runner.py` puts it through `LLJitMixin`, the in-process
+harness RPython's own JIT tests use: real metainterpreter, real optimizer,
+LLGraph backend. The loop that comes out is the trace RPython would compile,
+without a translation. The RPython checkout is already at this repository's root,
+so nothing had to be installed.
+
+```sh
+cd majit/examples/regex/rpython_original
+PYTHONPATH=<repo root> pypy runner.py 20 4096
+```
+
+Both sides scan the same bytes, pinned rather than assumed: `fixture.py` carries
+`NONMATCHING_4096_FNV1A = r_uint(0xd9f7f62ad250969e)` and `regex.rs` carries the
+same constant, each asserted by a test on its own side.
+
+Peeled body — from the last `label` on, what runs per input character — at 93
+nodes:
+
+| op | RPython JIT | majit `shortcircuit` | majit `jit_interp` |
+|---|---:|---:|---:|
+| `getfield_gc_r` | 0 | 0 | 0 |
+| `getfield_gc_i` | 24 | 24 | 24 |
+| `setfield_gc` | 93 | 93 | 93 |
+| `int_eq` | 2 | 2 | 2 |
+| `guard_true` | 6 | 6 | 1 |
+| `guard_false` | 21 | 20 | 0 |
+| total | 153 | 176 | 194 |
+
+Every structural count is exact, on both portals: no pointer read survives, one
+mark store per node, and 2 comparisons for 46 `Char` nodes — the subset
+construction, performed identically by both tracers. The loop tails are the same
+ops in the same order (`int_add`, `setfield_gc`, `int_lt`, `guard_true`, `jump`;
+RPython additionally carries a zero-cost `debug_merge_point`). At `n = 2` (21
+nodes) RPython gives `setfield_gc 21`, `int_eq 2`, `getfield_gc_r 0`, so the
+census tracks the tree rather than a constant.
+
+**This corrected the crate's attribution, which had the two portals backwards.**
+The post's source writes `shift` with `and`/`or`; part 2 then remarks that
+`&`/`|` is the better spelling. RPython's trace carries 27 guards, `shortcircuit`
+26, `jit_interp` 1 — so `shortcircuit.rs` is the faithful port of the post's own
+source and `jit_interp.rs` is the adapted variant, the A/B of that remark. The
+docs had called `jit_interp` "the post's portal" and `shortcircuit` "the
+control". Both module docs, `main.rs`'s row names, and this document now say
+which is which.
+
+The 153-vs-176 gap is one spelling difference, not a missing optimization: majit
+emits `IntIsTrue` ahead of each guard where an RPython guard takes its condition
+directly. `runner.py --listing` and `REGEX_LISTING=1` on the census test print
+the two peeled bodies op by op for reading side by side.
+
+Two RPython-side traps worth recording. `get_stats` lives in
+`rpython.jit.metainterp.warmspot`, not in `history`. And the annotator rejects a
+prebuilt `(1 << 64) - 1` mask outright (`seeing a prebuilt long`), so the LCG is
+spelled with `r_uint` — which is in any case the truer match for Rust's
+`wrapping_mul`.

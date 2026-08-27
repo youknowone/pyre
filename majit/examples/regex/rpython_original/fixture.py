@@ -1,0 +1,85 @@
+"""The benchmark regex and input, byte-for-byte what the Rust side uses.
+
+`bench_regex` mirrors `regex.rs bench_regex` (balanced association) and
+`nonmatching` mirrors `regex.rs nonmatching` -- the same LCG, the same seed,
+the same `d = n + 1` fixup pass -- so both implementations scan exactly the
+same string. A comparison of two matchers on two different inputs would not
+be a comparison.
+"""
+
+from rpython.rlib.rarithmetic import r_uint
+from rpython.rlib.rstring import StringBuilder
+
+from marked import Char, Alternative, Repetition, Sequence
+
+# `regex.rs` spells these `wrapping_mul` / `wrapping_add` on a u64; `r_uint`
+# is the machine word and wraps the same way, so the two generators agree
+# bit for bit rather than by a Python-side mask the annotator rejects.
+LCG_MUL = r_uint(6364136223846793005)
+LCG_ADD = r_uint(1442695040888963407)
+
+
+def ab():
+    return Alternative(Char(ord('a')), Char(ord('b')))
+
+
+def build_balanced(xs):
+    if len(xs) == 1:
+        return xs[0]
+    half = len(xs) // 2
+    return Sequence(build_balanced(xs[:half]), build_balanced(xs[half:]))
+
+
+def bench_regex(n):
+    """`(a|b)*a(a|b){n}a(a|b)*`, balanced -- `regex.rs bench_regex`."""
+    parts = [Repetition(ab()), Char(ord('a'))]
+    for _ in range(n):
+        parts.append(ab())
+    parts.append(Char(ord('a')))
+    parts.append(Repetition(ab()))
+    return build_balanced(parts)
+
+
+def count(re):
+    from marked import Binary, Repetition as Rep
+    if isinstance(re, Binary):
+        return 1 + count(re.left) + count(re.right)
+    if isinstance(re, Rep):
+        return 1 + count(re.re)
+    return 1
+
+
+def nonmatching(length, n, seed):
+    """`regex.rs nonmatching`, same LCG constants and same fixup.
+
+    Pinned against the Rust side by `NONMATCHING_4096_FNV1A` -- see
+    `test_nonmatching_digest_pins_the_cross_port_input` in `regex.rs`, and
+    `check_digest` below.
+    """
+    chars = ['a'] * length
+    sd = r_uint(seed)
+    for i in range(length):
+        sd = sd * LCG_MUL + LCG_ADD
+        if ((sd >> 33) & r_uint(1)) != r_uint(0):
+            chars[i] = 'b'
+    d = n + 1
+    for i in range(length - d):
+        if chars[i] == 'a' and chars[i + d] == 'a':
+            chars[i + d] = 'b'
+    builder = StringBuilder(length)
+    for i in range(length):
+        builder.append(chars[i])
+    return builder.build()
+
+
+# FNV-1a, matching `regex.rs NONMATCHING_4096_FNV1A`.
+FNV_OFFSET = r_uint(14695981039346656037)
+FNV_PRIME = r_uint(1099511628211)
+NONMATCHING_4096_FNV1A = r_uint(0xd9f7f62ad250969e)
+
+
+def digest(s):
+    h = FNV_OFFSET
+    for i in range(len(s)):
+        h = (h ^ r_uint(ord(s[i]))) * FNV_PRIME
+    return h

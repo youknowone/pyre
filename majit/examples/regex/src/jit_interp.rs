@@ -1,10 +1,22 @@
-//! The JIT portal: `shift` traced with the regex tree held constant.
+//! The JIT portal, `&`/`|` variant: `shift` traced with the tree held constant.
 //!
 //! "A JIT for Regular Expression Matching" makes the regex the JitDriver's
 //! green and the input position a red. The tracer then sees the tree as
 //! constant, inlines the whole `shift` recursion for one character, and folds
 //! every structural read away — what is left is the marks and the character
 //! comparisons, which is subset construction performed by the tracer.
+//!
+//! **Which of the two portals is the post's own spelling.** The post's source
+//! writes `shift` with Python `and`/`or`, and part 2 then remarks that `&`/`|`
+//! is the better spelling because it keeps short-circuit branches out of the
+//! loop body. This module took the remark; `shortcircuit.rs` next door takes
+//! the source. Running the post's matcher through RPython's own JIT
+//! (`rpython_original/`, under `LLJitMixin`) settles which is which: RPython's
+//! trace carries 27 guards, `shortcircuit` carries 26, and this module carries
+//! 1. So `shortcircuit` is the faithful port and this module is the adapted
+//! one — an A/B of the remark, not a second copy of the post. Every structural
+//! count is the same on all three (0 `getfield_gc_r`, 24 `getfield_gc_i`, 93
+//! `setfield_gc`, 2 `int_eq`); the census table is in `shortcircuit.rs`.
 //!
 //! Two things this file has to say in majit's vocabulary:
 //!

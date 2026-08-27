@@ -66,9 +66,9 @@ trap cleanup EXIT
 PYTHON=${PYTHON:-python3}
 
 # rank|label|status|min|median|max|load_before|load_after|flag|note
-# The rank is the post's own table order (pure Python, Google re2, C++, Java,
-# CPython re), so the report reads next to the post whatever order the rows
-# happened to finish in.
+# The rank is the post's own table order, minus the rows this example does not
+# run (Google re2 and Java -- see the README's Scope section), so the report
+# reads next to the post whatever order the rows happened to finish in.
 ROWS="$SCRATCH/rows"
 : >"$ROWS"
 VERIFY="$SCRATCH/verify"
@@ -77,9 +77,7 @@ VERIFY="$SCRATCH/verify"
 rank() {
     case $1 in
         python) echo 1 ;;
-        re2) echo 2 ;;
         cpp) echo 3 ;;
-        java) echo 4 ;;
         re) echo 5 ;;
         *) echo 9 ;;
     esac
@@ -115,7 +113,7 @@ verify_port() {
     fi
     case $out in
         verify\ *) ;;
-        *)  # e.g. `re2 unavailable: ...` — nothing to attest to, and nothing to
+        *)  # e.g. `... unavailable: ...` — nothing to attest to, and nothing to
             # disagree with either.  Do not record it as a verify line.
             echo "  $label: no verify line ($out)"
             return 0 ;;
@@ -142,7 +140,6 @@ run_row() {
     grep '^round ' "$err" | awk '{print $3}' >"$SCRATCH/$label.rates"
     if [ ! -s "$SCRATCH/$label.rates" ]; then
         # A program that printed no rounds may still have said something useful
-        # — `re2.py` prints `re2 unavailable: ...` and exits 0.
         skip "$label" "$(head -n 1 "$out")"
         return
     fi
@@ -186,27 +183,6 @@ else
 fi
 [ $CPP_OK = 1 ] || skip cpp "no working clang++ build (see above)"
 
-# On macOS `/usr/bin/javac` and `/usr/bin/java` are stubs that exist whether or
-# not a JDK does, so `command -v` is not the test — the test is whether the stub
-# resolves to a runtime.
-JAVA_OK=0
-JAVA_WHY=""
-if ! command -v javac >/dev/null 2>&1 || ! command -v java >/dev/null 2>&1; then
-    JAVA_WHY="no javac/java on PATH; install a JDK: brew install --cask temurin"
-elif ! javac -version >/dev/null 2>&1 || ! java -version >/dev/null 2>&1; then
-    JAVA_WHY="javac/java are the macOS stubs, no JDK behind them: brew install --cask temurin"
-elif ! javac -d "$SCRATCH" "$HERE/Marked.java" 2>"$SCRATCH/java.build"; then
-    JAVA_WHY="javac failed: $(head -n 3 "$SCRATCH/java.build" | tr '\n' ' ')"
-else
-    JAVA_OK=1
-fi
-if [ $JAVA_OK = 1 ]; then
-    echo "java: javac ok, $(java -version 2>&1 | head -n 1)"
-else
-    echo "java: $JAVA_WHY"
-    skip java "$JAVA_WHY"
-fi
-
 PY_OK=0
 if command -v "$PYTHON" >/dev/null 2>&1; then
     echo "py  : $($PYTHON -VV | head -n 1)"
@@ -220,21 +196,19 @@ echo
 echo "=== verify (correctness gate — a row that fails here is not timed) ="
 # Every port prints one `verify` line.  The marked-matcher ports print the input
 # digest, the answers to a fixed battery, and a digest of all `marked` bits left
-# in the tree after scanning the benchmark input; `re` and `re2` have neither
+# in the tree after scanning the benchmark input; `re` has neither
 # marks nor a node tree, so they attest only to the bytes.  The rule is
 # agreement, not self-assessment: a port that grades itself can only catch the
 # mistakes its author anticipated.
 [ $CPP_OK = 1 ] && { verify_port cpp "$CPP_BIN" --verify "$LEN" "$N" || CPP_OK=0; }
-[ $JAVA_OK = 1 ] && { verify_port java java -cp "$SCRATCH" Marked --verify "$LEN" "$N" || JAVA_OK=0; }
 if [ $PY_OK = 1 ]; then
     verify_port python "$PYTHON" "$HERE/marked.py" --verify "$LEN" "$N" || PY_OK=0
     verify_port re "$PYTHON" "$HERE/re_module.py" --verify "$LEN" "$N" || true
-    verify_port re2 "$PYTHON" "$HERE/re2.py" --verify "$LEN" "$N" || true
 fi
 
-# The marked-matcher ports must agree on the WHOLE line; `re`/`re2` only on the
+# The marked-matcher ports must agree on the WHOLE line; `re` only on the
 # three input fields, which is all they print.
-MARKED_LINES=$(awk '$1 == "cpp" || $1 == "java" || $1 == "python" {$1 = ""; print}' "$VERIFY" | sort -u)
+MARKED_LINES=$(awk '$1 == "cpp" || $1 == "python" {$1 = ""; print}' "$VERIFY" | sort -u)
 INPUT_FIELDS=$(sed -n 's/.*\(input_fnv1a=[0-9a-f]*\) \(head=[ab]*\) \(tail=[ab]*\).*/\1 \2 \3/p' "$VERIFY" | sort -u)
 VERIFY_OK=1
 if [ "$(grep -c . <<<"$MARKED_LINES")" -gt 1 ] && [ -n "$MARKED_LINES" ]; then
@@ -261,7 +235,6 @@ if [ $VERIFY_OK = 0 ]; then
     echo
     echo "  refusing to time anything: fix the disagreement first."
     CPP_OK=0
-    JAVA_OK=0
     PY_OK=0
 fi
 
@@ -269,14 +242,10 @@ echo
 echo "=== measuring (this is the slow part) ============================="
 
 [ $CPP_OK = 1 ] && run_row cpp "marked matcher, clang++ -O2" "$CPP_BIN" "$LEN" "$REPEATS" "$N"
-[ $JAVA_OK = 1 ] && run_row java "marked matcher, HotSpot, 5 warm-up rounds" \
-    java -cp "$SCRATCH" Marked "$LEN" "$REPEATS" "$N"
 if [ $PY_OK = 1 ]; then
     run_row python "marked matcher, pure Python" "$PYTHON" "$HERE/marked.py" "$LEN" "$REPEATS" "$N"
     run_row re "NOT COMPARABLE: backtracking, different work" \
         "$PYTHON" "$HERE/re_module.py" "$LEN" "$REPEATS" "$N"
-    run_row re2 "automaton engine, comparable in kind" \
-        "$PYTHON" "$HERE/re2.py" "$LEN" "$REPEATS" "$N"
 fi
 
 echo
@@ -336,13 +305,10 @@ echo "  ideal ratio n=2 over n=20 is 93/21 = 4.4x; the VERDICT is >2.0x, because
 echo "  on a loaded machine the ratio is noisy but 'the walk is in the loop' is not"
 CTRL_LEN=$((LEN / 4))
 [ "$CTRL_LEN" -lt 4096 ] && CTRL_LEN=4096
-for label in cpp java python; do
+for label in cpp python; do
     case $label in
         cpp) [ $CPP_OK = 1 ] || continue
              c20=("$CPP_BIN" "$CTRL_LEN" 3 20); c2=("$CPP_BIN" "$CTRL_LEN" 3 2) ;;
-        java) [ $JAVA_OK = 1 ] || continue
-             c20=(java -cp "$SCRATCH" Marked "$CTRL_LEN" 3 20)
-             c2=(java -cp "$SCRATCH" Marked "$CTRL_LEN" 3 2) ;;
         python) [ $PY_OK = 1 ] || continue
              c20=("$PYTHON" "$HERE/marked.py" "$CTRL_LEN" 3 20)
              c2=("$PYTHON" "$HERE/marked.py" "$CTRL_LEN" 3 2) ;;

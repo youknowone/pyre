@@ -10,6 +10,12 @@
 //!
 //! `regex` builds and lowers the tree; `interp` is the plain matcher over the
 //! lowered graph; `jit_interp` and `shortcircuit` are the two JIT portals.
+//! `shortcircuit` is the faithful port of the post's own source, which writes
+//! `shift` with `and`/`or`; `jit_interp` is the `&`/`|` variant part 2 of the
+//! series recommends. `rpython_original/` runs the post's RPython through
+//! RPython's own JIT and settles which is which — the traces agree op for op
+//! on every structural count, and the guard counts (RPython 27, `shortcircuit`
+//! 26, `jit_interp` 1) name the faithful one.
 //!
 //! This file is also the benchmark, and its measurement discipline is half of
 //! what it has to say. Every number printed below without a disclaimer was
@@ -59,8 +65,8 @@ const FLAT_ENOUGH: f64 = 1.10;
 
 const NAMES: [&str; 3] = [
     "Rust interp over NodeRec, no JIT",
-    "majit JIT, regex promoted",
-    "majit JIT, short-circuit and/or",
+    "majit JIT, `&`/`|` variant",
+    "majit JIT, the post's and/or",
 ];
 const R_INTERP: usize = 0;
 const R_JIT: usize = 1;
@@ -444,7 +450,7 @@ fn main() {
     println!();
     println!("NOT MEASURED BY THIS RUN — this binary times the Rust rows only, and quotes no");
     println!("number it did not take itself. The pure-Python marked matcher, the same matcher");
-    println!("in C++ and Java, CPython `re` and Google re2 are the rest of the post's table,");
+    println!("in C++ and CPython `re` are the rest of the post's table that this example runs,");
     println!("and `comparisons/run.sh` measures them, printing each row's load beside it:");
     println!(
         "  majit/examples/regex/comparisons/run.sh {} {REPEATS} {N}",

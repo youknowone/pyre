@@ -1,5 +1,8 @@
-//! The control for the post's short-circuit remark: the same portal, with a
-//! `shift` that branches instead of masking.
+//! The post's matcher as its own source writes it: a `shift` that branches.
+//!
+//! This is the module RPython's JIT produces the same trace for — see the
+//! cross-check below. `jit_interp` next door is the *adapted* portal the
+//! post's short-circuit remark tells you to write.
 //!
 //! "A JIT for Regular Expression Matching" says, without showing the numbers:
 //!
@@ -8,14 +11,61 @@
 //! > "and" and "or" you get a lot of assembler code generated, and it's not
 //! > particularly fast
 //!
-//! `interp.rs` and `jit_interp.rs` both follow that advice, and this crate has
-//! documented it without ever measuring it. This module is the other side of
-//! that A/B: `jit_interp`'s portal copied whole — same state fields, same
-//! greens, same three-instruction program, same promote, same
-//! `_immutable_fields_` declarations, same inline policy — with `shift`'s four
-//! arms written the way part 1's Python writes them, `and`/`or` that stop
-//! early. The state struct's NAME is the one other difference, and only so a
-//! degraded arm stays attributable; the field list is identical.
+//! `interp.rs` and `jit_interp.rs` both take that advice, and this crate had
+//! documented it without ever measuring it. This module is the unadapted side
+//! of the A/B, and therefore the post's own source: `jit_interp`'s portal
+//! copied whole — same state fields, same greens, same three-instruction
+//! program, same promote, same `_immutable_fields_` declarations, same inline
+//! policy — with `shift`'s four arms written the way part 1's Python writes
+//! them, `and`/`or` that stop early. The state struct's NAME is the one other
+//! difference, and only so a degraded arm stays attributable; the field list is
+//! identical. So the two portals differ in exactly the thing the remark is
+//! about, which is what makes the comparison below an A/B rather than two
+//! programs.
+//!
+//! # This is the module RPython's own JIT agrees with
+//!
+//! `rpython_original/` carries the post's matcher written in RPython — the
+//! class hierarchy, `_immutable_fields_`, and a JitDriver whose green is the
+//! regex — and `runner.py` puts it through `LLJitMixin`, the harness RPython's
+//! own JIT tests use: the real metainterpreter, the real optimizer, the LLGraph
+//! backend, in process. The loop that comes out is the trace RPython would
+//! compile. Both sides scan the same 4096 bytes, pinned by an FNV-1a digest
+//! asserted on both (`NONMATCHING_4096_FNV1A`).
+//!
+//! Peeled body, 93 nodes:
+//!
+//! ```text
+//!                    RPython   this module   jit_interp
+//!   getfield_gc_r          0             0            0
+//!   getfield_gc_i         24            24           24
+//!   setfield_gc           93            93           93
+//!   int_eq                 2             2            2
+//!   guard_true             6             6            1
+//!   guard_false           21            20            0
+//! ```
+//!
+//! Every structural count is exact: no pointer read survives on either side,
+//! one mark store per node, and two comparisons for 46 `Char` nodes — the
+//! subset construction, performed by both tracers. The loop tails are the same
+//! ops in the same order (`int_add`, `setfield_gc`, `int_lt`, `guard_true`,
+//! `jump`).
+//!
+//! **And the guards say this module, not `jit_interp`, is the post's own
+//! spelling.** The post's source is Python `and`/`or`, which really do
+//! short-circuit, so RPython's tracer emits branches — 27 guards. This module
+//! reproduces them with explicit `if`s and lands on 26. `jit_interp` masks with
+//! `&`/`|` and has 1. So `jit_interp` is the *adapted* version the post's
+//! remark tells you to write, and this module is what the post's code does
+//! before you take that advice.
+//!
+//! The bodies are 153 ops (RPython) against 176 (here), and the 23 are one
+//! spelling difference: majit emits `IntIsTrue` ahead of each guard where an
+//! RPython guard takes its condition directly. `REGEX_LISTING=1` on the census
+//! test prints both peeled bodies op by op, and `runner.py --listing` prints
+//! RPython's, for diffing.
+//!
+//! # The measurements
 //!
 //! Measured on this machine, dynasm, on the post's own
 //! `(a|b)*a(a|b){20}a(a|b)*` — 93 nodes, balanced — over a non-matching random
@@ -723,6 +773,19 @@ mod tests {
             sc.guard_failures,
             census(&sc.body),
         );
+        // `REGEX_LISTING=1` prints both peeled bodies op by op, which is what
+        // the RPython cross-check reads: `rpython_original/runner.py
+        // --listing` prints the same thing for the trace RPython's own
+        // optimizer produces, and the two lists are meant to be diffed. A
+        // census alone cannot tell "same ops in a different order" from "the
+        // same trace".
+        if std::env::var("REGEX_LISTING").is_ok() {
+            for (label, body) in [("branching", &sc.body), ("masking", &mk.body)] {
+                for (i, op) in body.iter().enumerate() {
+                    println!("[listing:{label}] {i:4}  {op:?}");
+                }
+            }
+        }
         println!(
             "[shortcircuit] {nodes} nodes, masking  : {} loop(s), {:?} bridge(s), \
              {:?} abort(s), {:?} guard failure(s), per character: {}",

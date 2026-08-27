@@ -236,6 +236,16 @@ pub fn nonmatching(len: usize, n: usize, mut seed: u64) -> Vec<u8> {
     s
 }
 
+/// FNV-1a over `nonmatching(4096, 20, 42)`.
+///
+/// The RPython port next door (`rpython_original/fixture.py`) reimplements
+/// this generator and asserts the same constant. A comparison of two matchers
+/// on two different inputs is not a comparison, and "I wrote the same LCG
+/// twice" is exactly the claim that is easy to get wrong and impossible to
+/// notice: both sides would still answer "no match", because almost every
+/// string fails this pattern.
+pub const NONMATCHING_4096_FNV1A: u64 = 0xd9f7_f62a_d250_969e;
+
 /// The correctness vectors: `(regex, input, should match)`.  Shared by `main`
 /// and the tests so the two can never drift.
 pub fn vectors() -> Vec<(Box<Node>, &'static str, bool)> {
@@ -290,6 +300,30 @@ pub fn vectors() -> Vec<(Box<Node>, &'static str, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The generator is the contract between this example and the RPython
+    /// port it is compared against.
+    ///
+    /// `rpython_original/fixture.py nonmatching` reimplements this LCG and
+    /// asserts the same digest, so the two matchers provably scan the same
+    /// 4096 bytes. Without it the cross-port trace comparison could be run on
+    /// two different strings and still look like it agreed, because this
+    /// pattern rejects almost everything.
+    #[test]
+    fn test_nonmatching_digest_pins_the_cross_port_input() {
+        let s = nonmatching(4096, 20, 42);
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in &s {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(
+            h, NONMATCHING_4096_FNV1A,
+            "the benchmark input moved; `rpython_original/fixture.py` pins the \
+             same digest and must move with it, or the two ports stop scanning \
+             the same bytes",
+        );
+    }
 
     #[test]
     fn test_vector_table_is_complete() {
