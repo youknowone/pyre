@@ -401,6 +401,16 @@ impl Assembler {
     /// invariant for liveness and jit-merge-point operand encoding, so we
     /// keep the orthodox translator-time assertion here instead of
     /// widening the limit to match internal `u16` builder fields.
+    ///
+    /// Upstream can assert because its jitcodes come from RPython functions,
+    /// where a violation is a translation-time bug. Pyre assembles arbitrary
+    /// user bytecode at runtime, so the enforcing copy of this rule is
+    /// `JitCodeBuilder::try_finish`, which tests the same three inequalities
+    /// and returns `None` — the caller above declines the graph and leaves the
+    /// function to the interpreter. That runs first, so by the time a
+    /// `JitCode` reaches here the three asserts are already satisfied: this is
+    /// a post-condition restating the rule at its orthodox position, not the
+    /// gate that keeps an unencodable frame out.
     fn check_result(&self, jitcode: &JitCode) {
         assert!(
             (jitcode.num_regs_i() as usize) + jitcode.constants_i.len() <= 256,

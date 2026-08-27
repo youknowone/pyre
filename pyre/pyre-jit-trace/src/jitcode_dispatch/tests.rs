@@ -803,8 +803,6 @@ fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -1058,8 +1056,6 @@ fn getfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -1116,8 +1112,6 @@ fn setfield_vable_with_none_obj_surfaces_vable_box_not_seeded() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -1190,8 +1184,6 @@ fn array_vable_handlers_with_none_obj_surface_vable_box_not_seeded() {
             trace_ctx: &mut tc,
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
@@ -1288,8 +1280,6 @@ fn array_vable_handlers_with_unpinned_index_surface_index_not_concrete() {
             trace_ctx: &mut tc,
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
@@ -1423,8 +1413,6 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
             trace_ctx: &mut tc,
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
@@ -1696,8 +1684,6 @@ fn drive_int_add_jump_if_ovf(
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
@@ -1855,8 +1841,6 @@ fn drive_alloc_with_descr(
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index: test_outer_resume_jitcode_index(),
@@ -2054,8 +2038,6 @@ fn run_hint_step_with_descrs(
         trace_ctx: tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index,
@@ -2564,8 +2546,6 @@ fn switch_id_hit_jumps_to_matching_target() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -2623,8 +2603,6 @@ fn switch_id_miss_falls_through() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -2681,8 +2659,6 @@ fn switch_id_requires_concrete_int_value() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -2748,8 +2724,6 @@ fn goto_if_not_truthy_records_guard_true_and_falls_through() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -2807,8 +2781,6 @@ fn goto_if_not_falsy_records_guard_false_and_jumps() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -2865,8 +2837,6 @@ fn goto_if_not_requires_concrete_int_value() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3225,6 +3195,13 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     descr_pool[7] = make_jitcode_descr(7);
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
+    // The standing exception is metainterp-level state
+    // (`pyjitpl.py:2417`), so it is seeded on the session.
+    {
+        let mut sess = session.borrow_mut();
+        sess.last_exc_value = Some(arg_value);
+        sess.last_exc_value_concrete = ConcreteValue::Int(123);
+    }
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
@@ -3242,8 +3219,6 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: Some(arg_value),
-        last_exc_value_concrete: ConcreteValue::Int(123),
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3265,11 +3240,12 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
     assert_eq!(outcome, DispatchOutcome::Terminate);
     assert_eq!(end_pc, caller_code.len());
     assert_eq!(
-        wc.last_exc_value, None,
+        wc.last_exc_value(),
+        None,
         "normal inline return must clear the caller's stale exception",
     );
     assert_eq!(
-        wc.last_exc_value_concrete,
+        wc.last_exc_value_concrete(),
         ConcreteValue::Null,
         "normal inline return must clear the caller's concrete exception shadow",
     );
@@ -3421,8 +3397,6 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3539,8 +3513,6 @@ fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3652,8 +3624,6 @@ fn inline_call_irf_r_populates_all_three_kind_banks() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3754,8 +3724,6 @@ fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3852,8 +3820,6 @@ fn inline_call_recursion_propagates_subraise_from_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3932,8 +3898,6 @@ fn inline_call_with_unresolvable_descr_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -3991,8 +3955,6 @@ fn inline_call_with_missing_sub_jitcode_lookup_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4046,8 +4008,6 @@ fn step_through_live_opcode_advances_by_offset_size() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4110,8 +4070,6 @@ fn step_through_ref_return_records_finish_with_descr_and_correct_arg() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4172,8 +4130,6 @@ fn ref_return_with_out_of_range_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4235,8 +4191,6 @@ fn raise_with_unwritten_register_surfaces_register_read_unbound() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4299,8 +4253,6 @@ fn step_through_int_return_records_finish_with_int_descr() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4380,8 +4332,6 @@ fn step_through_int_return_subwalk_surfaces_subreturn_some() {
         trace_ctx: &mut tc,
         is_top_level: false,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4449,8 +4399,6 @@ fn step_through_void_return_stashes_void_finish_payload() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4519,8 +4467,6 @@ fn step_through_void_return_subwalk_surfaces_subreturn_none() {
         trace_ctx: &mut tc,
         is_top_level: false,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4577,8 +4523,6 @@ fn raise_with_out_of_range_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4638,8 +4582,6 @@ fn step_through_goto_jumps_to_label_target() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4699,8 +4641,6 @@ fn step_through_goto_handles_high_byte_of_label() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4791,6 +4731,12 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
     let active_exc = regs[0];
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
+    // The standing exception is metainterp-level state
+    // (`pyjitpl.py:2417`), so it is seeded on the session.
+    {
+        let mut sess = session.borrow_mut();
+        sess.last_exc_value = Some(active_exc);
+    }
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
@@ -4808,8 +4754,6 @@ fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: Some(active_exc),
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4864,8 +4808,6 @@ fn step_through_catch_exception_advances_past_label_operand() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -4934,8 +4876,6 @@ fn step_through_raise_records_outermost_finish_and_terminates() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5018,8 +4958,6 @@ fn top_level_raise_settles_the_vable_token() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5126,8 +5064,6 @@ fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5211,6 +5147,12 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
     let descr_exc = make_fail_descr(99);
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
+    // The standing exception is metainterp-level state
+    // (`pyjitpl.py:2417`), so it is seeded on the session.
+    {
+        let mut sess = session.borrow_mut();
+        sess.last_exc_value = Some(active_exc);
+    }
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
@@ -5228,8 +5170,6 @@ fn step_through_reraise_at_top_level_records_outermost_finish() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: Some(active_exc),
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5307,8 +5247,6 @@ fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5363,8 +5301,6 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5383,7 +5319,7 @@ fn raise_at_top_level_populates_last_exc_value_before_finish() {
     };
     let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
     assert_eq!(
-        wc.last_exc_value,
+        wc.last_exc_value(),
         Some(exc),
         "raise/r must populate ctx.last_exc_value before terminating",
     );
@@ -5483,8 +5419,6 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5513,7 +5447,7 @@ fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
         "walker must terminate at handler's ref_return r5 (pc=12..14)",
     );
     assert_eq!(
-        wc.last_exc_value,
+        wc.last_exc_value(),
         Some(exc_arg),
         "caller's last_exc_value must be set to the exc OpRef from callee SubRaise",
     );
@@ -5606,8 +5540,6 @@ fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
         // Sub-walk frame: bubble-up behaviour, no FINISH conversion.
         is_top_level: false,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5677,8 +5609,6 @@ fn step_through_int_copy_advances_past_operand_bytes() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5745,8 +5675,6 @@ fn int_copy_writes_src_value_into_dst_register() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5804,8 +5732,6 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5862,8 +5788,6 @@ fn int_copy_with_out_of_range_src_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -5940,8 +5864,6 @@ fn step_through_ref_copy_advances_past_operand_bytes() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6006,8 +5928,6 @@ fn ref_copy_writes_src_value_into_dst_register() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6063,8 +5983,6 @@ fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6119,8 +6037,6 @@ fn ref_copy_with_out_of_range_src_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6186,8 +6102,6 @@ fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6413,8 +6327,6 @@ fn drive_int_between(
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6552,8 +6464,6 @@ fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6644,8 +6554,6 @@ fn drive_float_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6724,8 +6632,6 @@ fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6824,8 +6730,6 @@ fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -6997,8 +6901,6 @@ fn run_float_step(
         trace_ctx: tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: Some(0),
         outer_jitcode_index,
@@ -7193,8 +7095,6 @@ fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7250,8 +7150,6 @@ fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7309,8 +7207,6 @@ fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7376,8 +7272,6 @@ fn unsupported_opname_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7434,8 +7328,6 @@ fn ptr_nonzero_records_ptrne_with_box_and_null() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7606,8 +7498,6 @@ fn abort_result_r_is_pure_pc_advance() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7674,8 +7564,6 @@ fn ref_guard_value_records_guardvalue_with_concrete_constant() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7760,8 +7648,6 @@ fn int_guard_value_records_guardvalue_with_concrete_constant() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7847,8 +7733,6 @@ fn ref_guard_value_on_const_records_nothing() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -7944,8 +7828,6 @@ fn step_through_residual_call_r_r_records_callr_with_descr_and_args() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8117,8 +7999,6 @@ fn run_symbolic_box_str_dispatch(
         trace_ctx: &mut tc,
         is_top_level: false,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8259,8 +8139,6 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8347,8 +8225,6 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8407,8 +8283,6 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8443,7 +8317,7 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
 }
 
 // A may-force call that RAISES (publishes on BH_LAST_EXC_VALUE) is transcribed
-// onto WalkContext.last_exc_value (+ last_exc_value_concrete), while the
+// onto WalkSession.last_exc_value (+ last_exc_value_concrete), while the
 // blackhole carrier is consumed exactly once. The result box is NOT stamped
 // (only the normal-return path stamps a result, mirroring `execute_varargs`'s
 // success-only `result_box.value`).
@@ -8481,8 +8355,6 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8508,8 +8380,8 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         0,
         None,
     );
-    let captured_exc = wc.last_exc_value;
-    let captured_concrete = wc.last_exc_value_concrete;
+    let captured_exc = wc.last_exc_value();
+    let captured_concrete = wc.last_exc_value_concrete();
     drop(wc);
     assert!(
         captured_exc.is_some(),
@@ -8585,8 +8457,6 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8688,8 +8558,6 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8725,30 +8593,51 @@ fn may_force_vable_escape_surfaces_typed_abort() {
     );
 }
 
-#[test]
-fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py` routes
-    // `OS_NOT_IN_TRACE` residual calls through `do_not_in_trace_call`
-    // which executes the callee concretely and aborts to blackhole
-    // only if it raises (`pyjitpl.py`). The walker has no
-    // concrete executor, so it must surface a typed error rather
-    // than recording either the normal-return or
-    // SwitchToBlackhole shape.
-    let residual_byte = *insns_opname_to_byte()
-        .get("residual_call_r_r/iRd>r")
-        .expect("`residual_call_r_r/iRd>r` must be in insns table");
-    let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// A `jit.not_in_trace` callee that returns normally.
+///
+/// `execute_residual_call` reads the raise out of `BH_LAST_EXC_VALUE`, so
+/// leaving that cell alone is what "returned normally" means at this seam.
+extern "C" fn not_in_trace_returns_for_walker_test() -> i64 {
+    NOT_IN_TRACE_CALLS.with(|c| c.set(c.get() + 1));
+    0
+}
+
+/// The same callee, raising: publishes a non-zero exception pointer on
+/// `BH_LAST_EXC_VALUE` (the blackhole `bh_call_*` convention).
+extern "C" fn not_in_trace_raises_for_walker_test() -> i64 {
+    NOT_IN_TRACE_CALLS.with(|c| c.set(c.get() + 1));
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xDEAD));
+    0
+}
+
+thread_local! {
+    /// Counts entries into the two callees above, so a test can tell
+    /// "executed concretely" from "recorded symbolically and never run".
+    static NOT_IN_TRACE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Drive [`do_not_in_trace_call_result`] against a real callee address.
+///
+/// Returns the outcome, how many ops the trace grew by, and how many times
+/// the callee actually ran.
+fn run_not_in_trace(
+    callee: extern "C" fn() -> i64,
+    dst_bank: char,
+) -> (Result<Option<DispatchOutcome>, DispatchError>, usize, u32) {
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
-    let not_in_trace_descr = call_descr_with_oopspec(
-        43,
-        majit_ir::ExtraEffect::CannotRaise,
+    let funcbox = tc.const_int(callee as *const () as i64);
+    let allboxes = [funcbox];
+    let descr = call_descr_with_oopspec(
+        44,
+        majit_ir::ExtraEffect::CanRaise,
         majit_ir::OopSpecIndex::NotInTrace,
     );
-    let descr_pool = vec![not_in_trace_descr];
-    let frame_done_descr = done_descr_ref_for_tests();
+    let call_descr = descr.as_call_descr().expect("CallDescr");
+    let mut regs_i: Vec<OpRef> = Vec::new();
+    let mut regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
+    NOT_IN_TRACE_CALLS.with(|c| c.set(0));
+    let ops_before = tc.ops().len();
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
@@ -8760,14 +8649,12 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
         registers_f: &mut [],
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
-        descr_refs: &descr_pool,
+        descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
-        is_authoritative_executor: false,
+        is_authoritative_executor: true,
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8784,10 +8671,76 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
+    let ei = call_descr.get_extra_info();
+    let outcome = do_not_in_trace_call_result(&mut wc, ei, &allboxes, call_descr, dst_bank, 0);
+    drop(wc);
+    let grew = tc.ops().len() - ops_before;
+    (outcome, grew, NOT_IN_TRACE_CALLS.with(|c| c.get()))
+}
+
+#[test]
+fn not_in_trace_normal_return_executes_concretely_and_records_no_ir() {
+    // `do_not_in_trace_call` (pyjitpl.py) runs the callee through
+    // `execute_varargs` and returns `None`, so `do_residual_call` hands its
+    // caller no result box and the history never grows: "the trace doesn't
+    // contain the call at all".
+    let (outcome, ops_recorded, calls) =
+        run_not_in_trace(not_in_trace_returns_for_walker_test, 'v');
     assert_eq!(
-        err,
-        DispatchError::NotInTraceRequiresConcreteExecution { pc: 0 },
+        outcome,
+        Ok(Some(DispatchOutcome::Continue)),
+        "a normally-returning OS_NOT_IN_TRACE callee must let the walk continue",
+    );
+    assert_eq!(
+        calls, 1,
+        "the callee must be executed concretely, exactly once"
+    );
+    assert_eq!(
+        ops_recorded, 0,
+        "OS_NOT_IN_TRACE records no IR — upstream returns None from \
+         do_not_in_trace_call, so no ResOperation joins the history",
+    );
+}
+
+#[test]
+fn not_in_trace_raise_switches_to_blackhole_and_records_no_ir() {
+    // pyjitpl.py: "cannot trace this!  it raises, so we have to follow the
+    // exception-catching path, but the trace doesn't contain the call at
+    // all" — `SwitchToBlackhole(Counters.ABORT_ESCAPE,
+    // raising_exception=True)`.
+    let (outcome, ops_recorded, calls) = run_not_in_trace(not_in_trace_raises_for_walker_test, 'v');
+    assert_eq!(
+        outcome,
+        Ok(Some(DispatchOutcome::SwitchToBlackhole {
+            reason: majit_metainterp::counters::ABORT_ESCAPE,
+            raising_exception: true,
+        })),
+        "a raising OS_NOT_IN_TRACE callee must abort to blackhole",
+    );
+    assert_eq!(
+        calls, 1,
+        "the raise is observed by running the callee, not by guessing"
+    );
+    assert_eq!(
+        ops_recorded, 0,
+        "the aborting case records no IR either — the call is absent from the trace",
+    );
+}
+
+#[test]
+fn not_in_trace_with_a_destination_bank_stays_fail_loud() {
+    // `jtransform.py` refuses to emit a `jit.not_in_trace` call whose result
+    // is not `lltype.Void`, so only the `residual_call_*_v` spellings can
+    // carry this oopspec. A destination bank here is a codewriter invariant
+    // violation; the walker must not invent a value for it.
+    let (outcome, _ops, calls) = run_not_in_trace(not_in_trace_returns_for_walker_test, 'r');
+    assert_eq!(
+        outcome,
+        Err(DispatchError::NotInTraceRequiresConcreteExecution { pc: 0 }),
+    );
+    assert_eq!(
+        calls, 0,
+        "the guard must fail before running anything, so the refusal has no side effect",
     );
 }
 
@@ -8831,8 +8784,6 @@ fn residual_call_r_r_with_jit_force_virtual_oopspec_returns_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8890,8 +8841,6 @@ fn residual_call_r_r_with_elidable_can_raise_records_callpurer_plus_guard() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -8961,8 +8910,6 @@ fn residual_call_r_r_with_cannot_raise_records_callr_no_guard() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9034,8 +8981,6 @@ fn residual_call_r_r_writes_recorder_result_into_dst_register() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9127,8 +9072,6 @@ fn residual_call_r_r_can_raise_writes_dst_before_guard_no_exception() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9209,8 +9152,6 @@ fn residual_call_ir_r_can_raise_writes_dst_before_guard_no_exception() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9290,8 +9231,6 @@ fn residual_call_r_r_with_out_of_range_dst_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9351,8 +9290,6 @@ fn residual_call_r_r_with_descr_index_out_of_range_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9450,8 +9387,6 @@ fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9548,8 +9483,6 @@ fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9654,8 +9587,6 @@ fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9792,8 +9723,6 @@ fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9866,8 +9795,6 @@ fn residual_call_descr_not_call_descr_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -9926,8 +9853,6 @@ fn residual_call_r_r_with_out_of_range_arg_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10010,8 +9935,6 @@ fn walk_return_value_helper_terminates_at_first_ref_return() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &production_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10125,8 +10048,6 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &production_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10255,8 +10176,6 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
             trace_ctx: &mut tc,
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: EntryPyPc::Py(0),
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
@@ -10346,8 +10265,6 @@ fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10434,6 +10351,13 @@ fn inline_call_r_v_accepts_void_returning_callee() {
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
     let session = std::cell::RefCell::new(WalkSession::default());
+    // The standing exception is metainterp-level state
+    // (`pyjitpl.py:2417`), so it is seeded on the session.
+    {
+        let mut sess = session.borrow_mut();
+        sess.last_exc_value = Some(stale_exc);
+        sess.last_exc_value_concrete = ConcreteValue::Int(123);
+    }
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
@@ -10451,8 +10375,6 @@ fn inline_call_r_v_accepts_void_returning_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: Some(stale_exc),
-        last_exc_value_concrete: ConcreteValue::Int(123),
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10472,8 +10394,8 @@ fn inline_call_r_v_accepts_void_returning_callee() {
     let (outcome, _) =
         walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
     assert_eq!(outcome, DispatchOutcome::Terminate);
-    assert_eq!(wc.last_exc_value, None);
-    assert_eq!(wc.last_exc_value_concrete, ConcreteValue::Null);
+    assert_eq!(wc.last_exc_value(), None);
+    assert_eq!(wc.last_exc_value_concrete(), ConcreteValue::Null);
 }
 
 #[test]
@@ -10536,8 +10458,6 @@ fn inline_call_r_v_rejects_non_void_returning_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10622,8 +10542,6 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10706,8 +10624,6 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10795,8 +10711,6 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10882,8 +10796,6 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &lookup,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -10958,8 +10870,6 @@ fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11055,8 +10965,6 @@ fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11130,8 +11038,6 @@ fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11193,8 +11099,6 @@ fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11268,8 +11172,6 @@ fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11363,8 +11265,6 @@ fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11448,8 +11348,6 @@ fn setfield_gc_i_redundant_write_skips_recording() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11511,8 +11409,6 @@ fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11600,8 +11496,6 @@ fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11672,8 +11566,6 @@ fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11822,8 +11714,6 @@ fn getarrayitem_gc_pure_const_operands_fold_without_recording_or_counting() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11901,8 +11791,6 @@ fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -11972,8 +11860,6 @@ fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -12292,8 +12178,6 @@ fn walk_undecodable_byte_surfaces_typed_error() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -12372,8 +12256,6 @@ fn jit_merge_point_first_visit_continues_then_closes_loop() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -12462,8 +12344,6 @@ fn loop_header_stamps_seen_flag() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -12532,8 +12412,6 @@ fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -12597,8 +12475,6 @@ fn jit_merge_point_unresolved_green_key_fails_loud() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -12990,8 +12866,6 @@ fn int_scratch_move_carries_the_concrete_shadow_to_the_destination() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -13186,8 +13060,6 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -13287,8 +13159,6 @@ fn mayforce_null_ref_arg_exempts_the_unread_load_global_namespace() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -13382,8 +13252,6 @@ fn mayforce_null_ref_arg_exempts_the_with_except_start_receiver() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,
@@ -13614,8 +13482,6 @@ fn foriter_body_identity_names_the_jitcode_its_op_pc_indexes() {
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
-        last_exc_value: None,
-        last_exc_value_concrete: ConcreteValue::Null,
         entry_py_pc: EntryPyPc::Py(0),
         outer_resume_marker_jit_pc: None,
         outer_jitcode_index: 0,

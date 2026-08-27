@@ -345,6 +345,15 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         0
     };
 
+    // The standing exception the adapter caller handed over is
+    // metainterp-level state (`pyjitpl.py:2417`), so it is seeded on the
+    // session the walk shares, not on the entry frame's context.
+    {
+        let mut walk_session = session.borrow_mut();
+        walk_session.last_exc_value = initial_last_exc_value;
+        walk_session.last_exc_value_concrete = initial_last_exc_value_concrete;
+    }
+
     let result = {
         let mut wc = WalkContext {
             callee_shadow: None,
@@ -384,8 +393,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             trace_ctx,
             is_top_level,
             sub_jitcode_lookup,
-            last_exc_value: initial_last_exc_value,
-            last_exc_value_concrete: initial_last_exc_value_concrete,
             entry_py_pc,
             outer_resume_marker_jit_pc: None,
             outer_jitcode_index: 0,
@@ -502,8 +509,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // reads (`last_exc_value/>r`) is the SAVE_EXCEPTION box — the
             // runtime-restored value, NOT a baked constant — so a value-using
             // handler (`except E as e`) sees the actual exception.
-            wc.last_exc_value = Some(value_op);
-            wc.last_exc_value_concrete = ConcreteValue::Ref(exc_edge_concrete);
+            wc.set_last_exc_value(value_op, ConcreteValue::Ref(exc_edge_concrete));
             wc.fbw_mode.class_of_last_exc_is_const = true;
             // The inlined callees this route unwound clear out of, innermost
             // first, BEFORE the catching frame's own node: both recorders
@@ -537,8 +543,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // Mirror the walk-level SubRaise routing (mod.rs `finishframe_
             // exception`): seed `last_exc_value` + the handler-entry operand
             // stack (exc on TOS), then enter at the handler.
-            wc.last_exc_value = Some(seed.exc);
-            wc.last_exc_value_concrete = seed.exc_concrete;
+            wc.set_last_exc_value(seed.exc, seed.exc_concrete);
             // The raise is a const-class exception (the callee's inline RAISE
             // recorded a NewWithVtable of a known class), so its class is
             // constant — same as the `exc_edge_catch_target` branch and the
@@ -668,7 +673,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         }
         // Read final last_exc_value before wc drops so the borrow
         // checker can release sym for the writeback below.
-        let final_last_exc = wc.last_exc_value;
+        let final_last_exc = wc.last_exc_value();
         let final_class_of_last_exc_is_const = wc.fbw_mode.class_of_last_exc_is_const;
         drop(wc);
         // Full `sym.last_exc_*` state writeback parity.
@@ -681,7 +686,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         //
         // Of these, the walker can produce:
         //   - `last_exc_box`: the symbolic OpRef. Mirrored from
-        //     `wc.last_exc_value` (RPython's metainterp.last_exc_value
+        //     `wc.last_exc_value()` (RPython's metainterp.last_exc_value
         //     and last_exc_box are different fields — concrete pointer
         //     vs Box — but the walker tracks only the symbolic one,
         //     which lines up with `sym.last_exc_box`).
@@ -690,7 +695,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         //     in `opimpl_raise` (line 1694) AND `execute_ll_raised`
         //     (pyjitpl.py with `constant=...` parameter — set
         //     after GUARD_CLASS / GUARD_EXCEPTION). Walker's raise/r
-        //     arm always sets `wc.last_exc_value = Some(exc)` so
+        //     arm always sets `wc.set_last_exc_value(exc, ..)` so
         //     mirroring `Some` → const=true is RPython-orthodox.
         //
         // This adapter does not currently write back `sym.last_exc_value`
@@ -1368,8 +1373,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             trace_ctx: ctx,
             is_top_level: false,
             sub_jitcode_lookup: lookup_ref,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
             // The outer Python frame is the root, paused at `root_pc`.
             entry_py_pc: EntryPyPc::Jit(root_pc),
             outer_resume_marker_jit_pc: root_frame.resume_marker_jit_pc,

@@ -31,7 +31,7 @@
 //! | `int_return/i`      | PARITY        | int-bank counterpart of `ref_return/r` — top-level records `Finish(reg) descr=done_with_this_frame_descr_int` (`pyjitpl.py`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py opimpl_int_return = _opimpl_any_return`. |
 //! | `float_return/f`    | PARITY        | float-bank counterpart — top-level records `Finish(reg) descr=done_with_this_frame_descr_float` (`pyjitpl.py`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py opimpl_float_return = _opimpl_any_return`. |
 //! | `void_return/`      | PARITY        | void return — top-level records `Finish([]) descr=done_with_this_frame_descr_void` (`pyjitpl.py`, `exits = []` branch), sub-walk surfaces `SubReturn{None}`. RPython `pyjitpl.py opimpl_void_return → finishframe(None)`. |
-//! | `inline_call_r_r/dR>r` | PARITY (per-frame catch) | recurses into sub-jitcode via `JitCodeDescr::jitcode_index()`, populates callee `registers_r` (`setup_call_r`, OOR surfaces `InlineCallArityMismatch`), clears the caller's `last_exc_value` before writing `SubReturn{value}` into its Ref dst (`pyjitpl.py finishframe`), and scans caller's `op.next_pc` for `live/` + `catch_exception/L` on `SubRaise` (`pyjitpl.py finishframe_exception`). Sub-walk reaching `Terminate` is unexpected (top-level should never fire from a sub-walk); `SubReturn{None}` clears before surfacing `UnexpectedVoidSubReturn`. |
+//! | `inline_call_r_r/dR>r` | PARITY (per-frame catch) | recurses into sub-jitcode via `JitCodeDescr::jitcode_index()`, populates callee `registers_r` (`setup_call_r`, OOR surfaces `InlineCallArityMismatch`), clears `last_exc_value` before writing `SubReturn{value}` into its Ref dst (`pyjitpl.py finishframe`), and scans caller's `op.next_pc` for `live/` + `catch_exception/L` on `SubRaise` (`pyjitpl.py finishframe_exception`). Sub-walk reaching `Terminate` is unexpected (top-level should never fire from a sub-walk); `SubReturn{None}` clears before surfacing `UnexpectedVoidSubReturn`. |
 //! | `inline_call_r_i/dR>i` | PARITY        | int-result sibling of `inline_call_r_r/dR>r`. Same recursion, arglist, normal-return clear, and raise routing; only the dst bank changes (`registers_i[dst] = subreturn_value`). RPython `pyjitpl.py:1266-1324 _opimpl_inline_call*` is generated through `_opimpl_any_inline_call` decorator that varies on the result type — pyre's walker shares the body via `dispatch_inline_call_dr_kind(dst_bank)`. |
 //! | `inline_call_ir_r/dIR>r`, `inline_call_ir_i/dIR>i` | PARITY | extended-arglist siblings — descr + I-list + R-list + dst. RPython `setup_call(argboxes_i, argboxes_r, argboxes_f)` (pyjitpl.py) populates the callee's int + ref banks from the two lists. Walker uses `dispatch_inline_call_dir_kind(dst_bank)` which reads `read_int_var_list` then `read_ref_var_list`, clears the caller exception slot on normal return, and surfaces per-bank arity overflow as `InlineCallIntArityMismatch` / `InlineCallArityMismatch`. |
 //! | `inline_call_irf_r/dIRF>r`, `inline_call_irf_f/dIRF>f` | PARITY | full-arglist variants — descr + I-list + R-list + F-list + dst. RPython same `setup_call` distribution; walker uses `dispatch_inline_call_dirf_kind(dst_bank)` extending the dIR helper with `read_float_var_list` + float-bank arg setup and the same normal-return clear. Float arity overflow surfaces `InlineCallFloatArityMismatch`. |
@@ -49,9 +49,9 @@
 //! | `residual_call_r_r/iRd>r` | TODO (`direct_assembler_call` + `capture_resumedata` not yet wired) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py + 2109`; (3) vable IR bookkeeping (`pyjitpl.py`) via [`maybe_walker_vable_and_vrefs_before_residual_call`] — emits FORCE_TOKEN + SETFIELD_GC only; the runtime heap halves of the token protocol (`vinfo.tracing_before_residual_call` / `vrefinfo.tracing_before_residual_call` and the after-call `vinfo.tracing_after_residual_call`, `pyjitpl.py`) are bracketed around the concrete callee execution by [`try_execute_residual_call_via_executor`], which arms TOKEN_TRACING_RESCALL before the call and probe-and-clears it after, surfacing [`DispatchError::VableEscapedDuringResidualCall`] on a detected force (`pyjitpl.py` ABORT_ESCAPE parity). The vref halves of the bracket ARE called by the walker, under the same `is_may_force` gate, and their loops are NOT empty: [`walker_ec_enter`] takes a vref of every seeded callee frame through `TraceCtx::opimpl_virtual_ref` (`ExecutionContext.enter`'s vref), so `virtualref_boxes` carries real pairs. Measured over 431 synth + 93 parity fixtures: 5487 bracket entries, of which 686 (12.5%) saw at least one pair and 66 of 316 emitting fixtures reached a nonzero count, up to 7 pairs. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py handle_possible_exception`). `heapcache.invalidate_caches_varargs(call_opcode, ei, allboxes)` (`pyjitpl.py + 2659`) is wired around every recorded call op. `OS_NOT_IN_TRACE` is fail-loud-guarded up front via [`do_not_in_trace_call_result`] — `effect_info_for_call_flavor` stub never sets the index today (pyre-jit's `flatten.rs`), making it dead until producers land. Same fail-loud treatment via [`do_jit_force_virtual_guard`] for `OS_JIT_FORCE_VIRTUAL` (stricter-than-PyPy — needs OpRef→concrete-pointer resolver). Still deferred (each blocked on infrastructure absent from pyre-jit-trace): `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py` — assembler_call paths route through `inline_call_*/dR>X` instead), KEEPALIVE for vablebox (only fires when `direct_assembler_call` returns a vablebox), and `num_live`-aware `capture_resumedata(after_residual_call=True)` on the guards (`pyjitpl.py → 2586`). |
 //! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
 //! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + guard emission as `_r_r` via [`select_residual_call_opcode`]. |
-//! | `raise/r`           | PARITY (`GUARD_CLASS`) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; the retired trait-side path read `concrete_exc.ob_header.ob_type` from the concrete frame snapshot and emitted the orthodox `GuardClass(exc_box, cls_const)` per the heapcache `is_class_known` gate. |
-//! | `reraise/`          | PARITY        | reads `ctx.last_exc_value` (asserts via `ReraiseWithoutLastExcValue` matching `pyjitpl.py assert`); same dual top-level/sub-walk routing as `raise/r` (`pyjitpl.py popframe + finishframe_exception`). |
-//! | `last_exc_value/>r` | PARITY        | reads `ctx.last_exc_value`, writes the OpRef into `registers_r[dst]` — pure SSA rename, no IR op recorded. RPython `pyjitpl.py opimpl_last_exc_value` returns `self.metainterp.last_exc_box` after asserting `last_exc_value` is non-null; missing slot surfaces `LastExcValueWithoutActiveException` (codewriter invariant: only emits inside `catch_exception/L` body). |
+//! | `raise/r`           | PARITY (`GUARD_CLASS`) | sets the session's `last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; the retired trait-side path read `concrete_exc.ob_header.ob_type` from the concrete frame snapshot and emitted the orthodox `GuardClass(exc_box, cls_const)` per the heapcache `is_class_known` gate. |
+//! | `reraise/`          | PARITY        | reads `ctx.last_exc_value()` (asserts via `ReraiseWithoutLastExcValue` matching `pyjitpl.py assert`); same dual top-level/sub-walk routing as `raise/r` (`pyjitpl.py popframe + finishframe_exception`). |
+//! | `last_exc_value/>r` | PARITY        | reads `ctx.last_exc_value()`, writes the OpRef into `registers_r[dst]` — pure SSA rename, no IR op recorded. RPython `pyjitpl.py opimpl_last_exc_value` returns `self.metainterp.last_exc_box` after asserting `last_exc_value` is non-null; missing slot surfaces `LastExcValueWithoutActiveException` (codewriter invariant: only emits inside `catch_exception/L` body). |
 //!
 //! Covers: decode walker, `WalkContext { registers_r, trace_ctx }` +
 //! `ref_return/r` recording, `goto/L`, `catch_exception/L`,
@@ -533,6 +533,36 @@ pub struct WalkSession {
     /// neither abort-point flushing nor a later caller-level blackhole latch
     /// may consume it after the sub-walk unwinds.
     pub abort_in_subwalk: bool,
+    /// `MetaInterp.last_exc_value` (`pyjitpl.py:2417`): the standing
+    /// exception the walk is unwinding, as one slot for the whole walk
+    /// rather than one per frame.
+    ///
+    /// Set by `raise/r` (`pyjitpl.py:1695 opimpl_raise`) and by the
+    /// residual-call arms that observe a raise (`execute_ll_raised`,
+    /// `:2775`); cleared by a normal return before the frame is popped
+    /// (`finishframe`, `:2505`) and by the residual success arm
+    /// (`clear_exception`, `:2782`). `newframe` never touches it, which is
+    /// why it lives here and not on [`WalkContext`]: an inline sub-walk
+    /// pushes a frame, and the handler that finally reads the slot may sit
+    /// any number of levels above the frame that raised.
+    ///
+    /// The readers are the handler-body opcodes — `last_exception`,
+    /// `last_exc_value/>r`, `reraise/` — which `catch_exception/L` is the
+    /// only codewriter route to.
+    pub last_exc_value: Option<OpRef>,
+    /// Concrete shadow companion to [`WalkSession::last_exc_value`].
+    ///
+    /// Holds the live `PyObjectRef` of the standing exception so
+    /// `last_exc_value/>r` can propagate the concrete into the
+    /// destination's `concrete_registers_r` slot, and so a follow-on
+    /// `raise/r` reading that destination finds a non-Null concrete and
+    /// emits the correct GUARD_CLASS.
+    ///
+    /// `ConcreteValue::Null` means "no active exception concrete known" —
+    /// it matches `last_exc_value == None` for the common case, or means
+    /// an adapter caller seeded only the symbolic OpRef without a concrete
+    /// (e.g. a synthetic test fixture).
+    pub last_exc_value_concrete: ConcreteValue,
     /// Blackhole `tmpreg_r`/`tmpreg_i`/`tmpreg_f` (`blackhole.py`):
     /// the single-slot scratch that `insert_renamings` (`flatten.py`)
     /// routes a cyclic parallel move through via `*_push`/`*_pop` pairs.
@@ -570,6 +600,8 @@ impl Default for WalkSession {
             is_being_profiled: false,
             framestack: Vec::new(),
             abort_in_subwalk: false,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
             tmpreg_r: OpRef::NONE,
             tmpreg_r_concrete: ConcreteValue::Null,
             tmpreg_i: OpRef::NONE,
@@ -1722,37 +1754,6 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
     /// `SubJitCodeBody`. Invoked when `inline_call_r_r/dR>r` fires
     /// and needs to recurse into the callee's bytecode body.
     pub sub_jitcode_lookup: &'static_a SubJitCodeLookup,
-    /// Per-frame mirror of RPython `metainterp.last_exc_value`
-    /// (`pyjitpl.py`). Set by `raise/r` (caller-frame side, before
-    /// `SubRaise` propagates) and by the `inline_call` SubRaise arm
-    /// when it catches at a `catch_exception/L` handler (the handler's
-    /// own opcodes — `last_exception`, `last_exc_value`, `reraise/` —
-    /// read this field). RPython keeps this on the metainterp object
-    /// (one shared slot); the walker carries one per WalkContext
-    /// because each recursive frame has its own context. The flow
-    /// (callee raise → caller catch → caller handler reads) only
-    /// touches the caller's slot, so per-frame storage is equivalent
-    /// to RPython's metainterp-level slot for the catch path. The other
-    /// half is normal return: `finishframe` clears before `popframe()`, so
-    /// each caller-side `SubReturn` handler clears this caller slot.
-    pub last_exc_value: Option<OpRef>,
-    /// Concrete shadow companion to [`last_exc_value`].
-    /// Holds the live `PyObjectRef` of the standing
-    /// exception so `last_exc_value/>r` can propagate the concrete
-    /// into the destination's `concrete_registers_r` slot, and so a
-    /// follow-on `raise/r` reading that destination finds a non-Null
-    /// concrete and emits the correct GUARD_CLASS.
-    ///
-    /// Set by `raise/r` (walker side) alongside `last_exc_value`, by
-    /// the `inline_call` SubRaise arm when it catches at
-    /// `catch_exception/L`, and by `dispatch_via_miframe`'s entry
-    /// from `sym.last_exc_value` when an adapter caller seeded the exception.
-    ///
-    /// `ConcreteValue::Null` means "no active exception concrete
-    /// known" — matches `last_exc_value == None` for the common case,
-    /// or means an adapter caller seeded only the symbolic OpRef without
-    /// a concrete (e.g. a synthetic test fixture).
-    pub last_exc_value_concrete: ConcreteValue,
     /// Outer snapshot coordinate. Root entries keep `MIFrame.orgpc`; every
     /// coordinate-native producer stores its raw JitCode offset and resolves
     /// the matching Python PC lazily at the consumer boundary.
@@ -1891,6 +1892,58 @@ pub struct WalkContext<'frame, 'static_a: 'frame, Sym: WalkSym> {
 }
 
 impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
+    /// The standing exception, read from the one session-wide slot
+    /// (`metainterp.last_exc_value`, `pyjitpl.py:1717 opimpl_last_exc_value`).
+    fn last_exc_value(&self) -> Option<OpRef> {
+        self.session.borrow().last_exc_value
+    }
+
+    /// Concrete shadow of [`WalkContext::last_exc_value`].
+    fn last_exc_value_concrete(&self) -> ConcreteValue {
+        self.session.borrow().last_exc_value_concrete
+    }
+
+    /// `metainterp.last_exc_value = exc` with its concrete shadow
+    /// (`pyjitpl.py:1695`, `:2775 execute_ll_raised`).
+    fn set_last_exc_value(&self, exc: OpRef, concrete: ConcreteValue) {
+        let mut sess = self.session.borrow_mut();
+        sess.last_exc_value = Some(exc);
+        sess.last_exc_value_concrete = concrete;
+    }
+
+    /// Rewrite only the symbolic half, for the arm that has already
+    /// established the concrete one — `handle_possible_exception` pins the
+    /// class first and then swaps in the `GUARD_EXCEPTION` result box
+    /// (`pyjitpl.py:1946`).
+    fn set_last_exc_value_op(&self, exc: OpRef) {
+        self.session.borrow_mut().last_exc_value = Some(exc);
+    }
+
+    /// Rewrite only the concrete half, for the arm that already carries the
+    /// symbolic OpRef and is refining the live `PyObjectRef` behind it.
+    fn set_last_exc_value_concrete(&self, concrete: ConcreteValue) {
+        self.session.borrow_mut().last_exc_value_concrete = concrete;
+    }
+
+    /// `metainterp.clear_exception()` (`pyjitpl.py:2782`), which
+    /// `finishframe` also runs before popping the frame (`:2505`).
+    fn clear_last_exc_value(&self) {
+        let mut sess = self.session.borrow_mut();
+        sess.last_exc_value = None;
+        sess.last_exc_value_concrete = ConcreteValue::Null;
+    }
+
+    /// Restore both halves of the slot, including back to "no exception".
+    ///
+    /// The residual-call arms that save the slot across a nested walk need
+    /// the `None` case too, which [`WalkContext::set_last_exc_value`] cannot
+    /// express.
+    fn restore_last_exc_value(&self, exc: Option<OpRef>, concrete: ConcreteValue) {
+        let mut sess = self.session.borrow_mut();
+        sess.last_exc_value = exc;
+        sess.last_exc_value_concrete = concrete;
+    }
+
     /// Resolve the outer snapshot coordinate at the exact consumer boundary.
     fn entry_py_pc(&self) -> u32 {
         match self.entry_py_pc {
@@ -3595,8 +3648,7 @@ pub fn walk<Sym: WalkSym>(
                         true,
                         emit_runtime,
                     );
-                    ctx.last_exc_value = Some(exc);
-                    ctx.last_exc_value_concrete = exc_concrete;
+                    ctx.set_last_exc_value(exc, exc_concrete);
                     // pyjitpl.py `finishframe_exception` only
                     // unwinds frames and selects the handler.  The shared
                     // MetaInterp exception-class state was established by
@@ -7538,7 +7590,7 @@ impl ActiveResumeFrame {
 /// per-call guard-emission still catches exception divergence at
 /// replay, just without the class pin.
 fn walker_record_guard_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, pc: usize) {
-    let exc_obj = match ctx.last_exc_value_concrete {
+    let exc_obj = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(p) if !p.is_null() => p,
         _ => {
             ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
@@ -7569,17 +7621,17 @@ fn walker_record_guard_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         guard_op,
         majit_ir::Value::Ref(majit_ir::GcRef(exc_obj as usize)),
     );
-    ctx.last_exc_value = Some(if class_of_last_exc_is_const {
+    let exc_box = if class_of_last_exc_is_const {
         ctx.trace_ctx.const_ref(exc_obj as usize as i64)
     } else {
         guard_op
-    });
+    };
+    ctx.set_last_exc_value_op(exc_box);
     ctx.fbw_mode.class_of_last_exc_is_const = true;
 }
 
 fn clear_walk_exception<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    ctx.clear_last_exc_value();
 }
 
 fn direct_call_release_gil<Sym: WalkSym>(
@@ -7730,9 +7782,9 @@ fn direct_call_release_gil<Sym: WalkSym>(
         if resid_raised {
             walker_record_guard_exception(ctx, pc);
             let exc = ctx
-                .last_exc_value
+                .last_exc_value()
                 .expect("resid_raised implies last_exc_value seeded by the Err branch");
-            let exc_concrete = ctx.last_exc_value_concrete;
+            let exc_concrete = ctx.last_exc_value_concrete();
             return Ok(Some(DispatchOutcome::SubRaise { exc, exc_concrete }));
         }
         ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
@@ -9650,8 +9702,7 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
     // `exec_result` Ok leg) is what drains it before the handler's trailing
     // `catch_exception/L`.  Without this clear the elided residual leaves
     // `last_exc_value` set and the walk aborts `CatchExceptionWithActiveException`.
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    ctx.clear_last_exc_value();
     Ok(true)
 }
 
@@ -9805,8 +9856,7 @@ fn emit_namespace_cell_store_fold<Sym: WalkSym>(
     // `store_name_fn` is `CallFlavor::Plain` (can-raise); the fold replaces a
     // SUCCESSFUL non-raising store, so mirror the residual success arm's
     // exception clear exactly as [`emit_namespace_cell_fold`] does.
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    ctx.clear_last_exc_value();
     Ok(true)
 }
 
@@ -11064,7 +11114,7 @@ fn handle<Sym: WalkSym>(
             // or (b) a previous catch handler didn't clear
             // last_exc_value after handling the raise. Either is a
             // codewriter-pass invariant violation.
-            if ctx.last_exc_value.is_some() {
+            if ctx.last_exc_value().is_some() {
                 return Err(DispatchError::CatchExceptionWithActiveException { pc: op.pc });
             }
             Ok((DispatchOutcome::Continue, op.next_pc))
@@ -12036,7 +12086,7 @@ fn handle<Sym: WalkSym>(
             // `ob_header.ob_type` resolves to the per-`ExcKind` `PyType`
             // static (`interp_exceptions.rs::exc_kind_to_pytype`), so the
             // emitted `GuardClass` discriminates the actual subclass.
-            // Stashes the concrete into `ctx.last_exc_value_concrete`
+            // Stashes the concrete into `ctx.last_exc_value_concrete()`
             // so a downstream
             // `last_exc_value/>r` can propagate it into its dst slot.
             let exc = read_ref_reg(code, op, 0, ctx)?;
@@ -12077,8 +12127,7 @@ fn handle<Sym: WalkSym>(
                     }
                 }
             }
-            ctx.last_exc_value = Some(exc);
-            ctx.last_exc_value_concrete = concrete_exc;
+            ctx.set_last_exc_value(exc, concrete_exc);
             ctx.fbw_mode.class_of_last_exc_is_const = true;
             let freshly_normalized = fbw_built_exc_take(exc);
             if !recording_raise_keeps_existing_traceback(ctx, op.pc) {
@@ -12142,7 +12191,7 @@ fn handle<Sym: WalkSym>(
             // Reads no operand; the `>r` decorator writes the result into
             // `registers_r[dst]`. No IR op recorded — the standing
             // `metainterp.last_exc_box` (mirrored here as
-            // `ctx.last_exc_value`) is already a recorder OpRef from when
+            // `ctx.last_exc_value()`) is already a recorder OpRef from when
             // `raise/r` set it. This is a pure SSA-rename of the
             // exception slot into a Ref-bank dst, mirroring how
             // `int_copy/i>i` and `_opimpl_any_copy` collapse to a
@@ -12164,7 +12213,7 @@ fn handle<Sym: WalkSym>(
             // (e.g. `BC_LAST_EXC_VALUE` consumer in CPython 3.14
             // `LOAD_SPECIAL`/`CHECK_EXC_MATCH` lowering) lands.
             let exc = ctx
-                .last_exc_value
+                .last_exc_value()
                 .ok_or(DispatchError::LastExcValueWithoutActiveException { pc: op.pc })?;
             let dst = code[op.pc + 1] as usize;
             // Propagate the standing exception's
@@ -12173,7 +12222,7 @@ fn handle<Sym: WalkSym>(
             // adapter caller or an earlier walker `raise/r`). This lets a follow-on `raise/r` reading
             // `registers_r[dst]` find a non-Null concrete and emit the
             // correct GUARD_CLASS.
-            let exc_concrete = ctx.last_exc_value_concrete;
+            let exc_concrete = ctx.last_exc_value_concrete();
             write_ref_reg(ctx, op.pc, dst, exc, exc_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
@@ -12198,12 +12247,12 @@ fn handle<Sym: WalkSym>(
             // Operand layout `>i`: 1B dst register only; the dst byte sits
             // at `op.pc + 1`.
             let exc = ctx
-                .last_exc_value
+                .last_exc_value()
                 .ok_or(DispatchError::LastExceptionWithoutActiveException { pc: op.pc })?;
             let typeptr = if let Some(cls) = ctx.trace_ctx.heap_cache().get_known_class(exc) {
                 cls
             } else {
-                let exc_ptr = match ctx.last_exc_value_concrete {
+                let exc_ptr = match ctx.last_exc_value_concrete() {
                     ConcreteValue::Ref(p) if !p.is_null() => p,
                     _ => {
                         return Err(DispatchError::LastExceptionWithoutActiveException {
@@ -12247,13 +12296,13 @@ fn handle<Sym: WalkSym>(
             // invariant: `reraise` only emits inside a `catch_exception`
             // body or after an explicit `raise`).
             let exc = ctx
-                .last_exc_value
+                .last_exc_value()
                 .ok_or(DispatchError::ReraiseWithoutLastExcValue { pc: op.pc })?;
             // Symmetric with `raise/r`.
             Ok((
                 DispatchOutcome::SubRaise {
                     exc,
-                    exc_concrete: ctx.last_exc_value_concrete,
+                    exc_concrete: ctx.last_exc_value_concrete(),
                 },
                 op.next_pc,
             ))

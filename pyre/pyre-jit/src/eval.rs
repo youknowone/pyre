@@ -8416,24 +8416,41 @@ fn unsupported_jit_shape_uncached(
     // prevents a cold, disjoint loop from blacklisting an earlier hot loop.
 
     // Single-byte register-or-constant index ceiling (`assembler.py:72`
-    // `chr(reg)`; `assembler.py` / `check_result` assert
-    // `count_regs[kind] + len(constants) <= 256`). RPython assembles jitcodes
-    // at translation time from the hand-written interpreter, where the ceiling
-    // is a bounded invariant; pyre assembles a jitcode per *user* Python frame
-    // at runtime, so a data-heavy frame (a module body with thousands of
-    // literal constants — e.g. `html.entities`, whose `<module>` frame carries
-    // ~4000 string constants) genuinely overruns it and the assembler asserts
-    // mid-emission. Decline such a frame to the interpreter before tracing.
+    // `chr(reg)`; `assembler.py:265-269 check_result` asserts
+    // `count_regs[kind] + len(constants) <= 256`, per kind). RPython assembles
+    // jitcodes at translation time from the hand-written interpreter, where the
+    // ceiling is a bounded invariant; pyre assembles a jitcode per *user*
+    // Python frame at runtime, so a data-heavy frame (a module body with
+    // thousands of literal constants — e.g. `html.entities`, whose `<module>`
+    // frame carries ~4000 string constants) genuinely overruns it.
     //
-    // The predicate over-approximates the assembled counts, so it never admits
-    // an unencodable frame: the per-kind constant pool is bounded above by the
+    // This test is an ECONOMIC guard, not the correctness gate. The authority
+    // is `JitCodeBuilder::try_finish`, which applies the per-kind rule exactly
+    // (`total_i`/`total_r`/`total_f > 256`) and returns `None`; every
+    // over-a-byte operand path latches `note_encoding_overflow` on the way
+    // there, so assembly declines rather than asserting. `assemble` propagates
+    // the `None` and `drain_unfinished_graphs` caches
+    // `JIT_SHAPE_CONST_ENCODING_OVERFLOW` for the graph, the same treatment the
+    // label-space and code-length ceilings already get. What this test buys is
+    // skipping a futile flatten + regalloc + assembly for a frame that would be
+    // declined at the end of it — worth having, because such a frame is
+    // typically a module body that runs exactly once.
+    //
+    // It over-approximates the assembled counts, so it never admits an
+    // unencodable frame: the per-kind constant pool is bounded above by the
     // whole constant table (flattened through nestable constants, see
     // `const_pool_slot_upper_bound`) plus the name table, and each kind's
     // register file is bounded above by the frame's live-slot capacity — the
     // operand stack plus every local/cell/free slot, padded for the always-live
     // vable red args and the transient temporaries one opcode lowering keeps
-    // live at once. When even this loose sum cannot fit in a byte, no assembler
-    // kind bank can encode the frame.
+    // live at once.
+    //
+    // Summing the kinds instead of testing each bank separately costs almost
+    // nothing here: a Python frame's registers are the operand stack plus
+    // locals/cells/frees, all `PyObjectRef`, and its constants are `co_consts`
+    // (pooled as `ConstRef` by `Instruction::LoadConst`) plus `co_names`. Both
+    // land in the ref bank, so the sum and the largest bank differ only by the
+    // codewriter's own int scratch slots and the headroom below.
     const SYNTHESIZED_REG_HEADROOM: usize = 16;
     let register_slots_upper_bound = SYNTHESIZED_REG_HEADROOM
         + code.max_stackdepth as usize

@@ -931,8 +931,8 @@ pub fn execute_pure_call(
 /// (`pyre-jit-trace/src/jitcode_dispatch.rs`) for the per-EI-branch
 /// inventory.
 ///
-/// The walker has no `MetaInterp` to thread; instead it owns a
-/// `WalkContext.last_exc_value` shadow.  This function therefore
+/// The walker has no `MetaInterp` to thread; instead its per-walk
+/// `WalkSession.last_exc_value` is that slot.  This function therefore
 /// returns the BH_LAST_EXC_VALUE seam value via `Result::Err` so the
 /// caller can write it into the walker's exc shadow + emit
 /// `GUARD_NO_EXCEPTION`, mirroring upstream's
