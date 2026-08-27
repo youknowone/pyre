@@ -7978,6 +7978,74 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             }
         }
     }
+    // `super(C, self).name` / `super().name`: emit the `Method`
+    // `W_Super.getattribute` builds instead of the opaque residual that
+    // rebuilds the proxy, re-walks the MRO suffix and re-binds the descriptor
+    // every iteration.  Any non-matching shape falls through to the generic
+    // residual (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadSuperAttr
+    {
+        if let (
+            Some(&global_super_opref),
+            Some(&self_opref),
+            Some(&cls_opref),
+            Some(&code_opref),
+            Some(&namei_opref),
+        ) = (
+            r_args.first(),
+            r_args.get(1),
+            r_args.get(2),
+            r_args.get(4),
+            i_args.first(),
+        ) {
+            if let (
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(w_code_ptr))),
+                Some(majit_ir::Value::Int(namei)),
+            ) = (
+                ctx.trace_ctx.box_value(code_opref),
+                ctx.trace_ctx.box_value(namei_opref),
+            ) {
+                if spec_gate(SpecFold::LoadSuperAttr, || {
+                    try_walker_specialize_load_super_attr(
+                        ctx,
+                        op.pc,
+                        global_super_opref,
+                        self_opref,
+                        cls_opref,
+                        w_code_ptr,
+                        namei as usize,
+                        dst,
+                        dst_bank,
+                    )
+                })?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
+    // The method form's `[func, self_or_null]` split.  Paired with the fold
+    // above: without it the two residuals FORCE the still-virtual `Method`,
+    // which costs a real allocation the fold alone would not pay.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::SuperAttrUnwrap
+    {
+        if let (Some(&raw_opref), Some(&which_opref)) = (r_args.first(), i_args.first()) {
+            if let Some(majit_ir::Value::Int(which)) = ctx.trace_ctx.box_value(which_opref) {
+                if spec_gate(SpecFold::SuperAttrUnwrap, || {
+                    try_walker_fold_super_attr_unwrap(ctx, op.pc, raw_opref, which, dst, dst_bank)
+                })?
+                .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            }
+        }
+    }
     if ctx.is_authoritative_executor
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadMethodSelf
     {

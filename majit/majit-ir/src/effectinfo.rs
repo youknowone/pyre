@@ -1115,6 +1115,22 @@ pub enum RuntimeHelperKind {
     /// this tag to fold the pure `compute_load_method_bound` decision once the
     /// paired [`LoadAttr`] method-cache fold has made `attr` concrete.
     LoadMethodSelf,
+    /// `load_super_attr(global_super, self, cls, frame, code, name_idx,
+    /// is_two_arg)` — the LOAD_SUPER_ATTR residual (`bh_load_super_attr_fn`).
+    /// It builds the super proxy and resolves the attribute through the proxy's
+    /// `__getattribute__`, whose descriptor `__get__` may run Python, so it has
+    /// the same standing as [`RuntimeHelperKind::LoadAttr`]: a body carrying one
+    /// is DEFERRED rather than proven clean, and an unfolded residual still
+    /// reaches the nested-residual backstop.
+    LoadSuperAttr,
+    /// `super_attr_unwrap(raw, which)` — the LOAD_SUPER_ATTR method-form split
+    /// (`bh_super_attr_unwrap_fn`).  A total function of its argument: an
+    /// `is_method` class test plus one of two field reads, no allocation, no
+    /// raise, no Python.  Reading a field twice commits nothing, so unlike its
+    /// producer this one is replay-SAFE, the standing
+    /// [`RuntimeHelperKind::LoadConst`] and [`RuntimeHelperKind::LoadGlobal`]
+    /// carry.
+    SuperAttrUnwrap,
     /// `bh_delete_attr_fn(obj, code, name_idx)` — the plain DELETE_ATTR
     /// residual (`lower_delete_attr_hlop_to_insn` → `space.delattr`), the
     /// deletion counterpart of [`StoreAttr`](RuntimeHelperKind::StoreAttr).

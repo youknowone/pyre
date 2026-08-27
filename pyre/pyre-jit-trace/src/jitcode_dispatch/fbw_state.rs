@@ -3188,6 +3188,14 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     | majit_ir::RuntimeHelperKind::NewtupleFromArray
                     | majit_ir::RuntimeHelperKind::NewlistFromArray
                     | majit_ir::RuntimeHelperKind::GetCurrentException
+                    // `super_attr_unwrap` is a total function of its argument —
+                    // an `is_method` class test and one of two field reads — so
+                    // re-running one reads the same two words again and commits
+                    // nothing.  It is the method-form half of LOAD_SUPER_ATTR,
+                    // emitted twice per site, and without this standing both
+                    // copies poison every `super()`-bearing body out of its
+                    // inline.
+                    | majit_ir::RuntimeHelperKind::SuperAttrUnwrap
             );
             // `box_int` is the only generic replay-safe helper here whose
             // result is necessarily numeric.  `load_const` may return a str,
@@ -3329,7 +3337,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                 // resumes a frame whose callable slot was never written, so
                 // widening it past a method-form body needs
                 // `foriter_deferred_admit`'s loop-header check to account for
-                // it (`fbw_callee_body_has_load_method_self_residual`).  Keep
+                // it (`fbw_callee_body_has_two_entry_method_push`).  Keep
                 // the surface where it was.
                 let defer_truth_or_method_self = match ei.runtime_helper {
                     majit_ir::RuntimeHelperKind::LoadMethodSelf => method_form_deferred_helpers,
@@ -3347,6 +3355,15 @@ pub(crate) fn fbw_callee_body_replay_scan(
                             | majit_ir::RuntimeHelperKind::LoadAttr
                             | majit_ir::RuntimeHelperKind::BinaryOp
                             | majit_ir::RuntimeHelperKind::CompareOp
+                            // `load_super_attr` is `load_attr` with the MRO
+                            // walk started after an explicit class: same
+                            // question (which descriptor does this name
+                            // resolve to, and does binding it run Python),
+                            // same answer.  Deferring it is what lets a
+                            // `super().m(x)` body inline at all; an unfolded
+                            // residual still reaches
+                            // `fbw_abort_nested_unjournaled_residual`.
+                            | majit_ir::RuntimeHelperKind::LoadSuperAttr
                     );
                 if defer_helper {
                     deferred_call = true;
@@ -3494,7 +3511,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
     }
 }
 
-/// True iff the body carries a `load_method_self` residual.
+/// True iff the body carries a residual that pushes a two-entry method form.
 ///
 /// `LOAD_ATTR name + NULL|self` pushes TWO operand-stack entries that stay live
 /// from that opcode until the matching `CALL` consumes them, which is as far
@@ -3502,7 +3519,12 @@ pub(crate) fn fbw_callee_body_replay_scan(
 /// result is consumed by the very next op.  A body that owns a loop header puts
 /// guards inside that window, so it is the one shape where a deopt can land
 /// between the push and the call.
-pub(crate) fn fbw_callee_body_has_load_method_self_residual(
+///
+/// `LOAD_SUPER_ATTR`'s method form pushes the same two entries through its own
+/// pair of `super_attr_unwrap` residuals, so it belongs to the same shape.  It
+/// could not reach this window while those residuals poisoned the body out of
+/// its inline; once they carry replay-safe standing it can.
+pub(crate) fn fbw_callee_body_has_two_entry_method_push(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
 ) -> bool {
@@ -3516,8 +3538,11 @@ pub(crate) fn fbw_callee_body_has_load_method_self_residual(
                 .and_then(|index| callee_descr_refs.get(index))
                 .and_then(|descr| descr.as_call_descr())
                 .is_some_and(|descr| {
-                    descr.get_extra_info().runtime_helper
-                        == majit_ir::RuntimeHelperKind::LoadMethodSelf
+                    matches!(
+                        descr.get_extra_info().runtime_helper,
+                        majit_ir::RuntimeHelperKind::LoadMethodSelf
+                            | majit_ir::RuntimeHelperKind::SuperAttrUnwrap
+                    )
                 })
         {
             return true;

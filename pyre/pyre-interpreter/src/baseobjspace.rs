@@ -10513,6 +10513,115 @@ pub unsafe fn bound_method_attr_fast_path(
     Some((w_type, version_tag, w_descr))
 }
 
+/// The `super(C, self).name` shape that reduces, purely, to
+/// `w_method_new(w_descr, self_obj, objtype)` — the bound method
+/// `W_Super.getattribute` builds when the MRO walk that starts after `C`
+/// lands on a plain function and binding it runs no Python.
+///
+/// Shared by the interpreter's LOAD_SUPER_ATTR and the tracer's
+/// `try_walker_specialize_load_super_attr`, for the reason
+/// [`load_method_fast_path`] states: the two must agree on which receivers
+/// take the reduced shape or the recorded and the concrete stacks desync.
+///
+/// Unlike [`bound_method_attr_fast_path`] this needs no instance-dict
+/// shadowing check and no `has_object_getattribute`: `W_Super.getattribute`
+/// (descriptor.py) never consults the receiver's dict and never routes
+/// through the receiver type's `__getattribute__`, it walks the stored
+/// `su_objtype`'s MRO directly.  What it does need is the half of
+/// `_super_check` that settles without Python
+/// ([`crate::builtins::super_check_python_free`]): the remaining arm is a
+/// `__class__` getattr, which a property answers with arbitrary code.
+///
+/// Returns `(objtype, version_tag, w_descr)`.  The caller pins `objtype` on
+/// the receiver's `w_class` slot and `version_tag` on `objtype`, which
+/// together make the walk's answer a constant: the classes it reads are all
+/// ancestors of `objtype`, and `mutated()` recurses into subclasses, so a
+/// dict store or a `__bases__` reassignment on any of them bumps `objtype`'s
+/// own tag.
+///
+/// # Safety
+/// `start_type` and `self_obj` must be valid object pointers (null tolerated).
+pub unsafe fn super_attr_fast_path(
+    start_type: PyObjectRef,
+    self_obj: PyObjectRef,
+    name: &str,
+) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+    // `getattr_str_impl` reaches its super branch only for a name it has not
+    // already answered itself: that branch is guarded `name != "__class__"`,
+    // and the terminal `__dict__` read sits above it.
+    if name == "__class__" || name == "__dict__" {
+        return None;
+    }
+    if start_type.is_null() || self_obj.is_null() || !is_type(start_type) {
+        return None;
+    }
+    // descriptor.py `_super_check` first arm: a class receiver makes
+    // `getattribute` bind with `descr_obj = PY_NULL`, so there is no `Method`
+    // to emit, and the `w_class` read below would answer the metaclass rather
+    // than the walked type.
+    if is_type(self_obj) {
+        return None;
+    }
+    // `super_check_python_free`'s second arm — its answer is the type whose
+    // MRO `getattribute` walks.
+    let objtype = crate::typedef::r#type(self_obj)?.as_ptr();
+    if !issubtype_w(objtype, start_type) {
+        return None;
+    }
+    // The tracer pins the class by guarding the receiver's `w_class` slot, so
+    // only a receiver whose class IS that slot can be reproduced.  An
+    // exception instance carrying the generic stub resolves its class through
+    // the kind registry instead.
+    if !std::ptr::eq(objtype, (*self_obj).w_class) {
+        return None;
+    }
+    // typeobject.py: an uncacheable type cannot pin the lookup.
+    let version_tag = pyre_object::typeobject::w_type_get_version_tag(objtype);
+    if version_tag == 0 {
+        return None;
+    }
+    // descriptor.py `W_Super.getattribute`: `su_objtype`'s MRO, skipping
+    // everything up to and including `su_type`.  A null mro answers `None`
+    // there rather than falling back to `compute_mro`.
+    let mro_ptr = w_type_get_mro(objtype);
+    if mro_ptr.is_null() {
+        return None;
+    }
+    let mut past_super = false;
+    let mut w_descr = PY_NULL;
+    for &t in (*mro_ptr).as_slice() {
+        if std::ptr::eq(t, start_type) {
+            past_super = true;
+            continue;
+        }
+        if !past_super || !is_type(t) {
+            continue;
+        }
+        if let Some(attr) = crate::type_dict_lookup(t, name) {
+            w_descr = attr;
+            break;
+        }
+    }
+    if w_descr.is_null() {
+        return None;
+    }
+    // `get(w_descr, self_obj, objtype)` must reduce to `w_method_new`, which
+    // is the EXACT `function` typedef and nothing else.  `get` dispatches
+    // `is_method_descriptor` FIRST and answers a `method_descriptor` with
+    // `builtin_bound_method_new`, whose result has a different `type()` and a
+    // `module` field the caller's `Method` template does not write.  Every
+    // other descriptor shape — property, classmethod, staticmethod, getset,
+    // member, slot wrapper, builtin function, or a user `__get__` — either
+    // runs Python or returns something that is not a `Method`.
+    //
+    // `function` is a static typedef, so its `__get__` cannot be reassigned
+    // and needs no version pin of its own.
+    if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
+        return None;
+    }
+    Some((objtype, version_tag, w_descr))
+}
+
 /// descroperation.py `object_getattribute(space)` — the canonical
 /// `object.__getattribute__` descriptor used as the identity anchor for
 /// the `uses_object_getattribute` fast path.  Returns true iff `w_descr`
