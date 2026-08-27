@@ -285,6 +285,21 @@ pub enum CallTarget {
         name: String,
         #[serde(default)]
         owner_path: Vec<String>,
+        /// `true` when the constructed ADT is a `struct`, whose value is
+        /// described entirely by the field writes that follow it.
+        ///
+        /// A sum-type variant constructor sets `false`.  Charon does not spell
+        /// the enum tag as a MIR operand, so a rewrite that turns the
+        /// constructor into a bare allocation would drop it, and only `Result`
+        /// and `Option` — whose variant order the language fixes — can have
+        /// one stamped back on ([`sum_variant_ctor`]).  `false` is therefore
+        /// the safe answer and the one every constructor that cannot prove
+        /// otherwise records: a consumer that reads this decides whether to
+        /// allocate, and dropping a tag is silent.
+        ///
+        /// [`sum_variant_ctor`]: crate::codewriter::jtransform
+        #[serde(default)]
+        is_struct: bool,
     },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
@@ -348,6 +363,7 @@ impl CallTarget {
         Self::SyntheticTransparentCtor {
             name: name.into(),
             owner_path: Vec::new(),
+            is_struct: false,
         }
     }
 
@@ -362,6 +378,26 @@ impl CallTarget {
         Self::SyntheticTransparentCtor {
             name: name.into(),
             owner_path,
+            is_struct: false,
+        }
+    }
+
+    /// [`synthetic_transparent_ctor_with_owner`] for a constructor the caller
+    /// has resolved to a `struct` declaration rather than an enum variant.
+    ///
+    /// Separate from the general constructor so that "this is a struct" is
+    /// something a caller states from a resolved `TypeDeclKind`, never a
+    /// default a new call site inherits by omission.
+    ///
+    /// [`synthetic_transparent_ctor_with_owner`]: Self::synthetic_transparent_ctor_with_owner
+    pub fn synthetic_transparent_struct_ctor(
+        owner_path: Vec<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self::SyntheticTransparentCtor {
+            name: name.into(),
+            owner_path,
+            is_struct: true,
         }
     }
 
@@ -383,7 +419,9 @@ impl CallTarget {
             // make `Instruction::LoadFast` and `OtherEnum::LoadFast`
             // share segments and break any downstream caller that
             // uses `path_segments()` for qualified identity.
-            CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+            CallTarget::SyntheticTransparentCtor {
+                name, owner_path, ..
+            } => {
                 let mut segs: Vec<&str> = owner_path.iter().map(String::as_str).collect();
                 segs.push(name.as_str());
                 Some(segs)
@@ -408,7 +446,9 @@ impl fmt::Display for CallTarget {
                 ..
             } => f.write_str(name),
             CallTarget::FunctionPath { segments } => f.write_str(&segments.join("::")),
-            CallTarget::SyntheticTransparentCtor { name, owner_path } => {
+            CallTarget::SyntheticTransparentCtor {
+                name, owner_path, ..
+            } => {
                 if owner_path.is_empty() {
                     write!(f, "<synthetic-transparent-ctor {name}>")
                 } else {

@@ -330,7 +330,10 @@ pub(crate) fn widen_unit_return_to_void(graph: &mut FunctionGraph) {
 /// it before the bare-path compare so suffixed and bare Result ctors are
 /// recognised alike.
 pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
-    let CallTarget::SyntheticTransparentCtor { name, owner_path } = target else {
+    let CallTarget::SyntheticTransparentCtor {
+        name, owner_path, ..
+    } = target
+    else {
         return None;
     };
     let [head @ .., tail] = owner_path.as_slice() else {

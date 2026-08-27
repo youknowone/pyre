@@ -222,10 +222,12 @@ build.
 
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn
-off that many of the 74 hand-written trace-time specialization rows (the
-`spec_folds!` invocation at `jitcode_dispatch/diag.rs:342-417`; count them
-there rather than trusting this sentence), and an unset variable suppresses
-none. It is a measurement instrument — suppressing a fold is how the descent
+off that many of the 77 trace-time specialization rows (the `spec_folds!`
+invocation at `jitcode_dispatch/diag.rs:342-421`; count them there rather
+than trusting this sentence), and an unset variable suppresses none.  Not all
+75 are hand-written: `subscr_tuple_descent`, `unary_invert_descent` and
+`unary_negative_descent` name orthodox sub-walks of the interpreter's own
+body, and a row is what lets one be suppressed and A/B'd like any other. It is a measurement instrument — suppressing a fold is how the descent
 wall behind it is made to print — so it retires with the folds it selects,
 not before them.
 `PYRE_FBW_SPEC_CENSUS` in §6c is its read-only half: the per-fold
@@ -348,6 +350,7 @@ under measurement.
 | gate | default polarity | what it gates / retirement condition |
 |---|---|---|
 | `PYRE_PROBE14` | OFF | reports discarded reference-constant relocations; retire when relocation preservation is covered by ordinary tests |
+| `PYRE_GC_TYPE_COUNT` | OFF | prints `[gc-type-count] frozen=N max=M` when `freeze_types` runs, so the number to size `TypeRegistry::MAX_TYPES` against can be read instead of guessed -- the `register` assert names the cap it blew but not the total it needed; retire when the registry grows on demand rather than pre-allocating a fixed capacity for a stable base address |
 | `PYRE_GC_SIZE_AUDIT` | OFF | panics when a block is stamped with a type id whose declared payload is larger than the block's own extent, at the allocation that stamps it rather than in whichever later collection reads the neighbouring block as a field (varsize types are exempt); retire when every allocator derives the size from the type id it stamps, so the two cannot disagree |
 
 ## Summary

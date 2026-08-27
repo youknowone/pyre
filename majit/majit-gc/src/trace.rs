@@ -307,16 +307,24 @@ pub struct TypeRegistry {
 
 impl TypeRegistry {
     /// Maximum number of types the backing `layout_table` can hold
-    /// without reallocating. Sized generously above the dozen-or-so
-    /// types pyre currently registers; bumps require recompiling
-    /// majit-gc.
+    /// without reallocating; bumps require recompiling majit-gc.
     ///
     /// RPython's `type_info_group` is bounded by the half-word width
     /// of the inline `GROUP_MEMBER_OFFSET` (translator/c/src/llgroup.h)
     /// — 64KB on 32-bit and 4GB on 64-bit. majit's bound is set by
     /// the maximum number of distinct GC types we expect to register,
-    /// not by an addressing limit.
-    pub const MAX_TYPES: usize = 1024;
+    /// not by an addressing limit: `Header` gives the type id the whole
+    /// low 32 bits (`header::TYPE_ID_BITS`), so this constant costs
+    /// pre-allocated capacity and nothing else.
+    ///
+    /// It was 1024, sized for "the dozen-or-so types pyre registers".
+    /// Lowering the named-struct transparent constructors to `New`
+    /// (`jtransform`) turns each one into a registered GC type and put
+    /// the count past that: `PYRE_GC_TYPE_COUNT=1` reports 1046 frozen.
+    /// Read that number before choosing the next value rather than
+    /// inferring one from the `register` assert, which names the cap it
+    /// blew and not the total it needed.
+    pub const MAX_TYPES: usize = 4096;
 }
 
 /// Custom trace function type.
@@ -975,6 +983,15 @@ impl TypeRegistry {
             return;
         }
         self.can_add_new_types = false;
+        // The `register` assert says to bump `MAX_TYPES` but not to what;
+        // this is the number to size it against.
+        if std::env::var_os("PYRE_GC_TYPE_COUNT").is_some() {
+            eprintln!(
+                "[gc-type-count] frozen={} max={}",
+                self.entries.len(),
+                Self::MAX_TYPES
+            );
+        }
         self.assign_inheritance_ids();
         // Refresh layout_table rows for object types whose
         // subclassrange_{min,max} just changed.

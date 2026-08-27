@@ -5525,6 +5525,25 @@ pub fn neg(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_numeric_unaryop_override(a, "__neg__")? {
             return Ok(result);
         }
+        neg_inner(a)
+    }
+}
+
+/// [`neg`] past its `__neg__` override probe.
+///
+/// Split out so that a trace can descend this body rather than re-emit it by
+/// hand.  The probe is what stops such a descent: its
+/// `needs_numeric_unaryop_dispatch` is `dont_look_inside` and is the second
+/// operation the body executes.  A caller that has already proven an exact
+/// builtin receiver cannot take it, so entering here records the arm that
+/// receiver selects and nothing else.  Every other caller reaches this through
+/// [`neg`] and is unaffected.
+///
+/// Unlike [`invert_inner`] this keeps the `bool` operand: `neg` has no separate
+/// bool slot to leave behind, and the integer arm below already answers `True`
+/// and `False` through [`int_value`].
+pub fn neg_inner(a: PyObjectRef) -> PyResult {
+    unsafe {
         if is_int(a) || is_bool(a) {
             let v = int_value(a);
             return match v.checked_neg() {
