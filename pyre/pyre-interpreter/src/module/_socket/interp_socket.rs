@@ -2214,8 +2214,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 unsafe { rffi::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) }
             };
             if rc != 0 {
-                let msg = rffi::gai_strerror(rc);
-                return Err(socket_converted_error("gaierror", Some(rc), &msg));
+                return Err(set_gaierror(rc));
             }
 
             // Every field and entry is freshly allocated and the next lap
@@ -2337,8 +2336,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     unsafe { rffi::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res) }
                 };
                 if rc != 0 {
-                    let msg = rffi::gai_strerror(rc);
-                    return Err(socket_converted_error("gaierror", Some(rc), &msg));
+                    return Err(set_gaierror(rc));
                 }
                 let head = res;
                 let ai = unsafe { &*head };
@@ -2380,8 +2378,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 };
                 unsafe { rffi::freeaddrinfo(head) };
                 if nrc != 0 {
-                    let msg = rffi::gai_strerror(nrc);
-                    return Err(socket_converted_error("gaierror", Some(nrc), &msg));
+                    return Err(set_gaierror(nrc));
                 }
                 let host_s = unsafe {
                     std::ffi::CStr::from_ptr(host_buf.as_ptr())
@@ -3191,6 +3188,28 @@ fn c_uint_converter(
     }
 }
 
+/// The failure `getaddrinfo` / `getnameinfo` report through their return code
+/// rather than through `errno`.
+///
+/// `set_gaierror` spells the message `gai_strerror(error)` only where
+/// `HAVE_GAI_STRERROR` is defined, and the Windows build does not define it —
+/// `socket` publishes no `gai_strerror` there either — so the message is the
+/// fixed `"getaddrinfo failed"`.  `rsocket.GAIError.get_msg` answers
+/// `_rsocket_rffi.gai_strerror_str`, which on Windows is
+/// `rwin32.FormatError(errno)`; that spelling is the system message table's,
+/// so it comes back in the host's UI language.  MEASURED 2026-08-27 against
+/// CPython 3.14.2 on a ko-KR host: `socket.getaddrinfo` on an unresolvable
+/// name answers `gaierror(11001, 'getaddrinfo failed')` there and
+/// `gaierror(11001, '<localized>')` under PyPy 7.3.22.
+#[cfg(any(unix, windows))]
+fn set_gaierror(error: libc::c_int) -> crate::PyError {
+    #[cfg(unix)]
+    let message = rffi::gai_strerror(error);
+    #[cfg(windows)]
+    let message = "getaddrinfo failed".to_string();
+    socket_converted_error("gaierror", Some(error), &message)
+}
+
 /// The failure `gethostbyname` / `gethostbyaddr` report, which they leave in
 /// `h_errno` rather than `errno`.
 ///
@@ -3228,8 +3247,8 @@ fn sockaddr_len_of(family: libc::c_int) -> Option<usize> {
 /// bit pattern.  Everything else ends in
 /// `getaddrinfo(name, None, family=family, address_to_fill=result)`, and
 /// `rsocket.py getaddrinfo` answers a non-zero return with
-/// `raise GAIError(error)` — so a name that does not resolve reports
-/// `gaierror(rc, gai_strerror(rc))`, which is what callers classify on.
+/// `raise GAIError(error)` — so a name that does not resolve reports the
+/// `gaierror` `set_gaierror` builds, which is what callers classify on.
 /// gethostbyname is not used here: its process-global result buffer is not
 /// re-entrant and was corrupted by socketserver worker threads.
 #[cfg(any(unix, windows))]
@@ -3272,11 +3291,7 @@ fn resolve_ip_host(
         unsafe { rffi::getaddrinfo(name_ptr, service_ptr, &hints, &mut result) }
     };
     if rc != 0 {
-        return Err(socket_converted_error(
-            "gaierror",
-            Some(rc),
-            &rffi::gai_strerror(rc),
-        ));
+        return Err(set_gaierror(rc));
     }
     let ambiguous_wildcard =
         wildcard && !result.is_null() && !unsafe { &*result }.ai_next.is_null();

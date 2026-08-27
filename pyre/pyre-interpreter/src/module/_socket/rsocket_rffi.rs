@@ -189,28 +189,15 @@ pub fn error_is_would_block(code: i32) -> bool {
     code == ws::WSAEWOULDBLOCK || code == ws::WSAETIMEDOUT
 }
 
-/// `gai_strerror`.  The symbol is a header-level inline on Windows, where the
-/// `EAI_*` codes are WSA error codes and the system message table describes
-/// them.
+/// `gai_strerror`.  Unix only: the symbol is a header-level inline over the
+/// system message table on Windows, `HAVE_GAI_STRERROR` is not defined for
+/// that build, and `set_gaierror` spells the message itself there, so nothing
+/// asks for it.
 #[cfg(unix)]
 pub fn gai_strerror(code: libc::c_int) -> String {
     unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(code)) }
         .to_string_lossy()
         .into_owned()
-}
-#[cfg(all(windows, feature = "host_env"))]
-pub fn gai_strerror(code: libc::c_int) -> String {
-    rustpython_host_env::windows::format_error_message(Some(code as u32))
-        .map(|message| {
-            message
-                .trim_end_matches(|c: char| c <= ' ' || c == '.')
-                .to_string()
-        })
-        .unwrap_or_else(|| format!("Unknown error {code}"))
-}
-#[cfg(all(windows, not(feature = "host_env")))]
-pub fn gai_strerror(code: libc::c_int) -> String {
-    format!("Unknown error {code}")
 }
 
 // ── name lookups ──
