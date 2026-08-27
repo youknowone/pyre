@@ -362,6 +362,185 @@ pub struct RegAllocator {
     pub num_regs: usize,
 }
 
+/// Register allocation result for the original flowspace graph.
+///
+/// RPython: `rpython.tool.algo.regalloc.RegAllocator`.  The existing
+/// [`RegAllocator`] is the codewriter graph adapter; `shadowcolor.py` runs one
+/// phase earlier and therefore keeps the flowspace graph's variable identities
+/// directly, exactly as upstream's `perform_register_allocation(graph,
+/// consider_var)` does.
+#[derive(Debug, Clone)]
+pub struct FlowRegAllocator {
+    coloring: VarMap<usize>,
+    /// RPython `RegAllocator.numcolors`, populated by `find_num_colors()`.
+    pub numcolors: usize,
+}
+
+impl FlowRegAllocator {
+    /// RPython `RegAllocator.getcolor`.
+    pub fn getcolor(&self, var: &crate::flowspace::model::Variable) -> usize {
+        self.coloring[var]
+    }
+
+    /// RPython `RegAllocator.checkcolor`.
+    pub fn checkcolor(&self, var: &crate::flowspace::model::Variable, color: usize) -> bool {
+        self.coloring.get(var).copied() == Some(color)
+    }
+}
+
+/// `regalloc.py::perform_register_allocation(graph, consider_var)` for an
+/// RPython flowspace graph.
+///
+/// Rust cannot overload the codewriter adapter's identically named function,
+/// so the owner-qualified name records the only API-shape adaptation.  The
+/// dependency, reverse coalescing, and coloring passes below follow
+/// `RegAllocator.make_dependencies`, `coalesce_variables`, and
+/// `find_node_coloring` in their upstream order.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Variable hashes by immutable identity, matching RPython identity-keyed dicts"
+)]
+pub fn perform_flowspace_register_allocation(
+    graph: &crate::flowspace::model::FunctionGraph,
+    consider: &dyn Fn(&crate::flowspace::model::Variable) -> bool,
+) -> FlowRegAllocator {
+    use crate::flowspace::model::Hlvalue;
+
+    let mut depgraph = DependencyGraph::new();
+
+    for block_ref in graph.iterblocks() {
+        let block = block_ref.borrow();
+        let mut die_at: VarMap<usize> = VarMap::default();
+        for value in &block.inputargs {
+            if let Hlvalue::Variable(var) = value {
+                die_at.insert(var.clone(), 0);
+            }
+        }
+        for (index, op) in block.operations.iter().enumerate() {
+            for value in &op.args {
+                if let Hlvalue::Variable(var) = value {
+                    die_at.insert(var.clone(), index);
+                }
+            }
+            if let Hlvalue::Variable(result) = &op.result {
+                die_at.insert(result.clone(), index + 1);
+            }
+        }
+        if let Some(Hlvalue::Variable(var)) = &block.exitswitch {
+            die_at.remove(var);
+        }
+        for link_ref in &block.exits {
+            for value in link_ref.borrow().args.iter().flatten() {
+                if let Hlvalue::Variable(var) = value {
+                    die_at.remove(var);
+                }
+            }
+        }
+        let mut die_at: Vec<(usize, crate::flowspace::model::Variable)> = die_at
+            .into_iter()
+            .map(|(var, index)| (index, var))
+            .collect();
+        die_at.sort_by_key(|(index, _)| *index);
+
+        let inputvars: Vec<_> = block
+            .inputargs
+            .iter()
+            .filter_map(|value| match value {
+                Hlvalue::Variable(var) if consider(var) => Some(var.clone()),
+                _ => None,
+            })
+            .collect();
+        for (index, var) in inputvars.iter().enumerate() {
+            depgraph.add_node(var.clone());
+            for other in &inputvars[..index] {
+                depgraph.add_edge(other.clone(), var.clone());
+            }
+        }
+        let mut livevars: VarSet = inputvars.into_iter().collect();
+        let mut die_index = 0;
+        for (index, op) in block.operations.iter().enumerate() {
+            while die_at
+                .get(die_index)
+                .is_some_and(|(last_use, _)| *last_use == index)
+            {
+                livevars.remove(&die_at[die_index].1);
+                die_index += 1;
+            }
+            if let Hlvalue::Variable(result) = &op.result
+                && consider(result)
+            {
+                depgraph.add_node(result.clone());
+                for var in &livevars {
+                    if var != result && consider(var) {
+                        depgraph.add_edge(var.clone(), result.clone());
+                    }
+                }
+                livevars.insert(result.clone());
+            }
+        }
+    }
+
+    let mut unionfind = UnionFind::new();
+    let mut blocks = graph.iterblocks();
+    while let Some(block_ref) = blocks.pop() {
+        for link_ref in &block_ref.borrow().exits {
+            let link = link_ref.borrow();
+            if let Some(Hlvalue::Variable(var)) = &link.last_exception {
+                depgraph.add_node(var.clone());
+            }
+            if let Some(Hlvalue::Variable(var)) = &link.last_exc_value {
+                depgraph.add_node(var.clone());
+            }
+            let Some(target) = &link.target else {
+                continue;
+            };
+            for (source, target) in link.args.iter().zip(&target.borrow().inputargs) {
+                let (Some(Hlvalue::Variable(source)), Hlvalue::Variable(target)) =
+                    (source.as_ref(), target)
+                else {
+                    continue;
+                };
+                if !consider(source) || !consider(target) {
+                    continue;
+                }
+                let source_rep = unionfind.find_rep(source.clone());
+                let target_rep = unionfind.find_rep(target.clone());
+                if source_rep == target_rep || depgraph.has_edge(&target_rep, &source_rep) {
+                    continue;
+                }
+                let representative = unionfind.union(source_rep.clone(), target_rep.clone());
+                if representative == source_rep {
+                    depgraph.coalesce(target_rep, source_rep);
+                } else {
+                    depgraph.coalesce(source_rep, target_rep);
+                }
+            }
+        }
+    }
+
+    let representative_coloring = depgraph.find_node_coloring();
+    let mut coloring = VarMap::default();
+    for block_ref in graph.iterblocks() {
+        for var in block_ref.borrow().getvariables() {
+            if consider(&var) {
+                let representative = unionfind.find_rep(var.clone());
+                if let Some(color) = representative_coloring.get(&representative) {
+                    coloring.insert(var, *color);
+                }
+            }
+        }
+    }
+    let numcolors = coloring
+        .values()
+        .copied()
+        .max()
+        .map_or(0, |color| color + 1);
+    FlowRegAllocator {
+        coloring,
+        numcolors,
+    }
+}
+
 impl RegAllocator {
     /// Look up the register color assigned to `var` — matches upstream
     /// `coloring: dict[Variable, int]` (`tool/algo/regalloc.py:31`).
