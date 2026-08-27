@@ -2939,6 +2939,12 @@ pub struct TlsConnection {
     context_identity: usize,
     server_context: *const Context,
     server_hit_counted: bool,
+    /// `SSL_RECEIVED_SHUTDOWN`: a fatal alert from the peer ends the
+    /// session, and every later operation answers from that state rather
+    /// than from the wire.  rustls latches the same fact inside
+    /// `process_new_packets`, but only a call that consumed fresh
+    /// ciphertext reaches it, so the latch is kept here too.
+    peer_sent_fatal_alert: bool,
 }
 
 impl TlsConnection {
@@ -3046,7 +3052,10 @@ impl TlsConnection {
                 Err(error) => return Err(rustls_error(error)),
             };
             self.pending_received_tls_start += read;
-            inner.process_new_packets().map_err(rustls_protocol_error)?;
+            if let Err(error) = inner.process_new_packets() {
+                self.peer_sent_fatal_alert |= matches!(error, rustls::Error::AlertReceived(_));
+                return Err(rustls_protocol_error(error));
+            }
             self.note_server_resumption();
             self.compact_received_tls();
         }
@@ -3283,6 +3292,7 @@ pub unsafe fn connection_new(
         context_identity: context.identity,
         server_context: std::ptr::null(),
         server_hit_counted: false,
+        peer_sent_fatal_alert: false,
     })))
 }
 
@@ -3533,7 +3543,15 @@ pub unsafe fn connection_write_plain(
     data: &[u8],
 ) -> TlsResult<usize> {
     use std::io::Write;
-    unsafe { (&mut *connection).active_mut()? }
+    let connection = unsafe { &mut *connection };
+    if connection.peer_sent_fatal_alert {
+        return Err((
+            TLS_ERROR_ZERO_RETURN,
+            "TLS/SSL connection has been closed (EOF)".to_string(),
+        ));
+    }
+    connection
+        .active_mut()?
         .writer()
         .write(data)
         .map_err(rustls_error)
@@ -3558,6 +3576,18 @@ pub unsafe fn connection_read_plain(
         Ok(read) => {
             output.truncate(read);
             Ok(output)
+        }
+        // A session the peer ended with a fatal alert has no more plaintext
+        // coming, and `SSL_read` answers `SSL_ERROR_ZERO_RETURN` from
+        // `SSL_RECEIVED_SHUTDOWN` rather than asking the transport again.
+        // rustls' reader reports `WouldBlock` for both, so without the latch
+        // the caller goes back to the socket and reports whatever it finds
+        // there instead of the alert.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                && connection.peer_sent_fatal_alert =>
+        {
+            Ok(Vec::new())
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Err((
             TLS_ERROR_WANT_READ,
