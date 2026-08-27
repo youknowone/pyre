@@ -82,8 +82,6 @@ pub struct W_SSLSocket {
     pub backend: *mut pyre_native::ssl::TlsConnection,
     pub context: PyObjectRef,
     pub socket: PyObjectRef,
-    pub socket_send: PyObjectRef,
-    pub socket_recv: PyObjectRef,
     pub incoming: PyObjectRef,
     pub outgoing: PyObjectRef,
     pub owner: PyObjectRef,
@@ -449,29 +447,10 @@ fn parse_server_hostname(
     Ok((Some(hostname.clone()), w_str_new(&hostname)))
 }
 
-fn import_module(name: &str) -> Result<PyObjectRef, crate::PyError> {
-    crate::importing::dunder_import(
-        name,
-        w_none(),
-        w_none(),
-        w_none(),
-        0,
-        crate::call::getexecutioncontext(),
-    )?;
-    crate::importing::get_sys_module(name).ok_or_else(|| {
-        crate::PyError::new(
-            crate::PyErrorKind::ImportError,
-            format!("No module named '{name}'"),
-        )
-    })
-}
-
 fn allocate_ssl_socket(
     backend: *mut pyre_native::ssl::TlsConnection,
     context: PyObjectRef,
     socket: PyObjectRef,
-    socket_send: PyObjectRef,
-    socket_recv: PyObjectRef,
     incoming: PyObjectRef,
     outgoing: PyObjectRef,
     owner: PyObjectRef,
@@ -484,28 +463,17 @@ fn allocate_ssl_socket(
     // has to move these constants with it.
     const CONTEXT_SLOT: usize = 0;
     const SOCKET_SLOT: usize = 1;
-    const SOCKET_SEND_SLOT: usize = 2;
-    const SOCKET_RECV_SLOT: usize = 3;
-    const INCOMING_SLOT: usize = 4;
-    const OUTGOING_SLOT: usize = 5;
-    const OWNER_SLOT: usize = 6;
-    const SERVER_HOSTNAME_SLOT: usize = 7;
+    const INCOMING_SLOT: usize = 2;
+    const OUTGOING_SLOT: usize = 3;
+    const OWNER_SLOT: usize = 4;
+    const SERVER_HOSTNAME_SLOT: usize = 5;
 
     let _ = ssl_socket_methods::type_object();
     let _roots = pyre_object::gc_roots::push_roots();
     // Bound rather than spelled twice: `first` is derived from this array's
     // own length, so pinning one more value cannot leave the block start
     // pointing one slot past where the pins actually begin.
-    let pinned = [
-        context,
-        socket,
-        socket_send,
-        socket_recv,
-        incoming,
-        outgoing,
-        owner,
-        server_hostname,
-    ];
+    let pinned = [context, socket, incoming, outgoing, owner, server_hostname];
     for value in pinned {
         let _ = pyre_object::gc_roots::pin_root(value);
     }
@@ -525,8 +493,6 @@ fn allocate_ssl_socket(
         backend,
         context: unsafe { pyre_object::gc_roots::shadow_stack_get(first + CONTEXT_SLOT) },
         socket: unsafe { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_SLOT) },
-        socket_send: unsafe { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_SEND_SLOT) },
-        socket_recv: unsafe { pyre_object::gc_roots::shadow_stack_get(first + SOCKET_RECV_SLOT) },
         incoming: unsafe { pyre_object::gc_roots::shadow_stack_get(first + INCOMING_SLOT) },
         outgoing: unsafe { pyre_object::gc_roots::shadow_stack_get(first + OUTGOING_SLOT) },
         owner: unsafe { pyre_object::gc_roots::shadow_stack_get(first + OWNER_SLOT) },
@@ -1243,8 +1209,6 @@ mod context_methods {
                 std::ptr::null_mut(),
                 self as *const W_SSLContext as PyObjectRef,
                 w_none(),
-                w_none(),
-                w_none(),
                 incoming,
                 outgoing,
                 owner,
@@ -1316,16 +1280,10 @@ mod context_methods {
                 ));
             }
             let requested_session = clone_requested_session(session, self.backend)?;
-            let socket_module = import_module("socket")?;
-            let socket_class = crate::baseobjspace::getattr_str(socket_module, "socket")?;
-            let socket_send = crate::baseobjspace::getattr_str(socket_class, "send")?;
-            let socket_recv = crate::baseobjspace::getattr_str(socket_class, "recv")?;
             Ok(allocate_ssl_socket(
                 std::ptr::null_mut(),
                 self as *const W_SSLContext as PyObjectRef,
                 socket,
-                socket_send,
-                socket_recv,
                 w_none(),
                 w_none(),
                 owner,
@@ -1449,17 +1407,6 @@ mod memory_bio_methods {
 mod ssl_socket_methods {
     use super::*;
 
-    fn call_transport(
-        callable: PyObjectRef,
-        socket: PyObjectRef,
-        args: &[PyObjectRef],
-    ) -> Result<PyObjectRef, crate::PyError> {
-        let mut call_args = Vec::with_capacity(args.len() + 1);
-        call_args.push(socket);
-        call_args.extend_from_slice(args);
-        crate::call::call_function_impl_result(callable, &call_args)
-    }
-
     fn is_blocking_error(error: &crate::PyError) -> bool {
         let Some(class) = crate::builtins::lookup_exc_class("BlockingIOError") else {
             return false;
@@ -1501,7 +1448,17 @@ mod ssl_socket_methods {
     }
 
     fn receive_tls(socket: &mut W_SSLSocket, data: &[u8]) -> Result<usize, crate::PyError> {
-        let read = match unsafe { pyre_native::ssl::connection_receive_tls(socket.backend, data) } {
+        // `PySSL_BEGIN_ALLOW_THREADS` around `SSL_read`: parsing the records
+        // and verifying the peer's certificate is the expensive half of a
+        // handshake, and it reads a buffer this module owns rather than
+        // anything the interpreter does.  Holding the interpreter across it
+        // is what let a server finish rejecting a client certificate — alert
+        // and socket close included — inside the client thread's own `send`.
+        let outcome = {
+            let _blocked = crate::module::thread::before_external_block();
+            unsafe { pyre_native::ssl::connection_receive_tls(socket.backend, data) }
+        };
+        let read = match outcome {
             Ok(read) => read,
             Err(error) => {
                 // rustls may have queued the fatal alert describing this
@@ -1511,6 +1468,15 @@ mod ssl_socket_methods {
                 return tls_result(Err(error));
             }
         };
+        settle_received_tls(socket)?;
+        Ok(read)
+    }
+
+    /// What is left to do once rustls has accepted the peer's records: deliver
+    /// the protocol events it observed, and keep the trust anchor a lazy CA
+    /// directory contributed.  Both need the interpreter, so a released run
+    /// leaves them to its caller.
+    fn settle_received_tls(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
         run_message_callbacks(socket)?;
         if let Some(root) =
             unsafe { pyre_native::ssl::connection_take_verified_root(socket.backend) }
@@ -1521,7 +1487,7 @@ mod ssl_socket_methods {
                 pyre_native::ssl::context_add_verified_root(context.backend, root)
             })?;
         }
-        Ok(read)
+        Ok(())
     }
 
     fn run_message_callbacks(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
@@ -1568,6 +1534,22 @@ mod ssl_socket_methods {
             return Ok(());
         }
 
+        // `SSL_set_fd`: the records reach the descriptor from here rather
+        // than through the socket's Python `send`, so the whole queue costs
+        // one released region instead of one per record.
+        if let Some((transport, fd)) = pump_transport(socket)? {
+            let backend = socket.backend;
+            loop {
+                match pump(backend, fd, &mut [], PumpGoal::Flush) {
+                    PumpExit::Done(_) => return Ok(()),
+                    PumpExit::Interrupted => {
+                        crate::module::signal::interp_signal::checksignals_now()?
+                    }
+                    exit => return Err(pump_error(transport, exit)),
+                }
+            }
+        }
+
         loop {
             let data =
                 tls_result(unsafe { pyre_native::ssl::connection_peek_tls(socket.backend) })?;
@@ -1575,12 +1557,14 @@ mod ssl_socket_methods {
             if data.is_empty() {
                 return Ok(());
             }
-            let sent = match call_transport(
-                socket.socket_send,
-                transport_socket(socket)?,
-                &[w_bytes_from_bytes(&data)],
+            // The callbacks above ran Python, so the transport is read back
+            // after them.
+            let transport = transport_socket(socket)?;
+            let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
+            let sent = match crate::module::_socket::interp_socket::socket_send_bytes(
+                transport, fd, &data, 0,
             ) {
-                Ok(value) => crate::baseobjspace::int_w(value)?,
+                Ok(sent) => sent,
                 Err(error) if is_blocking_error(&error) => {
                     return Err(tls_error(
                         pyre_native::ssl::TLS_ERROR_WANT_WRITE,
@@ -1597,6 +1581,172 @@ mod ssl_socket_methods {
             }
             unsafe { pyre_native::ssl::connection_consume_tls(socket.backend, sent as usize) };
         }
+    }
+
+    /// What a released run is driving toward.
+    enum PumpGoal {
+        /// Complete the handshake.
+        Handshake,
+        /// Produce up to this many bytes of plaintext.
+        Read(usize),
+        /// Put every record rustls has queued on the wire.
+        Flush,
+    }
+
+    /// Why a released run gave the interpreter back.
+    enum PumpExit {
+        /// The goal is met.  `Read` carries the plaintext it produced; the
+        /// other two carry nothing.
+        Done(Vec<u8>),
+        /// A server has parsed ClientHello and is waiting for
+        /// `configure_accepted_server`, which runs Python.
+        NeedsConfig,
+        /// The transport reported end of file.
+        Eof,
+        /// A transport call could not proceed. `write` says which half it was,
+        /// and `code` is what the socket API reported, or 0 for a send that
+        /// accepted nothing.
+        Failed { write: bool, code: i32 },
+        /// A transport call was interrupted; the caller delivers the signal.
+        Interrupted,
+        /// rustls rejected the exchange.
+        Rejected((i32, String)),
+    }
+
+    /// The `PySSL_BEGIN_ALLOW_THREADS` bracket that `SSL_do_handshake`,
+    /// `SSL_read` and `SSL_write` each put around their whole exchange: the
+    /// peer's records are read, answered and parsed without the interpreter,
+    /// so it is released across the exchange rather than taken back between
+    /// every record.  A thread that is not asking for the interpreter cannot
+    /// land in the middle of another one's `send`, which is what lets a peer's
+    /// fatal alert reach a client that is already parked in `recv`.
+    ///
+    /// Nothing here may touch a Python object.  The states that need one - a
+    /// server context to choose, a signal to deliver, an error to raise - end
+    /// the run and are answered by the caller.
+    fn pump(
+        backend: *mut pyre_native::ssl::TlsConnection,
+        fd: crate::module::_socket::rsocket_rffi::Socket,
+        buf: &mut [u8],
+        goal: PumpGoal,
+    ) -> PumpExit {
+        use crate::module::_socket::interp_socket::{socket_recv_raw, socket_send_raw};
+        use crate::module::_socket::rsocket_rffi::error_is_interrupted;
+
+        let _blocked = crate::module::thread::before_external_block();
+        loop {
+            loop {
+                let data = match unsafe { pyre_native::ssl::connection_peek_tls(backend) } {
+                    Ok(data) => data,
+                    Err(error) => return PumpExit::Rejected(error),
+                };
+                if data.is_empty() {
+                    break;
+                }
+                match socket_send_raw(fd, &data, 0) {
+                    Ok(sent) if sent > 0 => unsafe {
+                        pyre_native::ssl::connection_consume_tls(backend, sent as usize)
+                    },
+                    Ok(_) => {
+                        return PumpExit::Failed {
+                            write: true,
+                            code: 0,
+                        };
+                    }
+                    Err(code) if error_is_interrupted(code) => return PumpExit::Interrupted,
+                    Err(code) => return PumpExit::Failed { write: true, code },
+                }
+            }
+            match goal {
+                PumpGoal::Flush => return PumpExit::Done(Vec::new()),
+                PumpGoal::Handshake => {
+                    if !unsafe { pyre_native::ssl::connection_is_handshaking(backend) } {
+                        return PumpExit::Done(Vec::new());
+                    }
+                    if unsafe { pyre_native::ssl::connection_waiting_for_server_config(backend) } {
+                        return PumpExit::NeedsConfig;
+                    }
+                }
+                PumpGoal::Read(size) => {
+                    match unsafe { pyre_native::ssl::connection_read_plain(backend, size) } {
+                        Ok(data) => return PumpExit::Done(data),
+                        Err((code, _)) if code == pyre_native::ssl::TLS_ERROR_WANT_READ => {}
+                        Err(error) => return PumpExit::Rejected(error),
+                    }
+                }
+            }
+            match socket_recv_raw(fd, buf, 0) {
+                Ok(0) => return PumpExit::Eof,
+                Ok(read) => {
+                    if let Err(error) =
+                        unsafe { pyre_native::ssl::connection_receive_tls(backend, &buf[..read]) }
+                    {
+                        return PumpExit::Rejected(error);
+                    }
+                }
+                Err(code) if error_is_interrupted(code) => return PumpExit::Interrupted,
+                Err(code) => return PumpExit::Failed { write: false, code },
+            }
+        }
+    }
+
+    /// The exception a released run's transport failure raises, once the
+    /// interpreter is back.  Every caller answers the exits that are not
+    /// failures - and `Rejected`, whose alert has to go out first - before
+    /// reaching here.
+    fn pump_error(transport: PyObjectRef, exit: PumpExit) -> crate::PyError {
+        match exit {
+            PumpExit::Eof => tls_error(
+                pyre_native::ssl::TLS_ERROR_EOF,
+                "EOF occurred in violation of protocol".to_string(),
+            ),
+            PumpExit::Failed { write, code } => {
+                if code != 0 {
+                    let error = crate::module::_socket::interp_socket::socket_error_for_operation(
+                        transport, code,
+                    );
+                    if !is_blocking_error(&error) {
+                        return error;
+                    }
+                }
+                let (want, message) = if write {
+                    (
+                        pyre_native::ssl::TLS_ERROR_WANT_WRITE,
+                        "The operation did not complete (write)",
+                    )
+                } else {
+                    (
+                        pyre_native::ssl::TLS_ERROR_WANT_READ,
+                        "The operation did not complete (read)",
+                    )
+                };
+                tls_error(want, message.to_string())
+            }
+            PumpExit::Rejected((code, message)) => tls_error(code, message),
+            PumpExit::Done(_) | PumpExit::NeedsConfig | PumpExit::Interrupted => {
+                unreachable!("the caller answers every exit that is not a transport failure")
+            }
+        }
+    }
+
+    /// The transport a released run drives, or `None` for a connection that
+    /// has to reach Python between records: a `MemoryBIO` pair has no
+    /// descriptor behind it, and a registered `_msg_callback` is called for
+    /// every record as it is seen.
+    fn pump_transport(
+        socket: &W_SSLSocket,
+    ) -> Result<Option<(PyObjectRef, crate::module::_socket::rsocket_rffi::Socket)>, crate::PyError>
+    {
+        if !unsafe { is_none(socket.incoming) } || !unsafe { is_none(socket.outgoing) } {
+            return Ok(None);
+        }
+        let context = W_SSLContext::from_obj(socket.context).expect("SSL socket owns its context");
+        if !unsafe { is_none(context.msg_callback) } {
+            return Ok(None);
+        }
+        let transport = transport_socket(socket)?;
+        let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
+        Ok(Some((transport, fd)))
     }
 
     fn receive_transport(socket: &mut W_SSLSocket) -> Result<(), crate::PyError> {
@@ -1623,12 +1773,13 @@ mod ssl_socket_methods {
             return Ok(());
         }
 
-        let value = match call_transport(
-            socket.socket_recv,
-            transport_socket(socket)?,
-            &[w_int_new(32 * 1024)],
+        let transport = transport_socket(socket)?;
+        let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
+        let mut buf = vec![0u8; 32 * 1024];
+        let read = match crate::module::_socket::interp_socket::socket_recv_bytes(
+            transport, fd, &mut buf, 0,
         ) {
-            Ok(value) => value,
+            Ok(read) => read,
             Err(error) if is_blocking_error(&error) => {
                 return Err(tls_error(
                     pyre_native::ssl::TLS_ERROR_WANT_READ,
@@ -1637,19 +1788,13 @@ mod ssl_socket_methods {
             }
             Err(error) => return Err(error),
         };
-        let buffer = crate::baseobjspace::simple_buffer_bytes(value)?.ok_or_else(|| {
-            crate::PyError::type_error("socket recv() returned a non-bytes value")
-        })?;
-        if buffer.as_bytes().is_empty() {
-            buffer.release();
+        if read == 0 {
             return Err(tls_error(
                 pyre_native::ssl::TLS_ERROR_EOF,
                 "EOF occurred in violation of protocol".to_string(),
             ));
         }
-        let result = receive_tls(socket, buffer.as_bytes());
-        buffer.release();
-        result.map(|_| ())
+        receive_tls(socket, &buf[..read]).map(|_| ())
     }
 
     fn reject_sni(socket: &mut W_SSLSocket, alert: u8, reason: &str) -> Result<(), crate::PyError> {
@@ -1847,8 +1992,43 @@ mod ssl_socket_methods {
                     ));
                 }
             }
+            let mut pump_buffer = Vec::new();
             loop {
                 unsafe { configure_accepted_server(self as *mut W_SSLSocket) }?;
+                let handshaking =
+                    unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) };
+                if let Some((transport, fd)) = if handshaking {
+                    pump_transport(self)?
+                } else {
+                    None
+                } {
+                    if pump_buffer.is_empty() {
+                        pump_buffer.resize(32 * 1024, 0u8);
+                    }
+                    let backend = self.backend;
+                    match pump(backend, fd, &mut pump_buffer, PumpGoal::Handshake) {
+                        PumpExit::Done(_) => {
+                            settle_received_tls(self)?;
+                            return Ok(());
+                        }
+                        PumpExit::NeedsConfig => {
+                            settle_received_tls(self)?;
+                            continue;
+                        }
+                        PumpExit::Interrupted => {
+                            crate::module::signal::interp_signal::checksignals_now()?;
+                            continue;
+                        }
+                        PumpExit::Rejected(error) => {
+                            // rustls may have queued the fatal alert describing
+                            // this protocol error. Send it before unwinding so
+                            // the peer cannot remain blocked in its handshake.
+                            let _ = flush_transport(self);
+                            return tls_result(Err(error));
+                        }
+                        exit => return Err(pump_error(transport, exit)),
+                    }
+                }
                 flush_transport(self)?;
                 if !unsafe { pyre_native::ssl::connection_is_handshaking(self.backend) } {
                     return Ok(());
@@ -1924,14 +2104,46 @@ mod ssl_socket_methods {
             } else {
                 requested as usize
             };
-            let data = loop {
-                match unsafe { pyre_native::ssl::connection_read_plain(self.backend, size) } {
-                    Ok(data) => break data,
-                    Err((code, _)) if code == pyre_native::ssl::TLS_ERROR_WANT_READ => {
-                        receive_transport(self)?;
-                        flush_transport(self)?;
+            let data = if let Some((transport, fd)) = pump_transport(self)? {
+                // `SSL_read` under one `PySSL_BEGIN_ALLOW_THREADS`: the
+                // plaintext drain, the transport read and the record parsing
+                // all run in the released region, so a caller waiting for the
+                // peer is parked in `recv` rather than holding the
+                // interpreter between them.
+                let mut buf = vec![0u8; 32 * 1024];
+                let backend = self.backend;
+                loop {
+                    match pump(backend, fd, &mut buf, PumpGoal::Read(size)) {
+                        PumpExit::Done(data) => {
+                            settle_received_tls(self)?;
+                            break data;
+                        }
+                        PumpExit::NeedsConfig => {
+                            unsafe { configure_accepted_server(self as *mut W_SSLSocket) }?
+                        }
+                        PumpExit::Interrupted => {
+                            crate::module::signal::interp_signal::checksignals_now()?
+                        }
+                        PumpExit::Rejected(error) => {
+                            // rustls may have queued the fatal alert describing
+                            // this protocol error. Send it before unwinding so
+                            // the peer cannot remain blocked.
+                            let _ = flush_transport(self);
+                            return tls_result(Err(error));
+                        }
+                        exit => return Err(pump_error(transport, exit)),
                     }
-                    Err((code, message)) => return Err(tls_error(code, message)),
+                }
+            } else {
+                loop {
+                    match unsafe { pyre_native::ssl::connection_read_plain(self.backend, size) } {
+                        Ok(data) => break data,
+                        Err((code, _)) if code == pyre_native::ssl::TLS_ERROR_WANT_READ => {
+                            receive_transport(self)?;
+                            flush_transport(self)?;
+                        }
+                        Err((code, message)) => return Err(tls_error(code, message)),
+                    }
                 }
             };
             if let Some(buffer) = writable.as_mut() {
