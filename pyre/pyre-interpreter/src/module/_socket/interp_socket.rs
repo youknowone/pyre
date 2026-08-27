@@ -29,34 +29,34 @@ use super::rsocket_rffi as rffi;
 /// constants/helpers above are usable, but `socket.socket(...)` raises
 /// the C-extension stub error.
 
-/// `interp_socket.py converted_error` — turn an rsocket
-/// `SocketError` subclass into the matching python-level exception.
+/// `interp_socket.py idna_converter` — turn the host of an address tuple
+/// into the bytes a sockaddr is built from.  Accepts str / bytes /
+/// bytearray, refuses an embedded null, and — unlike `socket_encode_idna`
+/// — hands an ASCII host straight through, so a numeric address or a
+/// plain ASCII name never enters the codec.
 ///
-/// `applevelerrcls` matches the field defined on each rsocket error
-/// class (`rpython/rlib/rsocket.py:1316/1360/1372/1383`):
-///   "error"    → builtin `OSError`
-///   "gaierror" → `_socket.gaierror` (OSError subclass)
-///   "herror"   → `_socket.herror`   (OSError subclass)
-///   "timeout"  → builtin `TimeoutError` (per `get_error()` line 1062-3,
-///                NOT the `_socket.timeout` attribute, which is a
-///                separate OSError subclass exposed for `isinstance` use)
-///
-/// When `errno` is `Some`, builds the exception with `(errno, message)`
-/// like `SocketErrorWithErrno` (`interp_socket.py:1074-1075`); otherwise
-/// only `(message,)` like the plain SocketError (`:1077-1078`).
-/// `interp_socket.py idna_converter` — turn a hostname argument
-/// into a `Vec<u8>` suitable for passing to a DNS resolver.
-///
-/// Accepts str / bytes / bytearray.  For str: tries ASCII first; on
-/// UnicodeEncodeError falls back to the `idna` codec.  Embedded null
-/// bytes raise TypeError (matching `:120-122`).  Other input types
-/// raise TypeError.
+/// Three details follow `getsockaddrarg`'s own converter rather than
+/// `idna_converter`, which spells each of them differently.  The fast
+/// path is gated on the argument being an exact `str`, matching the
+/// compact-ASCII representation no `str` subclass instance has, where
+/// `idna_converter` gates on an ascii *encode* succeeding.  A codec
+/// failure becomes a bare TypeError rather than the codec's own error.
+/// And the wrong-type message names the three accepted types.  MEASURED
+/// 2026-08-27 with `class S(str): pass`: `connect((S("a" * 70), 80))`
+/// answers `TypeError("encoding of hostname failed")` under CPython
+/// 3.14.2 and `gaierror(11001)` under PyPy 7.3.22, and a host whose
+/// first label is empty answers that same TypeError against
+/// `UnicodeError("encoding with 'idna' codec failed ...")`.
 #[cfg(any(unix, windows))]
 fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    let wrong_type = |obj: pyre_object::PyObjectRef| {
+        crate::PyError::type_error(format!(
+            "str, bytes or bytearray expected, not {}",
+            crate::type_methods::arg_type_name(obj)
+        ))
+    };
     if w_host.is_null() {
-        return Err(crate::PyError::type_error(
-            "string or unicode text buffer expected, not None",
-        ));
+        return Err(wrong_type(w_host));
     }
     let bytes: Vec<u8> = unsafe {
         if pyre_object::is_str(w_host) {
@@ -64,22 +64,28 @@ fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, cr
             // utf-8 view — one carrying a lone surrogate — reaches the `idna`
             // fallback the same way any other non-ASCII host does.
             let s = pyre_object::unicodeobject::w_str_get_wtf8(w_host);
-            if s.as_bytes().is_ascii() {
+            if pyre_object::is_exact_type(w_host, &pyre_object::STR_TYPE) && s.as_bytes().is_ascii()
+            {
                 s.as_bytes().to_vec()
             } else {
                 // `space.encode_unicode_object(w_host, 'idna', None)`: the
                 // codec runs on the string value itself rather than through
                 // an `encode` attribute lookup, so a `str` subclass cannot
-                // decide how its hostname reaches the resolver, and the
-                // error a caller sees is the codec's own rejection.
-                crate::type_methods::encode_object(w_host, "idna", "strict")?
+                // decide how its hostname reaches the resolver.  Whatever it
+                // raised is dropped for the one message that covers every way
+                // an address host can fail to encode, which also drops a
+                // failure the codec did not cause.
+                crate::type_methods::encode_object(w_host, "idna", "strict")
+                    .map_err(|_| crate::PyError::type_error("encoding of hostname failed"))?
             }
         } else if pyre_object::bytesobject::is_bytes_like(w_host) {
-            pyre_object::w_bytes_data(w_host).to_vec()
+            // The guard admits a bytearray, so the read has to dispatch on
+            // the storage type: `w_bytes_data` would take a
+            // `W_BytearrayObject`'s `*mut Vec<u8>` for a `*const BytesBlock`
+            // and slice from the capacity word.
+            pyre_object::bytesobject::bytes_like_data(w_host).to_vec()
         } else {
-            return Err(crate::PyError::type_error(
-                "string or unicode text buffer expected",
-            ));
+            return Err(wrong_type(w_host));
         }
     };
     if bytes.contains(&0) {
@@ -90,6 +96,99 @@ fn socket_idna_converter(w_host: pyre_object::PyObjectRef) -> Result<Vec<u8>, cr
     Ok(bytes)
 }
 
+/// `interp_func.py encode_idna` — run the `idna` codec over a host
+/// argument with no ASCII shortcut, so an empty label or one 64 bytes or
+/// longer is refused before any resolver sees it and an
+/// internationalized name reaches the resolver in its ACE spelling.
+/// `caller` names the function the argument was passed to.
+///
+/// `encode_idna` hands the argument to the unbound `unicode.encode`, so a
+/// `bytes` or `bytearray` host is a TypeError from the gateway there.  The
+/// `et` argument converter these three entry points parse their host with
+/// accepts both and passes them through untouched, and that is the 3.14
+/// answer.  MEASURED 2026-08-27: `gethostbyname(b"localhost")` and
+/// `gethostbyname(bytearray(b"localhost"))` both answer `"127.0.0.1"`
+/// under CPython 3.14.2, where PyPy 7.3.22 raises
+/// `TypeError("'str' object expected, got 'bytes' instead")`.  Only a
+/// `str` is ever encoded: the bytes forms already name an encoded host.
+#[cfg(any(unix, windows))]
+fn socket_encode_idna(
+    caller: &str,
+    w_host: pyre_object::PyObjectRef,
+) -> Result<Vec<u8>, crate::PyError> {
+    unsafe {
+        if pyre_object::is_str(w_host) {
+            crate::type_methods::encode_object(w_host, "idna", "strict")
+        } else if pyre_object::bytesobject::is_bytes_like(w_host) {
+            Ok(pyre_object::bytesobject::bytes_like_data(w_host).to_vec())
+        } else {
+            Err(crate::PyError::type_error(format!(
+                "{caller}() argument 1 must be str, bytes or bytearray, not {}",
+                crate::type_methods::clinic_arg_type_name(w_host)
+            )))
+        }
+    }
+}
+
+/// The host argument of `gethostbyname`, `gethostbyname_ex` and
+/// `gethostbyaddr`: `socket_encode_idna` followed by the `et` converter's
+/// own `strlen(buf) != size` scan, which refuses a host carrying an
+/// embedded null.  `encode_idna` has no such scan — MEASURED 2026-08-27,
+/// PyPy 7.3.22 resolves a host whose name is followed by a null and more
+/// text as if the text were not there, because the resolver stops at the
+/// null — so the refusal is the 3.14 answer.
+///
+/// The scan runs after the codec, so a host that is both bad idna and
+/// null-bearing reports the codec's error.  The type name the message
+/// wants is read first: the codec runs Python, and `w_host` is a bare
+/// reference that a collection can leave behind.
+#[cfg(any(unix, windows))]
+fn socket_idna_host_arg(
+    caller: &str,
+    w_host: pyre_object::PyObjectRef,
+) -> Result<std::ffi::CString, crate::PyError> {
+    let type_name = crate::type_methods::clinic_arg_type_name(w_host);
+    let bytes = socket_encode_idna(caller, w_host)?;
+    std::ffi::CString::new(bytes).map_err(|_| {
+        crate::PyError::type_error(format!(
+            "{caller}() argument 1 must be encoded string without null bytes, not {type_name}"
+        ))
+    })
+}
+
+/// The C string a `getaddrinfo` argument becomes.  Neither
+/// `interp_func.py getaddrinfo` nor the 3.14 entry point scans its host or
+/// its service for an embedded null: the encoded bytes are handed to
+/// `getaddrinfo` as a C string, so the name simply stops at the first one.
+/// MEASURED 2026-08-27: a host of `"localhost"` followed by a null and
+/// more text resolves to what `"localhost"` alone resolves to under
+/// CPython 3.14.2 and PyPy 7.3.22 alike.
+#[cfg(any(unix, windows))]
+fn socket_cstring_at_nul(mut bytes: Vec<u8>) -> std::ffi::CString {
+    if let Some(nul) = bytes.iter().position(|&b| b == 0) {
+        bytes.truncate(nul);
+    }
+    // The truncation removed every interior null.
+    std::ffi::CString::new(bytes).unwrap()
+}
+
+/// `interp_socket.py converted_error` — turn an rsocket
+/// `SocketError` subclass into the matching python-level exception.
+///
+/// `applevelerrcls` matches the field defined on each rsocket error class
+/// (`rsocket.py` `SocketError`, `GAIError`, `HSocketError`,
+/// `SocketTimeout`):
+///   "error"    → builtin `OSError`
+///   "gaierror" → `_socket.gaierror` (OSError subclass)
+///   "herror"   → `_socket.herror`   (OSError subclass)
+///   "timeout"  → builtin `TimeoutError` (`get_error` answers
+///                `space.w_TimeoutError` for that name, NOT the
+///                `_socket.timeout` attribute, which is a separate
+///                OSError subclass exposed for `isinstance` use)
+///
+/// When `errno` is `Some`, builds the exception with `(errno, message)`
+/// the way `converted_error` does for a `SocketErrorWithErrno`; otherwise
+/// only `(message,)`, like the plain `SocketError`.
 #[cfg(any(unix, windows))]
 fn socket_converted_error(
     applevelerrcls: &str,
@@ -1193,9 +1292,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "gethostbyname() missing argument",
                         ));
                     }
-                    let host_bytes = socket_idna_converter(args[0])?;
-                    let c = std::ffi::CString::new(host_bytes)
-                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let c = socket_idna_host_arg("gethostbyname", args[0])?;
                     // `rsocket.gethostbyname` is `makeipaddr(name, INETAddress())`
                     // and `socket_gethostbyname` is `setipaddr(name, AF_INET)`:
                     // both resolve, neither calls the `gethostbyname` of the
@@ -1231,9 +1328,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "gethostbyname_ex() missing argument",
                         ));
                     }
-                    let host_bytes = socket_idna_converter(args[0])?;
-                    let c = std::ffi::CString::new(host_bytes)
-                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let c = socket_idna_host_arg("gethostbyname_ex", args[0])?;
                     // `rsocket.gethostbyname_ex` resolves the name first and
                     // only then reads the `hostent`, so an unresolvable name
                     // reports `gaierror` and a name the resolver knows but the
@@ -1265,9 +1360,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             "gethostbyaddr() missing argument",
                         ));
                     }
-                    let host_bytes = socket_idna_converter(args[0])?;
-                    let c = std::ffi::CString::new(host_bytes)
-                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
+                    let c = socket_idna_host_arg("gethostbyaddr", args[0])?;
                     // `rsocket.gethostbyaddr` is `makeipaddr(ip)` — the
                     // argument is resolved for whichever family answers, not
                     // required to be numeric — and only the reverse lookup that
@@ -2123,32 +2216,33 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     "getaddrinfo() missing host or port",
                 ));
             }
-            // host: None | str
-            let host_obj = args[0];
+            // `socket_encode_idna` runs the codec, which is Python and can
+            // collect, and the native argument slice is only current at
+            // entry: pin the arguments and read each one back from its slot.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let args_base = pyre_object::gc_roots::pin_roots(args);
+            // host: None | bytes | str
+            let host_obj = pyre_object::gc_roots::shadow_stack_get(args_base);
             let host: Option<std::ffi::CString> = unsafe {
                 if pyre_object::is_none(host_obj) {
                     None
                 } else if pyre_object::bytesobject::is_bytes(host_obj) {
-                    Some(
-                        std::ffi::CString::new(
-                            pyre_object::bytesobject::bytes_like_data(host_obj),
-                        )
-                        .map_err(|_| crate::PyError::value_error("embedded null in host"))?,
-                    )
+                    Some(socket_cstring_at_nul(
+                        pyre_object::bytesobject::bytes_like_data(host_obj).to_vec(),
+                    ))
                 } else if pyre_object::is_str(host_obj) {
-                    let s = crate::baseobjspace::str_utf8_w(host_obj)?.to_string();
-                    Some(
-                        std::ffi::CString::new(s.as_bytes())
-                            .map_err(|_| crate::PyError::value_error("embedded null in host"))?,
-                    )
+                    Some(socket_cstring_at_nul(socket_encode_idna(
+                        "getaddrinfo",
+                        host_obj,
+                    )?))
                 } else {
                     return Err(crate::PyError::type_error(
                         "getaddrinfo() argument 1 must be string or None",
                     ));
                 }
             };
-            // port: None | int | str
-            let port_obj = args[1];
+            // port: None | int | bytes | str
+            let port_obj = pyre_object::gc_roots::shadow_stack_get(args_base + 1);
             let port: Option<std::ffi::CString> = unsafe {
                 if pyre_object::is_none(port_obj) {
                     None
@@ -2156,18 +2250,15 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     let v = pyre_object::w_int_get_value(port_obj);
                     Some(std::ffi::CString::new(format!("{v}")).unwrap())
                 } else if pyre_object::bytesobject::is_bytes(port_obj) {
-                    Some(
-                        std::ffi::CString::new(
-                            pyre_object::bytesobject::bytes_like_data(port_obj),
-                        )
-                        .map_err(|_| crate::PyError::value_error("embedded null in port"))?,
-                    )
+                    Some(socket_cstring_at_nul(
+                        pyre_object::bytesobject::bytes_like_data(port_obj).to_vec(),
+                    ))
                 } else if pyre_object::is_str(port_obj) {
+                    // The service is spelled utf-8 rather than idna:
+                    // `getaddrinfo` encodes it with
+                    // `space.encode_unicode_object(w_port, 'utf-8', 'strict')`.
                     let s = crate::baseobjspace::str_utf8_w(port_obj)?.to_string();
-                    Some(
-                        std::ffi::CString::new(s.as_bytes())
-                            .map_err(|_| crate::PyError::value_error("embedded null in port"))?,
-                    )
+                    Some(socket_cstring_at_nul(s.into_bytes()))
                 } else {
                     return Err(crate::PyError::type_error(
                         "getaddrinfo() argument 2 must be integer or string",
@@ -2178,12 +2269,13 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
             let int_arg =
                 |idx: usize, default: libc::c_int| -> Result<libc::c_int, crate::PyError> {
                     if args.len() > idx {
-                        if !unsafe { pyre_object::is_int(args[idx]) } {
+                        let v = pyre_object::gc_roots::shadow_stack_get(args_base + idx);
+                        if !unsafe { pyre_object::is_int(v) } {
                             return Err(crate::PyError::type_error(
                                 "getaddrinfo: family/type/proto/flags must be integers",
                             ));
                         }
-                        Ok(unsafe { pyre_object::w_int_get_value(args[idx]) } as libc::c_int)
+                        Ok(unsafe { pyre_object::w_int_get_value(v) } as libc::c_int)
                     } else {
                         Ok(default)
                     }
@@ -3426,14 +3518,15 @@ fn pack_inet_addr(
     }
     let host_obj = unsafe { pyre_object::w_tuple_getitem(addr, 0) }
         .ok_or_else(|| crate::PyError::value_error("address: missing host"))?;
+    // `idna_converter` runs the codec for a host that is not a plain ASCII
+    // `str`, which is Python and can collect, so the tuple is pinned across
+    // the conversion and every later read goes through the slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let addr_slot = pyre_object::gc_roots::pin_roots(&[addr, host_obj]);
+    let host = socket_idna_converter(pyre_object::gc_roots::shadow_stack_get(addr_slot + 1))?;
+    let addr = pyre_object::gc_roots::shadow_stack_get(addr_slot);
     let port_obj = unsafe { pyre_object::w_tuple_getitem(addr, 1) }
         .ok_or_else(|| crate::PyError::value_error("address: missing port"))?;
-    let host = unsafe {
-        if !pyre_object::is_str(host_obj) {
-            return Err(crate::PyError::type_error("address host must be a string"));
-        }
-        crate::baseobjspace::str_utf8_w(host_obj)?.to_string()
-    };
     if !unsafe { pyre_object::is_int(port_obj) } {
         return Err(crate::PyError::type_error(
             "address port must be an integer",
@@ -3449,14 +3542,24 @@ fn pack_inet_addr(
     }
     let port = (port_raw as u16).to_be();
 
-    let c_host = std::ffi::CString::new(host.as_bytes())
-        .map_err(|_| crate::PyError::value_error("embedded null in host"))?;
+    // The resolver below releases the GIL, so read what is left of the tuple
+    // out of it first; `addr` is a bare reference and a collection that runs
+    // meanwhile can leave it behind.
+    let tuple_int = |index: i64| -> Option<u32> {
+        unsafe { pyre_object::w_tuple_getitem(addr, index) }
+            .map(|v| unsafe { pyre_object::w_int_get_value(v) } as u32)
+    };
+    let flowinfo = if len >= 3 { tuple_int(2) } else { None };
+    let scope_id = if len >= 4 { tuple_int(3) } else { None };
+
+    // `socket_idna_converter` already refused every null.
+    let c_host = std::ffi::CString::new(host).unwrap();
     if family == rffi::AF_INET {
         let sin = unsafe { &mut *(&mut storage as *mut _ as *mut rffi::sockaddr_in) };
         sin.sin_family = rffi::AF_INET as rffi::SaFamily;
         sin.sin_port = port;
         // inet_pton handles both "0.0.0.0" and dotted-quad.
-        let r = if host.is_empty() {
+        let r = if c_host.as_bytes().is_empty() {
             // RSocket.makeipaddr('', result) uses the wildcard address for
             // bind(), as required by socketserver and socket_helper.bind_port.
             rffi::sockaddr_in_set_addr(sin, rffi::INADDR_ANY);
@@ -3484,7 +3587,7 @@ fn pack_inet_addr(
         sin6.sin6_family = rffi::AF_INET6 as rffi::SaFamily;
         sin6.sin6_port = port;
         let mut buf = [0u8; 16];
-        let r = if host.is_empty() {
+        let r = if c_host.as_bytes().is_empty() {
             1
         } else {
             unsafe {
@@ -3505,15 +3608,12 @@ fn pack_inet_addr(
             rffi::sockaddr_in6_set_scope_id(sin6, rffi::sockaddr_in6_get_scope_id(found));
         }
         rffi::sockaddr_in6_set_addr(sin6, buf);
-        if len >= 3
-            && let Some(v) = unsafe { pyre_object::w_tuple_getitem(addr, 2) } {
-                sin6.sin6_flowinfo = unsafe { pyre_object::w_int_get_value(v) } as u32;
-            }
-        if len >= 4
-            && let Some(v) = unsafe { pyre_object::w_tuple_getitem(addr, 3) } {
-                let scope_id = unsafe { pyre_object::w_int_get_value(v) } as u32;
-                rffi::sockaddr_in6_set_scope_id(sin6, scope_id);
-            }
+        if let Some(v) = flowinfo {
+            sin6.sin6_flowinfo = v;
+        }
+        if let Some(v) = scope_id {
+            rffi::sockaddr_in6_set_scope_id(sin6, v);
+        }
         Ok((
             storage,
             core::mem::size_of::<rffi::sockaddr_in6>() as rffi::SockLen,
@@ -4105,7 +4205,17 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                // `pack_inet_addr` runs Python for a host that is not a plain
+                // ASCII `str`, so the socket is read back from its slot
+                // rather than from the native argument slice, which is
+                // only current at entry.
+                #[cfg(windows)]
+                let _roots = pyre_object::gc_roots::push_roots();
+                #[cfg(windows)]
+                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
                 let (storage, slen) = pack_inet_addr("connect", family, proto, args[1])?;
+                #[cfg(windows)]
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 #[cfg(windows)]
                 if let Some(timeout) = socket_positive_timeout(obj) {
                     return match socket_connect_timed(fd, &storage, slen, timeout) {
@@ -4152,7 +4262,17 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let fd = socket_fd(obj)?;
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                // `pack_inet_addr` runs Python for a host that is not a plain
+                // ASCII `str`, so the socket is read back from its slot
+                // rather than from the native argument slice, which is
+                // only current at entry.
+                #[cfg(windows)]
+                let _roots = pyre_object::gc_roots::push_roots();
+                #[cfg(windows)]
+                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
                 let (storage, slen) = pack_inet_addr("connect_ex", family, proto, args[1])?;
+                #[cfg(windows)]
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 #[cfg(windows)]
                 if let Some(timeout) = socket_positive_timeout(obj) {
                     let err = socket_connect_timed(fd, &storage, slen, timeout).err();
@@ -4361,7 +4481,14 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let buf = buffer.as_bytes();
                 let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
                 let proto = socket_get_attr_i64(obj, "_proto") as libc::c_int;
+                // `pack_inet_addr` runs Python for a host that is not a plain
+                // ASCII `str`, so the socket is read back from its slot
+                // rather than from the native argument slice, which is
+                // only current at entry.
+                let _roots = pyre_object::gc_roots::push_roots();
+                let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
                 let (storage, slen) = pack_inet_addr("sendto", family, proto, addr_obj)?;
+                let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 loop {
                     let (r, errno) = socket_call(|| unsafe {
                         rffi::sendto(
@@ -5038,6 +5165,11 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 0
             };
+            // `pack_inet_addr` runs Python for a host that is not a plain
+            // ASCII `str`, so the socket is read back from its slot rather
+            // than from the native argument slice, which is only current at
+            // entry.  The scope opened above covers the slot.
+            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
             let (addr_storage, addr_len) =
                 if args.len() >= 5 && !unsafe { pyre_object::is_none(args[4]) } {
                     let family = socket_get_attr_i64(obj, "_family") as libc::c_int;
@@ -5047,6 +5179,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 } else {
                     (None, 0)
                 };
+            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
 
             // Lay out cmsgs into a single control buffer.
             let total_control: usize = cmsgs
