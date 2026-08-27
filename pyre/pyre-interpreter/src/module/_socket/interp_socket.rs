@@ -2639,8 +2639,8 @@ fn socket_wait_readable(
 /// and the wait for its outcome is explicit; POSIX's `SO_SNDTIMEO` already
 /// bounds the call and keeps the straight-line path.
 ///
-/// Returns the code the attempt reported, `WSAETIMEDOUT` on expiry, so both
-/// `connect` and `connect_ex` can shape it the way each one answers.
+/// Returns the code the attempt reported, so both `connect` and `connect_ex`
+/// can shape it the way each one answers.
 #[cfg(windows)]
 fn socket_connect_timed(
     fd: rffi::Socket,
@@ -2681,7 +2681,12 @@ fn socket_connect_wait(
         return Err(poll_errno);
     }
     if ready == 0 {
-        return Err(rffi::ETIMEDOUT);
+        // `_connect` answers the expiry with `WSAEWOULDBLOCK` — the code the
+        // non-blocking connect itself reported — beside a separate timeout
+        // flag.  `connect_ex` returns that code, and `connect` reads it back
+        // through `socket_io_err_for_operation`, which a positive timeout
+        // turns into the `TimeoutError` the flag stands for.
+        return Err(rffi::WSAEWOULDBLOCK);
     }
     // `SO_ERROR` carries the outcome of a connect that finished after its call
     // returned; zero means it succeeded.

@@ -108,10 +108,6 @@ pub const WSAENOTSOCK: i32 = ws::WSAENOTSOCK;
 /// room left, which is the one failure a caller may choose to drop.
 #[cfg(windows)]
 pub const WSAEWOULDBLOCK: i32 = ws::WSAEWOULDBLOCK;
-/// The code an expired wait reports, so a timeout this module times itself
-/// reads back the same as one the host produced.
-#[cfg(windows)]
-pub const ETIMEDOUT: i32 = ws::WSAETIMEDOUT;
 #[cfg(windows)]
 pub const NI_MAXHOST: usize = ws::NI_MAXHOST as usize;
 #[cfg(windows)]
