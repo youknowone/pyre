@@ -76,6 +76,33 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// half: interpreter-visible graphs keep `force_virtualizable_if_necessary`.
 /// `#[inline(never)]` keeps the callee name on the Call so the rewrite can
 /// see it.
+///
+/// # Reach: none, today
+///
+/// Measured against the prepass artefacts in
+/// `target/*/build/pyre-jit-trace-*/out/jit_metadata.json`: no
+/// `symbolic_fnaddr_paths` entry names this function and no jitcode carries
+/// its name, and the same holds for its one caller,
+/// `pyframe.rs descr_typecheck_fget_getdictscope`. The codewriter never sees
+/// the call, so `rewrite_op_jit_force_virtualizable` deletes nothing. To
+/// re-derive, read those two lists out of that file and filter them for
+/// `force_virtualizable` and for `getdictscope`.
+///
+/// That is downstream of the missing injection rather than a gap of its own.
+/// Upstream reaches the rewrite because `hook_access_field` puts the marker
+/// at every redirected FIELD access, which lands it inside graphs the
+/// codewriter does look into; a hand-placed marker at one consumer only
+/// reaches it if that consumer happens to be one of those graphs.
+///
+/// The other force sites call [`force_frame`] or
+/// [`force_frame_before_locals_read`] directly, and only two of them sit in
+/// a graph that has a jitcode — `pyframe.rs`
+/// `FrameLocalsProxy::force_locals` and `builtins.rs`
+/// `bytearray_check_exports`. Both want the force to survive there: the
+/// first carries the `vable_token` test itself, the second materializes the
+/// red frame so the collector reads a current `valuestackdepth`. In the rest
+/// the codewriter never looks inside, so a direct call and a deleted marker
+/// come to the same thing.
 #[inline(never)]
 pub fn jit_force_virtualizable(frame: *mut PyFrame) {
     force_frame_before_locals_read(frame);
