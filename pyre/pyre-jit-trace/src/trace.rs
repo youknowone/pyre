@@ -6858,6 +6858,31 @@ pub mod fbw_diag {
     pub const BRIDGE_EC_FROM_PORTAL_RED: usize = 17;
     pub const BRIDGE_EC_MISSING: usize = 18;
 
+    /// An in-flight FOR_ITER item the walk consumed concretely and no leg
+    /// handed back — the iteration it belongs to is LOST.
+    ///
+    /// The walker takes the item out of the stash on an abort and the legacy
+    /// replay is supposed to push it at the loop header. Two refusals stand in
+    /// the way and both end the same way: the R1 never-double guard in
+    /// `fbw_foriter_inflight_take` (a body effect committed since the consume,
+    /// so re-running the body would double it) and the header-state guard in
+    /// `deliver_inflight_foriter_item` (the live frame is not parked at the
+    /// header the item's body pc names, so pushing would corrupt the operand
+    /// stack). Each refusal is correct in isolation — the alternative is a
+    /// double-apply or a wrong stack — and each costs one iteration of the
+    /// caller's loop, which is a WRONG ANSWER rather than a slow one.
+    ///
+    /// Upstream has no counterpart: `_copy_data_from_miframe` always leaves a
+    /// resumable image, so there is no state RPython can abort into that has
+    /// consumed an item it cannot give back.
+    ///
+    /// Its healthy value is exactly zero. `class` in a loop body after an
+    /// unjournaled heap effect is the witness that made it nonzero
+    /// (`class_stmt_after_attr_store_keeps_the_iteration`, 9995 of 10000
+    /// iterations before the class-body qmut abort latched its operand stack);
+    /// nothing in the corpus reaches either refusal today.
+    pub const FORITER_ITEM_DROPPED: usize = 19;
+
     /// The `[jit-stats]` key for each tally slot, in index order, so a slot
     /// cannot be added without naming it and no reader can print a subset of
     /// them by accident.  Both readers join these against `get(i)`:
@@ -6901,6 +6926,7 @@ pub mod fbw_diag {
         "gate_declined_function_entry",
         "bridge_ec_from_portal_red",
         "bridge_ec_missing",
+        "fbw_foriter_item_dropped",
     ];
 
     /// One ring entry per walk: four slots of outcome name (8 ASCII bytes per
@@ -6951,6 +6977,13 @@ pub mod fbw_diag {
 
     pub fn record_gate_declined_function_entry() {
         bump(GATE_DECLINED_FUNCTION_ENTRY);
+    }
+
+    /// Record one consumed FOR_ITER item that no leg handed back.  The
+    /// header-state refusal that produces one of these lives in `pyre-jit`, so
+    /// it reaches the tally the same way the gate refusals above do.
+    pub fn record_foriter_item_dropped() {
+        bump(FORITER_ITEM_DROPPED);
     }
 
     /// Read one slot (out-of-range reads as 0).  Surfaced to the wasm host
