@@ -64,6 +64,7 @@ pub mod tagged_int;
 pub mod tupleobject;
 pub mod typedef;
 pub mod typeobject;
+pub mod unicode_array;
 pub mod unicodeobject;
 pub mod weakref;
 

@@ -10281,7 +10281,7 @@ pub fn is_build_class_builtin(obj: PyObjectRef) -> bool {
         return false;
     }
     let func = unsafe { crate::gateway::builtin_code_get(code) };
-    std::ptr::fn_addr_eq(func, builtin_build_class as crate::gateway::BuiltinCodeFn)
+    crate::gateway::builtin_code_fn_eq(func, builtin_build_class as crate::gateway::BuiltinCodeFn)
 }
 
 /// `str(obj)` → convert to string
@@ -16031,6 +16031,10 @@ pub(crate) fn sort_list_in_place(
     if key_fn.is_none() {
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         unsafe {
+            if pyre_object::listobject::w_list_sort_range(list, reverse) {
+                return Ok(());
+            }
+            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
             if let Some((items, len)) = pyre_object::listobject::w_list_int_items_raw(list) {
                 sort_scalars(std::slice::from_raw_parts_mut(items, len), reverse)?;
                 return Ok(());
@@ -16040,6 +16044,9 @@ pub(crate) fn sort_list_in_place(
                 return Ok(());
             }
             if pyre_object::listobject::w_list_sort_int_or_float(list, reverse) {
+                return Ok(());
+            }
+            if pyre_object::listobject::w_list_sort_strings(list, reverse) {
                 return Ok(());
             }
         }

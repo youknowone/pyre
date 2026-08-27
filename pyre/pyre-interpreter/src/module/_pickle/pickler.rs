@@ -132,6 +132,14 @@ struct PickleCtx {
     memo_slot: usize,
     /// `gc_identity_hash(obj)` → memo indices sharing that hash.
     index: HashMap<usize, Vec<usize>>,
+    /// `str_memo` / `bytes_memo` (interp_pickle.py): value-keyed memos for the
+    /// exact `str` and `bytes` types, consulted before the identity memo.  An
+    /// unboxing list strategy stores the erased rpython string and wraps a
+    /// fresh object per read, so repeated references to one logical value
+    /// reach the identity memo as different objects and would each be written
+    /// where the second belongs as a GET.
+    str_memo: HashMap<Vec<u8>, usize>,
+    bytes_memo: HashMap<Vec<u8>, usize>,
     /// `persistent_id` callable resolved off the pickler (subclass override
     /// or set attribute), or `PY_NULL` when not defined.
     pers_func: PinnedRef,
@@ -163,6 +171,40 @@ impl PickleCtx {
     /// The memo `list`, re-read from its pinned slot (it may have moved).
     fn memo_list(&self) -> PyObjectRef {
         pyre_object::gc_roots::shadow_stack_get(self.memo_slot)
+    }
+
+    /// The `str_memo` / `bytes_memo` key for an exact `str` or `bytes`:
+    /// `space.utf8_w(w_obj)` and `space.bytes_w(w_obj)` respectively.
+    fn value_memo_key(w_obj: PyObjectRef) -> Option<(bool, Vec<u8>)> {
+        unsafe {
+            if pyre_object::is_exact_type(w_obj, &pyre_object::STR_TYPE) {
+                return Some((
+                    true,
+                    pyre_object::unicodeobject::w_str_get_wtf8(w_obj)
+                        .as_bytes()
+                        .to_vec(),
+                ));
+            }
+            if pyre_object::is_exact_type(w_obj, &pyre_object::bytesobject::BYTES_TYPE) {
+                return Some((
+                    false,
+                    pyre_object::bytesobject::w_bytes_data(w_obj).to_vec(),
+                ));
+            }
+        }
+        None
+    }
+
+    /// `interp_pickle.py W_Pickler.save`'s value-based memo lookup, which
+    /// precedes the identity memo.
+    fn value_memo_get(&self, w_obj: PyObjectRef) -> Option<usize> {
+        let (is_str, key) = Self::value_memo_key(w_obj)?;
+        let memo = if is_str {
+            &self.str_memo
+        } else {
+            &self.bytes_memo
+        };
+        memo.get(&key).copied()
     }
 
     fn memo_get(&self, w_obj: PyObjectRef) -> Option<usize> {
@@ -1079,6 +1121,8 @@ fn pickle_core_impl(
     let w_memo = pyre_object::gc_roots::pin_root(w_memo);
     let memo_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let mut index: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut str_memo: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut bytes_memo: HashMap<Vec<u8>, usize> = HashMap::new();
     let n = unsafe { pyre_object::listobject::w_list_len(w_memo) };
     for i in 0..n {
         let o = unsafe { pyre_object::listobject::w_list_getitem(w_memo, i as i64) }.unwrap();
@@ -1091,6 +1135,14 @@ fn pickle_core_impl(
             .entry(pyre_object::gc_hook::gc_identity_hash(o as usize))
             .or_default()
             .push(i);
+        if let Some((is_str, key)) = PickleCtx::value_memo_key(o) {
+            let memo = if is_str {
+                &mut str_memo
+            } else {
+                &mut bytes_memo
+            };
+            memo.insert(key, i);
+        }
     }
 
     let mut ctx = PickleCtx {
@@ -1099,6 +1151,8 @@ fn pickle_core_impl(
         fix_imports,
         memo_slot,
         index,
+        str_memo,
+        bytes_memo,
         pers_func,
         buffer_callback,
         fast,
@@ -1270,8 +1324,9 @@ fn save_object(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) -> Res
             || pyre_object::is_exact_type(w_obj, &pyre_object::INT_TYPE)
             || pyre_object::is_exact_type(w_obj, &pyre_object::FLOAT_TYPE)
     };
-    // Identity memo — a repeated reference becomes a GET back-reference.
-    if !is_atom && let Some(idx) = ctx.memo_get(w_obj) {
+    // Value memo, then identity memo — a repeated reference becomes a GET
+    // back-reference.
+    if !is_atom && let Some(idx) = ctx.value_memo_get(w_obj).or_else(|| ctx.memo_get(w_obj)) {
         write_get(ctx, buf, idx);
         return Ok(());
     }
@@ -2502,8 +2557,17 @@ fn memoize(ctx: &mut PickleCtx, buf: &mut Framer, w_obj: PyObjectRef) {
     // Compute the move-stable hash before the append, whose growth could
     // relocate `w_obj` and leave the local stale.
     let h = pyre_object::gc_hook::gc_identity_hash(w_obj as usize);
+    let value_key = PickleCtx::value_memo_key(w_obj);
     unsafe { pyre_object::listobject::w_list_append(list, w_obj) };
     ctx.index.entry(h).or_default().push(idx);
+    if let Some((is_str, key)) = value_key {
+        let memo = if is_str {
+            &mut ctx.str_memo
+        } else {
+            &mut ctx.bytes_memo
+        };
+        memo.insert(key, idx);
+    }
     if ctx.proto >= 4 {
         buf.push(op::MEMOIZE);
     } else if ctx.bin {

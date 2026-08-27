@@ -42,6 +42,11 @@ fn count_program(n: i64) -> Vec<i64> {
 }
 
 static COMPILES: AtomicU32 = AtomicU32::new(0);
+// Both tests install the same capture-free compile callback, hence share the
+// process-global counter.  Rust runs sibling tests concurrently; keep each
+// reset/run/read interval indivisible just as
+// `jit_interp_halt_arm_post_loop_expression::run` does for its probe.
+static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct VmState {
     regs: Vec<i64>,
@@ -151,6 +156,7 @@ fn clean_interp(program: &Bytecode) -> i64 {
 
 #[test]
 fn a_label_entered_deopt_resumes_at_the_green_pc() {
+    let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for n in [1_000i64, 1_001] {
         let program = count_program(n);
         COMPILES.store(0, Ordering::Relaxed);
@@ -179,6 +185,7 @@ fn a_label_entered_deopt_resumes_at_the_green_pc() {
 /// attributed to the compiled tier rather than to the bytecode or the fixture.
 #[test]
 fn the_same_machine_without_tracing_answers_n() {
+    let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for n in [1_000i64, 1_001] {
         let program = count_program(n);
         COMPILES.store(0, Ordering::Relaxed);

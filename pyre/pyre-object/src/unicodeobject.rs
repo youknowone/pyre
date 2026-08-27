@@ -214,6 +214,46 @@ pub fn w_str_new_managed(s: &str) -> PyObjectRef {
     w_str_from_wtf8_managed(Wtf8Buf::from_string(s.to_string()))
 }
 
+/// Wrap an existing PyPy UTF-8 `rpython str` payload for
+/// `AsciiListStrategy.wrap` (`listobject.py`).  The immutable `_utf8` storage
+/// is shared and only the exact `W_UnicodeObject` wrapper is newly allocated,
+/// just as `space.newutf8(stringval, len(stringval))` does upstream.
+#[majit_macros::dont_look_inside]
+pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let value_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(value as PyObjectRef);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(get_instantiate(&STR_TYPE));
+    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_UNICODE_GC_TYPE_ID, W_UNICODE_OBJECT_SIZE);
+    let value = crate::gc_roots::shadow_stack_get(value_slot) as *mut UnicodeValueStorage;
+    // AsciiListStrategy accepts only `is_ascii()` values, for which the byte
+    // length and code-point length are identical.
+    let len = unsafe { (*value).len() };
+    let body = W_UnicodeObject {
+        ob_header: PyObject {
+            ob_type: &STR_TYPE as *const PyType,
+            w_class: crate::gc_roots::shadow_stack_get(class_slot),
+        },
+        value,
+        byte_len: len,
+        len,
+        w_slots: PY_NULL,
+        index_storage: std::ptr::null_mut(),
+        hash: 0,
+    };
+    if raw.is_null() {
+        crate::lltype::malloc_typed(body) as PyObjectRef
+    } else {
+        unsafe { std::ptr::write(raw as *mut W_UnicodeObject, body) };
+        // `value` may be an existing young GC storage box.  The new wrapper is
+        // born old, so mirror the creation barrier used by
+        // `w_bytes_from_block` before the list drops its array edge.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        raw as PyObjectRef
+    }
+}
+
 /// Allocate a new W_UnicodeObject from a WTF-8 buffer that may carry lone
 /// surrogate code points (produced by surrogateescape / surrogatepass
 /// decoding).  `byte_len` is the WTF-8 byte count, `len` the code point
@@ -847,6 +887,16 @@ pub unsafe fn w_str_get_wtf8(obj: PyObjectRef) -> &'static Wtf8 {
         let str_obj = obj as *const W_UnicodeObject;
         &*(*str_obj).value
     }
+}
+
+/// Return the erased UTF-8 `rpython str` stored by PyPy's
+/// `AsciiListStrategy`.
+///
+/// # Safety
+/// `obj` must point to a valid exact `W_UnicodeObject`.
+#[inline]
+pub unsafe fn w_str_storage(obj: PyObjectRef) -> *mut UnicodeValueStorage {
+    unsafe { (*(obj as *const W_UnicodeObject)).value }
 }
 
 /// Object-space entry to [`W_UnicodeObject::eq_w`].

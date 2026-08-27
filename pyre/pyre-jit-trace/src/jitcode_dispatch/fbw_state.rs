@@ -1395,7 +1395,11 @@ pub(crate) fn fbw_store_journal_rollback() {
                             }
                             pyre_object::listobject::ListStrategy::Float
                             | pyre_object::listobject::ListStrategy::Empty
-                            | pyre_object::listobject::ListStrategy::Bytes => {
+                            | pyre_object::listobject::ListStrategy::Size
+                            | pyre_object::listobject::ListStrategy::SimpleRange
+                            | pyre_object::listobject::ListStrategy::Range
+                            | pyre_object::listobject::ListStrategy::Bytes
+                            | pyre_object::listobject::ListStrategy::Ascii => {
                                 crate::trace::fbw_diag::bump(
                                     crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED,
                                 );
@@ -1442,9 +1446,15 @@ pub(crate) fn fbw_store_journal_rollback() {
                     // Empty never enters the append journal (no spare-capacity
                     // fold path records it); nothing to rewind.
                     pyre_object::listobject::ListStrategy::Empty => {}
+                    pyre_object::listobject::ListStrategy::Size => {}
+                    // BaseRangeListStrategy append materialises before the
+                    // append, so compact range storage is never journalled.
+                    pyre_object::listobject::ListStrategy::SimpleRange => {}
+                    pyre_object::listobject::ListStrategy::Range => {}
                     // Bytes append does not enter this journal until the
                     // walker has a BytesBlock store emitter.
                     pyre_object::listobject::ListStrategy::Bytes => {}
+                    pyre_object::listobject::ListStrategy::Ascii => {}
                 }
                 pyre_object::listobject::w_list_set_allocated(list, allocated_before);
             }

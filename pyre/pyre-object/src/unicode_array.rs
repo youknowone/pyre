@@ -1,28 +1,28 @@
 use std::ops::{Index, IndexMut};
 
-use crate::bytesobject::BytesBlock;
 use crate::object_array::{
     ItemsBlock, alloc_list_items_block_gc, dealloc_list_items_block, items_block_capacity,
     items_block_items_base,
 };
 use crate::pyobject::PyObjectRef;
+use rustpython_wtf8::Wtf8Buf;
 
-/// PyPy `BytesListStrategy`'s erased `[rpython str]` storage.
+/// PyPy `AsciiListStrategy`'s erased `[rpython str]` storage.
 ///
-/// Each entry is the GC pointer to a `BytesBlock`, not a boxed
-/// `W_BytesObject`.  `ItemsBlock` is the runtime's `GcArray(GCREF)` shape, so
+/// Each entry is the GC pointer to a `Wtf8Buf`, not a boxed
+/// `W_UnicodeObject`.  `ItemsBlock` is the runtime's `GcArray(GCREF)` shape, so
 /// its existing varsize trace forwards both the backing block and every raw
 /// string pointer it contains.
 #[repr(C)]
-pub struct BytesArray {
+pub struct UnicodeArray {
     pub block: *mut ItemsBlock,
     len: usize,
 }
 
-pub const BYTES_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(BytesArray, block);
-pub const BYTES_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(BytesArray, len);
+pub const UNICODE_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(UnicodeArray, block);
+pub const UNICODE_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(UnicodeArray, len);
 
-impl BytesArray {
+impl UnicodeArray {
     #[inline]
     fn base(&self) -> *mut PyObjectRef {
         unsafe { items_block_items_base(self.block) }
@@ -35,7 +35,7 @@ impl BytesArray {
         }
     }
 
-    pub fn from_vec(values: Vec<*const BytesBlock>) -> Self {
+    pub fn from_vec(values: Vec<*const Wtf8Buf>) -> Self {
         let mut refs = Vec::with_capacity(values.len());
         for value in values {
             refs.push(value as PyObjectRef);
@@ -47,7 +47,7 @@ impl BytesArray {
         }
     }
 
-    /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for bytes.
+    /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for ASCII text.
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {
             return Self::empty();
@@ -71,7 +71,7 @@ impl BytesArray {
         self.block = crate::gc_roots::shadow_stack_get(slot) as *mut ItemsBlock;
     }
 
-    pub fn install(&mut self, fresh: BytesArray) {
+    pub fn install(&mut self, fresh: UnicodeArray) {
         let _roots = crate::gc_roots::push_roots();
         let slot = fresh.pin_block();
         *self = fresh;
@@ -110,17 +110,17 @@ impl BytesArray {
     /// `W_ListObject` — the only object through which a collection reaches it.
     /// An old-gen owner that gains that edge without being on the remembered
     /// set is skipped by the minor collection that would forward the block, and
-    /// the block, along with every `BytesBlock` reachable only through it, is
-    /// reclaimed while the list still names it. `BytesArray` cannot reach its
+    /// the block, along with every `Wtf8Buf` reachable only through it, is
+    /// reclaimed while the list still names it. `UnicodeArray` cannot reach its
     /// owner to barrier it, so it never allocates a block: the list reserves
-    /// room through `W_ListObject::bytes_grow`, which barriers on both sides of
+    /// room through `W_ListObject::ascii_grow`, which barriers on both sides of
     /// the allocation. Refuse loudly rather than grow behind the owner's back.
     #[inline]
     fn assert_room(&self, additional: usize) {
         assert!(
             self.len + additional <= self.capacity(),
-            "BytesArray needs {additional} more slot(s) than its capacity {}; \
-             reserve through W_ListObject::bytes_grow first",
+            "UnicodeArray needs {additional} more slot(s) than its capacity {}; \
+             reserve through W_ListObject::ascii_grow first",
             self.capacity(),
         );
     }
@@ -132,7 +132,7 @@ impl BytesArray {
         }
     }
 
-    pub fn push(&mut self, value: *const BytesBlock) {
+    pub fn push(&mut self, value: *const Wtf8Buf) {
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
@@ -152,19 +152,19 @@ impl BytesArray {
         self.len == 0
     }
 
-    pub fn as_slice(&self) -> &[*const BytesBlock] {
-        unsafe { std::slice::from_raw_parts(self.base() as *const *const BytesBlock, self.len) }
+    pub fn as_slice(&self) -> &[*const Wtf8Buf] {
+        unsafe { std::slice::from_raw_parts(self.base() as *const *const Wtf8Buf, self.len) }
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [*const BytesBlock] {
-        unsafe { std::slice::from_raw_parts_mut(self.base() as *mut *const BytesBlock, self.len) }
+    pub fn as_mut_slice(&mut self) -> &mut [*const Wtf8Buf] {
+        unsafe { std::slice::from_raw_parts_mut(self.base() as *mut *const Wtf8Buf, self.len) }
     }
 
-    pub fn to_vec(&self) -> Vec<*const BytesBlock> {
+    pub fn to_vec(&self) -> Vec<*const Wtf8Buf> {
         self.as_slice().to_vec()
     }
 
-    pub fn insert(&mut self, index: usize, value: *const BytesBlock) {
+    pub fn insert(&mut self, index: usize, value: *const Wtf8Buf) {
         assert!(index <= self.len);
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
@@ -179,7 +179,7 @@ impl BytesArray {
         self.len += 1;
     }
 
-    pub fn set(&mut self, index: usize, value: *const BytesBlock) {
+    pub fn set(&mut self, index: usize, value: *const Wtf8Buf) {
         assert!(index < self.len);
         let _roots = crate::gc_roots::push_roots();
         let slot = crate::gc_roots::shadow_stack_len();
@@ -188,7 +188,7 @@ impl BytesArray {
         unsafe { *self.base().add(index) = crate::gc_roots::shadow_stack_get(slot) };
     }
 
-    pub fn remove(&mut self, index: usize) -> *const BytesBlock {
+    pub fn remove(&mut self, index: usize) -> *const Wtf8Buf {
         assert!(index < self.len);
         let value = self.as_slice()[index];
         unsafe {
@@ -200,7 +200,7 @@ impl BytesArray {
         value
     }
 
-    pub fn pop(&mut self) -> *const BytesBlock {
+    pub fn pop(&mut self) -> *const Wtf8Buf {
         assert!(self.len > 0);
         let value = self.as_slice()[self.len - 1];
         self.len -= 1;
@@ -212,7 +212,7 @@ impl BytesArray {
         self.as_mut_slice().reverse();
     }
 
-    pub fn splice(&mut self, start: usize, remove_count: usize, values: &[*const BytesBlock]) {
+    pub fn splice(&mut self, start: usize, remove_count: usize, values: &[*const Wtf8Buf]) {
         let old_len = self.len;
         let start = start.min(old_len);
         let removed = remove_count.min(old_len - start);
@@ -224,8 +224,8 @@ impl BytesArray {
         }
         assert!(
             new_len <= self.capacity(),
-            "BytesArray splice needs {new_len} slots but capacity is {}; \
-             reserve through W_ListObject::bytes_grow first",
+            "UnicodeArray splice needs {new_len} slots but capacity is {}; \
+             reserve through W_ListObject::ascii_grow first",
             self.capacity(),
         );
         self.barrier();
@@ -276,21 +276,21 @@ impl BytesArray {
     }
 }
 
-impl Drop for BytesArray {
+impl Drop for UnicodeArray {
     fn drop(&mut self) {
         unsafe { dealloc_list_items_block(self.block) };
     }
 }
 
-impl Index<usize> for BytesArray {
-    type Output = *const BytesBlock;
+impl Index<usize> for UnicodeArray {
+    type Output = *const Wtf8Buf;
 
     fn index(&self, index: usize) -> &Self::Output {
         &self.as_slice()[index]
     }
 }
 
-impl IndexMut<usize> for BytesArray {
+impl IndexMut<usize> for UnicodeArray {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.as_mut_slice()[index]
     }

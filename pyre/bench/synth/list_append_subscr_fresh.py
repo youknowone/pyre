@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=20
-# A fresh empty list promoted by append has a trace-allocated typed backing
-# block. The following subscript may revisit that symbolic block through
-# W_ListObject.int_items.block before compiled execution gives it a real pointer.
+# A fresh empty list promoted by append takes RPython's first 0 -> 4 backing
+# grow. The following subscript revisits that block through
+# W_ListObject.int_items.block after the grow helper updates the owner field.
 
 
 def f(n):

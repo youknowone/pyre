@@ -2226,6 +2226,28 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // AsciiListStrategy stores exact ASCII `_utf8` rpython-string
+            // pointers in the same GcArray(GCREF) representation.
+            (
+                "ascii_items.len",
+                std::mem::offset_of!(W_ListObject, ascii_items)
+                    + pyre_object::unicode_array::UNICODE_ARRAY_LEN_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "ascii_items.block",
+                std::mem::offset_of!(W_ListObject, ascii_items)
+                    + pyre_object::unicode_array::UNICODE_ARRAY_BLOCK_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_ListObject",
         "listobject::W_ListObject",
@@ -4160,6 +4182,14 @@ pub fn list_bytes_items_len_descr() -> DescrRef {
 
 pub fn list_bytes_items_block_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 11)
+}
+
+pub fn list_ascii_items_len_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 12)
+}
+
+pub fn list_ascii_items_block_descr() -> DescrRef {
+    field_descr_from_group(&W_LIST_DESCR_GROUP, 13)
 }
 
 pub fn list_w_class_descr() -> DescrRef {
@@ -6155,6 +6185,12 @@ mod tests {
                 list_bytes_items_block_descr(),
                 Type::Ref,
             ),
+            ("ascii_items.len", list_ascii_items_len_descr(), Type::Int),
+            (
+                "ascii_items.block",
+                list_ascii_items_block_descr(),
+                Type::Ref,
+            ),
         ] {
             let descr = make_descr_from_bh(&BhDescr::Field {
                 offset: 0,
@@ -6194,6 +6230,7 @@ mod tests {
             ("int_items", list_int_items_block_descr()),
             ("float_items", list_float_items_block_descr()),
             ("bytes_items", list_bytes_items_block_descr()),
+            ("ascii_items", list_ascii_items_block_descr()),
         ] {
             let descr = make_descr_from_bh(&BhDescr::Field {
                 offset: 0,
@@ -6276,6 +6313,10 @@ mod tests {
         assert!(list_gc_offsets.contains(
             &(std::mem::offset_of!(W_ListObject, bytes_items)
                 + pyre_object::bytes_array::BYTES_ARRAY_BLOCK_OFFSET)
+        ));
+        assert!(list_gc_offsets.contains(
+            &(std::mem::offset_of!(W_ListObject, ascii_items)
+                + pyre_object::unicode_array::UNICODE_ARRAY_BLOCK_OFFSET)
         ));
     }
 
@@ -7429,6 +7470,8 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "float_items.block" => return list_float_items_block_descr(),
                     "bytes_items.len" => return list_bytes_items_len_descr(),
                     "bytes_items.block" => return list_bytes_items_block_descr(),
+                    "ascii_items.len" => return list_ascii_items_len_descr(),
+                    "ascii_items.block" => return list_ascii_items_block_descr(),
                     // A bare `int_items` / `float_items` read addresses the
                     // typed-storage struct base, which is its first field
                     // (`block`, `INT_ARRAY_BLOCK_OFFSET == 0`) — the same
@@ -7439,6 +7482,7 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     "int_items" => return list_int_items_block_descr(),
                     "float_items" => return list_float_items_block_descr(),
                     "bytes_items" => return list_bytes_items_block_descr(),
+                    "ascii_items" => return list_ascii_items_block_descr(),
                     // The `w_list_append` body's `match list.strategy` reads the
                     // header `strategy` field directly.  The codewriter resolves
                     // its offset but produces a `SimpleFieldDescr` with no

@@ -1225,6 +1225,12 @@ pub unsafe fn mapdict_strategy_repr(obj: PyObjectRef) -> Option<rustpython_wtf8:
     if !unsafe { has_mapdict_layout(obj) } {
         return None;
     }
+    // `user_setup` installs the type's terminator as part of building the
+    // instance, so an object carrying the mixin never holds a null map and
+    // `strategy()` always has one to describe.  pyre installs it on first
+    // touch instead, which would otherwise make an untouched instance report
+    // nothing and raise `TypeError` for the caller.
+    unsafe { ensure_mapdict_initialized(obj) };
     let map = unsafe { mapdict_carrier(obj) }._get_mapdict_map();
     if map.is_null() {
         None

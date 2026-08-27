@@ -1809,6 +1809,10 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         let len = w_list_len(obj) as i64;
         let (start, _stop, step, slicelength) =
             crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+        // BaseRangeListStrategy.getslice materialises the receiver before
+        // delegating to IntegerListStrategy, even though slicing is otherwise
+        // a read-only operation.
+        obj = pyre_object::listobject::w_list_materialize_range(obj);
         let mut items = Vec::new();
         let mut i = start;
         for n in 0..slicelength {
@@ -4663,17 +4667,17 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
                 && pyre_object::bytesobject::w_bytes_getitem(w_one, 0)
                     == pyre_object::bytesobject::w_bytes_getitem(w_two, 0);
         }
-        // `W_UnicodeObject.is_w` (unicodeobject.py): `_len()` is the
-        // codepoint count. When it is > 1, upstream returns `s1 is s2`
-        // (utf8 storage identity) — distinct `str`s never share storage, so
-        // `false`; when it is <= 1 (unique-ified) it returns `s1 == s2`,
-        // i.e. WTF-8 byte equality. `str` subclasses keep pointer identity
-        // through the exact-type gate.
+        // `W_UnicodeObject.is_w` (unicodeobject.py): strings longer than one
+        // code point use `_utf8` storage identity; AsciiListStrategy
+        // deliberately re-wraps that same storage. Zero- and one-code-point
+        // strings are unique-ified and compare by value.
+        // `str` subclasses keep pointer identity through the exact-type gate.
         if pyre_object::pyobject::is_exact_type(w_one, &pyre_object::pyobject::STR_TYPE)
             && pyre_object::pyobject::is_exact_type(w_two, &pyre_object::pyobject::STR_TYPE)
         {
             if pyre_object::unicodeobject::w_str_len(w_one) > 1 {
-                return false;
+                return pyre_object::unicodeobject::w_str_storage(w_one)
+                    == pyre_object::unicodeobject::w_str_storage(w_two);
             }
             return pyre_object::unicodeobject::w_str_get_wtf8(w_one)
                 == pyre_object::unicodeobject::w_str_get_wtf8(w_two);
@@ -14070,8 +14074,10 @@ fn _unpackiterable_unknown_length(
     let w_iterator = || pyre_object::gc_roots::shadow_stack_get(root_base);
     // baseobjspace.py — `try: items = newlist_hint(length_hint(...))
     // except MemoryError: items = []`.
-    let _ = length_hint(w_iterable, 0)?;
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::listobject::w_list_new_empty());
+    let sizehint = length_hint(w_iterable, 0)?;
+    let _ = pyre_object::gc_roots::pin_root(
+        pyre_object::listobject::w_list_new_object_with_sizehint(sizehint),
+    );
     // The slot index is computed once here, not at the append below.  Spelled
     // `root_base + 1` inside the drain's `Ok` arm, the addition lands in the
     // arm's own block ahead of the call, and the link out of that block then
@@ -18151,6 +18157,34 @@ pub(crate) unsafe fn generator_frame_is_finished(
     crate::executioncontext::may_ignore_finalizer(gen_obj);
 }
 
+/// CPython 3.14 `gen_close` / `_PyFrame_ClearExceptCode`: releasing the
+/// generator frame is an observable refcount boundary, so an object whose
+/// last reference was a frame local runs `__del__` before the following
+/// opcode.  PyPy's `GeneratorIterator.frame_is_finished` only drops
+/// `self.frame` and lets its tracing GC discover the local later.  Keep that
+/// frame-clearing shape, then run the existing non-moving reachability pass
+/// and drain its queue before returning to the caller.  Deferring this through
+/// `UserDelAction.fire()` is too late: a test method can read the class flag in
+/// the very next opcode.  The non-moving collector follows `do_collect_full`'s
+/// explicit-collection shape — finish an older incremental cycle, then take a
+/// fresh root snapshot — so the pass observes the frame release even when a
+/// major was already in progress.  The pending-finalizer census avoids paying
+/// for a collection when no application callback could be observed.
+///
+/// The PyPy load-bearing-hint census around `GeneratorIterator` finds only
+/// `_immutable_fields_ = ['pycode']` and `rgc.may_ignore_finalizer(self)`;
+/// neither governs the released locals or their finalization timing.
+pub(crate) fn generator_close_finalizer_boundary() {
+    if !majit_gc::gc_has_pending_finalizers() {
+        return;
+    }
+    let action = crate::executioncontext::space_user_del_action();
+    if !action.is_null() {
+        pyre_object::gc_hook::try_gc_collect_oldgen();
+        unsafe { (*action)._run_finalizers() };
+    }
+}
+
 /// generator.py `_invoke_execute_frame`: install the generator's
 /// exception state, execute its already-entered frame resume, finish the frame
 /// on errors, and perform the common frame/running/EC cleanup in `finally`.
@@ -18690,6 +18724,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
                 w_generator_set_exhausted(gen_obj);
             } else {
                 generator_frame_is_finished(gen_obj, &mut *frame_ptr);
+                generator_close_finalizer_boundary();
             }
             return Ok(w_none());
         }
@@ -18715,6 +18750,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // unlike a Python handler, no PUSH_EXC_INFO will clear the
             // temporary propagation root for us.
             crate::eval::set_in_flight_exception(PY_NULL);
+            generator_close_finalizer_boundary();
             value
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => {
@@ -18722,6 +18758,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // GeneratorExit after matching it.  Mirror PUSH_EXC_INFO's
             // ownership transfer by ending pyre's propagation root here.
             crate::eval::set_in_flight_exception(PY_NULL);
+            generator_close_finalizer_boundary();
             Ok(w_none())
         }
         Err(e) => Err(e),
@@ -20083,6 +20120,29 @@ pub fn dict_move_to_end(obj: PyObjectRef, key: PyObjectRef, last: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_is_w_uses_codepoint_count_and_shared_storage() {
+        crate::test_hooks::install_hash_hook();
+
+        // PyPy unique-ifies one-code-point strings by value even when their
+        // UTF-8 representation occupies multiple bytes.
+        let non_ascii_one = pyre_object::unicodeobject::w_str_new_managed("é");
+        let non_ascii_one_again = pyre_object::unicodeobject::w_str_new_managed("é");
+        assert!(is_w(non_ascii_one, non_ascii_one_again));
+
+        // Longer strings compare their erased `_utf8` storage, which is what
+        // AsciiListStrategy preserves while allocating fresh wrappers.
+        let original = pyre_object::unicodeobject::w_str_new_managed("ascii");
+        let shared = unsafe {
+            pyre_object::unicodeobject::w_str_from_storage(
+                pyre_object::unicodeobject::w_str_storage(original),
+            )
+        };
+        let distinct = pyre_object::unicodeobject::w_str_new_managed("ascii");
+        assert!(is_w(original, shared));
+        assert!(!is_w(original, distinct));
+    }
 
     #[test]
     fn call_expands_packed_arguments_and_keywords() {

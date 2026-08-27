@@ -842,18 +842,33 @@ pub(crate) fn deque_repeat(
     let self_obj = pyre_object::gc_roots::shadow_stack_get(roots);
     let base = snapshot(self_obj);
     // interp_deque.py W_Deque.mul: ovfcheck(self.len * num) raises
-    // MemoryError.  `try_reserve_exact` is the implicit allocation edge that
-    // follows the explicit overflow check in the RPython body.
-    let total = base
-        .len()
-        .checked_mul(num)
-        .ok_or_else(|| crate::PyError::memory_error(""))?;
+    // MemoryError.  `ovfcheck` guards a machine-signed multiplication, so the
+    // edge is `isize` rather than the `usize` the accumulator counts in.
+    if num > 0 && base.len() > (isize::MAX as usize) / num {
+        return Err(crate::PyError::memory_error(""));
+    }
+    // `copied = W_Deque(space); copied.maxlen = self.maxlen`, then
+    // `for _ in range(num): copied.extend(self)`.  Every `append` behind that
+    // `extend` runs `trimleft`, so the copy never holds more than `maxlen`
+    // items at any point; materialising the whole product and trimming once
+    // at the end is what makes a bounded deque times a large count exhaust
+    // memory instead of answering.
+    let maxlen = maxlen_bound(self_obj);
+    let total = base.len() * num;
     let mut items = Vec::new();
     items
-        .try_reserve_exact(total)
+        .try_reserve_exact(match maxlen {
+            Some(m) => total.min(m.saturating_add(base.len())),
+            None => total,
+        })
         .map_err(|_| crate::PyError::memory_error(""))?;
     for _ in 0..num {
         items.extend_from_slice(&base);
+        if let Some(m) = maxlen
+            && items.len() > m
+        {
+            items.drain(0..items.len() - m);
+        }
     }
     let ty = unsafe { w_instance_get_type(self_obj) };
     let list = w_list_new(items);
@@ -1345,24 +1360,33 @@ impl W_Deque {
             store(self_obj, vec![]);
             return Ok(self_obj);
         }
-        // interp_deque.py W_Deque.imul: ovfcheck(self.len * num), followed by
-        // the allocation's implicit MemoryError edge.
+        // interp_deque.py W_Deque.imul: ovfcheck(self.len * num), whose
+        // machine-signed multiplication puts the edge at `isize`.
         let repeat = num as usize;
-        let total = base
-            .len()
-            .checked_mul(repeat)
-            .ok_or_else(|| crate::PyError::memory_error(""))?;
+        if base.len() > (isize::MAX as usize) / repeat {
+            return Err(crate::PyError::memory_error(""));
+        }
+        // `copy` is a `maxlen`-bounded copy of self and `self.extend(copy)`
+        // runs `num - 1` times.  self is already trimmed, and every `append`
+        // behind `extend` trims again, so it never holds more than `maxlen`
+        // items — the product is never materialised.
+        let maxlen = maxlen_bound(self_obj);
+        let total = base.len() * repeat;
         let mut items = Vec::new();
         items
-            .try_reserve_exact(total)
+            .try_reserve_exact(match maxlen {
+                Some(m) => total.min(m.saturating_add(base.len())),
+                None => total,
+            })
             .map_err(|_| crate::PyError::memory_error(""))?;
-        for _ in 0..repeat {
+        items.extend_from_slice(&base);
+        for _ in 0..repeat - 1 {
             items.extend_from_slice(&base);
-        }
-        if let Some(m) = maxlen_bound(self_obj)
-            && items.len() > m
-        {
-            items.drain(0..items.len() - m);
+            if let Some(m) = maxlen
+                && items.len() > m
+            {
+                items.drain(0..items.len() - m);
+            }
         }
         store(self_obj, items);
         Ok(self_obj)

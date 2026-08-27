@@ -7135,15 +7135,35 @@ impl MiniMarkGC {
         self.oldgen_nonmoving_active = true;
         self.oldgen_nonmoving_young_marks.clear();
 
-        if self.gc_state == GcState::Scanning {
-            self.start_incremental_cycle();
+        // `do_collect_full` / incminimark.py `gc_step_until` first finishes
+        // an in-progress major, then starts a fresh cycle whose root snapshot
+        // is taken at the explicit collection boundary.  The non-moving twin
+        // owes the same ordering: merely finishing an older cycle can retain
+        // an object which became unreachable after that cycle began.
+        if self.gc_state != GcState::Scanning {
+            self.gc_step_until_scanning();
+            self.clear_oldgen_nonmoving_young_marks();
         }
+        self.start_incremental_cycle();
         // Keep this oldgen-only entry stop-the-world: it may enter while
         // MARKING or SWEEPING, but always returns after the complete cycle.
         self.gc_step_until_scanning();
 
         // Strictly-last: clear VISITED on every young object greyed this cycle
         // (the oldgen sweep already cleared it on old-gen survivors).
+        self.clear_oldgen_nonmoving_young_marks();
+        self.oldgen_nonmoving_active = false;
+
+        // This entry has no upstream counterpart, but it is a public collection
+        // entry point and it can queue mirrors, so it owes the same schedule.
+        self.rrc_invoke_callback();
+    }
+
+    /// Clear the nursery VISITED bits accumulated by one non-moving major.
+    /// A fresh explicit cycle must begin with those bits clear or its marker
+    /// will mistake the preceding cycle's young survivors for already-traced
+    /// objects and skip their old-generation children.
+    fn clear_oldgen_nonmoving_young_marks(&mut self) {
         let marks = std::mem::take(&mut self.oldgen_nonmoving_young_marks);
         for addr in marks {
             // Nothing moved and nothing young was freed, so each addr is still
@@ -7154,11 +7174,6 @@ impl MiniMarkGC {
                 unsafe { (*hdr).clear_flag(flags::VISITED) };
             }
         }
-        self.oldgen_nonmoving_active = false;
-
-        // This entry has no upstream counterpart, but it is a public collection
-        // entry point and it can queue mirrors, so it owes the same schedule.
-        self.rrc_invoke_callback();
     }
 
     fn gc_step_until_scanning(&mut self) {
@@ -13809,6 +13824,32 @@ cache size\t: 8192 kB\n";
         assert!(unsafe { !(*q_hdr).has_flag(flags::VISITED) });
 
         gc.roots.clear();
+    }
+
+    /// An explicit non-moving collection must use roots observed at the call,
+    /// not merely finish an incremental cycle whose root snapshot predates a
+    /// release.  This is the non-moving counterpart of `do_collect_full`'s
+    /// initial `gc_step_until_scanning_with_minors` followed by a fresh cycle.
+    #[test]
+    fn nonmoving_major_starts_fresh_after_finishing_an_in_progress_cycle() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let object = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
+        let mut root = object;
+        unsafe { gc.roots.add(&mut root) };
+
+        // Seed the in-progress cycle while `object` is live, then release it.
+        gc.major_collection_step();
+        assert_ne!(gc.gc_state, GcState::Scanning);
+        gc.roots.clear();
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert_eq!(
+            gc.oldgen.object_count(),
+            0,
+            "the explicit collection's fresh root snapshot must sweep object"
+        );
     }
 
     /// A non-moving major must run `invalidate_old_weakrefs` (reads the

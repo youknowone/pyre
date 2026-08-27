@@ -5079,8 +5079,16 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
         // The generic residual constructs the erased rpython-string array.
         // The walker has no BytesBlock payload emitter yet.
         ListStrategy::Bytes => return Ok(None),
-        // Empty is impossible here (len >= 1); decline defensively.
-        ListStrategy::Empty => return Ok(None),
+        // The generic residual constructs AsciiListStrategy's erased UTF-8
+        // storage; the walker has no raw UnicodeValueStorage emitter yet.
+        ListStrategy::Ascii => return Ok(None),
+        // Empty is impossible here (len >= 1); decline defensively. Range
+        // storage is built only by the interpreter-internal `make_range_list`
+        // seam and has no walker-native erased-tuple emitter yet.
+        ListStrategy::Empty
+        | ListStrategy::Size
+        | ListStrategy::SimpleRange
+        | ListStrategy::Range => return Ok(None),
     };
 
     // Concrete shadow: a fresh list built from the element shadows
@@ -13292,7 +13300,8 @@ unsafe fn orthodox_list_append_recognize(
         let obj_ok = !value.is_null()
             && !pyre_object::is_plain_int1(value)
             && !pyre_object::is_float_strategy_item(value)
-            && !pyre_object::pyobject::is_exact_type(value, &pyre_object::bytesobject::BYTES_TYPE);
+            && !pyre_object::is_bytes_strategy_item(value)
+            && !pyre_object::is_ascii_strategy_item(value);
         if !int_ok && !float_ok && !obj_ok {
             return None;
         }
@@ -13520,7 +13529,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     sub_body: &SubJitCodeBody,
     self_ref: OpRef,
     value_op: OpRef,
-    inner_self: pyre_object::PyObjectRef,
+    mut inner_self: pyre_object::PyObjectRef,
     value: pyre_object::PyObjectRef,
     len_before: usize,
 ) -> Result<(), DispatchError> {
@@ -13577,12 +13586,16 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(strategy_ref, expected);
         // Emit the transition IR mutating the existing wrapper (helpers.rs).
-        // The emitter seeds the new block's capacity getfield cache so the
-        // append body sub-walk's spare-capacity `0 < capacity` check folds.
+        // It stages the same first 0 -> 4 RPython grow as the concrete helper,
+        // leaving the append body to record the length/item stores.
         crate::helpers::emit_promote_empty_list_inline(ctx.trace_ctx, self_ref, target);
         // Concrete promotion of the real list, then journal so a non-commit
         // walk rolls back to Empty.
-        unsafe { pyre_object::w_list_switch_to_strategy_for(inner_self, value) };
+        inner_self = unsafe { pyre_object::w_list_switch_to_strategy_for(inner_self, value) };
+        ctx.trace_ctx.set_opref_concrete(
+            self_ref,
+            majit_ir::Value::Ref(majit_ir::GcRef(inner_self as usize)),
+        );
         fbw_append_promote_journal_push(inner_self);
     }
 

@@ -59,13 +59,43 @@ fn set_contextvar_context(args: &[pyre_object::PyObjectRef]) -> crate::PyResult 
 /// `sizehint` items.
 ///
 /// The hint names a storage length, not a length, so what comes back is `[]`.
-/// A list here grows its block as it is appended to and carries no capacity
-/// that can be set before the first item, so the number is read -- upstream
-/// unwraps it as an `int` and a caller passing something else is owed the
-/// error -- and nothing else is done with it.
+/// SizeListStrategy retains it without allocating; the first append chooses
+/// the concrete strategy and asks its `get_empty_storage(sizehint)` for the
+/// exact backing capacity.
 fn newlist_hint(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
-    let _sizehint = crate::baseobjspace::int_w(args[0])?;
-    Ok(pyre_object::w_list_new(Vec::new()))
+    let sizehint = crate::baseobjspace::int_w(args[0])?;
+    isize::try_from(sizehint)
+        .map_err(|_| crate::PyError::overflow_error("integer does not fit in signed word"))?;
+    Ok(pyre_object::listobject::w_list_new_with_sizehint(sizehint))
+}
+
+/// `interp_magic.py resizelist_hint`: forward to the live list strategy.
+fn resizelist_hint(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let w_list = args[0];
+    if !unsafe { pyre_object::is_list(w_list) } {
+        return Err(crate::PyError::type_error("arg 1 must be a 'list'"));
+    }
+    let sizehint = crate::baseobjspace::int_w(args[1])?;
+    isize::try_from(sizehint)
+        .map_err(|_| crate::PyError::overflow_error("integer does not fit in signed word"))?;
+    if !unsafe { pyre_object::listobject::w_list_resize_hint(w_list, sizehint) } {
+        return Err(crate::PyError::memory_error(""));
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// `interp_magic.py list_get_physical_size`.
+fn list_get_physical_size(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
+    let w_list = args[0];
+    if !unsafe { pyre_object::is_list(w_list) } {
+        return Err(crate::PyError::type_error("expected list"));
+    }
+    let Some(size) = (unsafe { pyre_object::listobject::w_list_physical_size(w_list) }) else {
+        return Err(crate::PyError::value_error(
+            "can't get physical size of list",
+        ));
+    };
+    Ok(pyre_object::w_int_new(size as i64))
 }
 
 /// `interp_magic.py add_memory_pressure`: report a raw allocation to
@@ -276,6 +306,8 @@ crate::py_module! {
         "set_contextvar_context" / 1 = set_contextvar_context,
         "add_memory_pressure" / 1 = add_memory_pressure,
         "newlist_hint" / 1 = newlist_hint,
+        "resizelist_hint" / 2 = resizelist_hint,
+        "list_get_physical_size" / 1 = list_get_physical_size,
         "reversed_dict" / 1 = reversed_dict,
         "move_to_end" / * = move_to_end,
         "objects_in_repr" / 0 = objects_in_repr,

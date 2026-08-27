@@ -857,8 +857,10 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyre_object::listobject::jit_drain_list_append,
     );
 
-    // The drain's prologue (`w_list_new_empty`) wraps opaque host plumbing and
-    // has a one-word return, so publish it as a residual-call target.
+    // The drain's prologue (`w_list_new_object_with_sizehint`) wraps opaque
+    // host plumbing and has a one-word return, so publish it as a
+    // residual-call target. Keep `w_list_new_empty` registered for its other
+    // residual sites.
     // `w_list_new_object` is residualized (`#[dont_look_inside]`) but was
     // unregistered; bind it too so any direct residual site resolves.
     let w_list_new_empty: fn() -> pyre_object::PyObjectRef =
@@ -870,6 +872,19 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         w_list_new_empty,
     );
     p0(&mut entries, "w_list_new_empty", w_list_new_empty);
+    let w_list_new_object_with_sizehint: fn(i64) -> pyre_object::PyObjectRef =
+        pyre_object::listobject::w_list_new_object_with_sizehint;
+    pa1(
+        &mut entries,
+        "pyre_object::listobject::w_list_new_object_with_sizehint",
+        "pyre_object::w_list_new_object_with_sizehint",
+        w_list_new_object_with_sizehint,
+    );
+    p1(
+        &mut entries,
+        "w_list_new_object_with_sizehint",
+        w_list_new_object_with_sizehint,
+    );
     let w_none: fn() -> pyre_object::PyObjectRef = pyre_object::noneobject::w_none;
     pa0(
         &mut entries,

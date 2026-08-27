@@ -7,7 +7,7 @@ use crate::object_array::{
     typed_items_block_capacity,
 };
 
-pub const FLOAT_ARRAY_INLINE_CAP: usize = 8;
+pub const FLOAT_ARRAY_INLINE_CAP: usize = 4;
 
 /// Unboxed `float` list storage — `listobject.py` FloatListStrategy
 /// `lstorage = erase([float])`, i.e. a `Ptr(GcArray(Float))`.
@@ -88,6 +88,17 @@ impl FloatArray {
         arr
     }
 
+    /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for floats.
+    pub fn with_capacity(capacity: usize) -> Self {
+        if capacity == 0 {
+            return Self::empty();
+        }
+        Self {
+            block: unsafe { alloc_typed_items_block(capacity, gc_float_array_gc_type_id()) },
+            len: AtomicUsize::new(0),
+        }
+    }
+
     /// Pin `block` on the shadow stack and return its slot. The
     /// [`crate::int_array::IntArray::pin_block`] twin — see it for why an
     /// old-gen, non-moving block still has to be rooted before the next GC
@@ -160,8 +171,10 @@ impl FloatArray {
     }
 
     fn grow(&mut self, min_cap: usize) {
+        let extra = if min_cap < 9 { 3 } else { 6 };
         let target_cap = min_cap
-            .max(self.capacity().saturating_mul(2))
+            .saturating_add(extra)
+            .saturating_add(min_cap >> 3)
             .max(FLOAT_ARRAY_INLINE_CAP);
         self.block = unsafe {
             grow_typed_items_block(

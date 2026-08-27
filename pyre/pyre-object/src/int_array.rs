@@ -10,7 +10,7 @@ use crate::object_array::{
 /// Small-buffer capacity constant retained for the append/pop inline-capacity
 /// trace path (`is_inline()` is always false, so it is never consulted at
 /// runtime).
-pub const INT_ARRAY_INLINE_CAP: usize = 8;
+pub const INT_ARRAY_INLINE_CAP: usize = 4;
 
 /// Unboxed `int` list storage — `listobject.py` IntegerListStrategy
 /// `lstorage = erase([int])`, i.e. a `Ptr(GcArray(Signed))`.
@@ -104,6 +104,18 @@ impl IntArray {
             std::ptr::copy_nonoverlapping(values.as_ptr(), arr.base(), len);
         }
         arr
+    }
+
+    /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)`: allocate the
+    /// exact hinted RPython items array while keeping its live length zero.
+    pub fn with_capacity(capacity: usize) -> Self {
+        if capacity == 0 {
+            return Self::empty();
+        }
+        Self {
+            block: unsafe { alloc_typed_items_block(capacity, gc_int_array_gc_type_id()) },
+            len: AtomicUsize::new(0),
+        }
     }
 
     /// Pin `block` on the shadow stack and return its slot, so the block stays
@@ -203,8 +215,12 @@ impl IntArray {
     }
 
     fn grow(&mut self, min_cap: usize) {
+        // rlist.py `_ll_list_resize_hint_really(overallocate=True)`:
+        // 0, 4, 8, 16, 25, 35, ...
+        let extra = if min_cap < 9 { 3 } else { 6 };
         let target_cap = min_cap
-            .max(self.capacity().saturating_mul(2))
+            .saturating_add(extra)
+            .saturating_add(min_cap >> 3)
             .max(INT_ARRAY_INLINE_CAP);
         self.block = unsafe {
             grow_typed_items_block(
