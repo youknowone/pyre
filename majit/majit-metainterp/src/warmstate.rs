@@ -702,6 +702,19 @@ pub struct WarmEnterState {
     /// returns `NotHot` above `decay_all_counters`, deliberately — so a cache
     /// keyed on this counter changes nothing but the work spent reaching it.
     cell_generation: u64,
+    /// `warmstate.py:783` `self.jitdriver_sd._confirm_enter_jit_ptr` — the
+    /// driver's `confirm_enter_jit` callback, or `None` when the declaration
+    /// omitted the kwarg (`rlib/jit.py:626,688`).
+    ///
+    /// `warmstate.py:784-786` reads the pointer once and substitutes a
+    /// `return True` closure when it is absent, which is what `None` means
+    /// here; [`Self::confirm_enter_jit`] is that substitution.
+    ///
+    /// Upstream passes the hook every green AND red argument
+    /// (`warmspot.py:598` `onlygreens=False`). The green key hash is what both
+    /// veto positions here hold, so that is what a hook is handed; a hook
+    /// needing more state reads it off the interpreter it was declared in.
+    confirm_enter_jit_ptr: Option<fn(u64) -> bool>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -767,7 +780,18 @@ impl WarmEnterState {
         }
     }
 
+    /// `warmstate.py:425-441` `bound_reached` — the veto, then the mark.
+    ///
+    /// Every tracing start in this module funnels through here or through its
+    /// typed twin: `maybe_compile` and `maybe_compile_with_key` reach it from
+    /// their own decision, and `force_start_tracing*` (which is what
+    /// `MetaInterp::bound_reached` calls) reaches it after theirs. That makes
+    /// this the one position at which the hook fires exactly once per start,
+    /// which is what upstream gets by having a single `bound_reached`.
     fn start_tracing_cell(&mut self, cell_key: u64) -> HotResult {
+        if !self.confirm_enter_jit(cell_key) {
+            return HotResult::NotHot;
+        }
         self.counter.reset(self.bucket_of(cell_key));
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
@@ -829,6 +853,7 @@ impl WarmEnterState {
                 m
             },
             cell_generation: 0,
+            confirm_enter_jit_ptr: None,
         }
     }
 
@@ -1006,6 +1031,13 @@ impl WarmEnterState {
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
             let abort_count = cell.abort_count;
             if is_compiled {
+                // warmstate.py:501 — the second veto position, between
+                // finding a live procedure token and `raise
+                // EnterJitAssembler`. A hook that refuses leaves the caller
+                // interpreting rather than entering the machine code.
+                if !self.confirm_enter_jit(cell_key) {
+                    return HotResult::NotHot;
+                }
                 return HotResult::RunCompiled;
             }
             if is_tracing {
@@ -1122,6 +1154,11 @@ impl WarmEnterState {
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
             let abort_count = cell.abort_count;
             if is_compiled {
+                // warmstate.py:501 — see `maybe_compile_decision`, whose
+                // position this is the typed twin of.
+                if !self.confirm_enter_jit(hash) {
+                    return HotResult::NotHot;
+                }
                 return HotResult::RunCompiled;
             }
             if is_tracing {
@@ -1207,6 +1244,11 @@ impl WarmEnterState {
     /// transitions its own cell on a hash collision.
     fn start_tracing_cell_for_key(&mut self, key: &GreenKey) -> HotResult {
         let hash = key.get_uhash();
+        // `warmstate.py:427` — see `start_tracing_cell`, whose position this
+        // is the typed twin of.
+        if !self.confirm_enter_jit(hash) {
+            return HotResult::NotHot;
+        }
         self.counter.reset(hash);
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
@@ -2538,15 +2580,32 @@ impl WarmEnterState {
         &self.enable_opts
     }
 
-    /// warmstate.py: confirm_enter_jit(*args)
-    /// Hook called before entering JIT compilation to allow the user
-    /// to abort tracing based on runtime conditions.
-    /// Returns true if tracing should proceed, false to abort.
+    /// `warmstate.py:783-793` `make_jitdriver_callbacks` —
+    /// `self.confirm_enter_jit`, the callable every veto position calls.
     ///
-    /// In RPython this is a user-provided callback set via JitDriver.
-    /// Here we provide a default that always returns true.
-    pub fn confirm_enter_jit(&self, _green_key: u64) -> bool {
-        true
+    /// The driver's own hook when one was declared, and upstream's
+    /// `def confirm_enter_jit(*args): return True` substitution
+    /// (`warmstate.py:785-786`) when it was not.
+    ///
+    /// Called at both of upstream's veto positions: `warmstate.py:427` at the
+    /// head of `bound_reached`, which is [`Self::start_tracing_cell`] /
+    /// [`Self::start_tracing_cell_for_key`] here, and `warmstate.py:501`
+    /// before entering already-compiled machine code.
+    pub fn confirm_enter_jit(&self, green_key: u64) -> bool {
+        match self.confirm_enter_jit_ptr {
+            None => true,
+            Some(hook) => hook(green_key),
+        }
+    }
+
+    /// `warmspot.py:596-598` `make_driverhook_graphs` —
+    /// `jd._confirm_enter_jit_ptr = self._make_hook_graph(...)`.
+    ///
+    /// Upstream builds the pointer from the `JitDriver` declaration; nothing
+    /// below the declaration can know what it said, so an interpreter installs
+    /// its own here. `None` restores the no-hook default.
+    pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(u64) -> bool>) {
+        self.confirm_enter_jit_ptr = hook;
     }
 
     /// warmstate.py: get_location(greenkey)
@@ -5679,6 +5738,118 @@ mod tests {
              at once instead of waiting for the counter",
         );
         assert_eq!(typed.get_stats().num_cells, 1, "no split on the typed path");
+    }
+
+    /// Drive `key` to the tick that would start a trace.
+    ///
+    /// `WarmEnterState::new(3)` needs three ticks; the first two answer
+    /// `NotHot` from the counter alone and reach no veto position.
+    fn tick_to_threshold(ws: &mut WarmEnterState, key: &GreenKey) -> HotResult {
+        ws.maybe_compile_with_key(key);
+        ws.maybe_compile_with_key(key);
+        ws.maybe_compile_with_key(key)
+    }
+
+    /// `warmstate.py:427-428` — a hook that refuses stops the trace before the
+    /// cell is marked, so the location keeps interpreting and stays startable.
+    ///
+    /// Without a hook installed the same fixture answers `StartTracing`
+    /// (`maybe_compile_with_key_lazily_installs_on_threshold_tick` above), so
+    /// the veto is what the answer turns on here.
+    #[test]
+    fn a_confirm_enter_jit_veto_stops_the_tracing_start() {
+        fn refuse(_green_key: u64) -> bool {
+            false
+        }
+        let mut ws = WarmEnterState::new(3);
+        ws.set_confirm_enter_jit(Some(refuse));
+        let key = GreenKey::new(vec![11, 13]);
+
+        assert!(
+            matches!(tick_to_threshold(&mut ws, &key), HotResult::NotHot),
+            "the threshold tick reaches the veto, and a refusal is `return` \
+             upstream — the caller keeps interpreting",
+        );
+        assert!(
+            ws.lookup_chain_with_key(&key)
+                .is_none_or(|cell| !cell.is_tracing()),
+            "`cell.flags |= JC_TRACING` is below the veto (warmstate.py:441), \
+             so a refused start must leave no cell claiming to be tracing",
+        );
+    }
+
+    /// `warmstate.py:501` — the second veto position, between finding a live
+    /// procedure token and `raise EnterJitAssembler`.
+    #[test]
+    fn a_confirm_enter_jit_veto_stops_entry_into_compiled_code() {
+        fn refuse(_green_key: u64) -> bool {
+            false
+        }
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![21, 23]);
+        let _token = attach_alive_for_key(&mut ws, &key, JitCellToken::new(1));
+        assert!(
+            matches!(ws.maybe_compile_with_key(&key), HotResult::RunCompiled),
+            "fixture: the cell is compiled and entered before any hook exists",
+        );
+
+        ws.set_confirm_enter_jit(Some(refuse));
+        assert!(
+            matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot),
+            "a refusal at :501 leaves the caller interpreting rather than \
+             entering the machine code",
+        );
+    }
+
+    /// The hook fires once per tracing start, not once per decision.
+    ///
+    /// Upstream has a single `bound_reached` and calls it there
+    /// (`warmstate.py:427`). Here the decision and the start are two calls —
+    /// `maybe_compile_decision` answers, and `MetaInterp::bound_reached`
+    /// reaches the cell through `force_start_tracing_for_key` — so a veto
+    /// placed in both would consult a user callback twice for one entry.
+    #[test]
+    fn the_confirm_enter_jit_hook_fires_once_per_tracing_start() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_green_key: u64) -> bool {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+        let mut ws = WarmEnterState::new(3);
+        ws.set_confirm_enter_jit(Some(allow));
+        let key = GreenKey::new(vec![31, 33]);
+        let hash = key.get_uhash();
+
+        assert!(matches!(ws.maybe_compile_decision(hash), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile_decision(hash), HotResult::NotHot));
+        assert!(
+            matches!(ws.maybe_compile_decision(hash), HotResult::StartTracing),
+            "the decision alone answers, and it is not a veto position",
+        );
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the decision must not consult the hook; the start does",
+        );
+
+        assert!(matches!(
+            ws.force_start_tracing_for_key(&key),
+            HotResult::StartTracing
+        ));
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "one entry, one call",
+        );
+    }
+
+    /// The default is upstream's own substitution: no hook declared means
+    /// `def confirm_enter_jit(*args): return True` (`warmstate.py:785-786`).
+    #[test]
+    fn no_declared_hook_confirms_every_entry() {
+        let ws = WarmEnterState::new(3);
+        assert!(ws.confirm_enter_jit(0));
+        assert!(ws.confirm_enter_jit(u64::MAX));
     }
 
     /// warmstate.py — typed variant of `maybe_compile_and_run`.
