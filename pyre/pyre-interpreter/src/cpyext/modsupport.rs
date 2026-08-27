@@ -40,7 +40,9 @@ struct ModuleFields {
 }
 
 type ModuleTable = super::address_table::AddressMap<ModuleFields>;
-static MODULE_FIELDS: super::ForkMutex<ModuleTable> = super::ForkMutex::new(
+use super::address_table::AddressTable;
+
+static MODULE_FIELDS: AddressTable<ModuleTable> = AddressTable::new(
     std::collections::HashMap::with_hasher(BuildHasherDefault::new()),
 );
 
@@ -83,7 +85,7 @@ fn set_field(module: PyObjectRef, update: impl FnOnce(&mut ModuleFields)) {
 /// The state block itself is not freed: pyre has no module deallocation path,
 /// and an extension may still hold the address.
 pub(super) fn forget_module_fields(mirror: usize) {
-    MODULE_FIELDS.lock().remove(&mirror);
+    MODULE_FIELDS.take(mirror);
 }
 
 /// The single-phase modules `PyState_AddModule` has filed, one slot per module

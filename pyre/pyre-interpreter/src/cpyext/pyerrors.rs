@@ -129,8 +129,10 @@ type BlockSet = super::address_table::AddressSet;
 /// class derived from `StopIteration` has a type mirror of its own, and asking
 /// the size instead is what turns an unrelated C type's storage into a
 /// reference to decrement.
-static ATTACHED: super::ForkMutex<BlockSet> =
-    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static ATTACHED: AddressTable<BlockSet> =
+    AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { ATTACHED.reinit_after_fork() };
@@ -190,7 +192,7 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
 /// Release the reference a `StopIteration` mirror owns — `pyerrors.py:45-50
 /// stopiteration_dealloc`.
 pub(super) fn forget_block(raw: *mut CPyObject) {
-    if !ATTACHED.lock().remove(&(raw as usize)) {
+    if !ATTACHED.discard(raw as usize) {
         return;
     }
     let py_stopiteration = raw as *mut CPyStopIterationObject;

@@ -13,6 +13,7 @@
 //! the collector's own address tables.
 
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Odd 64-bit multiplier (2^64 / golden ratio).
 const SPREAD_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -62,6 +63,130 @@ impl Hasher for AddressHasher {
 pub(super) type AddressBuildHasher = BuildHasherDefault<AddressHasher>;
 pub(super) type AddressMap<V> = std::collections::HashMap<usize, V, AddressBuildHasher>;
 pub(super) type AddressSet = std::collections::HashSet<usize, AddressBuildHasher>;
+
+/// A collection whose entry count is what decides whether it holds anything.
+pub(super) trait Populated {
+    fn population(&self) -> usize;
+}
+
+impl<V> Populated for AddressMap<V> {
+    fn population(&self) -> usize {
+        self.len()
+    }
+}
+
+impl Populated for AddressSet {
+    fn population(&self) -> usize {
+        self.len()
+    }
+}
+
+/// A side table keyed on a mirror address, publishing how much it holds.
+///
+/// Tearing a mirror down asks every one of these tables to release whatever it
+/// keyed by that address, and for most programs almost none of them hold
+/// anything: an extension that never builds a `datetime` leaves that table
+/// empty for the whole run, and one that never hands C a borrowed reference
+/// leaves `BORROWED` empty.  Asking is otherwise a mutex and a probe each,
+/// once per teardown, so the count is published outside the lock and an empty
+/// table answers [`AddressTable::is_empty`] without taking it.
+///
+/// The count is republished when a guard is dropped rather than by each
+/// mutating call, which is what lets every caller keep using the collection
+/// directly through the guard.
+pub(super) struct AddressTable<C> {
+    entries: super::ForkMutex<C>,
+    population: AtomicUsize,
+}
+
+// SAFETY: the payload is reachable only through `entries`, whose own `Sync`
+// carries the same bound.
+unsafe impl<C: Send> Sync for AddressTable<C> {}
+
+impl<C: Populated> AddressTable<C> {
+    pub(super) const fn new(entries: C) -> Self {
+        Self {
+            entries: super::ForkMutex::new(entries),
+            population: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn lock(&self) -> AddressTableGuard<'_, C> {
+        AddressTableGuard {
+            entries: self.entries.lock(),
+            population: &self.population,
+        }
+    }
+
+    /// Whether the table holds nothing, without taking its lock.
+    ///
+    /// A teardown reaching this has the mirror's last reference, so no other
+    /// thread is entering the table under that address; the acquire pairs with
+    /// the release a guard makes before it unlocks, so a count read here is
+    /// one some thread actually published.
+    pub(super) fn is_empty(&self) -> bool {
+        self.population.load(Ordering::Acquire) == 0
+    }
+
+    /// # Safety
+    /// Only in a forked child, where the thread that held the lock is gone.
+    pub(super) unsafe fn reinit_after_fork(&self) {
+        unsafe { self.entries.reinit_after_fork() };
+    }
+}
+
+impl<V> AddressTable<AddressMap<V>> {
+    /// Take what this table keyed by `address`, if anything.
+    ///
+    /// This is the teardown spelling: a mirror reaching it has no references
+    /// left, so no other thread is entering the table under its address, and a
+    /// table that reads empty stays empty for every key that matters here.
+    pub(super) fn take(&self, address: usize) -> Option<V> {
+        if self.is_empty() {
+            return None;
+        }
+        self.lock().remove(&address)
+    }
+}
+
+impl AddressTable<AddressSet> {
+    /// Drop `address` from this table, answering whether it was there.
+    ///
+    /// The empty case is decided as it is in [`AddressTable::take`].
+    pub(super) fn discard(&self, address: usize) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        self.lock().remove(&address)
+    }
+}
+
+/// Holds a table open, and republishes its population on the way out.
+pub(super) struct AddressTableGuard<'a, C: Populated> {
+    entries: parking_lot::MutexGuard<'a, C>,
+    population: &'a AtomicUsize,
+}
+
+impl<C: Populated> Drop for AddressTableGuard<'_, C> {
+    fn drop(&mut self) {
+        self.population
+            .store(self.entries.population(), Ordering::Release);
+    }
+}
+
+impl<C: Populated> std::ops::Deref for AddressTableGuard<'_, C> {
+    type Target = C;
+
+    fn deref(&self) -> &C {
+        &self.entries
+    }
+}
+
+impl<C: Populated> std::ops::DerefMut for AddressTableGuard<'_, C> {
+    fn deref_mut(&mut self) -> &mut C {
+        &mut self.entries
+    }
+}
 
 #[cfg(test)]
 mod tests {

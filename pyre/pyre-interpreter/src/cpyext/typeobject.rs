@@ -544,8 +544,10 @@ fn builtin_type(layout: &'static pyre_object::pyobject::PyType) -> PyObjectRef {
 /// the mirror rather than with this call.  Keyed by the mirror's address, which
 /// is fixed for its life; [`forget_type_name`] is what releases it.
 type NameTable = super::address_table::AddressMap<CString>;
-static TYPE_NAMES: super::ForkMutex<NameTable> =
-    super::ForkMutex::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static TYPE_NAMES: AddressTable<NameTable> =
+    AddressTable::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// `typeobject.py:708-722 type_dealloc` — release what a synthesized mirror's
 /// own fields hold, and the string behind `tp_name`.
@@ -559,7 +561,7 @@ static TYPE_NAMES: super::ForkMutex<NameTable> =
 /// # Safety
 /// `raw` must be a live block whose count has fallen to zero.
 pub(super) unsafe fn forget_type_mirror(raw: *mut CPyObject) {
-    if TYPE_NAMES.lock().remove(&(raw as usize)).is_none() {
+    if TYPE_NAMES.take(raw as usize).is_none() {
         return;
     }
     let mirror = raw as *mut CPyTypeObject;
@@ -4333,8 +4335,8 @@ type BlockSet = super::address_table::AddressMap<usize>;
 
 /// The blocks [`descriptor_attach`] filled, and so the ones whose references
 /// are this module's to release.
-static DESCRIPTOR_BLOCKS: super::ForkMutex<BlockSet> =
-    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+static DESCRIPTOR_BLOCKS: AddressTable<BlockSet> =
+    AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// Whether `w_type` is one of this module's descriptor carriers.
 ///
@@ -4450,7 +4452,7 @@ pub(super) fn descriptor_attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
 /// Release what a descriptor block owns — `typeobject.py descr_dealloc` and
 /// `wrapper_dealloc`, which frees the wrapper block on top of it.
 pub(super) fn forget_descriptor_block(raw: *mut CPyObject) {
-    let Some(base) = DESCRIPTOR_BLOCKS.lock().remove(&(raw as usize)) else {
+    let Some(base) = DESCRIPTOR_BLOCKS.take(raw as usize) else {
         return;
     };
     let descr = raw as *mut CPyDescrObject;

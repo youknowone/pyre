@@ -728,8 +728,10 @@ type BlockSet = super::address_table::AddressSet;
 /// A set of addresses rather than a size test, for the reason
 /// `pyerrors::ATTACHED` states: what decides whether the word at that offset
 /// is a reference is whether this module wrote it.
-static ATTACHED: super::ForkMutex<BlockSet> =
-    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static ATTACHED: AddressTable<BlockSet> =
+    AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// Which of the two blocks with fields a class of the `datetime` module takes
 /// — `cdatetime.py:143-160 init_datetime`'s three `basestruct`s, of which
@@ -863,7 +865,7 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
 /// Release the reference a `time` or `datetime` mirror owns —
 /// `cdatetime.py:191-204 type_dealloc`.
 pub(super) fn forget_block(raw: *mut CPyObject) {
-    if !ATTACHED.lock().remove(&(raw as usize)) {
+    if !ATTACHED.discard(raw as usize) {
         return;
     }
     let block = raw as *mut CPyDateTimeWithTZInfo;

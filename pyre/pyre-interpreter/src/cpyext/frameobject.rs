@@ -52,8 +52,10 @@ const _: () = {
 type PendingSet = super::address_table::AddressSet;
 
 /// Mirrors [`PyFrame_New`] handed out that have no interpreter frame yet.
-static PENDING: super::ForkMutex<PendingSet> =
-    super::ForkMutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static PENDING: AddressTable<PendingSet> =
+    AddressTable::new(HashSet::with_hasher(BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { PENDING.reinit_after_fork() };
@@ -150,7 +152,7 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
 /// Reached from `pyobject::dealloc`, which runs it while the block is still
 /// live and before anything can hand the address back out.
 pub(super) fn forget_block(raw: *mut CPyObject) {
-    PENDING.lock().remove(&(raw as usize));
+    PENDING.discard(raw as usize);
     let Some(py_frame) = fields(raw) else {
         return;
     };

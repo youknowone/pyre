@@ -814,9 +814,11 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
 /// reference is held here instead, keyed by the mirror's address; it is the
 /// reference, not this table, that roots the list.
 type SnapshotMap = super::address_table::AddressMap<usize>;
-static ITERATION_KEYS: super::ForkMutex<SnapshotMap> = super::ForkMutex::new(
-    SnapshotMap::with_hasher(std::hash::BuildHasherDefault::new()),
-);
+use super::address_table::AddressTable;
+
+static ITERATION_KEYS: AddressTable<SnapshotMap> = AddressTable::new(SnapshotMap::with_hasher(
+    std::hash::BuildHasherDefault::new(),
+));
 
 /// The lock word can be held by a thread the child does not have; the
 /// snapshots the payload names are still mapped, because `fork` copies the
@@ -923,7 +925,7 @@ pub unsafe extern "C" fn PyDict_Next(
 /// A caller that stops walking before the end never reaches the arm that frees
 /// it, so the mirror's own deallocation is the other end of that lifetime.
 pub(super) fn forget_iteration(mirror: usize) {
-    if let Some(held) = ITERATION_KEYS.lock().remove(&mirror) {
+    if let Some(held) = ITERATION_KEYS.take(mirror) {
         unsafe { pyobject::decref(held as *mut CPyObject) };
     }
 }

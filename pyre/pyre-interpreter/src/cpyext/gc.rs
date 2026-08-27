@@ -29,8 +29,10 @@ use std::ffi::{c_int, c_void};
 /// addresses is enough. An address is stable for a block's life, and
 /// [`forget`] is called from `dealloc` before the block is released.
 type TrackedSet = super::address_table::AddressSet;
-static TRACKED: super::ForkMutex<TrackedSet> =
-    super::ForkMutex::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static TRACKED: AddressTable<TrackedSet> =
+    AddressTable::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// The blocks whose `tp_finalize` has already run.
 ///
@@ -41,8 +43,8 @@ static TRACKED: super::ForkMutex<TrackedSet> =
 /// rather than in `dealloc`, which runs before `tp_dealloc` -- that is the
 /// moment a second deallocation still has to read it -- and clearing at
 /// release is also what keeps a recycled address from inheriting a stale one.
-static FINALIZED: super::ForkMutex<TrackedSet> =
-    super::ForkMutex::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
+static FINALIZED: AddressTable<TrackedSet> =
+    AddressTable::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { TRACKED.reinit_after_fork() };
@@ -61,7 +63,7 @@ pub(super) fn mark_finalized(raw: usize) {
 
 /// Drop the finalized flag for a block that is being released.
 pub(super) fn forget_finalized(raw: usize) {
-    FINALIZED.lock().remove(&raw);
+    FINALIZED.discard(raw);
 }
 
 /// Claim the finalizer of a block whose linked object the collector has just
@@ -138,7 +140,7 @@ pub(super) fn track(raw: *mut CPyObject) {
 /// Drop a block from the tracked set -- `PyObject_GC_UnTrack`, and the release
 /// `dealloc` performs for a block that never untracked itself.
 pub(super) fn forget(raw: usize) {
-    TRACKED.lock().remove(&raw);
+    TRACKED.discard(raw);
 }
 
 /// Every tracked block, as addresses.

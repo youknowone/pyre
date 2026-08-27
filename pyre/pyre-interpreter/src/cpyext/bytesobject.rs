@@ -27,8 +27,10 @@ pub unsafe extern "C" fn PyBytes_FromString(text: *const c_char) -> *mut CPyObje
 /// exists.  This set only records which mirrors have not been read as a value
 /// yet.
 type PendingSet = super::address_table::AddressSet;
-static PENDING: super::ForkMutex<PendingSet> =
-    super::ForkMutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static PENDING: AddressTable<PendingSet> =
+    AddressTable::new(HashSet::with_hasher(BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { PENDING.reinit_after_fork() };
@@ -36,7 +38,7 @@ pub(super) unsafe fn after_fork_child() {
 
 /// Drop what a dying mirror recorded here.
 pub(super) fn forget_pending(mirror: usize) {
-    PENDING.lock().remove(&mirror);
+    PENDING.discard(mirror);
 }
 
 /// Whether `raw` is a mirror [`PyBytes_FromStringAndSize`] handed out and

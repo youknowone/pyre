@@ -520,7 +520,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     // `tp_dealloc` can free the block out from under it.  A borrow it owns may
     // be the last reference to its own container, so that recursion runs here.
     release_borrowed(raw);
-    BYTE_CACHE.lock().remove(&address);
+    BYTE_CACHE.take(address);
     forget_items(address);
     super::dictobject::forget_iteration(address);
     super::modsupport::forget_module_fields(address);
@@ -730,8 +730,10 @@ pub fn drain_dead() {
 /// keeps the container, which is what would release the entry.
 type BorrowSet = super::address_table::AddressSet;
 type BorrowMap = super::address_table::AddressMap<BorrowSet>;
-static BORROWED: ForkMutex<BorrowMap> =
-    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static BORROWED: AddressTable<BorrowMap> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 /// A borrowed reference to `w_item`, owned by `container`'s mirror.
 ///
@@ -761,7 +763,7 @@ pub(super) fn borrow_from(container: *mut CPyObject, w_item: PyObjectRef) -> *mu
 
 /// Release everything a dying container mirror borrowed on C's behalf.
 fn release_borrowed(container: *mut CPyObject) {
-    let owned = BORROWED.lock().remove(&(container as usize));
+    let owned = BORROWED.take(container as usize);
     for item in owned.into_iter().flatten() {
         unsafe { decref(item as *mut CPyObject) };
     }
@@ -804,8 +806,8 @@ pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
 /// good for as long as the container does because the array holds it.
 /// Held as addresses, which a mirror pointer is and a `Send` bound accepts.
 type ItemCache = super::address_table::AddressMap<Box<[usize]>>;
-static ITEM_ARRAYS: ForkMutex<ItemCache> =
-    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+static ITEM_ARRAYS: AddressTable<ItemCache> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 /// Give `raw`'s array `items` and answer where they sit.
 ///
@@ -888,7 +890,7 @@ pub(super) fn replace_cached_item(
 /// Drop the array a dying container mirror handed out, and the references it
 /// owned with it.
 fn forget_items(raw: usize) {
-    let array = ITEM_ARRAYS.lock().remove(&raw);
+    let array = ITEM_ARRAYS.take(raw);
     release_item_array(array);
 }
 
@@ -900,8 +902,8 @@ fn forget_items(raw: usize) {
 /// is neither NUL-terminated nor at a fixed address.  It is a side table rather
 /// than a field so that a mirror block is exactly what its type declares.
 type ByteCache = super::address_table::AddressMap<Box<[u8]>>;
-static BYTE_CACHE: ForkMutex<ByteCache> =
-    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+static BYTE_CACHE: AddressTable<ByteCache> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 /// The mirror's cached bytes and their length, without the terminator.
 ///

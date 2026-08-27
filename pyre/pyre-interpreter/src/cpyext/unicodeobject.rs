@@ -169,8 +169,10 @@ struct Block {
 }
 
 type BlockTable = super::address_table::AddressMap<Block>;
-static BLOCKS: super::ForkMutex<BlockTable> =
-    super::ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+use super::address_table::AddressTable;
+
+static BLOCKS: AddressTable<BlockTable> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { BLOCKS.reinit_after_fork() };
@@ -178,7 +180,7 @@ pub(super) unsafe fn after_fork_child() {
 
 /// Drop what a dying mirror's canonical form occupied.
 pub(super) fn forget_block(mirror: usize) {
-    BLOCKS.lock().remove(&mirror);
+    BLOCKS.take(mirror);
 }
 
 /// Whether `raw` is a string [`PyUnicode_New`] handed out and nothing has read
