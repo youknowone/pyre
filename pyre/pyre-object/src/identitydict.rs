@@ -218,6 +218,7 @@ pub static IDENTITY_DICT_STRATEGY: IdentityDictStrategy = IdentityDictStrategy;
 pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
     crate::dictmultiobject::DictStrategyRef {
         imp: &IDENTITY_DICT_STRATEGY,
+        owner: std::ptr::null_mut(),
     };
 
 impl IdentityDictStrategy {

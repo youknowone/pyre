@@ -5170,6 +5170,7 @@ pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
 pub static MAP_DICT_STRATEGY_REF: pyre_object::dictmultiobject::DictStrategyRef =
     pyre_object::dictmultiobject::DictStrategyRef {
         imp: &MAP_DICT_STRATEGY,
+        owner: std::ptr::null_mut(),
     };
 
 impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
