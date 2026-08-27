@@ -93,7 +93,9 @@ cached_type!(PYCUNIONTYPE, pycuniontype_type, || {
 });
 
 cached_type!(PYCFUNCPTRTYPE, pycfuncptrtype_type, || {
-    make_ctypes_metatype("PyCFuncPtrType", |_| {})
+    make_ctypes_metatype("PyCFuncPtrType", |ns| {
+        install_init(ns, cfuncptrtype_init);
+    })
 });
 
 cached_type!(STRUCTURE, structure_type, || {
@@ -453,20 +455,46 @@ fn cstructtype_init(args: &[PyObjectRef]) -> PyResult {
     metaclass_init(args, |cls| struct_union_init_stginfo(cls, false))
 }
 
+fn cfuncptrtype_init(args: &[PyObjectRef]) -> PyResult {
+    metaclass_init(args, funcptr_init_stginfo)
+}
+
+/// `PyCFuncPtrType` layout: pointer-sized `StgInfo` with `ISPOINTER`.
+///
+/// What a call itself needs -- `_argtypes_`, `_restype_`, `_flags_` -- is read
+/// off the class where it was set, so the carrier is here for the questions
+/// every other ctypes type answers out of one: how wide a field of this type
+/// is, and what a `POINTER` to it or an array of it is built over.
+fn funcptr_init_stginfo(cls: PyObjectRef) -> PyResult {
+    let psize = host_ctypes::pointer_size();
+    // `paramfunc` names the shape a carrier is read as, and a function pointer
+    // is none of the five this build reads -- an argument of one is settled by
+    // `classify_argtype` before a `paramfunc` is asked for.
+    let mut data = StgInfoData::new(psize, psize, ParamFunc::Other);
+    data.length = 1;
+    data.flags |= stginfo::TYPEFLAG_ISPOINTER;
+    data.format = Some("X{}".to_string());
+    stginfo::stginfo_set(cls, stginfo::stginfo_new(data));
+    Ok(pyre_object::w_none())
+}
+
 fn cuniontype_init(args: &[PyObjectRef]) -> PyResult {
     metaclass_init(args, |cls| struct_union_init_stginfo(cls, true))
 }
 
 /// `PyCSimpleType` layout: validate `_type_` and build a simple `StgInfo`.
 fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
-    let tc = match cdata::type_code_of(cls) {
-        Some(tc) => tc,
-        // No `_type_` at all: `_SimpleCData` itself and abstract intermediates.
-        None => return Ok(pyre_object::w_none()),
+    // No `_type_` at all: `_SimpleCData` itself and abstract intermediates.
+    let Some(declared) = cdata::declared_type_str(cls) else {
+        return Ok(pyre_object::w_none());
     };
-    if tc.chars().count() != 1 || !host_ctypes::simple_type_chars().contains(tc.as_str()) {
+    // Judged on what the class declared, not on the code it was read as: a
+    // declaration too long to be one reads back as no code, which is what an
+    // abstract intermediate looks like too.
+    if declared.chars().count() != 1 || !host_ctypes::simple_type_chars().contains(declared) {
         return Err(cdata::invalid_type_code_error());
     }
+    let tc = cdata::TypeCode::new(declared).ok_or_else(cdata::invalid_type_code_error)?;
     let size = host_ctypes::simple_type_size(&tc).ok_or_else(cdata::invalid_type_code_error)?;
     let align = host_ctypes::simple_type_align(&tc).ok_or_else(cdata::invalid_type_code_error)?;
     let mut data = StgInfoData::new(size, align, ParamFunc::Simple);
