@@ -453,3 +453,20 @@ pub struct BorrowedByte<'a> {
 pub fn borrowed_byte_fields_alias(a: &BorrowedByte<'_>, b: &BorrowedByte<'_>) -> bool {
     core::ptr::eq(a.p, b.p)
 }
+
+/// `u32::from(u16)` — a numeric `From` whose source and destination are both
+/// integer-kinded, so the conversion is a no-op once both sit in the `Int`
+/// register bank. The pair, so the fixture also pins that the *argument*
+/// survives: an alias that dropped it would read as "no call" just as well.
+#[inline(never)]
+pub fn widening_int_from(narrow: u16) -> u32 {
+    u32::from(narrow) + 1
+}
+
+/// The same shape across the float boundary, which must NOT alias: this one
+/// is a real conversion and the fixture is what keeps the integer rule from
+/// being widened into it.
+#[inline(never)]
+pub fn widening_float_from(narrow: i32) -> f64 {
+    f64::from(narrow) + 1.0
+}

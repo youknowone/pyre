@@ -7491,6 +7491,7 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1
                     && (matches!(self.blanket_into_devirt(&reg), Some(IntoDevirt::Identity))
                         || self.is_reflexive_from(&reg)
+                        || self.is_widening_int_from(&reg)
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.is_noop_ptr_cast(&reg)
                         || self.is_reflexive_into_iter(&reg)
@@ -11660,6 +11661,51 @@ impl<'a> Lowering<'a> {
             (Some(src_ty), Some(dst_ty)) => src_ty == dst_ty,
             _ => false,
         }
+    }
+
+    /// A callsite of a numeric `From` whose source and destination are both
+    /// integer-kinded (`core::convert::num::<Impl>::from`) — `u32::from(u16)`
+    /// and its family.
+    ///
+    /// `jtransform.py:330-337` deletes every one of these outright:
+    /// `rewrite_op_cast_char_to_int`, `cast_int_to_uint`, `cast_uint_to_int`
+    /// and the rest are each `pass`, because a cast between two integer
+    /// primitives is a no-op once both live in the same `Int` register kind.
+    /// This is the same conclusion for the same reason, reached at the
+    /// callsite rather than at an op because `core` carries no graph body and
+    /// the call would otherwise stay residual.
+    ///
+    /// Narrowing needs no separate rule: `From` between numerics is
+    /// implemented only where the conversion is lossless, so a source that is
+    /// wider than its destination never selects this impl.
+    ///
+    /// 128-bit is excluded on both sides. [`ValueType::Int128`] /
+    /// [`ValueType::UInt128`] are not the register kind — `OpKind::ConstInt128`
+    /// says so where it is declared — so aliasing across that boundary would
+    /// put a value in a bank that cannot hold it.
+    ///
+    /// Float is excluded by the same test: `f64::from(i32)` is a real
+    /// conversion (`cast_int_to_float`), not an alias.
+    fn is_widening_int_from(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        if fd.item_meta.name_path() != "core::convert::num::<Impl>::from" {
+            return false;
+        }
+        let Some(src) = fd.signature.inputs.first() else {
+            return false;
+        };
+        let register_int = |ty: &TyRef| {
+            matches!(
+                tyref_to_value_type(ty, self.llbc),
+                ValueType::Int | ValueType::Unsigned
+            )
+        };
+        register_int(src) && register_int(&fd.signature.output)
     }
 
     /// `f64::is_nan(self)` — `core` has no graph body (Opaque), so the

@@ -1457,6 +1457,62 @@ fn a_scalar_element_indexes_to_an_int_banked_array_read() {
 /// asserted together: never peeling types the first `Ref`; peeling only the
 /// `?`-desugaring shells types the second `Ref`, because `Bound` is not one;
 /// peeling every borrowed primitive types the third `Unsigned`.
+/// `jtransform.py:330-337` deletes every cast between integer primitives —
+/// `rewrite_op_cast_char_to_int`, `cast_int_to_uint`, `cast_uint_to_int` and
+/// the rest are each `pass` — because the two share one register kind. A
+/// numeric `From` reaches the same conversion through a call, and `core`
+/// carries no graph body, so left alone it stays residual.
+///
+/// The float sibling is asserted in the same test because it is the only thing
+/// stopping the rule from being read as "numeric `From` is always identity":
+/// `f64::from(i32)` moves banks and has to keep its call.
+#[test]
+fn an_integer_widening_from_aliases_but_a_float_one_does_not() {
+    use majit_translate::{CallTarget, OpKind};
+    let llbc = load_corpus();
+
+    let numeric_from_calls = |name: &str| -> usize {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => {
+                    segments.iter().any(|s| s == "num")
+                        && segments.last().map(String::as_str) == Some("from")
+                }
+                _ => false,
+            })
+            .count()
+    };
+
+    assert_eq!(
+        numeric_from_calls("widening_int_from"),
+        0,
+        "`u32::from(u16)` is a no-op in the Int bank and keeps no call",
+    );
+    assert_eq!(
+        numeric_from_calls("widening_float_from"),
+        1,
+        "`f64::from(i32)` crosses banks, so it is a conversion and keeps its call",
+    );
+
+    // The alias has to bind the destination to the argument, not drop it: a
+    // lowering that discarded the operand would also report zero calls.
+    let graph = lower_function(llbc, "widening_int_from").expect("lowering");
+    let adds = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op.contains("add")))
+        .count();
+    assert_eq!(adds, 1, "the widened value still reaches the `+ 1`");
+}
+
 #[test]
 fn a_borrowed_primitive_banks_by_its_container() {
     use majit_translate::model::{OpKind, ValueType};
@@ -1480,7 +1536,10 @@ fn a_borrowed_primitive_banks_by_its_container() {
 
     assert_eq!(
         payloads("slice_get_tag_dispatch"),
-        vec![("core::option::Option::Some".to_string(), ValueType::Unsigned)],
+        vec![(
+            "core::option::Option::Some".to_string(),
+            ValueType::Unsigned
+        )],
         "the `?` payload of an `Option<&u8>` is the byte, not a pointer to it",
     );
     assert_eq!(
