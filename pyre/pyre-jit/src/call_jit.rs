@@ -2202,7 +2202,8 @@ fn jit_blackhole_resume_from_guard(
 /// copy as a GC root for the duration of `blackhole_from_resumedata`.
 ///
 /// `deadframe` is an off-heap copy of the guard-failure values
-/// (`result.values`).  The collector is moving, so a minor collection
+/// (`raw_exit_values` over the result's exit slots).  The collector is moving,
+/// so a minor collection
 /// triggered while `blackhole_from_resumedata` lazily materializes virtuals
 /// (`getvirtual_ptr` → allocator) relocates the boxed objects and leaves the
 /// copy holding from-space pointers; `resume.rs::decode_ref` then reads

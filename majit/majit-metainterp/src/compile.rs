@@ -144,18 +144,29 @@ const EXIT_VALUE_INLINE: usize = 8;
 
 /// Storage for one exit's decoded values, as machine words.
 ///
-/// Both this and [`ExitValues`] are written once per exit from a compiled
-/// entry and read by the guard, blackhole and finish arms downstream. Holding
-/// them inline keeps the ordinary entry from asking the allocator for a buffer
-/// it will free before the next one; an exit wider than [`EXIT_VALUE_INLINE`]
-/// spills to the heap and pays exactly what it paid before.
+/// Written by the raw run path, and by the guard-failure and detailed-run arms
+/// that ask [`raw_exit_values`] for one. Holding it inline keeps those from
+/// asking the allocator for a buffer they free before the next entry; an exit
+/// wider than [`EXIT_VALUE_INLINE`] spills to the heap and pays exactly what it
+/// paid before.
 pub type ExitRawValues = smallvec::SmallVec<[i64; EXIT_VALUE_INLINE]>;
 
 /// Storage for one exit's decoded values, typed — see [`ExitRawValues`].
 ///
-/// A `Value` is two words, so this array is the more expensive half of the
-/// pair and is what bounds [`EXIT_VALUE_INLINE`] from above.
+/// A `Value` is two words, so this array is the more expensive half of the pair
+/// and is what bounds [`EXIT_VALUE_INLINE`] from above. It is also the only
+/// half a [`CompileResult`] carries, because the other is a projection of it.
 pub type ExitValues = smallvec::SmallVec<[Value; EXIT_VALUE_INLINE]>;
+
+/// Project decoded exit slots back to the machine words they were read as.
+///
+/// [`Value::as_raw_i64`] is exact for every slot type a fail-arg list can hold,
+/// so this recovers what a second list built beside [`ExitValues`] would have
+/// held. Its callers are the guard-failure and detailed-run arms, which then
+/// own the buffer; the steady finish exit calls nothing here.
+pub fn raw_exit_values(typed: &[Value]) -> ExitRawValues {
+    typed.iter().map(Value::as_raw_i64).collect()
+}
 
 /// Static exit metadata for a compiled guard or finish point.
 #[derive(Debug, Clone)]
@@ -219,7 +230,13 @@ impl CompiledExitLayout {
 
 /// Typed result from running compiled code.
 pub struct CompileResult<M> {
-    pub values: ExitRawValues,
+    /// The exit slots this run left through.
+    ///
+    /// The machine-word list that used to sit beside this one is gone: every
+    /// reader of it is on the guard-failure or detailed-run path, so a steady
+    /// finish exit built one per entry and dropped it unread, moving eighty
+    /// bytes through each by-value return of this struct on the way. Those
+    /// readers call [`raw_exit_values`] on this list instead.
     pub typed_values: ExitValues,
     /// Snapshot of the compiled entry's metadata taken *before*
     /// `execute_token`, mirroring `warmstate.py` `execute_assembler`'s hold on

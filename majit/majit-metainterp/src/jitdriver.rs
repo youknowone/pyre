@@ -5781,7 +5781,10 @@ impl<S: JitState> JitDriver<S> {
                 .exit_layout
                 .take()
                 .expect("a guard exit carries its exit layout");
-            let raw_values = result.values.clone();
+            // Projected here rather than carried on the result: only this arm
+            // and the detailed run below read machine words, and building the
+            // list on every entry charged the finish exit for both.
+            let raw_values = crate::compile::raw_exit_values(&result.typed_values);
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
             let guard_value_operand = result.guard_value_operand;
             // blackhole.py `_prepare_resume_from_failure(deadframe)`:
@@ -7369,10 +7372,11 @@ impl<S: JitState> JitDriver<S> {
         // The pointer travels; the layout behind it is opened past the finish
         // arm below, which is the one that carries none.
         let exit_layout = result.exit_layout.take();
+        // Projected first: the take below is what leaves `typed_values` empty.
+        let raw_values = crate::compile::raw_exit_values(&result.typed_values).into_vec();
         // Taken, not copied: every field this arm needs is read out here and
-        // `result` is dropped just below, so neither buffer has a reader left.
+        // `result` is dropped just below, so the buffer has no reader left.
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
-        let raw_values = std::mem::take(&mut result.values).into_vec();
         let guard_value_operand = result.guard_value_operand;
         // llmodel.py grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
@@ -9967,7 +9971,7 @@ mod tests {
             .meta
             .run_compiled_detailed(green_key, &[0])
             .expect("guard should fail");
-        let fail_values = failure.values.clone();
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
         let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
         drop(failure);
 

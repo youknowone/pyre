@@ -7152,7 +7152,7 @@ fn drive_unpack_iterable_trace(
                         r.is_exit_frame_with_exception,
                         r.fail_index,
                         r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
-                        r.values.clone(),
+                        majit_metainterp::raw_exit_values(&r.typed_values),
                         r.exit_layout.clone(),
                         r.exception.exc_value,
                     )

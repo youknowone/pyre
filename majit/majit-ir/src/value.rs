@@ -140,6 +140,21 @@ impl Value {
         }
     }
 
+    /// Machine-word projection: the integer for `Int`, the pointer bits for
+    /// `Ref`, the bit pattern for `Float`, and zero for `Void` — the encoding
+    /// a compiled exit's slots are read out of the frame in.
+    ///
+    /// The `Void` arm is why this is not [`Const::as_raw_i64`]: a `Const` has
+    /// no void variant, and an exit slot does.
+    pub fn as_raw_i64(&self) -> i64 {
+        match self {
+            Value::Int(v) => *v,
+            Value::Ref(v) => v.as_usize() as i64,
+            Value::Float(v) => v.to_bits() as i64,
+            Value::Void => 0,
+        }
+    }
+
     /// Project a `Value` into a `Const`.  Mirrors RPython where
     /// `ConstInt`/`ConstFloat`/`ConstPtr` (history.py/261/307) are
     /// the only concrete constant classes — there is no `ConstVoid`,

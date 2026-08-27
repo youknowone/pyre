@@ -11052,7 +11052,6 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
-        let exit_arity = exit_types.len();
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
         // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) with `trace_id == 0`
         // and `fail_index == u32::MAX`; they carry no per-trace exit
@@ -11106,31 +11105,7 @@ impl<M: Clone> MetaInterp<M> {
         {
             layout.exit_types.resize(exit_types.len(), Type::Int);
         }
-        let mut values = ExitRawValues::with_capacity(exit_arity);
-        let mut typed_values = ExitValues::with_capacity(exit_arity);
-        for (i, &tp) in exit_types.iter().enumerate() {
-            match tp {
-                Type::Int => {
-                    let value = self.backend.get_int_value(&frame, i);
-                    values.push(value);
-                    typed_values.push(Value::Int(value));
-                }
-                Type::Ref => {
-                    let value = self.backend.get_ref_value(&frame, i);
-                    values.push(value.as_usize() as i64);
-                    typed_values.push(Value::Ref(value));
-                }
-                Type::Float => {
-                    let value = self.backend.get_float_value(&frame, i);
-                    values.push(value.to_bits() as i64);
-                    typed_values.push(Value::Float(value));
-                }
-                Type::Void => {
-                    values.push(0);
-                    typed_values.push(Value::Void);
-                }
-            }
-        }
+        let typed_values = Self::decode_exit_slots(&self.backend, &frame, exit_types);
         let savedata = self.backend.get_savedata_ref(&frame);
         // pyjitpl.py:3119-3123: exc_class = ptr2int(exception_obj.typeptr)
         let exc_value_ref = self.backend.grab_exc_value(&frame);
@@ -11147,7 +11122,6 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         Some(CompileResult {
-            values,
             typed_values,
             meta,
             fail_index,
@@ -11218,41 +11192,32 @@ impl<M: Clone> MetaInterp<M> {
 
     /// `compile.py _DoneWithThisFrameDescr.get_result` and
     /// `handle_fail`'s exit read: decode a returned frame's exit slots into the
-    /// raw and typed lists every consumer of a compiled run reads.
+    /// typed list every consumer of a compiled run reads.
     ///
     /// The slot types come from the descr the run ended on, so this is the one
     /// step both outcomes of a compiled entry share.
+    ///
+    /// Only the typed list is built. The machine-word list beside it used to be
+    /// built here too and travelled out on the result, but its four readers are
+    /// all on the guard-failure and detailed-run paths, so a steady finish exit
+    /// built and dropped one per entry; they call [`raw_exit_values`] on the
+    /// typed list instead, which is [`Value::as_raw_i64`] per slot and loses
+    /// nothing.
     fn decode_exit_slots(
         backend: &BackendImpl,
         frame: &majit_backend::DeadFrame,
         exit_types: &[Type],
-    ) -> (ExitRawValues, ExitValues) {
-        let mut values = ExitRawValues::with_capacity(exit_types.len());
+    ) -> ExitValues {
         let mut typed_values = ExitValues::with_capacity(exit_types.len());
         for (i, &tp) in exit_types.iter().enumerate() {
-            match tp {
-                Type::Int => {
-                    let value = backend.get_int_value(frame, i);
-                    values.push(value);
-                    typed_values.push(Value::Int(value));
-                }
-                Type::Ref => {
-                    let value = backend.get_ref_value(frame, i);
-                    values.push(value.as_usize() as i64);
-                    typed_values.push(Value::Ref(value));
-                }
-                Type::Float => {
-                    let value = backend.get_float_value(frame, i);
-                    values.push(value.to_bits() as i64);
-                    typed_values.push(Value::Float(value));
-                }
-                Type::Void => {
-                    values.push(0);
-                    typed_values.push(Value::Void);
-                }
-            }
+            typed_values.push(match tp {
+                Type::Int => Value::Int(backend.get_int_value(frame, i)),
+                Type::Ref => Value::Ref(backend.get_ref_value(frame, i)),
+                Type::Float => Value::Float(backend.get_float_value(frame, i)),
+                Type::Void => Value::Void,
+            });
         }
-        (values, typed_values)
+        typed_values
     }
 
     /// `warmstate.py execute_assembler(loop_token, *args)`: the run
@@ -11342,11 +11307,11 @@ impl<M: Clone> MetaInterp<M> {
         let exit_types: &[Type] = descr.fail_arg_types();
         // The exit slots are read for both outcomes, so they are decoded before
         // the split rather than once in each arm.
-        let (values, typed_values) = Self::decode_exit_slots(&self.backend, &frame, exit_types);
+        let typed_values = Self::decode_exit_slots(&self.backend, &frame, exit_types);
         // The deadframe decode, amplified. It READS the frame the run returned
-        // and builds two fresh lists; it does not touch the frame, so it
-        // repeats. Each pass drops what it built, which is the same drop the
-        // shipping pass eventually pays for its own.
+        // and builds a fresh list; it does not touch the frame, so it repeats.
+        // Each pass drops what it built, which is the same drop the shipping
+        // pass eventually pays for its own.
         #[cfg(feature = "__execute-stage-probe")]
         {
             count_execute_stage_passes(ExecuteStage::Decode, stage_repeats.decode);
@@ -11391,7 +11356,6 @@ impl<M: Clone> MetaInterp<M> {
             // and JUMP arms have returned, so a layout built here would be
             // copied out of this result and dropped without a reader.
             return CompileResult {
-                values,
                 typed_values,
                 meta,
                 fail_index,
@@ -11483,7 +11447,6 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         CompileResult {
-            values,
             typed_values,
             meta,
             fail_index,
@@ -12272,6 +12235,28 @@ impl<M: Clone> MetaInterp<M> {
         self.warm_state
             .get_procedure_token(green_key)
             .filter(|token| token.has_compiled_code())
+    }
+
+    /// [`Self::resolve_cell_key`] and [`Self::entry_procedure_token`] from one
+    /// walk of the cell chain, reporting the key it resolved beside the token.
+    ///
+    /// A door holding a raw bucket hash owes both — the resolve, so its
+    /// decision is about the cell its greens own, and the token, so the run it
+    /// hands on enters that same cell's code. Asking for them separately walks
+    /// the chain twice; see [`WarmState::resolved_cell_procedure_token`].
+    ///
+    /// The key comes back because the second conjunct of the runnable predicate
+    /// reads `compiled_loops`, which is indexed by that key and is not a cell
+    /// walk, so the caller still needs it.
+    pub fn resolved_entry_procedure_token(
+        &self,
+        green_key_hash: u64,
+        make_green_key: impl FnOnce() -> majit_ir::GreenKey,
+    ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
+        let (cell_key, token) = self
+            .warm_state
+            .resolved_cell_procedure_token(green_key_hash, make_green_key);
+        (cell_key, token.filter(|token| token.has_compiled_code()))
     }
 
     /// [`Self::has_compiled_loop`] with both flag reads removed, for pricing
@@ -14814,7 +14799,7 @@ impl<M: Clone> MetaInterp<M> {
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
         let is_finish = result.is_finish;
-        let values = result.values.to_vec();
+        let values = crate::compile::raw_exit_values(&result.typed_values).into_vec();
         let typed_values = result.typed_values.clone();
         let savedata = result.savedata;
         let exception = result.exception.clone();
