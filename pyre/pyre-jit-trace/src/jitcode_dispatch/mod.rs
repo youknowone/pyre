@@ -9535,7 +9535,34 @@ fn walker_foriter_green_key<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     op_pc: usize,
 ) -> Option<u64> {
-    if ctx.fbw_mode.inline_subwalk || ctx.fbw_mode.snapshot_sym.is_null() {
+    // `op_pc` indexes the JitCode the walk is CURRENTLY executing, so the code
+    // object paired with it has to be that JitCode's.  Inside an inline
+    // sub-walk that is the callee's, resolved through
+    // `InlineCalleeConsts` exactly as `fbw_foriter_body_from_op_pc` resolves
+    // the matching body coordinate — `fbw_mode.snapshot_sym` still names the
+    // outer portal, and mapping a callee offset through the caller's pc tables
+    // answers with a Python pc that belongs to neither loop.
+    //
+    // Reading the caller's tables was why this returned `None` for every
+    // sub-walk, and the FOR_ITER specializations that key their demotion descr
+    // off this green key declined with it: a `for` loop inside an inlined
+    // callee kept the opaque `ForIterNext` residual, which runs the iterator's
+    // `__next__` as a real frame in the plain interpreter.
+    if let Some(consts) = ctx.inline_callee_consts {
+        let w_code = consts.w_code as *const ();
+        if w_code.is_null() {
+            return None;
+        }
+        let jitcode = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)?;
+        let foriter_start_pc =
+            crate::py_coord::containing_py_pc_for_jitcode_pc(&jitcode.metadata, op_pc) as usize;
+        return Some(crate::driver::make_green_key(
+            w_code,
+            foriter_start_pc,
+            ctx.session.borrow().is_being_profiled,
+        ));
+    }
+    if ctx.fbw_mode.snapshot_sym.is_null() {
         return None;
     }
     // SAFETY: snapshot-root mode keeps the outer `PyreSym` live throughout
