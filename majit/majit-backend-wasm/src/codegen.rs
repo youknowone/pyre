@@ -850,6 +850,24 @@ impl RefHomes {
                 }
             }
         }
+        // `store_force_descr` publishes the bracketing guard's fail arguments
+        // into the frame and leaves the bracket armed past the op, so a force
+        // arriving later is what reads them; x86 keeps that guard's gcmap as
+        // `finish_gcmap` for the same reason.  Ordinary liveness stops at the
+        // guard — nothing consumes them after it — so a Ref that crosses no
+        // collecting call would take no home and `emit_force_arm` would publish
+        // its raw pointer into the untraced exit slots.  Give every one of them
+        // a traced home to name instead.
+        for op in ops
+            .iter()
+            .filter(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
+        {
+            for arg in exit_fail_args(op) {
+                if ref_values.contains(arg) {
+                    Self::assign(&mut by_id, &mut next, arg.raw());
+                }
+            }
+        }
         // Resume-at-LABEL Ref captures must also have an ordinary home.  The
         // high capture slot preserves the value while another bridge executes
         // on this frame; the ordinary home participates in the existing
