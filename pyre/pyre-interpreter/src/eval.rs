@@ -5540,8 +5540,12 @@ mod tests {
         let code = compile_exec("pass").expect("compile failed");
         let mut frame = PyFrame::new(code);
         let frame_ptr = frame.as_mut_ptr();
-        let ec = unsafe { (*frame_ptr).execution_context as *mut PyExecutionContext };
-        assert!(!ec.is_null(), "the frame must carry an execution context");
+        // The frame no longer carries its context, so resolve the thread's.
+        // Read it AFTER building the frame: `PyFrame::new` re-stamps
+        // `LAST_EXEC_CTX`, and this has to be the same context
+        // `install_current_frame` will resolve.
+        let ec = crate::call::getexecutioncontext() as *mut PyExecutionContext;
+        assert!(!ec.is_null(), "the runtime must own an execution context");
         let outer_top = unsafe { (*ec).topframeref };
 
         unsafe { (*ec).enter(frame_ptr) };
