@@ -1363,13 +1363,6 @@ fn emit_write_barrier_if_needed(
     wb_applied.insert(wb_key);
 }
 
-/// Whether any op in the trace needs a write-barrier trampoline call, which
-/// requires the `jit_call` import to be present.
-fn has_ref_store_op(ops: &[Op], ref_values: &RefValues) -> bool {
-    ops.iter()
-        .any(|op| write_barrier_base(op, ref_values).is_some())
-}
-
 /// Emit a write-barrier check on `base_ref` before a ref-storing field/array
 /// store, standing in for the `COND_CALL_GC_WB` the native GC rewrite pass
 /// inserts. When the residual type family is declared (`residual_type_base`),
@@ -1642,13 +1635,17 @@ fn emit_reload_frame_if_necessary(
         // this does not need the residual direct-call type to be declared.
         emit_ca_reload_top(sink, top_addr);
         sink.local_set(0);
-    } else if let Some(base) = residual_type_base {
+    } else if let Some(base) = residual_type_base.filter(|_| ca_reload_fn_ptr != 0) {
         sink.i32_const(ca_reload_fn_ptr as i32);
         sink.call_indirect(0, base);
         sink.i32_wrap_i64();
         sink.local_set(0);
     } else {
-        // The trampoline path still assumes a non-moving frame: its scratch writes use local 0.
+        // No reload: either the trampoline path, which assumes a non-moving
+        // frame because its scratch writes use local 0, or an embedder whose
+        // host entry runs traces on a frame the shadow stack does not describe
+        // — it published no reload helper, and reloading from a shadow stack
+        // that never held this frame would install an unrelated one.
     }
 }
 
@@ -1797,22 +1794,64 @@ pub struct GuardGcTypeInfo {
 /// and one the IR cannot check — a helper declared to take a pointer has an
 /// `i32` parameter on wasm32, and `call_indirect` type-checks its callee on
 /// every call, so a call lowered this way traps instead of reaching a helper
-/// whose real signature is narrower. Only an embedder whose residual helpers
-/// are uniformly word-wide may leave this on; clearing it returns every call to
-/// the trampoline, which reads the callee's declared type before calling it.
+/// whose real signature is narrower.
+///
+/// [`ResidualCallAbi`] is how an embedder says which of the two it is.
 ///
 /// Read once per emitted call, so it must be set before the first compile.
-static DIRECT_RESIDUAL_CALL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+static RESIDUAL_CALL_ABI: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Set the direct-residual-call policy. See [`DIRECT_RESIDUAL_CALL`] for the
-/// ABI the enabled form assumes of the embedder's residual helpers.
-pub fn set_direct_residual_calls(enabled: bool) {
-    DIRECT_RESIDUAL_CALL.store(enabled, std::sync::atomic::Ordering::Relaxed);
+/// How faithfully a residual callee's call descr describes its real wasm
+/// signature.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResidualCallAbi {
+    /// Every callee reachable as a residual is spelled with word-sized `i64`
+    /// parameters and result and casts at its own boundary, so a descr's word
+    /// type *is* the callee's wasm type. Any word-typed residual then lowers
+    /// to a direct in-module `call_indirect`. The default.
+    Word,
+    /// Only the callees named by [`crate::set_faithful_residual_call_addrs`]
+    /// are known to be spelled that way. Every other residual keeps the host
+    /// trampoline, which reads the callee's declared type before calling it:
+    /// slower, but correct for a callee spelled with a pointer parameter,
+    /// which is narrower than a word on wasm32. Vouching for too few callees
+    /// costs speed; vouching for one whose parameters are not all words costs
+    /// a trap, so the safe direction is to add them one at a time.
+    Vouched,
 }
 
-fn direct_residual_calls() -> bool {
-    DIRECT_RESIDUAL_CALL.load(std::sync::atomic::Ordering::Relaxed)
+/// Declare which [`ResidualCallAbi`] this embedder's residual helpers satisfy.
+pub fn set_residual_call_abi(abi: ResidualCallAbi) {
+    let encoded = match abi {
+        ResidualCallAbi::Word => 0,
+        ResidualCallAbi::Vouched => 1,
+    };
+    RESIDUAL_CALL_ABI.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn residual_call_abi() -> ResidualCallAbi {
+    match RESIDUAL_CALL_ABI.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => ResidualCallAbi::Word,
+        _ => ResidualCallAbi::Vouched,
+    }
+}
+
+/// Whether `op`'s callee may be called with the wasm type its descr's word
+/// types imply, rather than through the reflecting trampoline.
+fn residual_callee_abi_is_word(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> bool {
+    match residual_call_abi() {
+        ResidualCallAbi::Word => true,
+        ResidualCallAbi::Vouched => {
+            // Only a compile-time callee can be checked against the list; a
+            // register-form func pointer is a different target on every
+            // execution.
+            let Some(func_ptr) = op.getarglist().first().map(|arg| arg.to_opref()) else {
+                return false;
+            };
+            func_ptr.is_constant()
+                && crate::residual_call_descr_is_faithful(resolve_const_bits(constants, func_ptr))
+        }
+    }
 }
 
 /// If `op` is a residual CALL whose ABI is uniformly i64 (all Int/Ref args and
@@ -1827,7 +1866,7 @@ fn direct_residual_calls() -> bool {
 /// which neither lowering touches, so a direct call is sound. Float /
 /// release-GIL / cond / assembler calls and non-reflectable descrs remain on
 /// the trampoline.
-fn residual_call_i64_arity(op: &Op) -> Option<usize> {
+fn residual_call_i64_arity(op: &Op, constants: &indexmap::IndexMap<u32, i64>) -> Option<usize> {
     use OpCode::*;
     if !matches!(
         op.opcode,
@@ -1858,6 +1897,9 @@ fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     // descr's `arg_types` describes those call args, so the counts must match.
     let nargs = op.getarglist().len().saturating_sub(1);
     if arg_types.len() != nargs {
+        return None;
+    }
+    if !residual_callee_abi_is_word(op, constants) {
         return None;
     }
     Some(nargs)
@@ -1906,9 +1948,9 @@ fn residual_call_typed_sig(
     // site keeps the four predicates disjoint, so the signature collected for an
     // op is always the signature its emit reaches -- a type collected for an op
     // the i64 family claims would declare an index nothing branches to.
-    if residual_call_i64_arity(op).is_some()
-        || residual_call_void_word_arity(op).is_some()
-        || residual_call_void_true_arity(op).is_some()
+    if residual_call_i64_arity(op, constants).is_some()
+        || residual_call_void_word_arity(op, constants).is_some()
+        || residual_call_void_true_arity(op, constants).is_some()
     {
         return None;
     }
@@ -1972,7 +2014,10 @@ fn residual_call_typed_sig(
 /// sound.
 /// Float / release-GIL / cond / assembler calls and non-reflectable descrs
 /// remain on the trampoline.
-fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
+fn residual_call_void_word_arity(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<usize> {
     use OpCode::*;
     if !matches!(
         op.opcode,
@@ -1996,6 +2041,9 @@ fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
     if arg_types.len() != nargs {
         return None;
     }
+    if !residual_callee_abi_is_word(op, constants) {
+        return None;
+    }
     Some(nargs)
 }
 
@@ -2005,7 +2053,10 @@ fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
 /// no result to drop. Float / release-GIL / cond / assembler calls,
 /// non-reflectable descrs, and descr/operand arity mismatches remain on the
 /// trampoline.
-fn residual_call_void_true_arity(op: &Op) -> Option<usize> {
+fn residual_call_void_true_arity(
+    op: &Op,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<usize> {
     use OpCode::*;
     if !matches!(
         op.opcode,
@@ -2029,6 +2080,9 @@ fn residual_call_void_true_arity(op: &Op) -> Option<usize> {
     if arg_types.len() != nargs {
         return None;
     }
+    if !residual_callee_abi_is_word(op, constants) {
+        return None;
+    }
     Some(nargs)
 }
 
@@ -2039,11 +2093,15 @@ fn residual_call_void_true_arity(op: &Op) -> Option<usize> {
 /// (its `wasm_jit_write_barrier` helper takes 1 arg). All of these share
 /// the i64-result residual-call type family, so one max covers them. True-void
 /// residuals use a separate result family and arity census.
-fn direct_helper_i64_arity(op: &Op, ref_values: &RefValues) -> Option<usize> {
-    if let Some(n) = residual_call_i64_arity(op) {
+fn direct_helper_i64_arity(
+    op: &Op,
+    ref_values: &RefValues,
+    constants: &indexmap::IndexMap<u32, i64>,
+) -> Option<usize> {
+    if let Some(n) = residual_call_i64_arity(op, constants) {
         return Some(n);
     }
-    if let Some(n) = residual_call_void_word_arity(op) {
+    if let Some(n) = residual_call_void_word_arity(op, constants) {
         return Some(n);
     }
     match op.opcode {
@@ -2056,33 +2114,14 @@ fn direct_helper_i64_arity(op: &Op, ref_values: &RefValues) -> Option<usize> {
     }
 }
 
-fn has_call_ops(ops: &[Op]) -> bool {
-    // `New*` also reaches the host via the `jit_call` trampoline, so the import
-    // must be present for it too. `Newstr` / `Newunicode` stay listed as a
-    // conservative superset: `build_function` declines any trace carrying them
-    // (no rstr lowering), so their entry here only ever over-imports.
-    ops.iter().any(|op| {
-        op.opcode.is_call()
-            || matches!(
-                op.opcode,
-                OpCode::New
-                    | OpCode::NewWithVtable
-                    | OpCode::NewArray
-                    | OpCode::NewArrayClear
-                    | OpCode::Newstr
-                    | OpCode::Newunicode
-            )
-    })
-}
-
 /// Whether this trace emits a host `jit_call` / `jit_call_compact` trampoline
 /// invocation and therefore needs the corresponding function import.
 ///
 /// Keep this in lockstep with the individual emission arms below: the uniform
-/// i64, typed float, and true-void residual families, `New*`, and write barriers
-/// are direct under [`DIRECT_RESIDUAL_CALL`]; non-uniform CALLs and string
-/// allocation retain the trampoline. When the direct family is disabled, all
-/// of the existing call-area users return to the trampoline baseline.
+/// i64, typed float, and true-void residual families, `New*`, and write
+/// barriers are direct as far as [`RESIDUAL_CALL_ABI`] lets each one be;
+/// non-uniform CALLs, an unvouched callee, and string allocation retain the
+/// trampoline.
 fn has_trampoline_calls(
     inputargs: &[InputArg],
     ops: &[Op],
@@ -2090,10 +2129,6 @@ fn has_trampoline_calls(
     emit_ca: bool,
 ) -> bool {
     let ref_values = RefValues::collect(inputargs, ops);
-    if !direct_residual_calls() {
-        return has_call_ops(ops) || has_ref_store_op(ops, &ref_values);
-    }
-
     ops.iter().any(|op| match op.opcode {
         // `build_function` handles an enabled CALL_ASSEMBLER before the generic
         // CALL arm, lowering it directly to the callee-loop table slot. It
@@ -2105,9 +2140,9 @@ fn has_trampoline_calls(
         // Every residual CALL uses the trampoline unless its exact lowering
         // predicate supplies an i64, typed float, or true-void helper ABI.
         _ if op.opcode.is_call() => {
-            direct_helper_i64_arity(op, &ref_values).is_none()
+            direct_helper_i64_arity(op, &ref_values, constants).is_none()
                 && residual_call_typed_sig(op, constants).is_none()
-                && residual_call_void_true_arity(op).is_none()
+                && residual_call_void_true_arity(op, constants).is_none()
         }
         // `New*` and ref-store write barriers are covered by
         // `direct_helper_i64_arity`, so their direct-family arms do not touch
@@ -3057,16 +3092,16 @@ pub fn build_wasm_module(
     // keeps the tail call area for future bridges.
     let needs_call =
         has_trampoline_calls(&analysis_inputargs, &analysis_ops, constants, ca.emit_ca);
-    // In-module residual calls ([`DIRECT_RESIDUAL_CALL`]): the largest
+    // In-module residual calls ([`RESIDUAL_CALL_ABI`]): the largest
     // eligible `(i64×n)->i64` arity in this trace — residual CALLs (word
     // result or word-ABI void) plus the `New*` / write-barrier helper
     // targets, which share the same uniform-i64 ABI — or `None` if there
     // are none. Each distinct arity `0..=max` gets its own function type
     // (declared below) so those arms can `call_indirect` with a static type.
-    let residual_max_arity = if direct_residual_calls() {
+    let residual_max_arity = {
         let scanned = analysis_ops
             .iter()
-            .filter_map(|op| direct_helper_i64_arity(op, &ref_values))
+            .filter_map(|op| direct_helper_i64_arity(op, &ref_values, constants))
             .max();
         if ca.emit_ca {
             // The CA arm's frame helpers (`wasm_jit_ca_reload_frame()`,
@@ -3082,33 +3117,25 @@ pub fn build_wasm_module(
         } else {
             scanned
         }
-    } else {
-        None
     };
     // Typed float residual calls use their descr's faithful wasm ABI instead
     // of the uniform i64 helper family. Preserve first-use order so a given
     // trace gets stable type indices while declaring each signature once.
     let mut typed_residual_sigs = Vec::new();
-    if direct_residual_calls() {
-        for op in analysis_ops {
-            if let Some(sig) = residual_call_typed_sig(op, constants)
-                && !typed_residual_sigs.contains(&sig)
-            {
-                typed_residual_sigs.push(sig);
-            }
+    for op in analysis_ops {
+        if let Some(sig) = residual_call_typed_sig(op, constants)
+            && !typed_residual_sigs.contains(&sig)
+        {
+            typed_residual_sigs.push(sig);
         }
     }
     // True-void residual calls use `(i64×n) -> ()`, a separate family from the
     // i64- and f64-result types. As with the uniform i64 family, declaring
     // `0..=max` makes each type index a base plus the call arity.
-    let true_void_residual_max_arity = if direct_residual_calls() {
-        analysis_ops
-            .iter()
-            .filter_map(residual_call_void_true_arity)
-            .max()
-    } else {
-        None
-    };
+    let true_void_residual_max_arity = analysis_ops
+        .iter()
+        .filter_map(|op| residual_call_void_true_arity(op, constants))
+        .max();
     // The shared indirect-function table backs direct residual helpers as well
     // as host-trampoline dispatch, chained bridges, and CA recursion.
     let needs_table = needs_call
@@ -3459,8 +3486,8 @@ fn build_function(
     inline_trip: Option<(InlineTripProbe, u32)>,
 ) -> Result<Function, BackendError> {
     // The CA arm requires residual types (the setup above forces arity >= 2
-    // while [`DIRECT_RESIDUAL_CALL`] is enabled). Its `jit_call` fallback
-    // branches are retained solely for the direct-family-disabled baseline.
+    // whenever it is emitted). Its `jit_call` fallback branches are retained
+    // solely for a trace that declared no residual type family at all.
     debug_assert!(!ca.emit_ca || residual_type_base.is_some());
     let value_locals_end = value_types.end_local();
     // Resume-at-LABEL shape, needed here because `resume_dispatch` costs a
@@ -5933,7 +5960,8 @@ fn build_function(
                 // no marshalling and no call-area traffic. A direct target may
                 // collect or force, so reload local 0 and its live Ref homes on
                 // return. Falls back below when ineligible.
-                if let (Some(base), Some(nargs)) = (residual_type_base, residual_call_i64_arity(op))
+                if let (Some(base), Some(nargs)) =
+                    (residual_type_base, residual_call_i64_arity(op, constants))
                 {
                     let call_args = &op.getarglist()[1..];
                     for arg in call_args {
@@ -5968,9 +5996,10 @@ fn build_function(
                     }
                     // store-on-def (end of loop) homes a Ref result, so the
                     // direct path must NOT `continue` past it.
-                } else if let (Some(base), Some(nargs)) =
-                    (residual_type_base, residual_call_void_word_arity(op))
-                {
+                } else if let (Some(base), Some(nargs)) = (
+                    residual_type_base,
+                    residual_call_void_word_arity(op, constants),
+                ) {
                     // Direct in-module word-ABI void residual call: the callee
                     // really is `(i64×n)->i64` (descr result_size == 8), so use
                     // the i64 family and drop the dummy result.
@@ -6052,7 +6081,7 @@ fn build_function(
                     }
                 } else if let (Some(base), Some(nargs)) = (
                     true_void_residual_type_base,
-                    residual_call_void_true_arity(op),
+                    residual_call_void_true_arity(op, constants),
                 ) {
                     // Direct in-module true-void residual call: the callee is
                     // `(i64×n)->()` (descr result_size == 0), so the call has no

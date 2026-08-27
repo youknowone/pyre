@@ -465,6 +465,27 @@ fn build_module_with_frame(
     gc_info: &codegen::GuardGcTypeInfo,
     frame: codegen::FrameGeometry,
 ) -> (Vec<u8>, Vec<codegen::GuardExit>) {
+    build_module_with_ca(
+        inputargs,
+        ops,
+        constants,
+        vtable_offset,
+        gc_info,
+        frame,
+        codegen::CaParams::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_module_with_ca(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    vtable_offset: Option<usize>,
+    gc_info: &codegen::GuardGcTypeInfo,
+    frame: codegen::FrameGeometry,
+    ca: codegen::CaParams,
+) -> (Vec<u8>, Vec<codegen::GuardExit>) {
     let inputs = codegen::ModuleBuildInputs {
         inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
         ops: ops.iter().cloned().collect(),
@@ -488,7 +509,7 @@ fn build_module_with_frame(
         external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame,
-        ca: codegen::CaParams::default(),
+        ca,
     };
     let (bytes, guards, _) =
         codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
@@ -2303,7 +2324,10 @@ fn test_true_void_family_does_not_shift_new_call_type() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
-    assert_eq!(indirect_calls.len(), 4);
+    // The void call and the `New`. Neither is followed by a frame reload:
+    // `CaParams::default()` publishes no reload helper, which says the frame
+    // this trace runs on is not one the jitframe shadow stack describes.
+    assert_eq!(indirect_calls.len(), 2);
     assert_eq!(
         function_type(&bytes, indirect_calls[0].0 as usize),
         (
@@ -2312,7 +2336,7 @@ fn test_true_void_family_does_not_shift_new_call_type() {
         )
     );
     assert_eq!(
-        function_type(&bytes, indirect_calls[2].0 as usize),
+        function_type(&bytes, indirect_calls[1].0 as usize),
         (
             vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
             vec![wasmparser::ValType::I64]
@@ -2348,7 +2372,8 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
     validate_wasm(&bytes);
     assert_eq!(guards.len(), 1);
     let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
-    assert_eq!(indirect_calls, vec![(3, 0), (1, 0), (3, 0), (1, 0)]);
+    // No reload between them: `CaParams::default()` publishes no reload helper.
+    assert_eq!(indirect_calls, vec![(3, 0), (3, 0)]);
     assert_eq!(
         function_type(&bytes, indirect_calls[0].0 as usize),
         (
@@ -2358,7 +2383,7 @@ fn test_list_append_word_abi_and_new_type_indices_match_declared_i64_types() {
         "jit_list_append returns an ignored machine word"
     );
     assert_eq!(
-        function_type(&bytes, indirect_calls[2].0 as usize),
+        function_type(&bytes, indirect_calls[1].0 as usize),
         (
             vec![wasmparser::ValType::I64, wasmparser::ValType::I64],
             vec![wasmparser::ValType::I64]
@@ -2481,7 +2506,8 @@ fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
     assert!(has_table_import(&bytes));
     assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
     let (indirect_calls, drops) = indirect_call_types_and_drop_count(&bytes);
-    assert_eq!(indirect_calls, vec![(2, 0), (1, 0)]);
+    // The call alone: `CaParams::default()` publishes no reload helper.
+    assert_eq!(indirect_calls, vec![(2, 0)]);
     assert_eq!(
         function_type(&bytes, 2),
         (
@@ -2490,6 +2516,52 @@ fn test_void_word_abi_call_uses_i64_result_type_and_drop() {
         )
     );
     assert_eq!(drops, 1, "the ignored word result must be dropped");
+}
+
+/// A published reload helper is the statement that the running frame can move,
+/// so the reload after a collecting call must appear exactly when one is
+/// published. Emitting it unconditionally calls through whatever occupies the
+/// unpublished slot and then installs its result as the frame pointer, which
+/// is why both directions are asserted here rather than only the one this
+/// backend's own host takes.
+#[test]
+fn test_frame_reload_is_emitted_only_when_a_reload_helper_is_published() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let ops = vec![
+        void_call(vec![Type::Int], &[OpRef::input_arg_int(0)], 8),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let build = |ca| {
+        build_module_with_ca(
+            &inputargs,
+            &ops,
+            &indexmap::IndexMap::new(),
+            Some(0),
+            &codegen::GuardGcTypeInfo::default(),
+            codegen::FrameGeometry::fixed(),
+            ca,
+        )
+        .0
+    };
+
+    let unpublished = build(codegen::CaParams::default());
+    validate_wasm(&unpublished);
+    assert_eq!(
+        indirect_call_types_and_drop_count(&unpublished).0,
+        vec![(2, 0)],
+        "the call alone; a frame the host never pushed has nothing to reload from"
+    );
+
+    let published = build(codegen::CaParams {
+        ca_reload_fn_ptr: 7,
+        ..codegen::CaParams::default()
+    });
+    validate_wasm(&published);
+    assert_eq!(
+        indirect_call_types_and_drop_count(&published).0,
+        vec![(2, 0), (1, 0)],
+        "the reload follows the call whose collection may have moved the frame"
+    );
 }
 
 #[test]

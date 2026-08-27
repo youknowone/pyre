@@ -332,8 +332,9 @@ pub struct TraceEntryCensusStorage {
 }
 
 /// Arm trace-entry instrumentation before the guest starts compiling traces.
-/// Native runs select the same facility with `MAJIT_TRACE_ENTRY_CENSUS`; wasm
-/// has no environment, so its host calls this function through pyre-wasm.
+/// `MAJIT_TRACE_ENTRY_CENSUS` selects the same facility wherever the guest has
+/// an environment to read it from; a guest that has none is armed by its host
+/// through this function instead.
 pub fn trace_entry_census_enable() {
     TRACE_ENTRY_CENSUS_FORCED.store(true, Ordering::Relaxed);
 }
@@ -342,15 +343,12 @@ fn trace_entry_census_enabled() -> bool {
     if TRACE_ENTRY_CENSUS_FORCED.load(Ordering::Relaxed) {
         return true;
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("MAJIT_TRACE_ENTRY_CENSUS").is_some())
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        false
-    }
+    // Read on every target. Whether a wasm guest has an environment is a
+    // property of its embedder, not of the architecture: one launched as a
+    // WASI command inherits the variables its host passes it, and one with no
+    // environment reads an absent variable rather than failing to compile.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAJIT_TRACE_ENTRY_CENSUS").is_some())
 }
 
 /// Allocate the one counter array that an armed physical trace module uses.
@@ -1175,13 +1173,41 @@ fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
     })?
 }
 
+/// Whether the host entry runs a trace on a `JitFrame` it pushed onto the
+/// jitframe shadow stack.
+///
+/// `execute_token` allocates that frame only once a `JitFrame` type id has been
+/// registered; with none it runs the trace on a plain host buffer, which no
+/// collection moves and which the shadow stack never describes. Every frame
+/// reload a trace body emits answers out of that shadow stack, so an embedder
+/// that registered no type id must get no reloads at all — a reload there would
+/// replace the running frame pointer with whatever root happens to sit on top.
+fn host_entry_frame_is_jitframe() -> bool {
+    wasm_jitframe_tid() != 0
+}
+
 /// Address of the active jitframe shadow-stack top cell for ordinary trace
 /// body reloads. This does not depend on nursery fast-path eligibility: the
-/// reload is valid whenever a GC is active at compilation time.
+/// reload is valid whenever a GC is active at compilation time *and* the host
+/// entry runs its traces on a pushed `JitFrame`.
 fn jf_top_addr() -> Option<u32> {
+    if !host_entry_frame_is_jitframe() {
+        return None;
+    }
     with_wasm_active_gc(|_| majit_gc::shadow_stack::get_root_stack_top_addr())
         .and_then(|addr| u32::try_from(addr).ok())
         .filter(|&addr| addr != 0)
+}
+
+/// Table slot of the frame-reload helper, or `0` when the running frame is not
+/// one the shadow stack describes. Zero reaches codegen as "this trace needs no
+/// reload", which is what a frame the host never pushed — and never moves —
+/// requires.
+fn body_reload_fn_ptr() -> i64 {
+    if !host_entry_frame_is_jitframe() {
+        return 0;
+    }
+    wasm_jit_ca_reload_frame as *const () as usize as i64
 }
 
 /// `majit_gc::CollectGenerationFn` installed by `register_active_hooks`. Drives
@@ -3412,7 +3438,7 @@ impl majit_backend::Backend for WasmBackend {
             frame,
             ca: ca_targets.as_ref().map_or_else(
                 || codegen::CaParams {
-                    ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                    ca_reload_fn_ptr: body_reload_fn_ptr(),
                     jf_top_addr: jf_top_addr(),
                     ..codegen::CaParams::default()
                 },
@@ -4215,7 +4241,7 @@ impl majit_backend::Backend for WasmBackend {
             }
         } else {
             codegen::CaParams {
-                ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                ca_reload_fn_ptr: body_reload_fn_ptr(),
                 jf_top_addr: jf_top_addr(),
                 ..codegen::CaParams::default()
             }
@@ -4786,11 +4812,14 @@ impl majit_backend::Backend for WasmBackend {
                 return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
             }
 
-            // Legacy host-Vec frame path (default, PYRE_WASM_CA off): fail_index
-            // at frame[0], inputs/outputs at frame[1 + i], surviving Ref homes
-            // manually rooted across the trace. A home slot only ever holds null
-            // (entry init) or a valid GcRef (store-on-def), so forwarding is
-            // safe. The path to
+            // Host-buffer frame path, for an embedder that registered no
+            // `JitFrame` type id: fail_index at frame[0], inputs/outputs at
+            // frame[1 + i], surviving Ref homes manually rooted across the
+            // trace. A home slot only ever holds null (entry init) or a valid
+            // GcRef (store-on-def), so forwarding is safe. This buffer is not
+            // on the jitframe shadow stack and no collection moves it, which is
+            // what `host_entry_frame_is_jitframe` reports to codegen so the
+            // body emits no frame reload. The path to
             // `wasm_gc_remove_root` is straight-line and the wasm32 build is
             // `panic=abort`, so `glue::execute` cannot unwind and leak roots.
             let mut frame = vec![0i64; frame_size];
