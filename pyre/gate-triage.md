@@ -222,8 +222,8 @@ build.
 
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn
-off that many of the 75 trace-time specialization rows (the `spec_folds!`
-invocation at `jitcode_dispatch/diag.rs:342-419`; count them there rather
+off that many of the 77 trace-time specialization rows (the `spec_folds!`
+invocation at `jitcode_dispatch/diag.rs:342-421`; count them there rather
 than trusting this sentence), and an unset variable suppresses none.  Not all
 75 are hand-written: `subscr_tuple_descent`, `unary_invert_descent` and
 `unary_negative_descent` name orthodox sub-walks of the interpreter's own
