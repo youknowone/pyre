@@ -134,6 +134,30 @@ pub struct GraphTransformConfig {
     /// that part of the translated low-level type here.
     #[serde(default)]
     pub struct_storage: Vec<StructStorageDescriptor>,
+    /// Type names whose `jit_merge_point` / `can_enter_jit` / `loop_header`
+    /// methods are the jitdriver markers.
+    ///
+    /// Upstream needs no such list: `rlib/jit.py` registers
+    /// `ExtEnterLeaveMarker` against `JitDriver`'s own methods, so one class
+    /// answers for every driver an interpreter declares, and
+    /// `rewrite_op_jit_marker` reads the instance back out of
+    /// `op.args[1].value`. A Rust front-end has no equivalent registry to key
+    /// on, so the embedding pipeline names its driver here the way
+    /// [`Self::struct_storage`] names its own storage shapes.
+    ///
+    /// [`Default`] is pyre's pair, so a pipeline that does not name one keeps
+    /// pyre's behaviour.
+    #[serde(default = "default_jitdriver_receiver_roots")]
+    pub jitdriver_receiver_roots: Vec<String>,
+}
+
+/// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
+/// two drivers.
+fn default_jitdriver_receiver_roots() -> Vec<String> {
+    RECOGNIZED_JITDRIVER_RECEIVER_ROOTS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 impl Default for GraphTransformConfig {
@@ -145,6 +169,7 @@ impl Default for GraphTransformConfig {
             vable_arrays: Vec::new(),
             call_effects: Vec::new(),
             struct_storage: Vec::new(),
+            jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
         }
     }
 }
@@ -472,7 +497,10 @@ enum JitMarkerKey {
     LoopHeader,
 }
 
-/// JitDriver receiver types whose `jit_merge_point`/`can_enter_jit`/`loop_header` markers are recognized; each becomes its own portal via `portal_jd_index`.
+/// pyre's own driver receiver types, and the
+/// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its
+/// own portal via `portal_jd_index`. Another embedding pipeline names its
+/// driver through that field rather than being added here.
 const RECOGNIZED_JITDRIVER_RECEIVER_ROOTS: &[&str] = &["PyPyJitDriver", "UnpackIterableJitDriver"];
 
 /// The null-pointer builtins `HostEnv::bootstrap` registers
@@ -506,7 +534,10 @@ fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
         .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
 }
 
-fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
+fn jit_marker_key_from_target(
+    target: &CallTarget,
+    driver_roots: &[String],
+) -> Option<JitMarkerKey> {
     let CallTarget::Method {
         name,
         receiver_root: Some(receiver_root),
@@ -515,7 +546,7 @@ fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
     else {
         return None;
     };
-    if !RECOGNIZED_JITDRIVER_RECEIVER_ROOTS.contains(&receiver_root.as_str()) {
+    if !driver_roots.iter().any(|root| root == receiver_root) {
         return None;
     }
     match name.as_str() {
@@ -604,6 +635,7 @@ fn is_source_constant_variable(
 fn autodetect_jit_markers_redvars(
     graph: &FunctionGraph,
     greens: &[crate::flowspace::model::Variable],
+    driver_roots: &[String],
 ) -> Vec<crate::flowspace::model::Variable> {
     use crate::codewriter::type_state::ConcreteType;
     use crate::flowspace::model::Variable;
@@ -616,20 +648,20 @@ fn autodetect_jit_markers_redvars(
                 let OpKind::Call { target, args, .. } = &op.kind else {
                     return None;
                 };
-                (jit_marker_key_from_target(target) == Some(JitMarkerKey::JitMergePoint)).then(
-                    || {
-                        (
-                            block,
-                            index,
-                            args.first().cloned(),
-                            args.iter()
-                                .skip(1)
-                                .take(greens.len())
-                                .cloned()
-                                .collect::<Vec<_>>(),
-                        )
-                    },
-                )
+                (jit_marker_key_from_target(target, driver_roots)
+                    == Some(JitMarkerKey::JitMergePoint))
+                .then(|| {
+                    (
+                        block,
+                        index,
+                        args.first().cloned(),
+                        args.iter()
+                            .skip(1)
+                            .take(greens.len())
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                })
             })
         })
         .expect("autoreds portal graph must contain a jit_merge_point");
@@ -3616,7 +3648,7 @@ impl<'a> Transformer<'a> {
         // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
         // pyre keys on the direct_call callee identity since the front-end
         // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
-        if let Some(key) = jit_marker_key_from_target(target)
+        if let Some(key) = jit_marker_key_from_target(target, &self.config.jitdriver_receiver_roots)
             && let Some(ops) = self.try_handle_jit_marker(key, args, graph)
         {
             return RewriteResult::Replace(ops);
@@ -5726,8 +5758,13 @@ impl<'a> Transformer<'a> {
                 // support.py guards the portal scan on `autoreds`.
                 // Explicit-red drivers retain the existing call-site payload
                 // path byte-for-byte.
-                let detected_reds =
-                    autoreds.then(|| autodetect_jit_markers_redvars(graph, greens_raw));
+                let detected_reds = autoreds.then(|| {
+                    autodetect_jit_markers_redvars(
+                        graph,
+                        greens_raw,
+                        &self.config.jitdriver_receiver_roots,
+                    )
+                });
                 let reds_raw = detected_reds.as_deref().unwrap_or(&user_args[num_greens..]);
                 self.check_jit_marker_operand_kinds(
                     jitdriver_index,
@@ -10943,7 +10980,11 @@ mod tests {
         ];
 
         assert_eq!(
-            autodetect_jit_markers_redvars(&graph, &[remapped_green]),
+            autodetect_jit_markers_redvars(
+                &graph,
+                &[remapped_green],
+                &default_jitdriver_receiver_roots(),
+            ),
             vec![red_i, w_iterator, items, red_f],
             "reds must be INT<REF<FLOAT with deterministic Variable-id order within a kind"
         );
@@ -10954,35 +10995,79 @@ mod tests {
         let unpack_merge =
             CallTarget::method("jit_merge_point", Some("UnpackIterableJitDriver".into()));
         assert_eq!(
-            jit_marker_key_from_target(&unpack_merge),
+            jit_marker_key_from_target(&unpack_merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
 
         let merge = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
         assert_eq!(
-            jit_marker_key_from_target(&merge),
+            jit_marker_key_from_target(&merge, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::JitMergePoint)
         );
         let cej = CallTarget::method("can_enter_jit", Some("PyPyJitDriver".into()));
         assert_eq!(
-            jit_marker_key_from_target(&cej),
+            jit_marker_key_from_target(&cej, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::CanEnterJit)
         );
         let lh = CallTarget::method("loop_header", Some("PyPyJitDriver".into()));
         assert_eq!(
-            jit_marker_key_from_target(&lh),
+            jit_marker_key_from_target(&lh, &default_jitdriver_receiver_roots()),
             Some(JitMarkerKey::LoopHeader)
         );
         // Other receivers or other methods must not match.
         let other = CallTarget::method("jit_merge_point", Some("SomeOtherType".into()));
-        assert_eq!(jit_marker_key_from_target(&other), None);
+        assert_eq!(
+            jit_marker_key_from_target(&other, &default_jitdriver_receiver_roots()),
+            None
+        );
         let missing_receiver = CallTarget::method("jit_merge_point", None);
-        assert_eq!(jit_marker_key_from_target(&missing_receiver), None);
+        assert_eq!(
+            jit_marker_key_from_target(&missing_receiver, &default_jitdriver_receiver_roots()),
+            None
+        );
         let other_method = CallTarget::method("not_a_marker", Some("PyPyJitDriver".into()));
-        assert_eq!(jit_marker_key_from_target(&other_method), None);
+        assert_eq!(
+            jit_marker_key_from_target(&other_method, &default_jitdriver_receiver_roots()),
+            None
+        );
         // Non-method targets are never markers.
         let free_fn = CallTarget::function_path(["module", "jit_merge_point"]);
-        assert_eq!(jit_marker_key_from_target(&free_fn), None);
+        assert_eq!(
+            jit_marker_key_from_target(&free_fn, &default_jitdriver_receiver_roots()),
+            None
+        );
+    }
+
+    /// A second interpreter embedding this pipeline names its own driver type,
+    /// the way `rlib/jit.py` lets any `JitDriver` instance carry the markers
+    /// rather than privileging the one pyre happens to declare.
+    ///
+    /// Both directions are asserted: naming a driver makes its markers
+    /// recognised, and it also stops pyre's own names from being recognised —
+    /// so this fails if the roots are read from the constant rather than from
+    /// the config.
+    #[test]
+    fn an_embedding_pipeline_names_its_own_jitdriver_receiver() {
+        let embedder: Vec<String> = vec!["HostJitDriver".to_string()];
+
+        let theirs = CallTarget::method("jit_merge_point", Some("HostJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&theirs, &embedder),
+            Some(JitMarkerKey::JitMergePoint),
+            "a pipeline that names its driver has its merge point recognised",
+        );
+
+        let ours = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&ours, &embedder),
+            None,
+            "the configured set REPLACES the default rather than extending it",
+        );
+        assert_eq!(
+            jit_marker_key_from_target(&theirs, &default_jitdriver_receiver_roots()),
+            None,
+            "and the default does not already carry the embedder's name",
+        );
     }
 
     #[test]
@@ -11039,8 +11124,9 @@ mod tests {
         FunctionGraph::set_concretetype_of_inline(&frame, ConcreteType::GcRef);
         FunctionGraph::set_concretetype_of_inline(&ec, ConcreteType::GcRef);
         let merge_target = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
-        let merge_key = jit_marker_key_from_target(&merge_target)
-            .expect("source jit_merge_point method must be recognized");
+        let merge_key =
+            jit_marker_key_from_target(&merge_target, &default_jitdriver_receiver_roots())
+                .expect("source jit_merge_point method must be recognized");
         let merge_ops = transformer
             .try_handle_jit_marker(
                 merge_key,
@@ -11061,8 +11147,9 @@ mod tests {
         );
 
         let enter_target = CallTarget::method("can_enter_jit", Some("PyPyJitDriver".into()));
-        let enter_key = jit_marker_key_from_target(&enter_target)
-            .expect("source can_enter_jit method must be recognized");
+        let enter_key =
+            jit_marker_key_from_target(&enter_target, &default_jitdriver_receiver_roots())
+                .expect("source can_enter_jit method must be recognized");
         let enter_ops = transformer
             .try_handle_jit_marker(enter_key, &[], &graph)
             .expect("recognized can_enter_jit marker must lower");
