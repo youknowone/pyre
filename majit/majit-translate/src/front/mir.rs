@@ -6566,6 +6566,7 @@ impl<'a> Lowering<'a> {
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.static_int_value_op(&segments))
+                    .or_else(|| known_array_layout_const(&segments))
                     .or_else(|| self.const_eval_global(id))
                     .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
@@ -11791,7 +11792,9 @@ impl<'a> Lowering<'a> {
     /// descr-based consumption is safe to alias to its receiver.
     fn is_items_block_base_ptr_add(&self, reg: &RegularCall) -> bool {
         graph_is_items_block_base_accessor(&self.graph.name)
-            && regular_call_is_ptr_add(reg, self.llbc)
+            && (regular_call_is_ptr_add(reg, self.llbc)
+                || (is_typed_array_base_adapter(&self.graph.name)
+                    && regular_call_is_ptr_wrapping_add(reg, self.llbc)))
     }
 
     /// `slice::from_raw_parts{,_mut}` inside a container's items-view adapter:
@@ -17143,6 +17146,25 @@ fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &Llbc) -> bool {
     })
 }
 
+/// The wrapping twin used only by `IntArray::base` / `FloatArray::base`.
+/// Their null storage form deliberately computes an aligned, non-null address
+/// for Rust's zero-length slice contract, while every live element access has
+/// first installed a real `TypedItemsBlock`.  In the translated graph that
+/// live path is RPython's `l.items` GcArray header, just like the direct
+/// `typed_items_block_items_base` accessor.
+fn regular_call_is_ptr_wrapping_add(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        matches!(
+            fd.item_meta.name_path().as_str(),
+            "core::ptr::mut_ptr::<Impl>::wrapping_add"
+                | "core::ptr::const_ptr::<Impl>::wrapping_add"
+        )
+    })
+}
+
 /// Whether a statically-resolved [`RegularCall`] is one of the two
 /// `ItemsBlock` items-base accessors brick 1 rewrites to return the
 /// block *header* pointer (`items_block_items_base` /
@@ -17171,8 +17193,10 @@ fn regular_call_is_typed_items_block_accessor(reg: &RegularCall, llbc: &Llbc) ->
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return false;
     };
-    llbc.fn_by_id(*id)
-        .is_some_and(|fd| is_typed_items_block_base_accessor(fd.item_meta.name_path().as_str()))
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        let name = fd.item_meta.name_path();
+        is_typed_items_block_base_accessor(&name) || is_typed_array_base_adapter(&name)
+    })
 }
 
 /// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
@@ -22012,6 +22036,15 @@ fn is_typed_items_block_base_accessor(name: &str) -> bool {
     path_ends_with_segments(name, "rlist::typed_items_block_items_base")
 }
 
+/// Scalar storage adapters for PyPy's `GcArray(Signed|Float)` list items.
+/// These spell the physical header offset locally because their empty Rust
+/// arrays need a non-null zero-length-slice address; for every live element
+/// access the block is non-null and the translated value is still `l.items`.
+fn is_typed_array_base_adapter(name: &str) -> bool {
+    path_ends_with_segments(name, "int_array::<Impl>::base")
+        || path_ends_with_segments(name, "float_array::<Impl>::base")
+}
+
 /// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
 /// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
 /// receiver (see [`Lowering::is_items_block_base_ptr_add`]).
@@ -22024,7 +22057,9 @@ fn is_typed_items_block_base_accessor(name: &str) -> bool {
 /// — the element side is refused by [`is_object_ref_items_ptr`] as well, so the
 /// two gates agree by construction rather than by coincidence.
 fn graph_is_items_block_base_accessor(name: &str) -> bool {
-    is_object_items_block_base_accessor(name) || is_typed_items_block_base_accessor(name)
+    is_object_items_block_base_accessor(name)
+        || is_typed_items_block_base_accessor(name)
+        || is_typed_array_base_adapter(name)
 }
 
 /// One path segment, with a raw-identifier prefix removed.  `r#struct` and
@@ -22109,6 +22144,23 @@ fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
         _ => return None,
     };
     Some(OpKind::ConstFloat(bits))
+}
+
+/// Target-layout value of the scalar GcArray's items offset.  Charon leaves
+/// Rust's `offset_of!(TypedItemsBlock, items)` initializer opaque, but the
+/// translated lltype fixes the same layout structurally: one target-word
+/// length header followed by an 8-byte-aligned Signed/Float item array
+/// (`rlist.py:84,116`).  This is the front-end counterpart of
+/// `CallControl::array_items_base`; it derives the target value instead of
+/// importing a host-runtime constant or registering a fake residual getter.
+fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
+    let path = segments.join("::");
+    if !path_ends_with_segments(&path, "rlist::TYPED_ITEMS_BLOCK_ITEMS_OFFSET") {
+        return None;
+    }
+    let word = crate::layout::target_word_size();
+    let items_offset = word.div_ceil(8) * 8;
+    Some(OpKind::ConstInt(items_offset as i64))
 }
 
 /// Supply the value of a `CodeFlags` associated constant. `bitflags!`
@@ -26052,6 +26104,12 @@ mod tests {
         assert!(graph_is_items_block_base_accessor(
             "majit_rlib::lltypesystem::rlist::typed_items_block_items_base"
         ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::int_array::<Impl>::base"
+        ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::float_array::<Impl>::base"
+        ));
 
         // Bodies that dereference a `.add(NAMED_OFFSET)` interior pointer
         // in place must NOT be aliased — the offset is load-bearing.
@@ -26064,6 +26122,9 @@ mod tests {
         // A leaf collision in another module must not widen the gate.
         assert!(!graph_is_items_block_base_accessor(
             "pyre_object::other_mod::items_block_items_base_helper"
+        ));
+        assert!(!graph_is_items_block_base_accessor(
+            "pyre_object::my_int_array::<Impl>::base"
         ));
     }
 
@@ -30588,6 +30649,76 @@ mod tests {
             unwrap_residuals, 0,
             "checked conversion Result::unwrap must become a discriminant guard"
         );
+    }
+
+    /// The scalar unwrapped-list storage adapters are Rust spellings of
+    /// RPython's `l.items` GcArray.  A live `push` must therefore end in the
+    /// same `setarrayitem` shape as `rlist.ll_append_noresize`, never in the
+    /// synthetic raw-pointer write that blocks annotation.  The adapter body
+    /// itself must also be free of the opaque Rust `offset_of!` getter; its
+    /// target-layout constant is part of the translated GcArray shape.
+    #[test]
+    #[ignore]
+    fn unwrapped_array_pushes_lower_to_rpython_gcarray_writes() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real object LLBC");
+        for (base, function, expected_array) in [
+            (
+                "pyre_object::int_array::<Impl>::base",
+                "pyre_object::int_array::<Impl>::push",
+                "[i64]",
+            ),
+            (
+                "pyre_object::float_array::<Impl>::base",
+                "pyre_object::float_array::<Impl>::push",
+                "[f64]",
+            ),
+        ] {
+            let base_graph = super::lower_function(&llbc, base)
+                .unwrap_or_else(|err| panic!("lower {base}: {err}"));
+            assert!(
+                !base_graph.blocks.iter().flat_map(|block| &block.operations).any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().is_some_and(|leaf| leaf == "TYPED_ITEMS_BLOCK_ITEMS_OFFSET")
+                )),
+                "{base} must fold the target-layout items offset"
+            );
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|err| panic!("lower {function}: {err}"));
+            let operations: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .collect();
+            assert!(
+                operations.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::ArrayWrite {
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == expected_array
+                )),
+                "{function} must write {expected_array} through setarrayitem"
+            );
+            assert!(
+                !operations.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["__deref_write".to_string()]
+                )),
+                "{function} must not retain a raw-pointer write"
+            );
+        }
     }
 
     #[test]
