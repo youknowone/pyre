@@ -157,9 +157,12 @@ PLATFORM_GATED = {
         lambda p: p != "wasi",
         "cannot create socket on WASI",
     ),
-    # `if not support.has_fork_support: raise unittest.SkipTest(...)`
+    # `if not support.has_fork_support: raise unittest.SkipTest(...)`, and
+    # `has_fork_support` is `hasattr(os, "fork")` minus the platforms that
+    # have the call but cannot use it: `is_emscripten`, `is_wasi`,
+    # `is_apple_mobile` and `is_android`.
     "test.test_fork1": (
-        lambda p: p not in ("win32", "emscripten", "wasi"),
+        lambda p: p not in ("win32", "emscripten", "wasi", "ios", "tvos", "watchos", "android"),
         "os.fork() not available",
     ),
     # `if not hasattr(os, "openpty"): raise unittest.SkipTest(...)`

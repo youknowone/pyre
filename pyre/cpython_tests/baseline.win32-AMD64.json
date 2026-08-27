@@ -2,31 +2,40 @@
   "host": "win32-AMD64",
   "modules": {
     "test.test_eintr": {
-      "dynasm": "SKIP"
+      "dynasm": "SKIP",
+      "reason": "EINTRTests is skipUnless(os.name == 'posix', 'only supported on Unix'), so every case in the module skips and none is left to report a result"
     },
     "test.test_file_eintr": {
-      "dynasm": "SKIP"
+      "dynasm": "SKIP",
+      "reason": "the skipUnless(os.name == 'posix') sits on the TestFileIOSignalInterrupt mixin that every concrete case class inherits from, so every case skips"
     },
     "test.test_import": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "ImportTests.test_dll_dependency_import is the module's only skipUnless(sys.platform == 'win32') case, and it reads importlib.util.find_spec('_sqlite3').origin: pyre ships no _sqlite3, so find_spec answers None. Not a platform difference in the import machinery -- a missing extension module the POSIX hosts never exercise"
     },
     "test.test_mmap": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "MmapTests.setUp's os.unlink(TESTFN) raises PermissionError WinError 32 once a preceding case leaves the mapping's file open: finalization is not refcount-prompt and Windows refuses to unlink an open file. 40 of the 51 cases error on that one line; POSIX unlinks an open file and passes"
     },
     "test.test_msvcrt": {
-      "dynasm": "PASS"
+      "dynasm": "PASS",
+      "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for import msvcrt"
     },
     "test.test_startfile": {
-      "dynasm": "PASS"
+      "dynasm": "PASS",
+      "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for os.startfile"
     },
     "test.test_venv": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "EnvBuilder.setup_python's nt branch copies venvlaunchert.exe / venvwlaunchert.exe out of venv/scripts/nt, which holds only activate.bat and deactivate.bat, so Scripts/<exe> is never produced and every case that looks for it fails. The POSIX branch copies the interpreter itself"
     },
     "test.test_winapi": {
-      "dynasm": "PASS"
+      "dynasm": "PASS",
+      "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for import _winapi"
     },
     "test.test_winreg": {
-      "dynasm": "PASS"
+      "dynasm": "PASS",
+      "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for import winreg"
     }
   },
   "stdlib_version": "3.14.6"
