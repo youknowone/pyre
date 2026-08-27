@@ -118,8 +118,13 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     };
 
     if !quiet {
-        println!("{BANNER}");
-        println!("Type \"exit()\" or Ctrl-D to exit.");
+        // `pymain_header` writes both of its lines with `fprintf(stderr, ...)`,
+        // and `print_banner` reaches the same descriptor through `sys.stderr`,
+        // so the prompt's greeting is not part of its stdout.  A session whose
+        // stdout is captured -- a pipe, a doctest harness, an editor's REPL
+        // pane -- gets the results and not the banner.
+        eprintln!("{BANNER}");
+        eprintln!("Type \"exit()\" or Ctrl-D to exit.");
     }
 
     let mut full_input = String::new();
