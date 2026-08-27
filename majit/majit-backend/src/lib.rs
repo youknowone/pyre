@@ -1185,7 +1185,19 @@ pub struct JitCellToken {
     /// repeated `invalidate_loop()` to invalidate newer guards, but not an old
     /// guard that already has a bridge attached. The token owns the Arcs so
     /// addresses baked into compiled artifacts remain valid for its lifetime.
-    bridge_invalidation_flags: parking_lot::Mutex<Vec<Arc<AtomicBool>>>,
+    /// Shared with [`Self::quasi_immut_handle`], which is what the
+    /// interpreter's `QuasiImmut` registry holds a weak reference to.
+    bridge_invalidation_flags: Arc<parking_lot::Mutex<Vec<Arc<AtomicBool>>>>,
+    /// The projection of this token that `quasiimmut.py register_loop_token`
+    /// records.  Upstream registers the loop token itself, and can, because
+    /// its `QuasiImmut.invalidate` runs under the GIL on the one thread that
+    /// owns every token.  pyre's runs on whichever mutator wrote the watched
+    /// field, so registering the token would let that thread perform the final
+    /// `Arc<JitCellToken>` drop -- and the token owns `Cell` and
+    /// `Rc<RdVirtualInfo>` state that is `Send`/`Sync` only by the
+    /// single-JIT-thread promise below.  Invalidation reads nothing but
+    /// atomics, so it is split into a value that carries no such promise.
+    quasi_immut_handle: Arc<LoopInvalidation>,
     /// Alternative loop versions to compile immediately after the main loop.
     pub version_info: Option<LoopVersionInfo>,
     /// history.py:455: _keepalive_jitcell_tokens — set of other tokens
@@ -1366,6 +1378,8 @@ impl JitCellToken {
         self.retraced_count.set(value);
     }
     pub fn new(number: u64) -> Self {
+        let invalidated = Arc::new(AtomicBool::new(false));
+        let bridge_invalidation_flags = Arc::new(parking_lot::Mutex::new(Vec::new()));
         JitCellToken {
             number,
             green_key: Cell::new(0),
@@ -1373,8 +1387,12 @@ impl JitCellToken {
             virtualizable_arg_index: Cell::new(None),
             outermost_jitdriver_index: None,
             compiled: OnceLock::new(),
-            invalidated: Arc::new(AtomicBool::new(false)),
-            bridge_invalidation_flags: parking_lot::Mutex::new(Vec::new()),
+            quasi_immut_handle: Arc::new(LoopInvalidation {
+                invalidated: invalidated.clone(),
+                bridge_flags: bridge_invalidation_flags.clone(),
+            }),
+            invalidated,
+            bridge_invalidation_flags,
             version_info: None,
             keepalive_tokens: parking_lot::Mutex::new(Vec::new()),
             // `rpython/jit/backend/x86/assembler.py:514` creates the
@@ -1463,10 +1481,7 @@ impl JitCellToken {
     /// far is set too. A bridge compiled after this call mints a fresh clear
     /// flag and starts valid.
     pub fn invalidate(&self) {
-        self.invalidated.store(true, Ordering::Release);
-        for flag in self.bridge_invalidation_flags.lock().iter() {
-            flag.store(true, Ordering::Release);
-        }
+        self.quasi_immut_handle.invalidate();
     }
 
     /// Load the compiled entry address written at backend `compile_loop`
@@ -1551,6 +1566,13 @@ impl JitCellToken {
     /// Get a clone of the invalidated flag (for registering with QuasiImmut).
     pub fn invalidation_flag(&self) -> Arc<AtomicBool> {
         self.invalidated.clone()
+    }
+
+    /// The value `compile.py record_loop_or_bridge` hands to
+    /// `QuasiImmut.register_loop_token` for each quasi-immutable this loop's
+    /// trace folded a field of.
+    pub fn quasi_immut_handle(&self) -> Arc<LoopInvalidation> {
+        self.quasi_immut_handle.clone()
     }
 
     /// Mint the clear invalidation flag owned by a newly compiled bridge.
@@ -1648,13 +1670,40 @@ impl std::fmt::Debug for JitCellToken {
     }
 }
 
-impl majit_ir::QuasiImmutLoopToken for JitCellToken {
+/// Everything `quasiimmut.py QuasiImmut.invalidate` touches on a loop token,
+/// held apart from the token so the registry can name it without naming the
+/// token.
+///
+/// Both fields are shared with the [`JitCellToken`] that minted this, so an
+/// invalidation reaching either side is the same store.  Nothing here is
+/// thread-confined: the flags are atomics behind `Arc`s whose addresses are
+/// baked into compiled `GUARD_NOT_INVALIDATED` sites, and the bridge list is
+/// behind its own mutex.  That is the whole point -- a mutator thread may
+/// perform the last drop of this value, which it may not do to a token.
+#[derive(Debug)]
+pub struct LoopInvalidation {
+    /// `JitCellToken.invalidated`, the root generation.
+    invalidated: Arc<AtomicBool>,
+    /// `JitCellToken.bridge_invalidation_flags`.
+    bridge_flags: Arc<parking_lot::Mutex<Vec<Arc<AtomicBool>>>>,
+}
+
+impl LoopInvalidation {
+    /// quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
+    /// followed by `cpu.invalidate_loop(looptoken)`.  Both projections happen
+    /// here in pyre: the root flag makes the warm cell stop returning the
+    /// token, and every bridge-generation flag activates its still-unpatched
+    /// GUARD_NOT_INVALIDATED sites.
+    fn invalidate(&self) {
+        self.invalidated.store(true, Ordering::Release);
+        for flag in self.bridge_flags.lock().iter() {
+            flag.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl majit_ir::QuasiImmutLoopToken for LoopInvalidation {
     fn invalidate_for_quasi_immut(&self) {
-        // quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
-        // followed by `cpu.invalidate_loop(looptoken)`.  `invalidate` performs both
-        // projections in pyre: the root flag makes the warm cell stop
-        // returning this token, and every bridge-generation flag activates
-        // its still-unpatched GUARD_NOT_INVALIDATED sites.
         self.invalidate();
     }
 }

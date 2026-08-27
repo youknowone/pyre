@@ -6765,7 +6765,13 @@ pub(crate) fn register_quasi_immutable_deps(_green_key: u64) {
     let Some(token) = driver.last_compiled_artifact_token() else {
         return;
     };
-    let token: std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken> = token;
+    // The registry keeps a weak reference and upgrades it on the thread that
+    // writes the watched field, so what it holds must be droppable there.
+    // `JitCellToken` is not -- `Arc<JitCellToken>` is `Send` only under the
+    // single-JIT-thread promise its `unsafe impl` states -- so register the
+    // token's invalidation projection, which owns nothing but atomics and
+    // stays alive exactly as long as the token does.
+    let token: std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken> = token.quasi_immut_handle();
     for qmut in deps {
         qmut.register_loop_token(&token);
     }
