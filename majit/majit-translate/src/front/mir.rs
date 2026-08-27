@@ -4641,6 +4641,18 @@ impl<'a> Lowering<'a> {
                     // to the recorded Variable for a constant operand.
                     let arr = self.realias_operand(alias.base_local, alias.base_var);
                     let idx = self.realias_operand(alias.index_local, alias.index_var);
+                    let arr = if matches!(alias.array_type_id.as_deref(), Some("[i64]" | "[f64]")) {
+                        self.narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(arr),
+                            alias.array_type_id.as_deref().expect("matched Some above"),
+                        )
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone()
+                    } else {
+                        arr
+                    };
                     OpKind::ArrayWrite {
                         base: arr,
                         index: idx,
@@ -8393,6 +8405,60 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // Scalar twin of the object-items arm above:
+                // `*typed_items_block_items_base(block).cast::<i64|f64>()
+                // .add(idx)` is RPython's getarrayitem on
+                // `GcArray(Signed|Float)`. The accessor has already collapsed
+                // its interior pointer to the block header, so use the typed
+                // array identity to restore both header offset and item bank.
+                // The shared escape gate proves the `.add` result is consumed
+                // by exactly one dereference and never used as a raw pointer.
+                if let Some((item_ty, array_type_id)) = self.typed_items_elem_ptr_add(
+                    &reg,
+                    args.len(),
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                ) {
+                    let base = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(args[0].clone()),
+                            &array_type_id,
+                        )
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone();
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: args[1].clone(),
+                            item_ty,
+                            array_type_id: Some(array_type_id.clone()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: base,
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            array_type_id: Some(array_type_id),
+                        },
+                    );
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `FixedObjectArray::set_ref(self, index, value)` — the
                 // length-prefixed array's GC-published element store.  The
                 // method body hand-rolls the write-barrier dance
@@ -10878,13 +10944,15 @@ impl<'a> Lowering<'a> {
         {
             self.unwrap_or_sites.push(site);
         }
-        // Capture `Option::unwrap(opt)` sites for the discriminant guard
-        // `front::option_unwrap` synthesizes.  Like `unwrap_or`, `unwrap`'s body
-        // is Opaque (foreign `core`) and its receiver is the `Option` ADT, so
-        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
-        // `args[0]`, the sole argument).  `recognize_unwrap_site` confirms the
-        // receiver is an `Option` (not `Result`).  A resolution miss leaves the
-        // residual call — an unregistered callee the rtyper census Skips.
+        // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
+        // sites for the discriminant guard `front::option_unwrap` synthesizes.
+        // Like `unwrap_or`, `unwrap`'s body is Opaque (foreign `core`) and its
+        // receiver is the enum ADT, so `first_is_self` routes it to a
+        // `CallTarget::Method` (receiver in `args[0]`, the sole argument).
+        // `recognize_unwrap_site` records the payload-tag polarity and excludes
+        // the exception carrier Result owned by `front::result_exc`. A
+        // resolution miss leaves the residual call — an unregistered callee
+        // the rtyper census Skips.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -11862,6 +11930,34 @@ impl<'a> Lowering<'a> {
             self.body,
             self.llbc,
         )
+    }
+
+    /// Scalar `GcArray(Signed|Float)` counterpart of
+    /// [`Self::is_list_items_elem_ptr_add`]. Returns the RPython item bank and
+    /// ARRAY identity when the pointer traces to
+    /// `typed_items_block_items_base`, names an `i64`/`f64` element, and is
+    /// consumed by one immediate dereference.
+    fn typed_items_elem_ptr_add(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> Option<(ValueType, String)> {
+        if !is_typed_items_elem_ptr_add_parts(
+            reg,
+            args_len,
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+        ) {
+            return None;
+        }
+        raw_ptr_typed_items_element(first_arg_ty?, self.llbc)
     }
 
     /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
@@ -13601,30 +13697,56 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve a recognized `Option::unwrap(opt)` call into an
-    /// [`crate::front::option_unwrap::UnwrapSite`] — the `Option` enum root +
-    /// `Some` variant owners and the payload type the discriminant-guard
-    /// post-pass needs.  `None` (leaving the residual call) when the receiver
-    /// type is not a resolvable `Option`.  Guards on `Option` specifically —
-    /// `Result::unwrap` shares the method name but its `Ok`/`Err` tags do not
-    /// match `Some`=1/`None`=0.
+    /// Resolve a recognized `Option::unwrap(opt)` / plain-error
+    /// `Result::unwrap(res)` call into an
+    /// [`crate::front::option_unwrap::UnwrapSite`] — the enum root, payload
+    /// variant owner, payload type, and discriminant polarity the guard
+    /// post-pass needs. `Result<T, PyError>` remains the exception transform's
+    /// domain and is deliberately excluded. `None` leaves the residual call.
     fn recognize_unwrap_site(
         &self,
         recv_ty: Option<&TyRef>,
         result_var: &Variable,
     ) -> Option<crate::front::option_unwrap::UnwrapSite> {
         let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+        let is_option = crate::front::result_exc::tyref_is_option(recv_ty, self.llbc);
+        let (enum_owner, payload_owner, payload_on_disc_true, niche) = if is_option {
+            let (option_owner, some_owner, _) = self.resolve_option_consumer_owners(recv_ty)?;
+            (
+                option_owner,
+                some_owner,
+                true,
+                self.tyref_is_niche_option_ptr(recv_ty),
+            )
+        } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
+            && !crate::front::result_exc::tyref_is_result_of_carrier(
+                recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
+            let def_id = self.tyref_adt_def_id(recv_ty)?;
+            let td = self.llbc.type_by_id(def_id)?;
+            // Match the per-instantiation owner minted by checked conversion
+            // producers (`Result<usize, TryFromIntError>`, etc.). A bare
+            // Result root would split the producer and consumer classdefs.
+            let enum_owner = format!(
+                "{}{}",
+                td.item_meta.name_path(),
+                tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            );
+            let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, 0)?;
+            (enum_owner, payload_owner, false, false)
+        } else {
             return None;
-        }
-        let (option_owner, some_owner, payload_ty) =
-            self.resolve_option_consumer_owners(recv_ty)?;
-        let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        };
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         Some(crate::front::option_unwrap::UnwrapSite {
             result_var: result_var.clone(),
-            option_owner,
-            some_owner,
+            enum_owner,
+            payload_owner,
             payload_ty,
+            payload_on_disc_true,
             niche,
         })
     }
@@ -14852,7 +14974,10 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Lower the infallible `usize::try_from(<u8|u16|u32>)`
+    /// Lower Rust's checked integer-to-`usize` shell to the same primitive
+    /// comparisons and cast operations RPython emits for integer reprs.
+    ///
+    /// The infallible `usize::try_from(<u8|u16|u32>)`
     /// (`core::convert::num::ptr_try_from_impls::<Impl>::try_from`,
     /// Opaque in the LLBC like every core fn) to its decomposed
     /// always-`Ok` shape: `__discriminant = 0` (`Result`'s `Ok` tag)
@@ -14863,10 +14988,14 @@ impl<'a> Lowering<'a> {
     /// (`pyopcode.rs` `u32_as_usize` / `raise_kind_as_usize`), whose
     /// `Err` arm is statically dead for the `U8`/`U16`/`U32` sources
     /// filtered on below — narrower than `usize` on every target pyre
-    /// builds for, wasm32 included.  Impls with word-sized-or-wider
-    /// inputs — the genuinely fallible directions of the same impl
-    /// group — keep the `Call` form, so this filter must not be
-    /// widened to `U64` on the strength of the host being 64-bit.
+    /// builds for, wasm32 included.  A same-width signed source (`isize`, or
+    /// `i64` in a 64-bit LLBC corpus) is fallible only for negative values.
+    /// Preserve Rust's observable `Result` branch as a runtime tag and cast
+    /// its success payload with RPython's `cast_int_to_uint` spelling
+    /// (`rint.py:200-205`).  The cast is total and may run eagerly on the Err
+    /// arm because that payload is dead there.  Fixed-width `i64` is admitted
+    /// only when Charon's target metadata proves an eight-byte pointer; wider
+    /// signed sources on a narrower target remain fail-closed.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -14903,10 +15032,22 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        if !matches!(
+        let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")
-        ) {
+        );
+        let src_is_signed_word = match self.tyref_literal_int_atom(src) {
+            Some("Isize") => true,
+            Some("I64") => self.llbc.target_pointer_size() == Some(8),
+            _ => false,
+        };
+        if !src_is_small_uint && !src_is_signed_word {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if self.tyref_literal_uint_atom(&success_ty) != Some("Usize") {
             return Ok(false);
         }
         let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
@@ -14926,6 +15067,56 @@ impl<'a> Lowering<'a> {
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
         let arg = arg.clone();
+        if src_is_signed_word {
+            let bb_id = self.block_id[mir_bb];
+            let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+                let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(result.clone()),
+                    kind,
+                });
+                result
+            };
+            let zero = push_op(&mut self.graph, OpKind::ConstInt(0));
+            // Result convention: Ok=0, Err=1.  For equal-width signed →
+            // unsigned conversion the sign test is the complete overflow
+            // predicate.
+            let disc = push_op(
+                &mut self.graph,
+                OpKind::BinOp {
+                    op: "lt".to_string(),
+                    lhs: arg.clone(),
+                    rhs: zero,
+                    result_ty: ValueType::Int,
+                },
+            );
+            let payload = push_op(
+                &mut self.graph,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                    args: vec![arg],
+                    result_ty: ValueType::Unsigned,
+                },
+            );
+            let payload_owner =
+                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+            self.emit_tagged_pair_aggregate_typed(
+                mir_bb,
+                &owner,
+                &payload_owner,
+                disc,
+                payload,
+                ValueType::Unsigned,
+                dest_local,
+                target,
+            )?;
+            return Ok(true);
+        }
         if self.multi_assigned_locals.contains(&dest_local) {
             // A re-bindable local may later carry a runtime `Result`,
             // so the constant tag can't be recorded and consumers
@@ -16973,6 +17164,17 @@ fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool 
         .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path().as_str()))
 }
 
+/// The scalar `TypedItemsBlock` accessor, kept separate from the object-array
+/// pair because its consumers must emit `GcArray(Signed|Float)` operations,
+/// never reference-array operations.
+fn regular_call_is_typed_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id)
+        .is_some_and(|fd| is_typed_items_block_base_accessor(fd.item_meta.name_path().as_str()))
+}
+
 /// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
 /// constant.  The borrow tracks the operand, so callers reading a
 /// receiver type from a raw `CallPayload` (the deferred-write liveness
@@ -17009,6 +17211,29 @@ fn is_list_items_elem_ptr_add_parts(
         && add_dest_used_only_as_single_deref(body, dest_local)
 }
 
+/// Scalar half of brick 3. The physical `TypedItemsBlock` stores only the two
+/// RPython array families declared by `rlist.rs`: `GcArray(Signed)` (`i64`)
+/// and `GcArray(Float)` (`f64`). Other raw-pointer pointees remain residual.
+#[allow(clippy::too_many_arguments)]
+fn is_typed_items_elem_ptr_add_parts(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> bool {
+    args_len == 2
+        && regular_call_is_ptr_add(reg, llbc)
+        && base_ty.is_some_and(|ty| raw_ptr_typed_items_element(ty, llbc).is_some())
+        && index_local.is_some()
+        && base_local
+            .is_some_and(|base| base_traces_to_typed_items_block_accessor(body, base, llbc))
+        && add_dest_used_only_as_single_deref(body, dest_local)
+}
+
 /// Whether MIR local `base` — the receiver of a `*base.add(idx)` over
 /// `*mut PyObjectRef` — traces, through plain `Copy` / `Move` aliases,
 /// to the result of an `items_block_items_base` / `items_block_items_ptr`
@@ -17022,6 +17247,33 @@ fn is_list_items_elem_ptr_add_parts(
 /// `add` and falls to the legacy walker.  A multiply-defined or
 /// non-`Copy`-produced local is ambiguous and rejected.
 fn base_traces_to_items_block_accessor(body: &Unstructured, base: usize, llbc: &Llbc) -> bool {
+    base_traces_to_items_block_accessor_matching(
+        body,
+        base,
+        llbc,
+        regular_call_is_items_block_accessor,
+    )
+}
+
+fn base_traces_to_typed_items_block_accessor(
+    body: &Unstructured,
+    base: usize,
+    llbc: &Llbc,
+) -> bool {
+    base_traces_to_items_block_accessor_matching(
+        body,
+        base,
+        llbc,
+        regular_call_is_typed_items_block_accessor,
+    )
+}
+
+fn base_traces_to_items_block_accessor_matching(
+    body: &Unstructured,
+    base: usize,
+    llbc: &Llbc,
+    matches_accessor: fn(&RegularCall, &Llbc) -> bool,
+) -> bool {
     let mut cur = base;
     for _ in 0..32 {
         let mut producers = 0usize;
@@ -17030,11 +17282,46 @@ fn base_traces_to_items_block_accessor(body: &Unstructured, base: usize, llbc: &
         for bb in &body.body {
             for stmt in &bb.statements {
                 if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind()
-                    && matches!(place.kind, PlaceKind::Local(i) if i as usize == cur)
+                    && matches!(&place.kind, PlaceKind::Local(i) if *i as usize == cur)
                 {
                     producers += 1;
-                    if let Rvalue::Use(op) = &rvalue {
-                        copy_src = operand_local(Some(op));
+                    match &rvalue {
+                        Rvalue::Use(op) => copy_src = operand_local(Some(op)),
+                        // `typed_items_block_items_base(..) as *const i64`
+                        // changes only the raw-pointer pointee spelling. The
+                        // address is identical, so follow it exactly as
+                        // RPython follows `cast_pointer` while retaining the
+                        // final pointee type for the array descr.
+                        Rvalue::Cast(_, op, target_ty)
+                            if tyref_node(target_ty, llbc)
+                                .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                .is_some()
+                                && operand_tyref(op).is_some_and(|source_ty| {
+                                    tyref_node(source_ty, llbc)
+                                        .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                        .is_some()
+                                }) =>
+                        {
+                            copy_src = operand_local(Some(op));
+                        }
+                        // Charon also serializes raw pointer casts through its
+                        // older `UnaryOp({Cast: RawPtr(..)}, operand)` form.
+                        // It is the same address-preserving cast as the
+                        // dedicated `Rvalue::Cast` arm above.
+                        Rvalue::UnaryOp(kind, op)
+                            if unary_op_is_cast(kind)
+                                && tyref_node(&place.ty, llbc)
+                                    .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                    .is_some()
+                                && operand_tyref(op).is_some_and(|source_ty| {
+                                    tyref_node(source_ty, llbc)
+                                        .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                        .is_some()
+                                }) =>
+                        {
+                            copy_src = operand_local(Some(op));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -17043,7 +17330,7 @@ fn base_traces_to_items_block_accessor(body: &Unstructured, base: usize, llbc: &
             {
                 producers += 1;
                 if let CallFunc::Regular(reg) = &call.func
-                    && regular_call_is_items_block_accessor(reg, llbc)
+                    && matches_accessor(reg, llbc)
                 {
                     is_accessor = true;
                 }
@@ -17288,6 +17575,16 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
             || (is_vec_index_mut_regular(reg, llbc)
                 && add_dest_used_only_as_single_deref(body, p as usize))
             || is_list_items_elem_ptr_add_parts(
+                reg,
+                call.args.len(),
+                operand_local(call.args.first()),
+                call.args.first().and_then(operand_tyref),
+                operand_local(call.args.get(1)),
+                p as usize,
+                body,
+                llbc,
+            )
+            || is_typed_items_elem_ptr_add_parts(
                 reg,
                 call.args.len(),
                 operand_local(call.args.first()),
@@ -19725,6 +20022,21 @@ fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     raw_ptr_pointee_class_root(inner, llbc).is_some()
 }
 
+/// RPython item bank and ARRAY identity carried by a raw pointer into a
+/// `TypedItemsBlock`. That block is exactly `GcArray(Signed)` or
+/// `GcArray(Float)`, so admit only the two source spellings its runtime layout
+/// documents; the ARRAY name supplies the 8-byte stride and header offset.
+fn raw_ptr_typed_items_element(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, String)> {
+    let pointee = type_node_raw_ptr_pointee(tyref_node(ty, llbc)?, llbc)?;
+    let spelling = json_ty_scalar_element_spelling(pointee, llbc)?;
+    if !matches!(spelling.as_str(), "i64" | "f64") {
+        return None;
+    }
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    let item_ty = tyref_to_value_type(&TyRef::Other(pointee.clone()), llbc);
+    Some((item_ty, format!("[{spelling}]")))
+}
+
 /// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
 /// the upstream `cast_pointer(PTRTYPE, ptr)` op (lltype.py).  The
 /// target class travels in the path (same `Vec<Variable>`-carrier
@@ -21696,6 +22008,10 @@ fn is_object_items_block_base_accessor(name: &str) -> bool {
         || path_ends_with_segments(name, "object_array::items_block_items_ptr")
 }
 
+fn is_typed_items_block_base_accessor(name: &str) -> bool {
+    path_ends_with_segments(name, "rlist::typed_items_block_items_base")
+}
+
 /// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
 /// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
 /// receiver (see [`Lowering::is_items_block_base_ptr_add`]).
@@ -21708,8 +22024,7 @@ fn is_object_items_block_base_accessor(name: &str) -> bool {
 /// — the element side is refused by [`is_object_ref_items_ptr`] as well, so the
 /// two gates agree by construction rather than by coincidence.
 fn graph_is_items_block_base_accessor(name: &str) -> bool {
-    is_object_items_block_base_accessor(name)
-        || path_ends_with_segments(name, "rlist::typed_items_block_items_base")
+    is_object_items_block_base_accessor(name) || is_typed_items_block_base_accessor(name)
 }
 
 /// One path segment, with a raw-identifier prefix removed.  `r#struct` and
@@ -25754,12 +26069,10 @@ mod tests {
 
     /// brick 1 collapses an accessor to its receiver — the block header — and
     /// only brick 3's `base_size`-bearing array descr adds the item offset
-    /// back. So every REFERENCE accessor brick 1 rewrites must also be one
-    /// brick 3 recognises, or the residual `.add` strides from the length
-    /// word. The typed accessor is the deliberate exception: brick 1 collapses
-    /// it, and its scalar element is refused on the element side instead
-    /// (`is_object_ref_items_ptr`), so no `Ref`-typed array op is minted for a
-    /// `u64` block.
+    /// back. Every accessor brick 1 rewrites must therefore have a matching
+    /// brick-3 family: object accessors use `GcArray(OBJECTPTR)`, while the
+    /// typed accessor is deliberately excluded from that predicate and uses
+    /// the separate `GcArray(Signed|Float)` gate.
     #[test]
     fn the_two_bricks_agree_on_every_reference_items_base_accessor() {
         use super::{graph_is_items_block_base_accessor, is_object_items_block_base_accessor};
@@ -25776,7 +26089,8 @@ mod tests {
             assert!(graph_is_items_block_base_accessor(name));
         }
 
-        // The typed block: brick 1 only.
+        // The typed block is not an object-array accessor; its own brick-3
+        // gate supplies the scalar array operation.
         let typed = "majit_rlib::lltypesystem::rlist::typed_items_block_items_base";
         assert!(graph_is_items_block_base_accessor(typed));
         assert!(!is_object_items_block_base_accessor(typed));
@@ -30200,6 +30514,79 @@ mod tests {
             program.struct_ids.get(frame_owner).copied().flatten(),
             Some(pyframe_ids[0]),
             "the retained owner spelling must resolve to the frame's StructId"
+        );
+    }
+
+    /// `range_list_length` stores the PyPy strategy length in an RPython
+    /// Signed cell and converts it to Rust's indexing carrier.  The opaque
+    /// core `TryFrom` shell must be decomposed by the MIR front rather than
+    /// surviving as a residual foreign call that blocks the whole list
+    /// strategy closure.
+    #[test]
+    #[ignore]
+    fn range_list_length_lowers_signed_to_usize_try_from() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real object LLBC");
+        let source = super::lower_function(&llbc, "pyre_object::listobject::range_state_value")
+            .expect("lower listobject::range_state_value");
+        assert!(
+            source
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::ArrayRead {
+                        item_ty: ValueType::Int,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == "[i64]"
+                )),
+            "TypedItemsBlock i64 dereference must be a GcArray(Signed) read"
+        );
+        let graph = super::lower_function(&llbc, "pyre_object::listobject::range_list_length")
+            .expect("lower listobject::range_list_length");
+        let residuals: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments
+                    .iter()
+                    .any(|segment| segment == "ptr_try_from_impls") =>
+                {
+                    Some(segments.join("::"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            residuals.is_empty(),
+            "signed-to-usize conversion must not leave an opaque core call: {residuals:?}"
+        );
+        let unwrap_residuals = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "unwrap"
+                )
+            })
+            .count();
+        assert_eq!(
+            unwrap_residuals, 0,
+            "checked conversion Result::unwrap must become a discriminant guard"
         );
     }
 

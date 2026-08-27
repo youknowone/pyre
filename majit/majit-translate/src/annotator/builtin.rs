@@ -1515,10 +1515,28 @@ fn cast_instance_intrinsic(
             ));
         }
     };
+    let operand = arg_at(args_s, 0, crate::runtime_names::shims::CAST_INSTANCE);
+    let projected = bk.project_struct_field_type(&root);
+    // A physical `TypedItemsBlock` pointer is the Rust owner for RPython's
+    // direct `GcArray(Signed|Float)`. The MIR front records that cast as this
+    // same pointer-narrow marker with a `[i64]` / `[f64]` target spelling.
+    // Return the target SomeList annotation so `getitem` dispatches through
+    // ListRepr; the typer below emits the same `cast_pointer` to the target
+    // GcArray lowleveltype that an RPython erase/unerase boundary produces.
+    // Reaching the marker proves the pointer is immediately dereferenced, so
+    // a null value is not an observable successful path.
+    if matches!(&projected, SomeValue::List(_)) {
+        return match operand {
+            SomeValue::List(_) => Ok(operand.clone()),
+            SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::Address(_) => Ok(projected),
+            other => Err(AnnotatorError::new(format!(
+                "__cast_instance_intrinsic: non-pointer operand for list root {root:?}: {other:?}"
+            ))),
+        };
+    }
     // Carry the operand's nullability onto the downcast result instead
     // of unconditionally narrowing to non-None: a downcast of a nullable
     // pointer is itself nullable.
-    let operand = arg_at(args_s, 0, crate::runtime_names::shims::CAST_INSTANCE);
     let can_be_none = match operand {
         SomeValue::Instance(inst) => inst.can_be_none,
         SomeValue::None_(_) => true,
@@ -1536,7 +1554,7 @@ fn cast_instance_intrinsic(
             // (rclass.py:1035) constrains only the destination repr, not
             // the operand shape.  A genuine variant mismatch is still a
             // producer bug, surfaced with the root that was expected.
-            if bk.project_struct_field_type(&root).tag() == other.tag() {
+            if projected.tag() == other.tag() {
                 return Ok(operand.clone());
             }
             return Err(AnnotatorError::new(format!(
