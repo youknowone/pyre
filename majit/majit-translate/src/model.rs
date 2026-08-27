@@ -5929,6 +5929,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         notes: graph.notes.clone(),
         return_type: graph.return_type.clone(),
         hints: graph.hints.clone(),
+        access_directly: graph.access_directly,
         func: graph.func.clone(),
     }
 }
