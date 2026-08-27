@@ -27,26 +27,35 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 /// (`pyre-jit-trace/src/virtualizable_spec.rs`), the same way
 /// `_immutable_fields_` is handled.
 ///
-/// That table reaches the RUNTIME jitcode path — `pyre-jit`'s `codewriter.rs`
-/// and `flatten.rs`, and the `majit-ir` field descrs — and it does NOT reach
-/// this crate's `GraphTransformConfig`. Every production construction of that
-/// config is `GraphTransformConfig::default()`, whose `vable_fields` and
-/// `vable_arrays` are empty, and the only writer of either is
-/// `majit-translate/tests/test_fast2locals_codewriter.rs`. So in the LLBC
-/// codewriter the whole array protocol is inert by construction:
-/// `jtransform.rs check_no_vable_array` returns at its
-/// `vable_array_vars.is_empty()` guard before it can reject anything, and
-/// `rewrite_op_getfield`'s `VableFieldRead` arm never fires. Arming it is the
-/// unported work, not a missing call site.
+/// That table is also what arms this crate. `pyre-jit-trace`'s build script
+/// builds `GraphTransformConfig::vable_fields` and `vable_arrays` out of it
+/// (`build/prepass.rs`, behind the default-on `prepass` feature), and that
+/// run is the production translation. The emitted artefacts show the whole
+/// protocol firing: the instruction table carries `getfield_vable_i/r`,
+/// `setfield_vable_i/r`, `getarrayitem_vable_r`, `setarrayitem_vable_r` and
+/// `arraylen_vable`, and the descr table carries all five
+/// `BhDescr::VableField` indices, which `assembler.rs` mints only from the
+/// `VableFieldRead` / `VableFieldWrite` arms.
 ///
-/// What has no counterpart either way is the force injection: the frame
-/// forces are placed by hand at the consumers that need them
-/// (`pyre-interpreter` `sys.getframe`, `f_locals`, `f_back`). The marker
+/// This crate's own `generated::build` still passes
+/// `GraphTransformConfig::default()`, leaving `vable_fields` and
+/// `vable_arrays` empty, so along that path `jtransform.rs
+/// check_no_vable_array` returns at its `vable_array_vars.is_empty()` guard
+/// and `rewrite_op_getfield`'s `VableFieldRead` arm never fires. That path
+/// is a test fixture — the only caller of `generated::with_all_jitcodes` is
+/// `tests/test_make_jitcodes_produces_graph_keyed_output.rs` — so it
+/// diverges from the production config, not from upstream.
+///
+/// What has no counterpart either way is the force injection.
+/// `hook_access_field` puts a `jit_force_virtualizable` in front of every
+/// redirected access while rtyping; pyre instead places the forces by hand
+/// at the consumers that need them (`pyre-interpreter` `sys.getframe`,
+/// `f_locals`, `f_back`). The marker
 /// `executioncontext::jit_force_virtualizable` is what lets
 /// `jtransform.rs rewrite_op_jit_force_virtualizable` delete such a call from
-/// a looked-inside graph, and it keys on the CALL TARGET's name rather than on
-/// `vable_fields`, which is why that half works while the array protocol above
-/// stays inert.
+/// a looked-inside graph, and it keys on the CALL TARGET's name rather than
+/// on `vable_fields`, so the two halves are armed independently of each
+/// other.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,
