@@ -7674,7 +7674,11 @@ fn init_dict_type(ns: PyObjectRef) {
                 let mut index = 0usize;
                 loop {
                     let iterable = pyre_object::gc_roots::shadow_stack_get(sp + 2);
-                    let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, index) }) else {
+                    let Some(slot) = (unsafe { pyre_object::w_set_next_slot(iterable, index) })
+                    else {
+                        break;
+                    };
+                    let Some(key) = (unsafe { pyre_object::w_set_key_at(iterable, slot) }) else {
                         break;
                     };
                     let d = pyre_object::gc_roots::shadow_stack_get(sp);
@@ -7683,7 +7687,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         pyre_object::w_dict_store_hashed_checked(d, key.obj, value, key.hash)
                     }
                     .map_err(|_| crate::baseobjspace::take_pending_dict_key_error(key.obj))?;
-                    index += 1;
+                    index = slot + 1;
                 }
                 return Ok(pyre_object::gc_roots::shadow_stack_get(sp));
             }
@@ -26750,17 +26754,20 @@ fn set_intersect_update(
         let result = pyre_object::w_set_new();
         let result = pyre_object::gc_roots::pin_root(result);
         let mut i = 0;
-        while let Some(key) = pyre_object::w_set_key_at(keep, i) {
+        while let Some(slot) = pyre_object::w_set_next_slot(keep, i) {
+            let Some(key) = pyre_object::w_set_key_at(keep, slot) else {
+                break;
+            };
             if pyre_object::w_set_contains_key_checked(probe, key)
                 .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
-                let Some(key) = pyre_object::w_set_key_at(keep, i) else {
+                let Some(key) = pyre_object::w_set_key_at(keep, slot) else {
                     break;
                 };
                 pyre_object::w_set_insert_key_checked(result, key)
                     .map_err(crate::baseobjspace::map_set_update_error)?;
             }
-            i += 1;
+            i = slot + 1;
         }
         Ok(result)
     }
@@ -27040,13 +27047,16 @@ fn set_is_disjoint_from(
             (w_set, w_other)
         };
         let mut i = 0;
-        while let Some(key) = pyre_object::w_set_key_at(walk, i) {
+        while let Some(slot) = pyre_object::w_set_next_slot(walk, i) {
+            let Some(key) = pyre_object::w_set_key_at(walk, slot) else {
+                break;
+            };
             if pyre_object::w_set_contains_key_checked(probe, key)
                 .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
                 return Ok(false);
             }
-            i += 1;
+            i = slot + 1;
         }
         Ok(true)
     }
@@ -27073,13 +27083,16 @@ pub(crate) fn set_is_subset_of(
     let w_other = pyre_object::gc_roots::pin_root(w_other);
     unsafe {
         let mut i = 0;
-        while let Some(key) = pyre_object::w_set_key_at(w_set, i) {
+        while let Some(slot) = pyre_object::w_set_next_slot(w_set, i) {
+            let Some(key) = pyre_object::w_set_key_at(w_set, slot) else {
+                break;
+            };
             if !pyre_object::w_set_contains_key_checked(w_other, key)
                 .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
             {
                 return Ok(false);
             }
-            i += 1;
+            i = slot + 1;
         }
         Ok(true)
     }
@@ -27255,17 +27268,20 @@ fn set_symmetric_difference_storage(
         let d_new = pyre_object::gc_roots::pin_root(d_new);
         for (walk, probe) in [(w_other, w_set), (w_set, w_other)] {
             let mut i = 0;
-            while let Some(key) = pyre_object::w_set_key_at(walk, i) {
+            while let Some(slot) = pyre_object::w_set_next_slot(walk, i) {
+                let Some(key) = pyre_object::w_set_key_at(walk, slot) else {
+                    break;
+                };
                 if !pyre_object::w_set_contains_key_checked(probe, key)
                     .map_err(|_| crate::baseobjspace::take_pending_hash_error())?
                 {
-                    let Some(key) = pyre_object::w_set_key_at(walk, i) else {
+                    let Some(key) = pyre_object::w_set_key_at(walk, slot) else {
                         break;
                     };
                     pyre_object::w_set_insert_key_checked(d_new, key)
                         .map_err(crate::baseobjspace::map_set_update_error)?;
                 }
-                i += 1;
+                i = slot + 1;
             }
         }
         Ok(d_new)
@@ -27688,10 +27704,12 @@ fn set_iter_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
         let index = pyre_object::w_set_iter_get_index(args[0]);
         let mut remaining = Vec::with_capacity(startlen.saturating_sub(index));
-        for i in index..startlen {
-            if let Some(key) = pyre_object::w_set_key_at(w_set, i) {
+        let mut i = pyre_object::w_set_iter_get_slot(args[0]);
+        while let Some(slot) = pyre_object::w_set_next_slot(w_set, i) {
+            if let Some(key) = pyre_object::w_set_key_at(w_set, slot) {
                 remaining.push(key.obj);
             }
+            i = slot + 1;
         }
         let state = pyre_object::w_tuple_new(vec![pyre_object::w_list_new(remaining)]);
         Ok(pyre_object::w_tuple_new(vec![

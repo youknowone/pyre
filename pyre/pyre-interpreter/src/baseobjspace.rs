@@ -16007,11 +16007,18 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     "Set changed size during iteration",
                 ));
             }
+            // `index` counts what has been handed out, and `slot` says where
+            // the next one is read from: a delete tombstones its slot rather
+            // than renumbering the ones after it, so the two are equal only
+            // until the first hole.
             let index = pyre_object::w_set_iter_get_index(obj);
+            let cursor = pyre_object::w_set_iter_get_slot(obj);
             if index < startlen
-                && let Some(key) = pyre_object::w_set_key_at(w_set, index)
+                && let Some(slot) = pyre_object::w_set_next_slot(w_set, cursor)
+                && let Some(key) = pyre_object::w_set_key_at(w_set, slot)
             {
                 pyre_object::w_set_iter_set_index(obj, index + 1);
+                pyre_object::w_set_iter_set_slot(obj, slot + 1);
                 return Ok(key.obj);
             }
             pyre_object::w_set_iter_set_set(obj, pyre_object::PY_NULL);

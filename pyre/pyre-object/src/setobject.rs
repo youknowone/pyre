@@ -2,7 +2,8 @@
 //!
 //! PyPy equivalent: pypy/objspace/std/setobject.py
 //!
-//! Stores arbitrary PyObjectRef elements in a hashed IndexMap of ObjectKey,
+//! Stores arbitrary PyObjectRef elements in a hashed [`rordereddict`] table of
+//! ObjectKey,
 //! reusing the dict object strategy's hashing and equality semantics. PyPy
 //! carries multiple set strategies (EmptySet, IntegerSet, etc.); pyre starts
 //! with a single strategy while bringing the type online.
@@ -10,10 +11,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::pyobject::*;
-use indexmap::map::{RawEntryApiV1, raw_entry_v1::RawEntryMut};
 use pyre_macros::pyre_class;
 use std::cell::UnsafeCell;
-use std::hash::BuildHasher;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,7 +25,13 @@ pub static FROZENSET_TYPE: PyType = crate::pyobject::new_pytype("frozenset");
 pub struct W_SetIterObject {
     pub w_set: PyObjectRef,
     pub startlen: usize,
+    /// Elements handed out so far, which `descr_reduce` needs and the slot
+    /// cursor no longer counts once a hole opens.
     pub index: usize,
+    /// Where the next element is read from.  `index` counted table positions
+    /// while a delete renumbered them; a tombstoned table renumbers nothing,
+    /// so the cursor is a slot and the two part company after a `discard`.
+    pub slot: usize,
 }
 
 #[expect(
@@ -45,6 +50,7 @@ pub fn w_set_iter_new(w_set: PyObjectRef) -> PyObjectRef {
         w_set,
         startlen,
         index: 0,
+        slot: 0,
     })
 }
 
@@ -108,6 +114,22 @@ pub unsafe fn w_set_iter_set_index(obj: PyObjectRef, index: usize) {
     (*(obj as *mut W_SetIterObject)).index = index;
 }
 
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_set_iter_get_slot(obj: PyObjectRef) -> usize {
+    (*(obj as *const W_SetIterObject)).slot
+}
+
+#[inline]
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_set_iter_set_slot(obj: PyObjectRef, slot: usize) {
+    (*(obj as *mut W_SetIterObject)).slot = slot;
+}
+
 /// Python set object.
 ///
 /// Layout: `[ob_type | items | len]`. `items` points to a GC-managed hashed
@@ -160,22 +182,37 @@ pub const W_SET_GC_TYPE_ID: u32 = 30;
 /// `space.hash_w(obj)`, so the default `RandomState` would SipHash a digest
 /// that is itself the hash. `rordereddict` feeds the cached integer straight
 /// into the table; the multiply only spreads it into hashbrown's control bits.
-pub type SetItemsStorage = indexmap::IndexMap<
+pub type SetItemsStorage = crate::rordereddict::RDict<
     crate::dictmultiobject::ObjectKey,
     (),
     crate::dictmultiobject::ObjectKeyBuildHasher,
 >;
 
-/// Remove the entry at `index` in O(1).
+/// Remove the entry occupying `slot` in O(1).
 ///
-/// `rordereddict.py _ll_dict_del_entry` marks the slot dummy so remaining
-/// keys keep their order. `IndexMap` has no dummy, and `shift_remove_index`
-/// is O(n) in the tail — discarding the first of n keys n times is
-/// quadratic. `swap_remove_index` is the O(1) primitive. Set iteration
-/// order after a mid-table delete is unspecified (sets are unordered); a
-/// dummy port is the rordereddict convergence.
-unsafe fn set_remove_index(items: *mut SetItemsStorage, index: usize) {
-    let _ = (*items).swap_remove_index(index);
+/// `_ll_dict_del_entry` marks the index slot [`DELETED`] and clears the entry
+/// in place, so every surviving key keeps both its slot number and its
+/// position in the walk order.
+///
+/// [`DELETED`]: crate::rordereddict::DELETED
+unsafe fn set_remove_slot(items: *mut SetItemsStorage, slot: usize) {
+    let _ = (*items).remove_slot(slot);
+}
+
+/// The slot holding the first element at or after `from`, or `None` past the
+/// last one.
+///
+/// A walk counts in slots, not in positions: `_ll_dict_del_entry` leaves a
+/// hole where it deleted, so slot numbers outlive their neighbours' removal
+/// but stop being contiguous.  A caller re-reads its key with [`w_set_key_at`]
+/// at the slot this hands back and resumes from `slot + 1`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_SetObject`.
+pub unsafe fn w_set_next_slot(obj: PyObjectRef, from: usize) -> Option<usize> {
+    let _set_guard = w_set_lock(obj);
+    let s = &*(obj as *const W_SetObject);
+    (*s.items).next_valid_slot(from)
 }
 
 // PyPy serializes set strategy/storage operations with the GIL. Pyre is
@@ -317,8 +354,8 @@ fn set_write_barrier(obj: PyObjectRef) {
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
 /// `w_dict_new` twin: the body builds the host `SetItemsStorage`
-/// (`IndexMap<ObjectKey, ()>`) box before the object is allocated, so the
-/// foreign `IndexMap::default` construction is an unported host container op.
+/// (`RDict<ObjectKey, ()>`) box before the object is allocated, so the
+/// foreign `RDict::default` construction is an unported host container op.
 /// Tracing into it carries that op into the caller; residualising the whole
 /// constructor models it by signature — a plain `PyObjectRef` GCREF.
 #[majit_macros::dont_look_inside]
@@ -365,7 +402,7 @@ pub fn w_set_new() -> PyObjectRef {
 ///
 /// Same body as [`w_set_new`] with the constant `&FROZENSET_TYPE` baked
 /// into `ob_type`; see that constructor for the GC old-gen rationale.
-/// `#[dont_look_inside]` for the same `IndexMap::default` storage-box reason as
+/// `#[dont_look_inside]` for the same `RDict::default` storage-box reason as
 /// [`w_set_new`].
 #[majit_macros::dont_look_inside]
 pub fn w_frozenset_new() -> PyObjectRef {
@@ -483,21 +520,21 @@ unsafe fn callback_free_set_op<T>(
 /// keeps an orphaned box alive across the callbacks.  The table borrow ends
 /// before equality can call user code; a callback that grows or reorders the
 /// captured box restarts the scan (`ll_dict_lookup` paranoia,
-/// `rordereddict.py:1058`).  Capacity is exact here, not a proxy: within one
-/// box's lifetime `IndexMap` capacity only grows, and a `clear` swaps the box
-/// rather than resetting this one.
+/// `rordereddict.py:1058`).  The generation counter is exact here, not a
+/// proxy: it is bumped by every compaction and reindex, the only two things
+/// that move an entry out from under a slot number.
 unsafe fn scan_set_key_reentrant(
     items: *mut SetItemsStorage,
     mut key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(Option<usize>, crate::dictmultiobject::ObjectKey), crate::dictmultiobject::DictKeyError>
 {
     'restart: loop {
-        let table_capacity = (*items).capacity();
+        let generation = (*items).generation();
         let mut i = 0;
         loop {
-            let Some((stored_hash, stored_obj)) = (*items)
-                .get_index(i)
-                .map(|(stored, _)| (stored.hash, stored.obj))
+            let Some((slot, stored_hash, stored_obj)) = (*items)
+                .next_entry(i)
+                .map(|(slot, stored, _)| (slot, stored.hash, stored.obj))
             else {
                 return Ok((None, key));
             };
@@ -520,19 +557,19 @@ unsafe fn scan_set_key_reentrant(
                 // `true`, because a callback that reallocated the buffer or moved
                 // the candidate leaves the matched index stale
                 // (`rordereddict.py:1058`).
-                let disturbed = (*items).capacity() != table_capacity
+                let disturbed = (*items).generation() != generation
                     // `entries.valid(index) && entries[index].key == checkingkey`.
-                    || !(*items).get_index(i).is_some_and(|(stored, _)| {
+                    || !(*items).get_slot(slot).is_some_and(|(stored, _)| {
                         stored.hash == stored_hash && stored.obj == stored_obj
                     });
                 if disturbed {
                     continue 'restart;
                 }
                 if equal {
-                    return Ok((Some(i), key));
+                    return Ok((Some(slot), key));
                 }
             }
-            i += 1;
+            i = slot + 1;
         }
     }
 }
@@ -606,13 +643,13 @@ pub unsafe fn w_set_discard_key_checked(
     let _set_guard = w_set_lock(obj);
     if let Some(result) = callback_free_set_op(|| {
         let s = &mut *(obj as *mut W_SetObject);
-        let index = (*s.items).get_index_of(&key);
+        let index = (*s.items).index_of(&key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             return false;
         }
         match index {
             Some(index) => {
-                set_remove_index(s.items, index);
+                set_remove_slot(s.items, index);
                 s.set_len_relaxed((*s.items).len());
                 s.hash = -1;
                 true
@@ -629,7 +666,7 @@ pub unsafe fn w_set_discard_key_checked(
     if let Some(index) = found {
         // Remove from the captured box; a `clear` during the probe orphans it,
         // leaving the live storage untouched (`discard` of an absent element).
-        set_remove_index(items, index);
+        set_remove_slot(items, index);
         let s = &mut *(obj as *mut W_SetObject);
         s.set_len_relaxed((*s.items).len());
         s.hash = -1;
@@ -741,10 +778,10 @@ pub unsafe fn w_set_popitem(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// point between reading `src`'s table and installing the new field value.
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
-/// `w_set_new` twin: cloning `src`'s `SetItemsStorage` (`IndexMap<ObjectKey,
-/// ()>`) and boxing it into `d.items` is a foreign `IndexMap::clone` +
+/// `w_set_new` twin: cloning `src`'s `SetItemsStorage` (`RDict<ObjectKey,
+/// ()>`) and boxing it into `d.items` is a foreign `RDict::clone` +
 /// storage-box write. Tracing into it carries that host container op into the
-/// caller and unifies the `items` field as `Instance(IndexMap)`; residualising
+/// caller and unifies the `items` field as `Instance(RDict)`; residualising
 /// the whole assignment keeps the box off the trace, modelling it as a void
 /// effect on two GCREFs.
 ///
@@ -801,8 +838,8 @@ pub unsafe fn w_set_difference_update_from_set(
         let dst_items = (*(dst as *const W_SetObject)).items;
         let dst_len = (*dst_items).len();
         let mut i = 0;
-        while i < dst_len {
-            let Some(key) = w_set_key_at(dst, i) else {
+        while let Some(slot) = w_set_next_slot(dst, i) {
+            let Some(key) = w_set_key_at(dst, slot) else {
                 return Err(SetUpdateError::ChangedSize);
             };
             if !w_set_contains_key_for_update(src, key)? {
@@ -815,12 +852,12 @@ pub unsafe fn w_set_difference_update_from_set(
                 // CPython's set probe restarts when `entry->key` changes;
                 // once this live index disappeared there is no surviving
                 // entry to copy into the difference result.
-                let Some(key) = w_set_key_at(dst, i) else {
+                let Some(key) = w_set_key_at(dst, slot) else {
                     return Err(SetUpdateError::ChangedSize);
                 };
                 w_set_insert_key_checked(result, key)?;
             }
-            i += 1;
+            i = slot + 1;
         }
         w_set_copy_storage_from(dst, result);
         return Ok(());
@@ -829,15 +866,15 @@ pub unsafe fn w_set_difference_update_from_set(
     let src_items = (*(src as *const W_SetObject)).items;
     let src_len = (*src_items).len();
     let mut i = 0;
-    while i < src_len {
-        let Some(key) = w_set_key_at(src, i) else {
+    while let Some(slot) = w_set_next_slot(src, i) {
+        let Some(key) = w_set_key_at(src, slot) else {
             return Err(SetUpdateError::ChangedSize);
         };
         w_set_remove_key_for_update(dst, key)?;
         if (*(src as *const W_SetObject)).items != src_items || (*src_items).len() != src_len {
             return Err(SetUpdateError::ChangedSize);
         }
-        i += 1;
+        i = slot + 1;
     }
     Ok(())
 }
@@ -879,9 +916,9 @@ pub unsafe fn w_set_update_from_set(
     let dst_items = capture_set_items(dst);
     let src_items = capture_set_items(src);
     let mut i = 0;
-    while let Some((&key, _)) = (*src_items).get_index(i) {
+    while let Some((slot, &key, _)) = (*src_items).next_entry(i) {
         w_set_insert_key_into(dst, dst_items, key)?;
-        i += 1;
+        i = slot + 1;
     }
     Ok(())
 }
@@ -895,7 +932,7 @@ pub enum SetUpdateError {
     ChangedSize,
 }
 
-/// Insert one cached-hash key without holding an IndexMap borrow across user
+/// Insert one cached-hash key without holding a table borrow across user
 /// `eq_w`.
 ///
 /// The set's storage box is captured and pinned once at entry
@@ -928,7 +965,7 @@ unsafe fn w_set_insert_key_into(
     key: crate::dictmultiobject::ObjectKey,
 ) -> Result<(), SetUpdateError> {
     // Single insert probe (matches `r_dict.setitem`'s one bucket scan), run
-    // callback-free so no user `__eq__` mutates the set while the `IndexMap`
+    // callback-free so no user `__eq__` mutates the set while the table
     // borrow is live.  When every same-hash comparison stays inside the
     // builtin ladder the probe appends in place; a pair it cannot decide
     // breaks the probe, withholds the store, and re-runs the operation over
@@ -937,7 +974,7 @@ unsafe fn w_set_insert_key_into(
     // set's size.
     if let Some(result) = callback_free_set_op(|| {
         let entries = &mut *items;
-        let index = entries.get_index_of(&key);
+        let index = entries.index_of(&key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             return;
         }
@@ -960,14 +997,10 @@ unsafe fn w_set_insert_key_into(
     if found.is_some() {
         return Ok(());
     }
-    let entries = &mut *items;
-    let hash = entries.hasher().hash_one(key);
-    match entries.raw_entry_mut_v1().from_hash(hash, |_| false) {
-        RawEntryMut::Vacant(entry) => {
-            entry.insert_hashed_nocheck(hash, key, ());
-        }
-        RawEntryMut::Occupied(_) => unreachable!("a never-matching raw probe is vacant"),
-    }
+    // The scan above proved the key absent, and repeating the probe here would
+    // repeat its comparisons — the ones that can re-enter this table.  Place it
+    // on the digest alone (`ll_call_insert_clean_function`).
+    (*items).insert_known_absent(key, ());
     let set = &mut *(dst as *mut W_SetObject);
     set.set_len_relaxed((*set.items).len());
     set.hash = -1;
@@ -995,9 +1028,9 @@ unsafe fn w_set_contains_key_for_update(
         let items = (*(probe as *const W_SetObject)).items;
         let len = (*items).len();
         let mut i = 0;
-        while i < len {
-            let Some((&stored, _)) = (*items).get_index(i) else {
-                continue 'restart;
+        loop {
+            let Some((slot, &stored, _)) = (*items).next_entry(i) else {
+                break;
             };
             if stored.hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
@@ -1013,7 +1046,7 @@ unsafe fn w_set_contains_key_for_update(
                 }
                 if (*(probe as *const W_SetObject)).items != items
                     || (*items).len() != len
-                    || !(*items).get_index(i).is_some_and(|(current, _)| {
+                    || !(*items).get_slot(slot).is_some_and(|(current, _)| {
                         current.hash == stored.hash && current.obj == stored_obj
                     })
                 {
@@ -1023,15 +1056,15 @@ unsafe fn w_set_contains_key_for_update(
                     return Ok(true);
                 }
             }
-            i += 1;
+            i = slot + 1;
         }
         return Ok(false);
     }
 }
 
 /// `delitem_with_hash` for a mutation-sensitive difference update.  Find the
-/// matching bucket without lending IndexMap across Python code, restart after
-/// a hostile comparison like `ll_dict_lookup`, then delete the proven index
+/// matching bucket without lending the table across Python code, restart after
+/// a hostile comparison like `ll_dict_lookup`, then delete the proven slot
 /// without another equality callback.
 unsafe fn w_set_remove_key_for_update(
     dst: PyObjectRef,
@@ -1040,16 +1073,15 @@ unsafe fn w_set_remove_key_for_update(
     // Locate the bucket callback-free before falling back to the entry walk,
     // which is linear in the set's size.  The index is resolved inside the
     // probe and the removal withheld when a comparison leaves the builtin
-    // ladder, so the walk below can redo the whole operation.  The removal
-    // itself still shifts the tail, as in the fallback.
+    // ladder, so the walk below can redo the whole operation.
     if let Some(result) = callback_free_set_op(|| {
         let items = (*(dst as *const W_SetObject)).items;
-        let index = (*items).get_index_of(&key);
+        let index = (*items).index_of(&key);
         if crate::dict_eq_hook::callback_free_probe_broken() {
             return;
         }
         if let Some(index) = index {
-            set_remove_index(items, index);
+            set_remove_slot(items, index);
             let set = &mut *(dst as *mut W_SetObject);
             set.set_len_relaxed(set.len_relaxed() - 1);
             set.hash = -1;
@@ -1062,9 +1094,9 @@ unsafe fn w_set_remove_key_for_update(
         let len = (*items).len();
         let mut found = None;
         let mut i = 0;
-        while i < len {
-            let Some((&stored, _)) = (*items).get_index(i) else {
-                continue 'restart;
+        loop {
+            let Some((slot, &stored, _)) = (*items).next_entry(i) else {
+                break;
             };
             if stored.hash == key.hash {
                 let _roots = crate::gc_roots::push_roots();
@@ -1080,21 +1112,21 @@ unsafe fn w_set_remove_key_for_update(
                 }
                 if (*(dst as *const W_SetObject)).items != items
                     || (*items).len() != len
-                    || !(*items).get_index(i).is_some_and(|(current, _)| {
+                    || !(*items).get_slot(slot).is_some_and(|(current, _)| {
                         current.hash == stored.hash && current.obj == stored_obj
                     })
                 {
                     continue 'restart;
                 }
                 if equal {
-                    found = Some(i);
+                    found = Some(slot);
                     break;
                 }
             }
-            i += 1;
+            i = slot + 1;
         }
         if let Some(index) = found {
-            set_remove_index(items, index);
+            set_remove_slot(items, index);
             let set = &mut *(dst as *mut W_SetObject);
             set.set_len_relaxed(set.len_relaxed() - 1);
             set.hash = -1;
@@ -1149,8 +1181,9 @@ pub unsafe fn w_set_stored_hashes(obj: PyObjectRef) -> Vec<i64> {
     (*s.items).keys().map(|key| key.hash).collect()
 }
 
-/// The key at `index`, carrying the digest it was stored under, or `None` once
-/// `index` reaches the end.
+/// The key in `slot`, carrying the digest it was stored under, or `None` when
+/// nothing occupies it — past the last entry, or in the hole a delete left.
+/// [`w_set_next_slot`] finds the slots that answer.
 ///
 /// `setobject.py iterkeys_with_hash` walks a storage handing out
 /// `(key, keyhash)` pairs so the walk's consumer can place or probe the key
@@ -1164,11 +1197,11 @@ pub unsafe fn w_set_stored_hashes(obj: PyObjectRef) -> Vec<i64> {
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_key_at(
     obj: PyObjectRef,
-    index: usize,
+    slot: usize,
 ) -> Option<crate::dictmultiobject::ObjectKey> {
     let _set_guard = w_set_lock(obj);
     let s = &*(obj as *const W_SetObject);
-    (*s.items).get_index(index).map(|(&key, _)| key)
+    (*s.items).get_slot(slot).map(|(&key, _)| key)
 }
 
 /// Snapshot the contained elements as a `Vec`.

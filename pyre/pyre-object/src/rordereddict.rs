@@ -179,6 +179,14 @@ impl<K, V, S> RDict<K, V, S> {
     /// `d.num_ever_used_items` — one past the highest slot ever filled, and so
     /// the bound of a slot walk.  Dead slots below it read as `None`.
     #[inline]
+    /// `_ll_dictnext` (rordereddict.py:1373) — the entry at or after `from`,
+    /// paired with the slot holding it.
+    pub fn next_entry(&self, from: usize) -> Option<(usize, &K, &V)> {
+        let slot = self.next_valid_slot(from)?;
+        let e = self.entries[slot].as_ref()?;
+        Some((slot, &e.key, &e.value))
+    }
+
     pub fn entry_slots(&self) -> usize {
         self.entries.len()
     }
@@ -473,7 +481,8 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.lookup(hash, key)
     }
 
-    /// `_ll_dict_setitem_lookup_done` (rordereddict.py:675).
+    /// `ll_dict_setitem_with_hash` (rordereddict.py:668) — probe, then hand the
+    /// probe's answer to [`Self::setitem_lookup_done`].
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let hash = self.hash_of(&key);
         if self.indexes.is_empty() {
@@ -486,7 +495,36 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             }
             Err(index_slot) => index_slot,
         };
+        self.setitem_lookup_done(hash, Some(index_slot), key, value);
+        None
+    }
 
+    /// Place a key the caller has already proven absent, running no key
+    /// comparison of its own.
+    ///
+    /// The `i < 0` arm of `_ll_dict_setitem_lookup_done` entered without a
+    /// preceding `FLAG_STORE` probe: with no index slot to reuse, placement
+    /// goes through `ll_call_insert_clean_function` (rordereddict.py:699),
+    /// which probes on the digest alone.
+    ///
+    /// A caller that is wrong about absence gets a second entry under the same
+    /// key, and lookups then answer with whichever the probe reaches first.
+    /// This is for a probe whose comparisons ran somewhere they could be
+    /// undone — a set membership scan that must not hand the table a
+    /// comparison able to re-enter it.
+    pub fn insert_known_absent(&mut self, key: K, value: V) {
+        let hash = self.hash_of(&key);
+        if self.indexes.is_empty() {
+            self.reindex(DICT_INITSIZE);
+        }
+        self.setitem_lookup_done(hash, None, key, value);
+    }
+
+    /// The `i < 0` arm of `_ll_dict_setitem_lookup_done` (rordereddict.py:675):
+    /// grow or compact, then claim an index slot for a fresh entry.
+    /// `index_slot` is the one a `FLAG_STORE` probe ended on, `None` when the
+    /// caller never probed.
+    fn setitem_lookup_done(&mut self, hash: u64, index_slot: Option<usize>, key: K, value: V) {
         let mut reindexed = false;
         // `if len(d.entries) == d.num_ever_used_items: ll_dict_grow(d)` — the
         // entries array is full, and `ll_dict_grow` (755) compacts instead of
@@ -503,16 +541,17 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             reindexed = true;
             rc = self.resize_counter - 3;
         }
-        if reindexed {
-            let slot = self.next_slot();
-            self.insert_clean(hash, slot);
-        } else {
-            self.indexes[index_slot] = self.next_slot() + VALID_OFFSET;
+        // A reindex rebuilt the whole table, so the probe's slot names nothing.
+        match index_slot.filter(|_| !reindexed) {
+            Some(index_slot) => self.indexes[index_slot] = self.next_slot() + VALID_OFFSET,
+            None => {
+                let slot = self.next_slot();
+                self.insert_clean(hash, slot);
+            }
         }
         self.resize_counter = rc;
         self.entries.push(Some(Entry { hash, key, value }));
         self.num_live_items += 1;
-        None
     }
 
     /// `ll_call_delete_by_entry_index` (rordereddict.py:1157) — re-probe from
