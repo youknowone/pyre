@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=main
+# pyre-check: selfcheck-compiles=sites
 # pyre-check: spec-folds=builtin_locals
 # Self-checking guard for the cell half of the modelled `fast2locals`.
 #
