@@ -2563,6 +2563,15 @@ fn socket_call<R>(f: impl FnOnce() -> R) -> (R, i32) {
     }
 }
 
+/// `socket_io_err_for_operation` for a caller holding the code itself.
+#[cfg(any(unix, windows))]
+pub(crate) fn socket_error_for_operation(
+    obj: pyre_object::PyObjectRef,
+    errno: i32,
+) -> crate::PyError {
+    socket_io_err_for_operation(obj, std::io::Error::from_raw_os_error(errno))
+}
+
 #[cfg(any(unix, windows))]
 fn socket_io_err_for_operation(
     obj: pyre_object::PyObjectRef,
@@ -2738,7 +2747,7 @@ fn socket_apply_timeout(fd: rffi::Socket, timeout: f64) -> Result<(), crate::PyE
 }
 
 #[cfg(any(unix, windows))]
-fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<rffi::Socket, crate::PyError> {
+pub(crate) fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<rffi::Socket, crate::PyError> {
     let fd = rffi::socket_from_i64(socket_get_attr_i64(obj, "_fd"));
     if rffi::is_invalid(fd) {
         // `close` leaves `self.fd = INVALID_SOCKET` (`rsocket.py RSocket.close`)
@@ -2752,6 +2761,86 @@ fn socket_fd(obj: pyre_object::PyObjectRef) -> Result<rffi::Socket, crate::PyErr
         ));
     }
     Ok(fd)
+}
+
+/// `send` with nothing around it: no interpreter release, and the failure code
+/// handed back rather than turned into an exception.  A caller that is already
+/// inside a released region has neither the interpreter it would need to build
+/// one nor a second release to spend.  `_ssl` drives its TLS exchanges from
+/// here.
+#[cfg(any(unix, windows))]
+pub(crate) fn socket_send_raw(
+    fd: rffi::Socket,
+    buf: &[u8],
+    flags: libc::c_int,
+) -> Result<isize, i32> {
+    let sent = unsafe { rffi::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags) };
+    if sent >= 0 {
+        Ok(sent)
+    } else {
+        Err(rffi::last_error_code())
+    }
+}
+
+/// The `recv` counterpart of `socket_send_raw`, filling a caller's buffer.
+#[cfg(any(unix, windows))]
+pub(crate) fn socket_recv_raw(
+    fd: rffi::Socket,
+    buf: &mut [u8],
+    flags: libc::c_int,
+) -> Result<usize, i32> {
+    let read = unsafe { rffi::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), flags) };
+    if read >= 0 {
+        Ok(read as usize)
+    } else {
+        Err(rffi::last_error_code())
+    }
+}
+
+/// The interpreter release and interrupted-call retry `sock_send` runs around
+/// the syscall, lifted out of the exported-buffer scope so the release covers
+/// the error paths too.  `_ssl` writes a record through this wherever it
+/// cannot hold the release across the whole exchange.
+#[cfg(any(unix, windows))]
+pub(crate) fn socket_send_bytes(
+    obj: pyre_object::PyObjectRef,
+    fd: rffi::Socket,
+    buf: &[u8],
+    flags: libc::c_int,
+) -> Result<isize, crate::PyError> {
+    loop {
+        match socket_call(|| socket_send_raw(fd, buf, flags)).0 {
+            Ok(sent) => return Ok(sent),
+            Err(errno) if !rffi::error_is_interrupted(errno) => {
+                return Err(socket_error_for_operation(obj, errno));
+            }
+            // EINTR: deliver a pending signal, then retry
+            // (`converted_error` eintr_retry).
+            Err(_) => crate::module::signal::interp_signal::checksignals_now()?,
+        }
+    }
+}
+
+/// The `sock_recv` counterpart of `socket_send_bytes`, filling a caller's
+/// buffer rather than a fresh `bytes`.
+#[cfg(any(unix, windows))]
+pub(crate) fn socket_recv_bytes(
+    obj: pyre_object::PyObjectRef,
+    fd: rffi::Socket,
+    buf: &mut [u8],
+    flags: libc::c_int,
+) -> Result<usize, crate::PyError> {
+    loop {
+        match socket_call(|| socket_recv_raw(fd, buf, flags)).0 {
+            Ok(read) => return Ok(read),
+            Err(errno) if !rffi::error_is_interrupted(errno) => {
+                return Err(socket_error_for_operation(obj, errno));
+            }
+            // EINTR: deliver a pending signal, then retry
+            // (`converted_error` eintr_retry).
+            Err(_) => crate::module::signal::interp_signal::checksignals_now()?,
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -4325,28 +4414,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             // `PyBuffer_Release` after the call — `SimpleBufferBytes` has no
             // `Drop`, so an export that is never released leaves a `bytearray`
             // argument permanently exported and unable to be resized. The
-            // borrow of `buffer` is scoped to the closure so the release also
-            // covers the error paths.
-            let result = (|| -> Result<isize, crate::PyError> {
-                let buf = buffer.as_bytes();
-                loop {
-                    let (r, errno) = socket_call(|| unsafe {
-                        rffi::send(fd, buf.as_ptr() as *const libc::c_void, buf.len(), flags)
-                    });
-                    if r >= 0 {
-                        return Ok(r);
-                    }
-                    if !rffi::error_is_interrupted(errno) {
-                        return Err(socket_io_err_for_operation(
-                            obj,
-                            std::io::Error::from_raw_os_error(errno),
-                        ));
-                    }
-                    // EINTR: deliver a pending signal, then retry
-                    // (`converted_error` eintr_retry).
-                    crate::module::signal::interp_signal::checksignals_now()?;
-                }
-            })();
+            // result is held rather than propagated so the release covers the
+            // error paths too.
+            let result = socket_send_bytes(obj, fd, buffer.as_bytes(), flags);
             buffer.release();
             Ok(pyre_object::w_int_new(result? as i64))
         }),
@@ -4431,24 +4501,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 0
             };
             let mut buf = vec![0u8; n];
-            let got = loop {
-                let (r, errno) = socket_call(|| unsafe {
-                    rffi::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, n, flags)
-                });
-                if r >= 0 {
-                    break r;
-                }
-                if !rffi::error_is_interrupted(errno) {
-                    return Err(socket_io_err_for_operation(
-                        obj,
-                        std::io::Error::from_raw_os_error(errno),
-                    ));
-                }
-                // EINTR: deliver a pending signal, then retry
-                // (`converted_error` eintr_retry).
-                crate::module::signal::interp_signal::checksignals_now()?;
-            };
-            buf.truncate(got as usize);
+            let got = socket_recv_bytes(obj, fd, &mut buf, flags)?;
+            buf.truncate(got);
             Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
         }),
     ) };
