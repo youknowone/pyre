@@ -12918,111 +12918,144 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         })
     }
 
+    // `_is_end_of_source`: the tokenizer state the incomplete-input flag is read
+    // against.  `eval` parses one expression and stops at the first token that
+    // cannot continue it, so its tokenizer reaches the end of the source only
+    // when nothing earlier went wrong -- `x=[1,` fails at the `=`, three
+    // characters before the bracket that is left open, and is a program that is
+    // wrong where it stands however much more input follows it.
+    //
+    // `raw_location` is the parser's own range, which the CPython-shaped
+    // diagnostic override does not rewrite, and it is the only place that first
+    // failure survives: the override picks its message by scanning the whole
+    // source, so an unfinished construct anywhere in it replaces the one the
+    // parser actually stopped on.
+    //
+    // The block and interactive parsers stop at a statement boundary instead,
+    // where an unfinished compound statement legitimately fails ahead of the
+    // end -- `if 1:` wants an indented block the source has not reached -- so
+    // the test is `eval`'s alone.
+    fn parse_reached_end_of_source(e: &crate::compile::CompileError, source: &str) -> bool {
+        match e {
+            crate::compile::CompileError::Parse(error) => {
+                error.raw_location.end().to_usize() >= source.len()
+            }
+            crate::compile::CompileError::Codegen(_) => false,
+        }
+    }
+
     let incomplete = match allow_incomplete {
         None => false,
         // A source holding no statement is unfinished for whichever parser
         // wanted one, so the mode does not enter here.
         Some(_) if holds_no_statement(source) => true,
-        // `eval` parses one expression and reaches its own end-of-input error
-        // ahead of the flag: a source that stops mid-expression is reported as
-        // the syntax error it is, whatever the flag asks for.
-        Some(crate::compile::Mode::Eval) => false,
-        Some(mode) => match &e {
-            crate::compile::CompileError::Parse(error) => match &error.error {
-                ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
-                _ if error.is_unclosed_bracket => true,
-                ParseErrorType::Lexical(LexicalErrorType::FStringError(
-                    InterpolatedStringErrorType::UnterminatedTripleQuotedString,
-                )) => true,
-                ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
-                    let loc = error.raw_location.start().to_usize();
-                    // A triple-quoted literal left open wants more input under
-                    // either parser.  A single-quoted one still open at the end
-                    // of the source is unfinished only for the interactive
-                    // parser, which has another line to read; a block parser
-                    // holds all the input there is and reports the literal as
-                    // unterminated.
-                    opens_triple_quote(source, loc)
-                        || (matches!(mode, crate::compile::Mode::Single)
-                            && string_continues_to_eof(source, loc))
-                }
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("Expected an indented block after")
-                        || message.starts_with("expected an indented block after") =>
-                {
-                    // Byte offsets again: the span covers the blank run that
-                    // should have held the indented block.
-                    let bytes = source.as_bytes();
-                    let from = error
-                        .raw_location
-                        .start()
-                        .to_usize()
-                        .saturating_add(1)
-                        .min(bytes.len());
-                    let to = error
-                        .raw_location
-                        .end()
-                        .to_usize()
-                        .saturating_add(1)
-                        .min(bytes.len());
-                    from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
-                }
-                // `codeop._maybe_compile` retries a failed command with one
-                // trailing newline.  The pinned RustPython parser reports the
-                // first unterminated triple quote as `UnclosedStringError`,
-                // but the newline retry as this `OtherError` shape.  CPython
-                // keeps both attempts incomplete; preserve RustPython's
-                // triple-quote test across that parser-shape variation.
-                // `unterminated_string_message` writes `triple-quoted` only
-                // for a literal opened with three quotes, so the message is
-                // itself the evidence and no position has to be read: such a
-                // literal runs to the end of the source by construction, which
-                // is `E_EOFS` -- more input wanted.  `raw_location` cannot
-                // answer it anyway, being ruff's own range rather than the one
-                // the CPython-shaped override reports; for `f"""` the two sit
-                // on different offsets.
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("unterminated triple-quoted ") =>
-                {
-                    true
-                }
-                // The single-quoted spelling arrives the same way, and the
-                // generic arm below reads only whether the source ends on a
-                // newline -- which answers `a = 'a` but gets `a = 'a\` with one
-                // appended wrong, the one shape `codeop._maybe_compile` builds
-                // for every command it retries.
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("unterminated string literal") =>
-                {
-                    let loc = error.raw_location.start().to_usize();
-                    // A triple-quoted literal left open wants more input under
-                    // either parser.  A single-quoted one still open at the end
-                    // of the source is unfinished only for the interactive
-                    // parser, which has another line to read; a block parser
-                    // holds all the input there is and reports the literal as
-                    // unterminated.
-                    opens_triple_quote(source, loc)
-                        || (matches!(mode, crate::compile::Mode::Single)
-                            && string_continues_to_eof(source, loc))
-                }
-                // A closing bracket with no opener, or one that does not
-                // match the opener, is wrong where it stands rather than short
-                // of input: the tokenizer reports it away from `E_EOF`, so no
-                // continuation makes it parse.  `'x' was never closed` is the
-                // opposite case and `is_unclosed_bracket` answers it above.
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("unmatched ")
-                        || message.starts_with("closing parenthesis ") =>
-                {
-                    false
-                }
-                ParseErrorType::OtherError(_) => {
-                    error.raw_location.end().to_usize() >= source.len() && !source.ends_with('\n')
-                }
+        Some(mode) => {
+            let unfinished = match &e {
+                crate::compile::CompileError::Parse(error) => match &error.error {
+                    ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
+                    _ if error.is_unclosed_bracket => true,
+                    ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                        InterpolatedStringErrorType::UnterminatedTripleQuotedString,
+                    )) => true,
+                    ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
+                        let loc = error.raw_location.start().to_usize();
+                        // A triple-quoted literal left open wants more input under
+                        // every parser.  A single-quoted one still open at the end
+                        // of the source is reported as unterminated only by the
+                        // block parser, which holds all the input there is; the
+                        // interactive parser has another line to read and `eval`,
+                        // wanting one expression, stops at the end of the input it
+                        // was given, so for both the literal is unfinished.
+                        opens_triple_quote(source, loc)
+                            || (!matches!(mode, crate::compile::Mode::Exec)
+                                && string_continues_to_eof(source, loc))
+                    }
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("Expected an indented block after")
+                            || message.starts_with("expected an indented block after") =>
+                    {
+                        // Byte offsets again: the span covers the blank run that
+                        // should have held the indented block.
+                        let bytes = source.as_bytes();
+                        let from = error
+                            .raw_location
+                            .start()
+                            .to_usize()
+                            .saturating_add(1)
+                            .min(bytes.len());
+                        let to = error
+                            .raw_location
+                            .end()
+                            .to_usize()
+                            .saturating_add(1)
+                            .min(bytes.len());
+                        from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+                    }
+                    // `codeop._maybe_compile` retries a failed command with one
+                    // trailing newline.  The pinned RustPython parser reports the
+                    // first unterminated triple quote as `UnclosedStringError`,
+                    // but the newline retry as this `OtherError` shape.  CPython
+                    // keeps both attempts incomplete; preserve RustPython's
+                    // triple-quote test across that parser-shape variation.
+                    // `unterminated_string_message` writes `triple-quoted` only
+                    // for a literal opened with three quotes, so the message is
+                    // itself the evidence and no position has to be read: such a
+                    // literal runs to the end of the source by construction, which
+                    // is `E_EOFS` -- more input wanted.  `raw_location` cannot
+                    // answer it anyway, being ruff's own range rather than the one
+                    // the CPython-shaped override reports; for `f"""` the two sit
+                    // on different offsets.
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unterminated triple-quoted ") =>
+                    {
+                        true
+                    }
+                    // The single-quoted spelling arrives the same way, and the
+                    // generic arm below reads only whether the source ends on a
+                    // newline -- which answers `a = 'a` but gets `a = 'a\` with one
+                    // appended wrong, the one shape `codeop._maybe_compile` builds
+                    // for every command it retries.
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unterminated string literal") =>
+                    {
+                        let loc = error.raw_location.start().to_usize();
+                        // A triple-quoted literal left open wants more input under
+                        // every parser.  A single-quoted one still open at the end
+                        // of the source is reported as unterminated only by the
+                        // block parser, which holds all the input there is; the
+                        // interactive parser has another line to read and `eval`,
+                        // wanting one expression, stops at the end of the input it
+                        // was given, so for both the literal is unfinished.
+                        opens_triple_quote(source, loc)
+                            || (!matches!(mode, crate::compile::Mode::Exec)
+                                && string_continues_to_eof(source, loc))
+                    }
+                    // A closing bracket with no opener, or one that does not
+                    // match the opener, is wrong where it stands rather than short
+                    // of input: the tokenizer reports it away from `E_EOF`, so no
+                    // continuation makes it parse.  `'x' was never closed` is the
+                    // opposite case and `is_unclosed_bracket` answers it above.
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unmatched ")
+                            || message.starts_with("closing parenthesis ") =>
+                    {
+                        false
+                    }
+                    ParseErrorType::OtherError(_) => {
+                        error.raw_location.end().to_usize() >= source.len()
+                            && !source.ends_with('\n')
+                    }
+                    _ => false,
+                },
                 _ => false,
-            },
-            _ => false,
-        },
+            };
+            // `eval` reads the flag against a tokenizer that stopped where the
+            // expression did, so a failure short of the end of the source is a
+            // syntax error whatever the shape tests above say.
+            unfinished
+                && (!matches!(mode, crate::compile::Mode::Eval)
+                    || parse_reached_end_of_source(&e, source))
+        }
     };
 
     // `syntax_error_subclass` can supply a replacement message, so it
