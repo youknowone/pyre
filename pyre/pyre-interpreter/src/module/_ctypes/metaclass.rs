@@ -15,7 +15,7 @@
 //! `StgInfo.pointer_type` and read back through the `__pointer_type__` getset.
 
 use super::cdata;
-use super::stginfo::{self, StgInfoData};
+use super::stginfo::{self, ParamFunc, StgInfoData};
 use super::type_ns_store;
 use majit_rlib::rbigint::RBigInt as BigInt;
 use pyre_object::PyObjectRef;
@@ -393,7 +393,7 @@ fn pointer_set_type(args: &[PyObjectRef]) -> PyResult {
     let mut data = StgInfoData::new(
         host_ctypes::pointer_size(),
         host_ctypes::simple_type_align("P").unwrap_or(host_ctypes::pointer_size()),
-        "pointer",
+        ParamFunc::Pointer,
     );
     data.element_size = stginfo::field_size_of(proto).unwrap_or(0);
     data.length = 1;
@@ -469,8 +469,8 @@ fn simple_init_stginfo(cls: PyObjectRef) -> PyResult {
     }
     let size = host_ctypes::simple_type_size(&tc).ok_or_else(cdata::invalid_type_code_error)?;
     let align = host_ctypes::simple_type_align(&tc).ok_or_else(cdata::invalid_type_code_error)?;
-    let mut data = StgInfoData::new(size, align, "simple");
-    data.format = Some(tc.clone());
+    let mut data = StgInfoData::new(size, align, ParamFunc::Simple);
+    data.format = Some(tc.to_string());
     if host_ctypes::simple_type_is_pointer(&tc) {
         data.flags |= stginfo::TYPEFLAG_ISPOINTER;
     }
@@ -750,7 +750,7 @@ fn mark_type_final(ty: PyObjectRef, size: usize, align: usize) {
     match stginfo::stginfo_of(ty) {
         Some(info) => stginfo::stginfo_mark_final(info),
         None => {
-            let mut data = StgInfoData::new(size, align, "simple");
+            let mut data = StgInfoData::new(size, align, ParamFunc::Simple);
             data.flags |= stginfo::DICTFLAG_FINAL;
             stginfo::stginfo_set(ty, stginfo::stginfo_new(data));
         }
@@ -767,7 +767,11 @@ fn struct_union_init_stginfo(cls: PyObjectRef, is_union: bool) -> PyResult {
     match own_fields {
         Some(fields) => process_fields(cls, fields, is_union),
         None => {
-            let paramfunc = if is_union { "union" } else { "struct" };
+            let paramfunc = if is_union {
+                ParamFunc::Union
+            } else {
+                ParamFunc::Struct
+            };
             match first_base_stginfo(cls) {
                 Some(base_info) => {
                     let mut data = StgInfoData::new(
@@ -812,7 +816,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
                 "'{name}' is specified in _anonymous_ but not in _fields_"
             )));
         };
-        if !matches!(proto_kind(entry.ty).as_str(), "struct" | "union") {
+        if !matches!(proto_kind(entry.ty), ParamFunc::Struct | ParamFunc::Union) {
             return Err(crate::PyError::type_error(
                 "anonymous field must be a structure or union",
             ));
@@ -871,7 +875,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
         let name = &entry.name;
         let ftype = entry.ty;
         if is_swapped
-            && (matches!(proto_kind(ftype).as_str(), "pointer")
+            && (proto_kind(ftype) == ParamFunc::Pointer
                 || cdata::type_code_of(ftype)
                     .is_some_and(|code| matches!(code.as_str(), "u" | "P" | "z" | "Z" | "O")))
         {
@@ -997,7 +1001,11 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     let mut data = StgInfoData::new(
         aligned,
         total_align,
-        if is_union { "union" } else { "struct" },
+        if is_union {
+            ParamFunc::Union
+        } else {
+            ParamFunc::Struct
+        },
     );
     // Field count includes the inherited prefix, not just the own fields.
     data.length = base_length + entries.len();
@@ -1098,7 +1106,7 @@ fn fields_set(args: &[PyObjectRef]) -> PyResult {
     if stginfo::stginfo_is_final(info) {
         return Err(crate::PyError::attribute_error("_fields_ is final"));
     }
-    let is_union = stginfo::stginfo_paramfunc(info) == "union";
+    let is_union = stginfo::stginfo_paramfunc(info) == ParamFunc::Union;
     process_fields(cls, value, is_union)
 }
 
@@ -1190,18 +1198,19 @@ fn native_uint_to_bytes(value: u64, size: usize) -> Vec<u8> {
     }
 }
 
-/// The storage kind of a field's `proto` ("simple"/"struct"/"union"/…).
-fn proto_kind(proto: PyObjectRef) -> String {
+/// The storage kind of a field's `proto`.  A type with no `StgInfo` of its own
+/// is simple when it names a `_type_` code, and nothing otherwise.
+fn proto_kind(proto: PyObjectRef) -> ParamFunc {
     if let Some(info) = stginfo::stginfo_of(proto) {
         let pf = stginfo::stginfo_paramfunc(info);
-        if !pf.is_empty() {
+        if pf != ParamFunc::Other {
             return pf;
         }
     }
     if cdata::type_code_of(proto).is_some() {
-        return "simple".to_string();
+        return ParamFunc::Simple;
     }
-    String::new()
+    ParamFunc::Other
 }
 
 fn field_needs_swap(obj: PyObjectRef, proto: PyObjectRef, size: usize) -> bool {
@@ -1228,8 +1237,8 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
     let size = cf_usize(cfield, "byte_size");
     let index = cf_usize(cfield, "index");
 
-    match proto_kind(proto).as_str() {
-        "simple" => {
+    match proto_kind(proto) {
+        ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("field has no '_type_'"))?;
             let all = cdata::cdata_bytes(obj)
@@ -1261,7 +1270,7 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
             }
             Ok(cdata::decode_slot(&tc, &field_bytes))
         }
-        "array" => {
+        ParamFunc::Array => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
             let all = cdata::cdata_bytes(obj)
                 .ok_or_else(|| crate::PyError::type_error("instance has no buffer"))?;
@@ -1279,7 +1288,7 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
                 _ => Ok(cdata::make_indexed_subview(proto, obj, offset, size, index)),
             }
         }
-        "struct" | "union" | "pointer" => {
+        ParamFunc::Struct | ParamFunc::Union | ParamFunc::Pointer => {
             Ok(cdata::make_indexed_subview(proto, obj, offset, size, index))
         }
         _ => Err(crate::PyError::type_error("field type has no storage info")),
@@ -1298,8 +1307,8 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
     let size = cf_usize(cfield, "byte_size");
     let index = cf_usize(cfield, "index");
 
-    match proto_kind(proto).as_str() {
-        "simple" => {
+    match proto_kind(proto) {
+        ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("field has no '_type_'"))?;
             if cf_bool(cfield, "is_bitfield") {
@@ -1340,7 +1349,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             }
             Ok(pyre_object::w_none())
         }
-        "pointer" => {
+        ParamFunc::Pointer => {
             if unsafe { pyre_object::is_none(value) } {
                 cdata::cdata_write(obj, offset, &vec![0; size]);
                 return Ok(pyre_object::w_none());
@@ -1350,7 +1359,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             let array_decay = if cdata::is_cdata_instance(value) {
                 let value_cls = unsafe { pyre_object::w_instance_get_type(value) };
                 stginfo::stginfo_of(value_cls)
-                    .filter(|&i| stginfo::stginfo_paramfunc(i) == "array")
+                    .filter(|&i| stginfo::stginfo_paramfunc(i) == ParamFunc::Array)
                     .and_then(stginfo::stginfo_proto)
                     == expected
             } else {
@@ -1378,7 +1387,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             cdata::keep_ref(obj, &index.to_string(), keep);
             Ok(pyre_object::w_none())
         }
-        "array" => {
+        ParamFunc::Array => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
             match element.and_then(cdata::type_code_of).as_deref() {
                 Some("c") => {
@@ -1438,7 +1447,7 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             }
         }
         // Structures and unions are copied by value.
-        "struct" | "union" => {
+        ParamFunc::Struct | ParamFunc::Union => {
             if !unsafe { crate::baseobjspace::isinstance_w(value, proto) } {
                 return Err(crate::PyError::type_error("incompatible types"));
             }
@@ -1772,7 +1781,7 @@ fn array_init_stginfo(cls: PyObjectRef) -> PyResult {
         return Err(crate::PyError::overflow_error("array too large"));
     }
 
-    let mut data = StgInfoData::new(elem_size * length, elem_align, "array");
+    let mut data = StgInfoData::new(elem_size * length, elem_align, ParamFunc::Array);
     data.length = length;
     data.element_size = elem_size;
     data.proto = Some(elem);
@@ -1925,8 +1934,8 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
 
 fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
     let offset = idx * meta.element_size;
-    match proto_kind(meta.proto).as_str() {
-        "simple" => {
+    match proto_kind(meta.proto) {
+        ParamFunc::Simple => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
             let all = cdata::cdata_bytes(obj)
@@ -1935,13 +1944,9 @@ fn array_get_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize) -> PyResult {
             let start = offset.min(end);
             Ok(cdata::decode_slot(&tc, &all[start..end]))
         }
-        "struct" | "union" | "array" | "pointer" => Ok(cdata::make_indexed_subview(
-            meta.proto,
-            obj,
-            offset,
-            meta.element_size,
-            idx,
-        )),
+        ParamFunc::Struct | ParamFunc::Union | ParamFunc::Array | ParamFunc::Pointer => Ok(
+            cdata::make_indexed_subview(meta.proto, obj, offset, meta.element_size, idx),
+        ),
         _ => Err(crate::PyError::type_error(
             "element type has no storage info",
         )),
@@ -1965,8 +1970,8 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
 
 fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObjectRef) -> PyResult {
     let offset = idx * meta.element_size;
-    match proto_kind(meta.proto).as_str() {
-        "simple" => {
+    match proto_kind(meta.proto) {
+        ParamFunc::Simple => {
             let tc = cdata::type_code_of(meta.proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &idx.to_string())?;
@@ -1977,7 +1982,7 @@ fn array_set_index(obj: PyObjectRef, meta: &ArrayMeta, idx: usize, value: PyObje
             }
             Ok(pyre_object::w_none())
         }
-        "struct" | "union" | "array" | "pointer" => {
+        ParamFunc::Struct | ParamFunc::Union | ParamFunc::Array | ParamFunc::Pointer => {
             if !unsafe { crate::baseobjspace::isinstance_w(value, meta.proto) } {
                 return Err(crate::PyError::type_error("incompatible types"));
             }
@@ -2227,7 +2232,7 @@ fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
         return Err(crate::PyError::type_error("_type_ must have storage info"));
     }
     let psize = host_ctypes::pointer_size();
-    let mut data = StgInfoData::new(psize, psize, "pointer");
+    let mut data = StgInfoData::new(psize, psize, ParamFunc::Pointer);
     data.length = 1;
     data.flags |= stginfo::TYPEFLAG_ISPOINTER;
     data.proto = proto;
@@ -2237,7 +2242,7 @@ fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
                 let mut dims = Vec::new();
                 let mut current = p;
                 while let Some(info) = stginfo::stginfo_of(current) {
-                    if stginfo::stginfo_paramfunc(info) != "array" {
+                    if stginfo::stginfo_paramfunc(info) != ParamFunc::Array {
                         break;
                     }
                     dims.push(stginfo::stginfo_length(info));
@@ -2272,7 +2277,7 @@ fn pointer_init_stginfo(cls: PyObjectRef) -> PyResult {
             None => {
                 let size = stginfo::field_size_of(p).unwrap_or(0);
                 let align = stginfo::field_align_of(p).unwrap_or(1);
-                let info = stginfo::stginfo_new(StgInfoData::new(size, align, "simple"));
+                let info = stginfo::stginfo_new(StgInfoData::new(size, align, ParamFunc::Simple));
                 stginfo::stginfo_set(p, info);
                 info
             }
@@ -2432,8 +2437,8 @@ fn pointer_get_index(obj: PyObjectRef, index: isize) -> PyResult {
         return Err(crate::PyError::value_error("NULL pointer access"));
     }
     let addr = host_ctypes::pointer_item_address(ptr, index, element_size);
-    match proto_kind(proto).as_str() {
-        "simple" => {
+    match proto_kind(proto) {
+        ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
             let bytes = unsafe { host_ctypes::borrow_memory(addr as *const u8, element_size) };
@@ -2458,8 +2463,8 @@ fn pointer_setitem(args: &[PyObjectRef]) -> PyResult {
     }
     let index = unsafe { pyre_object::w_int_get_value(key) } as isize;
     let addr = host_ctypes::pointer_item_address(ptr, index, element_size);
-    match proto_kind(proto).as_str() {
-        "simple" => {
+    match proto_kind(proto) {
+        ParamFunc::Simple => {
             let tc = cdata::type_code_of(proto)
                 .ok_or_else(|| crate::PyError::type_error("element has no '_type_'"))?;
             let bytes = cdata::encode_instance_or_value(&tc, value, obj, &index.to_string())?;

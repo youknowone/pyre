@@ -43,6 +43,47 @@ fn stginfo_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// `StgInfo.paramfunc` — the storage shape a ctypes type has.
+///
+/// The carrier keeps it spelled out as a string, so a shape is one comparison
+/// on the way in and out rather than a fresh allocation at every read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ParamFunc {
+    Simple,
+    Array,
+    Pointer,
+    Struct,
+    Union,
+    /// A carrier with no `paramfunc`, or one naming a shape this build has no
+    /// arm for.
+    Other,
+}
+
+impl ParamFunc {
+    /// The spelling the carrier stores.
+    fn name(self) -> &'static str {
+        match self {
+            ParamFunc::Simple => "simple",
+            ParamFunc::Array => "array",
+            ParamFunc::Pointer => "pointer",
+            ParamFunc::Struct => "struct",
+            ParamFunc::Union => "union",
+            ParamFunc::Other => "",
+        }
+    }
+
+    fn from_name(name: &str) -> Self {
+        match name {
+            "simple" => ParamFunc::Simple,
+            "array" => ParamFunc::Array,
+            "pointer" => ParamFunc::Pointer,
+            "struct" => ParamFunc::Struct,
+            "union" => ParamFunc::Union,
+            _ => ParamFunc::Other,
+        }
+    }
+}
+
 /// Field values for [`stginfo_new`].
 pub(super) struct StgInfoData {
     pub size: usize,
@@ -50,7 +91,7 @@ pub(super) struct StgInfoData {
     pub length: usize,
     pub element_size: usize,
     pub flags: i64,
-    pub paramfunc: &'static str,
+    pub paramfunc: ParamFunc,
     pub proto: Option<PyObjectRef>,
     pub format: Option<String>,
     pub big_endian: bool,
@@ -58,7 +99,7 @@ pub(super) struct StgInfoData {
 
 impl StgInfoData {
     /// A minimal simple/aggregate carrier of the given size and alignment.
-    pub(super) fn new(size: usize, align: usize, paramfunc: &'static str) -> Self {
+    pub(super) fn new(size: usize, align: usize, paramfunc: ParamFunc) -> Self {
         StgInfoData {
             size,
             align: align.max(1),
@@ -102,7 +143,11 @@ pub(super) fn stginfo_new(data: StgInfoData) -> PyObjectRef {
             pyre_object::w_int_new(data.element_size as i64),
         );
         pyre_object::w_dict_setitem_str(d, K_FLAGS, pyre_object::w_int_new(data.flags));
-        pyre_object::w_dict_setitem_str(d, K_PARAMFUNC, pyre_object::w_str_new(data.paramfunc));
+        pyre_object::w_dict_setitem_str(
+            d,
+            K_PARAMFUNC,
+            pyre_object::w_str_new(data.paramfunc.name()),
+        );
         pyre_object::w_dict_setitem_str(d, K_PROTO, data.proto.unwrap_or_else(pyre_object::w_none));
         pyre_object::w_dict_setitem_str(
             d,
@@ -156,12 +201,15 @@ pub(super) fn stginfo_flags(info: PyObjectRef) -> i64 {
     get_int(info, K_FLAGS)
 }
 
-pub(super) fn stginfo_paramfunc(info: PyObjectRef) -> String {
+pub(super) fn stginfo_paramfunc(info: PyObjectRef) -> ParamFunc {
     match unsafe { pyre_object::w_dict_getitem_str(dict_of(info), K_PARAMFUNC) } {
         Some(o) if unsafe { pyre_object::is_str(o) } => {
-            unsafe { pyre_object::w_str_get_value(o) }.to_string()
+            match unsafe { pyre_object::w_str_get_value_opt(o) } {
+                Some(name) => ParamFunc::from_name(name),
+                None => ParamFunc::Other,
+            }
         }
-        _ => String::new(),
+        _ => ParamFunc::Other,
     }
 }
 
