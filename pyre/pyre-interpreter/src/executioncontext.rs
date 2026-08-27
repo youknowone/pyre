@@ -67,6 +67,20 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
     }
 }
 
+/// Stand-in for `rvirtualizable.py hook_access_field`'s
+/// `llops.genop('jit_force_virtualizable', [vinst, cname, cflags])`.
+///
+/// `jtransform.py rewrite_op_jit_force_virtualizable` deletes this call in
+/// every graph the codewriter looks inside (`return []`).  Residual calls
+/// still run the body, which is the `replace_force_virtualizable_with_call`
+/// half: interpreter-visible graphs keep `force_virtualizable_if_necessary`.
+/// `#[inline(never)]` keeps the callee name on the Call so the rewrite can
+/// see it.
+#[inline(never)]
+pub fn jit_force_virtualizable(frame: *mut PyFrame) {
+    force_frame_before_locals_read(frame);
+}
+
 /// `_jit_vref.py` `vref()` = `jit_force_virtual`.
 ///
 /// `topframeref` and every frame's `f_backref` hold a `jit.virtual_ref` — at

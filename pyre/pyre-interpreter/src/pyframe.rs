@@ -2647,6 +2647,38 @@ pub fn code_flags_make_generator(flags: crate::CodeFlags) -> bool {
     )
 }
 
+/// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame.fget_getdictscope`.
+///
+/// `GetSetProperty(PyFrame.fget_getdictscope)` binds this as `fget`.  The
+/// residual `jit_force_virtualizable` is the `replace_force_virtualizable_with_call`
+/// half; `jtransform.py rewrite_op_jit_force_virtualizable` deletes it from
+/// jitcode.  Publishing the wrapper descriptor seeds the same candidate
+/// graph `BuiltinCode.func` would contribute from the generated wrapper.
+pub fn descr_typecheck_fget_getdictscope(
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, crate::PyError> {
+    let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
+    if f.is_null() {
+        return Ok(pyre_object::w_none());
+    }
+    let anchor = unsafe { crate::eval::FrameAnchor::from_raw(f) };
+    crate::executioncontext::jit_force_virtualizable(anchor.live());
+    unsafe { &mut *anchor.live() }.fget_getdictscope()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[linkme::distributed_slice(crate::gateway::BUILTIN_WRAPPER_DESCRIPTORS)]
+#[allow(non_upper_case_globals)]
+static __majit_builtin_wrapper_target_fget_getdictscope: crate::gateway::BuiltinWrapperDescriptor =
+    crate::gateway::BuiltinWrapperDescriptor {
+        path: concat!(
+            module_path!(),
+            "::",
+            stringify!(descr_typecheck_fget_getdictscope)
+        ),
+        func: descr_typecheck_fget_getdictscope,
+    };
+
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_code`.
 ///
 /// `GetSetProperty` binds this as its `fget` for `f_code`.
@@ -3315,31 +3347,21 @@ impl PyFrame {
         Ok(self.get_w_locals())
     }
 
-    /// pyframe.py fget_getdictscope — the `f_locals` getset.
+    /// pyframe.py `fget_getdictscope` — the `f_locals` getset.
     ///
-    /// Both arms end at `fast2locals` (the proxy routes its reads back
-    /// through the frame), which reads `locals_cells_stack_w` directly — so
-    /// the virtualizable has to be materialized first or the mapping reports
-    /// the values the frame last wrote out under correct keys.
-    /// `sys._getframe` materializes it with its own explicit `force_frame`
-    /// (`module/sys/vm.rs getframe`), not as a side effect of the walk:
-    /// `gettopframe_nohidden` forces only the VREF of the frame it starts
-    /// from, which is not enough.  A frame reached through a traceback's
-    /// `tb_frame` gets neither.
-    /// The force materializes the fastlocals through a backend hook whose
-    /// callee this crate cannot follow, so the frame is read back.
+    /// Upstream is `return self.getdictscope()`.  Optimized frames answer
+    /// with a write-through `FrameLocalsProxy` instead: `lib-python/3/test/
+    /// test_frame.py` `FrameLocalsProxy.__name__`.  The residual force lives
+    /// on [`descr_typecheck_fget_getdictscope`], the GetSetProperty wrapper,
+    /// not here — `jtransform.py rewrite_op_jit_force_virtualizable` deletes
+    /// it from jitcode; the interpreter copy still runs.
     pub fn fget_getdictscope(&mut self) -> Result<PyObjectRef, crate::PyError> {
-        let anchor = crate::eval::FrameAnchor::new(self);
-        crate::executioncontext::force_frame_before_locals_read(anchor.live());
-        let frame = unsafe { &mut *anchor.live() };
-        if frame.code().flags.contains(crate::CodeFlags::OPTIMIZED)
-            || frame.has_active_hidden_locals()
+        if self.code().flags.contains(crate::CodeFlags::OPTIMIZED)
+            || self.has_active_hidden_locals()
         {
-            // The proxy keeps the frame past this call, so it stores the one
-            // read back after the force, not the pointer that went into it.
-            return Ok(frame_locals_proxy::new(anchor.live() as PyObjectRef));
+            return Ok(frame_locals_proxy::new(self as *mut PyFrame as PyObjectRef));
         }
-        let w = frame.getdictscope()?;
+        let w = self.getdictscope()?;
         Ok(if w.is_null() {
             pyre_object::w_dict_new()
         } else {

@@ -23,18 +23,20 @@ const INTERPRETER_LLBC: &str = concat!(
     "/../../build/llbc/pyre-interpreter.ullbc"
 );
 
-/// Lower `pyframe::<Impl>::fast2locals` out of the shipped LLBC, or `None`
-/// when the artefact is absent so the tests degrade to a skip.
-fn lower_fast2locals() -> Option<FunctionGraph> {
+fn interpreter_llbc() -> Option<Llbc> {
     if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
         eprintln!("skipping: {INTERPRETER_LLBC} is missing");
         return None;
     }
-    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    Some(Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc"))
+}
+
+fn lower_named(llbc: &Llbc, leaf: &str) -> FunctionGraph {
+    let suffix = format!("::{leaf}");
     let fd = llbc
         .iter_local_fns()
-        .find(|fd| fd.item_meta.name_path().ends_with("::fast2locals"))
-        .expect("fast2locals present in the shipped LLBC");
+        .find(|fd| fd.item_meta.name_path().ends_with(&suffix))
+        .unwrap_or_else(|| panic!("{leaf} present in the shipped LLBC"));
     // The graph under test returns `Result<(), PyError>`, so the lowering has
     // to be told which `Result` is the fallible return before `result_exc` can
     // turn it into exception edges.  `majit-translate` names no carrier of its
@@ -49,7 +51,66 @@ fn lower_fast2locals() -> Option<FunctionGraph> {
         },
         ..Default::default()
     };
-    Some(lower_fun_decl_with_static_addrs(&llbc, fd, static_addrs).expect("lower fast2locals"))
+    lower_fun_decl_with_static_addrs(llbc, fd, static_addrs)
+        .unwrap_or_else(|e| panic!("lower {leaf}: {e:?}"))
+}
+
+/// Lower `pyframe::<Impl>::fast2locals` out of the shipped LLBC, or `None`
+/// when the artefact is absent so the tests degrade to a skip.
+fn lower_fast2locals() -> Option<FunctionGraph> {
+    Some(lower_named(&interpreter_llbc()?, "fast2locals"))
+}
+
+fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
+    let mut leafs = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::Call { target, .. } = &op.kind
+                && let Some(segs) = target.path_segments()
+                && let Some(leaf) = segs.last()
+            {
+                leafs.push((*leaf).to_string());
+            }
+        }
+    }
+    leafs
+}
+
+/// `GetSetProperty(PyFrame.fget_getdictscope)`: the wrapper carries the
+/// residual force; `rewrite_op_jit_force_virtualizable` deletes it; the
+/// method itself matches `pyframe.py fget_getdictscope`.
+#[test]
+fn f_locals_gateway_force_is_deleted_and_the_method_has_none() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let gateway = lower_named(&llbc, "descr_typecheck_fget_getdictscope");
+    let method = lower_named(&llbc, "fget_getdictscope");
+    assert!(
+        call_leafs(&gateway)
+            .iter()
+            .any(|leaf| leaf == "jit_force_virtualizable"),
+        "gateway must spell the residual force as jit_force_virtualizable, got {:?}",
+        call_leafs(&gateway)
+    );
+    assert!(
+        call_leafs(&method)
+            .iter()
+            .all(|leaf| leaf != "jit_force_virtualizable"
+                && leaf != "force_frame"
+                && leaf != "force_frame_before_locals_read"),
+        "fget_getdictscope must match pyframe.py (no hand-placed force), got {:?}",
+        call_leafs(&method)
+    );
+
+    let transformed = majit_translate::transform_graph(&gateway, &config());
+    assert!(
+        call_leafs(&transformed.graph)
+            .iter()
+            .all(|leaf| leaf != "jit_force_virtualizable"),
+        "rewrite_op_jit_force_virtualizable must delete the call, got {:?}",
+        call_leafs(&transformed.graph)
+    );
 }
 
 /// The virtualizable configuration the production pipeline passes
