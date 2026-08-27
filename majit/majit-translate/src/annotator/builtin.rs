@@ -394,6 +394,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_metainterp.jit.hint_fresh_virtualizable",
         jit_hint_fresh_virtualizable,
     );
+    // `rlib/debug.py` — the assertion half of `check_not_access_directly`.
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.debug.check_not_access_directly",
+        rlib_check_not_access_directly,
+    );
     // Rust primitive type conversion impls — all return `SomeInteger`.
     analyzer_for(&mut reg, "u32.from", primitive_integer_conversion);
     analyzer_for(&mut reg, "i64.from", primitive_integer_conversion);
@@ -1696,6 +1702,37 @@ fn hint_virtualizable_flags(args_s: &[Option<SomeValue>], fresh_virtualizable: b
     ))
 }
 
+/// RPython `rlib/debug.py` — the `check_not_access_directly`
+/// ExtRegistryEntry's `compute_result_annotation`.
+///
+/// ```python
+/// def compute_result_annotation(self, s_arg):
+///     assert not s_arg.flags.get('access_directly', False)
+///     return s_arg
+/// ```
+///
+/// Upstream asserts, i.e. it aborts translation. The failure is a real
+/// defect in the caller — a graph reached the marked function carrying the
+/// virtualizable hint, which would specialize it — so this raises rather
+/// than silently dropping the flag.
+fn rlib_check_not_access_directly(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    let Some(Some(s_arg)) = args_s.first() else {
+        return Ok(s_impossible_value());
+    };
+    if let SomeValue::Instance(inst) = s_arg
+        && inst.flags.get("access_directly").copied().unwrap_or(false)
+    {
+        return Err(AnnotatorError::new(
+            "check_not_access_directly: argument carries the access_directly hint",
+        ));
+    }
+    Ok(s_arg.clone())
+}
+
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
 /// helpers.  Single implementation covers both `majit_log_enabled()`
 /// (logging gate) and `jit::we_are_jitted()` (JIT-context probe);
@@ -2406,6 +2443,26 @@ mod tests {
         );
         let out = hint_virtualizable_flags(&[Some(s)], false);
         assert_eq!(flags_of(&out), vec!["other".to_string()]);
+    }
+
+    /// `rlib/debug.py` asserts; the port raises instead of dropping the
+    /// flag, because the failure is a defect in the caller.
+    #[test]
+    fn check_not_access_directly_rejects_a_flagged_argument() {
+        let bk = bk();
+        let flagged = instance_of(&bk, "PyFrame", true, &["access_directly"]);
+        assert!(
+            rlib_check_not_access_directly(&bk, &[Some(flagged)], &HashMap::new()).is_err(),
+            "a flagged argument must abort, not pass"
+        );
+
+        let plain = instance_of(&bk, "PyFrame", true, &[]);
+        assert_eq!(
+            rlib_check_not_access_directly(&bk, &[Some(plain.clone())], &HashMap::new())
+                .expect("an unflagged argument passes"),
+            plain,
+            "the entry is an identity on the annotation it accepts"
+        );
     }
 
     /// Upstream's `isinstance(s_x, SomeInstance)` guard — anything else

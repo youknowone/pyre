@@ -10,6 +10,7 @@
 //! in a crate above the module that allocates it. The module path spells the
 //! upstream package it came from.
 
+pub mod debug;
 pub mod lltypesystem;
 pub mod rbigint;
 
