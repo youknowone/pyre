@@ -379,6 +379,21 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_metainterp.jit.we_are_jitted",
         majit_metainterp_bool_flag,
     );
+    // `rlib/jit.py` — the `hint` ExtRegistryEntry's
+    // `compute_result_annotation`, the one place upstream MINTS
+    // `access_directly` onto an annotation. Upstream spells the kwargs on a
+    // single `hint(x, **kwds)`; pyre dispatches one helper per kwarg, so the
+    // branch on which kwargs are present becomes the choice of analyzer.
+    analyzer_for(
+        &mut reg,
+        "majit_metainterp.jit.hint_access_directly",
+        jit_hint_access_directly,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_metainterp.jit.hint_fresh_virtualizable",
+        jit_hint_fresh_virtualizable,
+    );
     // Rust primitive type conversion impls — all return `SomeInteger`.
     analyzer_for(&mut reg, "u32.from", primitive_integer_conversion);
     analyzer_for(&mut reg, "i64.from", primitive_integer_conversion);
@@ -1596,6 +1611,91 @@ fn foreign_container_ctor(
     )))
 }
 
+/// RPython `rlib/jit.py` — the `hint` ExtRegistryEntry's
+/// `compute_result_annotation`, for the `access_directly=True` spelling.
+///
+/// ```python
+/// s_x = annmodel.not_const(s_x)
+/// ...
+/// if isinstance(s_x, annmodel.SomeInstance):
+///     classdesc = s_x.classdef.classdesc
+///     virtualizable = classdesc.get_param('_virtualizable_')
+///     if s_access_directly.const == True and virtualizable is not None:
+///         flags = s_x.flags.copy()
+///         flags['access_directly'] = True
+///         ...
+///     else:
+///         ...  # delete both flags
+/// return s_x
+/// ```
+///
+/// The `else` arm matters as much as the `if`: a hint on a class that does
+/// not declare `_virtualizable_` STRIPS the flags rather than leaving them,
+/// so the annotation cannot carry `access_directly` off a non-virtualizable.
+///
+/// The consumer is `specialize.py default_specialize`, which flags the
+/// CALLEE a flagged argument reaches — never the function that spells this
+/// hint, whose own arguments arrive unflagged.
+fn jit_hint_access_directly(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(hint_virtualizable_flags(args_s, false))
+}
+
+/// RPython `rlib/jit.py`, same entry, for the `fresh_virtualizable=True`
+/// spelling.
+///
+/// Upstream carries both kwargs on one call and asserts against the lone
+/// form — `assert s_access_directly, "lone fresh_virtualizable hint"`. Pyre
+/// splits the call in two, so this helper sets BOTH flags rather than
+/// `fresh_virtualizable` alone; the state upstream asserts against is then
+/// unreachable instead of merely undiagnosed.
+fn jit_hint_fresh_virtualizable(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    Ok(hint_virtualizable_flags(args_s, true))
+}
+
+/// The body both `hint` spellings share — `rlib/jit.py`'s
+/// `SomeInstance` branch.
+fn hint_virtualizable_flags(args_s: &[Option<SomeValue>], fresh_virtualizable: bool) -> SomeValue {
+    let Some(Some(s_x)) = args_s.first() else {
+        // `hint` is an identity on its argument; with nothing bound there is
+        // nothing to annotate and nothing to flag.
+        return s_impossible_value();
+    };
+    let s_x = super::model::not_const(s_x);
+    let SomeValue::Instance(inst) = &s_x else {
+        // Upstream's `isinstance(s_x, SomeInstance)` guard: every other
+        // annotation falls through to `return s_x` untouched.
+        return s_x;
+    };
+    let is_virtualizable = inst.classdef.as_ref().is_some_and(|classdef| {
+        let classdesc = classdef.borrow().classdesc.clone();
+        let param = classdesc.borrow().get_param("_virtualizable_", None, true);
+        !matches!(param, crate::flowspace::model::ConstValue::None)
+    });
+    let mut flags = inst.flags.clone();
+    if is_virtualizable {
+        flags.insert("access_directly".to_string(), true);
+        if fresh_virtualizable {
+            flags.insert("fresh_virtualizable".to_string(), true);
+        }
+    } else {
+        flags.remove("access_directly");
+        flags.remove("fresh_virtualizable");
+    }
+    SomeValue::Instance(super::model::SomeInstance::new(
+        inst.classdef.clone(),
+        inst.can_be_none,
+        flags,
+    ))
+}
+
 /// Analyzer for the `majit_metainterp` crate's `pub fn -> bool` flag
 /// helpers.  Single implementation covers both `majit_log_enabled()`
 /// (logging gate) and `jit::we_are_jitted()` (JIT-context probe);
@@ -2226,6 +2326,95 @@ mod tests {
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    /// Build a `SomeInstance` whose classdesc does or does not declare
+    /// `_virtualizable_` — `ClassDesc.get_param` reads it off the host class.
+    fn instance_of(
+        bk: &Rc<Bookkeeper>,
+        name: &str,
+        virtualizable: bool,
+        flags: &[&str],
+    ) -> SomeValue {
+        use crate::flowspace::model::{ConstValue, HostObject};
+        let mut members: indexmap::IndexMap<String, ConstValue> = indexmap::IndexMap::new();
+        if virtualizable {
+            members.insert(
+                "_virtualizable_".into(),
+                ConstValue::byte_str("locals_cells_stack_w[*]"),
+            );
+        }
+        let pyobj = HostObject::new_class_with_members(name, vec![], members);
+        let classdesc =
+            super::super::classdesc::ClassDesc::new(bk, pyobj, Some(name.to_string()), None, None)
+                .expect("ClassDesc::new");
+        let classdef = super::super::classdesc::ClassDef::new(bk, &classdesc);
+        let flags = flags
+            .iter()
+            .map(|f| ((*f).to_string(), true))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        SomeValue::Instance(super::super::model::SomeInstance::new(
+            Some(classdef),
+            false,
+            flags,
+        ))
+    }
+
+    fn flags_of(s: &SomeValue) -> Vec<String> {
+        let SomeValue::Instance(inst) = s else {
+            panic!("not an instance: {s:?}")
+        };
+        inst.flags.keys().cloned().collect()
+    }
+
+    /// `rlib/jit.py` mints the flag only when the class declares
+    /// `_virtualizable_`.
+    #[test]
+    fn the_hint_mints_access_directly_on_a_virtualizable() {
+        let bk = bk();
+        let s = instance_of(&bk, "PyFrame", true, &[]);
+        let out = hint_virtualizable_flags(&[Some(s)], false);
+        assert_eq!(flags_of(&out), vec!["access_directly".to_string()]);
+    }
+
+    /// The `fresh_virtualizable` spelling carries `access_directly` with it,
+    /// so the lone form upstream asserts against is unreachable.
+    #[test]
+    fn the_fresh_virtualizable_hint_carries_access_directly_too() {
+        let bk = bk();
+        let s = instance_of(&bk, "PyFrame", true, &[]);
+        let out = hint_virtualizable_flags(&[Some(s)], true);
+        assert_eq!(
+            flags_of(&out),
+            vec![
+                "access_directly".to_string(),
+                "fresh_virtualizable".to_string()
+            ]
+        );
+    }
+
+    /// The `else` arm: a hint on a class with no `_virtualizable_` STRIPS
+    /// both flags rather than leaving them in place.
+    #[test]
+    fn the_hint_strips_the_flags_off_a_non_virtualizable() {
+        let bk = bk();
+        let s = instance_of(
+            &bk,
+            "Plain",
+            false,
+            &["access_directly", "fresh_virtualizable", "other"],
+        );
+        let out = hint_virtualizable_flags(&[Some(s)], false);
+        assert_eq!(flags_of(&out), vec!["other".to_string()]);
+    }
+
+    /// Upstream's `isinstance(s_x, SomeInstance)` guard — anything else
+    /// returns unchanged.
+    #[test]
+    fn the_hint_leaves_a_non_instance_alone() {
+        let s = SomeValue::Integer(SomeInteger::default());
+        let out = hint_virtualizable_flags(&[Some(s.clone())], false);
+        assert_eq!(out, super::super::model::not_const(&s));
     }
 
     fn no_kwds() -> HashMap<String, Option<SomeValue>> {
