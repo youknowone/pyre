@@ -11822,6 +11822,28 @@ pub(crate) unsafe fn get(
         return Ok(if r.is_null() { None } else { Some(r) });
     }
 
+    // typedef.py GetSetProperty.descr_property_get reaches
+    // `self.fget(self, space, w_obj)` as an interp-level call, so a getset read
+    // costs one space-level call there.  The general `__get__` lookup at the end
+    // of this function reaches the same body through the
+    // `getset_descriptor.__get__` entry, which is itself a builtin function
+    // object, and so pays a second one on every `x.__class__`, `f.__name__`,
+    // `frame.f_lineno`, ... .  Run the body in place of the lookup, the licence
+    // the `property` arm above cites (descroperation.py:169-176).
+    //
+    // `is_getset_property` compares `ob_type` against the static
+    // `GETSET_DESCRIPTOR_TYPE`, which only `w_getset_property_new` installs, and
+    // `getset_descriptor` is not an acceptable base type -- so unlike `property`
+    // it needs no separate exact-type test to exclude a subclass that could have
+    // overridden `__get__`.
+    if pyre_object::typedef::is_getset_property(descr) {
+        // The general path passes `space.w_None` for class access
+        // (`WrappedDefault(None)` at the entry) and the owner type as `w_cls`.
+        let visible_obj = if obj.is_null() { w_none() } else { obj };
+        let result = crate::typedef::getset_property_get(descr, visible_obj, w_type)?;
+        return Ok(if result.is_null() { None } else { Some(result) });
+    }
+
     // typedef.py Member.descr_member_get:
     //   if space.is_w(w_obj, space.w_None): return self
     //   self.typecheck(space, w_obj)

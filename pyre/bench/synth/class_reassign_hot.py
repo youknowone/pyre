@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=100
+# pyre-check: spec-folds=object_class_attr
 # The ceiling is twice the slowest ratio the CI runners observe (49.3x on the
 # linux runner's cranelift), rounded up. It read 218 before a later tightening
 # fitted it to a single run's numbers.

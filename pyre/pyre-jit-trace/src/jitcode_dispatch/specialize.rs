@@ -3439,6 +3439,37 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
+    // `object.__class__`, under the pins the class-attribute arm above uses.
+    // `class_descr_fast_path` proves the receiver type resolves the name to
+    // `object`'s own getset, whose body is `space.type(w_obj)` — and the
+    // `w_class` guard the shape emits is that read, so the answer is the class
+    // the map terminator names.  A `__class__` overridden by a property
+    // declines in the predicate, and a later override bumps the pinned
+    // `version_tag`.
+    if name == "__class__"
+        && let Some(()) = spec_gate(SpecFold::ObjectClassAttr, || {
+            let Some((w_type, version_tag, map)) = (unsafe {
+                pyre_interpreter::objspace::std::mapdict::class_descr_fast_path(concrete_obj)
+            }) else {
+                return Ok(None);
+            };
+            walker_guard_mapdict_instance_shape(
+                ctx,
+                op_pc,
+                obj,
+                concrete_obj,
+                w_type,
+                version_tag,
+                map,
+            )?;
+            let value = ctx.trace_ctx.const_ref(w_type as i64);
+            write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+            Ok(Some(()))
+        })?
+    {
+        return Ok(Some(()));
+    }
+
     if let Some(walk_field) = traceback_walk_field(concrete_obj, name) {
         if let Some(()) = walker_specialize_traceback_walk_field(
             ctx,

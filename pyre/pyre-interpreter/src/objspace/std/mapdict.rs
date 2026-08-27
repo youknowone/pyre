@@ -1913,6 +1913,52 @@ pub unsafe fn class_attr_fast_path(
     Some((w_type, version_tag, map, w_descr))
 }
 
+/// The `__class__` twin of [`class_attr_fast_path`].  `object.__class__` is a
+/// data descriptor, so the class-attribute path declines it, but its getter
+/// body is `space.type(w_obj)` — the class the returned shape already names.
+///
+/// PyPy has no entry of this kind: its tracer inlines
+/// `Object.descr__getattribute__` → `GetSetProperty.descr_property_get` →
+/// `objectobject.py descr_get_class`, and `space.type(w_obj)` const-folds
+/// against the `guard_class` already in the trace.  Pyre's `LOAD_ATTR` is one
+/// residual, so the same answer is spelled as a fold instead.
+///
+/// [`crate::baseobjspace::isinstance_miss_class_lookup_is_pure`] is the
+/// standing predicate for the question — the receiver type inherits
+/// `object.__getattribute__` and its MRO resolves `__class__` to `object`'s
+/// own descriptor — and `observed_replay_safe_isinstance` already reads the
+/// same answer for `isinstance`'s own `__class__` consult.  A `__class__`
+/// overridden by a property (or any other descriptor) declines there and so
+/// declines here.  The name is a data descriptor, so no instance dict can
+/// shadow it and the map needs no `find_map_attr` miss test.
+///
+/// Returns the shape ingredients the caller guards; the value read is
+/// `w_type` itself.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn class_descr_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, u64, MapRef)> {
+    let map = unsafe { mapdict_map_or_null(w_obj) };
+    if map.is_null() {
+        return None;
+    }
+    if unsafe { map_is_devolved(map) } {
+        return None;
+    }
+    let w_type = unsafe { (*(*map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null() {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    if !unsafe { crate::baseobjspace::isinstance_miss_class_lookup_is_pure(w_type) } {
+        return None;
+    }
+    Some((w_type, version_tag, map))
+}
+
 /// The miss twin of [`load_attr_fast_path`]: return the ingredients for
 /// inlining the receiver type's `__getattr__` hook when `name` resolves
 /// nowhere.

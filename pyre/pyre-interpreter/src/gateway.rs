@@ -923,6 +923,45 @@ pub unsafe fn builtin_code_call(
     (wrapper.call)(wrapper.slot, args)
 }
 
+/// The `BuiltinCodeFn` a builtin function object was registered with, when
+/// calling it *is* invoking that function and nothing else: no receiver
+/// `owner` to typecheck, no slot `wrapper` standing in for the body, and a
+/// declared arity of exactly `arity`.  For that shape
+/// [`builtin_code_call`] reduces to `((*code).func)(args)`, and
+/// `builtin_code_call_positional` binds nothing because the arity is not
+/// `HOPELESS`.
+///
+/// The gateway's receiver / arity / keyword checks stand in front of a body
+/// for a caller that could get any of them wrong, which a Python caller can.
+/// An interp-level caller that already holds the arguments in the order the
+/// body declares them is the case `typedef.py` spells as a direct RPython
+/// call — `self.fget(self, space, w_obj)` — where pyre would otherwise route
+/// through `space.call_function`.  Everything else answers `None` and stays on
+/// the dispatcher.
+///
+/// # Safety
+/// `callable` must be a live object.
+pub unsafe fn builtin_fixed_arity_fn(callable: PyObjectRef, arity: u16) -> Option<BuiltinCodeFn> {
+    if !unsafe { crate::is_function(callable) } {
+        return None;
+    }
+    let code = unsafe { crate::function_get_code(callable) } as PyObjectRef;
+    if !unsafe { is_builtin_code(code) } {
+        return None;
+    }
+    let code = code as *const BuiltinCode;
+    // SAFETY: `is_builtin_code` proved the layout.
+    unsafe {
+        if (*code).fast_natural_arity != arity
+            || !(*code).owner.is_null()
+            || !(*code).wrapper.is_null()
+        {
+            return None;
+        }
+        Some((*code).func)
+    }
+}
+
 /// Wording for a keyword passed to a positional-only builtin.  A slot wrapper
 /// reports itself as `wrapper NAME()`; everything else uses its qualified
 /// name, the same split [`arity_mismatch`] draws.
