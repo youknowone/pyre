@@ -12371,46 +12371,33 @@ fn handle<Sym: WalkSym>(
             // exists) routes the inlined loop-bearing callee to its own compiled
             // loop, the trait-parity `LoopTargetDescr`/`CALL_ASSEMBLER` shape.
             //
-            // "An inlined callee's own loop" is whose loop this header is, which
-            // a non-empty framestack does not establish: a bridge's outer-frame
-            // continuation runs the trace ROOT forward (with a frame still on the
-            // stack) and reaches the very loop it exited, so the framestack proxy
-            // matches there too and routes a bridge that must close with a JUMP
-            // back into that loop (`CloseLoop` -> `CloseLoopWithArgs`) into a
-            // CALL_ASSEMBLER request no caller consumes, aborting it
-            // (`OuterNonTerminate`). Discriminate on the header's frame vs the
-            // trace root: same code = the root's own loop, so fall through to the
-            // normal loop-crossing path.
-            let fbw_root_code = {
-                let sym_ptr = ctx.fbw_mode.snapshot_sym;
-                if sym_ptr.is_null() {
-                    None
-                } else {
-                    unsafe {
-                        let sym = &*sym_ptr;
-                        if sym.jitcode().is_null() {
-                            None
-                        } else {
-                            let jc = &*sym.jitcode();
-                            let raw = jc.payload.code_ptr;
-                            if raw.is_null() {
-                                None
-                            } else {
-                                Some(pyre_interpreter::live_code_wrapper(raw as *const ()))
-                            }
-                        }
-                    }
-                }
-            };
-            let callee_code = ctx
-                .session
-                .borrow()
-                .framestack
-                .last()
-                .map(|frame| frame.w_code)
-                .filter(|&cc| {
-                    fbw_root_code.is_none_or(|root| root as *const () != cc as *const ())
-                });
+            // "An inlined callee's own loop" is whose loop this header is, and
+            // that is a FRAME question, not a code one: `opimpl_jit_merge_point`
+            // (pyjitpl.py) closes the loop only under `if not
+            // self.metainterp.portal_call_depth:` and otherwise finishes the
+            // frame and takes `do_recursive_call(..., assembler_call=True)`.
+            // A sub-walk is exactly a portal frame below the trace root — every
+            // one runs with `is_top_level == false` — while a bridge's
+            // outer-frame continuation runs the ROOT forward at the top level
+            // even with reconstructed parent frames still on the framestack, so
+            // it keeps closing with a JUMP back into its own loop rather than a
+            // CALL_ASSEMBLER request no caller consumes (`OuterNonTerminate`).
+            //
+            // A CODE-identity test cannot stand in for that: a self-recursive
+            // function inlined into itself has the callee's `w_code` EQUAL to the
+            // trace root's, so it read as "the root's own loop" and closed the
+            // loop against the caller's frame — publishing the header pc over the
+            // caller's post-loop operand stack, which `FOR_ITER` then advances as
+            // if it were the iterator (`loop_callee_for_header_resume`).
+            let callee_code = (!ctx.is_top_level)
+                .then(|| {
+                    ctx.session
+                        .borrow()
+                        .framestack
+                        .last()
+                        .map(|frame| frame.w_code)
+                })
+                .flatten();
             if let Some(callee_code) = callee_code {
                 let callee_key = crate::driver::make_green_key(
                     callee_code as *const (),

@@ -1,11 +1,3 @@
-# pyre-check: skip-backends=wasm
-# wasm still gets this WRONG, for a cause neither fix below can reach. It is
-# exempted so the guard stays meaningful on the backends it guards -- not because
-# wasm is right here. Measured: wasm reads 3691 on all nine `f_locals['acc']`
-# reads while the truth walks 104967 -> 105000, printing 104995; dynasm,
-# cranelift, PYRE_NO_JIT=1 and CPython all print 105005 -- stale in exactly the
-# way defect 1 was. See the wasm note at the bottom of this header.
-#
 # Regression guard: a callee that reads its CALLER's frame via sys._getframe(1)
 # must see the caller's live locals, even though the callee has a hot loop of its
 # own and so takes its own compiled-loop entry from inside the caller's running
@@ -21,19 +13,21 @@
 #      slot named -- and a null slot reads back as an ABSENT name, so
 #      `f_locals['acc']` raised KeyError instead of returning a value.
 #
-# wasm note. It is not a blanket wasm `f_locals` failure: a caller local read
-# through sys._getframe(1) is correct on wasm when the callee does not take a
-# compiled entry of its own from inside the caller's running loop. That shape is
-# what breaks it, and it breaks the invariant the wasm backend states three times
-# to justify lowering `GuardNotForced` to a no-op and calling may-force residuals
-# directly -- "the wasm virtualizable is always materialized"
-# (`majit-backend-wasm/src/codegen.rs:859`, `:908`, `:950`; the no-op guard at
-# `:2175`). Neither fix above can repair it: `OpCode::ForceToken` lowers to a
-# literal `0` sentinel (`codegen.rs:4225`), so the compiled loop stores 0 into
-# `vable_token` and `force_virtualizable_if_necessary` never forces; and wasm does
-# not override `force()` (`majit-backend/src/lib.rs:2170` returns None), so there
-# is no deadframe to decode even if it did. wasm holds loop state in wasm locals
-# rather than a heap jitframe, so forcing mid-execution is a wasm backend epic.
+# wasm note. This fixture carried `skip-backends=wasm` while the wasm backend
+# had no force protocol at all: `OpCode::ForceToken` lowered to a literal `0`,
+# which is `virtualref.py`'s `TOKEN_NONE`, so the compiled loop parked a zero in
+# `vable_token` and `force_virtualizable_if_necessary` never forced;
+# `GUARD_NOT_FORCED` always passed; and `Backend::force` /
+# `is_force_token_armed` kept their `None` / `false` defaults, so there was no
+# deadframe to decode even had the force run. wasm read 3691 on all nine
+# `f_locals['acc']` reads and printed 104995.
+#
+# The backend now implements it -- `ForceToken` names the JITFRAME,
+# `emit_force_bracket_before_call` arms the following `GUARD_NOT_FORCED`'s exit
+# before a may-force call, that guard tests the mark `force` leaves, and `force`
+# rebuilds a deadframe from the armed exit's spilled slots. Measured here: wasm
+# prints 105005 on three consecutive runs, matching dynasm, cranelift and
+# CPython, so the exemption is retired.
 import sys
 
 

@@ -1,27 +1,31 @@
-# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
-# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
-# rather than any generated code, and reads whatever the host's process
-# spawn cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`: the only loop here is the two-statement `while` driver,
+# so a pypy ratio compares two interpreters' startup rather than any generated
+# code, and reads whatever the host's process spawn cost happens to be that
+# run. The jitstats baselines gate it.
 # Coverage guard for the unconditional multi-frame blackhole path.
 #
 # A vable escape inside an INLINE sub-walk is what latches a multi-frame
-# blackhole image. The rest of the corpus never produces one: every other
-# getframe_* fixture drives with `for`, and with a FOR_ITER item in flight the
-# callee's nested residual is declined by fbw_abort_nested_unjournaled_residual
-# before execute_residual_call runs, so the force happens outside the sub-walk
-# and the single-frame arm takes it. Driving with `while` is what reaches the
-# site, and build_multi_frame_miframe then produces a depth-2 image the adopt
-# takes.
+# blackhole image: driving with `while` reaches the site, and
+# build_multi_frame_miframe then produces a depth-2 image the adopt takes.
+# Other fixtures reach a multi-frame adopt by other routes
+# (`getframe_caller_resume_coord_two_call_sites`,
+# `getframe_while_escaping_read_frame_identity`,
+# `trace_too_long_inline_multiframe`); this one pins the sub-walk route.
 #
 # The shape below is load-bearing, not incidental:
-#   - `while`, not `for`, per the decline above;
-#   - sys._getframe called with NO argument, because the executor declines a
-#     non-void residual whose arguments are not all concrete and the generic
-#     LoadConst path is hard-declined as symbolic inside a sub-walk, so a
-#     literal argument would make this depend on a dedicated fold rather than
-#     on the loop form;
-#   - nothing read off the returned frame, which would reintroduce that
-#     constant-fold dependency.
+#   - `while`, not `for`: with a FOR_ITER item in flight the callee's nested
+#     residual is declined by fbw_abort_nested_unjournaled_residual before
+#     execute_residual_call runs, so the force would happen outside the
+#     sub-walk and the single-frame arm would take it;
+#   - the CALLER's depth, `_gf(1)`.  `try_walker_specialize_sys_getframe` takes
+#     only depth 0 at the top walk level, where getframe's answer IS the portal
+#     virtualizable and no force is needed -- so a zero-argument call, which is
+#     what this fixture used to carry, now escapes nothing at all and the
+#     baselines went to `fbw_blackhole_adopted_multi_frame=0`.  Depth 1 names a
+#     frame the specialization refuses, so the call stays residual and forces;
+#   - nothing read off the returned frame: the read accessors force nothing
+#     either -- `fast2locals` is `@jit.unroll_safe` -- so a read would add
+#     opcodes without adding an escape.
 # Changing any of the three can silently stop exercising the path.
 #
 # The printed total counts one callee entry per iteration, so a resume that
@@ -33,7 +37,7 @@ _gf = sys._getframe
 
 
 def leaf(x):
-    _gf()
+    _gf(1)
     return x + 1
 
 

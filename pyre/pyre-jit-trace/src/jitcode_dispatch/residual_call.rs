@@ -1686,11 +1686,6 @@ fn capture_escape_flush_undo(frame: usize) {
     });
 }
 
-/// Record the locals region as the flush just left it, for the frame the
-/// pending capture holds.  Runs after the flush and before the residual's
-/// user Python can touch the region, so any later difference from this image
-/// is that user code's own write.  A second flush for the same frame supersedes
-/// the image: the restore must undo the flush that is actually standing.
 /// Report what the post-residual shadow refresh left behind, and optionally
 /// import the residual's own fastlocals writes into the shadow.
 ///
@@ -1789,6 +1784,94 @@ fn report_post_residual_shadow<Sym: WalkSym>(
     }
 }
 
+/// The frame a residual argument gives a live view of, following the one
+/// wrapper a bound read puts in the way.
+///
+/// `p["x"]` hands the proxy to the residual directly, but `p.get("x")` binds
+/// the method first and the CALL then carries a `Method` whose `__self__` is
+/// the proxy.  Nothing deeper is followed: a wrapper that hides the receiver
+/// from the residual's own arguments hides it from the compiled call too.
+fn proxy_viewed_frame(obj: pyre_object::PyObjectRef) -> Option<pyre_object::PyObjectRef> {
+    use pyre_interpreter::pyframe::frame_locals_proxy::viewed_frame;
+    if let Some(frame) = viewed_frame(obj) {
+        return Some(frame);
+    }
+    let receiver = unsafe { pyre_object::is_method(obj) }
+        .then(|| unsafe { pyre_object::w_method_get_self(obj) })
+        .filter(|recv| !recv.is_null())?;
+    viewed_frame(receiver)
+}
+
+/// Write the traced frame's locals region out before a residual that reads it
+/// through a live `FrameLocalsProxy`.
+///
+/// The proxy reads the frame's ARRAY, while a recording walk holds those locals
+/// in the virtualizable's boxes.  The `f_locals` getter fold already writes the
+/// region out when it hands a proxy over
+/// (`specialize.rs walker_write_back_standard_frame_locals`), but a proxy is a
+/// live view and outlives that write: bind one before a loop the JIT afterwards
+/// compiles and every later read answers with what the local held at the bind.
+/// Measured at `N=4000`, `p = f_locals` outside the loop and `p["x"]` in the
+/// body reads 1041 -- the compile threshold -- where the same read spelled
+/// `sys._getframe(0).f_locals["x"]`, which re-enters the fold each iteration,
+/// reads 3999.
+///
+/// A force at the read accessor is the shape this does NOT take, and
+/// `PyFrame::force_locals` records why: `hook_access_field` runs in residual
+/// code while a trace redirects the same accesses to the shadow, so forcing on
+/// every read forces the traced ones too and aborts the loop.  The write-back
+/// is not a force -- it is a mirror onto the concrete frame plus the same store
+/// into the trace, and none of its ops can reach `force_frame`.
+///
+/// Scoped to the standard virtualizable, gated on BOTH its red box and its
+/// concrete pointer, exactly as the getter fold gates itself.  A proxy onto any
+/// other frame is left alone: that frame's locals are in its own array already.
+///
+/// Every spelling of the read reaches the array through a residual that carries
+/// the proxy itself -- `p["x"]`, `len(p)`, `dict(p)`, and a helper the proxy is
+/// passed to, whose own subscript is the residual that carries it -- with one
+/// exception: `p.get("x")` binds `get` first, so the CALL sees a `Method` and
+/// the proxy only as its receiver.  [`proxy_viewed_frame`] takes that hop.
+///
+/// Called beside `vable_and_vrefs_before_residual_call`, which is the only
+/// point that satisfies the ordering: the dispatchers `record_op_with_descr`
+/// the CALL and only then hand it to
+/// [`try_execute_residual_call_via_executor`], so anything emitted from inside
+/// the executor lands AFTER the call in the trace.  Measured with the stores
+/// there, the walk still answered correctly -- the concrete mirror runs at
+/// record time either way -- while the compiled loop read what the PREVIOUS
+/// iteration's stores had left: `p["x"]` in a `x = i` body reported a lag of
+/// one on 1479 of the 2958 iterations past the compile point on dynasm, and
+/// none on cranelift.  Emitted here the stores sit between the token store and
+/// the call, where the residual reads them.
+fn write_back_locals_for_proxy_reader<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    allboxes: &[OpRef],
+) {
+    let (Some(frame_box), Some(frame_ptr)) = (
+        ctx.trace_ctx.standard_virtualizable_box(),
+        ctx.trace_ctx.standard_virtualizable_ptr(),
+    ) else {
+        return;
+    };
+    let mut reads_traced_frame = false;
+    for &arg in allboxes {
+        let Some(obj) = walker_concrete_ref_object(ctx, arg) else {
+            continue;
+        };
+        if proxy_viewed_frame(obj).is_some_and(|frame| frame as usize == frame_ptr) {
+            reads_traced_frame = true;
+            break;
+        }
+    }
+    if reads_traced_frame {
+        // A decline writes nothing and leaves the read as it is today.
+        let _ = crate::jitcode_dispatch::specialize::walker_write_back_standard_frame_locals(
+            ctx, frame_box, frame_ptr,
+        );
+    }
+}
+
 /// Adopt into the walk the fastlocals a residual wrote to the live frame.
 ///
 /// The walk holds each local as a box and reads it straight out of the
@@ -1837,6 +1920,11 @@ fn adopt_residual_locals_writes<Sym: WalkSym>(
     }
 }
 
+/// Record the locals region as the flush just left it, for the frame the
+/// pending capture holds.  Runs after the flush and before the residual's
+/// user Python can touch the region, so any later difference from this image
+/// is that user code's own write.  A second flush for the same frame supersedes
+/// the image: the restore must undo the flush that is actually standing.
 fn record_escape_flush_image(frame: usize) {
     ESCAPE_FLUSH_UNDO.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -2024,7 +2112,18 @@ pub(crate) fn flush_with_latched_stack(
     py_pc: usize,
     oprefs: &[OpRef],
 ) -> bool {
-    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None)
+    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None, ConsumedOperands::TosOnly)
+}
+
+/// How much of the latch may disagree with the vable shadow because the
+/// in-progress opcode has already popped it into registers — see
+/// [`flush_with_latched_stack_inner`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsumedOperands {
+    /// One slot, the opcode's TOS.
+    TosOnly,
+    /// The whole operand run, however deep.
+    WholeRun,
 }
 
 /// Resume a FOR_ITER body from the complete header stack plus the item the
@@ -2039,7 +2138,14 @@ pub(crate) fn flush_with_latched_stack_and_item(
     oprefs: &[OpRef],
     push: (pyre_object::PyObjectRef, usize),
 ) -> bool {
-    flush_with_latched_stack_inner(ctx, frame, header_py_pc, oprefs, Some(push))
+    flush_with_latched_stack_inner(
+        ctx,
+        frame,
+        header_py_pc,
+        oprefs,
+        Some(push),
+        ConsumedOperands::TosOnly,
+    )
 }
 
 fn flush_with_latched_stack_inner(
@@ -2048,6 +2154,7 @@ fn flush_with_latched_stack_inner(
     py_pc: usize,
     oprefs: &[OpRef],
     push: Option<(pyre_object::PyObjectRef, usize)>,
+    consumed_operands: ConsumedOperands,
 ) -> bool {
     {
         let mut stack = Vec::with_capacity(oprefs.len() + usize::from(push.is_some()));
@@ -2082,11 +2189,10 @@ fn flush_with_latched_stack_inner(
         } else {
             py_pc
         };
-        // Why this latch exists, checkable at runtime.  Measured over
-        // pyre/bench/synth, the only slot that ever disagrees with the vable
-        // shadow is the in-progress opcode's TOS, and it holds a compile-time
-        // NULL *constant* rather than a stale or absent value: exactly what
-        // `popvalue_maybe_none` writes (`pyframe.py` →
+        // Why this latch exists, checkable at runtime.  A slot that disagrees
+        // with the vable shadow holds a compile-time NULL *constant* rather
+        // than a stale or absent value: exactly what `popvalue_maybe_none`
+        // writes (`pyframe.py` →
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
         // via `jtransform.py:1898`).  The opcode had already popped the slot
         // before its residual forced.
@@ -2099,16 +2205,48 @@ fn flush_with_latched_stack_inner(
         // remove the need for it: `LOAD_ATTR` already emits the push mirror
         // via `emit_pushvalue_ref!` and its slot still reads NULL, because the
         // pop follows the push.
+        //
+        // How much of that run may disagree is [`ConsumedOperands`], and the
+        // two answers are about WHEN the leg's resume pc runs, not about the
+        // latch.
+        //
+        // `WholeRun` is the qmut abort's: it fires BEFORE its residual
+        // executes, so the opcode is entirely ahead of the walk and resuming
+        // at it re-runs nothing.  A `CALL` pops its whole callable/self/args
+        // run into registers before that residual — for a class statement the
+        // jitcode nulls four operand slots between the `LOAD_CONST` of the
+        // class name and the `CallFn` the abort fires at — so every one of
+        // them reads NULL here and a one-slot exemption declines on the first.
+        //
+        // `TosOnly` is the escape leg's, and it is a restriction rather than a
+        // measurement: that leg's opcode is IN PROGRESS (its residual is what
+        // forced), so its `last_instr = pc - 1` says "about to run the CALL"
+        // while the callee doing the forcing is already inside it.  Admitting
+        // the deeper run there turned `caller_f_lasti_across_residual_call`
+        // red — 2 of 20000 reads answered 42, the `LOAD_GLOBAL` ahead of the
+        // call, instead of the `CALL` at 52.  Widening it is part of that
+        // fixture's own epic, not of this check.
+        //
+        // Pops run top-down, so the consumed operands are a SUFFIX of the
+        // latch.  What stays refused either way is a disagreement against a
+        // non-NULL shadow, and a live operand sitting ABOVE a consumed one.
+        // Both say the latch is not this frame's continuation.
         let base = ctx
             .virtualizable_info()
             .map_or(usize::MAX, |info| info.num_static_extra_boxes);
         let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
+        // Lowest slot the in-progress opcode has already popped, once one is
+        // seen: everything from here up is its own operand run.
+        let mut consumed_from: Option<usize> = None;
         for (rel, &obj) in stack.iter().enumerate() {
             let entry =
                 ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
             let shadow = entry.map(|(_opref, value)| value);
-            let agrees =
-                matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
+            let shadow_ptr = match shadow {
+                Some(majit_ir::Value::Ref(r)) => Some(r.as_usize()),
+                _ => None,
+            };
+            let agrees = shadow_ptr == Some(obj as usize);
             if !agrees && fbw_debug_abort_enabled() {
                 // Report the OpRef too: a live box with a NULL value means
                 // the symbolic write landed and only the concrete mirror is
@@ -2120,18 +2258,27 @@ fn flush_with_latched_stack_inner(
                     entry.map(|(opref, _)| opref),
                 );
             }
-            // The only orthodox disagreement is the operand the in-progress
-            // opcode popped from TOS: the vable slot is NULL while the MIFrame
-            // register image still carries the consumed object.  A mismatch
-            // below TOS means the latch is not this frame's continuation.
-            let consumed_tos = rel + 1 == stack.len()
+            // The orthodox disagreement: the vable slot is NULL while the
+            // MIFrame register image still carries the object this opcode
+            // consumed out of it.
+            let consumed = !agrees
                 && obj as usize != 0
-                && matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0);
-            if !agrees && !consumed_tos {
+                && shadow_ptr == Some(0)
+                && (consumed_operands == ConsumedOperands::WholeRun || rel + 1 == stack.len());
+            let refusal = if consumed {
+                consumed_from.get_or_insert(rel);
+                None
+            } else if !agrees {
+                Some("disagrees against a shadow that is not a consumed NULL")
+            } else if consumed_from.is_some() && shadow_ptr != Some(0) {
+                Some("is a live operand above the consumed run")
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
                 if fbw_debug_abort_enabled() {
                     eprintln!(
-                        "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {rel}/{} \
-                         is not the consumed TOS",
+                        "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {rel}/{} {refusal}",
                         stack.len(),
                     );
                 }
@@ -2168,7 +2315,7 @@ pub(crate) fn flush_qmut_abort_state(
     py_pc: usize,
     oprefs: &[OpRef],
 ) -> bool {
-    flush_with_latched_stack(ctx, frame, py_pc, oprefs)
+    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None, ConsumedOperands::WholeRun)
 }
 
 /// Take the committed escape resume pc and which flush produced it (the
@@ -5414,7 +5561,25 @@ fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
         };
         args.push(value);
     }
-    pyre_interpreter::call::build_class_body_namespace_is_module_dict(&args)
+    if !pyre_interpreter::call::build_class_body_namespace_is_module_dict(&args) {
+        return false;
+    }
+    // Offer the flush leg the operand stack this opcode began with, the way the
+    // two sibling qmut sites do, under the same three preconditions: a
+    // sub-walk's mirror describes the CALLEE frame, and a bridge walk's abort
+    // path never reaches the epilogue that would adopt the flush.
+    //
+    // Without the offer the leg declines and the legacy replay stands, which
+    // re-runs the walked region from its start on top of the residuals the walk
+    // already executed concretely.  The FOR_ITER item consumed at the loop
+    // header is then refused delivery by the R1 never-double guard
+    // ([`fbw_foriter_inflight_take`]) and the whole iteration is LOST: a
+    // `self.x = v` ahead of a class statement in a loop body dropped one
+    // iteration per abort on both native backends.
+    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
+        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+    }
+    true
 }
 
 /// Opt-in until the `ForceQuasiImmutable` flush leg in `trace.rs` re-delivers
@@ -7086,6 +7251,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // split rationale.
         if emit_guard_not_forced {
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
         // pyjitpl.py `execute_and_record_varargs`; may-force
@@ -8409,6 +8575,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // walkthrough.
         if emit_guard_not_forced {
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
         if matches!(
@@ -8648,6 +8815,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // walkthrough.
         if emit_guard_not_forced {
             maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+            write_back_locals_for_proxy_reader(ctx, &allboxes);
         }
 
         if matches!(

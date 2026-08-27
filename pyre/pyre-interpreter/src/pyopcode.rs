@@ -3863,6 +3863,34 @@ fn jump_target_backward(instructions: &[CodeUnit], next_instr: usize, delta: usi
     skip_caches(instructions, next_instr) - delta
 }
 
+/// The instruction `pos` belongs to: `pos` itself, or the opcode whose cache
+/// region covers it.
+///
+/// The backward mirror of [`skip_caches`].  pyre materializes each cache word
+/// as an `Instruction::Cache` unit and dispatches it as a no-op, so a frame's
+/// `last_instr` can name one, and `next_instr() = last_instr + 1` steps into
+/// the region rather than over it.  That is sound for dispatch and for every
+/// resume coordinate, and it is exactly what a Python-visible offset must not
+/// be: `f_lasti` names an instruction (`_PyInterpreterFrame_LASTI` is derived
+/// from `instr_ptr`, which `TARGET(CALL)` sets before advancing over the
+/// caches), and `frame.f_lineno = N` indexes `mark_stacks`, whose cache
+/// entries keep `MARK_UNINITIALIZED`.
+///
+/// Bounded by the widest cache region in the instruction set, so the walk is
+/// a few steps rather than a scan.
+pub fn owning_instruction(instructions: &[CodeUnit], mut pos: usize) -> usize {
+    while pos > 0 && pos < instructions.len() {
+        let mut state = OpArgState::default();
+        let (instruction, _) = state.get(instructions[pos]);
+        if matches!(instruction, Instruction::Cache) {
+            pos -= 1;
+        } else {
+            break;
+        }
+    }
+    pos
+}
+
 pub fn skip_caches(instructions: &[CodeUnit], mut pos: usize) -> usize {
     while pos < instructions.len() {
         let mut state = OpArgState::default();

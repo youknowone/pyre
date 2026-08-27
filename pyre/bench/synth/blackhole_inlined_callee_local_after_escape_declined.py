@@ -1,18 +1,31 @@
-# Companion to blackhole_inlined_callee_local_after_escape,
-# carrying that file's shape at a force the constant-depth
-# `sys._getframe` arm DECLINES, so the machinery it documents stays
-# covered now that its own call site folds.
+# Companion to blackhole_inlined_callee_local_after_escape, written to carry
+# that file's shape at a force the constant-depth `sys._getframe` arm declines.
 #
-# `try_walker_specialize_sys_getframe` (jitcode_dispatch/specialize.rs) takes
-# only depth 0 at the top walk level, where `getframe`'s answer IS the portal
-# virtualizable and no force is needed.
-# The `_getframe` call itself folds here; the added `.f_locals` read is the
-# forcing residual, and it forces the SAME frame, so the shape below is
-# unchanged apart from where the force comes from.
+# !! THE GUARD BELOW IS CURRENTLY UNREACHABLE, and the recorded counters say so:
+# `fbw_blackhole_adopted_single_frame=0`, `..._multi_frame=0`, `loops_aborted=0`.
+# The prose from "Guard for what an adopted multi-frame blackhole chain owes"
+# down describes a path this file no longer takes.  Two independent changes
+# closed it, and neither can be undone from inside the fixture:
 #
-# The counters recorded for this file are the ones its original
-# carried before the fold; a diff against them is a real change in the escape
-# machinery, not in the arm.
+#   * the forcing residual is gone.  `try_walker_specialize_sys_getframe`
+#     answers depth 0 at the top walk level out of the portal virtualizable, so
+#     `sys._getframe()` folds; and the `.f_locals` read that replaced it as the
+#     lever stopped forcing when the proxy force moved to the WRITE accessors
+#     only -- correctly, since `fast2locals` is `@jit.unroll_safe` and forces
+#     nothing.  `sys._getframe(1)` does still force (measured: one escape, one
+#     `fbw_blackhole_adopted_single_frame`), which is the lever
+#     `getframe_while_inlined_callee_subwalk` now uses;
+#   * but a SINGLE-frame adopt is not this file's obligation.  Both failures
+#     below need the escape inside an INLINED callee, and `catches_here` is no
+#     longer inlined at all: it carries a try/except, so its whole-body replay
+#     scan comes back Dirty/DeferredCall and the unseeded sub-walk screen
+#     declines it (`InlineCallee::BranchyHandlerDirty`, census-visible under
+#     `PYRE_FBW_INLINE_DIAG=1` as `resolved-inline-decline`).  Restoring this
+#     guard means seeding a handler-bearing callee, not editing the driver.
+#
+# What still runs here is the printed answer, which its non-`_declined` sibling
+# also guards.  Keep the file: the day the seeded arm admits a handler-bearing
+# callee, this shape is the one that exercises it.
 #
 # Guard for what an adopted multi-frame blackhole chain owes its inner levels.
 #
