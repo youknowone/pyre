@@ -7599,6 +7599,34 @@ impl<S: JitState> JitDriver<S> {
         self.runnable_procedure_token(green_key).is_some()
     }
 
+    /// [`Self::resolve_cell_key`] and [`Self::runnable_procedure_token`] from
+    /// one walk of the cell chain.
+    ///
+    /// The two together are what a door holding a raw bucket hash asks: which
+    /// cell do my greens own, and does that cell have code to enter. Asked
+    /// separately they walk the chain twice for the same cell — see
+    /// [`MetaInterp::resolved_entry_procedure_token`]. The answer is identical
+    /// to resolving first and then asking; this only stops paying for the
+    /// second walk.
+    ///
+    /// The resolved key travels back with the token because a caller that goes
+    /// on to run needs it, and because the `compiled_loops` half of the
+    /// predicate is keyed by it.
+    #[inline]
+    pub fn resolved_runnable_procedure_token(
+        &self,
+        green_key_hash: u64,
+        make_green_key: impl FnOnce() -> GreenKey,
+    ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
+        let (cell_key, token) = self
+            .meta
+            .resolved_entry_procedure_token(green_key_hash, make_green_key);
+        (
+            cell_key,
+            token.filter(|_| self.meta.get_compiled_meta(cell_key).is_some()),
+        )
+    }
+
     /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed
     /// back so a door can carry it into the run instead of resolving the cell a
     /// second time.

@@ -208,6 +208,12 @@ pub use jitdriver::{BackEdgeStageRepeats, back_edge_stage_passes, set_back_edge_
 // this probe: the frame build it prices is the backend's, so the count for that
 // one arm is set through `majit_backend` and only its loop is in the backend.
 pub use majit_backend::CompiledTraceInfo;
+/// The object a door carries from its entry decision into the run.
+///
+/// Re-exported because [`JitDriver::runnable_procedure_token`] and
+/// [`JitDriver::resolved_runnable_procedure_token`] hand one to callers
+/// outside this crate, which have no other way to name its type.
+pub use majit_backend::JitCellToken;
 #[cfg(feature = "__execute-stage-probe")]
 pub use majit_backend::deadframe::{frame_build_passes, set_frame_build_repeats};
 #[cfg(feature = "__execute-stage-probe")]
