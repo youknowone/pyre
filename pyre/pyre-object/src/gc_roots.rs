@@ -201,11 +201,18 @@ impl RootStack {
         }
     }
 
-    /// Address of slot `index`, panicking exactly like indexing did.
+    /// Address of slot `index`.
     #[inline(always)]
     fn slot(&self, index: usize) -> *mut PyObjectRef {
-        assert!(index < self.len(), "shadow-stack index out of range");
-        // SAFETY: bounds-checked against the live length just above.
+        // Debug-only, because upstream reaches a shadow-stack slot by pointer
+        // arithmetic off `root_stack_top` with no check at all
+        // (shadowstack.py:76-88 stores at a compile-time colour offset).
+        // A panic path in the release body is a call, which forces a stack
+        // frame onto `normalize_published_slot` and keeps it from inlining
+        // into the pin it belongs to.  Every caller claimed `index` from
+        // `incr_stack` inside a bracket that is still open.
+        debug_assert!(index < self.len(), "shadow-stack index out of range");
+        // SAFETY: the claimed index is inside the live buffer.
         unsafe { self.base.get().add(index) }
     }
 }

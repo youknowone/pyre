@@ -51,6 +51,15 @@ pub struct OldGen {
     /// incminimark.py:1219-1221 and 2153-2158.  Unlike the removed F2-era
     /// payload side table, it has no entry for ordinary arena survivors.
     rawmalloced_payloads: AddressSet,
+    /// Lowest and highest payload address `rawmalloced_payloads` has ever
+    /// held, so a miss can be answered by a range compare — the shape the
+    /// arena half of `contains` already has.
+    ///
+    /// Monotone: a free leaves them where they are.  A widened range can only
+    /// send more addresses to the exact set, never fewer, so it cannot turn a
+    /// member into a non-member.
+    rawmalloced_lo: usize,
+    rawmalloced_hi: usize,
     rawmalloced_total_size: usize,
     /// incminimark.py:386,1073-1074 `rawmalloced_peak_size`.
     rawmalloced_peak_size: usize,
@@ -74,6 +83,8 @@ impl OldGen {
             young_rawmalloced_payloads: AddressSet::default(),
             raw_malloc_might_sweep: Vec::new(),
             rawmalloced_payloads: AddressSet::default(),
+            rawmalloced_lo: usize::MAX,
+            rawmalloced_hi: 0,
             rawmalloced_total_size: 0,
             rawmalloced_peak_size: 0,
             poison_on_alloc: std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some(),
@@ -178,8 +189,10 @@ impl OldGen {
             unsafe { ptr::write_bytes(raw, 0, card_header_bytes) };
         }
         let header_ptr = unsafe { raw.add(card_header_bytes) };
-        self.rawmalloced_payloads
-            .insert(header_ptr as usize + GcHeader::SIZE);
+        let payload = header_ptr as usize + GcHeader::SIZE;
+        self.rawmalloced_payloads.insert(payload);
+        self.rawmalloced_lo = self.rawmalloced_lo.min(payload);
+        self.rawmalloced_hi = self.rawmalloced_hi.max(payload);
         self.rawmalloced_total_size += alloc_size;
         self.rawmalloced_peak_size = self.rawmalloced_peak_size.max(self.rawmalloced_total_size);
         Some((
@@ -234,6 +247,8 @@ impl OldGen {
     /// Runs at the END of the minor collection, after every root and every
     /// remembered old parent has had its chance to stamp the flag.
     pub fn free_young_rawmalloced_objects(&mut self) {
+        // Once, above the loop: see `sweep_arenas_step`.
+        let log_free = crate::gc_lifetime_log_enabled();
         let young = std::mem::take(&mut self.young_rawmalloced_objects);
         self.young_rawmalloced_payloads.clear();
         for object in young {
@@ -243,7 +258,7 @@ impl OldGen {
                 self.old_rawmalloced_objects.push(object);
                 continue;
             }
-            if crate::gc_lifetime_log_enabled() {
+            if log_free {
                 eprintln!(
                     "[gc][free] addr={:#x} type_id={} kind=raw-young",
                     object.header_addr + GcHeader::SIZE,
@@ -359,6 +374,8 @@ impl OldGen {
     /// Process at most `nobjects` candidates and return the unused part of the
     /// budget, exactly like the upstream routine.
     pub fn sweep_rawmalloc_step(&mut self, mut nobjects: usize) -> usize {
+        // Once, above the loop: see `sweep_arenas_step`.
+        let log_free = crate::gc_lifetime_log_enabled();
         while !self.raw_malloc_might_sweep.is_empty() && nobjects > 0 {
             let object = self.raw_malloc_might_sweep.pop().unwrap();
             let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
@@ -366,7 +383,7 @@ impl OldGen {
                 hdr.clear_flag(flags::VISITED);
                 self.old_rawmalloced_objects.push(object);
             } else {
-                if crate::gc_lifetime_log_enabled() {
+                if log_free {
                     eprintln!(
                         "[gc][free] addr={:#x} type_id={} kind=raw",
                         object.header_addr + GcHeader::SIZE,
@@ -392,6 +409,12 @@ impl OldGen {
 
     /// incminimark.py:2549-2555: sweep at most `max_pages` frozen arena pages.
     pub fn sweep_arenas_step(&mut self, max_pages: usize) -> bool {
+        // Read the diagnostic gate once, outside the per-block callback:
+        // `gc_lifetime_log_enabled` is a `LazyLock`, so its acquire load
+        // cannot be hoisted out of the loop the closure inlines into.
+        // `_free_if_unvisited` (incminimark.py:2650-2656) is a flag test, a
+        // flag clear and a return.
+        let log_free = crate::gc_lifetime_log_enabled();
         self.ac.mass_free_incremental(
             &mut |header_ptr| unsafe {
                 let hdr = &mut *(header_ptr as *mut GcHeader);
@@ -399,7 +422,7 @@ impl OldGen {
                     hdr.clear_flag(flags::VISITED);
                     false
                 } else {
-                    if crate::gc_lifetime_log_enabled() {
+                    if log_free {
                         eprintln!(
                             "[gc][free] addr={:#x} type_id={} kind=arena",
                             header_ptr as usize + GcHeader::SIZE,
@@ -456,9 +479,24 @@ impl OldGen {
         self.ac.contains(obj_addr) || self.rawmalloced_contains(obj_addr)
     }
 
-    #[inline(never)]
+    /// Split again inside: the range compare inlines into `contains`, the
+    /// hashed lookup does not.
+    ///
+    /// Upstream never asks whether an address belongs to its heap at all —
+    /// RPython's type system settles it, so `visit` reads header flags
+    /// straight off the child (incminimark.py:2793-2798).  pyre's hybrid heap
+    /// has to ask, and the answer for an off-GC or arena address is "no", so
+    /// make that answer a compare rather than a hash of the whole set.
+    #[inline]
     fn rawmalloced_contains(&self, obj_addr: usize) -> bool {
-        !self.rawmalloced_payloads.is_empty() && self.rawmalloced_payloads.contains(&obj_addr)
+        obj_addr >= self.rawmalloced_lo
+            && obj_addr <= self.rawmalloced_hi
+            && self.rawmalloced_payload_set_contains(obj_addr)
+    }
+
+    #[inline(never)]
+    fn rawmalloced_payload_set_contains(&self, obj_addr: usize) -> bool {
+        self.rawmalloced_payloads.contains(&obj_addr)
     }
 
     pub fn mark_visited(obj_addr: usize) {

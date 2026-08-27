@@ -4839,14 +4839,21 @@ impl MiniMarkGC {
         }
 
         let type_info = self.types.get(type_id);
-        let gc_ptr_offsets: Vec<usize> = type_info.gc_ptr_offsets.clone();
+        let noffsets = type_info.gc_ptr_offsets.len();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
         let length_offset = type_info.length_offset;
         let base_size = type_info.size;
 
         // Process fixed-part GC pointer fields.
-        for &offset in &gc_ptr_offsets {
+        //
+        // Read by index rather than over a copy of the offsets: `base.py:286-289
+        // trace` walks `offsets_to_gc_pointers(typeid)[i]` in place, and this
+        // loop runs once per traced object, so a `Vec` clone here was a malloc
+        // and a memcpy per object on the minor collector's hot path.  The major
+        // mark's equivalent already avoids it with a reusable buffer.
+        for i in 0..noffsets {
+            let offset = self.types.get(type_id).gc_ptr_offsets[i];
             let slot = (obj_addr + offset) as *mut GcRef;
             let field_ref = unsafe { *slot };
             self.assert_traced_slot_initialized(
@@ -5220,9 +5227,16 @@ impl MiniMarkGC {
         // seeds stack roots for a major marking cycle. Mirror the same
         // root sets as minor collection, but mark old objects instead of
         // copying nursery objects.
-        let prebuilt = self.prebuilt_root_objects.clone();
-        for addr in prebuilt {
+        // `prebuilt_root_objects.foreach(self._collect_obj, None)`
+        // (incminimark.py:2707) walks the stack in place.  Index rather than
+        // clone: `seed_prebuilt_root` only sets header flags and pushes onto
+        // the gray stack, so the list cannot move under the loop, and the
+        // clone was a full copy of every prebuilt root per major cycle.
+        let mut i = 0;
+        while i < self.prebuilt_root_objects.len() {
+            let addr = self.prebuilt_root_objects[i];
             self.seed_prebuilt_root(addr);
+            i += 1;
         }
         let mut roots = self.enumerate_labeled_root_walker_values();
         // Objects already moved to a death queue remain ordinary roots until
@@ -5764,9 +5778,12 @@ impl MiniMarkGC {
     /// roots are deliberately not repeated here: upstream repeats only
     /// `collect_nonstack_roots`, not `collect_roots`.
     fn rescan_major_nonstack_roots_and_drain(&mut self) {
-        let prebuilt = self.prebuilt_root_objects.clone();
-        for addr in prebuilt {
+        // In place, for the reason `seed_major_roots` gives.
+        let mut i = 0;
+        while i < self.prebuilt_root_objects.len() {
+            let addr = self.prebuilt_root_objects[i];
             self.seed_prebuilt_root(addr);
+            i += 1;
         }
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.seed_major_root(*gcref, "rescan_extra_root");
@@ -6455,7 +6472,12 @@ impl MiniMarkGC {
     /// the black ones gray again; this can only add survivors, never free a
     /// reachable object.
     fn rescan_major_stack_roots_black_and_drain(&mut self) {
-        for gcref in self.enumerate_root_walker_values() {
+        // The labeled list directly: `enumerate_root_walker_values` drops the
+        // labels into a second full-population `Vec` because `GcRef` and
+        // `(GcRef, &str)` are different widths, and this pass runs once per
+        // major cycle over every root.  The label is what inspection wants,
+        // not this walk.
+        for (gcref, _) in self.enumerate_labeled_root_walker_values() {
             if gcref.is_null() {
                 continue;
             }
@@ -7139,10 +7161,22 @@ impl MiniMarkGC {
         // Minor collection first to empty the nursery.
         // This is the `_minor_collection()` performed by upstream's
         // `gc_step_until(STATE_MARKING)` before it starts the fresh cycle.
+        // Upstream calls the low-level `_minor_collection`, which has no
+        // major-progress tail, so suppress this wrapper's tail the way
+        // `gc_step_until_scanning_with_minors` does.
+        let was_enabled = self.enabled;
+        self.enabled = false;
         self.do_collect_nursery();
+        self.enabled = was_enabled;
 
+        // The rest of that same `gc_step_until(STATE_MARKING)` iteration.
+        // Reaching MARKING through `major_collection_step` is what runs the
+        // STATE_SCANNING arm (incminimark.py:2438-2447), which resets
+        // `size_objects_made_old` / `threshold_objects_made_old` before
+        // `collect_roots`; calling `start_incremental_cycle` directly opened
+        // the cycle with the finishing cycle's counters still in place.
         if self.gc_state == GcState::Scanning {
-            self.start_incremental_cycle();
+            self.major_collection_step();
         }
         self.gc_step_until_scanning_with_minors();
 
