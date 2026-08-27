@@ -166,6 +166,18 @@ fn weakref_obj_weak(obj: PyObjectRef) -> PyObjectRef {
 }
 
 #[inline]
+fn weakref_clear(obj: PyObjectRef) {
+    let slot = weakref_obj_weak(obj);
+    if unsafe { pyre_object::weakref::is_gc_weakref_box(slot) } {
+        unsafe { pyre_object::weakref::w_gc_weakref_box_clear(slot) };
+    } else if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
+        unsafe { pyre_object::weakref::w_weakref_object_set_obj_weak(obj, pyre_object::PY_NULL) };
+    } else {
+        write_attr(obj, ATTR_W_OBJ_WEAK, pyre_object::PY_NULL);
+    }
+}
+
+#[inline]
 fn weakref_callable(obj: PyObjectRef) -> PyObjectRef {
     if unsafe { pyre_object::weakref::is_typed_weakref(obj) } {
         unsafe { pyre_object::weakref::w_weakref_object_callable(obj) }
@@ -1098,6 +1110,12 @@ pub fn getlifeline(w_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     }
     let lifeline = weakref_lifeline_new();
     crate::baseobjspace::setweakref(w_obj, lifeline)?;
+    #[cfg(all(
+        feature = "cpyext",
+        not(feature = "sandbox"),
+        any(target_os = "macos", target_os = "linux")
+    ))]
+    crate::cpyext::remember_weakref_lifeline(w_obj, lifeline);
     Ok(lifeline)
 }
 
@@ -1128,6 +1146,14 @@ fn lifeline_refs(lifeline: PyObjectRef) -> Vec<PyObjectRef> {
         }
     }
     refs
+}
+
+/// `WeakrefLifeline.clear_all_weakrefs` — eagerly make every reference and
+/// proxy in this lifeline dead, leaving callback delivery to `_finalize_`.
+pub fn clear_all_weakrefs(lifeline: PyObjectRef) {
+    for w_ref in lifeline_refs(lifeline) {
+        weakref_clear(w_ref);
+    }
 }
 
 /// `WeakrefLifeline._finalize_` (interp__weakref.py), invoked

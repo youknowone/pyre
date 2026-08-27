@@ -780,6 +780,45 @@ pub(super) fn forget_block(raw: *mut CPyObject) {
     }
 }
 
+/// C references owned by `methodobject.py cfunction_attach` / `cmethod_attach`.
+///
+/// These carrier types do not declare `Py_TPFLAGS_HAVE_GC`, so `tp_traverse`
+/// cannot report their `m_self`, `m_module`, and `mm_class` fields. They still
+/// belong to the rawrefcount C graph: treating a short-lived bound method's
+/// `m_self` as an outside reference keeps its receiver alive for an extra
+/// collection, which is observable for `_cffi_backend.FFI` and its type cache.
+pub(super) fn mirror_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
+    let carrier = |cell| pyobject::as_pyobj(built_carrier_type(cell)) as usize;
+    let function = carrier(&PYCFUNCTION_TYPE_OBJ);
+    let method = carrier(&PYCMETHOD_TYPE_OBJ);
+    if function == 0 && method == 0 {
+        return;
+    }
+    for address in pyobject::entered_blocks() {
+        let raw = address as *mut CPyObject;
+        let tp = unsafe { (*raw).ob_type } as usize;
+        if tp != function && tp != method {
+            continue;
+        }
+        let block = raw as *mut CPyCFunctionObject;
+        let mut referents = Vec::with_capacity(if tp == method { 3 } else { 2 });
+        for referent in unsafe { [(*block).m_self, (*block).m_module] } {
+            if !referent.is_null() {
+                referents.push(referent as usize);
+            }
+        }
+        if tp == method {
+            let class = unsafe { (*(raw as *mut CPyCMethodObject)).mm_class };
+            if !class.is_null() {
+                referents.push(class as usize);
+            }
+        }
+        if !referents.is_empty() {
+            edges.push((address, referents));
+        }
+    }
+}
+
 fn method_def(carrier: PyObjectRef) -> Option<*mut CPyMethodDef> {
     let ml = carrier_get(carrier, ML_KEY)?;
     if !unsafe { pyre_object::is_int(ml) } {

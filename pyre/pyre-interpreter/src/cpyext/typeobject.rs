@@ -5237,15 +5237,15 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
             pyre_object::gc_roots::shadow_stack_get(type_slot),
             (*tp).tp_dictoffset != 0,
         );
-        // `typeobject.py:1458-1460 create_all_slots` takes the `wantweakref`
-        // branch for a namespace with no `__slots__`, which is every namespace
-        // built from C.  The field the offset would be read from cannot answer
-        // this: an extension writes `tp_weaklistoffset` after the type it
-        // readied is already built, which is where Cython puts the offset of a
-        // `cdef object __weakref__`.
+        // `typeobject.py create_all_slots` gives a C heap type's namespace the
+        // default weakref support even when its `PyType_FromSpec` layout has
+        // no `tp_weaklistoffset`.  A legacy static type gets it only from an
+        // explicit (or inherited) offset; this keeps slotless statics such as
+        // `_cffi_backend.FFI` non-weakrefable while retaining the heap-type
+        // behaviour the PyPy cpyext oracle exposes.
         pyre_object::typeobject::w_type_set_weakrefable(
             pyre_object::gc_roots::shadow_stack_get(type_slot),
-            true,
+            (*tp).tp_weaklistoffset != 0 || (*tp).tp_flags & PY_TPFLAGS_HEAPTYPE != 0,
         );
         // `type_call`'s own test, which is the slot rather than the flag: a
         // subtype of a type that carries the flag inherits the empty slot

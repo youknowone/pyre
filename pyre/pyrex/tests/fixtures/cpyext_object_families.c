@@ -249,6 +249,18 @@ static void cleared_dealloc(PyObject *self)
     Py_TYPE(self)->tp_free(self);
 }
 
+static PyObject *cleared_ping(PyObject *self, PyObject *unused)
+{
+    (void)self;
+    (void)unused;
+    return Py_NewRef(Py_None);
+}
+
+static PyMethodDef cleared_methods[] = {
+    {"ping", cleared_ping, METH_NOARGS, NULL},
+    {NULL, NULL, 0, NULL},
+};
+
 static PyTypeObject ClearedType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "cpyext_object_families.Cleared",
@@ -257,6 +269,7 @@ static PyTypeObject ClearedType = {
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
     .tp_new = PyType_GenericNew,
     .tp_dealloc = cleared_dealloc,
+    .tp_methods = cleared_methods,
 };
 
 static PyObject *wr_cleared_count(PyObject *s, PyObject *unused)

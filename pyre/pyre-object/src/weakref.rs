@@ -139,6 +139,12 @@ pub unsafe fn w_weakref_object_obj_weak(obj: PyObjectRef) -> PyObjectRef {
 }
 
 #[inline]
+pub unsafe fn w_weakref_object_set_obj_weak(obj: PyObjectRef, value: PyObjectRef) {
+    unsafe { (*(obj as *mut W_Weakref)).w_obj_weak = value };
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+#[inline]
 pub unsafe fn w_weakref_object_callable(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_Weakref)).w_callable }
 }

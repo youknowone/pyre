@@ -5681,6 +5681,22 @@ pub fn delweakref(obj: PyObjectRef) {
     }
 }
 
+/// `W_Root.clear_all_weakrefs` — detach the lifeline before clearing it so a
+/// resurrected object can create a fresh set rather than reuse dead refs.
+pub fn clear_all_weakrefs(obj: PyObjectRef) {
+    let Some(lifeline) = getweakref(obj) else {
+        return;
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(obj);
+    let _ = roots.pin_root(lifeline);
+    delweakref(pyre_object::gc_roots::shadow_stack_get(base));
+    crate::module::_weakref::interp__weakref::clear_all_weakrefs(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    );
+}
+
 /// Get an attribute from an object: `obj.name`.
 ///
 /// For module objects, looks up the name in the module's namespace dict

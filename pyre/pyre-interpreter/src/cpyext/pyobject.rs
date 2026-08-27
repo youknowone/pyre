@@ -92,6 +92,11 @@ const _: () = {
 struct Block {
     size: usize,
     generation: u64,
+    /// The C mirror of `W_Root`'s weakref lifeline.  PyPy keeps the lifeline
+    /// on the live `W_Root`; pyre's rawrefcount teardown can outlast that root,
+    /// so the per-mirror allocation record owns it until `tp_dealloc` calls
+    /// `PyObject_ClearWeakRefs`.
+    weakref_lifeline: usize,
 }
 
 /// The P list itself belongs to the collector, which is where every question
@@ -108,13 +113,25 @@ static BLOCK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Enter a block this layer handed out, under a generation of its own.
 fn record_block(address: usize, size: usize) {
     let generation = BLOCK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    BLOCK_SIZES
-        .lock()
-        .insert(address, Block { size, generation });
+    BLOCK_SIZES.lock().insert(
+        address,
+        Block {
+            size,
+            generation,
+            weakref_lifeline: 0,
+        },
+    );
 }
 
 fn block_at(address: usize) -> Option<Block> {
     BLOCK_SIZES.lock().get(&address).copied()
+}
+
+/// Every entered mirror block, for C-owned fields that are not covered by
+/// `tp_traverse`. The allocation record is already the owner of this census;
+/// callers filter the copied stable addresses by their concrete C type.
+pub(super) fn entered_blocks() -> Vec<usize> {
+    BLOCK_SIZES.lock().keys().copied().collect()
 }
 
 /// Whether the block at `address` is one this layer handed out.
@@ -375,6 +392,47 @@ pub fn as_pyobj(w_obj: PyObjectRef) -> *mut CPyObject {
         return std::ptr::null_mut();
     }
     majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize)) as *mut CPyObject
+}
+
+/// Attach `W_Root`'s weakref lifeline to an already-existing C mirror.
+///
+/// This is teardown state on the mirror itself, not a second identity table:
+/// `_Py_Dealloc` replaces/clears `ob_pyre_link` before calling `tp_dealloc`,
+/// while `Block` is the allocation record that deliberately survives through
+/// that call.  The owned C reference keeps the lifeline reachable without
+/// keeping its referent alive.
+pub(super) fn remember_weakref_lifeline(w_obj: PyObjectRef, lifeline: PyObjectRef) {
+    let raw = as_pyobj(w_obj);
+    if raw.is_null() {
+        return;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_obj);
+    let _ = roots.pin_root(lifeline);
+    let lifeline_raw = make_ref(pyre_object::gc_roots::shadow_stack_get(base + 1));
+    let mut blocks = BLOCK_SIZES.lock();
+    let Some(block) = blocks.get_mut(&(raw as usize)) else {
+        drop(blocks);
+        unsafe { decref(lifeline_raw) };
+        return;
+    };
+    if block.weakref_lifeline == 0 {
+        block.weakref_lifeline = lifeline_raw as usize;
+    } else {
+        drop(blocks);
+        unsafe { decref(lifeline_raw) };
+    }
+}
+
+/// Lifeline retained for a mirror whose deallocator is running.
+pub(super) fn weakref_lifeline(raw: *mut CPyObject) -> Option<PyObjectRef> {
+    let lifeline = block_at(raw as usize)?.weakref_lifeline as *mut CPyObject;
+    if lifeline.is_null() {
+        return None;
+    }
+    let object = unsafe { from_ref(lifeline) };
+    (!object.is_null()).then_some(object)
 }
 
 /// The address parked in a dying mirror's link slot while its deallocator runs
@@ -654,8 +712,17 @@ pub(super) unsafe fn reallocate_raw(
     if moved.is_null() {
         return std::ptr::null_mut();
     }
-    BLOCK_SIZES.lock().remove(&(raw as usize));
-    record_block(moved as usize, size);
+    let generation = BLOCK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut blocks = BLOCK_SIZES.lock();
+    blocks.remove(&(raw as usize));
+    blocks.insert(
+        moved as usize,
+        Block {
+            size,
+            generation,
+            weakref_lifeline: old.weakref_lifeline,
+        },
+    );
     moved as *mut std::ffi::c_void
 }
 
@@ -683,6 +750,9 @@ pub(super) unsafe fn free_block(raw: *mut CPyObject) {
     }
     if block.size != 0 {
         unsafe { std::alloc::dealloc(raw as *mut u8, block_layout(block.size)) };
+    }
+    if block.weakref_lifeline != 0 {
+        unsafe { decref(block.weakref_lifeline as *mut CPyObject) };
     }
 }
 

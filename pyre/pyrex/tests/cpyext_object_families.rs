@@ -193,11 +193,9 @@ eq('the callback ran', fired, ['called'])
 before = m.wr_cleared_count()
 victim = m.Cleared()
 watch = m.wr_new_ref(victim)
+eq('the bound C method works', victim.ping(), None)
 del victim
-for _ in range(4):
-    if m.wr_cleared_count() > before:
-        break
-    gc.collect()
+gc.collect()
 eq('the deallocator ran', m.wr_cleared_count(), before + 1)
 eq('the weak reference is dead', m.wr_get_object(watch), None)
 eq('and the call after it is clean', m.wr_check([]), False)
