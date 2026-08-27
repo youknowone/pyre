@@ -70,3 +70,5 @@ assert stderr_lines == 1, (stdout_lines, stderr_lines)
 # `-q` drops it from stderr too, rather than moving it.
 quiet_out, quiet_err = banner_streams([sys.executable, "-q"])
 assert (quiet_out, quiet_err) == (0, 0), (quiet_out, quiet_err)
+
+print("OK")

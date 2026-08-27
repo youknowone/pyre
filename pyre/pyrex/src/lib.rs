@@ -1379,12 +1379,13 @@ fn init_faulthandler(
     if !importing::faulthandler_flag() {
         return;
     }
-    // `run_command_line` installs once, ahead of the program it goes on to
-    // dispatch, so whatever that program does to the handlers is what the
-    // prompt inherits when `-i` follows it.  pyre reaches `import site` from
-    // each entry point instead of from one linear startup, and `-c`/`-m`/a
-    // script followed by `-i` reaches it twice; installing on the second pass
-    // would undo a `faulthandler.disable()` the program had just made.
+    // `_PyFaulthandler_Init` runs once per process, from `pyinit_core`, ahead
+    // of the program `run_command_line` goes on to dispatch, so whatever that
+    // program does to the handlers is what a following `-i` inherits.  pyre
+    // installs from `import site` instead, which each entry point reaches --
+    // one of them per process -- so this holds the installer idempotent at the
+    // point that depends on it: a second install would undo a
+    // `faulthandler.disable()` the program had just made.
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     let mut first = false;
     INSTALLED.call_once(|| first = true);

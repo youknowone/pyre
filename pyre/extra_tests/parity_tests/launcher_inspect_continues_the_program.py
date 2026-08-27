@@ -89,3 +89,5 @@ assert "FROM PROMPT" in out, (out, err)
 out, err, code = prompt([], "import atexit\natexit.register(lambda: print('BYE'))\nexit(3)\n")
 assert "BYE" in out, (out, err)
 assert code == 3, (code, err)
+
+print("OK")
