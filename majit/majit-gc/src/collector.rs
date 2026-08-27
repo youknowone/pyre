@@ -1,11 +1,11 @@
-/// MiniMarkGC — the core collector implementing the GcAllocator trait.
-///
-/// A generational copying collector with:
-/// - Bump-pointer nursery for young objects
-/// - ArenaCollection old gen plus rawmalloc fallback, with incremental major sweep
-/// - Write barrier with remembered set for old-to-young pointers
-///
-/// Modeled after incminimark's minor/major collection.
+//! MiniMarkGC — the core collector implementing the GcAllocator trait.
+//!
+//! A generational copying collector with:
+//! - Bump-pointer nursery for young objects
+//! - ArenaCollection old gen plus rawmalloc fallback, with incremental major sweep
+//! - Write barrier with remembered set for old-to-young pointers
+//!
+//! Modeled after incminimark's minor/major collection.
 use majit_ir::GcRef;
 use std::collections::VecDeque;
 use std::sync::RwLock;

@@ -1,11 +1,11 @@
-/// Bump-pointer nursery allocator.
-///
-/// A fixed-size memory region where young objects are allocated by
-/// advancing a free pointer. When the nursery is full, a minor
-/// collection copies live objects out.
-///
-/// Layout: [header0|payload0|header1|payload1|...|free...top]
-///          ^nursery_start                       ^free  ^top
+//! Bump-pointer nursery allocator.
+//!
+//! A fixed-size memory region where young objects are allocated by
+//! advancing a free pointer. When the nursery is full, a minor
+//! collection copies live objects out.
+//!
+//! Layout: [header0|payload0|header1|payload1|...|free...top]
+//!          ^nursery_start                       ^free  ^top
 use std::alloc::{self, Layout};
 use std::ptr;
 

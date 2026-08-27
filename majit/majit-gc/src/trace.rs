@@ -1,14 +1,14 @@
-/// Object tracing for GC reference discovery.
-///
-/// During collection, the GC needs to find all GC references within
-/// a live object so it can update them (for copying collection) or
-/// mark the targets (for mark-sweep).
-///
-/// Instead of a closure-based trace approach (which causes lifetime issues
-/// with the borrow checker), we use an offset-based approach: each type
-/// declares the offsets of its GC pointer fields relative to the object
-/// payload start. The collector reads/writes GcRef values at these offsets
-/// directly.
+//! Object tracing for GC reference discovery.
+//!
+//! During collection, the GC needs to find all GC references within
+//! a live object so it can update them (for copying collection) or
+//! mark the targets (for mark-sweep).
+//!
+//! Instead of a closure-based trace approach (which causes lifetime issues
+//! with the borrow checker), we use an offset-based approach: each type
+//! declares the offsets of its GC pointer fields relative to the object
+//! payload start. The collector reads/writes GcRef values at these offsets
+//! directly.
 use majit_ir::GcRef;
 
 /// One `gctypelayout.GCData.TYPE_INFO` entry of the materialized

@@ -1,22 +1,23 @@
-/// Shadow stack for GC root tracking in compiled JIT code.
-///
-/// RPython reference: rpython/jit/backend/llsupport/gc.py GcRootMap_shadowstack
-///
-/// Two stacks:
-/// 1. GcRef shadow stack — individual GC refs (legacy, for non-jitframe roots)
-/// 2. JitFrame shadow stack — jitframe pointers (RPython _call_header_shadowstack)
-///
-/// Protocol for jitframe shadow stack (assembler.py:1122-1136):
-///   Entry: inline MOVs push [is_minor=1, jf_ptr] to root stack
-///   Per-call: push_gcmap writes jf_gcmap; pop_gcmap clears it
-///   GC: walk_jf_roots → read jf_gcmap → trace ref slots
-///   Exit: pop_jf_to(depth)   — _call_footer_shadowstack
-///
-/// The jitframe shadow stack uses a per-thread flat memory array with a
-/// root_stack_top pointer, matching RPython's per-thread ShadowStackPool.
-/// Compiled code manipulates the current thread's root_stack_top with inline
-/// load/store instructions (no function calls), exactly as in
-/// assembler.py:1122-1136.
+//! Shadow stack for GC root tracking in compiled JIT code.
+//!
+//! RPython reference: rpython/jit/backend/llsupport/gc.py GcRootMap_shadowstack
+//!
+//! Two stacks:
+//! 1. GcRef shadow stack — individual GC refs (legacy, for non-jitframe roots)
+//! 2. JitFrame shadow stack — jitframe pointers (RPython _call_header_shadowstack)
+//!
+//! Protocol for jitframe shadow stack (`_call_header_shadowstack` /
+//! `_call_footer_shadowstack`):
+//!   Entry: inline MOVs push [is_minor=1, jf_ptr] to root stack
+//!   Per-call: push_gcmap writes jf_gcmap; pop_gcmap clears it
+//!   GC: walk_jf_roots → read jf_gcmap → trace ref slots
+//!   Exit: pop_jf_to(depth)   — _call_footer_shadowstack
+//!
+//! The jitframe shadow stack uses a per-thread flat memory array with a
+//! root_stack_top pointer, matching RPython's per-thread ShadowStackPool.
+//! Compiled code manipulates the current thread's root_stack_top with inline
+//! load/store instructions (no function calls), exactly as in
+//! `_call_header_shadowstack`.
 use std::cell::{Cell, RefCell};
 use std::sync::{Mutex, OnceLock, RwLock};
 
