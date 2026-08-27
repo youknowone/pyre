@@ -2264,8 +2264,7 @@ fn flush_with_latched_stack_inner(
             let consumed = !agrees
                 && obj as usize != 0
                 && shadow_ptr == Some(0)
-                && (consumed_operands == ConsumedOperands::WholeRun
-                    || rel + 1 == stack.len());
+                && (consumed_operands == ConsumedOperands::WholeRun || rel + 1 == stack.len());
             let refusal = if consumed {
                 consumed_from.get_or_insert(rel);
                 None
