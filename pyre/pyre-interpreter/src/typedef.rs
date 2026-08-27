@@ -7134,21 +7134,33 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "keys",
-            make_builtin_function_with_arity("keys", crate::type_methods::dict_method_keys, 1),
+            make_builtin_function_with_arity(
+                "keys",
+                crate::type_methods::__majit_wrap_dict_descr_keys,
+                1,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "values",
-            make_builtin_function_with_arity("values", crate::type_methods::dict_method_values, 1),
+            make_builtin_function_with_arity(
+                "values",
+                crate::type_methods::__majit_wrap_dict_descr_values,
+                1,
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "items",
-            make_builtin_function_with_arity("items", crate::type_methods::dict_method_items, 1),
+            make_builtin_function_with_arity(
+                "items",
+                crate::type_methods::__majit_wrap_dict_descr_items,
+                1,
+            ),
         )
     };
     unsafe {

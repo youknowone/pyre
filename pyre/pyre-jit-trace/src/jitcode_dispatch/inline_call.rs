@@ -3644,6 +3644,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // `builtin_wrapper_indirect_graphs` builds — i.e. one registered without a
     // `__majit_wrap_*` gateway.  The address is what identifies the missing
     // member, so print it.
+    //
+    // Every bail between here and the descent below names itself for the same
+    // reason.  With the tail of this function silent, a `PYRE_FBW_DESCENT_SCAN_OFF=1`
+    // run of `abc_instancecheck_weak_cache` printed no builtin-inline line at
+    // all and recorded the same 69 ops as the gated run, which reads as "the
+    // descent scan is the wall" when the scan had already been switched off and
+    // something downstream refused instead.
     macro_rules! builtin_inline_decline {
         ($why:expr, $addr:expr) => {
             if fbw_inline_diag_enabled() {
@@ -3687,9 +3694,11 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // MetaInterpStaticData registry.  The frozen table is lazy in pyre, so
     // publish this wrapper before any guard snapshot names its absolute index.
     if crate::state::ensure_build_time_jitcode_at(jitcode.index()).is_none() {
+        builtin_inline_decline!("wrapper jitcode absent from the build-time table", fnaddr);
         return Ok(None);
     }
     if body.num_regs_r < 1 {
+        builtin_inline_decline!("wrapper body has no ref register", fnaddr);
         return Ok(None);
     }
     if let Some(decline) = descent_decline(jitcode.index()) {
@@ -3723,7 +3732,10 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let nested_helper_entry = if nested_helper {
         match compute_inline_helper_call_entry_frame(ctx, op.pc) {
             Ok(frame) => Some(frame),
-            Err(_) => return Ok(None),
+            Err(_) => {
+                builtin_inline_decline!("no entry frame for the nested helper call", fnaddr);
+                return Ok(None);
+            }
         }
     } else {
         None
@@ -3736,12 +3748,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // or synthetic allocations so a missing coordinate is a clean decline.
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
+        builtin_inline_decline!("walk carries no snapshot symbol", fnaddr);
         return Ok(None);
     }
     // SAFETY: snapshot_sym is installed for the lifetime of the enclosing
     // full-body walk and is read-only here.
     let sym = unsafe { &*sym_ptr };
     if sym.jitcode().is_null() {
+        builtin_inline_decline!("snapshot symbol names no jitcode", fnaddr);
         return Ok(None);
     }
     let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
@@ -3830,6 +3844,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // seeding under the arraylen descriptor makes the later getitem miss and
     // manufactures a Box without its recording-time `.value`.
     let Some(wrapper_args_descr_index) = wrapper_args_item_descr_index(body.code) else {
+        builtin_inline_decline!("wrapper args item descriptor unresolved", fnaddr);
         return Ok(None);
     };
 
