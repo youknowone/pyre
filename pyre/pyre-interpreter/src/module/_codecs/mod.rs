@@ -958,22 +958,28 @@ fn decode_with_name(
     Ok(w_tuple_new(vec![decoded, w_int_new(consumed as i64)]))
 }
 
-/// Acquire the read-only bytes of a decoder input, reporting a decode-context
-/// TypeError (rather than the file-write helper's own wording) when the object
-/// is not a bytes-like buffer.
+/// `bufferstr_w`: the read-only bytes of a decoder input.
 ///
-/// Only that one wording is replaced.  A buffer the decoder may not read --
-/// a strided `memoryview`, which `bufferstr` refuses because the bytes it
-/// would decode are not the ones the object exposes -- has already said so
-/// with the error the acquisition raised, and reporting it as a wrong argument
-/// type instead names the wrong thing.
+/// The acquisition is `acquire_readbuf`'s single `PyBUF_SIMPLE` export, which
+/// every exporter answers, so an `mmap`, a `ctypes` array and an object whose
+/// `__buffer__` returns a view all decode alongside `bytes` and `bytearray`.
+/// Only `BufferInterfaceNotFound` is spelled here, with the converter's own
+/// wording.  A buffer the decoder may not read -- a strided `memoryview`, which
+/// the request refuses because the bytes it would decode are not the ones the
+/// object exposes -- has already said so with the acquisition's own error, and
+/// reporting it as a wrong argument type instead names the wrong thing.
 fn decode_input_bytes(w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    unsafe { crate::builtins::file_write_buffer_bytes(w_obj) }.map_err(|e| {
-        match e.kind == crate::PyErrorKind::TypeError {
-            true => bad_buffer_arg(w_obj),
-            false => e,
-        }
-    })
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    // The acquisition may run `__buffer__`, so the object naming the failure is
+    // read back from the shadow stack rather than from the argument.
+    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(w_obj)? else {
+        return Err(bad_buffer_arg(pyre_object::gc_roots::shadow_stack_get(sp)));
+    };
+    let data = buffer.as_bytes().to_vec();
+    buffer.release();
+    Ok(data)
 }
 
 /// PyPy `interp_codecs.utf_{16,32}_ex_decode`: the three-value entry point

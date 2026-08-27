@@ -121,8 +121,8 @@ else:
 assert codecs.charmap_encode("a", "strict", {97: b"x"}) == (b"x", 1)
 assert codecs.charmap_encode("a", "strict", {97: 120}) == (b"x", 1)
 
-# The encode leg reads a handler position the way the decode leg does, and
-# refuses an unrepresentable one in the same two shapes.
+# The encode leg reads a handler position the way the decode leg does, and an
+# unrepresentable one leaves through the same conversion error.
 def overflowing(exc):
     return ("?", 10**100)
 
@@ -131,7 +131,5 @@ try:
     codecs.charmap_encode("ሴ", "pyre.charmap.encode.overflow", {})
 except OverflowError:
     pass
-except IndexError as error:
-    assert "position -1" in str(error), str(error)
 else:
-    raise AssertionError("an unrepresentable position should be out of bounds")
+    raise AssertionError("an unrepresentable position should overflow")

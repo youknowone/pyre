@@ -57,13 +57,11 @@ pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeEncodeError");
 /// PyPy `pypy/module/exceptions/interp_exceptions.py:426
 /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
-/// W_UnicodeError, ...)` — subclass of UnicodeError.  Identity-only
-/// port (dedicated PyType + ExcKind for isinstance / `ob_type`
-/// discrimination); the 4-arg `(object, start, end, reason)` init
-/// signature and custom `__str__` formatting on the
-/// W_UnicodeTranslateError class itself are not yet ported.  See the
-/// `ExcKind::UnicodeTranslateError` doc for the broader identity-only
-/// pattern across pyre's exception subclasses.
+/// W_UnicodeError, ...)` — subclass of UnicodeError.  A dedicated PyType
+/// + ExcKind for isinstance / `ob_type` discrimination, with the 4-arg
+/// `(object, start, end, reason)` init signature and the class's own
+/// `__str__` formatting.  See the `ExcKind::UnicodeTranslateError` doc
+/// for the field flattening its payload slots follow.
 pub static EXC_UNICODE_TRANSLATE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeTranslateError");
 pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
@@ -195,33 +193,34 @@ pub enum ExcKind {
     UnicodeError = 27,
     /// `pypy/module/exceptions/interp_exceptions.py:426
     /// W_UnicodeTranslateError = _new_exception('UnicodeTranslateError',
-    /// W_UnicodeError, ...)`.  Identity-only port: a dedicated kind so
-    /// `ob_type` and `isinstance` discriminate it correctly; the 4-arg
-    /// `(object, start, end, reason)` `__init__` and custom `__str__`
-    /// remain TODO.
+    /// W_UnicodeError, ...)`.  A dedicated kind so `ob_type` and
+    /// `isinstance` discriminate it correctly, with the 4-arg
+    /// `(object, start, end, reason)` `__init__` and the class's own
+    /// `__str__`.
     ///
     /// Pyre takes the "union of all per-class fields" route: a single
     /// GC type id for `W_BaseException`, with every per-subclass slot
     /// flattened onto it.  W_UnicodeDecodeError / W_UnicodeEncodeError /
     /// W_UnicodeTranslateError carry `w_object`/`w_start`/`w_end`/
     /// `w_reason`/`w_encoding`; W_OSError carries `w_errno`/`w_strerror`/
-    /// `w_filename`/`w_filename2`.  Still identity-only (per-class
-    /// fields not yet flattened): W_StopIteration (`w_value`),
-    /// W_ImportError (`w_name`/`w_path`/`w_msg`), W_AttributeError
-    /// (`w_name`/`w_obj`).  The alternative — per-subclass
-    /// `W_<Kind>Object` structs, one GC type id per kind with isolated
-    /// layouts — would be more PyPy-orthodox but is not implemented.
+    /// `w_filename`/`w_filename2`; W_StopIteration carries `w_value`;
+    /// W_ImportError carries `w_exc_name`/`w_import_path`/`w_import_msg`;
+    /// W_AttributeError carries `w_exc_name`/`w_attr_obj`.  The
+    /// alternative — per-subclass `W_<Kind>Object` structs, one GC type
+    /// id per kind with isolated layouts — would be more PyPy-orthodox
+    /// but is not implemented.
     UnicodeTranslateError = 28,
     /// Subclass of ImportError raised when a module cannot be found.
-    /// Identity-only like ImportError (no flattened per-class fields).
+    /// Reads ImportError's flattened `w_exc_name` / `w_import_path` /
+    /// `w_import_msg` slots.
     ModuleNotFoundError = 29,
     /// `pypy/module/exceptions/interp_exceptions.py W_SyntaxError` —
     /// raised by `compile` / `exec` / `eval` / `ast.parse` on malformed
-    /// source.  Identity-only port: a dedicated kind so `ob_type` and
-    /// `isinstance(e, SyntaxError)` discriminate it; the
-    /// `(msg, (filename, lineno, offset, text))` `__init__` and the
-    /// flattened `msg`/`filename`/`lineno`/`offset`/`text` slots remain
-    /// TODO (the generic `args_w` constructor is used for now).
+    /// source.  A dedicated kind so `ob_type` and
+    /// `isinstance(e, SyntaxError)` discriminate it, with the
+    /// `(msg, (filename, lineno, offset, text))` `__init__` writing the
+    /// flattened `w_syntax_msg` / `w_syntax_filename` /
+    /// `w_syntax_lineno` / `w_syntax_offset` / `w_syntax_text` slots.
     SyntaxError = 30,
     /// Raised when a buffer-related operation cannot proceed — e.g.
     /// resizing a `bytearray` whose storage backs a live `memoryview`

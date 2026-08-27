@@ -12248,86 +12248,314 @@ fn binary_call_generator_error_span(source: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// `python.gram:invalid_assignment_target` calls `_PyPegen_get_expr_name` for
-/// both ordinary and augmented assignments.  RustPython stops at the colon in
-/// a dict comprehension instead, so parse the complete left expression and
-/// restore CPython 3.14's diagnostic for that named target.
-fn dict_comprehension_assignment_error(source: &str) -> Option<(String, usize, usize)> {
-    use rustpython_compiler::ast;
-
-    let bytes = source.as_bytes();
-    let mut delimiters = Vec::new();
-    let mut cursor = 0;
-    let assignment = loop {
-        let byte = *bytes.get(cursor)?;
-        match byte {
-            b'\'' | b'"' => {
-                let quote = byte;
-                let triple = bytes[cursor..].starts_with(&[quote, quote, quote]);
-                cursor += if triple { 3 } else { 1 };
-                while cursor < bytes.len() {
-                    if bytes[cursor] == b'\\' {
-                        cursor = (cursor + 2).min(bytes.len());
-                    } else if triple && bytes[cursor..].starts_with(&[quote, quote, quote]) {
-                        cursor += 3;
-                        break;
-                    } else if !triple && bytes[cursor] == quote {
-                        cursor += 1;
-                        break;
-                    } else {
-                        cursor += 1;
-                    }
-                }
+/// `action_helpers.c _PyPegen_get_expr_name`: the noun `python.gram`'s
+/// assignment diagnostics print for a target expression.
+fn assignment_expr_name(expr: &rustpython_compiler::ast::Expr) -> Option<&'static str> {
+    use rustpython_compiler::ast::Expr;
+    Some(match expr {
+        Expr::Attribute(_) => "attribute",
+        Expr::Subscript(_) => "subscript",
+        Expr::Starred(_) => "starred",
+        Expr::Name(_) => "name",
+        Expr::List(_) => "list",
+        Expr::Tuple(_) => "tuple",
+        Expr::Lambda(_) => "lambda",
+        Expr::Call(_) => "function call",
+        Expr::BoolOp(_) | Expr::BinOp(_) | Expr::UnaryOp(_) => "expression",
+        Expr::Generator(_) => "generator expression",
+        Expr::Yield(_) | Expr::YieldFrom(_) => "yield expression",
+        Expr::Await(_) => "await expression",
+        Expr::ListComp(_) => "list comprehension",
+        Expr::SetComp(_) => "set comprehension",
+        Expr::DictComp(_) => "dict comprehension",
+        Expr::Dict(_) => "dict literal",
+        Expr::Set(_) => "set display",
+        Expr::FString(_) => "f-string expression",
+        Expr::TString(_) => "t-string expression",
+        Expr::NoneLiteral(_) => "None",
+        Expr::BooleanLiteral(node) => {
+            if node.value {
+                "True"
+            } else {
+                "False"
             }
-            b'(' | b'[' | b'{' => {
-                delimiters.push(byte);
-                cursor += 1;
-            }
-            b')' | b']' | b'}' => {
-                delimiters.pop()?;
-                cursor += 1;
-            }
-            b'=' if delimiters.is_empty()
-                && !matches!(
-                    bytes.get(cursor.wrapping_sub(1)),
-                    Some(b'<' | b'>' | b'!' | b'=' | b':')
-                )
-                && bytes.get(cursor + 1) != Some(&b'=') =>
-            {
-                break cursor;
-            }
-            _ => cursor += 1,
         }
-    };
+        Expr::EllipsisLiteral(_) => "ellipsis",
+        Expr::StringLiteral(_) | Expr::BytesLiteral(_) | Expr::NumberLiteral(_) => "literal",
+        Expr::Compare(_) => "comparison",
+        Expr::If(_) => "conditional expression",
+        Expr::Named(_) => "named expression",
+        // `_PyPegen_get_expr_name` raises SystemError for anything else, which
+        // means no assignment diagnostic names it; leave the parser's own.
+        _ => return None,
+    })
+}
 
-    let mut lhs_end = assignment;
-    while lhs_end > 0 && bytes[lhs_end - 1].is_ascii_whitespace() {
-        lhs_end -= 1;
+/// `action_helpers.c _PyPegen_get_invalid_target` for `STAR_TARGETS`: the
+/// innermost element of a target that cannot be assigned to, or `None` when
+/// every element can.  Only a list and a tuple are descended, because those are
+/// the only targets whose elements are themselves targets.
+fn invalid_assignment_target(
+    expr: &rustpython_compiler::ast::Expr,
+) -> Option<&rustpython_compiler::ast::Expr> {
+    use rustpython_compiler::ast::Expr;
+    match expr {
+        Expr::List(node) => node.elts.iter().find_map(invalid_assignment_target),
+        Expr::Tuple(node) => node.elts.iter().find_map(invalid_assignment_target),
+        Expr::Starred(node) => invalid_assignment_target(&node.value),
+        Expr::Name(_) | Expr::Subscript(_) | Expr::Attribute(_) => None,
+        _ => Some(expr),
     }
-    let augmented = matches!(
-        bytes.get(lhs_end.wrapping_sub(1)),
-        Some(b'+' | b'-' | b'*' | b'/' | b'%' | b'@' | b'&' | b'|' | b'^')
-    );
-    if augmented {
-        lhs_end -= 1;
-        while lhs_end > 0 && bytes[lhs_end - 1].is_ascii_whitespace() {
-            lhs_end -= 1;
-        }
+}
+
+/// Whether `expr` is wrapped in parentheses the expression itself does not own.
+///
+/// A parenthesized expression reaches the grammar as an `atom`, so the
+/// precedence tests below see it as one whatever it contains — `(a or b) = 1`
+/// is named the way `f() = 1` is and `a or b = 1` is not.  Ruff's range for a
+/// generator expression and for a parenthesized tuple already covers the
+/// parentheses those two forms own, so both answer false here, which is what
+/// the `!(list|tuple|genexp|...)` guard wants.
+fn parenthesized_expr(source: &str, expr: &rustpython_compiler::ast::Expr) -> bool {
+    source
+        .get(..expr.range().start().to_usize())
+        .is_some_and(|before| before.trim_end().ends_with('('))
+}
+
+/// Whether the target reaches `python.gram:invalid_named_expression`'s third
+/// alternative, which is what prints the `Maybe you meant '=='` form.
+///
+/// That alternative reads `!(list|tuple|genexp|'True'|'None'|'False')
+/// a=bitwise_or '=' bitwise_or !('='|':=')`, so a target above `bitwise_or` in
+/// the precedence chain — a disjunction, an inversion, a comparison, a
+/// conditional expression, a lambda, an unparenthesized named or yield
+/// expression, a starred or an unparenthesized tuple — never matches it, and
+/// the six spelled-out forms are refused outright.
+fn named_expression_assignment_target(source: &str, expr: &rustpython_compiler::ast::Expr) -> bool {
+    use rustpython_compiler::ast::{Expr, UnaryOp};
+    if parenthesized_expr(source, expr) {
+        return true;
     }
-    let lhs_start = bytes[..lhs_end]
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())?;
-    let expression = source.get(lhs_start..lhs_end)?;
-    let parsed = crate::compile::parser::parse_expression(expression).ok()?;
-    if !matches!(parsed.syntax().body.as_ref(), ast::Expr::DictComp(_)) {
+    !matches!(
+        expr,
+        Expr::List(_)
+            | Expr::Tuple(_)
+            | Expr::Generator(_)
+            | Expr::NoneLiteral(_)
+            | Expr::BooleanLiteral(_)
+            | Expr::BoolOp(_)
+            | Expr::Compare(_)
+            | Expr::If(_)
+            | Expr::Lambda(_)
+            | Expr::Named(_)
+            | Expr::Yield(_)
+            | Expr::YieldFrom(_)
+            | Expr::Starred(_)
+    ) && !matches!(
+        expr,
+        Expr::UnaryOp(node) if node.op == UnaryOp::Not
+    )
+}
+
+/// Whether the assigned value begins with a `bitwise_or`, which is the second
+/// half of that same alternative.
+///
+/// The alternative consumes only a `bitwise_or` prefix of the value and then
+/// refuses a following `=` or `:=`, so `f() = a if b else c` matches on `a`
+/// while `f() = yield x`, `f() = *a,` and `f() = a := 1` do not.
+fn value_opens_with_bitwise_or(source: &str, expr: &rustpython_compiler::ast::Expr) -> bool {
+    use rustpython_compiler::ast::{Expr, UnaryOp};
+    if expr.range().is_empty() {
+        return false;
+    }
+    if parenthesized_expr(source, expr) {
+        return true;
+    }
+    match expr {
+        Expr::Yield(_) | Expr::YieldFrom(_) | Expr::Starred(_) | Expr::Lambda(_) => false,
+        Expr::Named(_) => false,
+        Expr::UnaryOp(node) if node.op == UnaryOp::Not => false,
+        Expr::BoolOp(node) => node
+            .values
+            .first()
+            .is_some_and(|value| value_opens_with_bitwise_or(source, value)),
+        Expr::BinOp(node) => value_opens_with_bitwise_or(source, &node.left),
+        Expr::Compare(node) => value_opens_with_bitwise_or(source, &node.left),
+        Expr::If(node) => value_opens_with_bitwise_or(source, &node.body),
+        Expr::Tuple(node) => node
+            .elts
+            .first()
+            .is_some_and(|value| value_opens_with_bitwise_or(source, value)),
+        _ => true,
+    }
+}
+
+/// The `!('='|':=')` half of that alternative, read off the text: a recovering
+/// parse ends the statement at the operator it could not use, so what follows
+/// the value is what the lookahead would have seen.
+fn value_followed_by_assignment(source: &str, value_end: usize) -> bool {
+    let rest = source.get(value_end..).unwrap_or_default().trim_start();
+    rest.starts_with(":=") || (rest.starts_with('=') && !rest.starts_with("=="))
+}
+
+/// The span of the augmented-assignment operator between a target and a value.
+fn augassign_operator_span(
+    source: &str,
+    target_end: usize,
+    value_start: usize,
+) -> Option<(usize, usize)> {
+    let gap = source.get(target_end..value_start)?;
+    let start = target_end + (gap.len() - gap.trim_start().len());
+    let end = target_end + gap.trim_end().len();
+    (start < end).then_some((start, end))
+}
+
+/// `python.gram:invalid_assignment` / `invalid_named_expression` name the
+/// assignment target with `_PyPegen_get_expr_name` and choose between three
+/// messages by the shape of the statement.  Ruff reaches only some of them, and
+/// for the rest reports either a generic parse failure or the target's source
+/// text, so rebuild the diagnostic from the statement the recovering parse
+/// produced.
+///
+/// The recovered tree is what makes this decidable: the alternatives turn on
+/// the number of targets, on the precedence of the target and of the value, and
+/// on whether either was parenthesized — none of which a scan of the text
+/// answers.  A statement whose target is assignable is left alone, which is how
+/// an error elsewhere in it keeps the parser's own message.
+fn assignment_target_error(
+    error: &crate::compile::CompileError,
+    source: &str,
+) -> Option<(String, usize, usize)> {
+    use rustpython_compiler::ast::{self, Expr, Stmt, visitor::Visitor};
+
+    // Both statements this reads are spelled with one, and the recovering parse
+    // below is a second parse of the whole source: skip it for the failures that
+    // cannot be an assignment at all.
+    if !source.contains('=') {
         return None;
     }
-    let message = if augmented {
-        "'dict comprehension' is an illegal expression for augmented assignment".to_owned()
-    } else {
-        "cannot assign to dict comprehension here. Maybe you meant '==' instead of '='?".to_owned()
+
+    // A bracket left open swallows the rest of the file, so the statements the
+    // recovering parse hands back are not the ones the grammar saw and the
+    // tokenizer's own complaint is about the whole source rather than any one
+    // of them.
+    if let crate::compile::CompileError::Parse(parse_error) = error
+        && parse_error.is_unclosed_bracket
+    {
+        return None;
+    }
+
+    // The location the diagnostic is being REPORTED at, not the range the parser
+    // stopped on: the CPython-shaped override already moved some diagnostics off
+    // the token that failed, and it is the reported one that has to belong to
+    // the statement named below.  A parser diagnostic counts that column in
+    // characters and a compiler one in UTF-8 bytes, the same split the caller
+    // makes when it converts back.
+    let (lineno, offset) = error.python_location();
+    let error_index = match error {
+        crate::compile::CompileError::Parse(_) => source_character_index(source, lineno, offset)?,
+        crate::compile::CompileError::Codegen(_) => source_byte_index(source, lineno, offset)?,
     };
-    Some((message, lhs_start, lhs_end))
+
+    struct AssignmentFinder<'a> {
+        index: usize,
+        found: Option<&'a Stmt>,
+    }
+
+    impl<'a> Visitor<'a> for AssignmentFinder<'a> {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            let range = statement.range();
+            if !(range.start().to_usize() <= self.index && self.index <= range.end().to_usize()) {
+                return;
+            }
+            if matches!(statement, Stmt::Assign(_) | Stmt::AugAssign(_)) {
+                self.found = Some(statement);
+            }
+            ast::visitor::walk_stmt(self, statement);
+        }
+    }
+
+    let parsed = crate::compile::parser::parse_unchecked_source(source, ast::PySourceType::Python);
+    let mut finder = AssignmentFinder {
+        index: error_index,
+        found: None,
+    };
+    for statement in &parsed.syntax().body {
+        finder.visit_stmt(statement);
+    }
+    let span = |expr: &Expr| {
+        (
+            expr.range().start().to_usize(),
+            expr.range().end().to_usize(),
+        )
+    };
+
+    match finder.found? {
+        Stmt::AugAssign(node) => {
+            let target = node.target.as_ref();
+            // `single_target` is the only augmented target the grammar accepts,
+            // so anything else reaches `invalid_assignment`'s last alternative.
+            if matches!(
+                target,
+                Expr::Name(_) | Expr::Attribute(_) | Expr::Subscript(_)
+            ) {
+                return None;
+            }
+            // That alternative reads `star_expressions augassign`, and an
+            // unparenthesized yield is not one: the parse stops at the operator.
+            if matches!(target, Expr::Yield(_) | Expr::YieldFrom(_))
+                && !parenthesized_expr(source, target)
+            {
+                let (start, end) = augassign_operator_span(
+                    source,
+                    target.range().end().to_usize(),
+                    node.value.range().start().to_usize(),
+                )?;
+                return Some(("invalid syntax".to_owned(), start, end));
+            }
+            let name = assignment_expr_name(target)?;
+            let (start, end) = span(target);
+            Some((
+                format!("'{name}' is an illegal expression for augmented assignment"),
+                start,
+                end,
+            ))
+        }
+        Stmt::Assign(node) => {
+            // `(star_targets '=')* a=yield_expr '='` carries its own message.
+            if let Some(target) = node.targets.iter().find(|target| {
+                matches!(target, Expr::Yield(_) | Expr::YieldFrom(_))
+                    && !parenthesized_expr(source, target)
+            }) {
+                let (start, end) = span(target);
+                return Some((
+                    "assignment to yield expression not possible".to_owned(),
+                    start,
+                    end,
+                ));
+            }
+            // `(star_targets '=')*` consumes the assignable targets ahead of the
+            // one that fails, which is why a chain reports its second target.
+            let invalid = node.targets.iter().find_map(invalid_assignment_target)?;
+            if let [target] = node.targets.as_slice()
+                && named_expression_assignment_target(source, target)
+                && value_opens_with_bitwise_or(source, &node.value)
+                && !value_followed_by_assignment(source, node.value.range().end().to_usize())
+            {
+                let name = assignment_expr_name(target)?;
+                let (start, end) = span(target);
+                return Some((
+                    format!("cannot assign to {name} here. Maybe you meant '==' instead of '='?"),
+                    start,
+                    end,
+                ));
+            }
+            let name = assignment_expr_name(invalid)?;
+            let (start, end) = span(invalid);
+            Some((format!("cannot assign to {name}"), start, end))
+        }
+        _ => None,
+    }
 }
 
 /// `Parser/string_parser.c parse_string_literal` raises the non-ASCII bytes
@@ -12918,111 +13146,156 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         })
     }
 
+    // `_is_end_of_source`: the tokenizer state the incomplete-input flag is read
+    // against.  `eval` parses one expression and stops at the first token that
+    // cannot continue it, so its tokenizer reaches the end of the source only
+    // when nothing earlier went wrong -- `x=[1,` fails at the `=`, three
+    // characters before the bracket that is left open, and is a program that is
+    // wrong where it stands however much more input follows it.
+    //
+    // `raw_location` is the parser's own range, which the CPython-shaped
+    // diagnostic override does not rewrite, and it is the only place that first
+    // failure survives: the override picks its message by scanning the whole
+    // source, so an unfinished construct anywhere in it replaces the one the
+    // parser actually stopped on.
+    //
+    // The block and interactive parsers stop at a statement boundary instead,
+    // where an unfinished compound statement legitimately fails ahead of the
+    // end -- `if 1:` wants an indented block the source has not reached -- so
+    // the test is `eval`'s alone.
+    fn parse_reached_end_of_source(e: &crate::compile::CompileError, source: &str) -> bool {
+        match e {
+            crate::compile::CompileError::Parse(error) => {
+                error.raw_location.end().to_usize() >= source.len()
+            }
+            crate::compile::CompileError::Codegen(_) => false,
+        }
+    }
+
     let incomplete = match allow_incomplete {
         None => false,
         // A source holding no statement is unfinished for whichever parser
         // wanted one, so the mode does not enter here.
         Some(_) if holds_no_statement(source) => true,
-        // `eval` parses one expression and reaches its own end-of-input error
-        // ahead of the flag: a source that stops mid-expression is reported as
-        // the syntax error it is, whatever the flag asks for.
-        Some(crate::compile::Mode::Eval) => false,
-        Some(mode) => match &e {
-            crate::compile::CompileError::Parse(error) => match &error.error {
-                ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
-                _ if error.is_unclosed_bracket => true,
-                ParseErrorType::Lexical(LexicalErrorType::FStringError(
-                    InterpolatedStringErrorType::UnterminatedTripleQuotedString,
-                )) => true,
-                ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
-                    let loc = error.raw_location.start().to_usize();
-                    // A triple-quoted literal left open wants more input under
-                    // either parser.  A single-quoted one still open at the end
-                    // of the source is unfinished only for the interactive
-                    // parser, which has another line to read; a block parser
-                    // holds all the input there is and reports the literal as
-                    // unterminated.
-                    opens_triple_quote(source, loc)
-                        || (matches!(mode, crate::compile::Mode::Single)
-                            && string_continues_to_eof(source, loc))
-                }
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("Expected an indented block after")
-                        || message.starts_with("expected an indented block after") =>
-                {
-                    // Byte offsets again: the span covers the blank run that
-                    // should have held the indented block.
-                    let bytes = source.as_bytes();
-                    let from = error
-                        .raw_location
-                        .start()
-                        .to_usize()
-                        .saturating_add(1)
-                        .min(bytes.len());
-                    let to = error
-                        .raw_location
-                        .end()
-                        .to_usize()
-                        .saturating_add(1)
-                        .min(bytes.len());
-                    from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
-                }
-                // `codeop._maybe_compile` retries a failed command with one
-                // trailing newline.  The pinned RustPython parser reports the
-                // first unterminated triple quote as `UnclosedStringError`,
-                // but the newline retry as this `OtherError` shape.  CPython
-                // keeps both attempts incomplete; preserve RustPython's
-                // triple-quote test across that parser-shape variation.
-                // `unterminated_string_message` writes `triple-quoted` only
-                // for a literal opened with three quotes, so the message is
-                // itself the evidence and no position has to be read: such a
-                // literal runs to the end of the source by construction, which
-                // is `E_EOFS` -- more input wanted.  `raw_location` cannot
-                // answer it anyway, being ruff's own range rather than the one
-                // the CPython-shaped override reports; for `f"""` the two sit
-                // on different offsets.
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("unterminated triple-quoted ") =>
-                {
-                    true
-                }
-                // The single-quoted spelling arrives the same way, and the
-                // generic arm below reads only whether the source ends on a
-                // newline -- which answers `a = 'a` but gets `a = 'a\` with one
-                // appended wrong, the one shape `codeop._maybe_compile` builds
-                // for every command it retries.
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("unterminated string literal") =>
-                {
-                    let loc = error.raw_location.start().to_usize();
-                    // A triple-quoted literal left open wants more input under
-                    // either parser.  A single-quoted one still open at the end
-                    // of the source is unfinished only for the interactive
-                    // parser, which has another line to read; a block parser
-                    // holds all the input there is and reports the literal as
-                    // unterminated.
-                    opens_triple_quote(source, loc)
-                        || (matches!(mode, crate::compile::Mode::Single)
-                            && string_continues_to_eof(source, loc))
-                }
-                // A closing bracket with no opener, or one that does not
-                // match the opener, is wrong where it stands rather than short
-                // of input: the tokenizer reports it away from `E_EOF`, so no
-                // continuation makes it parse.  `'x' was never closed` is the
-                // opposite case and `is_unclosed_bracket` answers it above.
-                ParseErrorType::OtherError(message)
-                    if message.starts_with("unmatched ")
-                        || message.starts_with("closing parenthesis ") =>
-                {
-                    false
-                }
-                ParseErrorType::OtherError(_) => {
-                    error.raw_location.end().to_usize() >= source.len() && !source.ends_with('\n')
-                }
+        Some(mode) => {
+            let unfinished = match &e {
+                crate::compile::CompileError::Parse(error) => match &error.error {
+                    ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
+                    _ if error.is_unclosed_bracket => true,
+                    ParseErrorType::Lexical(LexicalErrorType::FStringError(
+                        InterpolatedStringErrorType::UnterminatedTripleQuotedString,
+                    )) => true,
+                    ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
+                        let loc = error.raw_location.start().to_usize();
+                        // A triple-quoted literal left open wants more input under
+                        // every parser.  A single-quoted one still open at the end
+                        // of the source is reported as unterminated only by the
+                        // block parser, which holds all the input there is; the
+                        // interactive parser has another line to read and `eval`,
+                        // wanting one expression, stops at the end of the input it
+                        // was given, so for both the literal is unfinished.
+                        opens_triple_quote(source, loc)
+                            || (!matches!(mode, crate::compile::Mode::Exec)
+                                && string_continues_to_eof(source, loc))
+                    }
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("Expected an indented block after")
+                            || message.starts_with("expected an indented block after") =>
+                    {
+                        // Byte offsets again: the span covers the blank run that
+                        // should have held the indented block.
+                        let bytes = source.as_bytes();
+                        let from = error
+                            .raw_location
+                            .start()
+                            .to_usize()
+                            .saturating_add(1)
+                            .min(bytes.len());
+                        let to = error
+                            .raw_location
+                            .end()
+                            .to_usize()
+                            .saturating_add(1)
+                            .min(bytes.len());
+                        from <= to && bytes[from..to].iter().all(u8::is_ascii_whitespace)
+                    }
+                    // `codeop._maybe_compile` retries a failed command with one
+                    // trailing newline.  The pinned RustPython parser reports the
+                    // first unterminated triple quote as `UnclosedStringError`,
+                    // but the newline retry as this `OtherError` shape.  CPython
+                    // keeps both attempts incomplete; preserve RustPython's
+                    // triple-quote test across that parser-shape variation.
+                    // `unterminated_string_message` writes `triple-quoted` only
+                    // for a literal opened with three quotes, so the message is
+                    // itself the evidence and no position has to be read: such a
+                    // literal runs to the end of the source by construction, which
+                    // is `E_EOFS` -- more input wanted.  `raw_location` cannot
+                    // answer it anyway, being ruff's own range rather than the one
+                    // the CPython-shaped override reports; for `f"""` the two sit
+                    // on different offsets.
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unterminated triple-quoted ") =>
+                    {
+                        true
+                    }
+                    // The single-quoted spelling arrives the same way, and the
+                    // generic arm below reads only whether the source ends on a
+                    // newline -- which answers `a = 'a` but gets `a = 'a\` with one
+                    // appended wrong, the one shape `codeop._maybe_compile` builds
+                    // for every command it retries.
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unterminated string literal") =>
+                    {
+                        let loc = error.raw_location.start().to_usize();
+                        // A triple-quoted literal left open wants more input under
+                        // every parser.  A single-quoted one still open at the end
+                        // of the source is reported as unterminated only by the
+                        // block parser, which holds all the input there is; the
+                        // interactive parser has another line to read and `eval`,
+                        // wanting one expression, stops at the end of the input it
+                        // was given, so for both the literal is unfinished.
+                        opens_triple_quote(source, loc)
+                            || (!matches!(mode, crate::compile::Mode::Exec)
+                                && string_continues_to_eof(source, loc))
+                    }
+                    // A closing bracket with no opener, or one that does not
+                    // match the opener, is wrong where it stands rather than short
+                    // of input: the tokenizer reports it away from `E_EOF`, so no
+                    // continuation makes it parse.  `'x' was never closed` is the
+                    // opposite case and `is_unclosed_bracket` answers it above.
+                    ParseErrorType::OtherError(message)
+                        if message.starts_with("unmatched ")
+                            || message.starts_with("closing parenthesis ") =>
+                    {
+                        false
+                    }
+                    // Whatever else stopped the parse on the last token of a
+                    // source carrying no trailing newline ran out of input
+                    // rather than reading something wrong: the tokenizer sits
+                    // at `E_EOF`, so a further line can still complete it.
+                    // `exec` reads its source the way a file is read, with the
+                    // missing newline supplied for it, so past the shapes above
+                    // its failures are final -- only the `OtherError`
+                    // spellings, the decorator and the line continuation among
+                    // them, still want more input there.
+                    error_type
+                        if matches!(error_type, ParseErrorType::OtherError(_))
+                            || !matches!(mode, crate::compile::Mode::Exec) =>
+                    {
+                        error.raw_location.end().to_usize() >= source.len()
+                            && !source.ends_with('\n')
+                    }
+                    _ => false,
+                },
                 _ => false,
-            },
-            _ => false,
-        },
+            };
+            // `eval` reads the flag against a tokenizer that stopped where the
+            // expression did, so a failure short of the end of the source is a
+            // syntax error whatever the shape tests above say.
+            unfinished
+                && (!matches!(mode, crate::compile::Mode::Eval)
+                    || parse_reached_end_of_source(&e, source))
+        }
     };
 
     // `syntax_error_subclass` can supply a replacement message, so it
@@ -13215,7 +13488,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     if generator_span.is_some() {
         msg = "invalid syntax".to_owned();
     }
-    let assignment_error = dict_comprehension_assignment_error(source);
+    let assignment_error = assignment_target_error(&e, source);
     if let Some((replacement, _, _)) = &assignment_error {
         msg = replacement.clone();
     }
@@ -13237,12 +13510,17 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let escape_span = escape_error
         .filter(|escape| escape.message == msg)
         .map(|escape| escape.span);
+    // `assignment_span` precedes the three spans whose messages `msg` has
+    // already overwritten above, so the span and the message name the same
+    // construct: an invalid assignment target inside an f-string replacement
+    // field, or in a `yield`/`await` the recovered tree parenthesized, reaches
+    // both this and the shape test that ran first.
     let diagnostic_span = escape_span
         .or(literal_span)
+        .or(assignment_span)
         .or(fstring_span)
         .or(scope_span)
         .or(generator_span)
-        .or(assignment_span)
         .or(prefix_span)
         .or(delimiter_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
