@@ -10,14 +10,18 @@ already at the root of this repository.
 ## Run it
 
 ```sh
-cd majit/examples/regex/rpython_original
-PYTHONPATH=/path/to/pyre pypy runner.py 20 4096
+pypy majit/examples/regex/rpython_original/runner.py 20 4096
 ```
 
-`PYTHONPATH` is the repository root, because that is where `rpython/` lives.
-The interpreter must be a Python 2 (`pypy`, or a `python2` with the RPython
-checkout importable) — RPython's own toolchain is Python 2, and these files are
-written in it.
+Runnable from any directory, and nothing has to be installed or exported:
+`runner.py` walks up from its own path to find the `rpython/` checkout at this
+repository's root and puts it on `sys.path` itself.
+
+**It must be `pypy`, not `python3`.** RPython's toolchain is Python 2 and these
+files are written in it (any Python 2 with the checkout importable works).
+Running it under Python 3 prints the `pypy` command line to use and exits 2,
+rather than failing with a `print`-statement `SyntaxError` that names the wrong
+problem.
 
 Arguments are `n` (the regex's `{n}` repetition count, default 20) and the input
 length (default 4096). `--listing` additionally prints the peeled body op by op.
@@ -138,7 +142,7 @@ never masks a `Bool`.
 To read the two bodies side by side:
 
 ```sh
-PYTHONPATH=/path/to/pyre pypy runner.py 20 4096 --listing
+pypy majit/examples/regex/rpython_original/runner.py 20 4096 --listing
 REGEX_LISTING=1 cargo test -p regex --no-default-features --features dynasm \
     -- --nocapture the_branching_body_trades_ops_for_guards
 ```

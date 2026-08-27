@@ -452,8 +452,7 @@ fn main() {
     println!("against the RPython original and nothing else, so the pure-Python, C++ and");
     println!("CPython `re` rows have no port here and no number below is one of theirs. The");
     println!("comparison that IS owed is a trace comparison, not a speed one:");
-    println!("  cd majit/examples/regex/rpython_original && PYTHONPATH=<repo root> \\");
-    println!("      pypy runner.py {N} 4096");
+    println!("  pypy majit/examples/regex/rpython_original/runner.py {N} 4096");
     println!();
     println!("NOT MEASURED BY THIS RUN, AND NOT THIS MACHINE — the 2010 post's own figures, on");
     println!("its own hardware (Intel Core2 Duo P8400, 2.26GHz). Sixteen years and a different");
