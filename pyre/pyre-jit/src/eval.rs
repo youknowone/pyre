@@ -6512,7 +6512,11 @@ pub fn should_unroll_one_iteration(
         ptr if ptr.is_null() => false,
         code_ptr => {
             let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
-            code.flags.contains(pyre_interpreter::CodeFlags::GENERATOR)
+            // ITERABLE_COROUTINE and ASYNC_GENERATOR are deliberately not
+            // tested: the hook selects only the two bits upstream selects.
+            code.flags.intersects(
+                pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR,
+            )
         }
     }
 }
