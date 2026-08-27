@@ -1980,6 +1980,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         ec,
     );
 
+    // `pyframe.py execute_frame`'s `ec.enter(self)`, which upstream records
+    // ahead of the callee's `jit_merge_point` and this fold otherwise jumps
+    // over: without it the activation the CALL_ASSEMBLER runs never reaches
+    // `topframeref`, so `sys._getframe().f_back` walks straight from the
+    // callee's callee to this caller and every level in between is missing.
+    record_ec_enter_frame_chain(ctx.trace_ctx, callee_frame, ec);
+
     // do_residual_call step 1 (`pyjitpl.py`): FORCE_TOKEN +
     // SETFIELD_GC(vable_token) before the assembler call.
     maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
@@ -2150,6 +2157,20 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // `pyjitpl.py:2080-2081` keeps the assembler virtualizable alive after
     // the force guard has captured its resume data.
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
+    // `execute_frame`'s `finally: ec.leave(...)`.  A `finally` runs on every
+    // exit, and compiled code has no such construct, so the restore is
+    // recorded at the earliest point the call is known to have returned:
+    // after GUARD_NOT_FORCED, which `pyjitpl.py:2049-2079` keeps adjacent to
+    // the call, and BEFORE the exception guard.  Recording it past the
+    // exception guard instead would skip the restore on exactly the exit that
+    // needs it — a raising callee deopts at the guard, leaving the callee
+    // frame published in `topframeref` for the next `enter` to chain onto, and
+    // the root walker then traverses a chain that grows once per raise
+    // (`walk_pyframe_roots_area` took 100% of a profile of
+    // `synth/list_length_hint_validate`, which raises on four of every six
+    // calls).  The residual exposure — a failing GUARD_NOT_FORCED — is the one
+    // `TopFrameRefGuard` (`pyre-jit/src/eval.rs`) already covers.
+    record_ec_leave_frame_chain(ctx.trace_ctx, callee_frame, ec);
     // pyjitpl.py `handle_possible_exception`.
     if exec_raised {
         // Raising branch (pyjitpl.py): `GUARD_EXCEPTION` with
@@ -3365,6 +3386,82 @@ pub(crate) fn walker_ec_leave(
     }
     // `jit.virtual_ref_finish(frame_vref, frame)`.
     ctx.opimpl_virtual_ref_finish(callee_frame);
+}
+
+/// `executioncontext.py ExecutionContext.enter`'s frame-chain half, recorded
+/// with no concrete shadow.
+///
+/// ```python
+/// frame.f_backref = self.topframeref
+/// self.topframeref = jit.virtual_ref(frame)
+/// ```
+///
+/// [`walker_ec_enter`] is the seeded-callee form: it has a live callee frame
+/// at recording time, so it mirrors every store concretely and takes a real
+/// vref of the frame.  The CALL_ASSEMBLER folds build their callee frame out
+/// of recorded operations alone — `emit_new_pyframe_inline_with_params` never
+/// materializes one during the walk — so there is nothing to store into and
+/// nothing to take a vref of until the compiled loop runs.  What is recorded
+/// here is the interpreter-level reading of `jit.virtual_ref(frame)`, which
+/// is the frame pointer itself (`_jit_vref.py lowleveltype = OBJECTPTR`, no
+/// allocation) and is exactly what [`pyre_interpreter::PyExecutionContext::enter`]
+/// stores.
+///
+/// Upstream reaches `ec.enter` on this path too: `interp_jit.py` puts
+/// `jit_merge_point` on `PyFrame.dispatch`, so the CALL_ASSEMBLER that
+/// replaces the callee's merge point is recorded with `pyframe.py
+/// execute_frame`'s `ec.enter(self)` already traced ahead of it.  pyre's
+/// portal sits one level up, at `execute_frame` itself, so the fold jumps
+/// over the enter unless it records it here.
+fn record_ec_enter_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_ec: OpRef) {
+    let caller_topframeref = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[callee_ec],
+        crate::descr::ec_topframeref_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_frame, caller_topframeref],
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_ec, callee_frame],
+        crate::descr::ec_topframeref_descr(),
+    );
+}
+
+/// `executioncontext.py ExecutionContext.leave`'s frame-chain half, in
+/// `execute_frame`'s `finally` position, recorded with no concrete shadow.
+///
+/// ```python
+/// self.topframeref = frame.f_backref
+/// ```
+///
+/// No parens on `f_backref`, so a caller frame that stayed virtual stays
+/// virtual.  The escape branch and `virtual_ref_finish` that [`walker_ec_leave`]
+/// carries have no counterpart here for the same reason the enter takes no
+/// vref: this level never held one.  The profile-hook half stays with
+/// [`pyre_interpreter::PyExecutionContext::leave`] — see [`walker_ec_leave`]
+/// for why the portal-driver GREEN makes that split sound.
+///
+/// Record this at the earliest point the call is known to have returned, not
+/// on the trace's fall-through tail: a guard recorded ahead of it skips it on
+/// the exit it is needed for, and every skipped restore leaves a frame
+/// published in `topframeref` that the next `enter` chains onto.  The portal's
+/// `TopFrameRefGuard` (`pyre-jit/src/eval.rs`) balances the slot only when the
+/// activation itself ends, which is far too late for a loop that raises.
+fn record_ec_leave_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_ec: OpRef) {
+    let f_backref = ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[callee_frame],
+        crate::descr::pyframe_f_backref_descr(),
+    );
+    ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[callee_ec, f_backref],
+        crate::descr::ec_topframeref_descr(),
+    );
 }
 
 /// Resolve the generated builtin-wrapper argument slice's array-item
