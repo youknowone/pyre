@@ -1852,7 +1852,14 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
     // receiver. The bool tells all call entrypoints which of the two applies.
     // (`get_and_call_function`'s narrower `type(w_descr) is Function` test is
     // for the *other* entrypoint and must not be used here.)
-    if unsafe { crate::is_function(call_fn) } {
+    // A slot wrapper is the same shape: it takes the receiver as its first
+    // positional argument, and `__get__` on one only wraps it back up so the
+    // wrapper and the binding it would produce reach the same slot.  It is
+    // worth naming separately because it is what a natively implemented
+    // `__call__` is -- `_ctypes`'s is one -- and binding it costs an object
+    // per call.  `wrapper_descriptor` is not acceptable as a base class, so no
+    // `__get__` of another shape can arrive here.
+    if unsafe { crate::is_function(call_fn) || crate::is_slot_wrapper(call_fn) } {
         return Ok(Some((call_fn, true)));
     }
     let bound = unsafe { crate::baseobjspace::get(call_fn, callable, w_type) }?.unwrap_or(call_fn);
