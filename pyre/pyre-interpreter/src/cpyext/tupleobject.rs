@@ -5,6 +5,7 @@ use super::pyobject::{self, CPyObject};
 use super::typeobject::{CPyTypeObject, CPyVarObject};
 use pyre_object::PyObjectRef;
 use std::ffi::c_int;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// `PyTupleObject` -- the header, and the items that follow it.
 ///
@@ -57,6 +58,18 @@ pub(super) fn item_bytes(w_obj: PyObjectRef, ob_type: *mut CPyTypeObject) -> usi
         .saturating_mul(size_of::<*mut CPyObject>())
 }
 
+/// One slot of an in-block item array, as the atomic every writer goes through.
+///
+/// The array's address is handed to C, which reads a slot as a plain word --
+/// `PyTuple_GET_ITEM` is that read, and upstream's is no different.  What has
+/// to agree is this layer's own writes: a first reader filling a slot, a
+/// `PyTuple_SET_ITEM` replacing one and a teardown clearing one are three
+/// threads with no lock between them, the side table this replaced having been
+/// the thing that used to serialise them.
+unsafe fn slot<'a>(items: *mut *mut CPyObject, index: usize) -> &'a AtomicPtr<CPyObject> {
+    unsafe { AtomicPtr::from_ptr(items.add(index)) }
+}
+
 /// Where `raw`'s items sit, for a block that carries them.
 ///
 /// The count is `ob_size`, which [`super::typeobject::stamp_ob_size`] filled
@@ -87,7 +100,10 @@ fn items_in_block(raw: *mut CPyObject) -> Option<(*mut *mut CPyObject, usize)> {
 /// reference.
 fn fill_missing(raw: *mut CPyObject, items: *mut *mut CPyObject, length: usize) {
     for index in 0..length {
-        if !unsafe { items.add(index).read() }.is_null() {
+        if !unsafe { slot(items, index) }
+            .load(Ordering::Acquire)
+            .is_null()
+        {
             continue;
         }
         // Read the tuple back through the mirror before each `make_ref`: that
@@ -100,18 +116,30 @@ fn fill_missing(raw: *mut CPyObject, items: *mut *mut CPyObject, length: usize) 
         let item = unsafe { pyre_object::tupleobject::w_tuple_getitem(w_tuple, index as i64) };
         let Some(item) = item else { continue };
         let entry = pyobject::make_ref(item);
-        // Written only if the slot is still owed: the `make_ref` above can
-        // reach a reader that filled it, and two references would be one more
-        // than the block gives back.
-        match unsafe { items.add(index).read() }.is_null() {
-            true => unsafe { items.add(index).write(entry) },
-            false => unsafe { pyobject::decref(entry) },
+        // Published only if the slot is still owed, and the test and the write
+        // are one step: the `make_ref` above can reach a reader that filled it,
+        // and two references would be one more than the block gives back.
+        if unsafe { slot(items, index) }
+            .compare_exchange(
+                std::ptr::null_mut(),
+                entry,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            unsafe { pyobject::decref(entry) };
         }
     }
 }
 
 /// Give back the references a dying tuple mirror's items owned --
 /// `tupleobject.py tuple_dealloc`.
+///
+/// A `tp_dealloc` that resurrects the block leaves these slots cleared, and
+/// they are owed again rather than lost: `PyTuple_GET_ITEM(ob, i)` is
+/// `_PyTuple_ITEMS(ob)[i]`, so the next read fills them from the tuple the
+/// restored link answers with.
 pub(super) fn forget_block(raw: *mut CPyObject) {
     let Some((items, length)) = items_in_block(raw) else {
         return;
@@ -119,7 +147,7 @@ pub(super) fn forget_block(raw: *mut CPyObject) {
     for index in 0..length {
         // Cleared before the release: a deallocator this runs can reach the
         // same block, and has to find a slot it will not release twice.
-        let entry = unsafe { items.add(index).replace(std::ptr::null_mut()) };
+        let entry = unsafe { slot(items, index) }.swap(std::ptr::null_mut(), Ordering::AcqRel);
         unsafe { pyobject::decref(entry) };
     }
 }
@@ -272,7 +300,7 @@ fn replace_item(
     if index >= length {
         return None;
     }
-    Some(unsafe { items.add(index).replace(item) })
+    Some(unsafe { slot(items, index) }.swap(item, Ordering::AcqRel))
 }
 
 /// `PyTuple_SET_ITEM(op, i, v)` -- slot `i` is given `v`, whatever it held
