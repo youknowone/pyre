@@ -43,7 +43,7 @@ impl Eq for IdentityKey {}
 /// `IdentityDictStrategy` backing — erased identity-keyed `{}`
 /// (`identitydict.py:30`). GC-managed storage box (mirrors the other
 /// dict strategies; see `dictmultiobject::ObjectDictStorage`).
-pub type IdentityDictStorage = indexmap::IndexMap<IdentityKey, PyObjectRef>;
+pub type IdentityDictStorage = crate::rordereddict::RDict<IdentityKey, PyObjectRef>;
 
 /// Runtime-assigned GC type id for the [`IdentityDictStorage`] box.
 static IDENTITY_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
@@ -67,11 +67,9 @@ pub fn identity_dict_storage_gc_type_id() -> u32 {
 /// `obj` must point to a valid `W_DictObject` on
 /// [`IDENTITY_DICT_STRATEGY`].
 #[inline]
-unsafe fn identity_storage<'a>(
-    obj: PyObjectRef,
-) -> &'a indexmap::IndexMap<IdentityKey, PyObjectRef> {
+unsafe fn identity_storage<'a>(obj: PyObjectRef) -> &'a IdentityDictStorage {
     let dict = &*(obj as *const crate::dictmultiobject::W_DictObject);
-    &*(dict.dstorage as *const indexmap::IndexMap<IdentityKey, PyObjectRef>)
+    &*(dict.dstorage as *const IdentityDictStorage)
 }
 
 /// Internal helper: `IdentityDictStrategy::getitem` body.  Caller must have
@@ -102,8 +100,8 @@ pub unsafe fn w_dict_lookup_identity_strategy(
 /// Residualise the storage remove alone (`@dont_look_inside`,
 /// `rlib/jit.py:139`), the delete twin of [`w_dict_lookup_identity_strategy`]:
 /// upstream's `_ll_dict_del` (`rordereddict.py`) carries
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and an
-/// `IndexMap` can never be virtual to this front end, so the predicate is
+/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(i))`, and the
+/// storage can never be virtual to this front end, so the predicate is
 /// permanently false and the residual arm is the only one reachable.  The
 /// keys-version bump stays traced.
 ///
@@ -112,7 +110,7 @@ pub unsafe fn w_dict_lookup_identity_strategy(
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_dict_delete_identity_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
     identity_storage_mut(obj)
-        .shift_remove(&IdentityKey(key))
+        .remove(&IdentityKey(key))
         .is_some()
 }
 
@@ -174,11 +172,9 @@ pub unsafe fn w_dict_switch_identity_to_object_strategy(w_dict: PyObjectRef) {
 }
 
 #[inline]
-unsafe fn identity_storage_mut<'a>(
-    obj: PyObjectRef,
-) -> &'a mut indexmap::IndexMap<IdentityKey, PyObjectRef> {
+unsafe fn identity_storage_mut<'a>(obj: PyObjectRef) -> &'a mut IdentityDictStorage {
     let dict = &mut *(obj as *mut crate::dictmultiobject::W_DictObject);
-    &mut *(dict.dstorage as *mut indexmap::IndexMap<IdentityKey, PyObjectRef>)
+    &mut *(dict.dstorage as *mut IdentityDictStorage)
 }
 
 /// `identitydict.py IdentityDictStrategy`.
@@ -350,12 +346,22 @@ impl DictStrategy for IdentityDictStrategy {
         index: usize,
     ) -> Option<(PyObjectRef, PyObjectRef)> {
         identity_storage(w_dict)
-            .get_index(index)
+            .get_slot(index)
             .map(|(k, &v)| (k.0, v))
     }
 
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-        identity_storage(w_dict).get_index(index).map(|(_, &v)| v)
+        identity_storage(w_dict).get_slot(index).map(|(_, &v)| v)
+    }
+
+    /// A delete leaves a tombstone rather than closing the hole, so the
+    /// entries are not numbered densely and the default would walk positions.
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
+        identity_storage(w_dict).next_valid_slot(from)
+    }
+
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
+        identity_storage(w_dict).prev_valid_slot(before)
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {

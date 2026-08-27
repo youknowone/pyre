@@ -434,9 +434,13 @@ fn write_object(
         } else if !is_heap_type && is_dict(obj) {
             out.write_u8(b'{');
             let len = dictmultiobject::w_dict_len(obj);
-            for index in 0..len {
-                let (key, value) = dictmultiobject::w_dict_nth_item(obj_root.get(), index)
+            // A slot walk, not a positional one: a deleted entry leaves a
+            // tombstone `_ll_dictnext` steps over.
+            let mut cursor = 0;
+            for _ in 0..len {
+                let (slot, key, value) = dictmultiobject::w_dict_next_item(obj_root.get(), cursor)
                     .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
+                cursor = slot + 1;
                 let key_root = Rooted::new(key);
                 let value_root = Rooted::new(value);
                 write_object(out, key_root.get(), refs, version, depth - 1)?;

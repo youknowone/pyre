@@ -472,7 +472,7 @@ pub struct ModuleDictStorage {
 /// whose hash is a cheap chain cached on the string object, so a probe on a
 /// global's name costs one load there.
 pub type ModuleDictEntries =
-    indexmap::IndexMap<String, PyObjectRef, crate::dictmultiobject::StrKeyBuildHasher>;
+    crate::rordereddict::RDict<String, PyObjectRef, crate::dictmultiobject::StrKeyBuildHasher>;
 
 /// The per-name `GlobalCache` registry (`celldict.py self.caches`).
 ///
@@ -572,7 +572,7 @@ impl ModuleDictStorage {
     /// `__delitem__` semantics that `celldict.py items` /
     /// `:166-171 popitem` (LIFO) depend on.
     pub fn remove(&mut self, key: &str) -> Option<PyObjectRef> {
-        self.entries.shift_remove(key)
+        self.entries.remove(key)
     }
 
     /// `dict.clear()`.
@@ -1117,12 +1117,24 @@ impl ModuleDictStrategy {
         storage.entries.values().map(|v| unsafe { unwrap_cell(*v) })
     }
 
-    /// The name at iteration position `index`, or `None` past the end.
+    /// The name in slot `index`, or `None` past the end and for a tombstone.
     ///
     /// `getiterkeys` walks the whole map; a dict view's integer cursor wants
-    /// one entry, and the storage is an `IndexMap`, so ask it directly.
+    /// one entry, so ask the storage directly.
     pub fn nth_key<'a>(&self, storage: &'a ModuleDictStorage, index: usize) -> Option<&'a str> {
-        storage.entries.get_index(index).map(|(k, _)| k.as_str())
+        storage.entries.get_slot(index).map(|(k, _)| k.as_str())
+    }
+
+    /// The first live entry slot at or after `from` — `_ll_dictnext`
+    /// (`rordereddict.py:1373`).  A name deleted from a module leaves a
+    /// tombstone, so a walk steps over the holes rather than counting.
+    pub fn next_entry_slot(&self, storage: &ModuleDictStorage, from: usize) -> Option<usize> {
+        storage.entries.next_valid_slot(from)
+    }
+
+    /// [`Self::next_entry_slot`] descending, for `reversed(module.__dict__)`.
+    pub fn prev_entry_slot(&self, storage: &ModuleDictStorage, before: usize) -> Option<usize> {
+        storage.entries.prev_valid_slot(before)
     }
 
     /// [`Self::nth_key`]'s value half, unwrapped the way `getitervalues`
@@ -1134,7 +1146,7 @@ impl ModuleDictStrategy {
     ) -> Option<PyObjectRef> {
         storage
             .entries
-            .get_index(index)
+            .get_slot(index)
             .map(|(_, v)| unsafe { unwrap_cell(*v) })
     }
 
@@ -1263,6 +1275,28 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// (`dictmultiobject.py AbstractTypedStrategy.getitem`).
     unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
         crate::dictmultiobject::w_module_dict_nth_value_inner(w_dict, index)
+    }
+
+    /// Both storage halves tombstone their deletes, so neither numbers its
+    /// entries densely; the default would walk positions.
+    unsafe fn next_slot(&self, w_dict: PyObjectRef, from: usize) -> Option<usize> {
+        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
+            return entries.next_valid_slot(from);
+        }
+        self.next_entry_slot(
+            &*crate::dictmultiobject::w_module_dict_get_storage(w_dict),
+            from,
+        )
+    }
+
+    unsafe fn prev_slot(&self, w_dict: PyObjectRef, before: usize) -> Option<usize> {
+        if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
+            return entries.prev_valid_slot(before);
+        }
+        self.prev_entry_slot(
+            &*crate::dictmultiobject::w_module_dict_get_storage(w_dict),
+            before,
+        )
     }
 
     /// `celldict.py clear`.  Branches on

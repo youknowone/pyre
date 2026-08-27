@@ -17640,8 +17640,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 ));
             }
             // PyPy's strategy iterator retains its native mutation state even
-            // when a delete+insert restores the original length.  Pyre's
-            // compacting IndexMap needs the equivalent explicit stamp.
+            // when a delete+insert restores the original length; the stamp is
+            // pyre's explicit counterpart.
             let start_keys_version = dv::w_dict_view_iterator_get_start_keys_version(obj);
             if start_keys_version != dv::w_dict_keys_version(dict) {
                 return Err(PyError::new(
@@ -17653,18 +17653,22 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             if index >= startlen {
                 return Err(PyError::stop_iteration());
             }
+            // `_ll_dictnext` walks entry slots, forwards or (for
+            // `reversed(d)`, PyPy's `objectmodel.reversed_dict`) backwards,
+            // skipping the tombstones a delete leaves behind.  The cursor is a
+            // slot; `index` beside it stays the count of consumed pairs.
             let reverse = dv::w_dict_view_iterator_get_reverse(obj);
-            let storage_index = if reverse {
-                startlen.saturating_sub(index + 1)
+            let cursor = dv::w_dict_view_iterator_get_slot(obj);
+            let found = if reverse {
+                pyre_object::dictmultiobject::w_dict_prev_item(dict, cursor)
             } else {
-                index
+                pyre_object::dictmultiobject::w_dict_next_item(dict, cursor)
             };
-            let Some((k, mut v)) =
-                pyre_object::dictmultiobject::w_dict_nth_item(dict, storage_index)
-            else {
+            let Some((slot, k, mut v)) = found else {
                 return Err(PyError::stop_iteration());
             };
             dv::w_dict_view_iterator_set_index(obj, index + 1);
+            dv::w_dict_view_iterator_set_slot(obj, if reverse { slot } else { slot + 1 });
             // `:829-841` strategy-transition handling.
             let start_strategy_id = dv::w_dict_view_iterator_get_start_strategy_id(obj);
             let current_strategy_id = pyre_object::dictmultiobject::w_dict_strategy_id(dict);

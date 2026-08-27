@@ -5307,14 +5307,26 @@ fn set_init_from_iterable_impl(
             &pyre_object::DICT_TYPE,
         )
     } {
+        // `index` names an entry slot, and a tombstone sits between the live
+        // ones after a delete, so the walk steps to the next live slot rather
+        // than counting.  A typed strategy still ends it at the first step,
+        // because `w_dict_nth_hashed_key` answers `None` for one.
         let mut index = 0usize;
         let mut copied_hashed_key = false;
-        while let Some(key) = unsafe {
-            pyre_object::dictmultiobject::w_dict_nth_hashed_key(
+        while let Some(slot) = unsafe {
+            pyre_object::dictmultiobject::w_dict_next_slot(
                 pyre_object::gc_roots::shadow_stack_get(iterable_slot),
                 index,
             )
         } {
+            let Some(key) = (unsafe {
+                pyre_object::dictmultiobject::w_dict_nth_hashed_key(
+                    pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+                    slot,
+                )
+            }) else {
+                break;
+            };
             unsafe {
                 pyre_object::setobject::w_set_insert_key_checked(
                     pyre_object::gc_roots::shadow_stack_get(set_slot),
@@ -5323,7 +5335,7 @@ fn set_init_from_iterable_impl(
             }
             .map_err(crate::baseobjspace::map_set_update_error)?;
             copied_hashed_key = true;
-            index += 1;
+            index = slot + 1;
         }
         // Empty object-shaped dicts and non-empty ones both finish here.  For
         // an empty dict the active Object/Unicode strategy is detected by a
