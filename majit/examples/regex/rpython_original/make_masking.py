@@ -48,6 +48,15 @@ SUBS = [
 FIXTURE_SUBS = [
     ("from marked import Char, Alternative, Repetition, Sequence",
      "from marked_masking import Char, Alternative, Repetition, Sequence"),
+    # `count`'s import is function-local, and the table missed it for the same
+    # reason it missed `Sequence._shift`'s second short-circuit: it was read as
+    # the lines someone remembered rather than as every line naming the module.
+    # `count` then ran its `isinstance` across two copies of the hierarchy, so
+    # every node fell through to the leaf arm and `target_masking.py` printed
+    # `nodes=1` above the timings for the 93-node tree it was timing.
+    # `verify_no_plain_marked` below is what makes that unrepeatable.
+    ("    from marked import Binary, Repetition as Rep",
+     "    from marked_masking import Binary, Repetition as Rep"),
 ]
 
 FIXTURE_HEAD = '''"""The masking variant's fixture: `fixture.py` over `marked_masking`.
@@ -110,6 +119,32 @@ def verify_no_short_circuit(text, dest):
             sys.exit(2)
 
 
+def verify_no_plain_marked(text, dest):
+    """Refuse to emit a fixture that still names the branching module.
+
+    Every class the masking fixture touches has to come from
+    `marked_masking`. A surviving `marked` import does not raise: `isinstance`
+    is simply false across two copies of a hierarchy, so a walk over the tree
+    answers as though every node were a leaf, and the wrong answer is printed
+    rather than reported.
+    """
+    for no, line in enumerate(text.split('\n'), 1):
+        stripped = line.strip()
+        names_it = stripped.startswith('from marked import') or (
+            stripped.startswith('import marked')
+            and not stripped.startswith('import marked_masking')
+        )
+        if names_it:
+            sys.stderr.write(
+                "make_masking.py: %s line %d still imports from the branching\n"
+                "module, so its `isinstance` tests run across two copies of\n"
+                "the hierarchy:\n  %s\n"
+                "Add the line to the substitution table.\n"
+                % (dest, no, stripped)
+            )
+            sys.exit(2)
+
+
 def render(source, subs, head):
     with open(os.path.join(HERE, source)) as f:
         src = f.read()
@@ -129,6 +164,8 @@ def render(source, subs, head):
     out = head + out[j:].lstrip('\n')
     if source == 'marked.py':
         verify_no_short_circuit(out, 'marked_masking.py')
+    if source == 'fixture.py':
+        verify_no_plain_marked(out, 'fixture_masking.py')
     return out
 
 

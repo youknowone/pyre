@@ -40,7 +40,7 @@ def bench_regex(n):
 
 
 def count(re):
-    from marked import Binary, Repetition as Rep
+    from marked_masking import Binary, Repetition as Rep
     if isinstance(re, Binary):
         return 1 + count(re.left) + count(re.right)
     if isinstance(re, Rep):
