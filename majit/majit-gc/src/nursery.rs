@@ -257,11 +257,27 @@ impl Nursery {
     /// sites initialize their own GC-pointer fields.  Poison mode mirrors
     /// llarena.py mode 3 for detecting violations of that contract.
     ///
-    /// WASM-ONLY ADAPTATION: majit-backend-wasm/src/codegen.rs
-    /// documents that wasm skips the GC rewrite, so its JIT code has no
-    /// `clear_gc_fields` stores and still requires recycled nursery bytes to
-    /// be zero-filled.  Delete this target branch once wasm runs the rewrite
-    /// or its inline allocation paths explicitly initialize GC fields.
+    /// WASM-ONLY ADAPTATION, paired with `MiniMarkGC::clear_nursery_substitute`.
+    /// The wasm backend runs no part of `GcRewriterImpl` — the omission is
+    /// total rather than selective by allocation shape — and lowers `New`,
+    /// `NewArray`, the `non_moving` old-gen routing and the write barrier in
+    /// its own codegen instead. Two of the pass's zeroing duties go with it:
+    /// the `clear_gc_fields` NULL stores that follow `handle_new`, and the
+    /// clear half of `NewArrayClear`, which wasm lowers exactly like
+    /// `NewArray` — `wasm_jit_alloc_array` stamps the length and nothing
+    /// else. Zero-filling the recycled bytes is what makes both hold. The
+    /// `ZeroArray` that pass would have emitted never arrives, and the wasm
+    /// codegen declines a trace carrying one rather than lean on this arm.
+    /// The rewrite module's other half, `remove_ref_constants`, does run on
+    /// wasm, so "skips the GC rewrite" names `GcRewriterImpl` and not the
+    /// module.
+    ///
+    /// Deleting this arm takes either the whole pass — which additionally
+    /// needs a `ZeroArray` lowering and a descr-carrying `GC_LOAD`/`GC_STORE`
+    /// lowering, the arm that panics today — or explicit initialization at
+    /// four sites: the `New` and `NewArray` inline nursery bumps and the
+    /// `wasm_jit_alloc` / `wasm_jit_alloc_array` helpers.
+    /// `clear_nursery_substitute` goes at the same time, not before.
     pub fn reset(&mut self) {
         self.reset_range(self.start as usize, self.start as usize + self.size);
         self.ptrs.free = self.start;

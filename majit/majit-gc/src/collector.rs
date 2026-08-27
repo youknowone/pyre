@@ -2524,12 +2524,19 @@ impl MiniMarkGC {
 
     /// The clear an old-gen block owes when it stands in for a nursery bump.
     ///
-    /// WASM-ONLY ADAPTATION, paired with `Nursery::reset`: wasm skips the GC
-    /// rewrite, so its JIT code emits none of the `clear_gc_fields` stores that
-    /// carry `emit_raw_memclear`'s job there, and reads recycled bytes as
-    /// initialized. Its nursery arm hands out zero-filled memory, so a stand-in
-    /// for that arm owes the same. Every other target leaves the block as
-    /// `external_malloc` does.
+    /// WASM-ONLY ADAPTATION, paired with `Nursery::reset`, which states what
+    /// the zero-fill stands in for and what retiring it would take. In short:
+    /// wasm runs no part of the GC rewrite, so its compiled code emits none of
+    /// the `clear_gc_fields` stores that carry `emit_raw_memclear`'s job
+    /// there, and reads recycled bytes as initialized. Its nursery arm hands
+    /// out zero-filled memory, so a stand-in for that arm owes the same. Every
+    /// other target leaves the block as `external_malloc` does.
+    ///
+    /// Only the spill owes it. A request that asks for old-gen outright
+    /// arrives through `alloc_oldgen_typed`, which takes
+    /// [`alloc_in_oldgen_clear`](Self::alloc_in_oldgen_clear) and clears on
+    /// every target — so a wasm `New` against a `non_moving` descr is covered
+    /// without this arm.
     #[inline]
     fn clear_nursery_substitute(obj: GcRef, total_size: usize) {
         if cfg!(target_arch = "wasm32") {
