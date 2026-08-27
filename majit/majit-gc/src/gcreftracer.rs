@@ -42,6 +42,14 @@
 //! `asmmemmgr_gcreftracers` (or `CompiledLoopToken` itself) is GC-traced,
 //! this collapses to a managed `GCREFTRACER` GcStruct + custom trace
 //! hook, matching upstream exactly.
+//!
+//! One upstream duty does not carry over. `free_loop_and_bridges` calls
+//! `clear_gcref_tracer`, which zeroes `array_length`, because upstream's
+//! slot array is reserved inside the code block (`reserve_gcref_table`)
+//! and is freed with it — a tracer outliving the block would otherwise
+//! hand the collector freed memory. Here the slots are the table's own
+//! `Box`, allocated and released with it, so the array cannot outlive its
+//! storage and there is nothing to turn off.
 
 use std::cell::Cell;
 use std::sync::{Arc, RwLock, Weak};
@@ -73,14 +81,21 @@ pub struct GcTable {
 unsafe impl Send for GcTable {}
 unsafe impl Sync for GcTable {}
 
-/// Live per-loop tables, walked as GC roots. The strong reference is
-/// held by `CompiledLoopToken.asmmemmgr_gcreftracers` (parity
-/// `gcreftracers.append(tracer)`, `x86/assembler.py`); the registry
-/// keeps only a `Weak`, so when the loop token is freed the table drops
-/// and its registry entry becomes dangling — deregistration needs no
-/// explicit `free_loop` hook (neither backend's `free_loop` clears
-/// `asmmemmgr_gcreftracers`; both rely on `Arc<CompiledLoopToken>`
-/// drop).
+/// Live per-loop tables, walked as GC roots. A strong reference is held by
+/// `CompiledLoopToken.asmmemmgr_gcreftracers` (parity
+/// `gcreftracers.append(tracer)`, `x86/assembler.py`); the registry keeps
+/// only a `Weak`, and a `Weak` that stops upgrading is the whole of
+/// deregistration. No `free_loop` clears `asmmemmgr_gcreftracers`, and
+/// nothing dispatches `Backend::free_loop` at all — the release is `Arc`
+/// drop, driven by the memory manager retiring a token in
+/// `try_to_free_some_loops`.
+///
+/// That drop is not always the CLT's. On cranelift a bridge's table is
+/// pinned a second time by every `BridgeData` that can dispatch to the
+/// bridge, so it outlives the token it was registered against for as long
+/// as a fail descr in another token holds one. The table dies with its
+/// last strong holder, whichever that is; on dynasm the CLT is the only
+/// one.
 static LIVE_GC_TABLES: RwLock<Vec<Weak<GcTable>>> = RwLock::new(Vec::new());
 
 /// Test-only lock modeling the stop-the-world invariant that no table is

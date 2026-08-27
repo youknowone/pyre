@@ -1,11 +1,11 @@
-/// Bump-pointer nursery allocator.
-///
-/// A fixed-size memory region where young objects are allocated by
-/// advancing a free pointer. When the nursery is full, a minor
-/// collection copies live objects out.
-///
-/// Layout: [header0|payload0|header1|payload1|...|free...top]
-///          ^nursery_start                       ^free  ^top
+//! Bump-pointer nursery allocator.
+//!
+//! A fixed-size memory region where young objects are allocated by
+//! advancing a free pointer. When the nursery is full, a minor
+//! collection copies live objects out.
+//!
+//! Layout: [header0|payload0|header1|payload1|...|free...top]
+//!          ^nursery_start                       ^free  ^top
 use std::alloc::{self, Layout};
 use std::ptr;
 
@@ -54,6 +54,72 @@ pub const TRANSLATION_NURSERY_SIZE: usize = 896 * 1024;
 /// on its own.
 pub const DEFAULT_NURSERY_SIZE: usize = 4 * 1024 * 1024;
 
+/// Whether an arena can be made inaccessible on this target.
+///
+/// `llarena.has_protect` is true for posix and nt and false for everything
+/// else, which is what decides whether `post_setup` allocates the rotating
+/// nurseries at all.
+#[cfg(not(target_arch = "wasm32"))]
+pub const HAS_PROTECT: bool = true;
+/// See the posix/nt constant above; wasm32 is upstream's `else` arm.
+#[cfg(target_arch = "wasm32")]
+pub const HAS_PROTECT: bool = false;
+
+/// The granularity [`protect_arena`] works in.
+#[cfg(not(target_arch = "wasm32"))]
+fn page_size() -> usize {
+    region::page::size()
+}
+/// wasm32 never protects, so the value only has to be a plausible power of two.
+#[cfg(target_arch = "wasm32")]
+fn page_size() -> usize {
+    65536
+}
+
+/// The whole pages a nursery of `size` bytes occupies.
+///
+/// Protection is applied to whole pages, so an arena sharing its last page
+/// with another allocation could not be made inaccessible without taking that
+/// one with it. Rounding the request up is what makes the page ours to
+/// protect.
+fn arena_bytes(size: usize) -> usize {
+    let page = page_size();
+    size.div_ceil(page) * page
+}
+
+/// The layout every arena is allocated and freed with.
+fn arena_layout(size: usize) -> Layout {
+    Layout::from_size_align(arena_bytes(size), page_size()).expect("invalid nursery layout")
+}
+
+/// `llarena.arena_malloc(..., zero=True)` for one nursery-sized arena.
+fn alloc_arena(size: usize) -> *mut u8 {
+    let layout = arena_layout(size);
+    let start = unsafe { alloc::alloc_zeroed(layout) };
+    if start.is_null() {
+        alloc::handle_alloc_error(layout);
+    }
+    start
+}
+
+/// `llarena.arena_protect`.
+///
+/// A failure is dropped rather than reported, as `llimpl_protect` drops it
+/// ("ignore potential errors"): the protection is a debugging aid and a host
+/// that refuses it must still run the program.
+#[cfg(not(target_arch = "wasm32"))]
+fn protect_arena(start: *mut u8, size: usize, inaccessible: bool) {
+    let protection = if inaccessible {
+        region::Protection::NONE
+    } else {
+        region::Protection::READ_WRITE
+    };
+    let _ = unsafe { region::protect(start, arena_bytes(size), protection) };
+}
+/// wasm32 has no `arena_protect`; see [`HAS_PROTECT`].
+#[cfg(target_arch = "wasm32")]
+fn protect_arena(_start: *mut u8, _size: usize, _inaccessible: bool) {}
+
 /// Nursery memory region with bump-pointer allocation.
 ///
 /// incminimark.py:324-325 parity: nursery_free and nursery_top live in
@@ -70,6 +136,14 @@ pub struct Nursery {
     /// llarena.py mode-3 parity: poison recycled nursery bytes so tests
     /// expose allocation paths that incorrectly rely on zero-filled memory.
     poison_on_reset: bool,
+    /// incminimark.py `debug_rotating_nurseries` — spare arenas, each
+    /// inaccessible while it waits its turn.
+    ///
+    /// Empty unless `PYPY_GC_DEBUG` asked for them. Their point is that a
+    /// pointer into a retired nursery faults when it is read, instead of being
+    /// answered by whichever object was later allocated over it: the reuse is
+    /// what hides a missing root, not the staleness.
+    rotating: Vec<*mut u8>,
 }
 
 // Safety: The nursery owns its memory exclusively and only one thread accesses it.
@@ -80,11 +154,7 @@ impl Nursery {
     ///   self.nursery_free = self.nursery
     ///   self.nursery_top = self.nursery + self.nursery_size
     pub fn new(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, 16).expect("invalid nursery layout");
-        let start = unsafe { alloc::alloc_zeroed(layout) };
-        if start.is_null() {
-            alloc::handle_alloc_error(layout);
-        }
+        let start = alloc_arena(size);
         let top = unsafe { start.add(size) };
         let ptrs = Box::new(NurseryPtrs { free: start, top });
         let poison_on_reset = std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some();
@@ -93,7 +163,64 @@ impl Nursery {
             size,
             ptrs,
             poison_on_reset,
+            rotating: Vec::new(),
         }
+    }
+
+    /// incminimark.py `post_setup` — allocate `count` further arenas and
+    /// protect them, so [`Self::debug_rotate`] has a ring to draw from.
+    ///
+    /// Upstream allocates six. The count is a parameter only so a test can ask
+    /// for a shorter ring; a host reads it from `PYPY_GC_DEBUG`.
+    pub fn install_debug_rotating_nurseries(&mut self, count: usize) {
+        if !HAS_PROTECT {
+            return;
+        }
+        for _ in 0..count {
+            let arena = alloc_arena(self.size);
+            protect_arena(arena, self.size, true);
+            self.rotating.push(arena);
+        }
+    }
+
+    /// incminimark.py `debug_rotate_nursery`.
+    ///
+    /// Retire the current arena to the back of the ring — inaccessible — and
+    /// take the one at the front. Reports whether a ring was installed.
+    ///
+    /// The caller owns the precondition upstream states by calling this only
+    /// where `nursery_barriers` is still empty: nothing may be living in the
+    /// retired arena, because reading it now faults.
+    pub fn debug_rotate(&mut self) -> bool {
+        if self.rotating.is_empty() {
+            return false;
+        }
+        let old = self.start;
+        protect_arena(old, self.size, true);
+        let new = self.rotating.remove(0);
+        self.rotating.push(old);
+        protect_arena(new, self.size, false);
+        self.start = new;
+        // `debug_rotate_nursery` sets `nursery` and `nursery_top`, and the
+        // `nursery_free = nursery` its caller performs at the end of
+        // `_minor_collection` lands on the arena installed here.
+        self.ptrs.free = new;
+        self.ptrs.top = unsafe { new.add(self.size) };
+        true
+    }
+
+    /// How many spare arenas the rotation ring holds.
+    pub fn debug_rotating_nurseries(&self) -> usize {
+        self.rotating.len()
+    }
+
+    /// `_minor_collection` under `gc_nursery_debug` resets the recycled range
+    /// in `arena_reset` mode 3, the one that fills it with garbage.
+    ///
+    /// Additive because the arena reads `MAJIT_GC_NURSERY_POISON` for itself:
+    /// either spelling selects the mode, and neither turns the other off.
+    pub fn set_nursery_debug(&mut self, on: bool) {
+        self.poison_on_reset |= on;
     }
 
     /// incminimark.py malloc_fixedsize parity:
@@ -130,11 +257,27 @@ impl Nursery {
     /// sites initialize their own GC-pointer fields.  Poison mode mirrors
     /// llarena.py mode 3 for detecting violations of that contract.
     ///
-    /// WASM-ONLY ADAPTATION: majit-backend-wasm/src/codegen.rs
-    /// documents that wasm skips the GC rewrite, so its JIT code has no
-    /// `clear_gc_fields` stores and still requires recycled nursery bytes to
-    /// be zero-filled.  Delete this target branch once wasm runs the rewrite
-    /// or its inline allocation paths explicitly initialize GC fields.
+    /// WASM-ONLY ADAPTATION, paired with `MiniMarkGC::clear_nursery_substitute`.
+    /// The wasm backend runs no part of `GcRewriterImpl` — the omission is
+    /// total rather than selective by allocation shape — and lowers `New`,
+    /// `NewArray`, the `non_moving` old-gen routing and the write barrier in
+    /// its own codegen instead. Two of the pass's zeroing duties go with it:
+    /// the `clear_gc_fields` NULL stores that follow `handle_new`, and the
+    /// clear half of `NewArrayClear`, which wasm lowers exactly like
+    /// `NewArray` — `wasm_jit_alloc_array` stamps the length and nothing
+    /// else. Zero-filling the recycled bytes is what makes both hold. The
+    /// `ZeroArray` that pass would have emitted never arrives, and the wasm
+    /// codegen declines a trace carrying one rather than lean on this arm.
+    /// The rewrite module's other half, `remove_ref_constants`, does run on
+    /// wasm, so "skips the GC rewrite" names `GcRewriterImpl` and not the
+    /// module.
+    ///
+    /// Deleting this arm takes either the whole pass — which additionally
+    /// needs a `ZeroArray` lowering and a descr-carrying `GC_LOAD`/`GC_STORE`
+    /// lowering, the arm that panics today — or explicit initialization at
+    /// four sites: the `New` and `NewArray` inline nursery bumps and the
+    /// `wasm_jit_alloc` / `wasm_jit_alloc_array` helpers.
+    /// `clear_nursery_substitute` goes at the same time, not before.
     pub fn reset(&mut self) {
         self.reset_range(self.start as usize, self.start as usize + self.size);
         self.ptrs.free = self.start;
@@ -253,8 +396,17 @@ impl Nursery {
 
 impl Drop for Nursery {
     fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.size, 16).unwrap();
+        let layout = arena_layout(self.size);
+        // Unprotect a parked arena before handing it back: the allocator
+        // writes its own bookkeeping into the block it reclaims, and an
+        // inaccessible one would fault inside `dealloc`.
+        for &arena in &self.rotating {
+            protect_arena(arena, self.size, false);
+        }
         unsafe {
+            for &arena in &self.rotating {
+                alloc::dealloc(arena, layout);
+            }
             alloc::dealloc(self.start, layout);
         }
     }
@@ -263,6 +415,76 @@ impl Drop for Nursery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Protection works in whole pages, so an arena that did not start on one
+    /// could not be made inaccessible without taking a neighbour with it.
+    #[test]
+    fn an_arena_starts_on_a_page_boundary() {
+        let nursery = Nursery::new(4096);
+        assert_eq!(nursery.start_ptr() as usize % page_size(), 0);
+    }
+
+    /// `debug_rotate_nursery` hands out the ring's front arena and sends the
+    /// retired one to the back, so the count never changes and no address is
+    /// reused until the whole ring has turned.
+    #[test]
+    fn rotating_hands_out_a_fresh_arena_and_keeps_the_ring_full() {
+        if !HAS_PROTECT {
+            return;
+        }
+        let mut nursery = Nursery::new(4096);
+        nursery.install_debug_rotating_nurseries(2);
+        assert_eq!(nursery.debug_rotating_nurseries(), 2);
+
+        // The JIT hardcodes these two addresses, so a rotation that moved them
+        // would leave compiled code bumping a pointer pair nothing reads.
+        let free_slot = nursery.free_addr();
+        let top_slot = nursery.top_addr();
+
+        let first = nursery.start_ptr() as usize;
+        assert!(nursery.debug_rotate());
+        let second = nursery.start_ptr() as usize;
+        assert_ne!(second, first, "a rotation must hand out a different arena");
+        assert_eq!(
+            nursery.debug_rotating_nurseries(),
+            2,
+            "the retired arena takes the place of the one taken"
+        );
+        assert_eq!(
+            nursery.free_ptr() as usize,
+            second,
+            "the bump pointer follows the arena"
+        );
+        assert_eq!(nursery.top_ptr() as usize, second + nursery.size());
+        assert_eq!(nursery.free_addr(), free_slot, "the pointer pair stays put");
+        assert_eq!(nursery.top_addr(), top_slot);
+
+        assert!(nursery.debug_rotate());
+        let third = nursery.start_ptr() as usize;
+        assert_ne!(third, second);
+        assert_ne!(
+            third, first,
+            "two spares means three arenas before a repeat"
+        );
+
+        assert!(nursery.debug_rotate());
+        assert_eq!(
+            nursery.start_ptr() as usize,
+            first,
+            "and then the ring comes round"
+        );
+    }
+
+    /// `debug_rotate_nursery` opens with `if self.debug_rotating_nurseries:` —
+    /// without `PYPY_GC_DEBUG` there is nothing to rotate to and the arena
+    /// stays.
+    #[test]
+    fn rotating_without_a_ring_leaves_the_arena_alone() {
+        let mut nursery = Nursery::new(4096);
+        let before = nursery.start_ptr() as usize;
+        assert!(!nursery.debug_rotate());
+        assert_eq!(nursery.start_ptr() as usize, before);
+    }
 
     #[test]
     fn test_nursery_create() {

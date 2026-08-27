@@ -112,16 +112,17 @@ unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
     }
 }
 
-/// `gc.collect()` (interp_gc.py) trampoline. Bridges
-/// pyre-object's `try_gc_collect` to `majit_gc::collect_full`, which
-/// fans out to the active backend's `dynasm_collect_full` /
-/// `collect_full_via_active_runtime`. pyre-object intentionally has
+/// `gc.collect(n)` (interp_gc.py) trampoline. Bridges pyre-object's
+/// `try_gc_collect` to `majit_gc::collect_generation`, which fans out to the
+/// active backend's `dynasm_collect_generation` /
+/// `collect_generation_via_active_runtime`. pyre-object intentionally has
 /// no majit-gc dep, hence the indirection lives here.
 ///
 /// # Safety hazard (documented gap)
 ///
-/// `do_collect_full` always runs a minor cycle first; the nursery is
-/// moving. Any live PyObjectRef held on the Rust stack of the
+/// Every generation runs a minor cycle — `do_collect_full` starts with one
+/// and generation 0 is one — and the nursery is moving. Any live
+/// PyObjectRef held on the Rust stack of the
 /// bytecode interpreter that is NOT registered as a GC root (via
 /// `pyframe_root_walker` / shadow stack / `try_gc_add_root`) will
 /// dangle after collection. pyre's interpreter has no shadowstack
@@ -130,8 +131,8 @@ unsafe fn pyre_object_gc_alloc_collecting_rooted_trampoline(
 /// segfault on the next memory access. The trampoline is wired up, but
 /// safe enablement is not yet implemented: it requires a shadowstack
 /// pass that registers every live PyObjectRef as a GC root.
-fn pyre_object_gc_collect_trampoline() {
-    majit_gc::collect_full();
+fn pyre_object_gc_collect_trampoline(generation: i64) {
+    majit_gc::collect_generation(generation);
 }
 
 fn pyre_object_gc_collect_step_trampoline() -> (u8, u8) {

@@ -1,28 +1,32 @@
-/// Object tracing for GC reference discovery.
-///
-/// During collection, the GC needs to find all GC references within
-/// a live object so it can update them (for copying collection) or
-/// mark the targets (for mark-sweep).
-///
-/// Instead of a closure-based trace approach (which causes lifetime issues
-/// with the borrow checker), we use an offset-based approach: each type
-/// declares the offsets of its GC pointer fields relative to the object
-/// payload start. The collector reads/writes GcRef values at these offsets
-/// directly.
+//! Object tracing for GC reference discovery.
+//!
+//! During collection, the GC needs to find all GC references within
+//! a live object so it can update them (for copying collection) or
+//! mark the targets (for mark-sweep).
+//!
+//! Instead of a closure-based trace approach (which causes lifetime issues
+//! with the borrow checker), we use an offset-based approach: each type
+//! declares the offsets of its GC pointer fields relative to the object
+//! payload start. The collector reads/writes GcRef values at these offsets
+//! directly.
 use majit_ir::GcRef;
 
 /// One `gctypelayout.GCData.TYPE_INFO` entry of the materialized
 /// type-info group (gc.py:592, x86/assembler.py:1924-1943).
 ///
 /// Mirrors the shape of `TYPE_INFO` that `genop_guard_guard_is_object`
-/// reads: `infobits` at offset 0 carries `T_IS_RPYTHON_INSTANCE`. The
-/// rest of the struct is reserved so the size matches
-/// `rffi.sizeof(GCData.TYPE_INFO) = 16` on 64-bit majit. (RPython's
-/// 64-bit `TYPE_INFO` carries additional fields majit does not yet need
-/// — `customdata`, `fixedsize`, `ofstoptrs` — totalling 32 bytes in the
-/// C backend. majit only consults `infobits` from this struct and keeps
-/// the other fields out of this layout; the remaining padding is still
-/// present so the per-entry stride stays at a power of two.)
+/// reads: `infobits` at offset 0 carries `T_IS_RPYTHON_INSTANCE`.
+///
+/// This row is *smaller* than upstream's, not equal to it. `GCData.TYPE_INFO`
+/// is four words — `infobits`, `customdata`, `fixedsize`, `ofstoptrs` — so 32
+/// bytes on 64-bit, and `VARSIZE_TYPE_INFO` extends it to eight; upstream's
+/// per-entry size is not even uniform, since `get_type_id` allocates the
+/// narrow struct for a fixed-size type and the wide one for a varsize type.
+/// majit consults only `infobits` and keeps the other fields out of this
+/// layout, so the row is one word of content. The reserved word is not there
+/// to match a size: it is there so `TypeEntry`'s stride stays a power of two,
+/// which is what lets the backend address the table by a shift. Deleting it
+/// gives a stride of 24 and the shift no longer applies.
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 pub struct TypeInfoLayout {

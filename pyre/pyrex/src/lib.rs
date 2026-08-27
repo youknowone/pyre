@@ -1532,7 +1532,7 @@ fn run_atexit_callbacks(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyEx
 /// bumped `finalizer_trigger_count` is that sweep reporting what it found.
 fn collect_and_run_finalizers(ec_ptr: *const PyExecutionContext) -> bool {
     let triggers_before = pyre_interpreter::executioncontext::finalizer_trigger_count();
-    pyre_object::gc_hook::try_gc_collect();
+    pyre_object::gc_hook::try_gc_collect(2);
     let made_finalizable =
         pyre_interpreter::executioncontext::finalizer_trigger_count() != triggers_before;
     if !ec_ptr.is_null() {

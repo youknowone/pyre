@@ -469,7 +469,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         alloc_nursery_collecting_typed_rooted_via_active_runtime,
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
-    majit_gc::set_active_collect_full(Some(collect_full_via_active_runtime));
+    majit_gc::set_active_collect_generation(Some(collect_generation_via_active_runtime));
     majit_gc::set_active_collect_step(Some(collect_step_via_active_runtime));
     majit_gc::set_active_get_objects(Some(get_objects_via_active_runtime));
     majit_gc::set_active_get_referents(Some(get_referents_via_active_runtime));
@@ -488,6 +488,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_heap_stats(Some(heap_stats_via_active_runtime));
     majit_gc::set_active_gc_memory_stats(Some(gc_memory_stats_via_active_runtime));
     majit_gc::set_active_major_threshold_reached(Some(major_threshold_reached_via_active_runtime));
+    majit_gc::set_active_minor_collections_since_major(Some(
+        minor_collections_since_major_via_active_runtime,
+    ));
     majit_gc::set_active_root_hooks(
         Some(gc_add_root_via_active_runtime),
         Some(gc_remove_root_via_active_runtime),
@@ -1839,13 +1842,13 @@ fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.alloc_oldgen_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
-/// User-level `gc.collect()` trampoline — drives `GcAllocator::collect_full`
-/// on the active cranelift-owned GC. Mirrors the dynasm equivalent;
+/// User-level `gc.collect(n)` trampoline — drives
+/// `GcAllocator::collect_generation` on the active cranelift-owned GC. Mirrors the dynasm equivalent;
 /// safety constraints apply (caller must be at a safepoint where every
 /// live PyObjectRef is rooted — Rust-stack PyObjectRef in nursery would
 /// dangle after the embedded minor cycle).
-fn collect_full_via_active_runtime() {
-    with_cranelift_gc(|gc| gc.collect_full());
+fn collect_generation_via_active_runtime(generation: i64) {
+    with_cranelift_gc(|gc| gc.collect_generation(generation));
 }
 
 fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
@@ -1972,7 +1975,7 @@ fn total_memory_pressure_via_active_runtime() -> isize {
 
 /// Non-moving old-gen-only major trampoline — sweeps dead old-gen objects
 /// without moving the nursery, so the interpreter safepoint can drive it under
-/// an active JIT (non-empty nursery). Unlike [`collect_full_via_active_runtime`]
+/// an active JIT (non-empty nursery). Unlike [`collect_generation_via_active_runtime`]
 /// it runs no minor, so a Rust-stack nursery PyObjectRef cannot dangle.
 fn collect_oldgen_nonmoving_via_active_runtime() {
     with_cranelift_gc(|gc| gc.collect_oldgen_nonmoving());
@@ -2003,6 +2006,10 @@ fn gc_memory_stats_via_active_runtime() -> majit_gc::GcMemoryStats {
 /// safepoint (incminimark.py `threshold_reached`).
 fn major_threshold_reached_via_active_runtime() -> bool {
     with_cranelift_gc(|gc| gc.major_threshold_reached()).unwrap_or(false)
+}
+
+fn minor_collections_since_major_via_active_runtime() -> usize {
+    with_cranelift_gc(|gc| gc.minor_collections_since_major()).unwrap_or(0)
 }
 
 /// Host-side root-register trampoline. Bridges

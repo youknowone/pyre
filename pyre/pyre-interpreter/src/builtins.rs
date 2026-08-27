@@ -17292,7 +17292,12 @@ pub(crate) unsafe fn fileio_writebuf(
             let Ok(view) = w_memoryview_new_with_flags(obj, 0x0001) else {
                 return Err(type_error(obj));
             };
-            let _ = pyre_object::gc_roots::pin_root(view);
+            // The exporter's own `bf_getbuffer` ran to build this view, and
+            // the recursive call can run more Python, so the view is pinned
+            // across it -- with a bracket, since a pin with nothing to pop it
+            // leaves the slot on the shadow stack for good.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let view = pyre_object::gc_roots::pin_root(view);
             let (data, owner, _) = fileio_writebuf(view)?;
             return Ok((data, owner, true));
         }

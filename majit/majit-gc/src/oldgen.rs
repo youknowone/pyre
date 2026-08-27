@@ -205,6 +205,13 @@ impl OldGen {
 
     /// incminimark.py:1219-1221, the second half of `is_young_object`.
     #[inline]
+    /// Whether the young raw-malloced generation is empty.
+    ///
+    /// `debug_check_consistency` asserts it is, outside a minor collection.
+    pub fn young_rawmalloced_is_empty(&self) -> bool {
+        self.young_rawmalloced_objects.is_empty()
+    }
+
     pub fn young_rawmalloced_contains(&self, obj_addr: usize) -> bool {
         !self.young_rawmalloced_payloads.is_empty()
             && self.young_rawmalloced_payloads.contains(&obj_addr)

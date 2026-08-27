@@ -670,6 +670,23 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// `incminimark.py collect(gen=2)`: "Do a minor (gen=0), start a major
+    /// (gen=1), or do a full major (gen>=2) collection."
+    ///
+    /// The generation argument is the same one [`get_objects`](Self::get_objects)
+    /// takes, and the two agree on what a generation is: 0 is the nursery and
+    /// anything above it is what a minor collection has already promoted out of
+    /// it. This is what app-level `gc.collect(n)` reaches, so the dispatch has
+    /// to happen behind whichever hook the active backend installed rather than
+    /// on `gc_sync`'s singleton — the wasm backend keeps its GC somewhere that
+    /// singleton does not reach.
+    ///
+    /// A collector with no state machine has no generation to select, so the
+    /// default answers every one of them with the whole collection.
+    fn collect_generation(&mut self, _generation: i64) {
+        self.collect_full();
+    }
+
     /// `incminimark.py collect_step`: perform one minor collection
     /// and exactly one major-collection state transition, independently of
     /// the automatic-collection enabled flag.
@@ -912,9 +929,6 @@ pub trait GcAllocator: Send {
         false
     }
 
-    /// Free memory associated with invalidated JIT compiled code.
-    fn jit_free(&mut self, _code_ptr: usize, _size: usize) {}
-
     /// Pin a nursery object so it won't move during minor collection.
     /// Returns true if pinning succeeded.
     fn pin(&mut self, _obj: GcRef) -> bool {
@@ -973,6 +987,16 @@ pub trait GcAllocator: Send {
     /// driving repeated majors). Default `(0, 0)` for stub allocators.
     fn collection_counts(&self) -> (usize, usize) {
         (0, 0)
+    }
+
+    /// Minor collections run since the last major finished.
+    ///
+    /// Not derivable from [`collection_counts`](Self::collection_counts): that
+    /// pair is cumulative, and the caller cannot subtract a snapshot it was
+    /// never handed. `gc.get_count`'s second element is this number. Default
+    /// `0` for stub allocators, which run no collections to count.
+    fn minor_collections_since_major(&self) -> usize {
+        0
     }
 
     /// Whether a JIT inline nursery bump of `type_id` is equivalent to
@@ -1320,6 +1344,9 @@ impl GcAllocator for GcHandle {
     fn collect_full(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_full())
     }
+    fn collect_generation(&mut self, generation: i64) {
+        gc_sync::gc_op(|gc| gc.collect_generation(generation))
+    }
     fn collect_step(&mut self) -> GcStepTransition {
         gc_sync::gc_op(|gc| gc.collect_step())
     }
@@ -1439,9 +1466,6 @@ impl GcAllocator for GcHandle {
     fn gc_step(&mut self) -> bool {
         gc_sync::gc_op(|gc| gc.gc_step())
     }
-    fn jit_free(&mut self, code_ptr: usize, size: usize) {
-        gc_sync::gc_op(|gc| gc.jit_free(code_ptr, size))
-    }
     fn pin(&mut self, obj: GcRef) -> bool {
         gc_sync::gc_op(|gc| gc.pin(obj))
     }
@@ -1468,6 +1492,9 @@ impl GcAllocator for GcHandle {
     }
     fn collection_counts(&self) -> (usize, usize) {
         gc_sync::gc_query_reentrant(|gc| gc.collection_counts())
+    }
+    fn minor_collections_since_major(&self) -> usize {
+        gc_sync::gc_query_reentrant(|gc| gc.minor_collections_since_major())
     }
     fn type_alloc_is_plain(&self, type_id: u32) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.type_alloc_is_plain(type_id))
@@ -1554,48 +1581,6 @@ pub trait GcRewriter: Send {
     }
 }
 
-/// Stack map — records which frame slots contain GC references at a safepoint.
-///
-/// At each guard (potential GC safepoint), the backend records a stack map
-/// so the GC can find all live references in compiled code.
-#[derive(Debug, Clone)]
-pub struct GcMap {
-    /// Bitmap: bit N is set if frame slot N contains a GC reference.
-    pub ref_bitmap: Vec<u64>,
-}
-
-impl GcMap {
-    pub fn new() -> Self {
-        GcMap {
-            ref_bitmap: Vec::new(),
-        }
-    }
-
-    pub fn set_ref(&mut self, slot: usize) {
-        let word = slot / 64;
-        let bit = slot % 64;
-        if word >= self.ref_bitmap.len() {
-            self.ref_bitmap.resize(word + 1, 0);
-        }
-        self.ref_bitmap[word] |= 1u64 << bit;
-    }
-
-    pub fn is_ref(&self, slot: usize) -> bool {
-        let word = slot / 64;
-        let bit = slot % 64;
-        if word >= self.ref_bitmap.len() {
-            return false;
-        }
-        (self.ref_bitmap[word] >> bit) & 1 != 0
-    }
-}
-
-impl Default for GcMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────
 // Process-global active GC allocator hooks
 // ─────────────────────────────────────────────────────────────────────
@@ -1657,7 +1642,6 @@ pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
 /// Process-global callback that checks whether a type id indexes the active
 /// collector's registered type table.
 pub type IsRegisteredTypeIdFn = fn(typeid: u32) -> bool;
-pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
 /// Process-global callback that answers `rgc.can_move(gcref)`
 /// (rpython/rlib/rgc.py:229) for the currently active backend's GC. The
@@ -1675,7 +1659,6 @@ global_hook!(static ACTIVE_IS_REGISTERED_TYPE_ID: IsRegisteredTypeIdFn);
 global_hook!(static ACTIVE_CAN_MOVE: CanMoveFn);
 static ACTIVE_SUPPORTS_GUARD_GC_TYPE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-global_hook!(static ACTIVE_EXTRA_ROOT_WALKER: ExtraRootWalkerFn);
 
 /// Bundle of callbacks the metainterp / executor can reach through
 /// process-global cells. Mirrors the fan-out of methods RPython's optimizer
@@ -1754,19 +1737,6 @@ pub fn override_gc_guard_hooks_for_test(hooks: ActiveGcGuardHooks) -> GuardHooks
     let prev = current_gc_guard_hooks();
     set_active_gc_guard_hooks(hooks);
     GuardHooksTestGuard { prev, _lock: lock }
-}
-
-/// Install a process-global callback that exposes non-shadow-stack roots
-/// owned by the embedding runtime.
-pub fn set_active_extra_root_walker(walker: Option<ExtraRootWalkerFn>) {
-    ACTIVE_EXTRA_ROOT_WALKER.set(walker);
-}
-
-/// Walk the active runtime's extra GC roots.
-pub fn walk_active_extra_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
-    if let Some(f) = ACTIVE_EXTRA_ROOT_WALKER.get() {
-        f(visitor);
-    }
 }
 
 /// Hand the collector the payload address of every jitframe that is currently
@@ -2461,28 +2431,33 @@ pub unsafe fn alloc_fast_nursery_collecting_typed_rooted(
     }
 }
 
-/// Process-global callback that runs a full mark-sweep collection cycle
-/// on the active backend's GC (`GcAllocator::collect_full`). Used by
-/// `pypy/module/gc/interp_gc.py collect` ports — i.e. user-level
-/// `gc.collect()` reaches the live GC through this trampoline. Returns
-/// silently when no backend has installed a hook (callers treat
-/// it as a no-op).
-pub type CollectFullFn = fn();
+/// Process-global callback that runs `GcAllocator::collect_generation` on the
+/// active backend's GC. App-level `gc.collect(n)` reaches the live GC through
+/// this trampoline, carrying the generation it was given: the backends do not
+/// share one GC, so the dispatch cannot happen on `gc_sync`'s singleton.
+/// Returns silently when no backend has installed a hook (callers treat it as
+/// a no-op).
+pub type CollectGenerationFn = fn(i64);
 
-global_hook!(static ACTIVE_COLLECT_FULL: CollectFullFn);
+global_hook!(static ACTIVE_COLLECT_GENERATION: CollectGenerationFn);
 
-/// Install the active backend's full-collection trampoline. Pass
-/// `None` to clear.
-pub fn set_active_collect_full(hook: Option<CollectFullFn>) {
-    ACTIVE_COLLECT_FULL.set(hook);
+/// Install the active backend's collection trampoline. Pass `None` to clear.
+pub fn set_active_collect_generation(hook: Option<CollectGenerationFn>) {
+    ACTIVE_COLLECT_GENERATION.set(hook);
 }
 
-/// Trigger a full mark-sweep collection on the active backend's GC.
+/// Run `incminimark.py collect(gen)` on the active backend's GC.
 /// No-op when no backend has installed a hook.
-pub fn collect_full() {
-    if let Some(f) = ACTIVE_COLLECT_FULL.get() {
-        f();
+pub fn collect_generation(generation: i64) {
+    if let Some(f) = ACTIVE_COLLECT_GENERATION.get() {
+        f(generation);
     }
+}
+
+/// [`collect_generation`] at the generation that means "all of it". Named
+/// separately because `majit-translate`'s gctransform knows this symbol.
+pub fn collect_full() {
+    collect_generation(2);
 }
 
 /// Active-backend trampoline for `incminimark.py collect_step`.
@@ -2798,6 +2773,29 @@ pub fn active_major_threshold_reached() -> bool {
     }
 }
 
+/// Process-global callback for [`GcAllocator::minor_collections_since_major`],
+/// installed by whichever backend owns the GC. The interpreter's `gc` module
+/// asks through this rather than through `gc_sync`'s singleton, because the
+/// wasm backend keeps its GC somewhere that singleton does not reach.
+pub type MinorCollectionsSinceMajorFn = fn() -> usize;
+
+global_hook!(static ACTIVE_MINOR_COLLECTIONS_SINCE_MAJOR: MinorCollectionsSinceMajorFn);
+
+/// Install the minors-since-major callback for the active backend.
+pub fn set_active_minor_collections_since_major(hook: Option<MinorCollectionsSinceMajorFn>) {
+    ACTIVE_MINOR_COLLECTIONS_SINCE_MAJOR.set(hook);
+}
+
+/// Minor collections the active backend's GC has run since its last major.
+/// `0` when no backend has installed a hook, which is also the truthful
+/// answer for a process that has collected nothing.
+pub fn active_minor_collections_since_major() -> usize {
+    match ACTIVE_MINOR_COLLECTIONS_SINCE_MAJOR.get() {
+        Some(f) => f(),
+        None => 0,
+    }
+}
+
 /// Process-global callback that reports whether a raw address is owned
 /// by the active backend's GC heap. Used by host-side allocators
 /// (`pyre-object`'s `dealloc_items_block`) to discriminate
@@ -3103,15 +3101,6 @@ pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTrig
         Some(f) => f(fq_index, obj, trigger),
         None => gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger)),
     }
-}
-
-/// rgc.py `collect(gen)` — the internal entry that names how much work to do,
-/// as opposed to `gc.collect()`, which asks for all of it.  `gen < 0` is a
-/// minor with no major progress at all, `0` a minor plus whatever major step
-/// the accounting calls for, `1` that plus starting a cycle if none is running,
-/// and `>= 2` a full collection.
-pub fn gc_collect_gen(generation: i64) {
-    gc_sync::gc_op(|gc| gc.do_collect(generation));
 }
 
 /// Whether a collection could still deliver a finalizer — whether

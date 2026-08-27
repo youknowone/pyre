@@ -3597,9 +3597,9 @@ fn error_is_exception(err: &crate::PyError) -> bool {
     );
     if !err.exc_object.is_null() && !w_exception.is_null() {
         let _roots = pyre_object::gc_roots::push_roots();
-        let _ = pyre_object::gc_roots::pin_root(err.exc_object);
+        let exc_object = pyre_object::gc_roots::pin_root(err.exc_object);
         let w_exception = pyre_object::gc_roots::pin_root(w_exception);
-        return crate::baseobjspace::isinstance(err.exc_object, w_exception).unwrap_or(false);
+        return crate::baseobjspace::isinstance(exc_object, w_exception).unwrap_or(false);
     }
     // `exc_kind_matches(kind, "Exception")` spelled over `PyErrorKind`: every
     // variant descends from `Exception` except the two `BaseException` ones.

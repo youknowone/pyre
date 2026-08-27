@@ -2796,7 +2796,7 @@ unsafe fn scan_dict_key_reentrant(
                 let stored_slot = crate::gc_roots::shadow_stack_len();
                 let stored_obj = crate::gc_roots::pin_root(stored_obj);
                 let key_slot = crate::gc_roots::shadow_stack_len();
-                let _ = crate::gc_roots::pin_root(key.obj);
+                key.obj = crate::gc_roots::pin_root(key.obj);
 
                 let equal = dict_keys_equal(stored_obj, key.obj);
                 obj = crate::gc_roots::shadow_stack_get(obj_slot);

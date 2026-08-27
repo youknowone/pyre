@@ -1,11 +1,11 @@
-/// MiniMarkGC — the core collector implementing the GcAllocator trait.
-///
-/// A generational copying collector with:
-/// - Bump-pointer nursery for young objects
-/// - ArenaCollection old gen plus rawmalloc fallback, with incremental major sweep
-/// - Write barrier with remembered set for old-to-young pointers
-///
-/// Modeled after incminimark's minor/major collection.
+//! MiniMarkGC — the core collector implementing the GcAllocator trait.
+//!
+//! A generational copying collector with:
+//! - Bump-pointer nursery for young objects
+//! - ArenaCollection old gen plus rawmalloc fallback, with incremental major sweep
+//! - Write barrier with remembered set for old-to-young pointers
+//!
+//! Modeled after incminimark's minor/major collection.
 use majit_ir::GcRef;
 use std::collections::VecDeque;
 use std::sync::RwLock;
@@ -251,6 +251,15 @@ pub struct GcConfig {
     /// incminimark.py:275: card_page_indices (0 disables card marking).
     /// Must be a power of two.
     pub card_page_indices: u32,
+    /// gc/base.py `post_setup` — `PYPY_GC_DEBUG`, the level the collector's
+    /// own self-checks are gated on. 0 is off; 1 installs the rotating
+    /// nurseries; 2 additionally runs `debug_check_consistency` after every
+    /// minor collection.
+    pub debug: u8,
+    /// incminimark.py `gc_nursery_debug` — `PYPY_GC_NURSERY_DEBUG`. Fill the
+    /// recycled nursery with garbage rather than zeroes, and rotate the arena
+    /// when the debug ring is installed.
+    pub gc_nursery_debug: bool,
     /// translationoption.py `taggedpointers` (default off). When set,
     /// a small `int` may be stored as an unboxed immediate with an odd
     /// low bit; the collector must then skip such fields rather than read
@@ -258,12 +267,16 @@ pub struct GcConfig {
     pub taggedpointers: bool,
 }
 
+/// incminimark.py `post_setup` allocates this many spare nurseries, so a
+/// retired arena is not handed back until the whole ring has turned.
+pub const DEBUG_ROTATING_NURSERIES: usize = 6;
+
 /// The variables [`GcConfig`] and [`MiniMarkGC::with_config`] resolve against,
 /// for an embedder that has to hand its environment over rather than share it.
 ///
 /// Published here so such a host does not keep its own copy of the list in step
-/// with the collector; `PYPY_GC_DEBUG` and the tracing knobs are absent because
-/// nothing in this file reads them.
+/// with the collector; the tracing knobs are absent because nothing in this
+/// file reads them.
 pub const GC_ENV_NAMES: &[&str] = &[
     "PYPY_GC_NURSERY",
     "PYPY_GC_MAX_PINNED",
@@ -273,6 +286,8 @@ pub const GC_ENV_NAMES: &[&str] = &[
     "PYPY_GC_MIN",
     "PYPY_GC_MAX",
     "PYPY_GC_MAX_DELTA",
+    "PYPY_GC_NURSERY_DEBUG",
+    "PYPY_GC_DEBUG",
 ];
 
 /// Environment an embedder supplies because the platform gives the process
@@ -747,6 +762,10 @@ impl Default for GcConfig {
             debug_tiny_nursery,
             large_object_threshold: LARGE_OBJECT_THRESHOLD,
             card_page_indices: 128,
+            debug: read_uint_from_env("PYPY_GC_DEBUG")
+                .unwrap_or(0)
+                .min(u8::MAX as usize) as u8,
+            gc_nursery_debug: read_uint_from_env("PYPY_GC_NURSERY_DEBUG").is_some_and(|v| v != 0),
             taggedpointers: false,
         }
     }
@@ -996,6 +1015,22 @@ pub struct MiniMarkGC {
     pub minor_collections: usize,
     /// Count of major collections performed.
     pub major_collections: usize,
+    /// [`minor_collections`](Self::minor_collections) as it stood when the last
+    /// major *cycle* ended, so the difference is the minors run since.
+    ///
+    /// No incminimark counterpart: it exists for `gc.get_count`, whose second
+    /// element 3.14 defines as the generation-0 collections run since
+    /// generation 1 was last collected. A major here collects both older
+    /// generations, so it is what resets that count.
+    ///
+    /// Sampled at the FINALIZING -> SCANNING transition and not in
+    /// `finish_incremental_cycle`, which is a sweep-to-finalize seam rather
+    /// than the end: `do_collect_full` runs a minor before every remaining
+    /// step, so one more still runs after that seam, and sampling there leaves
+    /// `gc.collect()` reporting a minor the collection had not yet finished
+    /// running. Measured, not assumed — see
+    /// `minors_accumulate_until_a_major_finishes`.
+    minor_collections_at_major_end: usize,
     /// `incminimark.py:self.hooks`, supplied by the translated standalone
     /// target and restricted to its allocation-free low-level surface.
     hooks: GcHooks,
@@ -1128,8 +1163,6 @@ pub struct MiniMarkGC {
     /// shadow instead of a fresh allocation.  Cleared after each
     /// minor collection.
     nursery_objects_shadows: AddressMap<usize>,
-    /// Registry of compiled code regions for GC root scanning.
-    pub compiled_code_registry: CompiledCodeRegistry,
     /// llsupport/gc.py:563 vtable→typeid mapping. RPython derives this
     /// arithmetically from the GC `type_info_group` base; pyre's GC
     /// keeps an explicit table because frontends register vtables
@@ -1199,7 +1232,15 @@ impl MiniMarkGC {
         // nursery_size * major_collection_threshold.
         min_heap_size = min_heap_size.max(nursery_size as f64 * major_collection_threshold);
 
-        let nursery = Nursery::new(config.nursery_size);
+        let mut nursery = Nursery::new(config.nursery_size);
+        // incminimark.py `post_setup`: under `PYPY_GC_DEBUG` a retired nursery
+        // is protected rather than reused, so a pointer left behind in one
+        // faults on the next read instead of being answered by whatever was
+        // allocated over it.
+        if config.debug != 0 {
+            nursery.install_debug_rotating_nurseries(DEBUG_ROTATING_NURSERIES);
+        }
+        nursery.set_nursery_debug(config.gc_nursery_debug);
         // incminimark.py:516-528. `nonlarge_max + 1` is the large-object
         // cutoff; pyre stores that cutoff directly in the configuration.
         let max_number_of_pinned_objects =
@@ -1234,6 +1275,7 @@ impl MiniMarkGC {
             config,
             minor_collections: 0,
             major_collections: 0,
+            minor_collections_at_major_end: 0,
             hooks: GcHooks,
             stat_ac_arenas_count: 0,
             stat_rawmalloced_total_size: 0,
@@ -1265,7 +1307,6 @@ impl MiniMarkGC {
             max_number_of_pinned_objects,
             pinned_objects_in_nursery: 0,
             nursery_objects_shadows: AddressMap::default(),
-            compiled_code_registry: CompiledCodeRegistry::new(),
             vtable_to_type_id: AddressMap::default(),
             _infobits_offset: 0,
             _infobits_offset_plus: 0,
@@ -2483,12 +2524,19 @@ impl MiniMarkGC {
 
     /// The clear an old-gen block owes when it stands in for a nursery bump.
     ///
-    /// WASM-ONLY ADAPTATION, paired with `Nursery::reset`: wasm skips the GC
-    /// rewrite, so its JIT code emits none of the `clear_gc_fields` stores that
-    /// carry `emit_raw_memclear`'s job there, and reads recycled bytes as
-    /// initialized. Its nursery arm hands out zero-filled memory, so a stand-in
-    /// for that arm owes the same. Every other target leaves the block as
-    /// `external_malloc` does.
+    /// WASM-ONLY ADAPTATION, paired with `Nursery::reset`, which states what
+    /// the zero-fill stands in for and what retiring it would take. In short:
+    /// wasm runs no part of the GC rewrite, so its compiled code emits none of
+    /// the `clear_gc_fields` stores that carry `emit_raw_memclear`'s job
+    /// there, and reads recycled bytes as initialized. Its nursery arm hands
+    /// out zero-filled memory, so a stand-in for that arm owes the same. Every
+    /// other target leaves the block as `external_malloc` does.
+    ///
+    /// Only the spill owes it. A request that asks for old-gen outright
+    /// arrives through `alloc_oldgen_typed`, which takes
+    /// [`alloc_in_oldgen_clear`](Self::alloc_in_oldgen_clear) and clears on
+    /// every target — so a wasm `New` against a `non_moving` descr is covered
+    /// without this arm.
     #[inline]
     fn clear_nursery_substitute(obj: GcRef, total_size: usize) {
         if cfg!(target_arch = "wasm32") {
@@ -3028,10 +3076,6 @@ impl MiniMarkGC {
         } else {
             crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
         }
-        crate::walk_active_extra_roots(&mut |gcref| {
-            self.drag_out_root(gcref);
-        });
-
         // Multi-registrar walker fan-out (rd_consts const-pool, etc.).
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.drag_out_root(gcref);
@@ -3253,6 +3297,13 @@ impl MiniMarkGC {
             unsafe { (*header_of(obj_addr)).clear_flag(flags::PINNED) };
         }
         self.refresh_published_nursery_top();
+
+        // incminimark.py `_minor_collection`: `if self.DEBUG >= 2` — the whole
+        // heap is walked, so it is gated a level above the rotating nurseries
+        // rather than on `PYPY_GC_DEBUG` being set at all.
+        if self.config.debug >= 2 {
+            self.debug_check_consistency();
+        }
 
         // incminimark.py `self.root_walker.finished_minor_collection()`,
         // the callback framework.py:135-138 reads out of `_jit2gc`: after the
@@ -4073,10 +4124,12 @@ impl MiniMarkGC {
     /// whose all-ones flag region fakes every flag (IGNORE_FINALIZER
     /// included), so a raw read there would silently drop a finalizer entry.
     ///
-    /// Latent today: every finalizer-queue registrant (instances, generators)
-    /// is stable-allocated, so a queued object is never in the nursery. It
-    /// becomes load-bearing when instance allocation converges back to the
-    /// movable nursery (see `alloc_instance_object`).
+    /// Load-bearing today. Instances and generators are stable-allocated, but
+    /// `list_descr_new` takes its header from `w_list_new` — the collecting
+    /// *nursery* arm — and then calls `maybe_register_finalizer` for a
+    /// builtin-layout subclass, so a `class L(list)` with `__del__` puts a
+    /// nursery header on the queue. It gets more so when instance allocation
+    /// converges back to the movable nursery (see `alloc_instance_object`).
     fn get_possibly_forwarded_header(&self, obj_addr: usize) -> *const GcHeader {
         let hdr = unsafe { header_of(obj_addr) };
         if self.is_nursery_object_start(obj_addr) && unsafe { (*hdr).is_forwarded() } {
@@ -5109,10 +5162,6 @@ impl MiniMarkGC {
             crate::shadow_stack::walk_my_extra_areas(&mut visit_extra_area);
         }
 
-        crate::walk_active_extra_roots(&mut |gcref| {
-            result.push((*gcref, "active_extra_root"));
-        });
-
         crate::shadow_stack::walk_extra_roots(|gcref| {
             result.push((*gcref, "extra_root"));
         });
@@ -5787,6 +5836,9 @@ impl MiniMarkGC {
                 // incminimark.py:2623-2631: recursive collections from a
                 // handler must see a collector ready to start a new scan.
                 self.gc_state = GcState::Scanning;
+                // The cycle is over here, which is what `gc.get_count`'s
+                // second element counts from.
+                self.minor_collections_at_major_end = self.minor_collections;
                 self.execute_finalizer_triggers();
             }
         }
@@ -5803,15 +5855,101 @@ impl MiniMarkGC {
         }
     }
 
-    /// incminimark.py:1316-1319 debug invariant.
+    /// incminimark.py `debug_check_consistency`.
+    ///
+    /// Self-gated on the debug level rather than gated at its call sites, as
+    /// upstream is: the body opens with `if self.DEBUG:`, so a run that did
+    /// not ask for the checks pays one load and the checks are real
+    /// assertions rather than `debug_assert!`s that a release build drops.
+    /// `PYPY_GC_DEBUG` is the only way to arm them, and a run that sets it is
+    /// asking to be aborted on a broken invariant.
     fn debug_check_consistency(&self) {
+        if self.config.debug == 0 {
+            return;
+        }
+        assert!(
+            self.oldgen.young_rawmalloced_is_empty(),
+            "young raw-malloced objects in a major collection"
+        );
+        assert!(
+            self.young_objects_with_weakrefs.is_empty(),
+            "young objects with weakrefs in a major collection"
+        );
         if self.oldgen.rawmalloc_sweep_pending() {
-            debug_assert_eq!(
+            assert_eq!(
                 self.gc_state,
                 GcState::Sweeping,
                 "raw_malloc_might_sweep must be empty outside SWEEPING"
             );
         }
+        self.debug_check_reachable();
+    }
+
+    /// gc/base.py `debug_check_consistency`'s heap half — enumerate every root
+    /// and trace the whole reachable graph, checking each object once.
+    ///
+    /// Upstream keeps its seen set and pending stack as GC-side `AddressDict` /
+    /// `AddressStack` because it has no other allocator; here they are ordinary
+    /// Rust containers, which is the same structure without the bookkeeping.
+    fn debug_check_reachable(&self) {
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut pending: Vec<usize> = Vec::new();
+        let record =
+            |addr: usize, seen: &mut std::collections::HashSet<usize>, pending: &mut Vec<usize>| {
+                if seen.insert(addr) {
+                    self.debug_check_object(addr);
+                    pending.push(addr);
+                }
+            };
+        for root in self.enumerate_root_walker_values() {
+            if !root.is_null() {
+                record(root.0, &mut seen, &mut pending);
+            }
+        }
+        while let Some(obj_addr) = pending.pop() {
+            let type_id = unsafe { (*header_of(obj_addr)).type_id() };
+            if (type_id as usize) >= self.types.len() {
+                continue;
+            }
+            let mut children: Vec<usize> = Vec::new();
+            unsafe {
+                self.types.get(type_id).for_each_gc_ptr(obj_addr, |slot| {
+                    let child = *slot;
+                    if !child.is_null() {
+                        children.push(child.0);
+                    }
+                });
+            }
+            for child in children {
+                record(child, &mut seen, &mut pending);
+            }
+        }
+    }
+
+    /// incminimark.py `debug_check_object`: after a collection nothing is left
+    /// in the nursery but the pinned objects, and neither of the two flags the
+    /// collection itself uses may survive it.
+    fn debug_check_object(&self, obj_addr: usize) {
+        let hdr = unsafe { &*header_of(obj_addr) };
+        if self.is_pinned(GcRef(obj_addr)) {
+            assert!(
+                self.is_in_nursery(obj_addr),
+                "pinned object not in nursery at {obj_addr:#x}"
+            );
+            return;
+        }
+        assert!(
+            !self.is_in_nursery(obj_addr),
+            "object in nursery after collection at {obj_addr:#x}"
+        );
+        assert!(
+            !hdr.has_flag(flags::VISITED_RMY),
+            "GCFLAG_VISITED_RMY after collection at {obj_addr:#x}"
+        );
+        assert!(
+            !hdr.has_flag(flags::PINNED),
+            "GCFLAG_PINNED outside the nursery after collection at {obj_addr:#x}"
+        );
     }
 
     /// Perform one incremental marking step.
@@ -6293,9 +6431,11 @@ impl MiniMarkGC {
     /// and are therefore born black.
     ///
     /// pyre's stack root sets are mutated with no write barrier and hold
-    /// pre-cycle objects: a JitFrame lives in the old gen so its pointer stays
-    /// valid across a collecting call while compiled code stores Refs into its
-    /// gcmap slots, the blackhole register banks and resume-construction roots
+    /// pre-cycle objects: an off-GC JitFrame is `alloc_zeroed` memory outside
+    /// the heap entirely, so its pointer stays valid across a collecting call
+    /// while compiled code stores Refs into its gcmap slots (the nursery-built
+    /// frames get their pointer back from `_reload_frame_if_necessary`
+    /// instead), the blackhole register banks and resume-construction roots
     /// are plain slices, and `seed_major_root` arms a newly seeded old root
     /// into the remembered set only once — the next minor drains that set and
     /// nothing re-arms it. A black root can therefore come to hold the only
@@ -7475,6 +7615,22 @@ impl MiniMarkGC {
     /// A move within one object carries its items across card boundaries while
     /// the card bits stay where they are, so the per-card record is no longer
     /// true of the object and only the whole-object record is.
+    ///
+    /// Nothing calls this outside tests, and nothing could act on it if it
+    /// did: `CARDS_SET` is only ever set behind a `HAS_CARDS` test, and the
+    /// one non-test place that sets `HAS_CARDS`, `alloc_in_oldgen_with_cards`,
+    /// has no production caller. So the guard above rejects every object pyre
+    /// can build today.
+    ///
+    /// It stops rejecting them the moment a production caller of that
+    /// allocator lands, and the sites that owe this call then are the item
+    /// moves in `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
+    /// `object_remove` and `object_drain` each shift items with a bare
+    /// `ptr::copy`. Upstream reaches this barrier from those operations
+    /// through `rgc.ll_arraymove`, which `ll_insert_nonneg`, `ll_pop_zero`,
+    /// `ll_delitem_nonneg` and `ll_listdelslice_startstop` all call; pyre's
+    /// list is not an rtyper-lowered list, so it has no such seam and the
+    /// calls have to be written at those three sites.
     pub fn writebarrier_before_move(&mut self, array_addr: usize) {
         if self.config.card_page_indices == 0 {
             return;
@@ -7786,6 +7942,17 @@ impl MiniMarkGC {
             previous_end = header_addr + object_size;
         }
         self.nursery.reset_range(previous_end, nursery_end);
+        // `_minor_collection` rotates only on the no-pinned-objects arm: a
+        // pinned object stays where it is, and the arena holding it is about
+        // to be made inaccessible.
+        if self.config.gc_nursery_debug && barriers.is_empty() {
+            self.nursery.debug_rotate();
+        }
+        // Read the arena back rather than reusing the entry values: a rotation
+        // moved it, and both the barrier below and the `nursery_free` at the
+        // tail of this function have to name the arena now installed.
+        let nursery_start = self.nursery.start_ptr() as usize;
+        let nursery_end = nursery_start + self.nursery.size();
         barriers.push_back(nursery_end);
         self.nursery_barriers = barriers;
 
@@ -7850,201 +8017,9 @@ impl MiniMarkGC {
         !hdr.is_forwarded() && hdr.has_flag(flags::PINNED)
     }
 
-    /// Free memory associated with invalidated JIT compiled code.
-    ///
-    /// `code_ptr` and `size` identify the compiled code region to release.
-    /// The region is looked up and removed from the compiled code registry
-    /// so the GC no longer scans it for root references.
-    pub fn jit_free(&mut self, code_ptr: usize, size: usize) {
-        // Find and remove any compiled code region that matches the given range.
-        self.compiled_code_registry
-            .regions
-            .retain(|r| !(r.code_start == code_ptr && r.code_size == size));
-    }
-
     /// Number of objects in the remembered set (for testing / diagnostics).
     pub fn remembered_set_len(&self) -> usize {
         self.remembered_set.len()
-    }
-}
-
-/// Safepoint GC map: records which frame slots contain GC references
-/// at a specific program point (guard or call site).
-///
-/// The Cranelift backend builds these during compilation and stores them
-/// alongside the compiled code. During collection, the GC uses them to
-/// find live references on the stack.
-#[derive(Debug, Clone)]
-pub struct SafepointMap {
-    /// Map from code offset to GcMap.
-    pub entries: Vec<SafepointEntry>,
-}
-
-/// A single safepoint entry.
-#[derive(Debug, Clone)]
-pub struct SafepointEntry {
-    /// Offset in the compiled code (bytes from function start).
-    pub code_offset: u32,
-    /// Bitmap of which frame slots contain GC references.
-    pub gc_map: crate::GcMap,
-}
-
-impl SafepointMap {
-    pub fn new() -> Self {
-        SafepointMap {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Add a safepoint entry.
-    pub fn add(&mut self, code_offset: u32, gc_map: crate::GcMap) {
-        self.entries.push(SafepointEntry {
-            code_offset,
-            gc_map,
-        });
-    }
-
-    /// Look up the GcMap for a given code offset.
-    pub fn lookup(&self, code_offset: u32) -> Option<&crate::GcMap> {
-        self.entries
-            .iter()
-            .find(|e| e.code_offset == code_offset)
-            .map(|e| &e.gc_map)
-    }
-}
-
-impl Default for SafepointMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Registry of compiled code regions and their safepoint maps.
-///
-/// When the GC needs to scan the stack during collection, it uses the return
-/// address to find which compiled code region is active, then looks up the
-/// safepoint map to determine which frame slots contain GC references.
-///
-/// From rpython/jit/backend/llsupport/gc.py GcRootMap_asmgcc / GcRootMap_shadowstack.
-pub struct CompiledCodeRegistry {
-    /// Compiled code regions, sorted by start address for binary search.
-    regions: Vec<CompiledCodeRegion>,
-}
-
-/// A single compiled code region with its safepoint map.
-#[derive(Debug, Clone)]
-pub struct CompiledCodeRegion {
-    /// Start address of the compiled code.
-    pub code_start: usize,
-    /// Size of the compiled code in bytes.
-    pub code_size: usize,
-    /// Safepoint map for this region.
-    pub safepoint_map: SafepointMap,
-    /// Frame size in slots (each slot = 8 bytes).
-    pub frame_size_slots: u32,
-    /// JitCellToken number for identification.
-    pub loop_token: u64,
-}
-
-impl CompiledCodeRegistry {
-    pub fn new() -> Self {
-        CompiledCodeRegistry {
-            regions: Vec::new(),
-        }
-    }
-
-    /// Register a compiled code region.
-    pub fn register(&mut self, region: CompiledCodeRegion) {
-        self.regions.push(region);
-        // Keep sorted by code_start for binary search
-        self.regions.sort_by_key(|r| r.code_start);
-    }
-
-    /// Unregister a compiled code region (e.g., when invalidating a loop).
-    pub fn unregister(&mut self, loop_token: u64) {
-        self.regions.retain(|r| r.loop_token != loop_token);
-    }
-
-    /// Look up a compiled code region containing the given return address.
-    ///
-    /// Returns the region and the offset within it.
-    pub fn find_region(&self, return_addr: usize) -> Option<(&CompiledCodeRegion, u32)> {
-        // Binary search for the region containing this address
-        let idx = self
-            .regions
-            .binary_search_by(|r| {
-                if return_addr < r.code_start {
-                    std::cmp::Ordering::Greater
-                } else if return_addr >= r.code_start + r.code_size {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .ok()?;
-
-        let region = &self.regions[idx];
-        let offset = (return_addr - region.code_start) as u32;
-        Some((region, offset))
-    }
-
-    /// Scan a compiled frame for GC references using the safepoint map.
-    ///
-    /// Given a return address (from the call stack) and the frame base pointer,
-    /// enumerates all frame slots that contain GC references.
-    ///
-    /// # Safety
-    /// `frame_base` must point to a valid JIT frame with at least
-    /// `region.frame_size_slots` slots.
-    pub unsafe fn scan_frame(
-        &self,
-        return_addr: usize,
-        frame_base: *const usize,
-    ) -> Vec<*mut GcRef> {
-        let mut roots = Vec::new();
-
-        let (region, offset) = match self.find_region(return_addr) {
-            Some(r) => r,
-            None => return roots,
-        };
-
-        let gc_map = match region.safepoint_map.lookup(offset) {
-            Some(map) => map,
-            None => return roots,
-        };
-
-        // Enumerate all slots marked as GC references
-        for word_idx in 0..gc_map.ref_bitmap.len() {
-            let mut bits = gc_map.ref_bitmap[word_idx];
-            while bits != 0 {
-                let bit = bits.trailing_zeros() as usize;
-                let slot_idx = word_idx * 64 + bit;
-
-                if slot_idx < region.frame_size_slots as usize {
-                    let slot_ptr = unsafe { frame_base.add(slot_idx) } as *mut GcRef;
-                    roots.push(slot_ptr);
-                }
-
-                bits &= bits - 1; // Clear lowest set bit
-            }
-        }
-
-        roots
-    }
-
-    /// Number of registered regions.
-    pub fn len(&self) -> usize {
-        self.regions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.regions.is_empty()
-    }
-}
-
-impl Default for CompiledCodeRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -8179,6 +8154,10 @@ impl GcAllocator for MiniMarkGC {
         (self.minor_collections, self.major_collections)
     }
 
+    fn minor_collections_since_major(&self) -> usize {
+        self.minor_collections - self.minor_collections_at_major_end
+    }
+
     fn get_write_barrier_descr(&self) -> Option<crate::WriteBarrierDescr> {
         let mut descr = crate::WriteBarrierDescr::for_current_gc();
         if self.card_page_shift == 0 {
@@ -8243,6 +8222,10 @@ impl GcAllocator for MiniMarkGC {
 
     fn collect_full(&mut self) {
         self.do_collect_full();
+    }
+
+    fn collect_generation(&mut self, generation: i64) {
+        self.do_collect(generation);
     }
 
     fn collect_step(&mut self) -> crate::GcStepTransition {
@@ -8425,10 +8408,6 @@ impl GcAllocator for MiniMarkGC {
 
     fn gc_step(&mut self) -> bool {
         self.gc_step()
-    }
-
-    fn jit_free(&mut self, code_ptr: usize, size: usize) {
-        self.jit_free(code_ptr, size);
     }
 
     fn pin(&mut self, obj: GcRef) -> bool {
@@ -8730,6 +8709,62 @@ mod tests {
             large_object_threshold: nursery_size / 2,
             ..GcConfig::default()
         })
+    }
+
+    /// incminimark.py `_minor_collection`: on the `gc_nursery_debug` arm with
+    /// no pinned survivor, the recycled arena is retired and the next one in
+    /// the ring takes its place.
+    #[test]
+    fn a_minor_collection_rotates_the_nursery_under_gc_nursery_debug() {
+        if !crate::nursery::HAS_PROTECT {
+            return;
+        }
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            debug: 1,
+            gc_nursery_debug: true,
+            ..GcConfig::default()
+        });
+        assert_eq!(
+            gc.nursery.debug_rotating_nurseries(),
+            DEBUG_ROTATING_NURSERIES
+        );
+
+        let before = gc.nursery.start_ptr() as usize;
+        gc.do_collect_nursery();
+        let after = gc.nursery.start_ptr() as usize;
+
+        assert_ne!(before, after, "the minor collection retired the arena");
+        assert_eq!(
+            gc.nursery.free_ptr() as usize,
+            after,
+            "allocation resumes at the start of the arena now installed"
+        );
+        assert_eq!(
+            gc.published_nursery_top.load(Ordering::Relaxed),
+            after + gc.nursery.size(),
+            "compiled code reads the published top, which must follow"
+        );
+    }
+
+    /// `post_setup` allocates the ring only `if self.DEBUG and
+    /// llarena.has_protect`, so an ordinary run keeps its one arena and
+    /// `debug_rotate_nursery` finds nothing to rotate to.
+    #[test]
+    fn no_ring_is_allocated_without_the_debug_level() {
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            gc_nursery_debug: true,
+            ..GcConfig::default()
+        });
+        assert_eq!(gc.config.debug, 0);
+        assert_eq!(gc.nursery.debug_rotating_nurseries(), 0);
+
+        let before = gc.nursery.start_ptr() as usize;
+        gc.do_collect_nursery();
+        assert_eq!(gc.nursery.start_ptr() as usize, before);
     }
 
     /// incminimark.py:1890-1893 `free_young_rawmalloced_objects`: an
@@ -11519,210 +11554,6 @@ mod tests {
         );
     }
 
-    // ── SafepointMap tests ──
-
-    #[test]
-    fn test_safepoint_map_register_and_lookup() {
-        let mut smap = SafepointMap::new();
-
-        let mut gc_map_0 = crate::GcMap::new();
-        gc_map_0.set_ref(0);
-        gc_map_0.set_ref(3);
-
-        let mut gc_map_1 = crate::GcMap::new();
-        gc_map_1.set_ref(1);
-        gc_map_1.set_ref(7);
-
-        smap.add(100, gc_map_0);
-        smap.add(200, gc_map_1);
-
-        // Lookup existing entries.
-        let found_0 = smap.lookup(100).unwrap();
-        assert!(found_0.is_ref(0));
-        assert!(found_0.is_ref(3));
-        assert!(!found_0.is_ref(1));
-
-        let found_1 = smap.lookup(200).unwrap();
-        assert!(found_1.is_ref(1));
-        assert!(found_1.is_ref(7));
-        assert!(!found_1.is_ref(0));
-
-        // Lookup non-existent offset returns None.
-        assert!(smap.lookup(999).is_none());
-    }
-
-    #[test]
-    fn test_safepoint_map_empty() {
-        let smap = SafepointMap::new();
-        assert!(smap.lookup(0).is_none());
-        assert!(smap.entries.is_empty());
-    }
-
-    // ── CompiledCodeRegistry tests ──
-
-    #[test]
-    fn test_compiled_code_registry_register_and_find() {
-        let mut registry = CompiledCodeRegistry::new();
-        assert!(registry.is_empty());
-
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(16, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 42,
-        });
-
-        assert_eq!(registry.len(), 1);
-
-        // Address inside the region.
-        let (region, offset) = registry.find_region(0x1010).unwrap();
-        assert_eq!(region.loop_token, 42);
-        assert_eq!(offset, 0x10);
-
-        // Address at the start.
-        let (region, offset) = registry.find_region(0x1000).unwrap();
-        assert_eq!(region.loop_token, 42);
-        assert_eq!(offset, 0);
-
-        // Address outside the region.
-        assert!(registry.find_region(0x900).is_none());
-        assert!(registry.find_region(0x1100).is_none());
-    }
-
-    #[test]
-    fn test_compiled_code_registry_multiple_regions() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 4,
-            loop_token: 1,
-        });
-        registry.register(CompiledCodeRegion {
-            code_start: 0x3000,
-            code_size: 0x200,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 8,
-            loop_token: 2,
-        });
-        registry.register(CompiledCodeRegion {
-            code_start: 0x2000,
-            code_size: 0x80,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 2,
-            loop_token: 3,
-        });
-
-        assert_eq!(registry.len(), 3);
-
-        // Each region should be findable.
-        assert_eq!(registry.find_region(0x1050).unwrap().0.loop_token, 1);
-        assert_eq!(registry.find_region(0x2040).unwrap().0.loop_token, 3);
-        assert_eq!(registry.find_region(0x3100).unwrap().0.loop_token, 2);
-
-        // Gap between regions returns None.
-        assert!(registry.find_region(0x1200).is_none());
-    }
-
-    #[test]
-    fn test_compiled_code_registry_unregister() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 4,
-            loop_token: 10,
-        });
-        registry.register(CompiledCodeRegion {
-            code_start: 0x2000,
-            code_size: 0x100,
-            safepoint_map: SafepointMap::new(),
-            frame_size_slots: 4,
-            loop_token: 20,
-        });
-
-        assert_eq!(registry.len(), 2);
-
-        registry.unregister(10);
-        assert_eq!(registry.len(), 1);
-        assert!(registry.find_region(0x1050).is_none());
-        assert_eq!(registry.find_region(0x2050).unwrap().0.loop_token, 20);
-    }
-
-    #[test]
-    fn test_compiled_code_registry_safepoint_lookup_for_root_scanning() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(0x20, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x5000,
-            code_size: 0x200,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 99,
-        });
-
-        // Simulate finding a return address and looking up the safepoint map.
-        let return_addr = 0x5020;
-        let (region, offset) = registry.find_region(return_addr).unwrap();
-        let gc_map = region.safepoint_map.lookup(offset).unwrap();
-
-        // Verify the GC map identifies the correct slots.
-        assert!(gc_map.is_ref(0), "slot 0 should be a GC ref");
-        assert!(!gc_map.is_ref(1), "slot 1 should not be a GC ref");
-        assert!(gc_map.is_ref(2), "slot 2 should be a GC ref");
-        assert!(!gc_map.is_ref(3), "slot 3 should not be a GC ref");
-    }
-
-    #[test]
-    fn test_scan_frame_enumerates_gc_ref_slots() {
-        let mut registry = CompiledCodeRegistry::new();
-
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(0x10, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0xA000,
-            code_size: 0x100,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 77,
-        });
-
-        // Allocate a fake frame on the stack.
-        let frame: [usize; 4] = [111, 222, 333, 444];
-        let frame_base = frame.as_ptr();
-
-        let return_addr = 0xA010;
-        let roots = unsafe { registry.scan_frame(return_addr, frame_base) };
-
-        // Should find slots 0 and 2.
-        assert_eq!(roots.len(), 2);
-        unsafe {
-            assert_eq!(*(roots[0] as *const usize), 111);
-            assert_eq!(*(roots[1] as *const usize), 333);
-        }
-    }
-
     // ── Incremental marking tests ──
 
     #[test]
@@ -12075,11 +11906,117 @@ mod tests {
         gc.roots.clear();
     }
 
+    /// `gc.get_count`'s second element: minors accumulate and a finished major
+    /// is what resets them.
+    ///
+    /// Driven through `do_collect_full`, the operation `gc.collect()` runs, so
+    /// the state the interpreter reports afterwards is the state asserted
+    /// here. Stepping by hand would count differently: the reset lives in
+    /// `finish_incremental_cycle`, and a full collection runs minors around
+    /// its steps.
     #[test]
-    #[cfg(debug_assertions)]
+    fn minors_accumulate_until_a_major_finishes() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        assert_eq!(gc.minor_collections_since_major(), 0);
+
+        gc.do_collect_nursery();
+        gc.do_collect_nursery();
+        assert_eq!(gc.minor_collections_since_major(), 2);
+
+        // A survivor, so the major has something to trace.
+        let mut root = gc.alloc_with_type(tid, 16);
+        unsafe { gc.roots.add(&mut root) };
+
+        gc.do_collect_full();
+        assert!(gc.major_collections >= 1, "a full collection runs a major");
+        assert_eq!(
+            gc.minor_collections_since_major(),
+            0,
+            "a finished major resets the minors counted since the last one"
+        );
+
+        gc.do_collect_nursery();
+        assert_eq!(gc.minor_collections_since_major(), 1);
+        gc.roots.clear();
+    }
+
+    /// A GC armed for the debug checks, with the rotation ring the level also
+    /// installs.
+    fn debug_gc(nursery_size: usize) -> MiniMarkGC {
+        MiniMarkGC::with_config(GcConfig {
+            nursery_size,
+            large_object_threshold: nursery_size / 2,
+            debug: 1,
+            ..GcConfig::default()
+        })
+    }
+
+    /// The heap half of the check reaches an object through the root walk, so
+    /// a flag the collection should have cleared is caught on the object
+    /// rather than only on the collector's own lists.
+    ///
+    /// This is what makes the walk non-vacuous: without it a root enumeration
+    /// that returned nothing would pass every run.
+    #[test]
+    #[should_panic(expected = "GCFLAG_VISITED_RMY after collection")]
+    fn the_debug_walk_reaches_a_promoted_object() {
+        let mut gc = debug_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+        assert!(!gc.is_in_nursery(root.0), "the object promoted");
+
+        unsafe { (*header_of(root.0)).set_flag(flags::VISITED_RMY) };
+        gc.debug_check_consistency();
+    }
+
+    /// The same walk over a heap nothing has broken reports nothing, so the
+    /// test above is failing on the flag rather than on the walk itself.
+    #[test]
+    fn the_debug_walk_passes_a_clean_heap() {
+        let mut gc = debug_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+        gc.debug_check_consistency();
+        gc.roots.clear();
+    }
+
+    /// Without the level the body returns before the first assertion, so the
+    /// same broken flag goes unreported.
+    #[test]
+    fn the_debug_checks_are_off_without_the_level() {
+        let mut gc = test_gc(4096);
+        assert_eq!(gc.config.debug, 0);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        let mut root = obj;
+        unsafe { gc.roots.add(&mut root) };
+        gc.do_collect_nursery();
+
+        unsafe { (*header_of(root.0)).set_flag(flags::VISITED_RMY) };
+        gc.debug_check_consistency();
+        unsafe { (*header_of(root.0)).clear_flag(flags::VISITED_RMY) };
+        gc.roots.clear();
+    }
+
+    /// No `#[cfg(debug_assertions)]`: `debug_check_consistency` self-gates on
+    /// the debug level and asserts for real, so the check survives a release
+    /// build — which is what makes `PYPY_GC_DEBUG` worth setting there.
+    #[test]
     #[should_panic(expected = "raw_malloc_might_sweep must be empty outside SWEEPING")]
     fn rawmalloc_sweep_candidates_require_sweeping_state() {
-        let mut gc = test_gc(4096);
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            debug: 1,
+            ..GcConfig::default()
+        });
         let tid = gc.register_type(TypeInfo::simple(16));
         let raw_size = gc.oldgen.small_request_threshold() + std::mem::size_of::<usize>();
         gc.alloc_in_oldgen_clear(tid, raw_size);
@@ -12110,99 +12047,6 @@ mod tests {
         assert_eq!(gc.major_collections, majors_before + 1);
         assert_eq!(gc.oldgen.object_count(), 1);
         assert_eq!(root.0, live.0);
-        gc.roots.clear();
-    }
-
-    // ── GC stress tests ──
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn test_gc_stress_with_safepoint_scanning() {
-        // Register a compiled code region with a safepoint map, then
-        // allocate objects under pressure so nursery collections fire.
-        // After collection, verify that roots discovered via scan_frame
-        // point to valid, promoted objects.
-
-        let ptr_size = std::mem::size_of::<GcRef>();
-        let mut gc = test_gc(512); // small nursery to force frequent collections
-        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size * 2, vec![0, ptr_size]));
-
-        // Build a compiled code registry with a safepoint map marking
-        // frame slots 0 and 2 as GC references.
-        let mut registry = CompiledCodeRegistry::new();
-        let mut smap = SafepointMap::new();
-        let mut gc_map = crate::GcMap::new();
-        gc_map.set_ref(0);
-        gc_map.set_ref(2);
-        smap.add(0x50, gc_map);
-
-        registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 0x100,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 1,
-        });
-
-        // Simulate a JIT frame: slots 0 and 2 hold GcRefs, slots 1 and 3
-        // hold non-pointer data.
-        let obj_a = gc.alloc_with_type(tid, ptr_size * 2);
-        let obj_b = gc.alloc_with_type(tid, ptr_size * 2);
-        unsafe {
-            *(obj_a.0 as *mut GcRef) = GcRef::NULL;
-            *((obj_a.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
-            *(obj_b.0 as *mut GcRef) = GcRef::NULL;
-            *((obj_b.0 + ptr_size) as *mut GcRef) = GcRef::NULL;
-        }
-
-        let frame: [usize; 4] = [obj_a.0, 0xDEAD, obj_b.0, 0xBEEF];
-
-        // Register frame slots as GC roots (simulating what the backend does
-        // at a safepoint).
-        let roots_from_frame = unsafe { registry.scan_frame(0x1050, frame.as_ptr()) };
-        assert_eq!(roots_from_frame.len(), 2);
-
-        // Register the scanned slots as roots with the GC.
-        for root_ptr in &roots_from_frame {
-            unsafe {
-                gc.roots.add(*root_ptr);
-            }
-        }
-
-        // Allocate many objects to force multiple nursery collections.
-        for i in 0..200 {
-            let filler = gc.alloc_with_type(tid, ptr_size * 2);
-            unsafe {
-                *(filler.0 as *mut u64) = i as u64;
-            }
-        }
-        assert!(
-            gc.minor_collections > 0,
-            "should have triggered nursery collections"
-        );
-
-        // Read back the GcRefs from the frame slots (the GC may have updated
-        // them when it promoted the objects).
-        let ref_a = GcRef(frame[0]);
-        let ref_b = GcRef(frame[2]);
-
-        // The original nursery objects should have been forwarded.
-        // The frame slots must now point to valid (non-nursery) addresses.
-        assert!(!ref_a.is_null());
-        assert!(!ref_b.is_null());
-        assert!(
-            !gc.is_in_nursery(ref_a.0),
-            "object A should have been promoted out of nursery"
-        );
-        assert!(
-            !gc.is_in_nursery(ref_b.0),
-            "object B should have been promoted out of nursery"
-        );
-
-        // Verify non-GC slots are untouched.
-        assert_eq!(frame[1], 0xDEAD);
-        assert_eq!(frame[3], 0xBEEF);
-
         gc.roots.clear();
     }
 
@@ -13136,7 +12980,7 @@ cache size\t: 8192 kB\n";
         gc.roots.clear();
     }
 
-    // ── Pin / Unpin / jit_free tests ──
+    // ── Pin / Unpin tests ──
 
     #[test]
     fn test_pin_prevents_nursery_move() {
@@ -13391,42 +13235,6 @@ cache size\t: 8192 kB\n";
 
         crate::shadow_stack::pop_jf_to(0);
         gc.roots.clear();
-    }
-
-    #[test]
-    fn test_jit_free_unregisters_code() {
-        let mut gc = test_gc(4096);
-
-        let smap = SafepointMap::new();
-        gc.compiled_code_registry.register(CompiledCodeRegion {
-            code_start: 0x1000,
-            code_size: 256,
-            safepoint_map: smap,
-            frame_size_slots: 4,
-            loop_token: 1,
-        });
-
-        let smap2 = SafepointMap::new();
-        gc.compiled_code_registry.register(CompiledCodeRegion {
-            code_start: 0x2000,
-            code_size: 512,
-            safepoint_map: smap2,
-            frame_size_slots: 8,
-            loop_token: 2,
-        });
-
-        assert_eq!(gc.compiled_code_registry.len(), 2);
-
-        // Free the first region.
-        gc.jit_free(0x1000, 256);
-
-        assert_eq!(gc.compiled_code_registry.len(), 1);
-        assert!(gc.compiled_code_registry.find_region(0x1050).is_none());
-        assert!(gc.compiled_code_registry.find_region(0x2050).is_some());
-
-        // Free the second region.
-        gc.jit_free(0x2000, 512);
-        assert_eq!(gc.compiled_code_registry.len(), 0);
     }
 
     #[test]

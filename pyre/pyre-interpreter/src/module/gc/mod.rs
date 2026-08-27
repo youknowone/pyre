@@ -2,6 +2,15 @@
 //!
 //! Partial port of `interp_gc.py`. Explicit collection runs the complete
 //! RPython collection, then drains the finalizer queue synchronously.
+//!
+//! Part of this module answers to 3.14 alone. `moduledef.py` binds no
+//! `get_count`, `set_threshold`/`get_threshold`, `set_debug`/`get_debug` or
+//! `freeze`/`unfreeze`/`get_freeze_count`, so those have no implementation to
+//! follow and each one below states what it answers and why. Nothing grades
+//! them either: `test_gc` is an implementation-detail module on both axes —
+//! `lib-python/conftest.py`'s testmap skips it and `cpython_tests/run.py`
+//! carries that skip forward — so the assertions that would pin these live in
+//! `extra_tests/snippets/` instead.
 
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
@@ -17,18 +26,38 @@ pub mod hook;
 /// call so callers that toggle and re-read the state stay consistent.
 static GC_ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// The collector debug word.  PyPy does not expose this frontend knob, but
-/// the 3.14 observable contract requires the value to be interpreter-owned and
-/// shared by all threads.  The moving collector has no
-/// refcount-cycle diagnostic stream to toggle; the word is nevertheless kept
-/// exactly so callers can bracket a collection and restore the prior flags.
+/// The collector debug word.
+///
+/// `[3.14-spec]` PyPy exposes no such knob, and 3.14 requires the value to be
+/// interpreter-owned and shared by all threads, so the word is kept exactly:
+/// a caller can bracket a collection and restore the prior flags.  It drives
+/// nothing, and `DEBUG_SAVEALL` is the flag that shows why.  3.14 retains what
+/// the *cyclic* collector found unreachable, which is a small set precisely
+/// because refcounting already reclaimed the acyclic garbage before it ran.
+/// Here there is no refcount, so the population reaching the sweep's
+/// free-or-keep callback is everything that died since the last major —
+/// hundreds of objects across a dozen type ids inside the single collection
+/// `test_saveall` brackets, where it expects one — and no filter at that
+/// callback can recover the distinction, because a would-this-have-died-by-
+/// refcount answer is never computed.  The remaining flags describe a
+/// per-object cycle report this collector likewise does not produce.
 static GC_DEBUG: AtomicI64 = AtomicI64::new(0);
 
-/// The collection thresholds `gc.get_threshold()` reports.  pyre's collector
-/// has no generational allocation counters to drive, so the values are only
-/// remembered: `set_threshold` stores what it was given and `get_threshold`
-/// hands the same tuple back, which is the part of the pair's behaviour a
-/// caller can observe.  All three are kept, including the third, whose round
+/// The collection thresholds `gc.get_threshold()` reports.
+///
+/// `[3.14-spec]` A remembered round trip, where PyPy binds no threshold
+/// surface at all.  The values drive nothing, and the reason is a unit
+/// mismatch rather than an absence: what schedules a collection here is a byte
+/// reading — `get_total_memory_used` against `next_major_collection_threshold`
+/// — while `threshold0` is a count of container allocations, and the only
+/// knob retunable after construction, `set_max_heap_size`, is a byte ceiling
+/// too.  An old-gen live-*object* count does exist (`live_objects`, kept by
+/// the arena collection), so the honest statement is that no knob shares
+/// `threshold0`'s unit, not that nothing is counted.  Pointing a count at a
+/// byte knob would silently mean something neither 3.14 nor PyPy means.  So
+/// `set_threshold` stores what it was given and `get_threshold` hands the same
+/// tuple back, which is the part of the pair's behaviour a caller can
+/// observe.  All three are kept, including the third, whose round
 /// trip 3.14 preserves even though its own incremental collector sizes no
 /// third generation.  The initial values are the ones a fresh interpreter
 /// starts with.
@@ -1391,14 +1420,19 @@ crate::py_module! {
     },
     inline_functions: {
         fn collect(
-            #[default(w_int_new(0))] generation: PyObjectRef,
+            #[default(w_int_new(NUM_GENERATIONS - 1))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // `interp_gc.py collect` unwraps the optional generation as an
-            // int and ignores its value, because PyPy's frontend has no
-            // generations to select between.  This one reports three, so the
-            // argument is bounded the way `gc_collect_impl` bounds it; the
-            // value is still ignored below, since every collection here is a
-            // full one.
+            // `interp_gc.py collect` unwraps the optional generation as an int
+            // and then ignores it, because the frontend it belongs to has no
+            // generations to select between.  This one does: `NUM_GENERATIONS`
+            // publishes the mapping, `get_objects` already selects on it, and
+            // `get_count` reports per generation.  So the argument is bounded
+            // the way `gc_collect_impl` bounds it and then passed on to
+            // `incminimark.py collect(gen)`, whose generations are the same
+            // ones -- a minor at 0, a started major at 1, a full major at 2.
+            //
+            // The default is the oldest generation, so a bare `gc.collect()`
+            // is the full collection it has always been.
             let generation = crate::baseobjspace::int_w(
                 crate::baseobjspace::space_index(generation)?,
             )?;
@@ -1407,7 +1441,7 @@ crate::py_module! {
             }
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
-            pyre_object::gc_hook::try_gc_collect();
+            pyre_object::gc_hook::try_gc_collect(generation);
             run_finalizers_now();
             run_cpyext_deallocs_now();
             // The return value is the caller-observable axis and is an int.
@@ -1656,8 +1690,38 @@ crate::py_module! {
                 .map(|slot| w_int_new(slot.load(Ordering::Relaxed)))
                 .collect(),
         )),
+        // `gc_get_count_impl` reads three fields and only the first is an
+        // object count: element 0 is tracked-container allocations minus
+        // deallocations since generation 0 was collected, while elements 1 and
+        // 2 count *collections* -- generation-0 collections since generation 1
+        // was collected, and generation-1 collections since generation 2 was.
+        // Collecting a generation zeroes its own count and every younger one.
+        //
+        // Under the generation mapping `NUM_GENERATIONS` already publishes --
+        // 0 is the nursery, 1 the generation this collector keeps empty, 2
+        // what is not in the nursery -- a minor collection is the generation-0
+        // one and a major collects both older generations at once.  So element
+        // 1 is the minors run since the last major, which is what `collect(0)`
+        // moves.  Element 2 is exact at zero: `collect(1)` is `collect(0)` plus
+        // "start the major now if one is not already running", so asking for
+        // the middle generation runs no collection of its own for element 2 to
+        // count -- there is no middle generation holding anything to reclaim.
+        //
+        // Element 0 stays zero because no counter can be truthful here.  The
+        // allocation seam is keyed by a majit type id and nothing else
+        // (`try_gc_alloc(type_id, payload_size)`), and the tracked predicate is
+        // not a function of that key -- `cpython_object_is_gc` reaches the
+        // object's type and, for a type object, the object itself, so one type
+        // id covers both a tracked heap type and an untracked static one.
+        // Even a decidable bit would undercount: every backend emits the
+        // nursery bump inline and merges several objects into one, so compiled
+        // code allocates without passing any counter site, and a virtualized
+        // allocation is removed outright.  Counting by walking instead is what
+        // `gc.get_objects` costs, four orders of magnitude above this call.
         "get_count"     / 0 = |_| Ok(w_tuple_new(vec![
-            w_int_new(0), w_int_new(0), w_int_new(0),
+            w_int_new(0),
+            w_int_new(majit_gc::active_minor_collections_since_major() as i64),
+            w_int_new(0),
         ])),
         "get_debug"     / 0 = |_| Ok(w_int_new(GC_DEBUG.load(Ordering::Relaxed))),
         "set_debug"     / 1 = |args| {
@@ -1729,11 +1793,18 @@ crate::py_module! {
         "is_finalized"  / 1 = |args| Ok(w_bool_from(
             majit_gc::gc_finalizer_has_run(args[0] as usize),
         )),
-        // CPython 3.14 `gc.freeze()` moves the surviving objects into a
+        // `[3.14-spec]` `gc.freeze()` moves the surviving objects into a
         // permanent generation that later collections skip; it is a pre-fork
-        // hint, not a semantic guarantee. The collector has no permanent
-        // generation, so freezing and unfreezing are no-ops and the frozen
-        // count is always the truthful zero.
+        // hint, not a semantic guarantee.  PyPy binds none of the three.  The
+        // collector has no permanent generation, so freezing and unfreezing
+        // are no-ops and the frozen count is the truthful zero.
+        //
+        // Rooting the live set instead would not be that operation under
+        // another name: a frozen object in 3.14 is skipped by the cyclic
+        // collector but still reclaimed by refcount, while a rooted one is
+        // immortal until `unfreeze` and has its `__del__` deferred until then.
+        // That is a third behaviour, matching neither side, and the whole live
+        // set is what it would apply to.
         "freeze"           / 0 = |_| Ok(w_none()),
         "unfreeze"         / 0 = |_| Ok(w_none()),
         "get_freeze_count" / 0 = |_| Ok(w_int_new(0)),

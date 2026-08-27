@@ -31,22 +31,42 @@
 //! // pop_roots(livevars).
 //! ```
 //!
-//! ## Phase plan
+//! ## What this scaffold stands in for
 //!
-//! - **Phase 2a** — no-op stub. The API surface existed but the body
-//!   was empty.
-//! - **Phase 2b** — TLS shadow-stack body. [`push_roots`] snapshots
-//!   the thread-local shadow stack length into a [`RootScope`];
-//!   [`pin_root`] appends a [`PyObjectRef`]; [`Drop`] truncates the
-//!   stack back to the saved length. Mirrors
-//!   `rpython/memory/gctransform/shadowstack.py walk_stack_root`.
-//! - **Phase 2c (this commit)** — expose [`walk_shadow_stack`]
-//!   so the backend GC can visit pinned roots during nursery
-//!   collection. `pyre-jit::eval` registers a thin
-//!   `pyre-object`-to-`majit-gc` adapter through
-//!   `majit_gc::shadow_stack::register_extra_root_walker`; pinned
-//!   pointers are now observable to the active `MiniMarkGC`
-//!   instance and survive across collections.
+//! Upstream writes no bracket by hand. The transformer inserts
+//! `push_roots` / `pop_roots` around the operations that can collect,
+//! across the whole translated graph, so an author cannot forget one and a
+//! reviewer never has to look for it. pyre has no such pass over Rust
+//! code: every bracket is written by hand, and their count is the size of
+//! what an automatic transform would replace. From the repo root,
+//! excluding this module:
+//!
+//! ```text
+//! rg -o 'push_roots\(\)'     --glob '!target' --glob '!**/gc_roots.rs' pyre/ majit/ | wc -l   # 1376
+//! rg -o 'pin_root\('         --glob '!target' --glob '!**/gc_roots.rs' pyre/ majit/ | wc -l   # 2604
+//! rg -o 'shadow_stack_get\(' --glob '!target' --glob '!**/gc_roots.rs' pyre/ majit/ | wc -l   # 3571
+//! rg -l 'push_roots\(\)'     --glob '!target' --glob '!**/gc_roots.rs' pyre/ majit/ | wc -l   # 163
+//! ```
+//!
+//! A forgotten bracket is not a compile error, so nothing downstream
+//! assumes the set is complete. `crate::gc_interp` allocates interpreter
+//! boxes born-old through `try_gc_alloc_stable`, and the safepoint major
+//! is `MiniMarkGC::do_collect_oldgen_nonmoving`, which leaves the nursery
+//! byte-for-byte intact. Both exist because an unrooted [`PyObjectRef`] on
+//! the Rust stack of a bytecode handler would dangle across a moving
+//! minor. Ordinary moving-nursery allocation for the interpreter waits on
+//! the pass, not on this module.
+//!
+//! ## State
+//!
+//! [`push_roots`] snapshots the thread-local shadow-stack length into a
+//! [`RootScope`]; [`pin_root`] appends a [`PyObjectRef`]; [`Drop`]
+//! truncates back to the saved length (`shadowstack.py walk_stack_root`).
+//! [`walk_shadow_stack`] hands the pinned roots to the collector:
+//! `pyre-jit::eval` registers a `pyre-object`-to-`majit-gc` adapter
+//! through `majit_gc::shadow_stack::register_extra_root_walker`, so a
+//! pinned pointer is visible to the active `MiniMarkGC` and is read back
+//! forwarded.
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::Cell;
