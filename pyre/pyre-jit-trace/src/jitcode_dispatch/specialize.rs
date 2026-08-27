@@ -8114,6 +8114,10 @@ enum BuiltinLenSource {
     /// length off the RPython list in `self._data`; pyre mirrors that count
     /// into a field.  Mutable, unlike [`BuiltinLenSource::BytesField`].
     BytearrayField,
+    /// `W_SetObject.len` — `setobject.py W_BaseSetObject.length` answers
+    /// `self.strategy.length(self)`; pyre keeps the count on the body, so the
+    /// read is the same shape as [`BuiltinLenSource::BytearrayField`].
+    SetField,
     /// `tupleobject.py` carries no separate length field, so the length is
     /// `arraylen_gc(wrappeditems)`.
     TupleArrayLen,
@@ -8126,8 +8130,9 @@ enum BuiltinLenSource {
 }
 
 /// `len(x)` on an exact canonical `W_ListObject` / `W_UnicodeObject` /
-/// `W_BytesObject` / `W_BytearrayObject` / `W_TupleObject` / `W_Range`, or on
-/// an arity-2 tuple specialisation:
+/// `W_BytesObject` / `W_BytearrayObject` / `W_SetObject` (as either `set` or
+/// `frozenset`) / `W_TupleObject` / `W_Range`, or on an arity-2 tuple
+/// specialisation:
 /// lower the opaque `bh_call_fn(len_builtin, PY_NULL, x)` residual to the
 /// inline length read the meta-tracer produces upstream
 /// (descroperation.py `_len`): `guard_value(callable)` +
@@ -8139,7 +8144,10 @@ enum BuiltinLenSource {
 ///
 /// Returns `None` (fall through to the generic residual, SAFE) for any
 /// other shape: non-list/str/tuple arg, a subclass, a bound receiver, or wrong
-/// arity.
+/// arity.  `dict` is one of those: `W_DictObject` carries no length word at
+/// all -- `dictmultiobject.py length` goes through the strategy to
+/// `len(unerase(dstorage))`, and pyre's storage is an `IndexMap` whose count
+/// is not a field the trace can read.
 pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -8236,6 +8244,22 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
                 Some(exact),
                 BuiltinLenSource::BytearrayField,
                 pyre_object::bytearrayobject::w_bytearray_len(list_obj),
+            )
+        } else if std::ptr::eq(ob_type, &pyre_object::setobject::SET_TYPE)
+            || std::ptr::eq(ob_type, &pyre_object::setobject::FROZENSET_TYPE)
+        {
+            // Two types over one `W_SetObject` body, so the only thing the two
+            // differ in is which of them the class guard pins — and `ob_type`
+            // is already the one that matched.
+            let exact = pyre_object::pyobject::get_instantiate(&*ob_type);
+            if !std::ptr::eq(w_class, exact) {
+                return Ok(None);
+            }
+            (
+                ob_type as i64,
+                Some(exact),
+                BuiltinLenSource::SetField,
+                pyre_object::setobject::w_set_len(list_obj),
             )
         } else if std::ptr::eq(ob_type, &pyre_object::pyobject::TUPLE_TYPE) {
             let exact = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
@@ -8413,6 +8437,11 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
             ctx.trace_ctx,
             list_op,
             crate::descr::bytearray_length_descr(),
+        ),
+        BuiltinLenSource::SetField => crate::state::opimpl_getfield_gc_i(
+            ctx.trace_ctx,
+            list_op,
+            crate::descr::set_len_descr(),
         ),
         BuiltinLenSource::RangeField => unreachable!("range returned its wrapped length above"),
         // `specialisedtupleobject.py length()` returns the constant
