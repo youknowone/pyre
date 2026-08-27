@@ -42,112 +42,244 @@ fn ast_instance_type_name(object: PyObjectRef) -> &'static str {
     }
 }
 
+fn ast_fields_owner_name(w_type: PyObjectRef) -> String {
+    let name = unsafe { pyre_object::w_type_get_name(w_type) };
+    if name == "AST" {
+        let bases = unsafe { pyre_object::w_type_get_bases(w_type) };
+        if unsafe { pyre_object::w_tuple_len(bases) } == 1
+            && unsafe { pyre_object::w_tuple_getitem(bases, 0) }
+                == Some(crate::typedef::w_object())
+        {
+            // CPython's generated root retains the static tp_name `ast.AST`,
+            // while PyPy `State.make_new_type` owns it as the heap type `AST`.
+            // Keep the PyPy owner/storage and reproduce the 3.14 observable
+            // name only at `ast_type_init`'s missing `_fields` diagnostic.
+            return "ast.AST".to_owned();
+        }
+    }
+    name.to_owned()
+}
+
+fn ast_field_repr(field: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    unsafe { crate::display::py_repr_wtf8(field) }
+}
+
+fn ast_warn(message: rustpython_wtf8::Wtf8Buf) -> Result<(), crate::PyError> {
+    crate::warn::warn_category_w(
+        pyre_object::w_str_from_wtf8(message),
+        "DeprecationWarning",
+        2,
+    )
+}
+
+fn expr_context_type() -> PyObjectRef {
+    // CPython `ast_state.expr_context_type`; PyPy's `State` also owns this
+    // generated base beside the Load singleton.  Recover that same base from
+    // the singleton instead of adding a second semantic side table.
+    unsafe {
+        let load_type = pyre_object::w_instance_get_type(load_singleton());
+        let bases = pyre_object::w_type_get_bases(load_type);
+        pyre_object::w_tuple_getitem(bases, 0).expect("Load has expr_context base")
+    }
+}
+
+/// [3.14-spec] PyPy `W_AST_init` only assigns supplied arguments.  The pinned
+/// `ASTConstructorTests` require CPython 3.14 `ast_type_init`'s observable
+/// missing-field defaults/deprecations and unexpected-keyword deprecation.
+/// Keep PyPy's generated-type owner and general object-space dispatch while
+/// porting that constructor decision tree here.
 fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
     let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let Some((&zelf, values)) = positional.split_first() else {
+    let Some((_, values)) = positional.split_first() else {
         return Err(crate::PyError::type_error("AST.__init__() missing self"));
     };
     // `builtin_code_call` hands the body a native slice the collector does not
-    // update, and every store below allocates — a field value may be a `list`
-    // or a `dict`, and the keyword dict moves too.  The values and the keyword
-    // dict are one livevar set, so both slices are written before either is
-    // queried (a forwarding query is itself a safepoint), and each use reads
-    // its slot back.  `zelf` and the `_fields` strings do not move.
+    // update.  Publish self as well as every value: attribute lookup, equality,
+    // repr, warnings and stores all run Python and may collect.
     let roots = pyre_object::gc_roots::push_roots();
-    let values_base = roots.publish(values);
+    let positional_base = roots.publish(positional);
     let kwargs_slot = kwargs.map(|kwargs| roots.publish(&[kwargs]));
-    roots.normalize(values_base, values.len() + usize::from(kwargs.is_some()));
-    let fields_obj = crate::baseobjspace::getattr_str(zelf, "_fields")?;
-    let fields = unsafe { pyre_object::w_tuple_items_copy_as_vec(fields_obj) };
-    if values.len() > fields.len() {
+    roots.normalize(
+        positional_base,
+        positional.len() + usize::from(kwargs.is_some()),
+    );
+    let zelf = || roots.get(positional_base);
+    let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(unsafe { pyre_object::w_instance_get_type(zelf()) });
+    let fields_obj =
+        match crate::baseobjspace::findattr_result(roots.get(w_type_slot), "_fields")? {
+            Some(fields_obj) => fields_obj,
+            None => {
+                let owner = ast_fields_owner_name(roots.get(w_type_slot));
+                return Err(crate::PyError::attribute_error_with_context(
+                    format!("type object '{owner}' has no attribute '_fields'"),
+                    roots.get(w_type_slot),
+                    "_fields",
+                ));
+            }
+        };
+    let fields_obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(fields_obj);
+    // PyPy `W_AST_init` uses `space.fixedview`, and CPython uses the sequence
+    // protocol; user subclasses may therefore replace the generated tuple.
+    let fields = crate::baseobjspace::fixedview(roots.get(fields_obj_slot), -1)?;
+    let fields_base = roots.publish(&fields);
+    roots.normalize(fields_base, fields.len());
+    let num_fields = fields.len();
+    if values.len() > num_fields {
         return Err(crate::PyError::type_error(format!(
-            "{} constructor takes at most {} positional arguments",
-            ast_instance_type_name(zelf),
-            fields.len()
+            "{} constructor takes at most {} positional argument{}",
+            ast_instance_type_name(zelf()),
+            num_fields,
+            if num_fields == 1 { "" } else { "s" }
         )));
     }
-    let mut assigned_names = Vec::with_capacity(values.len() + kwargs.is_some() as usize);
-    for (index, &field) in fields.iter().take(values.len()).enumerate() {
-        let name = unsafe { pyre_object::w_str_get_value(field) };
-        assigned_names.push(name.to_owned());
-        crate::baseobjspace::setattr_str(zelf, name, roots.get(values_base + index))?;
+    // CPython `ast_type_init` uses a set, so duplicate or unhashable custom
+    // `_fields` have the same constructor semantics.  Build it through PyPy's
+    // set operation rather than a host side-table.
+    let remaining_fields = pyre_object::w_set_new();
+    let remaining_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(remaining_fields);
+    // Build the raw carrier only after `w_set_new` has had its allocation
+    // safepoint; `builtin_set_add_items` publishes every member before hashing.
+    let rooted_fields: Vec<_> = (0..num_fields)
+        .map(|index| roots.get(fields_base + index))
+        .collect();
+    crate::builtins::builtin_set_add_items(roots.get(remaining_slot), &rooted_fields)?;
+    for index in 0..values.len() {
+        crate::baseobjspace::setattr(
+            zelf(),
+            roots.get(fields_base + index),
+            roots.get(positional_base + index + 1),
+        )?;
+        crate::type_methods::set_discard_checked(
+            roots.get(remaining_slot),
+            roots.get(fields_base + index),
+        )?;
     }
+
+    let mut attributes_slot = None;
     if let Some(kwargs_slot) = kwargs_slot {
-        let entries = unsafe { pyre_object::w_dict_str_entries(roots.get(kwargs_slot)) };
-        let entry_values: Vec<PyObjectRef> = entries.iter().map(|(_, value)| *value).collect();
-        let entries_base = roots.publish(&entry_values);
-        roots.normalize(entries_base, entry_values.len());
-        for (index, (name, _)) in entries.iter().enumerate() {
-            if name == "__pyre_kw__" {
+        let entries = unsafe { pyre_object::w_dict_items(roots.get(kwargs_slot)) };
+        let mut entry_objects = Vec::with_capacity(entries.len() * 2);
+        for &(key, value) in &entries {
+            entry_objects.push(key);
+            entry_objects.push(value);
+        }
+        let entries_base = roots.publish(&entry_objects);
+        roots.normalize(entries_base, entry_objects.len());
+        for index in 0..entries.len() {
+            let key_slot = entries_base + index * 2;
+            let value_slot = key_slot + 1;
+            let key = roots.get(key_slot);
+            if unsafe {
+                pyre_object::is_str(key) && pyre_object::w_str_get_value(key) == "__pyre_kw__"
+            } {
                 continue;
             }
-            if assigned_names.iter().any(|assigned| assigned == name) {
-                return Err(crate::PyError::type_error(format!(
-                    "{} got multiple values for argument '{name}'",
-                    ast_instance_type_name(zelf)
-                )));
+
+            if crate::baseobjspace::contains(roots.get(fields_obj_slot), roots.get(key_slot))? {
+                if !crate::type_methods::set_discard_checked(
+                    roots.get(remaining_slot),
+                    roots.get(key_slot),
+                )? {
+                    let key_repr = ast_field_repr(roots.get(key_slot))?;
+                    return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                        ast_instance_type_name(zelf()),
+                        " got multiple values for argument ",
+                        key_repr
+                    )));
+                }
+            } else {
+                let attributes = if let Some(slot) = attributes_slot {
+                    roots.get(slot)
+                } else {
+                    let value = crate::baseobjspace::getattr_str(
+                        roots.get(w_type_slot),
+                        "_attributes",
+                    )?;
+                    let slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(value);
+                    attributes_slot = Some(slot);
+                    roots.get(slot)
+                };
+                if !crate::baseobjspace::contains(attributes, roots.get(key_slot))? {
+                    let key_repr = ast_field_repr(roots.get(key_slot))?;
+                    ast_warn(crate::display::wtf8_format!(
+                        ast_instance_type_name(zelf()),
+                        ".__init__ got an unexpected keyword argument ",
+                        key_repr,
+                        ". Support for arbitrary keyword arguments is deprecated and will be ",
+                        "removed in Python 3.15."
+                    ))?;
+                }
             }
-            crate::baseobjspace::setattr_str(zelf, name, roots.get(entries_base + index))?;
-            assigned_names.push(name.to_owned());
+            crate::baseobjspace::setattr(
+                zelf(),
+                roots.get(key_slot),
+                roots.get(value_slot),
+            )?;
         }
     }
-    let node = ast_instance_type_name(zelf);
-    for &field in node_sequence_fields(node) {
-        if !assigned_names.iter().any(|assigned| assigned == field) {
-            crate::baseobjspace::setattr_str(zelf, field, pyre_object::w_list_new(Vec::new()))?;
-        }
+
+    if unsafe { pyre_object::setobject::w_set_len(roots.get(remaining_slot)) } == 0 {
+        return Ok(pyre_object::w_none());
     }
-    for &field in node_load_fields(node) {
-        if !assigned_names.iter().any(|assigned| assigned == field) {
-            crate::baseobjspace::setattr_str(zelf, field, load_singleton())?;
+    let Some(field_types) =
+        crate::baseobjspace::findattr_result(roots.get(w_type_slot), "_field_types")?
+    else {
+        // CPython 3.14 `ast_type_init`: user AST subclasses without generated
+        // metadata keep the pre-3.13 behavior and leave omitted fields absent.
+        return Ok(pyre_object::w_none());
+    };
+    let field_types_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(field_types);
+    let remaining = unsafe { pyre_object::setobject::w_set_items(roots.get(remaining_slot)) };
+    let remaining_base = roots.publish(&remaining);
+    roots.normalize(remaining_base, remaining.len());
+    for index in 0..remaining.len() {
+        let field_slot = remaining_base + index;
+        let Some(field_type) = crate::baseobjspace::finditem(
+            roots.get(field_types_slot),
+            roots.get(field_slot),
+        )?
+        else {
+            let field_repr = ast_field_repr(roots.get(field_slot))?;
+            ast_warn(crate::display::wtf8_format!(
+                "Field ",
+                field_repr,
+                " is missing from ",
+                ast_instance_type_name(zelf()),
+                "._field_types. This will become an error in Python 3.15."
+            ))?;
+            continue;
+        };
+        let field_type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(field_type);
+        if unsafe { pyre_object::is_union(roots.get(field_type_slot)) } {
+            // Optional fields already have their inherited class-level None.
+        } else if unsafe { pyre_object::is_generic_alias(roots.get(field_type_slot)) } {
+            let empty = pyre_object::w_list_new(Vec::new());
+            let empty_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(empty);
+            crate::baseobjspace::setattr(
+                zelf(),
+                roots.get(field_slot),
+                roots.get(empty_slot),
+            )?;
+        } else if crate::baseobjspace::is_w(roots.get(field_type_slot), expr_context_type()) {
+            crate::baseobjspace::setattr(zelf(), roots.get(field_slot), load_singleton())?;
+        } else {
+            let field_repr = ast_field_repr(roots.get(field_slot))?;
+            ast_warn(crate::display::wtf8_format!(
+                ast_instance_type_name(zelf()),
+                ".__init__ missing 1 required positional argument: ",
+                field_repr,
+                ". This will become an error in Python 3.15."
+            ))?;
         }
     }
     Ok(pyre_object::w_none())
-}
-
-/// Repeated (`*`) ASDL fields.  CPython 3.14 `ast_type_init` installs a fresh
-/// list for each omitted field; this is instance state, never a class default.
-fn node_sequence_fields(name: &str) -> &'static [&'static str] {
-    match name {
-        "Module" => &["body", "type_ignores"],
-        "Interactive" => &["body"],
-        "FunctionType" => &["argtypes"],
-        "FunctionDef" | "AsyncFunctionDef" => &["body", "decorator_list", "type_params"],
-        "ClassDef" => &["bases", "keywords", "body", "decorator_list", "type_params"],
-        "Delete" => &["targets"],
-        "Assign" => &["targets"],
-        "TypeAlias" => &["type_params"],
-        "For" | "AsyncFor" | "While" | "If" => &["body", "orelse"],
-        "With" | "AsyncWith" => &["items", "body"],
-        "Match" => &["cases"],
-        "Try" | "TryStar" => &["body", "handlers", "orelse", "finalbody"],
-        "Import" | "ImportFrom" => &["names"],
-        "Global" | "Nonlocal" => &["names"],
-        "BoolOp" => &["values"],
-        "Dict" => &["keys", "values"],
-        "Set" => &["elts"],
-        "ListComp" | "SetComp" | "GeneratorExp" => &["generators"],
-        "DictComp" => &["generators"],
-        "Compare" => &["ops", "comparators"],
-        "Call" => &["args", "keywords"],
-        "JoinedStr" | "TemplateStr" => &["values"],
-        "List" | "Tuple" => &["elts"],
-        "ExceptHandler" => &["body"],
-        "MatchSequence" | "MatchOr" => &["patterns"],
-        "MatchMapping" => &["keys", "patterns"],
-        "MatchClass" => &["patterns", "kwd_attrs", "kwd_patterns"],
-        "comprehension" => &["ifs"],
-        "arguments" => &["posonlyargs", "args", "kwonlyargs", "kw_defaults", "defaults"],
-        "match_case" => &["body"],
-        _ => &[],
-    }
-}
-
-fn node_load_fields(name: &str) -> &'static [&'static str] {
-    match name {
-        "Attribute" | "Subscript" | "Starred" | "Name" | "List" | "Tuple" => &["ctx"],
-        _ => &[],
-    }
 }
 
 /// Optional (`?`) ASDL fields whose PyPy-generated type dictionary supplies
@@ -256,11 +388,11 @@ fn node_fields(name: &str) -> &'static [&'static str] {
     }
 }
 
-/// `Parser/Python.asdl`: one type spelling per entry in [`node_fields`].
-/// Keeping the ASDL `?`/`*` markers here lets the generated type setup below
-/// build the same union and `list[...]` objects as CPython 3.14
-/// `add_ast_annotations`, while the owner/type creation order remains PyPy's
-/// `State.make_new_type` order.
+/// CPython 3.14 `add_ast_annotations`: one public field-type spelling per
+/// entry in [`node_fields`].  Its generated metadata normalizes the two ASDL
+/// `expr?*` fields to `list[expr]`; [`node_signature`] restores the literal
+/// spelling only for their docs.  The owner/type creation order remains
+/// PyPy's `State.make_new_type` order.
 fn node_field_types(name: &str) -> &'static [&'static str] {
     match name {
         "Module" => &["stmt*", "type_ignore*"],
@@ -371,6 +503,52 @@ fn asdl_field_type(ns: PyObjectRef, spelling: &str) -> crate::PyResult {
     }
 }
 
+fn node_signature(name: &str) -> String {
+    let fields = node_fields(name);
+    let types = node_field_types(name);
+    assert_eq!(fields.len(), types.len(), "ASDL signature fields for {name}");
+    if fields.is_empty() {
+        name.to_owned()
+    } else {
+        let fields = types
+            .iter()
+            .zip(fields)
+            .map(|(typ, field)| {
+                // `Parser/Python.asdl` permits None placeholders in these two
+                // repeated expr fields.  CPython `add_ast_annotations`
+                // deliberately publishes `list[expr]`, while the generated
+                // docstring retains the literal `expr?*` ASDL spelling.
+                let typ = if (name == "Dict" && *field == "keys")
+                    || (name == "arguments" && *field == "kw_defaults")
+                {
+                    "expr?*"
+                } else {
+                    typ
+                };
+                format!("{typ} {field}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}({fields})")
+    }
+}
+
+fn node_doc(name: &str, variants: Option<&[&str]>) -> String {
+    let Some(variants) = variants else {
+        return node_signature(name);
+    };
+    let signatures: Vec<_> = variants
+        .iter()
+        .map(|variant| node_signature(variant))
+        .collect();
+    if signatures.iter().all(|signature| !signature.contains('(')) {
+        format!("{name} = {}", signatures.join(" | "))
+    } else {
+        let continuation = format!("\n{}| ", " ".repeat(name.len() + 1));
+        format!("{name} = {}", signatures.join(&continuation))
+    }
+}
+
 /// [3.14-spec] PyPy `State.make_new_type` publishes no field-type metadata,
 /// while the pinned `lib-python/3/test/test_ast/test_ast.py`
 /// `AST_Tests.test_arguments` requires the exact public mapping.  CPython 3.14
@@ -436,7 +614,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `type(name, (base,), {"__module__": "ast"})` — a fresh heap type. The
     // generated AST types report `__module__ == "ast"` (astcompiler/ast.py;
     // the host `_ast.Module.__module__` is likewise `'ast'`).
-    let make = |name: &str, base: PyObjectRef| -> PyObjectRef {
+    let make = |name: &str, base: PyObjectRef, variants: Option<&[&str]>| -> PyObjectRef {
         // A `dict` header moves, and every store below allocates: the key
         // string, the value, and the dict's own storage when it grows.
         let roots = pyre_object::gc_roots::push_roots();
@@ -495,11 +673,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             pyre_object::w_tuple_new(vec![base]),
             roots.get(dict_slot),
         ];
-        crate::builtins::type_descr_new(&args).expect("_ast heap type creation")
+        let typ = crate::builtins::type_descr_new(&args).expect("_ast heap type creation");
+        let type_roots = pyre_object::gc_roots::push_roots();
+        let type_slot = type_roots.base();
+        let _ = type_roots.pin_root(typ);
+        // PyPy `State.make_new_type` assigns its ASDL-generated `doc` after
+        // creating each generated type.  The pre-existing `W_AST` root keeps
+        // its None docstring.
+        if name != "AST" {
+            crate::baseobjspace::setattr_str(
+                type_roots.get(type_slot),
+                "__doc__",
+                pyre_object::w_str_new(&node_doc(name, variants)),
+            )
+            .expect("set generated _ast type doc");
+        }
+        type_roots.get(type_slot)
     };
 
     // Root: AST(object).
-    let ast = make("AST", crate::typedef::w_object());
+    let ast = make("AST", crate::typedef::w_object(), None);
     crate::baseobjspace::setattr_str(
         ast,
         "__init__",
@@ -554,10 +747,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("type_param", &["TypeVar", "ParamSpec", "TypeVarTuple"]),
     ];
     for (group, members) in groups {
-        let g = make(group, ast);
+        let g = make(group, ast, Some(members));
         crate::module_ns_store(ns, group, g);
         for m in *members {
-            let t = make(m, g);
+            let t = make(m, g, None);
             crate::module_ns_store(ns, m, t);
         }
     }
@@ -567,7 +760,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "comprehension", "arguments", "arg", "keyword", "alias", "withitem", "match_case",
     ];
     for name in standalone {
-        let t = make(name, ast);
+        let t = make(name, ast, None);
         crate::module_ns_store(ns, name, t);
     }
 
