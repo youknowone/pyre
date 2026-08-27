@@ -13,12 +13,10 @@ use std::sync::{
     Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
-// `Path` is used only by the host_env source/package loaders; keep it gated
-// so an host_env-off build does not warn on an unused import. `PathBuf`
-// appears in the host_env-independent module-search surface
-// (`SYS_PATH`, `find_module`, `parent_package_path`, `load_part`) and must
-// stay in scope unconditionally.
-#[cfg(feature = "host_env")]
+// `Path` and `PathBuf` both appear in the host_env-independent module-search
+// surface — `SYS_PATH`, `find_module`, `parent_package_path`, `load_part`,
+// and `init_sys_path`, which every host calls — so both stay in scope
+// unconditionally.
 use std::path::Path;
 // `normalize_lexically` walks a path a component at a time to collapse `.`
 // and `..`; it is reached only from the executable-discovery arm.
@@ -73,7 +71,17 @@ pub(crate) mod host {
             std::process::id()
         }
         pub fn isatty(fd: i32) -> bool {
-            unsafe { libc::isatty(fd) != 0 }
+            // wasm32 has no descriptor table to ask, and no `libc::isatty` to
+            // ask it with.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = fd;
+                return false;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            unsafe {
+                libc::isatty(fd) != 0
+            }
         }
         pub fn rename(
             from: impl AsRef<std::path::Path>,
@@ -695,7 +703,10 @@ pub fn install_builtin_modules() {
     // module literally named `posix` does not exist. os.py picks `os.name` and
     // the `path` module (posixpath vs ntpath) from which of the two names is in
     // `sys.builtin_module_names`.
-    #[cfg(not(windows))]
+    // wasm32's arm answers from the import source seam, which only `host_env`
+    // builds; without one there is nothing for `posix` to report and the name
+    // stays out of `sys.builtin_module_names` too.
+    #[cfg(all(not(windows), any(not(target_arch = "wasm32"), feature = "host_env")))]
     pyre_install_module!(posix);
     #[cfg(windows)]
     pyre_install_module!("nt"(posix));
@@ -2051,6 +2062,10 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     // `-P` (safe_path) suppresses it entirely.
     *SYS_PATH_0_PENDING.lock().unwrap() = (!safe_path_flag()).then(|| path0.to_os_string());
 
+    // The search path is a filesystem's, so a build with no host filesystem
+    // seeds none: `SYS_PATH` is `host_env`'s and so is every entry that could
+    // go in it.
+    #[cfg(feature = "host_env")]
     {
         let mut path = SYS_PATH.lock().unwrap();
         path.clear();

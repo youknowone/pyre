@@ -16,8 +16,10 @@ pub use interp_posix::{W_DirEntry, W_ScandirIterator};
 // wasm32 has no operating system to wrap: the only filesystem the guest can
 // see is the embedder's, reached through the import machinery's
 // `SourceProvider`.  That leaves a `posix` too narrow to be a `cfg` pass over
-// the syscall module, so it is its own arm.
-#[cfg(target_arch = "wasm32")]
+// the syscall module, so it is its own arm.  The seam is what `host_env`
+// builds, so without it there is nothing for this arm to answer from and the
+// module is not registered at all.
+#[cfg(all(target_arch = "wasm32", feature = "host_env"))]
 crate::pyre_module_init!(interp_posix_wasm);
 
 use pyre_object::PyObjectRef;
