@@ -1,11 +1,26 @@
 {
   "host": "win32-AMD64",
   "modules": {
+    "test.test_eintr": {
+      "dynasm": "SKIP"
+    },
+    "test.test_file_eintr": {
+      "dynasm": "SKIP"
+    },
+    "test.test_import": {
+      "dynasm": "FAIL"
+    },
+    "test.test_mmap": {
+      "dynasm": "FAIL"
+    },
     "test.test_msvcrt": {
       "dynasm": "PASS"
     },
     "test.test_startfile": {
       "dynasm": "PASS"
+    },
+    "test.test_venv": {
+      "dynasm": "FAIL"
     },
     "test.test_winapi": {
       "dynasm": "PASS"
