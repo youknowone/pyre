@@ -49,7 +49,7 @@ const _: () = {
     assert!(size_of::<CPyFrameObject>() == 64);
 };
 
-type PendingSet = HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+type PendingSet = super::address_table::AddressSet;
 
 /// Mirrors [`PyFrame_New`] handed out that have no interpreter frame yet.
 static PENDING: super::ForkMutex<PendingSet> =

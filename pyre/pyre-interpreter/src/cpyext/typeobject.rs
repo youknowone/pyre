@@ -543,11 +543,7 @@ fn builtin_type(layout: &'static pyre_object::pyobject::PyType) -> PyObjectRef {
 /// the type, so the string has to outlive every read of the field and die with
 /// the mirror rather than with this call.  Keyed by the mirror's address, which
 /// is fixed for its life; [`forget_type_name`] is what releases it.
-type NameTable = std::collections::HashMap<
-    usize,
-    CString,
-    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
->;
+type NameTable = super::address_table::AddressMap<CString>;
 static TYPE_NAMES: super::ForkMutex<NameTable> =
     super::ForkMutex::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
 
@@ -1555,8 +1551,7 @@ static BOUND_MINTED: super::ForkMutex<BoundAddresses> = super::ForkMutex::new(
     BoundAddresses::with_hasher(std::hash::BuildHasherDefault::new()),
 );
 
-type BoundAddresses =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+type BoundAddresses = super::address_table::AddressSet;
 
 type BoundNames = std::collections::HashMap<
     (usize, &'static str),
@@ -4334,11 +4329,7 @@ fn install_protocols(ns: PyObjectRef, tp: *mut CPyTypeObject) {
 /// A filled block, against the address of the [`CPyWrapperBase`] allocated for
 /// it -- 0 for every family that has none.  An address rather than a pointer
 /// because the table is shared across threads and a raw pointer is not.
-type BlockSet = std::collections::HashMap<
-    usize,
-    usize,
-    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
->;
+type BlockSet = super::address_table::AddressMap<usize>;
 
 /// The blocks [`descriptor_attach`] filled, and so the ones whose references
 /// are this module's to release.
@@ -5313,11 +5304,9 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
 /// checked the field answers "does this type have a `tp_new`", which is yes for
 /// every readied type.  What the check asks is the narrower question this
 /// records: did the extension declare one.
-static DECLARED_TP_NEW: super::ForkMutex<
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>,
-> = super::ForkMutex::new(std::collections::HashSet::with_hasher(
-    std::hash::BuildHasherDefault::new(),
-));
+static DECLARED_TP_NEW: super::ForkMutex<super::address_table::AddressSet> = super::ForkMutex::new(
+    super::address_table::AddressSet::with_hasher(std::hash::BuildHasherDefault::new()),
+);
 
 fn record_declared_tp_new(tp: *mut CPyTypeObject) {
     if unsafe { (*tp).tp_new.is_null() } {
@@ -5862,11 +5851,7 @@ fn single_base(bases: PyObjectRef) -> Result<*mut CPyTypeObject, crate::PyError>
 /// leaked deliberately, so the key is stable for the life of the process.  The
 /// module is held as an owned mirror reference, and it is that reference — not
 /// the table — that roots it.
-type TypeSideTable = std::collections::HashMap<
-    usize,
-    usize,
-    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
->;
+type TypeSideTable = super::address_table::AddressMap<usize>;
 static TYPE_MODULES: super::ForkMutex<TypeSideTable> = super::ForkMutex::new(
     TypeSideTable::with_hasher(std::hash::BuildHasherDefault::new()),
 );

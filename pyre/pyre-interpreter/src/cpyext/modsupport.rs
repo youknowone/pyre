@@ -39,8 +39,7 @@ struct ModuleFields {
     md_state: usize,
 }
 
-type ModuleTable =
-    std::collections::HashMap<usize, ModuleFields, BuildHasherDefault<std::hash::DefaultHasher>>;
+type ModuleTable = super::address_table::AddressMap<ModuleFields>;
 static MODULE_FIELDS: super::ForkMutex<ModuleTable> = super::ForkMutex::new(
     std::collections::HashMap::with_hasher(BuildHasherDefault::new()),
 );

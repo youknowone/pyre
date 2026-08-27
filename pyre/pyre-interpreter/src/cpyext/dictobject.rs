@@ -813,11 +813,7 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
 /// (`dictobject.py:301-311`).  Pyre's mirror has no such field, so the
 /// reference is held here instead, keyed by the mirror's address; it is the
 /// reference, not this table, that roots the list.
-type SnapshotMap = std::collections::HashMap<
-    usize,
-    usize,
-    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
->;
+type SnapshotMap = super::address_table::AddressMap<usize>;
 static ITERATION_KEYS: super::ForkMutex<SnapshotMap> = super::ForkMutex::new(
     SnapshotMap::with_hasher(std::hash::BuildHasherDefault::new()),
 );

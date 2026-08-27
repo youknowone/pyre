@@ -26,7 +26,7 @@ pub unsafe extern "C" fn PyBytes_FromString(text: *const c_char) -> *mut CPyObje
 /// — so `PyBytes_AS_STRING` hands out one address before and after the `bytes`
 /// exists.  This set only records which mirrors have not been read as a value
 /// yet.
-type PendingSet = HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+type PendingSet = super::address_table::AddressSet;
 static PENDING: super::ForkMutex<PendingSet> =
     super::ForkMutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
 

@@ -98,7 +98,7 @@ struct Block {
 /// about a link is now asked; this survives only because a mirror block's size
 /// is not something the collector has any reason to know.  Its keys are mirror
 /// addresses, which never move, so it needs no collection-time maintenance.
-type BlockSizes = HashMap<usize, Block, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockSizes = super::address_table::AddressMap<Block>;
 static BLOCK_SIZES: ForkMutex<BlockSizes> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
@@ -728,8 +728,8 @@ pub fn drain_dead() {
 /// that root belongs to -- [`borrowed_edges`].  Without that the retention above
 /// is unbounded rather than merely wide: an item referring back to its container
 /// keeps the container, which is what would release the entry.
-type BorrowSet = std::collections::HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
-type BorrowMap = HashMap<usize, BorrowSet, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BorrowSet = super::address_table::AddressSet;
+type BorrowMap = super::address_table::AddressMap<BorrowSet>;
 static BORROWED: ForkMutex<BorrowMap> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
@@ -803,7 +803,7 @@ pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
 /// through `PyTuple_GET_ITEM` is borrowed from the container, and it stays
 /// good for as long as the container does because the array holds it.
 /// Held as addresses, which a mirror pointer is and a `Send` bound accepts.
-type ItemCache = HashMap<usize, Box<[usize]>, BuildHasherDefault<std::hash::DefaultHasher>>;
+type ItemCache = super::address_table::AddressMap<Box<[usize]>>;
 static ITEM_ARRAYS: ForkMutex<ItemCache> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
@@ -899,7 +899,7 @@ fn forget_items(raw: usize) {
 /// hand out a stable, NUL-terminated address, and the interpreter's own storage
 /// is neither NUL-terminated nor at a fixed address.  It is a side table rather
 /// than a field so that a mirror block is exactly what its type declares.
-type ByteCache = HashMap<usize, Box<[u8]>, BuildHasherDefault<std::hash::DefaultHasher>>;
+type ByteCache = super::address_table::AddressMap<Box<[u8]>>;
 static BYTE_CACHE: ForkMutex<ByteCache> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 

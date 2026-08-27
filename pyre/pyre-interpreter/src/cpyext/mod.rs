@@ -15,6 +15,7 @@
     any(target_os = "macos", target_os = "linux")
 ))]
 
+mod address_table;
 pub mod buffer;
 pub mod bytearrayobject;
 pub mod bytesobject;
@@ -993,6 +994,7 @@ mod tests {
     /// The `BoundFamily.taken` locks are a field of a table rather than a
     /// static of their own; `typeobject::after_fork_child` walks
     /// `BOUND_FAMILIES` to reach them.
+
     #[test]
     fn every_fork_lock_is_reset_in_the_child() {
         let sources = sources();

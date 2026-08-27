@@ -28,8 +28,7 @@ use std::ffi::{c_int, c_void};
 /// question here is only ever "is this block one of them", so a set of
 /// addresses is enough. An address is stable for a block's life, and
 /// [`forget`] is called from `dealloc` before the block is released.
-type TrackedSet =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+type TrackedSet = super::address_table::AddressSet;
 static TRACKED: super::ForkMutex<TrackedSet> =
     super::ForkMutex::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
 

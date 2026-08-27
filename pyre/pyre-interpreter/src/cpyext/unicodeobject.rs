@@ -168,7 +168,7 @@ struct Block {
     pending: bool,
 }
 
-type BlockTable = HashMap<usize, Block, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockTable = super::address_table::AddressMap<Block>;
 static BLOCKS: super::ForkMutex<BlockTable> =
     super::ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 

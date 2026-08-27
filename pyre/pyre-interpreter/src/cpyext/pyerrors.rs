@@ -120,8 +120,7 @@ const _: () = {
     assert!(size_of::<CPyStopIterationObject>() == 4 * size_of::<usize>());
 };
 
-type BlockSet =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockSet = super::address_table::AddressSet;
 
 /// The mirrors [`attach`] filled, which is what says whose `value` is a
 /// reference to release.

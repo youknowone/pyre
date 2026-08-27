@@ -721,8 +721,7 @@ pub unsafe extern "C" fn PyDateTime_TIME_GET_TZINFO(object: *mut c_void) -> *mut
 
 // ── the fields a block carries ──────────────────────────────────────────
 
-type BlockSet =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockSet = super::address_table::AddressSet;
 
 /// The blocks [`attach`] filled a `tzinfo` reference into.
 ///

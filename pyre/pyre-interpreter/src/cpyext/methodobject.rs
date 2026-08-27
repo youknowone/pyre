@@ -83,7 +83,7 @@ const RESERVED_KEYS: &[&str] = &[
 #[derive(Default)]
 struct MethodDefTable {
     rows: Vec<usize>,
-    index_of: HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>,
+    index_of: super::address_table::AddressMap<usize>,
 }
 
 static METHOD_DEFS: super::ForkMutex<MethodDefTable> = super::ForkMutex::new(MethodDefTable {
