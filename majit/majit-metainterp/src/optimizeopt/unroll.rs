@@ -3408,7 +3408,7 @@ impl OptUnroll {
         // on the original `InputArg` object (resoperation.py:700 `_forwarded`
         // host). Read it only when it actually matches the inputarg's type
         // and index (the `ensure_inputarg_bindings` resize fills gaps with
-        // `new_int(0)` placeholders that would otherwise leak in here);
+        // `OptContext::inputarg_padding` that would otherwise leak in here);
         // last-resort fresh allocation when it carries no matching Rc (test
         // fixtures / type-mismatch edge cases).
         state.partial_trace_inputargs = ctx

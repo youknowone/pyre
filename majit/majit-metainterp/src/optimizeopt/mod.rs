@@ -1937,6 +1937,37 @@ impl OptContext {
         }
     }
 
+    /// The value `inputarg_refs` is padded with between the last bound
+    /// inputarg and a newly named position.
+    ///
+    /// `inputarg_refs` is indexed by trace position, and a bridge enters with
+    /// `inputarg_base = parent_high_water` ([`Self::inputarg_base`]), so
+    /// naming one of its inputargs grows the vector past every position the
+    /// parent trace ever reached. Allocating a distinct `Rc` per padding slot
+    /// made that growth cost one MALLOC per position of the parent trace, on
+    /// every bridge the optimizer runs — and the optimizer runs on attempted
+    /// bridges, not only on kept ones. One shared `Rc` makes it a refcount
+    /// bump.
+    ///
+    /// Sharing is sound because a padding slot is never a host: every reader
+    /// tests `ia.index == idx` before taking a slot as the canonical
+    /// `_forwarded` host ([`Self::resolve_to_operand`], `unroll.rs`
+    /// `partial_trace_inputargs`), and the write paths repair a slot before
+    /// binding it. `u32::MAX` is the index rather than `0` so that test cannot
+    /// accept the padding at position 0, which `InputArg::new_int(0)` could.
+    ///
+    /// Upstream has no counterpart: `optimizer.py` forwards on the box object
+    /// (`op.set_forwarded(newop)`) and keeps no positional side table, so
+    /// there is nothing there to pad.
+    fn inputarg_padding() -> majit_ir::InputArgRc {
+        thread_local! {
+            static PADDING: majit_ir::InputArgRc = std::rc::Rc::new(
+                majit_ir::InputArg::from_type(majit_ir::Type::Int, u32::MAX),
+            );
+        }
+        PADDING.with(std::rc::Rc::clone)
+    }
+
     /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
     /// `tp` (the `_forwarded` host that `resolve_to_operand` / `read_forwarded`
     /// / `clear_forwarded` / `materialize_operand_at` route the matching InputArg OpRef
@@ -1947,7 +1978,7 @@ impl OptContext {
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
         if pos >= self.inputarg_refs.len() {
             self.inputarg_refs
-                .resize_with(pos + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                .resize(pos + 1, Self::inputarg_padding());
             self.inputarg_refs[pos] =
                 std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
         } else if self.inputarg_refs[pos].tp != tp || self.inputarg_refs[pos].index != pos as u32 {
@@ -2242,12 +2273,12 @@ impl OptContext {
         let idx = opref.raw() as usize;
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                // `inputarg_refs` is grown with `resize_with(.., new_int(0))`
-                // (see `materialize_operand_at`), so a slot past the last
-                // bound inputarg holds a placeholder whose `index` is 0, not
-                // `idx`. Returning it hands the caller a box for a DIFFERENT
-                // position — and `new_int(0)` also retypes the read, so a Ref
-                // position resolves to an Int box. The write path already
+                // `inputarg_refs` is padded up to a named position (see
+                // `inputarg_padding`), so a slot past the last bound inputarg
+                // holds padding whose `index` is `u32::MAX`, not `idx`.
+                // Returning it hands the caller a box for a DIFFERENT
+                // position — and the padding is an Int, so a Ref position
+                // would resolve to an Int box. The write path already
                 // repairs such a slot before use; the read path must instead
                 // report "no binding", which makes `get_replacement_opref`
                 // return the position itself — `resoperation.py:57-68
@@ -2303,7 +2334,7 @@ impl OptContext {
                 let idx = ia.index as usize;
                 if idx >= self.inputarg_refs.len() {
                     self.inputarg_refs
-                        .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                        .resize(idx + 1, Self::inputarg_padding());
                 }
                 self.inputarg_refs[idx] = ia;
             } else if let Some(op) = o.bound_op() {
@@ -3143,7 +3174,7 @@ impl OptContext {
             let idx = ia.index as usize;
             if idx >= self.inputarg_refs.len() {
                 self.inputarg_refs
-                    .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                    .resize(idx + 1, Self::inputarg_padding());
             }
             self.inputarg_refs[idx] = ia;
         } else if let Some(op) = o.bound_op() {
@@ -4880,7 +4911,7 @@ impl OptContext {
                     .unwrap_or_else(|| opref.ty().unwrap_or(majit_ir::Type::Void));
                 if idx >= self.inputarg_refs.len() {
                     self.inputarg_refs
-                        .resize_with(idx + 1, || std::rc::Rc::new(majit_ir::InputArg::new_int(0)));
+                        .resize(idx + 1, Self::inputarg_padding());
                     self.inputarg_refs[idx] =
                         std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
                 } else if self.inputarg_refs[idx].tp != tp
