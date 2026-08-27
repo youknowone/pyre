@@ -11,11 +11,30 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
-/// `_thread.TIMEOUT_MAX` — the whole-second bound of the nanosecond timestamp
-/// an acquire timeout is converted to.  PyPy exposes the microsecond bound
-/// instead (`moduledef.py` `float(os_lock.TIMEOUT_MAX // 1000000)`), which
-/// is a thousand times larger and is its 3.11-era surface.
-const TIMEOUT_MAX: f64 = (i64::MAX / 1_000_000_000) as f64;
+/// `PY_TIMEOUT_MAX` — the acquire-timeout bound in microseconds.  A POSIX host
+/// waits on a nanosecond deadline and bounds it at `LLONG_MAX / 1000`; Windows
+/// waits through `WaitForSingleObject`, which takes a DWORD of milliseconds and
+/// reserves `0xFFFFFFFF` for `INFINITE`, so its bound is `0xFFFFFFFE * 1000`.
+const PY_TIMEOUT_MAX: i64 = if cfg!(windows) {
+    0xFFFF_FFFE * 1000
+} else {
+    i64::MAX / 1000
+};
+
+/// `PyTime_MAX` in the same microseconds: the timestamp an acquire timeout is
+/// converted to is `i64` nanoseconds.
+const PYTIME_MAX_US: i64 = i64::MAX / 1000;
+
+/// `_thread.TIMEOUT_MAX` — `floor(min(PY_TIMEOUT_MAX, PyTime_MAX))` in whole
+/// seconds, so 4294967.0 on Windows and 9223372036.0 where the timestamp is the
+/// smaller bound.  PyPy exposes the microsecond bound instead (`moduledef.py`
+/// `float(os_lock.TIMEOUT_MAX // 1000000)`), which is a thousand times larger
+/// and is its 3.11-era surface.
+const TIMEOUT_MAX: f64 = (if PY_TIMEOUT_MAX < PYTIME_MAX_US {
+    PY_TIMEOUT_MAX
+} else {
+    PYTIME_MAX_US
+} / 1_000_000) as f64;
 static THREAD_COUNT: AtomicI64 = AtomicI64::new(0);
 static STACK_SIZE: AtomicUsize = AtomicUsize::new(0);
 static FINALIZING: AtomicBool = AtomicBool::new(false);
@@ -726,7 +745,16 @@ fn parse_acquire_args(
         // `_PyTime_AsMicroseconds`.  Truncating instead would collapse any
         // positive sub-microsecond timeout to 0, which `acquire_timed` reads
         // as a non-blocking poll rather than a timed wait.
-        Ok((timeout * 1e6).ceil() as i64)
+        let microseconds = (timeout * 1e6).ceil() as i64;
+        // `lock_acquire_parse_args` bounds the MICROSECONDS against
+        // `PY_TIMEOUT_MAX`, which the nanosecond range above does not stand in
+        // for: on Windows the wait primitive takes a DWORD of milliseconds, so
+        // its bound is three orders of magnitude below what an `i64` of
+        // nanoseconds can carry.
+        if microseconds > PY_TIMEOUT_MAX {
+            return Err(crate::PyError::overflow_error("timeout value is too large"));
+        }
+        Ok(microseconds)
     }
 }
 
@@ -2573,7 +2601,6 @@ crate::py_module! {
     functions: {
         "allocate_lock"          / 0 = new_lock,
         "allocate"               / 0 = new_lock,
-        "_set_sentinel"          / 0 = new_lock,
         "_make_thread_handle"    / 1 = make_thread_handle,
         "get_ident"              / 0 = get_ident,
         "get_native_id"          / 0 = get_native_id,
