@@ -2542,7 +2542,18 @@ impl Assembler {
                     argcodes.push(kind_char);
                     operand_kinds.push(kind_char);
                 }
-                if let Some(result) = op.result.as_ref() {
+                // A result Variable's declared `concretetype` can be
+                // `Void` here for the same reason `emit_call_result_arg`
+                // guards it: `getkind(op.result.concretetype)` is the
+                // obligation `flatten.py`'s `serialize_op` enforces, and
+                // this default arm has no declared-kind side to consult
+                // at all, so it must ask the Variable directly. A Void
+                // result has no register to color; skip the `>` argcode
+                // rather than let `lookup_reg_with_kind_var` reach it.
+                if let Some(result) = op.result.as_ref()
+                    && crate::model::FunctionGraph::concretetype_of(result)
+                        != crate::model::ConcreteType::Void
+                {
                     argcodes.push('>');
                     let (reg, kind_char) = self.lookup_reg_with_kind_var(result, regallocs);
                     argcodes.push(kind_char);
@@ -2654,6 +2665,18 @@ impl Assembler {
         let Some(result) = result else {
             return declared_result_kind;
         };
+        // `declared_result_kind` is the call target's declared signature
+        // and can disagree with the result Variable's own `concretetype`
+        // (e.g. a synthetic ctor's `result_ty` staying `Ref` for a
+        // destination type that resolves to `Void`). `getkind(op.result.
+        // concretetype)` is the obligation `flatten.py`'s `serialize_op`
+        // enforces on the Variable, not the declared kind, so check it
+        // directly: a Void Variable has no register to color and must
+        // not reach `lookup_coloring_var`.
+        if crate::model::FunctionGraph::concretetype_of(result) == crate::model::ConcreteType::Void
+        {
+            return 'v';
+        }
         argcodes.push('>');
         let (reg, kind) = self.lookup_coloring_var(result, regallocs);
         let kind_char = match kind {
