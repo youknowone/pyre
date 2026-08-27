@@ -64,6 +64,71 @@ pub(super) type AddressBuildHasher = BuildHasherDefault<AddressHasher>;
 pub(super) type AddressMap<V> = std::collections::HashMap<usize, V, AddressBuildHasher>;
 pub(super) type AddressSet = std::collections::HashSet<usize, AddressBuildHasher>;
 
+/// An address a side table has been told to key an entry under.
+///
+/// Minting one enters it in [`HOLDERS`], and only [`hold`] can mint one, so
+/// the set is what every table put together holds.  That is the whole point:
+/// tearing a mirror down asks fourteen tables to release what they keyed by
+/// its address, and five of them are never empty for a program that imported
+/// anything -- a module's fields, a type's name, the tracked set -- so the
+/// per-table [`AddressTable::is_empty`] answer never fires for them and each
+/// costs a lock and a probe that finds nothing.  One question to [`HOLDERS`]
+/// settles all fourteen.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct Held(usize);
+
+impl Held {
+    pub(super) fn address(self) -> usize {
+        self.0
+    }
+}
+
+// A `Held` hashes and compares exactly as the address it wraps -- the derive
+// forwards to the single field -- so a table keyed on one is still read with a
+// plain `usize`, and only writing to it needs the mint.
+impl std::borrow::Borrow<usize> for Held {
+    fn borrow(&self) -> &usize {
+        &self.0
+    }
+}
+
+/// Every address some side table keys an entry under.
+///
+/// Entries only ever leave at a teardown, which drops the address from every
+/// table at once.  A table that gives an entry up on its own -- the untrack a
+/// C extension performs, say -- leaves this one stale, which costs that block
+/// a walk of the cascade it could have skipped and is otherwise harmless.
+static HOLDERS: AddressTable<AddressSet> = AddressTable::new(
+    std::collections::HashSet::with_hasher(BuildHasherDefault::new()),
+);
+
+/// Key `address` for a table, entering it in [`HOLDERS`].
+pub(super) fn hold(address: usize) -> Held {
+    HOLDERS.lock().insert(address);
+    Held(address)
+}
+
+/// Whether any table has something keyed by `address`, dropping the record.
+///
+/// The teardown spelling: the caller is about to ask every table to release
+/// what it holds, and a `false` here says none of them will find anything.
+pub(super) fn release_hold(address: usize) -> bool {
+    if HOLDERS.is_empty() {
+        return false;
+    }
+    HOLDERS.lock().remove(&address)
+}
+
+/// # Safety
+/// Only in a forked child, where the thread that held the lock is gone.
+pub(super) unsafe fn after_fork_child() {
+    unsafe { HOLDERS.reinit_after_fork() };
+}
+
+/// A table whose keys are minted by [`hold`], so that [`HOLDERS`] lists them.
+pub(super) type HeldMap<V> = std::collections::HashMap<Held, V, AddressBuildHasher>;
+pub(super) type HeldSet = std::collections::HashSet<Held, AddressBuildHasher>;
+
 /// A collection whose entry count is what decides whether it holds anything.
 pub(super) trait Populated {
     fn population(&self) -> usize;
@@ -76,6 +141,18 @@ impl<V> Populated for AddressMap<V> {
 }
 
 impl Populated for AddressSet {
+    fn population(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<V> Populated for HeldMap<V> {
+    fn population(&self) -> usize {
+        self.len()
+    }
+}
+
+impl Populated for HeldSet {
     fn population(&self) -> usize {
         self.len()
     }
@@ -135,7 +212,7 @@ impl<C: Populated> AddressTable<C> {
     }
 }
 
-impl<V> AddressTable<AddressMap<V>> {
+impl<V> AddressTable<HeldMap<V>> {
     /// Take what this table keyed by `address`, if anything.
     ///
     /// This is the teardown spelling: a mirror reaching it has no references
@@ -149,7 +226,7 @@ impl<V> AddressTable<AddressMap<V>> {
     }
 }
 
-impl AddressTable<AddressSet> {
+impl AddressTable<HeldSet> {
     /// Drop `address` from this table, answering whether it was there.
     ///
     /// The empty case is decided as it is in [`AddressTable::take`].
@@ -207,6 +284,30 @@ mod tests {
         let top_bits: std::collections::HashSet<u64> =
             (0..64).map(|i| hash_of(0x1_0000 + i * 16) >> 57).collect();
         assert!(top_bits.len() > 32, "control bytes collapsed: {top_bits:?}");
+    }
+
+    /// A table keyed by [`Held`] is still read with a plain address, which is
+    /// the whole reason only writing to one needs the mint.  `Borrow` requires
+    /// the two spellings to hash and compare alike for that to be sound.
+    #[test]
+    fn a_held_key_is_found_by_its_plain_address() {
+        let mut table: HeldMap<u8> = HeldMap::default();
+        table.insert(hold(0x4000), 7);
+        assert_eq!(table.get(&0x4000_usize), Some(&7));
+        assert_eq!(table.remove(&0x4000_usize), Some(7));
+        assert!(table.is_empty());
+        assert!(release_hold(0x4000));
+    }
+
+    /// The set is what every table put together holds, so a teardown that
+    /// finds nothing under an address may skip all of them.
+    #[test]
+    fn an_address_is_listed_until_it_is_released() {
+        let held = hold(0x5000);
+        assert_eq!(held.address(), 0x5000);
+        assert!(release_hold(0x5000), "holding an address lists it");
+        assert!(!release_hold(0x5000), "releasing it takes it off the list");
+        assert!(!release_hold(0x5010), "an address never held is not listed");
     }
 
     #[test]

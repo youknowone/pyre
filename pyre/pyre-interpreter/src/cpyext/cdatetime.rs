@@ -721,14 +721,14 @@ pub unsafe extern "C" fn PyDateTime_TIME_GET_TZINFO(object: *mut c_void) -> *mut
 
 // ── the fields a block carries ──────────────────────────────────────────
 
-type BlockSet = super::address_table::AddressSet;
+type BlockSet = super::address_table::HeldSet;
 
 /// The blocks [`attach`] filled a `tzinfo` reference into.
 ///
 /// A set of addresses rather than a size test, for the reason
 /// `pyerrors::ATTACHED` states: what decides whether the word at that offset
 /// is a reference is whether this module wrote it.
-use super::address_table::AddressTable;
+use super::address_table::{AddressTable, hold};
 
 static ATTACHED: AddressTable<BlockSet> =
     AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
@@ -858,7 +858,7 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
         };
     }
     if has {
-        ATTACHED.lock().insert(raw as usize);
+        ATTACHED.lock().insert(hold(raw as usize));
     }
 }
 

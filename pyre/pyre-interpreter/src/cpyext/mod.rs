@@ -210,6 +210,7 @@ pub fn after_fork_child() {
     unsafe {
         EXTENSIONS.reinit_after_fork();
         PACKAGE_CONTEXT.reinit_after_fork();
+        address_table::after_fork_child();
         pyobject::after_fork_child();
         typeobject::after_fork_child();
         modsupport::after_fork_child();

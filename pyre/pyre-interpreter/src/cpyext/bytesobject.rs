@@ -26,8 +26,8 @@ pub unsafe extern "C" fn PyBytes_FromString(text: *const c_char) -> *mut CPyObje
 /// — so `PyBytes_AS_STRING` hands out one address before and after the `bytes`
 /// exists.  This set only records which mirrors have not been read as a value
 /// yet.
-type PendingSet = super::address_table::AddressSet;
-use super::address_table::AddressTable;
+type PendingSet = super::address_table::HeldSet;
+use super::address_table::{AddressTable, hold};
 
 static PENDING: AddressTable<PendingSet> =
     AddressTable::new(HashSet::with_hasher(BuildHasherDefault::new()));
@@ -110,7 +110,7 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(
         // answers the requested length while C is still writing the buffer.
         (*(raw as *mut CPyVarObject)).ob_size = size;
     }
-    PENDING.lock().insert(raw as usize);
+    PENDING.lock().insert(hold(raw as usize));
     // The terminator `cached_bytes` appends is the NUL upstream's `ob_sval`
     // carries past `ob_size`.
     unsafe { pyobject::cached_bytes(raw, || data) };

@@ -39,8 +39,8 @@ struct ModuleFields {
     md_state: usize,
 }
 
-type ModuleTable = super::address_table::AddressMap<ModuleFields>;
-use super::address_table::AddressTable;
+type ModuleTable = super::address_table::HeldMap<ModuleFields>;
+use super::address_table::{AddressTable, hold};
 
 static MODULE_FIELDS: AddressTable<ModuleTable> = AddressTable::new(
     std::collections::HashMap::with_hasher(BuildHasherDefault::new()),
@@ -77,7 +77,7 @@ fn set_field(module: PyObjectRef, update: impl FnOnce(&mut ModuleFields)) {
     if mirror == 0 {
         return;
     }
-    update(MODULE_FIELDS.lock().entry(mirror).or_default());
+    update(MODULE_FIELDS.lock().entry(hold(mirror)).or_default());
 }
 
 /// Drop what a dying module mirror recorded.

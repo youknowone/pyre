@@ -120,7 +120,7 @@ const _: () = {
     assert!(size_of::<CPyStopIterationObject>() == 4 * size_of::<usize>());
 };
 
-type BlockSet = super::address_table::AddressSet;
+type BlockSet = super::address_table::HeldSet;
 
 /// The mirrors [`attach`] filled, which is what says whose `value` is a
 /// reference to release.
@@ -129,7 +129,7 @@ type BlockSet = super::address_table::AddressSet;
 /// class derived from `StopIteration` has a type mirror of its own, and asking
 /// the size instead is what turns an unrelated C type's storage into a
 /// reference to decrement.
-use super::address_table::AddressTable;
+use super::address_table::{AddressTable, hold};
 
 static ATTACHED: AddressTable<BlockSet> =
     AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
@@ -186,7 +186,7 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     );
     let value = pyobject::make_ref(unsafe { crate::baseobjspace::stopiteration_value(w_obj) });
     unsafe { (*(raw as *mut CPyStopIterationObject)).value = value };
-    ATTACHED.lock().insert(raw as usize);
+    ATTACHED.lock().insert(hold(raw as usize));
 }
 
 /// Release the reference a `StopIteration` mirror owns — `pyerrors.py:45-50

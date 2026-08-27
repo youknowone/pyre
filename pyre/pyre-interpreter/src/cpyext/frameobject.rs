@@ -49,10 +49,10 @@ const _: () = {
     assert!(size_of::<CPyFrameObject>() == 64);
 };
 
-type PendingSet = super::address_table::AddressSet;
+type PendingSet = super::address_table::HeldSet;
 
 /// Mirrors [`PyFrame_New`] handed out that have no interpreter frame yet.
-use super::address_table::AddressTable;
+use super::address_table::{AddressTable, hold};
 
 static PENDING: AddressTable<PendingSet> =
     AddressTable::new(HashSet::with_hasher(BuildHasherDefault::new()));
@@ -146,13 +146,17 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     }
 }
 
+/// Drop the record that a frame mirror is still owed its fields.
+pub(super) fn forget_pending(raw: *mut CPyObject) {
+    PENDING.discard(raw as usize);
+}
+
 /// Release the references a frame mirror owns — `frameobject.py:52-60
 /// frame_dealloc`.
 ///
 /// Reached from `pyobject::dealloc`, which runs it while the block is still
 /// live and before anything can hand the address back out.
 pub(super) fn forget_block(raw: *mut CPyObject) {
-    PENDING.discard(raw as usize);
     let Some(py_frame) = fields(raw) else {
         return;
     };
@@ -272,7 +276,7 @@ pub unsafe extern "C" fn PyFrame_New(
         (*raw).ob_pyre_link = PY_NULL;
         (*raw).ob_type = ob_type;
     }
-    PENDING.lock().insert(raw as usize);
+    PENDING.lock().insert(hold(raw as usize));
     let py_frame = raw as *mut CPyFrameObject;
     unsafe {
         (*py_frame).f_code = pyobject::make_ref(w_code);

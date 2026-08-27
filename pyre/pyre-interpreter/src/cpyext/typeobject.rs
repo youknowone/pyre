@@ -543,8 +543,8 @@ fn builtin_type(layout: &'static pyre_object::pyobject::PyType) -> PyObjectRef {
 /// the type, so the string has to outlive every read of the field and die with
 /// the mirror rather than with this call.  Keyed by the mirror's address, which
 /// is fixed for its life; [`forget_type_name`] is what releases it.
-type NameTable = super::address_table::AddressMap<CString>;
-use super::address_table::AddressTable;
+type NameTable = super::address_table::HeldMap<CString>;
+use super::address_table::{AddressTable, hold};
 
 static TYPE_NAMES: AddressTable<NameTable> =
     AddressTable::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
@@ -600,7 +600,7 @@ pub(super) fn type_mirror_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
     let names = TYPE_NAMES.lock();
     edges.reserve(names.len());
     for &block in names.keys() {
-        let mirror = block as *mut CPyTypeObject;
+        let mirror = block.address() as *mut CPyTypeObject;
         let base = unsafe { (*mirror).tp_base };
         let base = match is_heap_type(mirror) && !base.is_null() {
             true => unsafe { &raw mut (*base).ob_base.ob_base },
@@ -619,7 +619,7 @@ pub(super) fn type_mirror_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
         .map(|raw| raw as usize)
         .collect();
         if !referents.is_empty() {
-            edges.push((block, referents));
+            edges.push((block.address(), referents));
         }
     }
 }
@@ -881,7 +881,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
             (*mirror).tp_weaklistoffset = (*base).tp_weaklistoffset;
         }
     }
-    TYPE_NAMES.lock().insert(mirror as usize, name);
+    TYPE_NAMES.lock().insert(hold(mirror as usize), name);
 }
 
 /// The mirror of the base whose instance layout `w_type` extends —
@@ -4331,7 +4331,7 @@ fn install_protocols(ns: PyObjectRef, tp: *mut CPyTypeObject) {
 /// A filled block, against the address of the [`CPyWrapperBase`] allocated for
 /// it -- 0 for every family that has none.  An address rather than a pointer
 /// because the table is shared across threads and a raw pointer is not.
-type BlockSet = super::address_table::AddressMap<usize>;
+type BlockSet = super::address_table::HeldMap<usize>;
 
 /// The blocks [`descriptor_attach`] filled, and so the ones whose references
 /// are this module's to release.
@@ -4446,7 +4446,7 @@ pub(super) fn descriptor_attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
         }
         0
     };
-    DESCRIPTOR_BLOCKS.lock().insert(raw as usize, base);
+    DESCRIPTOR_BLOCKS.lock().insert(hold(raw as usize), base);
 }
 
 /// Release what a descriptor block owns — `typeobject.py descr_dealloc` and

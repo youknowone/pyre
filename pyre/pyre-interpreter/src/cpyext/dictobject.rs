@@ -813,8 +813,8 @@ pub unsafe extern "C" fn PyDict_MergeFromSeq2(
 /// (`dictobject.py:301-311`).  Pyre's mirror has no such field, so the
 /// reference is held here instead, keyed by the mirror's address; it is the
 /// reference, not this table, that roots the list.
-type SnapshotMap = super::address_table::AddressMap<usize>;
-use super::address_table::AddressTable;
+type SnapshotMap = super::address_table::HeldMap<usize>;
+use super::address_table::{AddressTable, hold};
 
 static ITERATION_KEYS: AddressTable<SnapshotMap> = AddressTable::new(SnapshotMap::with_hasher(
     std::hash::BuildHasherDefault::new(),
@@ -867,7 +867,9 @@ pub unsafe extern "C" fn PyDict_Next(
         .map(|(key, _)| key)
         .collect();
         let held = pyobject::make_ref(pyre_object::listobject::w_list_new(keys));
-        let previous = ITERATION_KEYS.lock().insert(object as usize, held as usize);
+        let previous = ITERATION_KEYS
+            .lock()
+            .insert(hold(object as usize), held as usize);
         if let Some(previous) = previous {
             unsafe { pyobject::decref(previous as *mut CPyObject) };
         }

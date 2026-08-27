@@ -168,8 +168,8 @@ struct Block {
     pending: bool,
 }
 
-type BlockTable = super::address_table::AddressMap<Block>;
-use super::address_table::AddressTable;
+type BlockTable = super::address_table::HeldMap<Block>;
+use super::address_table::{AddressTable, hold};
 
 static BLOCKS: AddressTable<BlockTable> =
     AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
@@ -256,7 +256,7 @@ fn canonical(raw: *mut CPyObject) -> Option<(c_int, usize, bool, *mut u8)> {
             return None;
         }
         let block = encode(w_obj);
-        BLOCKS.lock().entry(raw as usize).or_insert(block);
+        BLOCKS.lock().entry(hold(raw as usize)).or_insert(block);
     }
     let mut table = BLOCKS.lock();
     let block = table.get_mut(&(raw as usize))?;
@@ -309,7 +309,7 @@ pub unsafe extern "C" fn PyUnicode_New(size: isize, maxchar: Py_UCS4) -> *mut CP
         (*raw).ob_type = ob_type;
     }
     BLOCKS.lock().insert(
-        raw as usize,
+        hold(raw as usize),
         Block {
             kind,
             length: size as usize,
