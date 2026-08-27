@@ -32,7 +32,6 @@
 #![allow(dead_code)]
 
 use crate::pyobject::*;
-use crate::w_str_new;
 
 // ── MutableCell family ──────────────────────────────────────────────
 //
@@ -427,9 +426,19 @@ impl VersionTag {
 /// ```
 ///
 /// Wraps a Rust `&str` key as a Python `str` PyObjectRef.
+///
+/// The canonical object for the characters, not a fresh one.  This storage
+/// half keeps names as Rust strings, so the key object user code sees is
+/// rebuilt on every read, and building it is what two separate defects came
+/// from: `next(iter(d)) is next(iter(d))` answered false where both CPython
+/// and PyPy answer true, and `w_str_new` allocates the immortal flavour, so
+/// nothing reclaimed the copies -- measured over `globals()`, 118 bytes per
+/// key read, 2.1 GB across a 1.2M-iteration walk that a plain dict serves in
+/// a flat 60 MB.  Interning answers both: the table hands back one object per
+/// value, and `intern_wtf8_value` builds nothing on a hit.
 #[inline]
 pub fn _wrapkey(key: &str) -> PyObjectRef {
-    w_str_new(key)
+    crate::intern_str_value(key)
 }
 
 /// Strategy-owned storage for `ModuleDictStrategy`.
@@ -1261,7 +1270,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         let (key, cell) = storage.entries.pop()?;
         strategy.mutated();
         crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
-        Some((crate::w_str_new(&key), unwrap_cell(cell)))
+        Some((_wrapkey(&key), unwrap_cell(cell)))
     }
 
     /// `celldict.py getiterreversed` — reverse iteration
@@ -1280,7 +1289,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             .entries
             .iter()
             .rev()
-            .map(|(k, &cell)| (crate::w_str_new(k), unwrap_cell(cell)))
+            .map(|(k, &cell)| (_wrapkey(k), unwrap_cell(cell)))
             .collect()
     }
 
@@ -1306,7 +1315,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         let storage = &*module.dstorage;
         for (key, &cell) in storage.entries.iter() {
             let unwrapped = unwrap_cell(cell);
-            let key_obj = crate::w_str_new(key);
+            let key_obj = _wrapkey(key);
             crate::dictmultiobject::w_dict_store(new_dict, key_obj, unwrapped);
         }
         new_dict

@@ -1,17 +1,17 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=hot
+# pyre-check: selfcheck-compiles=hot,missing_window
 # pyre-check: spec-folds=kwonly_defaults_inline
 # Self-checking guard for the pins under an inlined callee's keyword-only
 # defaults.
 #
 # Seeding those locals no longer probes `__kwdefaults__` per call.  The mapping
 # a definition builds carries a version, so the walker bakes each entry's cell,
-# records a quasi-immutable marker on `Function.w_kw_defs` and one on the
-# mapping's strategy version, drains both with a single `GuardNotInvalidated`,
-# and reads the cell's field live.  Three separate mechanisms therefore stand
-# between a mutation and the next call, and a census can only say the fold
-# fired -- not that the pins are honest.  Each site below moves one of them and
-# prints a wrong number if that one is missing.
+# pins `Function.w_kw_defs` with a `GuardValue`, records a quasi-immutable
+# marker on the mapping's strategy version, drains that marker with a
+# `GuardNotInvalidated`, and reads the cell's field live.  Three separate
+# mechanisms therefore stand between a mutation and the next call, and a census
+# can only say the fold fired -- not that the pins are honest.  Each site below
+# moves one of them and prints a wrong number if that one is missing.
 #
 # Sites:
 #   A  overwrite an existing entry in place.  A cell that already holds an
@@ -22,7 +22,7 @@
 #      the deleted window is observable on its own -- the call must raise
 #      rather than seed a stale default.
 #   C  rebind the attribute.  `f.__kwdefaults__ = d` stores `d` itself, so only
-#      the `Function.w_kw_defs` marker can catch this; the version marker is
+#      the `Function.w_kw_defs` guard can catch this; the version marker is
 #      still watching the old mapping, which no longer answers anything.
 #   D  keep calling after that rebind.  A plain dict has no version to pin, so
 #      the resolve declines and the callee seeds through the ordinary path --
@@ -32,6 +32,23 @@ N = 20000
 
 def g(x, *, step=1, tag="a"):
     return x + step, tag
+
+
+def missing_window(n):
+    """Site B's deleted window, in a loop of its own so it compiles too.
+
+    Left inside `main` this ran interpreted no matter what the header
+    declared -- `selfcheck-compiles` names code objects, and `main` is not
+    one of them -- so the one site that asks a compiled trace to REFUSE a
+    baked default was the one site no compiled trace ever saw.
+    """
+    missing = 0
+    for i in range(n):
+        try:
+            g(i)
+        except TypeError:
+            missing += 1
+    return missing
 
 
 def hot(n, want_step, want_tag):
@@ -58,12 +75,7 @@ def main():
         return 1
 
     del g.__kwdefaults__["tag"]
-    missing = 0
-    for i in range(N):
-        try:
-            g(i)
-        except TypeError:
-            missing += 1
+    missing = missing_window(N)
     if missing != N:
         print(f"FAIL site B seeded a deleted default on {N - missing} of {N} calls")
         return 1

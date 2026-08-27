@@ -2495,6 +2495,18 @@ pub enum DispatchError {
     /// walker surfaces it as a typed abort that the production driver
     /// maps to `TraceAction::Abort` (recoverable — may retry later).
     AbortMarkerReached { pc: usize },
+    /// An inlined callee's keyword-only default mapping moved between the
+    /// record-time resolve and the marker that watches it.
+    /// `kwonly_defaults_for_inline` reads each entry's cell up front, and the
+    /// emit installs `record_quasiimmut_field` on the strategy version only
+    /// once the inline is committed to; a store from another thread in that
+    /// window bumps a version no watcher is registered against yet, so the
+    /// seeding would bake the pre-store cell and never be told.  The emit is
+    /// past the point it can decline from -- the guards for this inline are
+    /// already recorded -- so the walk gives the trace up instead.  The
+    /// sibling `emit_namespace_cell_fold` answers the same window with a
+    /// plain decline, which is why only this site needs a class of its own.
+    KwonlyDefaultsMappingRacedRecord { pc: usize },
     /// Record-time construction of a concrete shadow object failed after the
     /// specialization had emitted IR. Falling through to the generic residual
     /// would retain that partial prologue, so abort the whole walk.
@@ -2759,6 +2771,7 @@ impl DispatchError {
             Self::VableArrayIndexOutOfRange { .. } => "VableArrayIndexOutOfRange",
             Self::VableArrayIndexNotConcrete { .. } => "VableArrayIndexNotConcrete",
             Self::AbortMarkerReached { .. } => "AbortMarkerReached",
+            Self::KwonlyDefaultsMappingRacedRecord { .. } => "KwonlyDefaultsMappingRacedRecord",
             Self::ConcreteShadowAllocationFailed { .. } => "ConcreteShadowAllocationFailed",
             Self::AbortPermanentMarkerReached { .. } => "AbortPermanentMarkerReached",
             Self::MayForceNullRefArgUnsupported { .. } => "MayForceNullRefArgUnsupported",
@@ -2845,6 +2858,7 @@ impl DispatchError {
             | Self::AbortMarkerReached { pc, .. }
             | Self::ConcreteShadowAllocationFailed { pc, .. }
             | Self::AbortPermanentMarkerReached { pc, .. }
+            | Self::KwonlyDefaultsMappingRacedRecord { pc, .. }
             | Self::MayForceNullRefArgUnsupported { pc, .. }
             | Self::VableEscapedDuringResidualCall { pc, .. }
             | Self::GuardSnapshotVableUntyped { pc, .. }
@@ -9611,6 +9625,16 @@ fn emit_namespace_cell_fold<Sym: WalkSym>(
         return Ok(false);
     }
     if !walker_pin_namespace_version(ctx, op_pc, ns)? {
+        return Ok(false);
+    }
+    // The caller read `stored` before the marker above was installed, so a
+    // store from another thread in that window moved the entry while nothing
+    // was watching the version it bumped, and the constant baked below would
+    // be the cell from before it -- for the rest of the loop's life, since no
+    // invalidation is owed for a bump that predates its watcher.  Re-read now
+    // that the watcher stands and decline when the two disagree; single
+    // threaded there is no interval and this always agrees.
+    if crate::state::module_dict_cell_value_direct(ns, slot) != Some(stored) {
         return Ok(false);
     }
     let (result_opref, _) = emit_namespace_cell_value(ctx, op_pc, stored)?;
