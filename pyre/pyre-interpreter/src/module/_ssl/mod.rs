@@ -747,6 +747,36 @@ mod context_methods {
         }
 
         #[getter]
+        fn keylog_filename(&self) -> PyObjectRef {
+            self.keylog_filename
+        }
+
+        #[setter]
+        fn set_keylog_filename(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+            // PyPy `_SSLContext.keylog_filename` accepts exactly str or None,
+            // closes the old BIO first, opens the replacement in append mode,
+            // and retains the original Python str object for the getter.
+            if unsafe { is_none(value) } {
+                native_result(unsafe {
+                    pyre_native::ssl::context_set_keylog_filename(self.backend, None)
+                })?;
+                pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+                self.keylog_filename = w_none();
+                return Ok(());
+            }
+            if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
+                return Err(crate::PyError::type_error("str path expected"));
+            }
+            let path = fs_path(value)?;
+            native_result(unsafe {
+                pyre_native::ssl::context_set_keylog_filename(self.backend, Some(&path))
+            })?;
+            pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+            self.keylog_filename = value;
+            Ok(())
+        }
+
+        #[getter]
         fn num_tickets(&self) -> i64 {
             self.num_tickets as i64
         }

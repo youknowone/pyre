@@ -2252,9 +2252,26 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
             let port: Option<std::ffi::CString> = unsafe {
                 if pyre_object::is_none(port_obj) {
                     None
-                } else if pyre_object::is_int(port_obj) {
-                    let v = pyre_object::w_int_get_value(port_obj);
-                    Some(std::ffi::CString::new(format!("{v}")).unwrap())
+                } else if crate::baseobjspace::isinstance_int_w(port_obj) {
+                    // `interp_func.getaddrinfo` keeps PyPy's
+                    // `isinstance_w(..., w_int)` branch and passes a decimal
+                    // service string to `rsocket.getaddrinfo`.  PyPy 3.11's
+                    // `space.int_w` narrows that branch to a machine word, but
+                    // CPython 3.14 `test_getaddrinfo_int_port_overflow`
+                    // requires an arbitrary-size int to reach libc as text:
+                    // [3.14-spec] decimal bigint service ↔ PyPy machine-int
+                    // service — observable exception is gaierror/success, never
+                    // an interpreter OverflowError or TypeError.
+                    let exact = if pyre_object::is_bool(port_obj)
+                        || pyre_object::is_int(port_obj)
+                        || pyre_object::is_long(port_obj)
+                    {
+                        port_obj
+                    } else {
+                        crate::baseobjspace::space_int(port_obj)?
+                    };
+                    let service = crate::builtins::int_to_decimal_string(exact)?;
+                    Some(std::ffi::CString::new(service).unwrap())
                 } else if pyre_object::bytesobject::is_bytes(port_obj) {
                     Some(socket_cstring_at_nul(
                         pyre_object::bytesobject::bytes_like_data(port_obj).to_vec(),
