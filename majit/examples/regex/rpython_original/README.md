@@ -150,5 +150,6 @@ prints the whole operation — so they are read together, not `diff`ed.
 
 It is not a speed comparison. `meta_interp` runs the optimizer and the LLGraph
 backend, which executes traces in an interpreter; timing it would measure the
-harness. Speed lives in `../comparisons/`, and the quantity that travels there
-is a ratio taken within one run, never an absolute chars/s across machines.
+harness. Speed is the crate's own benchmark (`cargo run -p regex --release`),
+and the quantity that travels off this machine is a ratio taken within one run,
+never an absolute chars/s.

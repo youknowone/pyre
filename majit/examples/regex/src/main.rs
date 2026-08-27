@@ -23,9 +23,8 @@
 //! [`REPEATS`] timed runs with its min-max range beside it, taken at three
 //! input lengths, and every ratio is one measured row divided by another.
 //! Nothing is a constant carried over from an earlier session. What this run
-//! could not measure — the post's own 2010 figures, the Python rows recorded
-//! separately — is printed under a heading that says so, and no ratio above it
-//! is computed from any of it.
+//! could not measure — the post's own 2010 figures — is printed under a heading
+//! that says so, and no ratio above it is computed from any of it.
 
 pub mod interp;
 pub mod jit_interp;
@@ -425,7 +424,7 @@ fn main() {
             row.median() / slowest.median()
         );
     }
-    println!("  {:<32}{:>26}", "CPython `re`", "not measured by this run");
+    println!("  {:<32}{:>26}", "CPython `re`", "not ported here");
 
     // ── the two ratios the post makes its claims from ──────────────────────
     let jit = rows[R_JIT].median();
@@ -441,21 +440,20 @@ fn main() {
     println!("      by the same algorithm compiled ahead of time — here `rustc -O`, there");
     println!("      RPython translated to C. The absolute rows are not comparable across");
     println!("      sixteen years and two instruction sets; the ratio is.");
-    println!("  majit JIT / CPython `re`                            : not measured by this run");
-    println!("      nothing in this process ran `re`; this binary times the Rust rows only. It");
-    println!("      would not be a like-for-like ratio even once measured: `re` may bail out of");
-    println!("      a non-match early, while the marked matcher always scans the whole string.");
+    println!("  majit JIT / CPython `re`                            : not ported here");
+    println!("      the post's second ratio, and this example does not reproduce it. It would");
+    println!("      not be like-for-like anyway: `re` is a backtracking engine that may bail");
+    println!("      out of a non-match early, while the marked matcher always scans the whole");
+    println!("      string, so the two do different amounts of work per character.");
 
     // ── everything below here this run did NOT measure ─────────────────────
     println!();
-    println!("NOT MEASURED BY THIS RUN — this binary times the Rust rows only, and quotes no");
-    println!("number it did not take itself. The pure-Python marked matcher, the same matcher");
-    println!("in C++ and CPython `re` are the rest of the post's table that this example runs,");
-    println!("and `comparisons/run.sh` measures them, printing each row's load beside it:");
-    println!(
-        "  majit/examples/regex/comparisons/run.sh {} {REPEATS} {N}",
-        LENGTHS[2]
-    );
+    println!("NOT MEASURED BY THIS RUN — the post's other rows. This example compares itself");
+    println!("against the RPython original and nothing else, so the pure-Python, C++ and");
+    println!("CPython `re` rows have no port here and no number below is one of theirs. The");
+    println!("comparison that IS owed is a trace comparison, not a speed one:");
+    println!("  cd majit/examples/regex/rpython_original && PYTHONPATH=<repo root> \\");
+    println!("      pypy runner.py {N} 4096");
     println!();
     println!("NOT MEASURED BY THIS RUN, AND NOT THIS MACHINE — the 2010 post's own figures, on");
     println!("its own hardware (Intel Core2 Duo P8400, 2.26GHz). Sixteen years and a different");
