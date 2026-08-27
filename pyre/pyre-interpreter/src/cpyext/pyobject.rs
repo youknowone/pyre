@@ -92,6 +92,11 @@ const _: () = {
 struct Block {
     size: usize,
     generation: u64,
+    /// The C mirror of `W_Root`'s weakref lifeline.  PyPy keeps the lifeline
+    /// on the live `W_Root`; pyre's rawrefcount teardown can outlast that root,
+    /// so the per-mirror allocation record owns it until `tp_dealloc` calls
+    /// `PyObject_ClearWeakRefs`.
+    weakref_lifeline: usize,
 }
 
 /// The P list itself belongs to the collector, which is where every question
@@ -108,13 +113,25 @@ static BLOCK_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// Enter a block this layer handed out, under a generation of its own.
 fn record_block(address: usize, size: usize) {
     let generation = BLOCK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    BLOCK_SIZES
-        .lock()
-        .insert(address, Block { size, generation });
+    BLOCK_SIZES.lock().insert(
+        address,
+        Block {
+            size,
+            generation,
+            weakref_lifeline: 0,
+        },
+    );
 }
 
 fn block_at(address: usize) -> Option<Block> {
     BLOCK_SIZES.lock().get(&address).copied()
+}
+
+/// Every entered mirror block, for C-owned fields that are not covered by
+/// `tp_traverse`. The allocation record is already the owner of this census;
+/// callers filter the copied stable addresses by their concrete C type.
+pub(super) fn entered_blocks() -> Vec<usize> {
+    BLOCK_SIZES.lock().keys().copied().collect()
 }
 
 /// Whether the block at `address` is one this layer handed out.
@@ -377,6 +394,47 @@ pub fn as_pyobj(w_obj: PyObjectRef) -> *mut CPyObject {
     majit_gc::gc_rawrefcount_from_obj(majit_ir::GcRef(w_obj as usize)) as *mut CPyObject
 }
 
+/// Attach `W_Root`'s weakref lifeline to an already-existing C mirror.
+///
+/// This is teardown state on the mirror itself, not a second identity table:
+/// `_Py_Dealloc` replaces/clears `ob_pyre_link` before calling `tp_dealloc`,
+/// while `Block` is the allocation record that deliberately survives through
+/// that call.  The owned C reference keeps the lifeline reachable without
+/// keeping its referent alive.
+pub(super) fn remember_weakref_lifeline(w_obj: PyObjectRef, lifeline: PyObjectRef) {
+    let raw = as_pyobj(w_obj);
+    if raw.is_null() {
+        return;
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_obj);
+    let _ = roots.pin_root(lifeline);
+    let lifeline_raw = make_ref(pyre_object::gc_roots::shadow_stack_get(base + 1));
+    let mut blocks = BLOCK_SIZES.lock();
+    let Some(block) = blocks.get_mut(&(raw as usize)) else {
+        drop(blocks);
+        unsafe { decref(lifeline_raw) };
+        return;
+    };
+    if block.weakref_lifeline == 0 {
+        block.weakref_lifeline = lifeline_raw as usize;
+    } else {
+        drop(blocks);
+        unsafe { decref(lifeline_raw) };
+    }
+}
+
+/// Lifeline retained for a mirror whose deallocator is running.
+pub(super) fn weakref_lifeline(raw: *mut CPyObject) -> Option<PyObjectRef> {
+    let lifeline = block_at(raw as usize)?.weakref_lifeline as *mut CPyObject;
+    if lifeline.is_null() {
+        return None;
+    }
+    let object = unsafe { from_ref(lifeline) };
+    (!object.is_null()).then_some(object)
+}
+
 /// The address parked in a dying mirror's link slot while its deallocator runs
 /// — `pyobject.py w_marker_deallocating`, written by
 /// `cpyext/src/object.c:77` before it calls `tp_dealloc`.
@@ -522,9 +580,9 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     // `tp_dealloc` can free the block out from under it.  A borrow it owns may
     // be the last reference to its own container, so that recursion runs here.
     // Only a block some table keyed an entry under is walked.  `release_hold`
-    // answers for all fourteen at once, which the tables cannot do for
-    // themselves: five of them are never empty for a program that imported
-    // anything -- a module's fields, a type's name, the tracked set -- so
+    // answers for all of them at once, which the tables cannot do for
+    // themselves: five are never empty for a program that imported anything --
+    // a module's fields, a type's name, the tracked set -- so
     // `AddressTable::is_empty` never fires for those and each costs a lock and
     // a probe that finds nothing.
     if super::address_table::release_hold(address) {
@@ -534,10 +592,8 @@ unsafe fn dealloc(raw: *mut CPyObject) {
         super::dictobject::forget_iteration(address);
         super::modsupport::forget_module_fields(address);
         super::unicodeobject::forget_block(address);
-        super::bytesobject::forget_pending(address);
         super::frameobject::forget_pending(raw);
         super::pyerrors::forget_block(raw);
-        super::cdatetime::forget_block(raw);
         super::typeobject::forget_descriptor_block(raw);
         unsafe { super::typeobject::forget_type_mirror(raw) };
         super::gc::forget(address);
@@ -548,6 +604,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::frameobject::forget_block(raw);
     super::sliceobject::forget_block(raw);
     super::methodobject::forget_block(raw);
+    super::cdatetime::forget_block(raw);
     let block = block_at(address);
     let returned = if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };
@@ -654,8 +711,17 @@ pub(super) unsafe fn reallocate_raw(
     if moved.is_null() {
         return std::ptr::null_mut();
     }
-    BLOCK_SIZES.lock().remove(&(raw as usize));
-    record_block(moved as usize, size);
+    let generation = BLOCK_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut blocks = BLOCK_SIZES.lock();
+    blocks.remove(&(raw as usize));
+    blocks.insert(
+        moved as usize,
+        Block {
+            size,
+            generation,
+            weakref_lifeline: old.weakref_lifeline,
+        },
+    );
     moved as *mut std::ffi::c_void
 }
 
@@ -683,6 +749,9 @@ pub(super) unsafe fn free_block(raw: *mut CPyObject) {
     }
     if block.size != 0 {
         unsafe { std::alloc::dealloc(raw as *mut u8, block_layout(block.size)) };
+    }
+    if block.weakref_lifeline != 0 {
+        unsafe { decref(block.weakref_lifeline as *mut CPyObject) };
     }
 }
 
@@ -915,7 +984,20 @@ fn forget_items(raw: usize) {
 /// hand out a stable, NUL-terminated address, and the interpreter's own storage
 /// is neither NUL-terminated nor at a fixed address.  It is a side table rather
 /// than a field so that a mirror block is exactly what its type declares.
-type ByteCache = super::address_table::HeldMap<Box<[u8]>>;
+///
+/// The entry says whether the mirror is still only this buffer -- one
+/// `PyBytes_FromStringAndSize` handed out with no `bytes` behind it, that
+/// nothing has read as a value yet.  Held here rather than in a set of
+/// addresses beside it, so that the lock which answers the question is the one
+/// that settles the race to answer it; `unicodeobject` carries its own such
+/// flag in its own entry the same way.
+struct CachedBytes {
+    /// The payload, with the terminator appended after it.
+    bytes: Box<[u8]>,
+    pending: bool,
+}
+
+type ByteCache = super::address_table::HeldMap<CachedBytes>;
 static BYTE_CACHE: AddressTable<ByteCache> =
     AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
@@ -932,14 +1014,64 @@ pub(super) unsafe fn cached_bytes(
     raw: *mut CPyObject,
     produce: impl FnOnce() -> Vec<u8>,
 ) -> (*const c_char, usize) {
+    unsafe { cache_bytes(raw, produce, false) }
+}
+
+/// [`cached_bytes`] for a mirror that is still only the buffer it fills.
+///
+/// # Safety
+/// `raw` must be a live mirror.
+pub(super) unsafe fn cache_pending_bytes(
+    raw: *mut CPyObject,
+    produce: impl FnOnce() -> Vec<u8>,
+) -> (*const c_char, usize) {
+    unsafe { cache_bytes(raw, produce, true) }
+}
+
+/// # Safety
+/// `raw` must be a live mirror.
+unsafe fn cache_bytes(
+    raw: *mut CPyObject,
+    produce: impl FnOnce() -> Vec<u8>,
+    pending: bool,
+) -> (*const c_char, usize) {
     let mut cache = BYTE_CACHE.lock();
     let entry = cache.entry(hold(raw as usize)).or_insert_with(|| {
         let mut bytes = produce();
         bytes.push(0);
-        bytes.into_boxed_slice()
+        CachedBytes {
+            bytes: bytes.into_boxed_slice(),
+            pending,
+        }
     });
     // The box owns its bytes, so the address stays put as the map rehashes.
-    (entry.as_ptr() as *const c_char, entry.len() - 1)
+    (entry.bytes.as_ptr() as *const c_char, entry.bytes.len() - 1)
+}
+
+/// Whether `raw` is a mirror that is still only the buffer it was handed out
+/// as, so C may still be writing it.
+pub(super) fn bytes_pending(raw: *mut CPyObject) -> bool {
+    !raw.is_null()
+        && BYTE_CACHE
+            .lock()
+            .get(&(raw as usize))
+            .is_some_and(|entry| entry.pending)
+}
+
+/// Take a copy of such a mirror's buffer, and record that it is no longer only
+/// one.
+///
+/// The flag is cleared under the lock that answered it, so of two threads
+/// reading the same mirror as a value at once exactly one is told to build the
+/// `bytes`.  The copy is taken here for the same reason the caller would take
+/// it: building allocates, and this lock is one a deallocator takes.
+pub(super) fn claim_pending_bytes(raw: *mut CPyObject) -> Option<Vec<u8>> {
+    let mut cache = BYTE_CACHE.lock();
+    let entry = cache.get_mut(&(raw as usize))?;
+    if !std::mem::replace(&mut entry.pending, false) {
+        return None;
+    }
+    Some(entry.bytes[..entry.bytes.len() - 1].to_vec())
 }
 
 /// Give a mirror's cached bytes a new length, keeping what still fits and
@@ -965,10 +1097,10 @@ pub(super) unsafe fn resize_cached_bytes(
     if bytes.try_reserve_exact(size + 1).is_err() {
         return None;
     }
-    bytes.extend_from_slice(&entry[..(entry.len() - 1).min(size)]);
+    bytes.extend_from_slice(&entry.bytes[..(entry.bytes.len() - 1).min(size)]);
     bytes.resize(size + 1, 0);
-    *entry = bytes.into_boxed_slice();
-    Some(entry.as_ptr() as *const c_char)
+    entry.bytes = bytes.into_boxed_slice();
+    Some(entry.bytes.as_ptr() as *const c_char)
 }
 
 /// `state.py:106-107` — give the collector the callback it fires when it has

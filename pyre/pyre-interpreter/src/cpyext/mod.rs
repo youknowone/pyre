@@ -63,6 +63,12 @@ pub mod unicodewriter;
 pub mod warnings;
 pub mod weakrefobject;
 
+/// Keep the weakref lifeline with a C mirror until its `tp_dealloc` has had
+/// the `PyObject_ClearWeakRefs` opportunity PyPy gives the live `W_Root`.
+pub(crate) fn remember_weakref_lifeline(w_obj: PyObjectRef, lifeline: PyObjectRef) {
+    weakrefobject::remember_lifeline(w_obj, lifeline);
+}
+
 use parking_lot::ReentrantMutex;
 use pyre_object::PyObjectRef;
 use std::cell::UnsafeCell;
@@ -216,7 +222,6 @@ pub fn after_fork_child() {
         modsupport::after_fork_child();
         methodobject::after_fork_child();
         unicodeobject::after_fork_child();
-        bytesobject::after_fork_child();
         frameobject::after_fork_child();
         pyerrors::after_fork_child();
         cdatetime::after_fork_child();

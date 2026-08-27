@@ -14,9 +14,9 @@
 //! [`clear_garbage`] runs the `tp_clear` that breaks the cycle apart, no other
 //! layer being able to drop a reference that lives in a C field.
 //!
-//! [`c_edges`] is where every reference of that kind is collected, `tp_traverse`
-//! being one of two sources; the other is
-//! [`super::pyobject::borrowed_edges`].
+//! [`c_edges`] is where every reference of that kind is collected. Besides
+//! `tp_traverse`, the sources are [`super::pyobject::borrowed_edges`], the
+//! fields `methodobject.py cfunction_attach` owns, and type-mirror fields.
 
 use super::pyobject::CPyObject;
 use super::typeobject::{CPyTypeObject, PY_TPFLAGS_HAVE_GC};
@@ -286,6 +286,7 @@ pub(super) fn c_edges() -> Vec<(usize, Vec<usize>)> {
         }
     }
     super::pyobject::borrowed_edges(&mut edges);
+    super::methodobject::mirror_edges(&mut edges);
     super::typeobject::type_mirror_edges(&mut edges);
     edges
 }

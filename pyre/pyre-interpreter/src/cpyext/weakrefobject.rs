@@ -175,6 +175,10 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyWeakref_IsDead as *const ());
 }
 
+pub(super) fn remember_lifeline(object: PyObjectRef, lifeline: PyObjectRef) {
+    pyobject::remember_weakref_lifeline(object, lifeline);
+}
+
 /// `object.py PyObject_ClearWeakRefs(object)` — break every weak
 /// reference to `object` and run the callbacks they carry.
 ///
@@ -182,19 +186,14 @@ pub(super) fn ensure_linked() {
 /// nothing to break.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_ClearWeakRefs(object: *mut CPyObject) {
-    // A deallocator is the only place this may be called from --
-    // `weakrefobject.c PyObject_ClearWeakRefs` rejects anything whose count
-    // has not fallen to zero -- and a mirror whose deallocator is running
-    // carries the deallocating marker rather than its object.  The two halves
-    // die together, so the weak references were broken when the interpreter
-    // object was collected, which is what brought the mirror here.
     if pyobject::is_deallocating(object) {
+        if let Some(lifeline) = pyobject::weakref_lifeline(object) {
+            interp__weakref::clear_all_weakrefs(lifeline);
+        }
         return;
     }
     let Some(object) = super::object::argument(object) else {
         return;
     };
-    if let Some(lifeline) = crate::baseobjspace::getweakref(object) {
-        crate::module::_weakref::interp__weakref::finalize_weakrefs(lifeline);
-    }
+    crate::baseobjspace::clear_all_weakrefs(object);
 }

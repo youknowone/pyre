@@ -5453,9 +5453,12 @@ pub(crate) fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectR
 /// receiver's dictionary is a plain field or mapdict slot, so resolving it
 /// cannot run Python and the read is infallible.
 ///
-/// The probe that can raise needs a stored non-string key whose hash collides
-/// with `name`, which a reserved internal key never has, so the `unwrap_or`
-/// here reports no attribute rather than hiding one.
+/// The probe that can raise needs a *stored* non-string key whose hash collides
+/// with `name` and whose `__eq__` raises -- the key being looked up is a `str`
+/// and cannot be the one that raises.  The only caller reads a `_CFuncPtr`'s
+/// reserved keys, and neither that type nor a Python subclass of it gives an
+/// instance a reachable `__dict__`, so nothing but those `str` keys is ever
+/// stored and the `unwrap_or` here reports no attribute rather than hiding one.
 pub(crate) fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
     getdictvalue(obj, name).unwrap_or(None)
 }
@@ -5679,6 +5682,22 @@ pub fn delweakref(obj: PyObjectRef) {
     if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
         crate::objspace::std::mapdict::delweakref(obj);
     }
+}
+
+/// `W_Root.clear_all_weakrefs` — detach the lifeline before clearing it so a
+/// resurrected object can create a fresh set rather than reuse dead refs.
+pub fn clear_all_weakrefs(obj: PyObjectRef) {
+    let Some(lifeline) = getweakref(obj) else {
+        return;
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(obj);
+    let _ = roots.pin_root(lifeline);
+    delweakref(pyre_object::gc_roots::shadow_stack_get(base));
+    crate::module::_weakref::interp__weakref::clear_all_weakrefs(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    );
 }
 
 /// Get an attribute from an object: `obj.name`.

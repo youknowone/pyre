@@ -1498,8 +1498,19 @@ impl PartialEq<&str> for TypeCode {
 }
 
 /// The single-char ctypes `_type_` of `cls` (a type), read off the MRO.
-/// Returns `None` when the attribute is absent or not a string.
+/// Returns `None` when the attribute is absent, is not a string, or spells
+/// something no code is.
 pub(super) fn type_code_of(cls: PyObjectRef) -> Option<TypeCode> {
+    TypeCode::new(declared_type_str(cls)?)
+}
+
+/// The string a class declares as its `_type_`, before it is read as a code.
+///
+/// [`type_code_of`] answers `None` both for a class that declares nothing and
+/// for one whose declaration is too long to be a code, and class creation has
+/// to tell those apart: the first is `_SimpleCData` and the abstract
+/// intermediates under it, the second is a class that has to be refused.
+pub(super) fn declared_type_str(cls: PyObjectRef) -> Option<&'static str> {
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
         return None;
     }
@@ -1507,7 +1518,7 @@ pub(super) fn type_code_of(cls: PyObjectRef) -> Option<TypeCode> {
     if !unsafe { pyre_object::is_str(v) } {
         return None;
     }
-    TypeCode::new(unsafe { pyre_object::w_str_get_value_opt(v) }?)
+    unsafe { pyre_object::w_str_get_value_opt(v) }
 }
 
 /// Whether `obj` is a (subclass) type of `_SimpleCData`.
@@ -1576,6 +1587,15 @@ pub(super) fn decode_slot(tc: &str, bytes: &[u8]) -> PyObjectRef {
     if tc == "P" && host_ctypes::read_pointer_from_buffer(bytes) == 0 {
         return pyre_object::w_none();
     }
+    // Cut to the code's own width first.  A return value arrives as the
+    // register image it came back in rather than as a slot of its type, and
+    // `c_get` is `PyBytes_FromStringAndSize(ptr, 1)` -- one byte, whatever the
+    // register held above it.  Every other code already reads its own width,
+    // so this reaches them as the slice they were being handed anyway.
+    let bytes = match host_ctypes::simple_type_size(tc) {
+        Some(size) if size < bytes.len() => &bytes[..size],
+        _ => bytes,
+    };
     decoded_to_pyobject(host_ctypes::decode_type_code(tc, bytes))
 }
 
@@ -1686,20 +1706,16 @@ pub(super) fn encode_value(tc: &str, obj: PyObjectRef) -> Result<Vec<u8>, crate:
                 ));
             }
         }
-        "b" | "h" | "i" | "l" | "q" => {
+        // `get_long`, `get_ulong`, `get_longlong` and `get_ulonglong` each read
+        // the value through `PyLong_AsUnsignedLongMask`, so a value outside the
+        // field's range is the low bits of it and not an `OverflowError`:
+        // `c_int(2**31)` is `-2**31` and `c_longlong(2**63)` is `-2**63`.
+        // `truncatedint_w` is that read.  The encoder masks the `i128` down to
+        // the field's own width, so the sign the low 64 bits arrive with never
+        // reaches a narrower field.
+        "b" | "h" | "i" | "l" | "q" | "B" | "H" | "I" | "L" | "Q" => {
             let indexed = crate::baseobjspace::space_index(obj)?;
-            V::Signed(crate::baseobjspace::int_w(indexed)? as i128)
-        }
-        // Unsigned fields carry the full unsigned range; fall back to `uint_w`
-        // when the value exceeds `i64` so `c_ulonglong(2**63)` round-trips.  The
-        // encoder masks the `i128` to the field width, so the signed range still
-        // wraps as ctypes expects.
-        "B" | "H" | "I" | "L" | "Q" => {
-            let indexed = crate::baseobjspace::space_index(obj)?;
-            let v = crate::baseobjspace::int_w(indexed)
-                .map(|i| i as i128)
-                .or_else(|_| crate::baseobjspace::uint_w(indexed).map(|u| u as i128))?;
-            V::Signed(v)
+            V::Signed(crate::baseobjspace::truncatedint_w(indexed)? as i128)
         }
         "f" | "d" | "g" => V::Float(crate::baseobjspace::float_w(obj)?),
         "?" | "v" => V::Bool(crate::baseobjspace::is_true(obj)?),

@@ -4,9 +4,7 @@ use super::object::argument;
 use super::pyobject::{self, CPyObject};
 use super::typeobject::CPyVarObject;
 use pyre_object::PyObjectRef;
-use std::collections::HashSet;
 use std::ffi::{CStr, c_char, c_int};
-use std::hash::BuildHasherDefault;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_FromString(text: *const c_char) -> *mut CPyObject {
@@ -18,35 +16,6 @@ pub unsafe extern "C" fn PyBytes_FromString(text: *const c_char) -> *mut CPyObje
     pyobject::make_ref(pyre_object::bytesobject::w_bytes_from_bytes(bytes))
 }
 
-/// Mirrors [`PyBytes_FromStringAndSize`] handed out with no `bytes` behind
-/// them, whose buffer the caller is still writing.
-///
-/// The buffer itself is the mirror's [`pyobject::cached_bytes`] entry — the
-/// side table that stands in for the `ob_sval` field upstream's mirror carries
-/// — so `PyBytes_AS_STRING` hands out one address before and after the `bytes`
-/// exists.  This set only records which mirrors have not been read as a value
-/// yet.
-type PendingSet = super::address_table::HeldSet;
-use super::address_table::{AddressTable, hold};
-
-static PENDING: AddressTable<PendingSet> =
-    AddressTable::new(HashSet::with_hasher(BuildHasherDefault::new()));
-
-pub(super) unsafe fn after_fork_child() {
-    unsafe { PENDING.reinit_after_fork() };
-}
-
-/// Drop what a dying mirror recorded here.
-pub(super) fn forget_pending(mirror: usize) {
-    PENDING.discard(mirror);
-}
-
-/// Whether `raw` is a mirror [`PyBytes_FromStringAndSize`] handed out and
-/// nothing has read as a value yet — so C may still be writing it.
-fn is_pending(raw: *mut CPyObject) -> bool {
-    !raw.is_null() && PENDING.lock().contains(&(raw as usize))
-}
-
 /// The buffer such a mirror hands out and its length, or `None` for a mirror
 /// that already has its `bytes`.
 ///
@@ -55,7 +24,7 @@ fn is_pending(raw: *mut CPyObject) -> bool {
 /// early.  The producer below is unreachable: a pending mirror is entered in
 /// the cache when it is allocated.
 fn pending_buffer(raw: *mut CPyObject) -> Option<(*mut c_char, usize)> {
-    if !is_pending(raw) {
+    if !pyobject::bytes_pending(raw) {
         return None;
     }
     let (pointer, length) = unsafe { pyobject::cached_bytes(raw, Vec::new) };
@@ -110,10 +79,10 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(
         // answers the requested length while C is still writing the buffer.
         (*(raw as *mut CPyVarObject)).ob_size = size;
     }
-    PENDING.lock().insert(hold(raw as usize));
-    // The terminator `cached_bytes` appends is the NUL upstream's `ob_sval`
-    // carries past `ob_size`.
-    unsafe { pyobject::cached_bytes(raw, || data) };
+    // The terminator the cache appends is the NUL upstream's `ob_sval` carries
+    // past `ob_size`; the entry is what records that nothing has read this
+    // mirror as a value yet.
+    unsafe { pyobject::cache_pending_bytes(raw, || data) };
     raw
 }
 
@@ -128,16 +97,11 @@ pub(super) fn realize_pending(raw: *mut CPyObject) {
     if raw.is_null() {
         return;
     }
-    {
-        let mut pending = PENDING.lock();
-        if !pending.remove(&(raw as usize)) {
-            return;
-        }
-    }
-    let (pointer, length) = unsafe { pyobject::cached_bytes(raw, Vec::new) };
-    // Copied out, and both locks released, before the allocation below: it is a
-    // collection point, and the deallocator takes them.
-    let data = unsafe { std::slice::from_raw_parts(pointer as *const u8, length) }.to_vec();
+    // Copied out, and the lock released, before the allocation below: it is a
+    // collection point, and the deallocator takes it.
+    let Some(data) = pyobject::claim_pending_bytes(raw) else {
+        return;
+    };
     let roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(&data));
@@ -528,7 +492,7 @@ pub unsafe extern "C" fn PyBytes_Check(object: *mut CPyObject) -> c_int {
     // A pending mirror is a `bytes` by construction, and answering from its
     // type rather than from an object it does not have yet is what lets a
     // caller ask mid-fill -- `bytesobject.py:145-146`.
-    if is_pending(object) {
+    if pyobject::bytes_pending(object) {
         return 1;
     }
     let object = unsafe { pyobject::from_ref(object) };
@@ -537,7 +501,7 @@ pub unsafe extern "C" fn PyBytes_Check(object: *mut CPyObject) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyBytes_CheckExact(object: *mut CPyObject) -> c_int {
-    if is_pending(object) {
+    if pyobject::bytes_pending(object) {
         return 1;
     }
     let object = unsafe { pyobject::from_ref(object) };

@@ -180,10 +180,7 @@ fn build_api() -> Result<CPyDateTimeCAPI, crate::PyError> {
 }
 
 pub(super) unsafe fn after_fork_child() {
-    unsafe {
-        API_TABLE.reinit_after_fork();
-        ATTACHED.reinit_after_fork();
-    }
+    unsafe { API_TABLE.reinit_after_fork() };
 }
 
 // ── the constructors ────────────────────────────────────────────────────
@@ -721,18 +718,6 @@ pub unsafe extern "C" fn PyDateTime_TIME_GET_TZINFO(object: *mut c_void) -> *mut
 
 // ── the fields a block carries ──────────────────────────────────────────
 
-type BlockSet = super::address_table::HeldSet;
-
-/// The blocks [`attach`] filled a `tzinfo` reference into.
-///
-/// A set of addresses rather than a size test, for the reason
-/// `pyerrors::ATTACHED` states: what decides whether the word at that offset
-/// is a reference is whether this module wrote it.
-use super::address_table::{AddressTable, hold};
-
-static ATTACHED: AddressTable<BlockSet> =
-    AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
-
 /// Which of the two blocks with fields a class of the `datetime` module takes
 /// — `cdatetime.py:143-160 init_datetime`'s three `basestruct`s, of which
 /// `date` gets one it does not use and `_PyDateTime_Import` sizes back down.
@@ -857,18 +842,30 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
             false => std::ptr::null_mut(),
         };
     }
-    if has {
-        ATTACHED.lock().insert(hold(raw as usize));
-    }
 }
 
 /// Release the reference a `time` or `datetime` mirror owns —
 /// `cdatetime.py:191-204 type_dealloc`.
+///
+/// The block says so itself: `hastzinfo` is the word [`attach`] set beside the
+/// reference, and `type_dealloc`'s `if py_datetime.c_hastzinfo` reads exactly
+/// it.  The shape is asked first so the word is one this module put there --
+/// [`block_shape`] is the same question [`attach`] asked of the same type
+/// mirror, and a type mirror outlives every block of it.
 pub(super) fn forget_block(raw: *mut CPyObject) {
-    if !ATTACHED.discard(raw as usize) {
+    if raw.is_null() {
+        return;
+    }
+    let tp = unsafe { (*raw).ob_type };
+    if !matches!(block_shape(tp), Some(Shape::WithTZInfo))
+        || unsafe { (*tp).tp_basicsize } < Shape::WithTZInfo.size()
+    {
         return;
     }
     let block = raw as *mut CPyDateTimeWithTZInfo;
+    if unsafe { (*block).hastzinfo } == 0 {
+        return;
+    }
     unsafe {
         pyobject::decref((*block).tzinfo);
         (*block).tzinfo = std::ptr::null_mut();
