@@ -8109,28 +8109,24 @@ impl<S: JitState> JitDriver<S> {
         //     `ctx.virtualizable_boxes` / `virtualizable_values` /
         //     `virtualizable_array_lengths` from resume-decoded values.
         //
-        // TODO (`pyjitpl.py:3437 self.synchronize_
-        // virtualizable()`): the live PyFrame's vable static fields and
-        // array items are written from the resume data by pyre's
-        // separate guard-failure recovery path
-        // (`pyre-jit/src/eval.rs`'s `sync_virtualizable_after_guard_failure`
-        // selected via `ResumeVableMode::GuardFailureSync`), which fires
-        // BEFORE bridge tracing starts. The trailing
-        // `synchronize_virtualizable()` call inside `rebuild_state_after_
-        // failure` is therefore already satisfied by the time
-        // `setup_bridge_sym` runs.  An additional direct call to
-        // `ctx.synchronize_virtualizable()` cannot be wired today because
-        // `trace_ctx.rs`'s `synchronize_virtualizable` uses `value_to_raw_bits` while
-        // `sync_virtualizable_after_guard_failure` uses field-aware
-        // `value_to_static_vable_bits` / `value_to_vable_array_item_bits`
-        // (pyre/pyre-jit/src/eval.rs) — the Ref-array-slot
-        // auto-boxing of `Value::Int` / `Value::Float` via
-        // `pyre_object::intobject::w_int_new` cannot move into
-        // majit-metainterp without violating the majit ⊥ pyre crate
-        // boundary. Unifying the two writers (likely via a
-        // VTypeFieldConvert trait threaded into TraceCtx) is a separate
-        // epic; see `pyre-jit-trace::state::setup_bridge_sym` tail for
-        // the in-tree diagnosis.
+        //   * `pyjitpl.py:3437 self.synchronize_virtualizable()`, the
+        //     routine's closing line, writes those same vable boxes back
+        //     onto the live virtualizable. It is
+        //     `ctx.synchronize_virtualizable_after_guard_failure()` below,
+        //     fired once `setup_bridge_sym` has seeded the boxes and only on
+        //     an entry that asked to apply — an entry the blackhole preceded
+        //     has already had them written.
+        //
+        //     A frontend whose own guard-failure recovery performs that
+        //     write before bridge tracing starts declares
+        //     `JitState::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE` and
+        //     is skipped here. That is not a preference: this writer
+        //     converts every slot through `value_to_raw_bits`, while a
+        //     frontend whose Ref array slots hold boxed integers and floats
+        //     needs a field-aware conversion that allocates through its own
+        //     object model, which cannot be reached from this crate.
+        //     Unifying the two (likely a field-convert trait threaded into
+        //     `TraceCtx`) is a separate epic.
         let resume_data_result = S::rebuild_from_resumedata(
             &mut trace_meta,
             &retrace.fail_types,
