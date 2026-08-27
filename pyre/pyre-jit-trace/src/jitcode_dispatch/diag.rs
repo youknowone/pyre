@@ -85,6 +85,28 @@ pub(crate) fn fbw_inline_poison_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_FBW_INLINE_POISON").is_some())
 }
 
+/// `PYRE_NO_BINOP_REWIND`: stop treating a `BINARY_OP` / `COMPARE_OP` dunder
+/// entry as a boundary the abort can rewind to, and go back to declining every
+/// body the whole-body scan collapses to `DeferredCall` there.
+///
+/// On by default; the variable only turns it off, so a bisection can name this
+/// change in one command.  Two rewinds a non-CALL entry did not have stand behind it.
+/// The record-time one is the trace cut the caller takes on a `NotImplemented`
+/// result, under the same all-clear odometer reading the un-lowered-helper
+/// rollback uses.  The runtime one is the forward-flush carrier, which
+/// `latch_abort_call_resume` can now name from the frame's own resume sources
+/// -- reading the operand image off a CALL residual's operand list is what
+/// resumed one operand short at a `BINARY_OP`.
+///
+/// The admission it widens is NOT the whole-body verdict.  A body that commits
+/// and then answers `NotImplemented` has no sound exit in either direction, so
+/// the widening is to a body that cannot produce the singleton at all
+/// (`callee_can_return_not_implemented`); one that can keeps the `Clean` bar.
+pub(crate) fn binop_rewind_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_NO_BINOP_REWIND").is_none())
+}
+
 /// `PYRE_FBW_MF_DIAG`: multi-frame callee window diagnostics.
 pub(crate) fn fbw_mf_diag_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
