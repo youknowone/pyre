@@ -7,8 +7,39 @@ use pyre_object::PyObjectRef;
 
 const LOCATION_ATTRIBUTES: &[&str] = &["lineno", "col_offset", "end_lineno", "end_col_offset"];
 
+// CPython 3.14 `ast_state.Load_singleton`, the default for an omitted
+// `expr_context` field.  PyPy keeps generated AST type state process-wide;
+// keep the one movable instance in a registered process-lifetime root slot.
+static LOAD_SINGLETON: std::sync::OnceLock<Box<usize>> = std::sync::OnceLock::new();
+
+fn register_load_singleton(value: PyObjectRef) {
+    let _ = LOAD_SINGLETON.get_or_init(|| {
+        let mut slot = Box::new(value as usize);
+        let root = (&mut *slot) as *mut usize as *mut *mut u8;
+        unsafe { pyre_object::gc_hook::try_gc_add_root(root) };
+        slot
+    });
+}
+
+#[majit_macros::dont_look_inside]
+pub(crate) fn load_singleton() -> PyObjectRef {
+    **LOAD_SINGLETON
+        .get()
+        .expect("_ast Load singleton initialized before AST construction")
+        as PyObjectRef
+}
+
 fn tuple_of_names(names: &[&str]) -> PyObjectRef {
     pyre_object::w_tuple_new(names.iter().map(|name| pyre_object::w_str_new(name)).collect())
+}
+
+fn ast_instance_type_name(object: PyObjectRef) -> &'static str {
+    // PyPy `W_AST_init` asks `space.type(self)`: every public AST node uses
+    // the common `W_ObjectObject` payload, so its payload vtable only says
+    // `object`; the heap class lives in `w_class`.
+    unsafe {
+        pyre_object::w_type_get_name(pyre_object::w_instance_get_type(object))
+    }
 }
 
 fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
@@ -31,14 +62,14 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
     if values.len() > fields.len() {
         return Err(crate::PyError::type_error(format!(
             "{} constructor takes at most {} positional arguments",
-            unsafe { pyre_object::type_name_of(zelf) },
+            ast_instance_type_name(zelf),
             fields.len()
         )));
     }
-    let mut positional_names = Vec::with_capacity(values.len());
+    let mut assigned_names = Vec::with_capacity(values.len() + kwargs.is_some() as usize);
     for (index, &field) in fields.iter().take(values.len()).enumerate() {
         let name = unsafe { pyre_object::w_str_get_value(field) };
-        positional_names.push(name.to_owned());
+        assigned_names.push(name.to_owned());
         crate::baseobjspace::setattr_str(zelf, name, roots.get(values_base + index))?;
     }
     if let Some(kwargs_slot) = kwargs_slot {
@@ -50,16 +81,106 @@ fn ast_init(args: &[PyObjectRef]) -> crate::PyResult {
             if name == "__pyre_kw__" {
                 continue;
             }
-            if positional_names.iter().any(|positional| positional == name) {
+            if assigned_names.iter().any(|assigned| assigned == name) {
                 return Err(crate::PyError::type_error(format!(
                     "{} got multiple values for argument '{name}'",
-                    unsafe { pyre_object::type_name_of(zelf) }
+                    ast_instance_type_name(zelf)
                 )));
             }
             crate::baseobjspace::setattr_str(zelf, name, roots.get(entries_base + index))?;
+            assigned_names.push(name.to_owned());
+        }
+    }
+    let node = ast_instance_type_name(zelf);
+    for &field in node_sequence_fields(node) {
+        if !assigned_names.iter().any(|assigned| assigned == field) {
+            crate::baseobjspace::setattr_str(zelf, field, pyre_object::w_list_new(Vec::new()))?;
+        }
+    }
+    for &field in node_load_fields(node) {
+        if !assigned_names.iter().any(|assigned| assigned == field) {
+            crate::baseobjspace::setattr_str(zelf, field, load_singleton())?;
         }
     }
     Ok(pyre_object::w_none())
+}
+
+/// Repeated (`*`) ASDL fields.  CPython 3.14 `ast_type_init` installs a fresh
+/// list for each omitted field; this is instance state, never a class default.
+fn node_sequence_fields(name: &str) -> &'static [&'static str] {
+    match name {
+        "Module" => &["body", "type_ignores"],
+        "Interactive" => &["body"],
+        "FunctionType" => &["argtypes"],
+        "FunctionDef" | "AsyncFunctionDef" => &["body", "decorator_list", "type_params"],
+        "ClassDef" => &["bases", "keywords", "body", "decorator_list", "type_params"],
+        "Delete" => &["targets"],
+        "Assign" => &["targets"],
+        "TypeAlias" => &["type_params"],
+        "For" | "AsyncFor" | "While" | "If" => &["body", "orelse"],
+        "With" | "AsyncWith" => &["items", "body"],
+        "Match" => &["cases"],
+        "Try" | "TryStar" => &["body", "handlers", "orelse", "finalbody"],
+        "Import" | "ImportFrom" => &["names"],
+        "Global" | "Nonlocal" => &["names"],
+        "BoolOp" => &["values"],
+        "Dict" => &["keys", "values"],
+        "Set" => &["elts"],
+        "ListComp" | "SetComp" | "GeneratorExp" => &["generators"],
+        "DictComp" => &["generators"],
+        "Compare" => &["ops", "comparators"],
+        "Call" => &["args", "keywords"],
+        "JoinedStr" | "TemplateStr" => &["values"],
+        "List" | "Tuple" => &["elts"],
+        "ExceptHandler" => &["body"],
+        "MatchSequence" | "MatchOr" => &["patterns"],
+        "MatchMapping" => &["keys", "patterns"],
+        "MatchClass" => &["patterns", "kwd_attrs", "kwd_patterns"],
+        "comprehension" => &["ifs"],
+        "arguments" => &["posonlyargs", "args", "kwonlyargs", "kw_defaults", "defaults"],
+        "match_case" => &["body"],
+        _ => &[],
+    }
+}
+
+fn node_load_fields(name: &str) -> &'static [&'static str] {
+    match name {
+        "Attribute" | "Subscript" | "Starred" | "Name" | "List" | "Tuple" => &["ctx"],
+        _ => &[],
+    }
+}
+
+/// Optional (`?`) ASDL fields whose PyPy-generated type dictionary supplies
+/// `None`.  The location entries live on their ASDL owner and are inherited.
+fn node_default_none_fields(name: &str) -> &'static [&'static str] {
+    match name {
+        "stmt" | "expr" | "excepthandler" => &["end_lineno", "end_col_offset"],
+        "FunctionDef" | "AsyncFunctionDef" => &["returns", "type_comment"],
+        "Return" => &["value"],
+        "Assign" => &["type_comment"],
+        "AnnAssign" => &["value"],
+        "For" | "AsyncFor" | "With" | "AsyncWith" => &["type_comment"],
+        "Raise" => &["exc", "cause"],
+        "Assert" => &["msg"],
+        "ImportFrom" => &["module", "level"],
+        "Yield" => &["value"],
+        "FormattedValue" | "Interpolation" => &["format_spec"],
+        "Constant" => &["kind"],
+        "Slice" => &["lower", "upper", "step"],
+        "ExceptHandler" => &["type", "name"],
+        "arguments" => &["vararg", "kwarg"],
+        "arg" => &["annotation", "type_comment", "end_lineno", "end_col_offset"],
+        "keyword" => &["arg", "end_lineno", "end_col_offset"],
+        "alias" => &["asname", "end_lineno", "end_col_offset"],
+        "withitem" => &["optional_vars"],
+        "match_case" => &["guard"],
+        "MatchMapping" => &["rest"],
+        "MatchStar" => &["name"],
+        "MatchAs" => &["pattern", "name"],
+        "TypeVar" => &["bound", "default_value"],
+        "ParamSpec" | "TypeVarTuple" => &["default_value"],
+        _ => &[],
+    }
 }
 
 fn node_fields(name: &str) -> &'static [&'static str] {
@@ -135,8 +256,13 @@ fn node_fields(name: &str) -> &'static [&'static str] {
     }
 }
 
-fn node_has_location(name: &str) -> bool {
-    matches!(name, "FunctionDef" | "AsyncFunctionDef" | "ClassDef" | "Return" | "Delete" | "Assign" | "TypeAlias" | "AugAssign" | "AnnAssign" | "For" | "AsyncFor" | "While" | "If" | "With" | "AsyncWith" | "Match" | "Raise" | "Try" | "TryStar" | "Assert" | "Import" | "ImportFrom" | "Global" | "Nonlocal" | "Expr" | "Pass" | "Break" | "Continue" | "BoolOp" | "NamedExpr" | "BinOp" | "UnaryOp" | "Lambda" | "IfExp" | "Dict" | "Set" | "ListComp" | "SetComp" | "DictComp" | "GeneratorExp" | "Await" | "Yield" | "YieldFrom" | "Compare" | "Call" | "FormattedValue" | "JoinedStr" | "Interpolation" | "TemplateStr" | "Constant" | "Attribute" | "Subscript" | "Starred" | "Name" | "List" | "Tuple" | "Slice" | "ExceptHandler" | "MatchValue" | "MatchSingleton" | "MatchSequence" | "MatchMapping" | "MatchClass" | "MatchStar" | "MatchAs" | "MatchOr" | "TypeVar" | "ParamSpec" | "TypeVarTuple" | "arg" | "keyword" | "alias")
+fn node_attributes(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        "AST" => Some(&[]),
+        "stmt" | "expr" | "excepthandler" | "pattern" | "type_param" | "arg" | "keyword"
+        | "alias" => Some(LOCATION_ATTRIBUTES),
+        _ => None,
+    }
 }
 
 /// _ast stub — PyPy: pypy/module/_ast/
@@ -199,16 +325,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // its `~`/`^` anchors without it.
         put(dict_slot, "__match_args__", roots.get(fields_slot))
             .expect("set __match_args__ on _ast type namespace");
-        put(
-            dict_slot,
-            "_attributes",
-            tuple_of_names(if node_has_location(name) {
-                LOCATION_ATTRIBUTES
-            } else {
-                &[]
-            }),
-        )
-        .expect("set _attributes on _ast type namespace");
+        if let Some(attributes) = node_attributes(name) {
+            put(dict_slot, "_attributes", tuple_of_names(attributes))
+                .expect("set _attributes on _ast type namespace");
+        }
+        // PyPy `State.make_new_type`: optional ASDL fields are class-level
+        // `None` defaults, inherited from the owner for optional attributes.
+        for &field in node_default_none_fields(name) {
+            put(dict_slot, field, pyre_object::w_none())
+                .expect("set optional AST field default");
+        }
         for &field in node_fields(name) {
             put(field_types_slot, field, crate::typedef::w_object())
                 .expect("set _field_types item");
@@ -287,22 +413,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let g = make(group, ast);
         crate::module_ns_store(ns, group, g);
         for m in *members {
-            let roots = pyre_object::gc_roots::push_roots();
-            let type_slot = roots.base();
-            let _ = roots.pin_root(make(m, g));
-            // PyPy's generated `W_FormattedValue` and CPython 3.14's
-            // `make_type` declarations expose an omitted optional format
-            // spec as `None` through the class. `Interpolation` is the 3.14
-            // sibling with the same optional field.
-            if matches!(*m, "FormattedValue" | "Interpolation") {
-                crate::baseobjspace::setattr_str(
-                    roots.get(type_slot),
-                    "format_spec",
-                    pyre_object::w_none(),
-                )
-                .expect("set optional AST format_spec default");
-            }
-            crate::module_ns_store(ns, m, roots.get(type_slot));
+            let t = make(m, g);
+            crate::module_ns_store(ns, m, t);
         }
     }
 
@@ -313,6 +425,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let t = make(name, ast);
         crate::module_ns_store(ns, name, t);
     }
+
+    // CPython 3.14 `ast_state.Load_singleton`: every omitted expression
+    // context receives this same object.  Construct it after the ASDL groups
+    // have published `Load` and keep it outside the public module namespace.
+    let roots = pyre_object::gc_roots::push_roots();
+    let load_type_slot = roots.base();
+    let _ = roots.pin_root(crate::module_ns_get(ns, "Load").expect("_ast.Load registered"));
+    register_load_singleton(pyre_object::w_instance_new(roots.get(load_type_slot)));
 
     // `compile()` / `ast.parse()` flag bitmasks, used by `lib-python/3/ast.py`
     // (`flags = PyCF_ONLY_AST; flags |= PyCF_TYPE_COMMENTS`). Values are
