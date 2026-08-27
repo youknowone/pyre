@@ -2851,37 +2851,16 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// The two operands `builtins.rs super_operands_from_frame` reads off the
-/// frame, resolved as SSA values out of an inlined callee's own slot shadow:
-/// `localsplus[0]` and the `__class__` freevar cell.
+/// The `localsplus` slot the `__class__` cell occupies in `code`.
 ///
-/// Both are seeded by the inline itself.  The argument operands are written
-/// into the shadow from `callee_args`, and the closure cells are read live off
-/// the pinned function (`function_closure_descr` then the items block) and
-/// threaded into the new callee frame -- so this reads what the walk already
-/// holds and records nothing.
-///
-/// `None` for anything the shadow cannot answer for THIS level's frame, which
-/// includes every walk that owns no shadow at all: the portal's own slots come
-/// through `virtualizable_entry_at` instead, a channel this does not read.
-fn walker_bare_super_frame_slots<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-) -> Option<(OpRef, OpRef)> {
-    let shadow = ctx.callee_shadow.as_ref()?;
-    // `u16::MAX` is the strict fresh-frame fold switched off and a `NONE`
-    // frame box is a frame register that was never seeded; in neither case is
-    // the shadow the authority for this level's slots.
-    if shadow.fold_frame_reg == u16::MAX || shadow.frame_box.is_none() {
-        return None;
-    }
-    // SAFETY: the code object outlives the walk that resolved it; read-only.
-    let code = unsafe { shadow.code_ptr.as_ref()? };
+/// `None` where `builtins.rs super_operands_from_frame` takes a branch this
+/// does not model: no positional argument at all, and a first argument that is
+/// ALSO a cellvar (`_get_self_location`'s cellvar branch), whose slot holds a
+/// `Cell` rather than the receiver and so takes a second dereference.
+fn bare_super_class_slot(code: &pyre_interpreter::CodeObject) -> Option<usize> {
     if code.arg_count == 0 {
         return None;
     }
-    // `_get_self_location`'s cellvar branch: an argument that is also a
-    // cellvar holds a `Cell` at slot 0, so the receiver takes a second read.
-    // Not modelled -- decline and keep the residual.
     if code
         .varnames
         .first()
@@ -2890,40 +2869,112 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         return None;
     }
     let class_freevar = code.freevars.iter().position(|name| name == "__class__")?;
-    let class_slot = (code.varnames.len()
-        + pyre_interpreter::pyframe::npure_cellvars(code)
-        + class_freevar) as i64;
-    let slot_op = |slot: i64| -> Option<OpRef> {
-        let op = shadow.opref.get(&slot).copied()?;
-        // Only an entry recorded through THIS level's frame register describes
-        // this frame -- the same per-frame isolation the own-frame vable read
-        // applies.
-        (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
-    };
-    Some((slot_op(0)?, slot_op(class_slot)?))
+    Some(code.varnames.len() + pyre_interpreter::pyframe::npure_cellvars(code) + class_freevar)
 }
 
-/// Zero-argument `super()` inside an inlined callee, folded to the proxy
-/// itself rather than re-routed to a may-force residual.
+/// The two operands `builtins.rs super_operands_from_frame` reads off the
+/// frame, resolved as SSA values: `localsplus[0]` and the `__class__` freevar
+/// cell.
+///
+/// Which channel holds them is the frame's own: an inlined callee owns a
+/// [`CalleeLocalsShadow`], and everything else reads the standard
+/// virtualizable, the same split
+/// `try_walker_specialize_builtin_locals_in_callee` draws.
+///
+/// Either way the entries are already there.  The inline seeds the shadow with
+/// the argument operands and with the live closure-cell reads
+/// (`function_closure_descr`, then the items block) it threaded into the new
+/// callee frame; the portal's boxes are seeded from the frame it entered on.
+/// Reading them records no op.
+fn walker_bare_super_frame_slots<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<(OpRef, OpRef)> {
+    if let Some(shadow) = ctx.callee_shadow.as_ref() {
+        // `u16::MAX` is the strict fresh-frame fold switched off and a `NONE`
+        // frame box is a frame register that was never seeded; in neither case
+        // is the shadow the authority for this level's slots.
+        if shadow.fold_frame_reg == u16::MAX || shadow.frame_box.is_none() {
+            return None;
+        }
+        // SAFETY: the code object outlives the walk that resolved it; read-only.
+        let code = unsafe { shadow.code_ptr.as_ref()? };
+        let class_slot = bare_super_class_slot(code)? as i64;
+        let slot_op = |slot: i64| -> Option<OpRef> {
+            let op = shadow.opref.get(&slot).copied()?;
+            // Only an entry recorded through THIS level's frame register
+            // describes this frame -- the same per-frame isolation the
+            // own-frame vable read applies.
+            (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
+        };
+        return Some((slot_op(0)?, slot_op(class_slot)?));
+    }
+    // A sub-walk that owns no shadow walks a frame the standard virtualizable
+    // does not name, and a trace has exactly one of those.
+    if ctx.fbw_mode.inline_subwalk || current_inline_concrete_frame() != 0 {
+        return None;
+    }
+    // The frame `builtin_super`'s zero-argument tail reads is
+    // `ExecutionContext::gettopframe()`.  Require it to BE the standard
+    // virtualizable, so a hidden frame -- or any deeper one reached through the
+    // backref chain -- declines rather than answering for someone else's slots.
+    let vable_ptr = ctx.trace_ctx.standard_virtualizable_ptr()?;
+    let ec = pyre_interpreter::call::getexecutioncontext();
+    if ec.is_null() {
+        return None;
+    }
+    let frame = unsafe { (*ec).gettopframe_nohidden() };
+    if frame.is_null() || frame as usize != vable_ptr {
+        return None;
+    }
+    // SAFETY: the frame is the live standard virtualizable; read-only.
+    let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(&*frame) };
+    let code = unsafe { code_ptr.as_ref()? };
+    let class_slot = bare_super_class_slot(code)?;
+    // `locals_cells_stack_w` is PyFrame's only virtualizable array
+    // (`virtualizable_gen.rs arrays`), so array index 0 names it.
+    let info = ctx.trace_ctx.virtualizable_info()?;
+    let lengths = ctx.trace_ctx.virtualizable_array_lengths()?;
+    if info.num_arrays() != 1 || lengths.first().copied().unwrap_or(0) <= class_slot {
+        return None;
+    }
+    // The value comes from the SHADOW, never from the frame's heap array: an
+    // unsynchronized virtualizable's array holds whatever the frame last wrote
+    // out, which is the staleness the read barrier's `force_now` repairs before
+    // the residual reads it.  The shadow already holds the repaired value.
+    let self_op = ctx
+        .trace_ctx
+        .virtualizable_entry_at(info.get_index_in_array(0, 0, lengths))?
+        .0;
+    let cell_op = ctx
+        .trace_ctx
+        .virtualizable_entry_at(info.get_index_in_array(0, class_slot, lengths))?
+        .0;
+    Some((self_op, cell_op))
+}
+
+/// Zero-argument `super()` folded to the proxy itself rather than re-routed to
+/// a may-force residual.
 ///
 /// [`try_walker_specialize_bare_super_call`] moves the frame force onto a
 /// channel the walker can see, which is what keeps the loop from aborting; it
 /// does not remove it.  What is left is a `MOST_GENERAL` call that publishes a
 /// vref for the frame, wipes the trace's heap-field cache and is re-checked by
-/// two guards, once per iteration: over 2,000,000 iterations `su = super();
-/// su.m(x)` ran ~76ns each against ~1.8 for `su = super(C, self); su.m(x)`.
+/// two guards, once per iteration.  Measured over 2,000,000 iterations:
+/// `su = super(); su.m(x)` ran ~76ns each in an inlined callee and ~62 with
+/// the loop in its own frame, against ~1.8 for `su = super(C, self); su.m(x)`.
 ///
-/// The residual reads two frame slots and nothing else, and an inlined
-/// callee's walk holds both as SSA values already
-/// ([`walker_bare_super_frame_slots`]), so the whole call becomes the same
-/// `New` + `SetfieldGc` the two-argument spelling emits.
+/// The residual reads two frame slots and nothing else, and the walk holds
+/// both as SSA values already ([`walker_bare_super_frame_slots`]), so the whole
+/// call becomes the same `New` + `SetfieldGc` the two-argument spelling emits.
 ///
 /// The class comes out of the `__class__` cell as a baked constant under the
 /// `CellFamily.ever_mutated` quasi-immutable rather than a live read per
 /// iteration: the cell a class body fills is written once, before any method
 /// of that class can run, and `w_cell_set` marks the family the moment a
 /// second write happens -- which retires this trace.  A cell that has already
-/// been rebound declines here and keeps the residual.
+/// been rebound declines here and keeps the residual, as does a method whose
+/// own `self` is a cellvar and a receiver `super_check` cannot settle without
+/// running Python.
 pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],

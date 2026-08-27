@@ -46,13 +46,16 @@
 #      property runs exactly once per iteration, which a fold that executed the
 #      call and then declined would double.
 #   F  the loop INSIDE the super-bearing method, so the frame the proxy is
-#      built from is the portal's own rather than an inlined callee's.  That
-#      is the other half of the fold split this fixture names: the operands of
-#      A/B/C come out of the callee slot shadow
-#      (`walker_bare_super_frame_slots`) and the call is emitted away, while
-#      the portal's slots reach the walk on a channel that fold does not read,
-#      so F declines to the re-routed residual.  Both labels in the
-#      `spec-folds` header above therefore have a site.
+#      built from is the portal's own rather than an inlined callee's.  The
+#      two frames reach `walker_bare_super_frame_slots` on different channels
+#      -- A/B/C through the callee slot shadow, F through the standard
+#      virtualizable -- and a fold that read only one of them would answer for
+#      the wrong frame on the other.
+#   G  a method whose own `self` is also a cellvar, because a nested function
+#      closes over it.  Slot zero then holds a `Cell` rather than the receiver,
+#      which the virtual fold does not model, so G is the site that keeps the
+#      re-routed residual live: both labels in the `spec-folds` header above
+#      have one.
 N = 20000
 
 
@@ -111,6 +114,22 @@ class Portal(Base):
         return acc
 
 
+class Captured(Base):
+    """Site G's own class: `self` is a cellvar, shared with slot zero.
+
+    `_get_self_location`'s cellvar branch reads the receiver out of that cell.
+    The virtual fold does not model the second dereference and declines, so
+    this is the shape the re-routed residual still owns.
+    """
+
+    def val(self):
+        def again():
+            return self.tag()
+
+        s = super()
+        return s.val() + len(again())
+
+
 class ETrap(Base):
     """Site E's own method, reached only with a `Tricky` receiver.
 
@@ -132,12 +151,15 @@ def main():
     site_c = set()
     site_d = set()
     site_e = set()
+    site_g = set()
     tricky = Tricky()
+    captured = Captured()
     total = 0
     for _ in range(N):
         site_a.add(middle.val())
         site_b.add(leaf.val())
         site_c.add(leaf.tag())
+        site_g.add(captured.val())
         try:
             Leaf.val(42)
         except TypeError as exc:
@@ -161,6 +183,7 @@ def main():
         ("A", site_a, 11),
         ("B", site_b, 111),
         ("C", site_c, "leaf-middle-base"),
+        ("G", site_g, 1 + len("base")),
         (
             "D",
             site_d,

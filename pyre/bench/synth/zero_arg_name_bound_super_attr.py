@@ -3,27 +3,22 @@
 # The loop folds to one add per iteration on both JITs, so N has to be in
 # the hundreds of millions before pypy's execution time is a measurement
 # rather than a clock tick — and at that size cpython is minutes behind.
-# Zero-argument `super()` bound to a name, then read — the zero-argument twin
-# of `name_bound_super_attr.py`, and the last super spelling that carried a
-# residual.
+# Zero-argument `super()` bound to a name, with the loop inside the
+# super-bearing method — the portal-frame twin of
+# `zero_arg_name_bound_super_attr_inlined_callee.py`.
 #
-# `super()` with no arguments reads two frame slots, so it cannot be emitted
-# from its operand list the way the two-argument call can.  It was re-routed
-# instead: a may-force residual taking the walk's own frame box, which moved
-# the frame force onto a channel the walker models — enough to stop the loop
-# aborting, not enough to make the call cheap.  What was left published a vref
-# for the frame, wiped the trace's heap-field cache and was re-checked by two
-# guards, once per iteration.
+# One thing separates them and it is not visible in the Python: the two slots
+# `super()` reads reach the walk on different channels.  A callee the trace
+# inlines owns a slot shadow the inline seeded; a method that carries its own
+# loop is the frame the portal traces, and its slots come out of the standard
+# virtualizable.  A fold reading only the first channel leaves this spelling on
+# the re-routed may-force residual, which is where it was: ~62ns per iteration
+# at 2,000,000 iterations, against ~3 for the same body with no `super()` in
+# it at all.
 #
-# An inlined callee's walk already holds both slots as SSA values: the inline
-# seeds the callee slot shadow with the argument operands and with the live
-# closure-cell reads it threaded into the new frame.  Reading them there
-# leaves the same `New` + `SetfieldGc` the two-argument spelling emits.
-# Measured at 2,000,000 iterations on this shape: ~76ns per iteration before,
-# ~0.8 after, against ~1.1 for pypy.
-#
-# `bare_super_frame_escape.py` carries the correctness half, including the
-# portal-frame site this fold declines.
+# At this size the two are indistinguishable — this fixture and the same loop
+# calling `self.val(acc)` both run 0.53s against pypy's 0.35 — so what is left
+# is the loop shape, not the proxy.
 #
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
@@ -36,16 +31,12 @@ class Base:
 
 
 class Child(Base):
-    def val(self, x):
-        su = super()
-        return su.val(x)
+    def loop(self, n):
+        acc = 0
+        for _ in range(n):
+            su = super()
+            acc = su.val(acc)
+        return acc
 
 
-def run(o, n):
-    acc = 0
-    for _ in range(n):
-        acc = o.val(acc)
-    return acc
-
-
-print(run(Child(), N))
+print(Child().loop(N))
