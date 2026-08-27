@@ -141,6 +141,20 @@ pub struct BaseJitCell {
     /// [`WarmEnterState::install_new_cell`] that files the cell — an
     /// unassigned cell is in no chain and is reachable by nothing.
     pub cell_key: Option<u64>,
+    /// The bucket [`Self::cell_key`] maps to, memoized at filing time.
+    ///
+    /// [`WarmEnterState::bucket_of`] answers the same question, but a minted
+    /// key sends it through the `minted` map, so the walk that tells this
+    /// cell's chain neighbours apart paid one hash probe PER CELL, on every
+    /// walk. The number is fixed for the cell's whole life:
+    /// [`WarmEnterState::install_new_cell`] files the cell into `hash`'s slot
+    /// and, in the same step, gives it either `hash` itself or a minted key
+    /// registered as belonging to `hash`. Nothing moves a filed cell between
+    /// buckets afterwards — the prune walk relinks survivors inside their own
+    /// slot — so the memo cannot go stale.
+    ///
+    /// Meaningless while `cell_key` is `None`, and read only beside it.
+    pub cell_bucket: u64,
     /// warmstate.py:568-582 — typed green-key carried per-cell so
     /// `JitCell.comparekey(*greenargs2)` can do per-green typed
     /// equality across hash collisions:
@@ -194,6 +208,7 @@ impl BaseJitCell {
             abort_count: 0,
             next: None,
             cell_key: None,
+            cell_bucket: 0,
             comparekey: None,
             retained_greens: RetainedGreens::default(),
         }
@@ -3206,7 +3221,7 @@ impl WarmEnterState {
         let mut cell = self.lookup_chain(hash);
         while let Some(c) = cell {
             if let Some(cell_key) = c.cell_key
-                && self.bucket_of(cell_key) == hash
+                && c.cell_bucket == hash
             {
                 count += 1;
                 if found.is_none() {
@@ -3288,7 +3303,7 @@ impl WarmEnterState {
         let mut cell = self.lookup_chain(hash);
         while let Some(c) = cell {
             if let Some(cell_key) = c.cell_key
-                && self.bucket_of(cell_key) == hash
+                && c.cell_bucket == hash
             {
                 count += 1;
                 if first.is_none() {
@@ -3388,14 +3403,19 @@ impl WarmEnterState {
     pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
         self.bump_cell_generation();
         let mut keep = newcell.map(Box::new);
-        if let Some(cell) = &mut keep
-            && cell.cell_key.is_none()
-        {
-            cell.cell_key = Some(if self.cell_by_key(hash).is_none() {
-                hash
-            } else {
-                self.mint_cell_key(hash)
-            });
+        if let Some(cell) = &mut keep {
+            if cell.cell_key.is_none() {
+                cell.cell_key = Some(if self.cell_by_key(hash).is_none() {
+                    hash
+                } else {
+                    self.mint_cell_key(hash)
+                });
+            }
+            // The slot being filed IS the bucket, whichever of the two keys
+            // above the cell ended up with. Only the newly filed cell gets it:
+            // the chain members relinked below keep their own, which is what
+            // the truncated index put them here in spite of.
+            cell.cell_bucket = hash;
         }
         // counter.py: index = self._get_index(hash);
         //                    cell = self.celltable[index]
