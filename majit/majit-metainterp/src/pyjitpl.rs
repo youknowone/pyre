@@ -11191,7 +11191,14 @@ impl<M: Clone> MetaInterp<M> {
         // having decided anything about the cell first. A caller that already
         // gated on the token holds it and calls the run directly.
         let token = self.warm_state.get_procedure_token(green_key)?;
-        self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
+        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
+        Some(self.execute_assembler_at_dispatch_key(
+            &token,
+            green_key,
+            meta,
+            live_values,
+            dispatch_key,
+        ))
     }
 
     /// `compile.py must_compile` reads the failing GUARD_VALUE's operand off the
@@ -11268,11 +11275,10 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
         green_key: u64,
+        meta: std::sync::Arc<M>,
         live_values: &[Value],
         dispatch_key: u32,
-    ) -> Option<CompileResult<M>> {
-        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
-
+    ) -> CompileResult<M> {
         // Read once per run, ahead of every stage, so no stage's difference
         // carries it. See [`ExecuteStageRepeats`]; a default build has neither
         // this load nor the loops it feeds.
@@ -11384,7 +11390,7 @@ impl<M: Clone> MetaInterp<M> {
             // (`jitdriver`'s two run loops) take their copy after their finish
             // and JUMP arms have returned, so a layout built here would be
             // copied out of this result and dropped without a reader.
-            return Some(CompileResult {
+            return CompileResult {
                 values,
                 typed_values,
                 meta,
@@ -11402,7 +11408,7 @@ impl<M: Clone> MetaInterp<M> {
                 },
                 status: 0,
                 guard_value_operand: None,
-            });
+            };
         }
 
         let status = descr.get_status();
@@ -11476,7 +11482,7 @@ impl<M: Clone> MetaInterp<M> {
             ovf_flag: false,
         };
 
-        Some(CompileResult {
+        CompileResult {
             values,
             typed_values,
             meta,
@@ -11490,7 +11496,7 @@ impl<M: Clone> MetaInterp<M> {
             exception,
             status,
             guard_value_operand,
-        })
+        }
     }
 
     /// Attach resume data to a specific guard in a compiled loop.

@@ -5667,6 +5667,12 @@ impl<S: JitState> JitDriver<S> {
             let result = self.meta.execute_assembler_at_dispatch_key(
                 &procedure_token,
                 green_key,
+                // The run is handed the meta the gate above already read out of
+                // `compiled_loops`, rather than probing that map a third time
+                // for the same slot. Nothing between the two can replace the
+                // entry: `pre_run` cannot capture the driver and the
+                // `on_compiled_entry` hook is called through `&self.meta`.
+                std::sync::Arc::clone(&compiled_meta),
                 live_values,
                 selected_dispatch_key,
             );
@@ -5674,7 +5680,7 @@ impl<S: JitState> JitDriver<S> {
             // arguments, so the buffers go back before the first exit past
             // this point.
             self.entry_scratch_out(scratch);
-            let mut result = result?;
+            let mut result = result;
             if portal_rca {
                 eprintln!(
                     "[portal-rca][compiled-exit] green_key={green_key} \
@@ -5719,7 +5725,10 @@ impl<S: JitState> JitDriver<S> {
                 // Taken, not copied: this arm returns below, so the exit values
                 // in `result` have no reader past this point.
                 self.meta.back_edge_finish = Some(std::mem::take(&mut result.typed_values));
-                let run_meta = result.meta.clone();
+                // The meta the run was handed, not a second handle to it:
+                // cloning `result.meta` here bought a refcount pair for a value
+                // already in scope.
+                let run_meta = &compiled_meta;
                 // The FINISH arguments are NOT the loop-carried state, so they
                 // are not written back into it. `warmstate.py:405-419
                 // execute_assembler` takes the `DoneWithThisFrameDescr*` fast
@@ -5740,7 +5749,7 @@ impl<S: JitState> JitDriver<S> {
                 // `descriptor_cache`), so a second consultation could only
                 // return the same object at the cost of one more refcount pair
                 // per compiled entry.
-                self.sync_after(state, &run_meta, vable);
+                self.sync_after(state, run_meta, vable);
                 // Kept for callers that cannot consume the latch (a portal whose
                 // return type the expansion cannot build from a `Value`). Those
                 // callers see today's behaviour unchanged; a caller that drains
@@ -5750,14 +5759,15 @@ impl<S: JitState> JitDriver<S> {
 
             // Normal loop back-edge JUMP, not a guard failure.
             if result.fail_index == u32::MAX {
-                let run_meta = result.meta.clone();
+                // Same handle as the FINISH arm above, for the same reason.
+                let run_meta = &compiled_meta;
                 if !result.typed_values.is_empty() {
-                    state.restore_values(&run_meta, &result.typed_values);
+                    state.restore_values(run_meta, &result.typed_values);
                 }
                 // Carried from the entry decision above, not re-resolved; see
                 // the FINISH arm for why one resolution serves both ends of a
                 // compiled entry.
-                self.sync_after(state, &run_meta, vable);
+                self.sync_after(state, run_meta, vable);
                 return Some(target_pc);
             }
 
