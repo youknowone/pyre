@@ -1387,6 +1387,20 @@ fn call_function_ex_impl(
             .collect()
     };
 
+    // CPython 3.14's AST tp_init is the one builtin constructor that receives
+    // its raw kwargs dict before enforcing string keys.  Preserve that narrow
+    // type-slot boundary; every ordinary callable continues through PyPy's
+    // Arguments merge below, where non-string names are rejected.
+    if !kwargs_or_null().is_null()
+        && let Some(result) = crate::module::_ast::moduledef::call_type_with_raw_kwargs(
+            callable(),
+            &args(),
+            kwargs_or_null(),
+        )
+    {
+        return result;
+    }
+
     // Merge the `**` mapping into the call.  argument.py:106-150
     // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
     // path or an arbitrary object via `keys()` / `__getitem__` — raising
@@ -5495,7 +5509,7 @@ fn build_class_inner(
 /// Pack `(name, value)` keyword pairs into the `__pyre_kw__`-tagged
 /// trailing dict that the builtin kwargs ABI (`split_builtin_kwargs`)
 /// consumes.  Mirrors the producer in `call_with_kwargs`.
-fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
+pub(crate) fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
     // The dict is born young, and `w_dict_store` allocates when it promotes the
     // strategy — see the bracket in `call_with_kwargs`. `kw_items` is the
     // caller's array of raw references, so the pairs still to be installed are

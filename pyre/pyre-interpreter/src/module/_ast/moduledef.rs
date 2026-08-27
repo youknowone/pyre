@@ -72,6 +72,93 @@ fn ast_warn(message: rustpython_wtf8::Wtf8Buf) -> Result<(), crate::PyError> {
     )
 }
 
+fn is_ast_init_descriptor(descr: PyObjectRef) -> bool {
+    if !unsafe { crate::is_function(descr) } {
+        return false;
+    }
+    let code = unsafe { crate::getcode(descr) } as PyObjectRef;
+    (unsafe { crate::is_builtin_code(code) })
+        && crate::gateway::builtin_code_fn_eq(
+            unsafe { crate::gateway::builtin_code_get(code) },
+            ast_init,
+        )
+}
+
+/// [3.14-spec] CPython `ASTConstructorTests.test_non_str_kwarg` observes that
+/// `ast_type_init` receives the raw kwargs dict, while PyPy `Arguments`
+/// rejects a non-text key in `_do_combine_starstarargs_wrapped` before
+/// `W_AST_init`.  Keep that PyPy path for every ordinary callable.  Only when
+/// the live type still owns the generated AST init, inherits `object.__new__`
+/// unchanged, and uses the default metaclass do we invoke those same two
+/// descriptor bodies with pyre's raw builtin-kwargs carrier.
+pub(crate) fn call_type_with_raw_kwargs(
+    w_type: PyObjectRef,
+    positional: &[PyObjectRef],
+    kwargs: PyObjectRef,
+) -> Option<crate::PyResult> {
+    if !unsafe { pyre_object::is_type(w_type) && pyre_object::is_dict(kwargs) } {
+        return None;
+    }
+    let entries = unsafe { pyre_object::w_dict_items(kwargs) };
+    if entries
+        .iter()
+        .all(|(key, _)| unsafe { pyre_object::is_str(*key) })
+    {
+        return None;
+    }
+    if unsafe { pyre_object::w_instance_get_type(w_type) } != crate::typedef::w_type() {
+        return None;
+    }
+    let init_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__init__") }?;
+    if !is_ast_init_descriptor(init_descr) {
+        return None;
+    }
+    let new_descr = unsafe { crate::baseobjspace::lookup_in_type(w_type, "__new__") }?;
+    let object_new = unsafe {
+        crate::baseobjspace::lookup_in_type(crate::typedef::w_object(), "__new__")
+    }?;
+    if new_descr != object_new {
+        return None;
+    }
+
+    Some((|| -> crate::PyResult {
+        // The type, positionals and kwargs entries all cross object.__new__
+        // and ast_type_init, both allocating calls.  Publish the caller-owned
+        // slice before packing the raw carrier and rebuild each argument list
+        // from the forwarded slots.
+        let roots = pyre_object::gc_roots::push_roots();
+        let type_slot = roots.publish(&[w_type]);
+        let positional_base = roots.publish(positional);
+        let kwargs_slot = roots.publish(&[kwargs]);
+        roots.normalize(type_slot, positional.len() + 2);
+        let current_positional = |index: usize| roots.get(positional_base + index);
+
+        let current_entries = unsafe { pyre_object::w_dict_items(roots.get(kwargs_slot)) };
+        let carrier = crate::call::pack_pyre_kwargs(&current_entries);
+        let carrier_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(carrier);
+
+        let mut new_args = Vec::with_capacity(positional.len() + 2);
+        new_args.push(roots.get(type_slot));
+        for index in 0..positional.len() {
+            new_args.push(current_positional(index));
+        }
+        new_args.push(roots.get(carrier_slot));
+        let instance = crate::typedef::object_descr_new(&new_args)?;
+        let instance_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(instance);
+
+        let mut init_args = Vec::with_capacity(positional.len() + 2);
+        init_args.push(roots.get(instance_slot));
+        for index in 0..positional.len() {
+            init_args.push(current_positional(index));
+        }
+        init_args.push(roots.get(carrier_slot));
+        ast_init(&init_args)?;
+        Ok(roots.get(instance_slot))
+    })())
+}
+
 fn expr_context_type() -> PyObjectRef {
     // CPython `ast_state.expr_context_type`; PyPy's `State` also owns this
     // generated base beside the Load singleton.  Recover that same base from
