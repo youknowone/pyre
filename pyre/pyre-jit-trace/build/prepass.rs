@@ -24,9 +24,24 @@ use walkdir::WalkDir;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v16";
-/// Retained cache entries. Each is ~6 MB, and a handful covers the
-/// configurations one checkout switches between (native/wasm × release/dev).
-const CODEGEN_CACHE_MAX_ENTRIES: usize = 8;
+/// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
+/// it is `jit_metadata.json` -- so eight covers the configurations one checkout
+/// switches between (native/wasm × release/dev) inside 300 MB.
+///
+/// A cache shared between worktrees (`PYRE_JIT_TRACE_CACHE_DIR`) has to hold
+/// every checkout's working set at once. Eight slots divided between ten
+/// worktrees evict each other faster than they serve, which is slower than not
+/// sharing at all, so the shared default is sized for the worktrees rather than
+/// for one of them.
+const CODEGEN_CACHE_MAX_ENTRIES_LOCAL: usize = 8;
+const CODEGEN_CACHE_MAX_ENTRIES_SHARED: usize = 48;
+/// A cache version nothing has touched for this long belongs to no working
+/// set. Only consulted for a shared cache; see `prune_codegen_cache`.
+const CODEGEN_CACHE_STALE_VERSION: std::time::Duration =
+    std::time::Duration::from_secs(14 * 24 * 60 * 60);
+/// Names the directory the two settings above are read out of.
+const CODEGEN_CACHE_DIR_ENV: &str = "PYRE_JIT_TRACE_CACHE_DIR";
+const CODEGEN_CACHE_ENTRIES_ENV: &str = "PYRE_JIT_TRACE_CACHE_ENTRIES";
 /// Rewritten on every cache hit; its mtime is the entry's last-use stamp.
 const CODEGEN_CACHE_USED_MARKER: &str = ".last-used";
 const CODEGEN_OUTPUTS: &[&str] = &[
@@ -1865,6 +1880,12 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     println!("cargo::rerun-if-changed=src/virtualizable_spec.rs");
     println!("cargo::rerun-if-changed=src/call_spec.rs");
     println!("cargo::rerun-if-changed=src/llbc_fingerprint.rs");
+    // Neither reaches `codegen_cache_key` -- they choose where the cache lives
+    // and how much of it is kept, not what it contains -- but cargo still has
+    // to re-run this script when they move so the outputs land in, and are
+    // pruned against, the directory now in force.
+    println!("cargo::rerun-if-env-changed={CODEGEN_CACHE_DIR_ENV}");
+    println!("cargo::rerun-if-env-changed={CODEGEN_CACHE_ENTRIES_ENV}");
     println!("cargo::rerun-if-env-changed=MAJIT_RTYPER_VERBOSE");
     println!("cargo::rerun-if-env-changed=MAJIT_CALLEE_CENSUS");
     println!("cargo::rerun-if-env-changed=MAJIT_CALLEE_CENSUS_ROWS");
@@ -1937,8 +1958,72 @@ fn llbc_layout_sidecars() -> Vec<String> {
 /// HOST/TARGET/PROFILE/OPT_LEVEL, the feature set, the build-script binary's
 /// own bytes and the LLBC content, so an entry is only ever served back to the
 /// configuration that produced it.
+/// The cache root when several checkouts are pointed at one, or `None` for the
+/// per-worktree default.
+///
+/// Sharing is sound because `codegen_cache_key` derives the key from content
+/// alone -- workspace sources, `Cargo.lock`, the rustc version string, the LLBC
+/// inputs -- and never from a path. Two worktrees whose trees agree therefore
+/// agree on the key, and the entry one of them stored answers for the other.
+/// The store is already safe to race on: it stages into a pid-suffixed sibling
+/// and renames, and concedes without error when another process got there
+/// first.
+///
+/// Deliberately absent from `codegen_cache_key`: keying on where the cache
+/// lives would give each worktree its own key again and defeat the point.
+fn codegen_cache_shared_base() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os(CODEGEN_CACHE_DIR_ENV)?;
+    if dir.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(dir))
+}
+
 fn codegen_cache_base(repo_root: &str) -> std::path::PathBuf {
-    std::path::Path::new(repo_root).join("build/pyre-jit-trace-cache")
+    codegen_cache_shared_base()
+        .unwrap_or_else(|| std::path::Path::new(repo_root).join("build/pyre-jit-trace-cache"))
+}
+
+fn codegen_cache_max_entries() -> usize {
+    if let Some(n) = std::env::var(CODEGEN_CACHE_ENTRIES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return n.max(1);
+    }
+    if codegen_cache_shared_base().is_some() {
+        CODEGEN_CACHE_MAX_ENTRIES_SHARED
+    } else {
+        CODEGEN_CACHE_MAX_ENTRIES_LOCAL
+    }
+}
+
+/// Whether nothing under `version` has been used for `age`.
+///
+/// Reads each entry's `.last-used` marker, which a restore rewrites, and falls
+/// back to the entry's own mtime; the newest of them dates the version.
+fn codegen_cache_version_idle(version: &std::path::Path, age: std::time::Duration) -> bool {
+    let newest = std::fs::read_dir(version)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            std::fs::metadata(entry.path().join(CODEGEN_CACHE_USED_MARKER))
+                .or_else(|_| entry.metadata())
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
+        .max();
+    let stamp = match newest.or_else(|| {
+        std::fs::metadata(version)
+            .and_then(|meta| meta.modified())
+            .ok()
+    }) {
+        Some(stamp) => stamp,
+        // No readable timestamp: leave it alone rather than guess it is dead.
+        None => return false,
+    };
+    stamp.elapsed().map(|since| since > age).unwrap_or(false)
 }
 
 fn codegen_cache_dir(repo_root: &str, cache_key: &str) -> std::path::PathBuf {
@@ -1954,7 +2039,7 @@ fn touch_codegen_cache_entry(cache_dir: &std::path::Path) {
     let _ = std::fs::write(cache_dir.join(CODEGEN_CACHE_USED_MARKER), b"");
 }
 
-/// Drop entries beyond [`CODEGEN_CACHE_MAX_ENTRIES`], least recently used
+/// Drop entries beyond [`codegen_cache_max_entries`], least recently used
 /// first, along with any directory left by an earlier `CODEGEN_CACHE_VERSION`.
 /// Every distinct (target, profile, feature set, build-script binary, LLBC
 /// content) combination mints a key and nothing removed them before, so the
@@ -1965,11 +2050,22 @@ fn touch_codegen_cache_entry(cache_dir: &std::path::Path) {
 /// every output or reports failure — it never serves a partial set.
 fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
     let base = codegen_cache_base(repo_root);
+    let shared = codegen_cache_shared_base().is_some();
     if let Ok(versions) = std::fs::read_dir(&base) {
         for version in versions.flatten() {
-            if version.file_name() != std::ffi::OsStr::new(CODEGEN_CACHE_VERSION) {
-                let _ = std::fs::remove_dir_all(version.path());
+            if version.file_name() == std::ffi::OsStr::new(CODEGEN_CACHE_VERSION) {
+                continue;
             }
+            // A worktree-local cache has one owner, so every other version is
+            // this checkout's own leftovers and goes immediately. A shared one
+            // is also read by checkouts sitting at commits whose version is
+            // live *for them*: deleting it there would have each worktree
+            // wiping the others' cache on every build. Wait for it to go
+            // untouched instead.
+            if shared && !codegen_cache_version_idle(&version.path(), CODEGEN_CACHE_STALE_VERSION) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(version.path());
         }
     }
     let Ok(entries) = std::fs::read_dir(base.join(CODEGEN_CACHE_VERSION)) else {
@@ -1991,7 +2087,7 @@ fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
     }
     by_last_use.sort_by_key(|item| std::cmp::Reverse(item.0));
     // `keep` is excluded above and occupies one of the retained slots.
-    let retained = CODEGEN_CACHE_MAX_ENTRIES.saturating_sub(1);
+    let retained = codegen_cache_max_entries().saturating_sub(1);
     for (_, path) in by_last_use.into_iter().skip(retained) {
         let _ = std::fs::remove_dir_all(path);
     }
