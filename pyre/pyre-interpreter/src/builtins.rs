@@ -3548,6 +3548,10 @@ pub fn install_default_builtins(ns: PyObjectRef) {
     crate::module_ns_store(ns, "IOError", os_error);
     // `exceptions.c` — `EnvironmentError` is a deprecated alias of `OSError`.
     crate::module_ns_store(ns, "EnvironmentError", os_error);
+    // `_PyBuiltins_AddExceptions` binds `WindowsError` to `OSError` under
+    // `MS_WINDOWS`, so the name exists only on Windows.
+    #[cfg(windows)]
+    crate::module_ns_store(ns, "WindowsError", os_error);
     crate::module_ns_store(
         ns,
         "FileNotFoundError",
