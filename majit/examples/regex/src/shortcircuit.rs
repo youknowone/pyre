@@ -65,6 +65,55 @@
 //! recorded constant — the Rust suite cannot call a Python 2 — with the
 //! command to re-derive it beside the constant.
 //!
+//! ## The gate has been shown to fail
+//!
+//! A passing gate means nothing until it has been watched to fail. Three
+//! breaks, each applied to this file and then reverted:
+//!
+//! | break | what the gate did |
+//! |---|---|
+//! | the portal's `promote(root)` removed, so the tree stops being constant | `getfield_gc_r` 0 → **84**, caught by the structural assertion |
+//! | `Sequence` reads `left.marked` *after* the recursive shift instead of before | `getfield_gc_i` 24 → **1**, caught — and by six other tests, since it also changes the answer |
+//! | the `Char` arm masks (`mark & (ch == c)`) instead of branching — **same answers, same specialization** | guards 26 → **28**, total 176 → **180** |
+//!
+//! The third is the one that shaped this gate. It was written first with the
+//! branching guard count asserted as a band around RPython's 27, and the band
+//! let 28 straight through: the whole suite passed with a `Char` arm silently
+//! switched to the spelling the *other* portal is supposed to own. The band is
+//! now an exact recorded value for majit's own two numbers, and the third
+//! break fails.
+//!
+//! ## Speed
+//!
+//! `the_jit_is_worth_several_times_the_matcher_with_no_jit` measures the post's
+//! headline ratio — the JIT against the same algorithm with no JIT under it —
+//! in one process, over 1,048,576 characters, median of 5. On this machine,
+//! `--release`, dynasm:
+//!
+//! ```text
+//!   majit JIT : 36,530,817 chars/s   (min 28,390,215, max 37,312,110)
+//!   no JIT    :  6,700,337 chars/s   (min  5,680,768, max  7,246,276)
+//!   ratio     : 5.5x        the post's own: 16,500,000 / 720,000 = 22.9x
+//! ```
+//!
+//! Ours is the smaller ratio because the denominator is better: `interp.rs`
+//! through `rustc -O`, against RPython's C backend in 2010. Only the ratios
+//! are comparable — never the absolute rows, sixteen years and two instruction
+//! sets apart. A debug-profile run reads about 9.0x for the same reason in
+//! reverse, and the test says so rather than letting the number be quoted.
+//!
+//! Cranelift read 2.6x in the same conditions, over a 6.3M-17.8M spread
+//! against dynasm's 28.4M-37.3M. The backends agree op for op on every census
+//! above and differ only here, which is what a compile-time difference looks
+//! like: this row includes the one recording each `matches` call pays for, and
+//! cranelift compiles slower. The floor is 1.5x so it clears both under
+//! contention while staying far above the ~1x a lost finding would read.
+//!
+//! This is not a speed comparison against RPython. `rpython_original/` runs
+//! under `meta_interp`, which executes traces in an interpreter; timing it
+//! would measure the harness. The RPython comparison is the trace-shape one,
+//! and it is exact.
+//!
 //! **And the guards say this module, not `jit_interp`, is the post's own
 //! spelling.** The post's source is Python `and`/`or`, which really do
 //! short-circuit, so RPython's tracer emits branches — 27 guards. This module
@@ -735,38 +784,58 @@ mod tests {
     /// pypy majit/examples/regex/rpython_original/runner.py 20 4096
     /// pypy majit/examples/regex/rpython_original/runner.py 2 512
     /// ```
-    struct RpythonBody {
+    struct CrossCheck {
         nodes: usize,
-        total: usize,
+        /// RPython's own peeled body.
+        rpython_total: usize,
+        rpython_guards: usize,
+        /// The four structural counts, which every column must agree on.
         getfield_gc_r: usize,
         getfield_gc_i: usize,
         setfield_gc: usize,
         int_eq: usize,
-        guards: usize,
+        /// majit's branching body, recorded. Not derived from RPython's,
+        /// because it is legitimately different — the port carries marks as
+        /// `i64` where RPython carries `Bool`, so majit pays an `IntIsTrue`
+        /// per non-comparison guard and an `IntAnd` per truncation. Pinned
+        /// exactly rather than as a band around RPython's: a band wide enough
+        /// to hold the real gap is wide enough to hold a *changed* gap, and
+        /// this was measured letting a `Char` arm silently switch from
+        /// branching to masking (guards 26 -> 28) straight through.
+        branching_total: usize,
+        branching_guards: usize,
     }
 
     /// The post's own benchmark regex, `(a|b)*a(a|b){20}a(a|b)*`.
-    const RPYTHON_93: RpythonBody = RpythonBody {
+    const XCHECK_93: CrossCheck = CrossCheck {
         nodes: 93,
-        total: 153,
+        // RPython: guard_true 6 + guard_false 21.
+        rpython_total: 153,
+        rpython_guards: 27,
         getfield_gc_r: 0,
         getfield_gc_i: 24,
         setfield_gc: 93,
         int_eq: 2,
-        // guard_true 6 + guard_false 21.
-        guards: 27,
+        // majit: 24 IntIsTrue and 2 IntAnd over RPython's body, less
+        // RPython's one extra guard and its two `debug_merge_point`s.
+        branching_total: 176,
+        branching_guards: 26,
     };
 
     /// The node-count control: `{2}` instead of `{20}`, so 21 nodes.
-    const RPYTHON_21: RpythonBody = RpythonBody {
+    ///
+    /// At this size the guard counts land exactly on top of each other.
+    const XCHECK_21: CrossCheck = CrossCheck {
         nodes: 21,
-        total: 45,
+        // RPython: guard_true 6 + guard_false 3.
+        rpython_total: 45,
+        rpython_guards: 9,
         getfield_gc_r: 0,
         getfield_gc_i: 6,
         setfield_gc: 21,
         int_eq: 2,
-        // guard_true 6 + guard_false 3.
-        guards: 9,
+        branching_total: 51,
+        branching_guards: 9,
     };
 
     fn guards(body: &[OpCode]) -> usize {
@@ -990,7 +1059,7 @@ mod tests {
     /// must be far below both, or the A/B is not an A/B.
     #[test]
     fn the_peeled_body_matches_the_rpython_original() {
-        for want in [&RPYTHON_93, &RPYTHON_21] {
+        for want in [&XCHECK_93, &XCHECK_21] {
             let n = if want.nodes == 93 { 20 } else { 2 };
             let s = nonmatching(4096, n, 42);
             let nodes = count(lower(&bench_regex(n)));
@@ -1005,88 +1074,98 @@ mod tests {
                 "[rpython-xcheck]   {:<16}{:>9}{:>13}{:>12}",
                 "", "RPython", "branching", "masking"
             );
-            for (label, got_sc, got_mk, want_n) in [
+            let rows = [
                 (
                     "getfield_gc_r",
+                    want.getfield_gc_r,
                     n_of(&sc.body, OpCode::GetfieldGcR),
                     n_of(&mk.body, OpCode::GetfieldGcR),
-                    want.getfield_gc_r,
                 ),
                 (
                     "getfield_gc_i",
+                    want.getfield_gc_i,
                     n_of(&sc.body, OpCode::GetfieldGcI),
                     n_of(&mk.body, OpCode::GetfieldGcI),
-                    want.getfield_gc_i,
                 ),
                 (
                     "setfield_gc",
+                    want.setfield_gc,
                     n_of(&sc.body, OpCode::SetfieldGc),
                     n_of(&mk.body, OpCode::SetfieldGc),
-                    want.setfield_gc,
                 ),
                 (
                     "int_eq",
+                    want.int_eq,
                     n_of(&sc.body, OpCode::IntEq),
                     n_of(&mk.body, OpCode::IntEq),
-                    want.int_eq,
                 ),
-                ("guards", guards(&sc.body), guards(&mk.body), want.guards),
-                ("total", sc.body.len(), mk.body.len(), want.total),
-            ] {
-                println!("[rpython-xcheck]   {label:<16}{want_n:>9}{got_sc:>13}{got_mk:>12}");
+                (
+                    "guards",
+                    want.rpython_guards,
+                    guards(&sc.body),
+                    guards(&mk.body),
+                ),
+                ("total", want.rpython_total, sc.body.len(), mk.body.len()),
+            ];
+            for (label, rpy, got_sc, got_mk) in rows {
+                println!("[rpython-xcheck]   {label:<16}{rpy:>9}{got_sc:>13}{got_mk:>12}");
             }
 
-            // The structural four, exactly. Re-derive RPython's column with
-            // `pypy majit/examples/regex/rpython_original/runner.py`.
-            for (label, got, want_n) in [
-                (
-                    "getfield_gc_r",
-                    n_of(&sc.body, OpCode::GetfieldGcR),
-                    want.getfield_gc_r,
-                ),
-                (
-                    "getfield_gc_i",
-                    n_of(&sc.body, OpCode::GetfieldGcI),
-                    want.getfield_gc_i,
-                ),
-                (
-                    "setfield_gc",
-                    n_of(&sc.body, OpCode::SetfieldGc),
-                    want.setfield_gc,
-                ),
-                ("int_eq", n_of(&sc.body, OpCode::IntEq), want.int_eq),
-            ] {
+            // The four structural counts, exactly, on BOTH portals. These are
+            // the post's structural claims — the tree walk folded away, one
+            // mark per node, the `Char` nodes reduced by the subset
+            // construction — so a reproduction must match RPython digit for
+            // digit. `pypy majit/examples/regex/rpython_original/runner.py`
+            // re-derives RPython's column.
+            for (label, rpy, got_sc, got_mk) in rows.iter().take(4) {
                 assert_eq!(
-                    got, want_n,
-                    "{nodes} nodes: majit's branching body has {got} {label}, \
-                     RPython's has {want_n}. This is a structural claim of the \
-                     post, so the two must agree exactly; re-derive RPython's \
-                     with `pypy majit/examples/regex/rpython_original/runner.py`",
+                    *got_sc, *rpy,
+                    "{nodes} nodes: the branching body has {got_sc} {label}, \
+                     RPython's has {rpy}",
                 );
-                let got_mk = match label {
-                    "getfield_gc_r" => n_of(&mk.body, OpCode::GetfieldGcR),
-                    "getfield_gc_i" => n_of(&mk.body, OpCode::GetfieldGcI),
-                    "setfield_gc" => n_of(&mk.body, OpCode::SetfieldGc),
-                    _ => n_of(&mk.body, OpCode::IntEq),
-                };
                 assert_eq!(
-                    got_mk, want_n,
-                    "{nodes} nodes: the masking portal has {got_mk} {label} \
-                     against RPython's {want_n}; the `&`/`|` rewrite is only \
-                     supposed to move guards, not specialization",
+                    *got_mk, *rpy,
+                    "{nodes} nodes: the masking body has {got_mk} {label}, \
+                     RPython's has {rpy}. The `&`/`|` rewrite is only supposed \
+                     to move guards, not specialization",
                 );
             }
 
-            // The guards: the relationship, not the equality.
-            let sc_guards = guards(&sc.body);
-            assert!(
-                sc_guards + 1 >= want.guards && sc_guards <= want.guards + 1,
-                "{nodes} nodes: the branching body has {sc_guards} guards \
-                 against RPython's {}, so it is no longer the same spelling \
-                 of `shift`",
-                want.guards,
+            // majit's own two numbers, pinned exactly rather than as a band
+            // around RPython's. The gap between the columns is understood — an
+            // `IntIsTrue` per non-comparison guard and an `IntAnd` per
+            // truncation, because this port carries marks as `i64` where
+            // RPython carries `Bool` — and a *changed* gap is a finding, not
+            // noise. A +/-1 band here was measured letting a `Char` arm switch
+            // from branching to masking (26 guards -> 28, 176 ops -> 180)
+            // straight through, which is precisely the difference the two
+            // portals are supposed to be an A/B of.
+            assert_eq!(
+                guards(&sc.body),
+                want.branching_guards,
+                "{nodes} nodes: the branching body has {} guards, and {} were \
+                 recorded (RPython's own is {}). Guards are what identify this \
+                 module as the port of the post's `and`/`or` source, so this \
+                 number does not drift quietly: if the change is deliberate, \
+                 re-record it here and in the module doc's table",
+                guards(&sc.body),
+                want.branching_guards,
+                want.rpython_guards,
             );
-            let mk_guards = guards(&mk.body);
+            assert_eq!(
+                sc.body.len(),
+                want.branching_total,
+                "{nodes} nodes: the branching body is {} ops against the {} \
+                 recorded. RPython's is {}, and the difference between them is \
+                 accounted for op by op in this module's doc — a different \
+                 total means that accounting is now wrong",
+                sc.body.len(),
+                want.branching_total,
+                want.rpython_total,
+            );
+
+            // The masking portal stays the other side of the A/B.
+            let (sc_guards, mk_guards) = (guards(&sc.body), guards(&mk.body));
             assert!(
                 mk_guards * 4 < sc_guards,
                 "{nodes} nodes: the masking body has {mk_guards} guards \
@@ -1256,6 +1335,87 @@ mod tests {
              multi-frame bridge fix, 19x on cranelift before it and 1716x at \
              1M, and under 10x that table is wrong rather than stale",
             s.len(),
+        );
+    }
+
+    /// The post's headline ratio, measured: the JIT against the same matcher
+    /// with no JIT under it.
+    ///
+    /// "A JIT for Regular Expression Matching" reports 16,500,000 chars/s for
+    /// RPython + JIT against 720,000 for RPython translated to C — **22.9x**,
+    /// and that ratio is the one quantity in the post that travels off its
+    /// 2010 hardware. Both sides of it are measured here in one process, in
+    /// one run, so the ratio below is comparable to it even though neither
+    /// absolute row is.
+    ///
+    /// Ours is smaller than 22.9x, and that is expected rather than a
+    /// shortfall: the denominator is `interp.rs` through `rustc -O`, which is
+    /// a considerably better ahead-of-time compiler than RPython's C backend
+    /// was. A bigger denominator is a smaller ratio for the same JIT.
+    ///
+    /// This is NOT a comparison against RPython's *speed*. `rpython_original/`
+    /// runs under `meta_interp`, which executes traces in an interpreter;
+    /// timing it would measure the harness. The RPython comparison is the
+    /// trace-shape one above, and it is exact.
+    ///
+    /// Cheap enough to run by default — the two rows here are the fast ones,
+    /// about a second together. The ten-minute test below is ten minutes
+    /// because of the *branching* portal, which is not in this row.
+    ///
+    /// The floor is deliberately far under the measured value: this row is
+    /// wall-clock on a shared machine, and the finding is "the JIT is worth
+    /// several times the matcher it replaced", not a specific multiple. Min
+    /// and max are printed beside each median so a reader can see the spread
+    /// rather than take the median on trust.
+    #[test]
+    fn the_jit_is_worth_several_times_the_matcher_with_no_jit() {
+        let s = nonmatching(TIMED_CHARS, 20, 42);
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let jit = time_rate(lower(&bench_regex(20)), &s, TIMED_RUNS, |r, s| {
+            crate::jit_interp::matches(r, s, 3)
+        });
+        let plain = time_rate(lower(&bench_regex(20)), &s, TIMED_RUNS, |r, s| {
+            crate::interp::matches(r, s)
+        });
+        let ratio = median(&jit) / median(&plain);
+        println!(
+            "[perf] {TIMED_CHARS} chars, majit JIT : {:.0} chars/s (min {:.0}, max {:.0})",
+            median(&jit),
+            jit[0],
+            jit[jit.len() - 1],
+        );
+        println!(
+            "[perf] {TIMED_CHARS} chars, no JIT    : {:.0} chars/s (min {:.0}, max {:.0})",
+            median(&plain),
+            plain[0],
+            plain[plain.len() - 1],
+        );
+        println!(
+            "[perf] majit JIT / no JIT = {ratio:.1}x   \
+             (the post's own, on its 2010 machine: 16,500,000 / 720,000 = 22.9x)"
+        );
+        // The denominator is Rust that the test profile did or did not
+        // optimize, and that changes the ratio by more than the finding is
+        // worth arguing over. The JIT's own compiled code is the same either
+        // way, so a debug run inflates this row rather than deflating it —
+        // which is the safe direction for the floor below, and the wrong
+        // direction for quoting a number.
+        if cfg!(debug_assertions) {
+            println!(
+                "[perf] DEBUG PROFILE — `interp.rs` is unoptimized here, so both the rows \
+                 above and the ratio are inflated. Quote only `--release`:"
+            );
+            println!(
+                "[perf]   cargo test -p regex --release --no-default-features --features \
+                 dynasm -- --nocapture the_jit_is_worth_several_times"
+            );
+        }
+        assert!(
+            ratio > 1.5,
+            "the JIT read only {ratio:.2}x the same matcher with no JIT under \
+             it, over {TIMED_CHARS} characters. The post's comparable ratio is \
+             22.9x and this crate has measured 5.1x; under 1.5x the JIT is not \
+             paying for itself and the reproduction claim is about shape only",
         );
     }
 

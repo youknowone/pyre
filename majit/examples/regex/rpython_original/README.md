@@ -158,12 +158,29 @@ cargo test -p regex --no-default-features --features dynasm \
 
 It prints the three columns side by side and fails if they part. RPython's
 column is a recorded constant inside the test — a Rust test cannot call a
-Python 2 — with the `runner.py` command to re-derive it written beside it. The
-four structural counts are asserted **exactly**, on both portals and at both
-sizes, because those are the post's structural claims. The guards are asserted
-as a relationship instead: the branching portal within one of RPython's, the
-masking portal far below both. Guards are the one thing the two portals are
-supposed to differ on, so pinning them to equality would gate the wrong thing.
+Python 2 — with the `runner.py` command to re-derive it written beside it.
+
+The four structural counts are asserted **exactly**, on both portals and at
+both sizes, because those are the post's structural claims. majit's own two
+numbers — the branching body's guard count and its total — are asserted exactly
+as well, against recorded values rather than a band around RPython's.
+
+### The gate has been shown to fail
+
+A passing gate means nothing until it has been watched to fail. Three breaks,
+each applied and then reverted:
+
+| break | what the gate did |
+|---|---|
+| the portal's `promote(root)` removed, so the tree stops being constant to the tracer | `getfield_gc_r` 0 → **84**; the structural assertion fired |
+| `Sequence` reads `left.marked` *after* the recursive shift instead of before | `getfield_gc_i` 24 → **1**; caught here and by six other tests, since it also changes the answer |
+| the `Char` arm masks (`mark & (ch == c)`) instead of branching — **same answers, same specialization, same node count** | guards 26 → **28**, total 176 → **180** |
+
+The third is why the guard assertion is not a band. Written first as "within
+one of RPython's 27", it admitted 26, 27 *and* 28 — so the entire suite passed
+with a `Char` arm silently switched to the spelling the other portal is
+supposed to own, which is the exact difference this example exists to measure.
+Recording majit's own numbers closed it.
 
 ## What this settled about the crate's two portals
 
@@ -223,10 +240,33 @@ REGEX_LISTING=1 cargo test -p regex --no-default-features --features dynasm \
 The two listings are formatted differently — RPython's prints op names, majit's
 prints the whole operation — so they are read together, not `diff`ed.
 
-## What this is not
+## Speed is measured, but not here
 
 It is not a speed comparison. `meta_interp` runs the optimizer and the LLGraph
 backend, which executes traces in an interpreter; timing it would measure the
-harness. Speed is the crate's own benchmark (`cargo run -p regex --release`),
-and the quantity that travels off this machine is a ratio taken within one run,
-never an absolute chars/s.
+harness. The RPython comparison is the trace-shape one above, and that one is
+exact.
+
+The post's headline *ratio* is measured, on the majit side, in one process:
+
+```sh
+cargo test -p regex --release --no-default-features --features dynasm \
+    -- --nocapture the_jit_is_worth_several_times
+```
+
+```text
+[perf] 1048576 chars, majit JIT : 36530817 chars/s (min 28390215, max 37312110)
+[perf] 1048576 chars, no JIT    :  6700337 chars/s (min  5680768, max  7246276)
+[perf] majit JIT / no JIT = 5.5x   (the post's own: 16,500,000 / 720,000 = 22.9x)
+```
+
+A ratio taken inside one run is the only quantity that travels off a machine;
+the absolute rows are sixteen years and two instruction sets from the post's.
+Ours is the smaller ratio because its denominator is better — `interp.rs`
+through `rustc -O`, against RPython's C backend in 2010. `--release` matters:
+a debug run reads about 9.0x because the denominator is unoptimized, and the
+test prints a banner saying so rather than letting that number be quoted.
+
+Cranelift reads 2.6x in the same conditions. The two backends agree op for op
+on every census above and differ only here — this row includes the one
+recording each call pays for, and cranelift compiles slower than dynasm.
