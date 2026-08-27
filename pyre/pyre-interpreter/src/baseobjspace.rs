@@ -17974,6 +17974,34 @@ pub(crate) unsafe fn generator_frame_is_finished(
     crate::executioncontext::may_ignore_finalizer(gen_obj);
 }
 
+/// CPython 3.14 `gen_close` / `_PyFrame_ClearExceptCode`: releasing the
+/// generator frame is an observable refcount boundary, so an object whose
+/// last reference was a frame local runs `__del__` before the following
+/// opcode.  PyPy's `GeneratorIterator.frame_is_finished` only drops
+/// `self.frame` and lets its tracing GC discover the local later.  Keep that
+/// frame-clearing shape, then run the existing non-moving reachability pass
+/// and drain its queue before returning to the caller.  Deferring this through
+/// `UserDelAction.fire()` is too late: a test method can read the class flag in
+/// the very next opcode.  The non-moving collector follows `do_collect_full`'s
+/// explicit-collection shape — finish an older incremental cycle, then take a
+/// fresh root snapshot — so the pass observes the frame release even when a
+/// major was already in progress.  The pending-finalizer census avoids paying
+/// for a collection when no application callback could be observed.
+///
+/// The PyPy load-bearing-hint census around `GeneratorIterator` finds only
+/// `_immutable_fields_ = ['pycode']` and `rgc.may_ignore_finalizer(self)`;
+/// neither governs the released locals or their finalization timing.
+pub(crate) fn generator_close_finalizer_boundary() {
+    if !majit_gc::gc_has_pending_finalizers() {
+        return;
+    }
+    let action = crate::executioncontext::space_user_del_action();
+    if !action.is_null() {
+        pyre_object::gc_hook::try_gc_collect_oldgen();
+        unsafe { (*action)._run_finalizers() };
+    }
+}
+
 /// generator.py `_invoke_execute_frame`: install the generator's
 /// exception state, execute its already-entered frame resume, finish the frame
 /// on errors, and perform the common frame/running/EC cleanup in `finally`.
@@ -18513,6 +18541,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
                 w_generator_set_exhausted(gen_obj);
             } else {
                 generator_frame_is_finished(gen_obj, &mut *frame_ptr);
+                generator_close_finalizer_boundary();
             }
             return Ok(w_none());
         }
@@ -18538,6 +18567,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // unlike a Python handler, no PUSH_EXC_INFO will clear the
             // temporary propagation root for us.
             crate::eval::set_in_flight_exception(PY_NULL);
+            generator_close_finalizer_boundary();
             value
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => {
@@ -18545,6 +18575,7 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // GeneratorExit after matching it.  Mirror PUSH_EXC_INFO's
             // ownership transfer by ending pyre's propagation root here.
             crate::eval::set_in_flight_exception(PY_NULL);
+            generator_close_finalizer_boundary();
             Ok(w_none())
         }
         Err(e) => Err(e),

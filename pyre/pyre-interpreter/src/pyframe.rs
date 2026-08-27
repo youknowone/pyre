@@ -4406,6 +4406,7 @@ impl PyFrame {
                         &mut *frame_anchor.live(),
                     )
                 };
+                crate::baseobjspace::generator_close_finalizer_boundary();
                 return Ok(());
             }
             // pyframe.py:815-820: a dead `f_generator_wref` simply skips the
