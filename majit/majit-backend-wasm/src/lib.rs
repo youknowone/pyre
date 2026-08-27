@@ -1011,7 +1011,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_get_typeids_list(Some(wasm_get_typeids_list));
     majit_gc::set_active_add_memory_pressure(Some(wasm_add_memory_pressure));
     majit_gc::set_active_total_memory_pressure(Some(wasm_total_memory_pressure));
-    majit_gc::set_active_collect_full(Some(wasm_collect_full));
+    majit_gc::set_active_collect_generation(Some(wasm_collect_generation));
     majit_gc::set_active_collect_step(Some(wasm_collect_step));
     majit_gc::set_active_collect_oldgen(Some(wasm_collect_oldgen_nonmoving));
     majit_gc::set_active_heap_stats(Some(active_gc_heap_stats));
@@ -1178,16 +1178,17 @@ fn jf_top_addr() -> Option<u32> {
         .filter(|&addr| addr != 0)
 }
 
-/// `majit_gc::CollectFullFn` installed by `register_active_hooks`. Drives
-/// `gc.collect()` (`interp_gc.py`) through the active GC. Without it
-/// `majit_gc::collect_full` has no hook to dispatch to and silently returns,
+/// `majit_gc::CollectGenerationFn` installed by `register_active_hooks`. Drives
+/// `gc.collect(n)` (`interp_gc.py`) through the active GC. Without it
+/// `majit_gc::collect_generation` has no hook to dispatch to and silently
+/// returns,
 /// so no major cycle ever runs on this backend and
 /// `deal_with_objects_with_finalizers` — which lives inside the major — never
 /// executes: no `__del__`, no generator `finally`, not even under an explicit
-/// `gc.collect()`. Mirrors dynasm's `dynasm_collect_full` and cranelift's
-/// `collect_full_via_active_runtime`.
-fn wasm_collect_full() {
-    with_wasm_active_gc_mut(|gc| gc.collect_full());
+/// `gc.collect()`. Mirrors dynasm's `dynasm_collect_generation` and cranelift's
+/// `collect_generation_via_active_runtime`.
+fn wasm_collect_generation(generation: i64) {
+    with_wasm_active_gc_mut(|gc| gc.collect_generation(generation));
 }
 
 fn wasm_collect_step() -> majit_gc::GcStepTransition {

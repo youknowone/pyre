@@ -329,7 +329,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         dynasm_alloc_nursery_collecting_typed_rooted,
     ));
     majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
-    majit_gc::set_active_collect_full(Some(dynasm_collect_full));
+    majit_gc::set_active_collect_generation(Some(dynasm_collect_generation));
     majit_gc::set_active_collect_step(Some(dynasm_collect_step));
     majit_gc::set_active_get_objects(Some(dynasm_get_objects));
     majit_gc::set_active_get_referents(Some(dynasm_get_referents));
@@ -660,18 +660,18 @@ fn bh_alloc_struct(sizedescr: &majit_translate::jitcode::BhDescr) -> *mut libc::
     ptr
 }
 
-/// User-level `gc.collect()` trampoline — drives `GcAllocator::collect_full`
-/// on the active dynasm-owned GC. PyPy's `pypy/module/gc/interp_gc.py:7-26`
-/// runs `rgc.collect()` from app-level `gc.collect`; this is the dynasm
-/// backend's edge of that path. Safety: callers must be at a safepoint
+/// User-level `gc.collect(n)` trampoline — drives
+/// `GcAllocator::collect_generation` on the active dynasm-owned GC.
+/// `interp_gc.py collect` runs `rgc.collect()` from app-level `gc.collect`;
+/// this is the dynasm backend's edge of that path. Safety: callers must be at a safepoint
 /// where every live PyObjectRef is either in a registered root, on the
 /// Python value stack, or on the shadow stack — Rust-stack PyObjectRef
 /// in nursery would dangle after the embedded minor cycle.
-fn dynasm_collect_full() {
-    if gc_box::with_mut(|g| g.collect_full()).is_some() {
+fn dynasm_collect_generation(generation: i64) {
+    if gc_box::with_mut(|g| g.collect_generation(generation)).is_some() {
         return;
     }
-    majit_gc::gc_sync::gc_op(|g| g.collect_full());
+    majit_gc::gc_sync::gc_op(|g| g.collect_generation(generation));
 }
 
 fn dynasm_collect_step() -> majit_gc::GcStepTransition {
@@ -808,7 +808,7 @@ fn dynasm_total_memory_pressure() -> isize {
 
 /// Non-moving old-gen-only major. Reclaims stable-allocated interp int/float
 /// without moving the nursery, so the interpreter safepoint can fire it under
-/// an active JIT (nursery non-empty) — unlike [`dynasm_collect_full`], whose
+/// an active JIT (nursery non-empty) — unlike [`dynasm_collect_generation`], whose
 /// embedded minor would relocate a Rust-stack nursery PyObjectRef.
 fn dynasm_collect_oldgen_nonmoving() {
     if gc_box::with_mut(|g| g.collect_oldgen_nonmoving()).is_some() {

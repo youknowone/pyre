@@ -8209,6 +8209,10 @@ impl GcAllocator for MiniMarkGC {
         self.do_collect_full();
     }
 
+    fn collect_generation(&mut self, generation: i64) {
+        self.do_collect(generation);
+    }
+
     fn collect_step(&mut self) -> crate::GcStepTransition {
         self.collect_step()
     }

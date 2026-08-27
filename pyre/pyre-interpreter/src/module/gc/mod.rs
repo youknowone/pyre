@@ -1418,14 +1418,19 @@ crate::py_module! {
     },
     inline_functions: {
         fn collect(
-            #[default(w_int_new(0))] generation: PyObjectRef,
+            #[default(w_int_new(NUM_GENERATIONS - 1))] generation: PyObjectRef,
         ) -> Result<PyObjectRef, crate::PyError> {
-            // `interp_gc.py collect` unwraps the optional generation as an
-            // int and ignores its value, because PyPy's frontend has no
-            // generations to select between.  This one reports three, so the
-            // argument is bounded the way `gc_collect_impl` bounds it; the
-            // value is still ignored below, since every collection here is a
-            // full one.
+            // `interp_gc.py collect` unwraps the optional generation as an int
+            // and then ignores it, because the frontend it belongs to has no
+            // generations to select between.  This one does: `NUM_GENERATIONS`
+            // publishes the mapping, `get_objects` already selects on it, and
+            // `get_count` reports per generation.  So the argument is bounded
+            // the way `gc_collect_impl` bounds it and then passed on to
+            // `incminimark.py collect(gen)`, whose generations are the same
+            // ones -- a minor at 0, a started major at 1, a full major at 2.
+            //
+            // The default is the oldest generation, so a bare `gc.collect()`
+            // is the full collection it has always been.
             let generation = crate::baseobjspace::int_w(
                 crate::baseobjspace::space_index(generation)?,
             )?;
@@ -1434,7 +1439,7 @@ crate::py_module! {
             }
             crate::baseobjspace::clear_method_cache();
             crate::objspace::std::mapdict::clear_map_attr_cache();
-            pyre_object::gc_hook::try_gc_collect();
+            pyre_object::gc_hook::try_gc_collect(generation);
             run_finalizers_now();
             run_cpyext_deallocs_now();
             // The return value is the caller-observable axis and is an int.
@@ -1694,9 +1699,11 @@ crate::py_module! {
         // 0 is the nursery, 1 the generation this collector keeps empty, 2
         // what is not in the nursery -- a minor collection is the generation-0
         // one and a major collects both older generations at once.  So element
-        // 1 is the minors run since the last major, and element 2 is exact at
-        // zero: nothing here ever collects generation 1 on its own, so there
-        // is never a generation-1 collection to have run since the last major.
+        // 1 is the minors run since the last major, which is what `collect(0)`
+        // moves.  Element 2 is exact at zero: `collect(1)` is `collect(0)` plus
+        // "start the major now if one is not already running", so asking for
+        // the middle generation runs no collection of its own for element 2 to
+        // count -- there is no middle generation holding anything to reclaim.
         //
         // Element 0 stays zero because no counter can be truthful here.  The
         // allocation seam is keyed by a majit type id and nothing else

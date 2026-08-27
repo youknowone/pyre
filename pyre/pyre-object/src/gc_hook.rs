@@ -263,30 +263,31 @@ pub unsafe fn try_gc_alloc_collecting_rooted(
     Some(result)
 }
 
-/// Signature of the host-side full-collection callback. Used by
+/// Signature of the host-side collection callback. Used by
 /// `pypy/module/gc/interp_gc.py collect` ports — i.e. user-level
-/// `gc.collect()` reaches the live GC through this hook.
-pub type GcCollectHookFn = fn();
+/// `gc.collect(n)` reaches the live GC through this hook, carrying the
+/// generation it was asked for.
+pub type GcCollectHookFn = fn(i64);
 
 majit_gc::global_hook!(static GC_COLLECT_HOOK: GcCollectHookFn);
 
-/// Install the full-collection callback. Overwrites any previously-installed
-/// hook.
+/// Install the collection callback. Overwrites any previously-installed hook.
 pub fn register_gc_collect_hook(hook: GcCollectHookFn) {
     GC_COLLECT_HOOK.set(Some(hook));
 }
 
-/// Remove the full-collection callback.
+/// Remove the collection callback.
 pub fn clear_gc_collect_hook() {
     GC_COLLECT_HOOK.set(None);
 }
 
-/// Trigger a full mark-sweep collection via the installed hook. No-op
-/// when no hook is installed.
+/// Run `incminimark.py collect(gen)` via the installed hook: a minor at
+/// generation 0, a started major at 1, a full major at 2 and above. No-op when
+/// no hook is installed.
 #[majit_macros::dont_look_inside]
-pub fn try_gc_collect() {
+pub fn try_gc_collect(generation: i64) {
     if let Some(f) = GC_COLLECT_HOOK.get() {
-        f();
+        f(generation);
     }
 }
 

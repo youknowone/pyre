@@ -670,6 +670,23 @@ pub trait GcAllocator: Send {
     /// Trigger a full collection.
     fn collect_full(&mut self);
 
+    /// `incminimark.py collect(gen=2)`: "Do a minor (gen=0), start a major
+    /// (gen=1), or do a full major (gen>=2) collection."
+    ///
+    /// The generation argument is the same one [`get_objects`](Self::get_objects)
+    /// takes, and the two agree on what a generation is: 0 is the nursery and
+    /// anything above it is what a minor collection has already promoted out of
+    /// it. This is what app-level `gc.collect(n)` reaches, so the dispatch has
+    /// to happen behind whichever hook the active backend installed rather than
+    /// on `gc_sync`'s singleton — the wasm backend keeps its GC somewhere that
+    /// singleton does not reach.
+    ///
+    /// A collector with no state machine has no generation to select, so the
+    /// default answers every one of them with the whole collection.
+    fn collect_generation(&mut self, _generation: i64) {
+        self.collect_full();
+    }
+
     /// `incminimark.py collect_step`: perform one minor collection
     /// and exactly one major-collection state transition, independently of
     /// the automatic-collection enabled flag.
@@ -1326,6 +1343,9 @@ impl GcAllocator for GcHandle {
     }
     fn collect_full(&mut self) {
         gc_sync::gc_op(|gc| gc.collect_full())
+    }
+    fn collect_generation(&mut self, generation: i64) {
+        gc_sync::gc_op(|gc| gc.collect_generation(generation))
     }
     fn collect_step(&mut self) -> GcStepTransition {
         gc_sync::gc_op(|gc| gc.collect_step())
@@ -2411,28 +2431,33 @@ pub unsafe fn alloc_fast_nursery_collecting_typed_rooted(
     }
 }
 
-/// Process-global callback that runs a full mark-sweep collection cycle
-/// on the active backend's GC (`GcAllocator::collect_full`). Used by
-/// `pypy/module/gc/interp_gc.py collect` ports — i.e. user-level
-/// `gc.collect()` reaches the live GC through this trampoline. Returns
-/// silently when no backend has installed a hook (callers treat
-/// it as a no-op).
-pub type CollectFullFn = fn();
+/// Process-global callback that runs `GcAllocator::collect_generation` on the
+/// active backend's GC. App-level `gc.collect(n)` reaches the live GC through
+/// this trampoline, carrying the generation it was given: the backends do not
+/// share one GC, so the dispatch cannot happen on `gc_sync`'s singleton.
+/// Returns silently when no backend has installed a hook (callers treat it as
+/// a no-op).
+pub type CollectGenerationFn = fn(i64);
 
-global_hook!(static ACTIVE_COLLECT_FULL: CollectFullFn);
+global_hook!(static ACTIVE_COLLECT_GENERATION: CollectGenerationFn);
 
-/// Install the active backend's full-collection trampoline. Pass
-/// `None` to clear.
-pub fn set_active_collect_full(hook: Option<CollectFullFn>) {
-    ACTIVE_COLLECT_FULL.set(hook);
+/// Install the active backend's collection trampoline. Pass `None` to clear.
+pub fn set_active_collect_generation(hook: Option<CollectGenerationFn>) {
+    ACTIVE_COLLECT_GENERATION.set(hook);
 }
 
-/// Trigger a full mark-sweep collection on the active backend's GC.
+/// Run `incminimark.py collect(gen)` on the active backend's GC.
 /// No-op when no backend has installed a hook.
-pub fn collect_full() {
-    if let Some(f) = ACTIVE_COLLECT_FULL.get() {
-        f();
+pub fn collect_generation(generation: i64) {
+    if let Some(f) = ACTIVE_COLLECT_GENERATION.get() {
+        f(generation);
     }
+}
+
+/// [`collect_generation`] at the generation that means "all of it". Named
+/// separately because `majit-translate`'s gctransform knows this symbol.
+pub fn collect_full() {
+    collect_generation(2);
 }
 
 /// Active-backend trampoline for `incminimark.py collect_step`.
@@ -3076,15 +3101,6 @@ pub fn gc_register_finalizer(fq_index: usize, obj: GcRef, trigger: FinalizerTrig
         Some(f) => f(fq_index, obj, trigger),
         None => gc_sync::gc_op(|gc| gc.register_finalizer(fq_index, obj, trigger)),
     }
-}
-
-/// rgc.py `collect(gen)` — the internal entry that names how much work to do,
-/// as opposed to `gc.collect()`, which asks for all of it.  `gen < 0` is a
-/// minor with no major progress at all, `0` a minor plus whatever major step
-/// the accounting calls for, `1` that plus starting a cycle if none is running,
-/// and `>= 2` a full collection.
-pub fn gc_collect_gen(generation: i64) {
-    gc_sync::gc_op(|gc| gc.do_collect(generation));
 }
 
 /// Whether a collection could still deliver a finalizer — whether
