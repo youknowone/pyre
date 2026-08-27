@@ -1441,10 +1441,6 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
     let _ = STACK_ALMOST_FULL_FN.set(f);
 }
 
-/// Number of `MC_DIAG` slots. Declared once so the counter array and
-/// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 88;
-
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
 /// entered, 1 = declined_bridge_guards short-circuit, 2 = descr_addr==0 skip,
@@ -1657,17 +1653,21 @@ pub const MC_DIAG_SLOTS: usize = 88;
 /// already excluded `has_runnable_compiled_loop` (a driver-side meta table)
 /// while 64 reads `cell.is_compiled()` (the warmstate cell token). The two
 /// disagree in both directions, so **64 counts cell-vs-meta disagreement.**
-pub static MC_DIAG: [std::sync::atomic::AtomicU64; MC_DIAG_SLOTS] = {
+pub static MC_DIAG: [std::sync::atomic::AtomicU64; MC_DIAG_LABELS.len()] = {
     // `AtomicU64` is not `Copy`, but a repeat expression accepts a path to a
-    // const item, so the length is taken from `MC_DIAG_SLOTS` rather than from
+    // const item, so the length is taken from `MC_DIAG_LABELS` rather than from
     // a spelled-out row of elements that has to be recounted by hand.
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    [Z; MC_DIAG_SLOTS]
+    [Z; MC_DIAG_LABELS.len()]
 };
 
 /// Short label per [`MC_DIAG`] slot, in index order, so a tally cannot be added
 /// without naming it. Readers join these with the counter values.
-pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
+///
+/// This array is the slot count: [`MC_DIAG`] takes its length from
+/// `MC_DIAG_LABELS.len()`, so a tally and its name are added in one edit and
+/// neither can be written without the other.
+pub const MC_DIAG_LABELS: &[&str] = &[
     "mc_entered",
     "decl_shortcircuit",
     "descr0_skip",

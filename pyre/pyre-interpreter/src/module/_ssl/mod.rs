@@ -490,11 +490,13 @@ fn allocate_ssl_socket(
     const OUTGOING_SLOT: usize = 5;
     const OWNER_SLOT: usize = 6;
     const SERVER_HOSTNAME_SLOT: usize = 7;
-    const SLOT_COUNT: usize = 8;
 
     let _ = ssl_socket_methods::type_object();
     let _roots = pyre_object::gc_roots::push_roots();
-    for value in [
+    // Bound rather than spelled twice: `first` is derived from this array's
+    // own length, so pinning one more value cannot leave the block start
+    // pointing one slot past where the pins actually begin.
+    let pinned = [
         context,
         socket,
         socket_send,
@@ -503,10 +505,11 @@ fn allocate_ssl_socket(
         outgoing,
         owner,
         server_hostname,
-    ] {
+    ];
+    for value in pinned {
         let _ = pyre_object::gc_roots::pin_root(value);
     }
-    let first = pyre_object::gc_roots::shadow_stack_len() - SLOT_COUNT;
+    let first = pyre_object::gc_roots::shadow_stack_len() - pinned.len();
     for slot in [SOCKET_SLOT, OWNER_SLOT] {
         let rooted = unsafe { pyre_object::gc_roots::shadow_stack_get(first + slot) };
         if !unsafe { is_none(rooted) } {

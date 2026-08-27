@@ -1176,11 +1176,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // to 0 when the export is absent, which reads as healthy. Hence the one
         // lookup feeding the refusal below, and hence this line — not the
         // counter line — being where those four keys are emitted now.
-        // Both arrays take their length from this one constant, so a label
-        // added without a slot (or the reverse) is a compile error rather than
-        // a `zip` that silently drops the tail.
-        const FBW_SLOTS: usize = 19;
-        let fbw_labels: [&str; FBW_SLOTS] = [
+        // The value array is built FROM the label array below, so a label
+        // added without a slot (or the reverse) is impossible to write rather
+        // than a `zip` that silently drops the tail.
+        let fbw_labels = [
             "fbw_walks",
             "fbw_rolled_back_with_effects",
             "fbw_midbody_latch",
@@ -1204,7 +1203,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
             .and_then(|f| {
-                let mut values = [0u64; FBW_SLOTS];
+                let mut values = fbw_labels.map(|_| 0u64);
                 for (slot, value) in values.iter_mut().enumerate() {
                     *value = f.call(&mut store, slot as u32)?;
                 }
@@ -1213,7 +1212,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             Ok(values) => values,
             Err(_) => {
                 missing.push("pyre_fbw_diag");
-                [0; FBW_SLOTS]
+                fbw_labels.map(|_| 0u64)
             }
         };
         if !missing.is_empty() {

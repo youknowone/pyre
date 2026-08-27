@@ -3,13 +3,13 @@
 //!
 //! The runner links no pyre crate — it is a wasmtime host that reaches the
 //! counters through the `pyre_fbw_diag` wasm export — so it cannot import the
-//! authority and instead restates it as a positional array. Both sides are
-//! length-checked by rustc against their own constant (`RING_BASE` here,
-//! `FBW_SLOTS` there), which catches a slot added on one side only; neither
-//! compiler sees the SPELLINGS, so a rename drifts silently and every tally
-//! from the divergence onward is printed under the wrong key. This test
-//! compares the two source declarations as text, the same way
-//! `majit-metainterp/tests/mc_diag_mirror.rs` does for `MC_DIAG_LABELS`.
+//! authority and instead restates it as a positional array. Each side sizes
+//! its own value array from its own labels, which catches a slot added
+//! without a name; neither compiler sees the SPELLINGS, so a rename drifts
+//! silently and every tally from the divergence onward is printed under the
+//! wrong key. Hence this test: the authority is LINKED (`fbw_diag::LABELS` is
+//! in scope), the mirror is read out of the runner's source as text, the same
+//! way `majit-metainterp/tests/mc_diag_mirror.rs` does for `MC_DIAG_LABELS`.
 
 use std::path::{Path, PathBuf};
 
@@ -31,10 +31,9 @@ fn read(path: &Path) -> String {
 
 /// The string literals of the first array literal following `anchor`.
 ///
-/// Both declarations carry a `[` in their TYPE (`[&str; RING_BASE]` /
-/// `[&str; FBW_SLOTS]`), so scanning for the first `[` after the name lands
-/// there and yields zero entries. Anchor on the name, then step to the `= [`
-/// that opens the value.
+/// A declaration can carry a `[` in its TYPE, so scanning for the first `[`
+/// after the name may land there and yield zero entries. Anchor on the name,
+/// then step to the `= [` that opens the value.
 fn array_after(text: &str, anchor: &str, what: &str) -> Vec<String> {
     let at = text
         .find(anchor)
@@ -82,7 +81,24 @@ fn array_after(text: &str, anchor: &str, what: &str) -> Vec<String> {
     out
 }
 
-/// The integer literal a `usize` constant is declared with.
+fn runner_source() -> String {
+    read(&repo_root().join("pyre/pyre-wasm-runner/src/main.rs"))
+}
+
+/// The linked authority and the runner's textual mirror of it.
+///
+/// The authority is not parsed: this test links `pyre-jit-trace`, so
+/// `LABELS` itself is in scope and no anchor can select the wrong array on
+/// that side. Only the runner — which this crate cannot import — is read as
+/// text.
+fn extract(runner_src: &str) -> (&'static [&'static str], Vec<String>) {
+    (
+        pyre_jit_trace::trace::fbw_diag::LABELS,
+        array_after(runner_src, "let fbw_labels", "runner"),
+    )
+}
+
+/// The integer literal a `usize`/`u32` constant is declared with.
 fn declared_count(src: &str, anchor: &str, what: &str) -> usize {
     let at = src
         .find(anchor)
@@ -94,25 +110,10 @@ fn declared_count(src: &str, anchor: &str, what: &str) -> usize {
         .unwrap_or_else(|e| panic!("{what}: count is not a number ({digits:?}) — {e}"))
 }
 
-fn sources() -> (String, String) {
-    let root = repo_root();
-    (
-        read(&root.join("pyre/pyre-jit-trace/src/trace.rs")),
-        read(&root.join("pyre/pyre-wasm-runner/src/main.rs")),
-    )
-}
-
-fn extract(trace_src: &str, runner_src: &str) -> (Vec<String>, Vec<String>, usize) {
-    let slots = declared_count(trace_src, "pub const RING_BASE: usize = ", "pyre-jit-trace");
-    let authority = array_after(trace_src, "pub const LABELS", "pyre-jit-trace");
-    let runner = array_after(runner_src, "let fbw_labels", "runner");
-    (authority, runner, slots)
-}
-
 /// The slots whose two spellings disagree, over the shorter of the two.
-fn divergences(authority: &[String], runner: &[String]) -> Vec<String> {
+fn divergences(authority: &[&str], runner: &[String]) -> Vec<String> {
     (0..authority.len().min(runner.len()))
-        .filter(|&i| authority[i] != runner[i])
+        .filter(|&i| authority[i] != runner[i].as_str())
         .map(|i| {
             format!(
                 "  slot {i}: fbw_diag={:?} runner={:?}",
@@ -122,54 +123,17 @@ fn divergences(authority: &[String], runner: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Validates the source parser against the compiler-enforced slot count before
-/// using the parser to diagnose mirror drift.
-#[test]
-fn slots_agree_with_the_declared_count() {
-    let (trace_src, runner_src) = sources();
-    let (authority, _runner, slots) = extract(&trace_src, &runner_src);
-    assert_eq!(
-        authority.len(),
-        slots,
-        "the fbw_diag-side extraction found {} labels but RING_BASE is {slots}. \
-         rustc already enforces that array's length, so THE PARSER IN THIS FILE \
-         IS WRONG — do not touch fbw_diag::LABELS. Most likely the anchor now \
-         matches a different array, or an entry is not one-per-line.",
-        authority.len(),
-    );
-}
-
-/// The runner's own constant must agree too — otherwise a slot added on one
-/// side compiles on both and only the zip length changes.
-#[test]
-fn the_runner_declares_the_same_slot_count() {
-    let (trace_src, runner_src) = sources();
-    let slots = declared_count(
-        &trace_src,
-        "pub const RING_BASE: usize = ",
-        "pyre-jit-trace",
-    );
-    let mirrored = declared_count(&runner_src, "const FBW_SLOTS: usize = ", "runner");
-    assert_eq!(
-        mirrored, slots,
-        "pyre-wasm-runner's FBW_SLOTS is {mirrored} but \
-         pyre_jit_trace::trace::fbw_diag::RING_BASE is {slots}. The runner reads \
-         `pyre_fbw_diag(i)` for i in 0..FBW_SLOTS, so a low count silently drops \
-         the tail slots from the wasm `[jit-stats] fbw_diag` line and a high one \
-         reads past the tallies into the ring.",
-    );
-}
-
 #[test]
 fn the_runner_mirror_matches_fbw_diag_labels() {
-    let (trace_src, runner_src) = sources();
-    let (authority, runner, slots) = extract(&trace_src, &runner_src);
+    let runner_src = runner_source();
+    let (authority, runner) = extract(&runner_src);
+    let slots = authority.len();
 
     assert_eq!(
         runner.len(),
         slots,
-        "pyre-wasm-runner's fbw label array has {} entries but RING_BASE is \
-         {slots}. A tally slot was added to fbw_diag::LABELS without being \
+        "pyre-wasm-runner's fbw label array has {} entries but fbw_diag::LABELS \
+         has {slots}. A tally slot was added to fbw_diag::LABELS without being \
          appended to the mirror in pyre-wasm-runner/src/main.rs (or vice versa). \
          APPEND it — inserting in the middle silently renames every tally after \
          the insertion point.\n\
@@ -190,8 +154,8 @@ fn the_runner_mirror_matches_fbw_diag_labels() {
          key->value map, so a wrong name is compared against the wrong baseline \
          rather than reported as missing. Fix the mirror in \
          pyre-wasm-runner/src/main.rs to match pyre-jit-trace, which is the \
-         authority: its array is length-checked against RING_BASE, which is the \
-         same constant the counter array itself is sized by.",
+         authority: `RING_BASE` — the offset the counter array itself is laid \
+         out against — is that array's own length.",
         divergent.join("\n"),
     );
 }
@@ -297,8 +261,9 @@ fn each_label_sits_at_its_own_slot_constant() {
 /// anchors — the part that is easiest to get silently wrong — untested.
 #[test]
 fn the_mirror_check_catches_injected_drift() {
-    let (trace_src, runner_src) = sources();
-    let (authority, runner, slots) = extract(&trace_src, &runner_src);
+    let runner_src = runner_source();
+    let (authority, runner) = extract(&runner_src);
+    let slots = authority.len();
     assert_eq!(runner.len(), slots, "control needs a green starting tree");
 
     // Both injections edit only the text FROM the anchor onward, so a future
@@ -341,4 +306,40 @@ fn the_mirror_check_catches_injected_drift() {
         "control assumption broken: dropping the LAST slot should leave every \
          remaining slot correctly named, so only the length check can catch it",
     );
+}
+
+/// The ring GEOMETRY is mirrored too, and unlike the labels it is four bare
+/// integers with nothing to derive them from on the runner's side.
+///
+/// `RING_BASE` is now `LABELS.len()` here, so a tally added on the authority
+/// side moves the ring's start — and the runner, which decodes the ring by
+/// arithmetic on its own copy, would keep reading from the old offset and
+/// print the tail of the tallies as if it were a walk's outcome name. The
+/// label comparison above cannot see that: the runner's LABEL array and its
+/// RING constants are independent declarations.
+#[test]
+fn the_runner_mirrors_the_ring_layout() {
+    use pyre_jit_trace::trace::fbw_diag as d;
+
+    let runner_src = runner_source();
+    for (anchor, authority, name) in [
+        ("const RING_BASE: u32 = ", d::RING_BASE, "RING_BASE"),
+        (
+            "const RING_ENTRIES: u32 = ",
+            d::RING_ENTRIES,
+            "RING_ENTRIES",
+        ),
+        ("const RING_STRIDE: u32 = ", d::RING_STRIDE, "RING_STRIDE"),
+        ("const NAME_SLOTS: u32 = ", d::NAME_SLOTS, "NAME_SLOTS"),
+    ] {
+        let mirrored = declared_count(&runner_src, anchor, "runner");
+        assert_eq!(
+            mirrored, authority,
+            "pyre-wasm-runner declares {name} = {mirrored} but \
+             pyre_jit_trace::trace::fbw_diag::{name} is {authority}. The runner \
+             indexes the `pyre_fbw_diag` export with `RING_BASE + entry * \
+             RING_STRIDE`, so a stale copy decodes the wrong words and prints \
+             them as a walk outcome rather than failing.",
+        );
+    }
 }
