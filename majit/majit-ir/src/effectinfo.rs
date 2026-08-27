@@ -11,9 +11,9 @@
 //! The name and contents otherwise mirror upstream line-by-line.
 
 use crate::descr::DescrRef;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, LazyLock};
-use parking_lot::Mutex;
 
 /// effectinfo.py `class UnsupportedFieldExc(Exception)`.
 #[derive(Debug, Clone)]
@@ -411,8 +411,7 @@ pub fn intern_translated_effect_info(
     translated_id: u32,
     effect_info: EffectInfo,
 ) -> Arc<EffectInfoCell> {
-    let mut translated = translated_effect_infos()
-        .lock();
+    let mut translated = translated_effect_infos().lock();
     let slot = translated_id as usize;
     if translated.len() <= slot {
         translated.resize_with(slot + 1, || None);

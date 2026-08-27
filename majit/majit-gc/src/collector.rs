@@ -7,8 +7,8 @@
 //!
 //! Modeled after incminimark's minor/major collection.
 use majit_ir::GcRef;
-use std::collections::VecDeque;
 use parking_lot::RwLock;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 /// Monotonic source for the durations the collector reports to its hooks.
 ///

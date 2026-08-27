@@ -39,7 +39,8 @@ pub struct W_SRE_Pattern {
 /// traces into them: their GC-heap `w_pattern` / `w_groupindex` /
 /// `w_indexgroup` slots would otherwise be reclaimed or relocated without
 /// updating the slot.
-static SRE_PATTERNS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> = std::sync::OnceLock::new();
+static SRE_PATTERNS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
+    std::sync::OnceLock::new();
 
 fn sre_patterns() -> &'static parking_lot::Mutex<Vec<usize>> {
     SRE_PATTERNS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
@@ -48,8 +49,7 @@ fn sre_patterns() -> &'static parking_lot::Mutex<Vec<usize>> {
 /// Visit each immortal pattern's GC-heap `PyObjectRef` slots as roots.
 #[majit_macros::dont_look_inside]
 pub fn walk_sre_pattern_roots(mut visitor: impl FnMut(&mut PyObjectRef)) {
-    let patterns = sre_patterns()
-        .lock();
+    let patterns = sre_patterns().lock();
     for &addr in patterns.iter() {
         if addr == 0 {
             continue;
@@ -92,9 +92,7 @@ pub fn w_sre_pattern_new(
     // This is a prebuilt-family root store: make the collector rescan it after
     // publishing a newly allocated pattern.
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    sre_patterns()
-        .lock()
-        .push(obj as usize);
+    sre_patterns().lock().push(obj as usize);
     obj
 }
 

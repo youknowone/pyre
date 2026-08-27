@@ -17,10 +17,10 @@
 //! (`feedback_single_jitcodes_store`). Driver metadata only identifies indices
 //! in that store; it does not duplicate JitCode bodies.
 
+use parking_lot::Mutex;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Once, OnceLock};
-use parking_lot::Mutex;
 
 use majit_ir::DescrRef;
 use majit_translate::CompiledJitDriver;

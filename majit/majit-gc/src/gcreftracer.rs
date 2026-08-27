@@ -51,9 +51,9 @@
 //! `Box`, allocated and released with it, so the array cannot outlive its
 //! storage and there is nothing to turn off.
 
+use parking_lot::RwLock;
 use std::cell::Cell;
 use std::sync::{Arc, Weak};
-use parking_lot::RwLock;
 
 use majit_ir::GcRef;
 
@@ -234,8 +234,7 @@ mod tests {
 
     #[test]
     fn trace_forwards_slots_in_place() {
-        let _serialize = GC_TABLE_WALK_LOCK
-            .write();
+        let _serialize = GC_TABLE_WALK_LOCK.write();
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // A moving collection relocates 0x1000 -> 0x9000.
         table.trace(&mut |r| {
@@ -260,8 +259,7 @@ mod tests {
         // is the shared dynasm/cranelift `LoadFromGcTable` contract; wasm never
         // runs the GC rewrite (loud-panic), so it has no moving-GC ref-const
         // path to cover.
-        let _serialize = GC_TABLE_WALK_LOCK
-            .write();
+        let _serialize = GC_TABLE_WALK_LOCK.write();
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // `base` is the value baked into the trace at compile time.
         let base = table.base_addr();
@@ -299,8 +297,7 @@ mod tests {
 
     #[test]
     fn dropping_table_deregisters_from_walk() {
-        let _serialize = GC_TABLE_WALK_LOCK
-            .write();
+        let _serialize = GC_TABLE_WALK_LOCK.write();
         // A sentinel unlikely to collide with any other test's table.
         const SENTINEL: GcRef = GcRef(0x0000_DEAD_BEEF);
         // The write side is already held, so count through the unlocked

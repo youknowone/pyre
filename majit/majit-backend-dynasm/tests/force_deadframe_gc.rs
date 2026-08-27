@@ -45,10 +45,10 @@
 //! removes from, published to the collector as a root source. That test walks
 //! the registry to show the frame is in it and walks the JF shadow stack to
 //! show it is in nothing else, and only then collects.
+use parking_lot::Mutex;
 use std::cell::{Cell, UnsafeCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use majit_backend::{Backend, DeadFrame, JitCellToken};
 use majit_backend_dynasm::runner::DynasmBackend;

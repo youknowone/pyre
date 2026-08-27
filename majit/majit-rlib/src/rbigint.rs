@@ -4369,9 +4369,7 @@ impl PartsCacheBase {
 
     #[inline]
     fn parts_snapshot(&self) -> std::sync::Arc<Vec<std::sync::Arc<RBigInt>>> {
-        self.parts_cache
-            .lock()
-            .clone()
+        self.parts_cache.lock().clone()
     }
 
     /// Publish `expected[-1] ** 2` exactly as `_format` appends to
@@ -4396,9 +4394,7 @@ impl PartsCacheBase {
         extended.push(next);
         let extended = std::sync::Arc::new(extended);
 
-        let mut shared = self
-            .parts_cache
-            .lock();
+        let mut shared = self.parts_cache.lock();
         if std::sync::Arc::ptr_eq(&shared, expected) {
             *shared = extended;
         }
@@ -4432,8 +4428,7 @@ pub fn initialize_rbigint_parts_cache() {
 fn get_cached_parts(base: i64) -> PartsCacheRef {
     let index = base - 3;
     {
-        let all = PARTS_CACHE
-            .lock();
+        let all = PARTS_CACHE.lock();
         if let Some(cache) = &all[index as usize] {
             return cache.clone();
         }
@@ -4443,14 +4438,11 @@ fn get_cached_parts(base: i64) -> PartsCacheRef {
     // the collector walks this same process-global owner.
     let initial = std::sync::Arc::new(PartsCacheBase::new(base));
     let initial_part = {
-        let parts = initial
-            .parts_cache
-            .lock();
+        let parts = initial.parts_cache.lock();
         parts[0].clone()
     };
     let _initial_root = unsafe { PendingPartsCacheDigitRoot::new(&initial_part) };
-    let mut all = PARTS_CACHE
-        .lock();
+    let mut all = PARTS_CACHE.lock();
     all[index as usize].get_or_insert(initial).clone()
 }
 
@@ -7231,8 +7223,7 @@ mod tests {
         initialize_rbigint_parts_cache();
 
         let cache_from_owner = {
-            let all = PARTS_CACHE
-                .lock();
+            let all = PARTS_CACHE.lock();
             assert_eq!(all.len(), 34);
             all[10 - 3]
                 .as_ref()

@@ -547,8 +547,7 @@ pub(crate) fn fbw_depth_census_record(framestack: &[InlineFrame]) {
     FBW_DEPTH_HIST[depth.saturating_sub(1).min(FBW_DEPTH_HIST_BUCKETS - 1)].fetch_add(1, ordering);
 
     if depth > FBW_DEPTH_MAX.load(ordering) {
-        let mut deepest = FBW_DEPTH_DEEPEST
-            .lock();
+        let mut deepest = FBW_DEPTH_DEEPEST.lock();
         if depth > FBW_DEPTH_MAX.load(ordering) {
             deepest.clear();
             deepest.extend(framestack.iter().map(|frame| frame.w_code));
@@ -562,8 +561,7 @@ pub fn fbw_depth_census_summary() -> String {
     use std::fmt::Write;
 
     let ordering = std::sync::atomic::Ordering::Relaxed;
-    let deepest = FBW_DEPTH_DEEPEST
-        .lock();
+    let deepest = FBW_DEPTH_DEEPEST.lock();
     let mut hist = String::new();
     for (idx, count) in FBW_DEPTH_HIST.iter().enumerate() {
         if idx != 0 {

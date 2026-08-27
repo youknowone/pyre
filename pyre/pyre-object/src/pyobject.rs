@@ -419,8 +419,7 @@ pub struct SubclassRangeWriteGuard {
 
 /// Enter a subclass-range write section (see [`SubclassRangeWriteGuard`]).
 pub fn subclass_range_write_guard() -> SubclassRangeWriteGuard {
-    let writers = SUBCLASS_RANGE_WRITER_LOCK
-        .lock();
+    let writers = SUBCLASS_RANGE_WRITER_LOCK.lock();
     // Serialized by the writer lock, so this load/store pair is race-free.
     let seq = SUBCLASS_RANGE_SEQ.load(Ordering::Relaxed).wrapping_add(1);
     SUBCLASS_RANGE_SEQ.store(seq, Ordering::Relaxed);

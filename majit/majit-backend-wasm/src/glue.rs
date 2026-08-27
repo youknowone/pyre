@@ -15,8 +15,8 @@
 //! the rest of the backend stays binding-agnostic.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 use parking_lot::Mutex;
+use std::sync::OnceLock;
 
 static JIT_EXECUTE_COUNT: AtomicU64 = AtomicU64::new(0);
 static JIT_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);

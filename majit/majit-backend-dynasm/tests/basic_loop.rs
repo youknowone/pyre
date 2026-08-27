@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 /// Basic test: compile and execute a simple int_add loop via dynasm backend.
 ///
 /// Trace: i0 = input
@@ -9,7 +10,6 @@
 ///   finish(i1)      [on guard failure]
 use std::rc::Rc;
 use std::sync::LazyLock;
-use parking_lot::Mutex;
 
 use majit_backend::{Backend, JitCellToken, STATUS_TYPE_MASK, make_resume_guard_descr_typed};
 use majit_ir::{

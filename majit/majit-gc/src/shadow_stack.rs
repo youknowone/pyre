@@ -18,9 +18,9 @@
 //! Compiled code manipulates the current thread's root_stack_top with inline
 //! load/store instructions (no function calls), exactly as in
 //! `_call_header_shadowstack`.
+use parking_lot::{Mutex, RwLock};
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
-use parking_lot::{Mutex, RwLock};
 
 use majit_ir::GcRef;
 
@@ -1368,8 +1368,9 @@ const MAX_EXTRA_ROOT_WALKERS: usize = 8;
 /// Registered root walkers. Each slot is either `None` or a function
 /// pointer. We cap the count to keep the set stack-allocatable and
 /// avoid dynamic allocation in the GC hot path.
-static EXTRA_ROOT_WALKERS: parking_lot::RwLock<[Option<ExtraRootWalkerFn>; MAX_EXTRA_ROOT_WALKERS]> =
-    parking_lot::RwLock::new([None; MAX_EXTRA_ROOT_WALKERS]);
+static EXTRA_ROOT_WALKERS: parking_lot::RwLock<
+    [Option<ExtraRootWalkerFn>; MAX_EXTRA_ROOT_WALKERS],
+> = parking_lot::RwLock::new([None; MAX_EXTRA_ROOT_WALKERS]);
 
 /// Register an additional root walker.
 ///

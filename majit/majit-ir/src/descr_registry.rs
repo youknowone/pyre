@@ -90,18 +90,14 @@ pub fn register_array_len(descr: DescrRef) {
 /// Keyed sibling: publishes the descr to
 /// `gc_cache._cache_arraylen[key]`.
 pub fn register_keyed_arraylen(key: crate::descr::LLType, descr: DescrRef) {
-    gc_cache()
-        .lock()
-        .register_keyed_arraylen(key, descr);
+    gc_cache().lock().register_keyed_arraylen(key, descr);
 }
 
 /// `descr.py get_interiorfield_descr` cache-miss publication.
 /// TODO: prefer the keyed cache-or-mint path once
 /// `gc_cache.get_interiorfield_descr` lands.
 pub fn register_interior_field(descr: DescrRef) {
-    gc_cache()
-        .lock()
-        .register_external_interiorfield(descr);
+    gc_cache().lock().register_external_interiorfield(descr);
 }
 
 /// Keyed sibling: publishes the descr to

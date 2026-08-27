@@ -31,8 +31,8 @@
 //! bytecode, `GILReleaseAction` (gil.py) yields it from the periodic
 //! action; [`yield_thread`] is that yield.
 
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use parking_lot::{Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::gc_sync;

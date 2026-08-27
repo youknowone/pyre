@@ -3081,9 +3081,9 @@ static FBW_DECLINE_CENSUS: parking_lot::Mutex<std::collections::BTreeMap<&'stati
 /// Lock the census, recovering from poisoning: a `BTreeMap` of counters has no
 /// invariant a panicking writer can leave broken, and a diagnostic that goes
 /// silent after an unrelated panic is worse than one that keeps counting.
-fn census_map() -> parking_lot::MutexGuard<'static, std::collections::BTreeMap<&'static str, usize>> {
-    FBW_DECLINE_CENSUS
-        .lock()
+fn census_map() -> parking_lot::MutexGuard<'static, std::collections::BTreeMap<&'static str, usize>>
+{
+    FBW_DECLINE_CENSUS.lock()
 }
 
 /// Bump the decline count for `name` (a [`DispatchError::variant_name`] or

@@ -1807,8 +1807,7 @@ impl Drop for GuardHooksTestGuard {
     }
 }
 pub fn override_gc_guard_hooks_for_test(hooks: ActiveGcGuardHooks) -> GuardHooksTestGuard {
-    let lock = GUARD_HOOKS_TEST_LOCK
-        .lock();
+    let lock = GUARD_HOOKS_TEST_LOCK.lock();
     let prev = current_gc_guard_hooks();
     set_active_gc_guard_hooks(hooks);
     GuardHooksTestGuard { prev, _lock: lock }

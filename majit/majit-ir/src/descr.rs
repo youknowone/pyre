@@ -1,4 +1,6 @@
 use indexmap::IndexMap;
+use parking_lot::Mutex;
+use parking_lot::RwLock;
 /// Descriptor traits for the JIT IR.
 ///
 /// Translated from rpython/jit/metainterp/history.py (AbstractDescr)
@@ -109,9 +111,7 @@ use indexmap::IndexMap;
 ///   cached Arcs, so `OptVirtualize` emits SETFIELD_GC ops with the
 ///   same identities carried by `MetaInterp.virtualref_info`.
 use std::sync::Arc;
-use parking_lot::Mutex;
 use std::sync::OnceLock;
-use parking_lot::RwLock;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
 
@@ -1506,8 +1506,7 @@ impl GcCache {
     pub fn field_position_unresolved_sample(all_descrs: usize) -> Vec<String> {
         let limit = field_position_unresolved_limit().unwrap_or(0);
         let [parent_absent, parent_empty, rederived, unresolved] = Self::field_position_census();
-        let table = FIELD_UNRESOLVED_NAMES
-            .lock();
+        let table = FIELD_UNRESOLVED_NAMES.lock();
         let recorded: usize = table.values().sum();
         // Frequency first, then the key's own order, so the ranking is total
         // and two runs of one program print the same bytes.
@@ -1961,10 +1960,7 @@ impl GcCache {
                             .collect::<Vec<_>>()
                             .join("|"),
                     };
-                    *FIELD_UNRESOLVED_NAMES
-                        .lock()
-                        .entry(mint)
-                        .or_insert(0) += 1;
+                    *FIELD_UNRESOLVED_NAMES.lock().entry(mint).or_insert(0) += 1;
                 }
                 None
             }
@@ -6089,10 +6085,7 @@ impl FieldDescr for SimpleFieldDescr {
         self.index_in_parent
     }
     fn get_parent_descr(&self) -> Option<DescrRef> {
-        self.parent_descr
-            .read()
-            .as_ref()
-            .and_then(|p| p.upgrade())
+        self.parent_descr.read().as_ref().and_then(|p| p.upgrade())
     }
     fn get_vinfo(&self) -> Option<Arc<dyn VinfoMarker>> {
         self.vinfo.as_ref().and_then(|w| w.upgrade())

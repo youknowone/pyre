@@ -30,9 +30,9 @@
 //! returned reference remains protected until the caller roots it before its
 //! next collection-capable call.
 
+use parking_lot::{Condvar, Mutex};
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use parking_lot::{Condvar, Mutex};
 
 use crate::collector::MiniMarkGC;
 // The singleton is concrete, but its `GcAllocator` methods still need the
@@ -256,9 +256,9 @@ pub fn register_thread() {
     }
 
     let mut state = GC_SYNC.quiesce.lock();
-    GC_SYNC
-        .resumed
-            .wait_while(&mut state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire));
+    GC_SYNC.resumed.wait_while(&mut state, |_| {
+        GC_SYNC.stw_requested.load(Ordering::Acquire)
+    });
     state.running += 1;
     GC_THREAD.with(|t| t.running.set(true));
     GC_THREAD.with(|t| t.registered.set(true));
@@ -365,9 +365,9 @@ impl Drop for BlockingGuard {
             return;
         }
         let mut state = GC_SYNC.quiesce.lock();
-        GC_SYNC
-            .resumed
-                .wait_while(&mut state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire));
+        GC_SYNC.resumed.wait_while(&mut state, |_| {
+            GC_SYNC.stw_requested.load(Ordering::Acquire)
+        });
         state.running += 1;
         assert!(
             !GC_THREAD.with(|t| t.running.replace(true)),
@@ -439,9 +439,9 @@ pub fn enter_external_callback() -> CallbackGuard {
     let mut rejoined = false;
     if registered && !running {
         let mut state = GC_SYNC.quiesce.lock();
-        GC_SYNC
-            .resumed
-                .wait_while(&mut state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire));
+        GC_SYNC.resumed.wait_while(&mut state, |_| {
+            GC_SYNC.stw_requested.load(Ordering::Acquire)
+        });
         state.running += 1;
         GC_THREAD.with(|t| t.running.set(true));
         rejoined = true;
@@ -651,7 +651,7 @@ pub fn quiesce_mutators() -> StwGuard {
     let drain_target = usize::from(collector_is_running);
     GC_SYNC
         .quiesced
-            .wait_while(&mut state, |state| state.running != drain_target);
+        .wait_while(&mut state, |state| state.running != drain_target);
     drop(state);
     STW_OWNER.store(ident, Ordering::Release);
     STW_DEPTH.store(1, Ordering::Relaxed);
@@ -777,9 +777,9 @@ fn park_until_stw_done() {
         .expect("RUNNING underflow entering dispatch safepoint");
     GC_SYNC.quiesced.notify_all();
 
-    GC_SYNC
-        .resumed
-            .wait_while(&mut state, |_| GC_SYNC.stw_requested.load(Ordering::Acquire));
+    GC_SYNC.resumed.wait_while(&mut state, |_| {
+        GC_SYNC.stw_requested.load(Ordering::Acquire)
+    });
     state.running += 1;
     assert!(
         !GC_THREAD.with(|t| t.running.replace(true)),

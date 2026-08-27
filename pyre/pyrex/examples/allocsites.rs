@@ -30,11 +30,11 @@
 //! | `PYRE_ALLOCSITES_EVERY` | 1 | capture 1 in N of the eligible allocations |
 //! | `PYRE_ALLOCSITES_ROWS` | 40 | how many site rows to print |
 
+use parking_lot::Mutex;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::backtrace::Backtrace;
 use std::cell::Cell;
 use std::collections::HashMap;
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// Every allocation the program makes, whatever the configuration. Exact.

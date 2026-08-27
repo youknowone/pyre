@@ -149,9 +149,7 @@ impl Llbc {
         &self,
         entries: impl IntoIterator<Item = (String, TransparentScalarKind)>,
     ) {
-        let mut kinds = self
-            .transparent_scalar_kinds
-            .write();
+        let mut kinds = self.transparent_scalar_kinds.write();
         for (path, kind) in entries {
             match kinds.binary_search_by(|(known, _)| known.cmp(&path)) {
                 Ok(index) => assert_eq!(
@@ -165,9 +163,7 @@ impl Llbc {
 
     /// Look up the linked scalar shape of an opaque transparent declaration.
     pub fn transparent_scalar_kind(&self, path: &str) -> Option<TransparentScalarKind> {
-        let kinds = self
-            .transparent_scalar_kinds
-            .read();
+        let kinds = self.transparent_scalar_kinds.read();
         let index = kinds
             .binary_search_by(|(known, _)| known.as_str().cmp(path))
             .ok()?;

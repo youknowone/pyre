@@ -19,11 +19,11 @@ pub mod failguard;
 #[cfg(target_arch = "wasm32")]
 mod glue;
 
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
 /// `pyre_jit_bridge_diag` guest export (the runner prints them at

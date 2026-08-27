@@ -669,8 +669,9 @@ pub fn global_fail_descr(fail_index: u32) -> Option<Arc<WasmFailDescr>> {
 /// `CompiledWasmLoop::drop` removes its own entries (guarded by
 /// `func_handle`, so a recompile that re-stamped the same descr keeps the
 /// replacement's entry).
-pub static LABEL_TARGETS: parking_lot::Mutex<Option<std::collections::HashMap<usize, LabelTarget>>> =
-    parking_lot::Mutex::new(None);
+pub static LABEL_TARGETS: parking_lot::Mutex<
+    Option<std::collections::HashMap<usize, LabelTarget>>,
+> = parking_lot::Mutex::new(None);
 
 /// Look up a label target by descr identity.
 pub fn label_target(descr_id: usize) -> Option<LabelTarget> {

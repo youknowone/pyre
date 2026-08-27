@@ -5,9 +5,9 @@
 //! provides a concrete `PyreFieldDescr` implementing majit's
 //! `FieldDescr` trait for pyre's `#[repr(C)]` object layout.
 
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use parking_lot::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -260,8 +260,7 @@ fn get_or_create_array_descr_with_full_id(
         len_offset,
         array_type_id,
     };
-    let mut cache = ARRAY_DESCR_REGISTRY
-        .lock();
+    let mut cache = ARRAY_DESCR_REGISTRY.lock();
     if let Some(existing) = cache.get(&key) {
         return existing.clone();
     }
@@ -5790,9 +5789,7 @@ mod tests {
 
         // And neither of them may be reachable through the sentinel: that is
         // the slot a serialized `BhDescr` with no key lands on.
-        let sentinel = majit_ir::descr::gc_cache()
-            .lock()
-            .resolve_struct_tid(0);
+        let sentinel = majit_ir::descr::gc_cache().lock().resolve_struct_tid(0);
         assert_ne!(sentinel, Some(W_BASE_EXCEPTION_GC_TYPE_ID));
         assert_ne!(
             sentinel,
@@ -8277,15 +8274,13 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             // `u32::MAX` slot is the "no setup_descrs index assigned" default;
             // `get_index()` comes from `field_descr.index_in_parent` above).
             if type_id != 0 {
-                majit_ir::descr::gc_cache()
-                    .lock()
-                    .get_interiorfield_descr(
-                        majit_ir::descr::LLType::Array(type_id),
-                        bare_name,
-                        String::new(),
-                        array_descr,
-                        field_descr,
-                    )
+                majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+                    majit_ir::descr::LLType::Array(type_id),
+                    bare_name,
+                    String::new(),
+                    array_descr,
+                    field_descr,
+                )
             } else {
                 Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
                     u32::MAX,
@@ -8469,17 +8464,13 @@ pub(crate) fn publish_effect_info_descr_mints(entries: &[majit_ir::effectinfo::D
                 else {
                     continue;
                 };
-                Some(
-                    majit_ir::descr::gc_cache()
-                        .lock()
-                        .get_interiorfield_descr(
-                            array_key,
-                            name.clone(),
-                            String::new(),
-                            array_descr,
-                            field_descr,
-                        ),
-                )
+                Some(majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+                    array_key,
+                    name.clone(),
+                    String::new(),
+                    array_descr,
+                    field_descr,
+                ))
             }
             // A member paired with a spec of another shape cannot describe its
             // own slot; leaving it unpublished keeps it counted as absent
@@ -9175,17 +9166,15 @@ mod set_member_lookup_tests {
         let published = 0x7e57_0000_0000_0001u64;
         let never_named = 0x7e57_0000_0000_0002u64;
 
-        majit_ir::descr::gc_cache()
-            .lock()
-            .register_keyed_size(
-                majit_ir::descr::LLType::Struct(published),
-                Arc::new(majit_ir::descr::SimpleSizeDescr::with_vtable(
-                    u32::MAX,
-                    32,
-                    0,
-                    0,
-                )) as DescrRef,
-            );
+        majit_ir::descr::gc_cache().lock().register_keyed_size(
+            majit_ir::descr::LLType::Struct(published),
+            Arc::new(majit_ir::descr::SimpleSizeDescr::with_vtable(
+                u32::MAX,
+                32,
+                0,
+                0,
+            )) as DescrRef,
+        );
 
         let member = |struct_id| DescrSetMember::Field {
             struct_id,

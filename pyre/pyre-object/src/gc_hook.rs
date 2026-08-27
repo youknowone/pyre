@@ -79,7 +79,10 @@ pub unsafe fn offsets_for_pytype(
     if ob_type.is_null() {
         return None;
     }
-    PYRE_CLASS_GC_OFFSETS.read().get(&(ob_type as usize)).copied()
+    PYRE_CLASS_GC_OFFSETS
+        .read()
+        .get(&(ob_type as usize))
+        .copied()
 }
 
 /// Signature of the host-side GC allocation callback.

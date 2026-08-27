@@ -460,18 +460,14 @@ fn register_builtin_type_roots(addr: usize) {
     // Record the prebuilt-family store so the next minor collection scans it
     // (gc_roots.rs prebuilt-root write tracking).
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    builtin_type_namespace_roots()
-        .lock()
-        .push(addr);
+    builtin_type_namespace_roots().lock().push(addr);
 }
 
 /// Snapshot the registered immortal-type addresses for the root walker
 /// (`pyre_interpreter::eval::walk_builtin_type_dicts_gc`).
 #[majit_macros::dont_look_inside]
 pub fn snapshot_builtin_type_roots() -> Vec<usize> {
-    builtin_type_namespace_roots()
-        .lock()
-        .clone()
+    builtin_type_namespace_roots().lock().clone()
 }
 
 /// Allocate a new W_TypeObject with `flag_heaptype = true`.

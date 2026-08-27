@@ -9,8 +9,8 @@
 //! ownership: these frames come from [`crate::jitframe::alloc_off_gc_jitframe`]
 //! instead of the nursery, so they never move, take no root slot, and this
 //! value's `Drop` frees the whole `jf_forward` chain it was handed.
-use std::sync::OnceLock;
 use parking_lot::RwLock;
+use std::sync::OnceLock;
 
 use majit_ir::DescrRef;
 use majit_ir::GcRef;
