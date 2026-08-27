@@ -1619,6 +1619,8 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     // immediately below it to prove that reconstruction reached the operand
     // region.  FOR_ITER has only the iterator at `stack_end - 1`: it needs no
     // synthesized sentinel, and that iterator itself is the proof slot.
+    // `BINARY_OP` / `COMPARE_OP` have `[lhs, rhs]` and likewise synthesize
+    // nothing; `lhs`, the deeper of the two, is the proof.
     let operand_slots = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end)?;
     let (sentinel_slot, proof_slot) = match operand_slots {
         CallerOperandSlots::Call {
@@ -1626,6 +1628,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             callable,
         } => (Some(null_or_self), callable),
         CallerOperandSlots::ForIter { iterator } => (None, iterator),
+        CallerOperandSlots::Binary { lhs } => (None, lhs),
     };
     if let Some(sentinel_slot) = sentinel_slot {
         if sentinel_slot >= nlocals
@@ -1687,12 +1690,23 @@ enum CallerOperandSlots {
     ForIter {
         iterator: usize,
     },
+    /// `BINARY_OP` / `COMPARE_OP`: `[lhs, rhs]` ending at `stack_end`.
+    Binary {
+        lhs: usize,
+    },
 }
 
 /// Absolute frame slots proving the operand region at `call_jitcode_pc`, for a
 /// caller whose operand stack ends at `stack_end`. CALL names its synthetic
 /// `null_or_self` sentinel and callable proof; FOR_ITER names its iterator
-/// proof. `None` keeps the conservative decline for every other resume shape.
+/// proof; `BINARY_OP` / `COMPARE_OP` name their left operand, the deeper of
+/// the two, for the same role the callable plays for CALL. `None` keeps the
+/// conservative decline for every other resume shape.
+///
+/// The last of those is what an inlined dunder needs and had not got: the
+/// entry admits a body on the strength of an abort resuming forward past it,
+/// and with no arm here that reconstruction answered `None`, so the resume
+/// fell back to replaying the loop from its entry.
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -1714,6 +1728,10 @@ fn caller_operand_slots<Sym: WalkSym>(
         }
         pyre_interpreter::Instruction::ForIter { .. } => Some(CallerOperandSlots::ForIter {
             iterator: stack_end.checked_sub(1)?,
+        }),
+        pyre_interpreter::Instruction::BinaryOp { .. }
+        | pyre_interpreter::Instruction::CompareOp { .. } => Some(CallerOperandSlots::Binary {
+            lhs: stack_end.checked_sub(2)?,
         }),
         _ => None,
     }

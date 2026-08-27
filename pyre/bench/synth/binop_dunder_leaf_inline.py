@@ -15,9 +15,9 @@
 # its result without committing anything on the way.  That is not read off the
 # code object -- no static scan can separate `return self.v + o.v` over ints
 # from one whose `+` dispatches to a mutating dunder -- so the entry refuses
-# the first residual that could commit, before it runs, and cuts.  `fast`
-# below is the admitted side of that: its `+`, `*` and `<` all reduce to
-# integer arithmetic, so no such residual exists and the body inlines whole.
+# the first commit, before it runs, and cuts.  `fast` below is the admitted
+# side of that: its `+`, `*` and `<` all reduce to integer arithmetic, so
+# there is nothing to refuse and the body inlines whole.
 # `slow` is the declined side, delegating through a call that can; it must stay
 # residual and is here so the two sit side by side, not because it gates.
 # `synth/binop_dunder_commit_then_notimplemented` is what gates the refusal.

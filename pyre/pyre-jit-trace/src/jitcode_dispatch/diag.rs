@@ -90,18 +90,21 @@ pub(crate) fn fbw_inline_poison_enabled() -> bool {
 /// body the whole-body scan collapses to `DeferredCall` there.
 ///
 /// On by default; the variable only turns it off, so a bisection can name this
-/// change in one command.  Two rewinds a non-CALL entry did not have stand behind it.
-/// The record-time one is the trace cut the caller takes on a `NotImplemented`
-/// result, under the same all-clear odometer reading the un-lowered-helper
-/// rollback uses.  The runtime one is the forward-flush carrier, which
-/// `latch_abort_call_resume` can now name from the frame's own resume sources
-/// -- reading the operand image off a CALL residual's operand list is what
-/// resumed one operand short at a `BINARY_OP`.
+/// change in one command.  It stands on two rewinds a non-CALL entry did not
+/// have before.  The record-time one is the trace cut the caller takes on a
+/// `NotImplemented` result, under the same all-clear odometer reading the
+/// un-lowered-helper rollback uses.  The runtime one is the forward-flush
+/// carrier, which `latch_abort_call_resume` names from the frame's own resume
+/// sources; `caller_operand_slots` is where that entry's `[lhs, rhs]` operand
+/// image comes from, and reading the image off a CALL residual's operand list
+/// instead is what resumed one operand short at a `BINARY_OP`.
 ///
-/// The admission it widens is NOT the whole-body verdict.  A body that commits
-/// and then answers `NotImplemented` has no sound exit in either direction, so
-/// the widening is to a body that cannot produce the singleton at all
-/// (`callee_can_return_not_implemented`); one that can keeps the `Clean` bar.
+/// What it does NOT widen is the promise the entry makes about commits.  A
+/// body that commits and then answers `NotImplemented` has no sound exit in
+/// either direction, and no reading of the code object separates one from a
+/// body that does not, so the admission does not try: the descent runs under
+/// `BinopRewindInlineGuard` and `fbw_binop_rewind_refuse_commit` refuses the
+/// first commit before it runs.
 pub(crate) fn binop_rewind_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("PYRE_NO_BINOP_REWIND").is_none())

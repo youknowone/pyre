@@ -7866,6 +7866,24 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 )? {
                     return Ok(outcome);
                 }
+                // The resolver below COMMITS before it answers: the
+                // `Direct` arm performs the write and returns, reaching no
+                // hook that could refuse it afterwards.  A `BINARY_OP` /
+                // `COMPARE_OP` rewind region has to be asked first, then,
+                // rather than at the residual arm the `Residual` answer would
+                // eventually take.
+                //
+                // No shape reaches it today: a body carrying `STORE_ATTR`
+                // scans `Dirty`, which the admission at `inline_call.rs`
+                // refuses before the descent executes anything, and a body
+                // reaching one through a nested call is refused earlier still
+                // by `dunder_body_admissible_on_rewind`.  Both were measured
+                // (`[inline-foriter-gate] safety=Dirty legacy_admit=false`,
+                // `[binop-inline-decline] delegates through a nested call`).
+                // The refusal is here anyway because it is what the region
+                // PROMISES, and both of those gates are one widening away
+                // from not holding it.
+                fbw_binop_rewind_refuse_commit(ctx, op.pc)?;
                 if let Some(specialization) = spec_gate_store_attr(|| {
                     try_walker_specialize_store_attr(
                         ctx,
