@@ -883,11 +883,12 @@ where
     });
     use majit_translate::codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
     let body = &jc.code;
-    // Read the opcode byte directly from the captured offset
-    // (`JitCodeBuilder::jit_merge_point` records `self.code.len()`
-    // immediately before pushing the opcode).  No byte-stream scan —
-    // mirrors RPython `blackhole.py:107-156` argcode-based decode
-    // (operand bytes that happen to equal `BC_JIT_MERGE_POINT(_C)`
+    // Read the opcode byte directly from the captured offset.  Both routes
+    // into a body record it at the position they reserve for the opcode:
+    // `JitCodeBuilder::jit_merge_point` on the proc-macro route, and
+    // `Assembler::encode_op`'s `JitMergePoint` arm on the LLBC one.  No
+    // byte-stream scan — mirrors RPython `blackhole.py:107-156` argcode-based
+    // decode (operand bytes that happen to equal `BC_JIT_MERGE_POINT(_C)`
     // cannot trigger a false-positive payload validation).  Pre-Merge-
     // Point body-local lets and other lowerer-emitted prefix opcodes
     // (`bind_pre_merge_point_stmts` in `jitcode_lower/api.rs`) are
@@ -895,9 +896,11 @@ where
     let merge_offset = jc.exec.jit_merge_point_offset.unwrap_or_else(|| {
         panic!(
             "register_dispatch_jitcode: dispatch JitCode `{}` has no \
-             jit_merge_point_offset — `JitCodeBuilder::jit_merge_point` \
-             must have run during lowering (jitcode_lower.rs dispatch \
-             body emission invariant)",
+             jit_merge_point_offset — the body was assembled without a \
+             `jit_merge_point`, or it came through a route that does not \
+             record the offset (`JitCodeBuilder::jit_merge_point` on the \
+             proc-macro route, `Assembler::encode_op` then \
+             `JitCode::from_canonical` on the LLBC one)",
             jc.name(),
         )
     });
