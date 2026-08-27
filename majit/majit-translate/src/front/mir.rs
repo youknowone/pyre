@@ -308,6 +308,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             &mut acc.struct_fields,
             &mut acc.struct_origins,
             &mut acc.enum_variant_by_discriminant,
+            Some(&acc.struct_ids),
         );
     }
     Ok(
@@ -841,6 +842,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         &mut struct_fields,
         &mut struct_origins,
         &mut enum_variant_by_discriminant,
+        Some(&struct_ids),
     );
 
     // Per-instantiation enum-variant pre-registration source (#100): a
@@ -1500,16 +1502,20 @@ fn derive_program_metadata(
                         (fname, field_ty)
                     })
                     .collect();
+                let canonical_name = strip_crate_prefix(&name);
                 struct_fields.fields.insert(name.clone(), rows.clone());
+                struct_fields
+                    .fields
+                    .insert(canonical_name.clone(), rows.clone());
                 struct_fields.fields.insert(leaf.clone(), rows);
                 // Object identity for this struct type, minted from the
                 // crate-stripped qualified path — the spelling the descr
                 // layer keys `LLType::Struct` on and the runtime macro
                 // publishes.  Every name spelling (full-crate, stripped,
                 // bare leaf) resolves to it through the resolver table.
-                let sid = majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name));
+                let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
                 record_struct_id(&mut struct_ids, name.clone(), sid);
-                record_struct_id(&mut struct_ids, strip_crate_prefix(&name), sid);
+                record_struct_id(&mut struct_ids, canonical_name.clone(), sid);
                 record_struct_id(&mut struct_ids, leaf.clone(), sid);
                 // Exact field byte offsets from Charon's resolved layout
                 // (the true Rust layout, not the heuristic).  Field index
@@ -1560,8 +1566,9 @@ fn derive_program_metadata(
                         (fname, tyref_to_attr_value_type(&f.ty, llbc))
                     })
                     .collect();
-                struct_field_attrs.insert(strip_crate_prefix(&name), attr_rows);
+                struct_field_attrs.insert(canonical_name.clone(), attr_rows);
                 known_struct_names.insert(name);
+                known_struct_names.insert(canonical_name);
                 known_struct_names.insert(leaf);
             }
             TypeDeclKind::Enum(variants) => {
@@ -1972,9 +1979,10 @@ fn derive_program_metadata(
 /// are distinct entries by construction and there is no bare alias to
 /// withdraw.
 ///
-/// Derived purely from the current qualified (`::`-containing) keys, so
-/// the pass is idempotent and safe to re-run after the cross-LLBC
-/// merge re-introduces a per-crate-unique alias.
+/// Derived from the current qualified (`::`-containing) keys after collapsing
+/// their full/canonical spellings through the existing `StructId` object
+/// identity.  The pass is therefore idempotent and safe to re-run after the
+/// cross-LLBC merge re-introduces a per-crate-unique alias.
 fn harden_duplicate_leaf_metadata(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_origins: &mut std::collections::HashMap<String, String>,
@@ -1982,7 +1990,29 @@ fn harden_duplicate_leaf_metadata(
         String,
         std::collections::HashMap<i64, String>,
     >,
+    struct_ids: Option<&std::collections::HashMap<String, Option<majit_ir::descr::StructId>>>,
 ) {
+    // RPython groups aliases by the live class object, never by spelling.
+    // `StructId` is pyre's existing object-identity carrier: discard a
+    // crate-included/canonical duplicate before comparing declaration rows,
+    // and discard a resolver-tombstoned alias (`None`) because it denotes no
+    // unique declaration.  Tests that exercise this helper in isolation pass
+    // no identity table and retain the original spelling-based behavior.
+    fn unique_declarations<'a>(
+        keys: &[&'a str],
+        struct_ids: Option<&std::collections::HashMap<String, Option<majit_ir::descr::StructId>>>,
+    ) -> Vec<&'a str> {
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::with_capacity(keys.len());
+        for key in keys {
+            match struct_ids.and_then(|ids| ids.get(*key)) {
+                Some(Some(id)) if seen.insert(*id) => unique.push(*key),
+                Some(Some(_)) | Some(None) => {}
+                None => unique.push(*key),
+            }
+        }
+        unique
+    }
     let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for key in struct_fields.fields.keys() {
         if let Some((head, leaf)) = key.rsplit_once("::") {
@@ -2006,7 +2036,8 @@ fn harden_duplicate_leaf_metadata(
     }
     let mut drop_field_aliases: Vec<String> = Vec::new();
     let mut tombstone_origins: Vec<String> = Vec::new();
-    for (leaf, quals) in &by_leaf {
+    for (leaf, aliases) in &by_leaf {
+        let quals = unique_declarations(aliases, struct_ids);
         if quals.len() < 2 {
             continue;
         }
@@ -2017,17 +2048,23 @@ fn harden_duplicate_leaf_metadata(
         {
             drop_field_aliases.push((*leaf).to_string());
         }
-        let first_module = strip_crate_prefix(quals[0])
-            .rsplit_once("::")
-            .map(|(m, _)| m.to_string())
-            .unwrap_or_default();
-        if quals[1..].iter().any(|q| {
-            strip_crate_prefix(q)
+        // Two surviving identity-backed keys are necessarily two distinct
+        // declarations.  The fallback module comparison preserves the
+        // isolated helper tests and metadata without a resolver table.
+        let distinct_identity = struct_ids.is_some() || {
+            let first_module = strip_crate_prefix(quals[0])
                 .rsplit_once("::")
-                .map(|(m, _)| m)
-                .unwrap_or_default()
-                != first_module
-        }) {
+                .map(|(m, _)| m.to_string())
+                .unwrap_or_default();
+            quals[1..].iter().any(|q| {
+                strip_crate_prefix(q)
+                    .rsplit_once("::")
+                    .map(|(m, _)| m)
+                    .unwrap_or_default()
+                    != first_module
+            })
+        };
+        if distinct_identity {
             tombstone_origins.push((*leaf).to_string());
         }
     }
@@ -2065,7 +2102,8 @@ fn harden_duplicate_leaf_metadata(
         }
     }
     let mut drop_variant_aliases: Vec<String> = Vec::new();
-    for (alias, quals) in &variant_by_alias {
+    for (alias, aliases) in &variant_by_alias {
+        let quals = unique_declarations(aliases, struct_ids);
         if quals.len() < 2 {
             continue;
         }
@@ -2094,7 +2132,8 @@ fn harden_duplicate_leaf_metadata(
         }
     }
     let mut drop_enum_aliases: Vec<String> = Vec::new();
-    for (leaf, quals) in &enum_by_leaf {
+    for (leaf, aliases) in &enum_by_leaf {
+        let quals = unique_declarations(aliases, struct_ids);
         if quals.len() < 2 {
             continue;
         }
@@ -2592,14 +2631,29 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `__discriminant` diamond, same post-lowering shape and fail-safe
         // contract as `map_or`; gate the reachability sweep on an actual
         // rewrite.
-        let closure_select_rewritten = if lo.closure_select_sites.is_empty() {
-            0
+        let closure_select_outcome = if lo.closure_select_sites.is_empty() {
+            crate::front::option_closure_select::ClosureSelectRewriteOutcome::default()
         } else {
             crate::front::option_closure_select::rewire_closure_select_call_sites(
                 &mut lo.graph,
                 &lo.closure_select_sites,
             )
         };
+        // This late combinator pass synthesizes `call_once` sites after the
+        // first Result-exception pass.  A closure returning
+        // `Result<T, PyError>` uses the translated exception ABI, while
+        // `map`/`unwrap_or_else` retain that Result as an ordinary value.
+        // Apply the same custom-consumer catch-and-rewrap rule as a source MIR
+        // call so the combinator receives an `Ok`/`Err` shell again.
+        if !closure_select_outcome.result_exc_calls.is_empty() {
+            crate::front::result_exc::rewire_result_exc_call_sites(
+                &mut lo.graph,
+                &closure_select_outcome.result_exc_calls,
+                result_exc_callee,
+            )
+            .map_err(LowerError::Unsupported)?;
+        }
+        let closure_select_rewritten = closure_select_outcome.rewritten;
         // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
         // the residual `contains` method call in place with native
         // `bitand(le(a, x), ge(b, x))` compares and removes the paired
@@ -7091,9 +7145,15 @@ impl<'a> Lowering<'a> {
                             let Operand::Const(value) = op else {
                                 return None;
                             };
-                            let DecodedConst::Int(n) = decode_constant(self.llbc, value).ok()?
-                            else {
-                                return None;
+                            let n = match decode_constant(self.llbc, value).ok()? {
+                                DecodedConst::Int(n) => n,
+                                // Current Charon preserves a byte-string
+                                // aggregate's `u8` bank. The RPython
+                                // prebuilt ll_array constant uses the same
+                                // signed integer literal carrier after the
+                                // checked, value-preserving conversion.
+                                DecodedConst::UInt(n) => i64::try_from(n).ok()?,
+                                _ => return None,
                             };
                             vals.push(n);
                         }
@@ -7625,9 +7685,13 @@ impl<'a> Lowering<'a> {
         // `call.func`.  This is the same two-source type test used for
         // `SliceIndex::index` below and keeps Range* implementations on the
         // separate getslice lowering.
-        let slice_get_index_is_scalar = match &call.func {
-            CallFunc::Regular(reg) => self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref()),
-            _ => false,
+        let (slice_get_index_is_scalar, slice_get_element) = match &call.func {
+            CallFunc::Regular(reg) => {
+                let scalar = self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref());
+                let element = scalar.then(|| self.slice_get_element(reg)).flatten();
+                (scalar, element)
+            }
+            _ => (false, None),
         };
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
@@ -7711,6 +7775,27 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ConstBool(true),
                     });
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `gc_alloc_storage_box(Wtf8Buf, tid) -> *mut Wtf8Buf` is
+                // only the Rust ownership spelling of PyPy's direct `_utf8`
+                // RPython-string field.  The input value has already become
+                // the allocated `rpy_string`; a second nominal Wtf8Buf box
+                // does not exist in the translated object model.  Alias this
+                // one specialization to its value, exactly like
+                // `malloc_raw_alloc` round-trips a `SomeString`.  Every other
+                // `gc_alloc_storage_box<T>` keeps its translated GC-box body.
+                if args.len() == 2
+                    && self.is_string_storage_box_identity(
+                        &reg,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                    )
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -10589,8 +10674,10 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && fmt_path_ends_with(segments, &["slice", "<Impl>", "get"])
+            && slice_get_index_is_scalar
+            && let Some((item_ty, array_type_id)) = slice_get_element.clone()
             && let Some(site) =
-                self.recognize_slice_get_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
+                self.recognize_slice_get_site(&call.dest.ty, &result_var, item_ty, array_type_id)
         {
             self.slice_get_sites.push(site);
         }
@@ -11329,6 +11416,35 @@ impl<'a> Lowering<'a> {
         is_get && callsite_index_is_scalar
     }
 
+    /// ARRAY identity proof for the scalar-index `<[T]>::get` rewrite.
+    ///
+    /// This is the `get` counterpart of the `Index::index` element gate: a
+    /// scalar or an RPython GC-pointer value carries an element spelling so
+    /// the descr computes its exact stride; a thin pointer is already one
+    /// word and needs no identity. Any other inline Rust aggregate declines.
+    /// The outer `Option` is the proof, while the inner one is the optional
+    /// ARRAY identity (`Some(None)` means the proven thin-pointer case).
+    fn slice_get_element(&self, reg: &RegularCall) -> Option<(ValueType, Option<String>)> {
+        let element_ty = reg
+            .generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())?;
+        let element = tyref_node(&element_ty, self.llbc)?;
+        // `get` returns `Option<&T>`, but its devirtualized ArrayRead is the
+        // same RPython getarrayitem operation as `Index::index`: it produces
+        // T, not a Rust slot reference.  Read the bank from the call's T
+        // generic before looking at the reference-wrapped destination.
+        let item_ty = tyref_to_value_type(&element_ty, self.llbc);
+        if let Some(spelling) = json_ty_scalar_element_spelling(element, self.llbc)
+            .or_else(|| json_ty_rpython_gc_pointer_element_spelling(element, self.llbc))
+        {
+            return Some((item_ty, Some(format!("[{spelling}]"))));
+        }
+        json_ty_is_thin_pointer_element(element, self.llbc).then_some((item_ty, None))
+    }
+
     fn is_slice_scalar_index_mut_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -11901,6 +12017,28 @@ impl<'a> Lowering<'a> {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
+    }
+
+    /// `pyre_object::gc_storage::gc_alloc_storage_box::<Wtf8Buf>` is the
+    /// physical Rust owner for a value that the translated model already
+    /// represents as one RPython string.  Admit only the exact string-family
+    /// input and exactly-one-raw-pointer string-family result; other storage
+    /// boxes retain their allocation body.
+    fn is_string_storage_box_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path() == "pyre_object::gc_storage::gc_alloc_storage_box"
+            && first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
+            && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
     }
 
     /// `Option::<&T>::copied` / `Option::<T: Clone>::cloned` — reads the
@@ -13243,49 +13381,22 @@ impl<'a> Lowering<'a> {
     /// + `Some` variant owners [`Self::recognize_slice_first_site`] resolves,
     /// plus the `SliceIndex` instantiation gate `first` has no need of.
     ///
-    /// `<[T]>::get` is generic over `SliceIndex`, and only its scalar
-    /// instantiation returns `Option<&T>`.  Every range one (`Range`,
-    /// `RangeTo`, `RangeFrom`, `RangeFull`, `RangeInclusive`,
-    /// `RangeToInclusive`) returns `Option<&[T]>`, whose payload is a
-    /// SUB-SLICE: an element read at the range's start would hand the consumer
-    /// a `T` where a `[T]` is expected.  Pin the scalar one by the index
-    /// operand's declared `usize` — the same discriminator
-    /// [`Self::is_slice_scalar_index_call`] uses to separate `<[T]>::index`'s
-    /// scalar impl from its range ones.  A literal subscript arrives as an
-    /// `Operand::Const`, for which no `index_ty` is captured, so it declines
-    /// too: the residual call and its census Skip both survive.
-    ///
-    /// [`Self::option_residual_narrow_root`] refuses the range forms a second
-    /// time — a `[T]` payload is the `Slice` builtin, which has no ADT def-id
-    /// and so no registered narrow root — and is load-bearing for `get` for
-    /// the reason it is for `first`: it is exactly the shape `lower_call`
-    /// appends a trailing `__pyre_cast_instance` narrowing to, the cast the
-    /// post-pass absorbs and re-applies per arm.  It also declines a
-    /// value-slice `Option<u8>` / `Option<i64>` cleanly.
+    /// The call site has already proved the `SliceIndex` instantiation is
+    /// scalar through [`Self::is_slice_get_scalar_call`], using either the
+    /// operand Place type or (for a literal index) the method generic.  Resolve
+    /// the destination with the same consumer-owner rule used by checked
+    /// arithmetic and `Option` consumers: reference payloads may carry the
+    /// trailing narrowing cast the post-pass absorbs, while scalar payloads
+    /// (`Option<u8>`, `Option<i64>`, …) remain value-banked and have no cast.
     fn recognize_slice_get_site(
         &self,
         dest_ty: &TyRef,
-        index_ty: Option<&TyRef>,
         result_var: &Variable,
+        item_ty: ValueType,
+        array_type_id: Option<String>,
     ) -> Option<crate::front::slice_get::SliceGetSite> {
-        if index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) != Some("Usize") {
-            crate::decline::record_named(
-                crate::decline::gate::SLICE_GET_SITE,
-                "index-not-usize",
-                &self.graph.name,
-            );
-            return None;
-        }
-        if self.option_residual_narrow_root(dest_ty).is_none() {
-            crate::decline::record_named(
-                crate::decline::gate::SLICE_GET_SITE,
-                "payload-has-no-narrow-root",
-                &self.graph.name,
-            );
-            return None;
-        }
-        let Some((option_owner, some_owner, payload_ty)) =
-            self.resolve_bool_then_option_dest(dest_ty)
+        let Some((option_owner, some_owner, _reference_payload_ty)) =
+            self.resolve_option_consumer_owners(dest_ty)
         else {
             crate::decline::record_named(
                 crate::decline::gate::SLICE_GET_SITE,
@@ -13303,7 +13414,8 @@ impl<'a> Lowering<'a> {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
-            payload_ty,
+            payload_ty: item_ty,
+            array_type_id,
         })
     }
 
@@ -13702,13 +13814,29 @@ impl<'a> Lowering<'a> {
         // is `Option<T>` and its closure returns that same `Option<T>`;
         // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`'s closure and
         // dest are both `bool`.
-        let call_result_ty = match kind {
-            ClosureCombinator::Map => self.tyref_option_payload_value_type(dest_ty)?,
+        let call_result_tyref = match kind {
+            ClosureCombinator::Map => {
+                crate::front::result_exc::tyref_option_payload(dest_ty, self.llbc)?
+            }
             ClosureCombinator::AndThen
             | ClosureCombinator::OrElse
             | ClosureCombinator::UnwrapOrElse
-            | ClosureCombinator::IsSomeAnd => tyref_to_value_type(dest_ty, self.llbc),
+            | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
         };
+        let call_result_ty = tyref_to_value_type(&call_result_tyref, self.llbc);
+        let call_once_result_exc =
+            crate::front::result_exc::tyref_is_result_of_pyerror(&call_result_tyref, self.llbc)
+                .then(|| {
+                    let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+                        &call_result_tyref,
+                        self.llbc,
+                    );
+                    let payload_ty =
+                        crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
+                            .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                            .unwrap_or(ValueType::Ref(None));
+                    (suffix, payload_ty)
+                });
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
         // build none.  `U` is the dest payload, not the receiver's `T`, so the
@@ -13740,6 +13868,7 @@ impl<'a> Lowering<'a> {
             call_result_ty,
             args_tuple_suffix,
             niche,
+            call_once_result_exc,
         })
     }
 
@@ -15383,7 +15512,7 @@ impl<'a> Lowering<'a> {
         target: usize,
     ) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
-        let mut owner_path: Vec<String> = owner.split("::").map(str::to_string).collect();
+        let mut owner_path = crate::model::split_qualified_path(owner);
         let ctor_name = owner_path.pop().unwrap_or_default();
         let ctor_target = if owner_path.is_empty() {
             CallTarget::synthetic_transparent_ctor(ctor_name.clone())
@@ -18385,15 +18514,15 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     }
     // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
     // rpy_string in the value model (`tyref_is_string_value`), matching
-    // upstream's one string type (`rstr.py`).  A bare string-family value
-    // (parameter, return, local) seeds `SomeString` so it stays the string
-    // lattice node at every site instead of a classdef-carrying
-    // `SomeInstance(Wtf8Buf)`: a `Wtf8Buf` value stored into a `*mut Wtf8Buf`
-    // field flows `SomeString` through `malloc_raw` (which round-trips a
-    // non-`Instance` payload unchanged), keeping the field repr
-    // `Ptr(rpy_string)` consistent with the `getattr` + deref-to-`&Wtf8`
-    // read that reports the field as a string.
-    if tyref_is_string_value(ty, llbc) {
+    // upstream's one string type (`rstr.py`).  The exactly-one-raw-pointer
+    // form is the same translated value for pyre's owning storage spelling:
+    // both `malloc_raw(Wtf8Buf)` and `gc_alloc_storage_box(Wtf8Buf)` return
+    // `*mut Wtf8Buf`, while PyPy passes its `_utf8` RPython string through
+    // those sites directly.  Preserve `SomeString` on the return/phi as well
+    // as on the struct field; otherwise the GC-box success arm injects a
+    // nominal `SomeInstance(Wtf8Buf)` and generalizes `_utf8` away from its
+    // `StringRepr`.
+    if tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
         return ValueType::Str;
     }
     ValueType::Ref(None)
@@ -18903,8 +19032,12 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // valuetype_to_someshell) instead of the classdef-less `Ref(None)`
     // SomeInstance the fallback yields; the latter walls when the first
     // typed string write unions `String ∪ Instance(classdef-less)` with no
-    // pair(SomeString, SomeInstance).union() handler.
-    if tyref_is_string_value(ty, llbc) {
+    // pair(SomeString, SomeInstance).union() handler.  The raw-pointer form
+    // is the same translated value when a Rust object field owns the buffer
+    // behind `*mut Wtf8Buf` (`W_UnicodeObject.value`): PyPy's corresponding
+    // `_utf8` field is an RPython string, while Charon's exact layout still
+    // records the physical pointer-sized slot independently.
+    if tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
         return ValueType::Str;
     }
     ValueType::Ref(None)
@@ -18986,6 +19119,26 @@ fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
         return false;
     };
+    node_is_string_value(node, llbc)
+}
+
+/// Whether the pointee of exactly one raw-pointer layer is a string-family
+/// value.  This is deliberately narrower than teaching
+/// [`strip_ty_wrappers`] to erase `RawPtr`: ordinary typed raw pointers retain
+/// their pointee identity; only field-annotation projection asks whether the
+/// pointer is the storage spelling of RPython's string value.
+fn tyref_raw_ptr_pointee_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) = tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| n.as_object()?.get("RawPtr")?.as_array()?.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+    else {
+        return false;
+    };
+    node_is_string_value(pointee, llbc)
+}
+
+fn node_is_string_value(node: &serde_json::Value, llbc: &Llbc) -> bool {
     // `{Builtin: "Str"}` — the bare `str` value (no ADT def-id).
     if node
         .get("Adt")
@@ -19817,12 +19970,12 @@ fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
 }
 
 /// True when fn-level type variable `var_index` carries an
-/// `Into<String>` trait clause.  The clause's trait generics spell
+/// `Into<String>` / `Into<Wtf8Buf>` trait clause.  The clause's trait generics spell
 /// `[<subject>, <target>]`; the subject must be our variable and the
-/// target must resolve to the `alloc::string::String` ADT, with the
+/// target must resolve to the translated string-value family, with the
 /// trait decl's leaf name `Into` (a `From<String>` bound has the same
 /// generics shape but means the *opposite* conversion).
-fn typevar_bounded_by_into_string(
+fn typevar_bounded_by_into_string_value(
     var_index: u64,
     fn_generics: &serde_json::Value,
     llbc: &Llbc,
@@ -19888,9 +20041,8 @@ fn typevar_bounded_by_into_string(
         }
         let target_is_string = types
             .get(1)
-            .and_then(|t| resolve_tyexpr_to_adt_def_id_free(llbc, t))
-            .and_then(|id| llbc.type_by_id(id))
-            .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String");
+            .and_then(|target| strip(llbc, target))
+            .is_some_and(|target| node_is_string_value(target, llbc));
         if target_is_string {
             return true;
         }
@@ -19930,14 +20082,15 @@ fn tyref_generic_trait_bound_root(
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     let param_index = typevar_bound_index(strip_ty_wrappers(node, llbc)?)?;
-    // `T: Into<String>` — the conventional message-parameter bound
-    // (`PyError::type_error(msg: impl Into<String>)`).  Such a variable
-    // is a string at the annotation level (the model maps `String` and
-    // `str` to one string type), so it resolves to the `"String"` root
+    // `T: Into<String>` / `T: Into<Wtf8Buf>` — the conventional
+    // message-parameter bound (`PyError::new(message: impl Into<Wtf8Buf>)`).
+    // Such a variable is a string at the annotation level (the model maps
+    // `String`, `str`, `Wtf8`, and `Wtf8Buf` to one string type), so it
+    // resolves to the `"String"` root
     // and the input-cell derivation seeds `s_unicode0` instead of a
     // classdef-less instance shell whose field writes would poison
     // classdef attr cells.
-    if typevar_bounded_by_into_string(param_index, generics, llbc) {
+    if typevar_bounded_by_into_string_value(param_index, generics, llbc) {
         return Some("String".to_string());
     }
     for clause in generics.get("trait_clauses")?.as_array()? {
@@ -21285,7 +21438,7 @@ fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Ve
     if !llbc.type_by_id(owner_id)?.is_repr_transparent() {
         return None;
     }
-    let mut path = owner.split("::").map(str::to_string).collect::<Vec<_>>();
+    let mut path = crate::model::split_qualified_path(&owner);
     path.push(method);
     Some(path)
 }
@@ -22619,10 +22772,13 @@ fn read_array_literal_elements(
     Some(by_index.into_iter().map(|(_, v)| v).collect())
 }
 
-/// Resolve a Variable to the `i64` of the `ConstInt` op that produces it,
-/// following cross-block links via [`resolve_to_producer_op`]. Used to
-/// read the packed-format pieces byte array (each `__pos_i` element is a
-/// `ConstInt` byte).
+/// Resolve a Variable to the `i64` value of the integer constant op that
+/// produces it, following cross-block links via
+/// [`resolve_to_producer_op`].  Packed-format pieces are `[u8; N]`, so the
+/// ordinary lowering now preserves each byte as `ConstUInt`; older/synthetic
+/// fixtures may still spell the same in-range byte as `ConstInt`.  Accept both
+/// at this byte-decoding boundary without changing either SSA value's unsigned
+/// annotation.
 fn resolve_const_int(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -22632,6 +22788,7 @@ fn resolve_const_int(
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
     match &block.operations.get(idx)?.kind {
         OpKind::ConstInt(n) => Some(*n),
+        OpKind::ConstUInt(n) => i64::try_from(*n).ok(),
         _ => None,
     }
 }
@@ -25646,7 +25803,7 @@ mod tests {
         };
 
         // Build the pieces array the way the front-end lowers it: an
-        // `Array` ctor followed by `__pos_i` FieldWrites of ConstInt
+        // `Array` ctor followed by `__pos_i` FieldWrites of ConstUInt
         // bytes. Template for `format!("hi{}")` → pieces ["hi", ""],
         // one placeholder = bytes [2, 'h', 'i', 0xC0, 0].
         let mut graph = FunctionGraph::new("arraylit");
@@ -25660,12 +25817,12 @@ mod tests {
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
         });
-        let bytes = [2i64, 104, 105, 0xC0, 0];
+        let bytes = [2u64, 104, 105, 0xC0, 0];
         for (i, b) in bytes.iter().enumerate() {
             let v = Variable::new();
             graph.block_mut(a).operations.push(SpaceOperation {
                 result: Some(v.clone()),
-                kind: OpKind::ConstInt(*b),
+                kind: OpKind::ConstUInt(*b),
             });
             graph.block_mut(a).operations.push(SpaceOperation {
                 result: None,
@@ -26948,6 +27105,53 @@ mod tests {
         );
     }
 
+    /// Anchor PyPy's single string-valued `W_UnicodeObject._utf8` shape to
+    /// the real pyre-object LLBC.  Rust stores that value behind
+    /// `*mut Wtf8Buf`, but both its canonical annotation metadata and the
+    /// managed storage-box call must collapse to the one RPython string value.
+    #[test]
+    #[ignore]
+    fn unicode_storage_matches_real_object_llbc() {
+        use crate::model::{CallTarget, OpKind, ValueType};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(&llbc);
+        assert!(
+            fields
+                .fields
+                .get("pyre_object::unicodeobject::W_UnicodeObject")
+                .is_some_and(
+                    |rows| rows.contains(&("value".to_string(), "*mut Wtf8Buf".to_string()))
+                ),
+            "the declaration metadata must retain the physical storage row"
+        );
+        assert!(
+            attrs
+                .get("unicodeobject::W_UnicodeObject")
+                .is_some_and(|rows| rows.contains(&("value".to_string(), ValueType::Str))),
+            "W_UnicodeObject.value must project as PyPy's string-valued _utf8 field"
+        );
+
+        let graph = super::lower_function(&llbc, "w_str_from_wtf8_managed")
+            .expect("lower managed string constructor");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["gc_alloc_storage_box"])
+                )
+            }),
+            "the Wtf8 storage box must be an RPython-string identity"
+        );
+    }
+
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
     /// interpreter LLBC.  `constant_at` must project the wrapper's sole field
@@ -27023,7 +27227,6 @@ mod tests {
                 ("im".to_string(), ValueType::Float),
             ])
         );
-
         let constant_at = super::lower_function(&llbc, "constant_at")
             .expect("lower ConstantOpcodeHandler::constant_at");
         let constant_ops: Vec<_> = constant_at
@@ -28536,6 +28739,106 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn string_storage_pointer_seeds_the_rpython_string_field_repr() {
+        let wtf8buf = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["rustpython_wtf8", 0]},
+                    {"Ident": ["Wtf8Buf", 0]}
+                ],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 16}
+                }},
+                "source_text": "pub struct Wtf8Buf { ... }",
+                "attr_info": {
+                    "attributes": [], "inline": null, "rename": null, "public": true
+                },
+                "is_local": false
+            },
+            "kind": "Opaque",
+            "layout": null
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, wtf8buf],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [null, {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [
+                            {"Ident": ["core", 0]},
+                            {"Ident": ["convert", 0]},
+                            {"Ident": ["Into", 0]}
+                        ],
+                        "span": {"data": {
+                            "file_id": 0,
+                            "beg": {"line": 1, "col": 0},
+                            "end": {"line": 1, "col": 16}
+                        }},
+                        "source_text": "pub trait Into<T> { ... }",
+                        "attr_info": {
+                            "attributes": [], "inline": null, "rename": null, "public": true
+                        },
+                        "is_local": false
+                    }
+                }],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let pointee = serde_json::json!({
+            "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+        });
+        let storage_ptr = TyRef::Other(serde_json::json!({
+            "RawPtr": [pointee, "Mut"]
+        }));
+
+        assert_eq!(
+            super::tyref_to_attr_value_type(&storage_ptr, &llbc),
+            ValueType::Str,
+            "W_UnicodeObject.value is the Rust storage spelling of PyPy's string-valued _utf8 field"
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&storage_ptr, &llbc),
+            ValueType::Str,
+            "the owning storage pointer must remain the same RPython string at return and phi sites"
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&TyRef::Other(pointee.clone()), &llbc),
+            ValueType::Str,
+            "a bare Wtf8Buf value is the same RPython string representation"
+        );
+
+        let generic_message = TyRef::Other(serde_json::json!({
+            "TypeVar": {"Bound": [0, 0]}
+        }));
+        let generics = serde_json::json!({
+            "trait_clauses": [{
+                "trait_": {"skip_binder": {
+                    "id": 1,
+                    "generics": {"types": [
+                        {"TypeVar": {"Bound": [1, 0]}},
+                        pointee
+                    ]}
+                }}
+            }]
+        });
+        assert_eq!(
+            super::tyref_generic_trait_bound_root(&generic_message, &llbc, Some(&generics),)
+                .as_deref(),
+            Some("String"),
+            "impl Into<Wtf8Buf> message parameters seed the one RPython string input cell"
+        );
+    }
+
     fn rows(spec: &[(&str, &str)]) -> Vec<(String, String)> {
         spec.iter()
             .map(|(n, t)| (n.to_string(), t.to_string()))
@@ -28563,7 +28866,7 @@ mod tests {
         origins.insert("FrameBlock".to_string(), "pyopcode".to_string());
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert!(
             !reg.fields.contains_key("FrameBlock"),
@@ -28597,10 +28900,40 @@ mod tests {
         origins.insert("Point".to_string(), "eval".to_string());
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert_eq!(reg.fields.get("Point"), Some(&shape));
         assert_eq!(origins.get("Point").map(String::as_str), Some("eval"));
+    }
+
+    #[test]
+    fn harden_deduplicates_full_and_canonical_aliases_by_struct_identity() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let shape = rows(&[("ob_header", "PyObject"), ("value", "*mut Wtf8Buf")]);
+        let full = "pyre_object::unicodeobject::W_UnicodeObject";
+        let canonical = "unicodeobject::W_UnicodeObject";
+        reg.fields.insert(full.to_string(), shape.clone());
+        reg.fields.insert(canonical.to_string(), shape.clone());
+        reg.fields
+            .insert("W_UnicodeObject".to_string(), shape.clone());
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("W_UnicodeObject".to_string(), "unicodeobject".to_string());
+        let mut enums = std::collections::HashMap::new();
+        let sid = majit_ir::descr::StructId::from_canonical(canonical);
+        let ids = std::collections::HashMap::from([
+            (full.to_string(), Some(sid)),
+            (canonical.to_string(), Some(sid)),
+            ("W_UnicodeObject".to_string(), Some(sid)),
+        ]);
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, Some(&ids));
+
+        assert_eq!(reg.fields.get("W_UnicodeObject"), Some(&shape));
+        assert_eq!(
+            origins.get("W_UnicodeObject").map(String::as_str),
+            Some("unicodeobject"),
+            "two spellings of one StructId must not tombstone its origin"
+        );
     }
 
     #[test]
@@ -28626,7 +28959,7 @@ mod tests {
         reg.fields.insert("StepResult".to_string(), disc.clone());
         reg.fields.insert("Verdict".to_string(), disc.clone());
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert!(
             !enums.contains_key("StepResult"),
@@ -28665,7 +28998,7 @@ mod tests {
         origins.insert("W_IntObject".to_string(), "intobject".to_string());
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert_eq!(reg.fields.get("W_IntObject"), Some(&shape));
         assert_eq!(
@@ -28703,7 +29036,7 @@ mod tests {
         let mut origins = std::collections::HashMap::new();
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert!(
             !reg.fields.contains_key("Outcome::Ok"),
@@ -31280,6 +31613,128 @@ mod tests {
             calls_path(&["__getslice_minusone"]),
             1,
             "the marker strip must use the len-minus-one slice helper"
+        );
+    }
+
+    /// PyPy's rStringIO and buffered I/O implementations use ordinary
+    /// `buffer[start:end]` list slices. The Rust port spells those as a
+    /// `SliceIndex<Range<usize>>` call, which must recover RPython's direct
+    /// `getslice` operation without adding a non-upstream dominator proof.
+    #[test]
+    #[ignore]
+    fn pypy_buffer_ranges_lower_to_getslice() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for fname in ["read_bytes", "parse_length_prefixed_protocols"] {
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["core", "slice", "index", "<Impl>", "index"]))
+                }),
+                "{fname}: PyPy list slice must not remain an opaque Rust index"
+            );
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &["__getslice_range".to_string()])
+                }),
+                "{fname}: Range slice must use the RPython getslice marker"
+            );
+        }
+    }
+
+    /// `forwarded_exporter` uses
+    /// `W_PickleBuffer::from_obj(obj).map(|pb| -> Result<_, PyError> { ... })`.
+    /// The closure graph follows the uniform Result exception ABI, while
+    /// `Option::map` must retain that Result as data inside `Some`; anchor the
+    /// late synthesized call to the ordinary catch-and-rewrap caller rule.
+    #[test]
+    #[ignore]
+    fn forwarded_exporter_map_rewraps_scoped_result() {
+        use crate::model::{CallTarget, ExitSwitch, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "forwarded_exporter").expect("lower forwarded_exporter");
+
+        let call_block = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "call_once"
+                    )
+                })
+            })
+            .expect("Option::map closure call_once block");
+        assert!(
+            matches!(call_block.exitswitch, Some(ExitSwitch::LastException)),
+            "the Result-returning closure call must expose normal/exception successors"
+        );
+        for variant in ["Ok", "Err"] {
+            assert_eq!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .filter(|op| matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        } if name == variant
+                    ))
+                    .count(),
+                1,
+                "the caller must rebuild one Result::{variant} shell"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn check_len_result_uint_format_template_collapses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "_check_len_result").expect("lower _check_len_result");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["Argument", "new_display"])
+                        || super::is_arguments_new_path(segments)
+                        || super::fmt_path_ends_with(segments, &["fmt", "format"])
+                )
+            }),
+            "the unsigned `[u8; N]` template must collapse to native RPython string operations"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::BinOp { op, result_ty: ValueType::Ref(None), .. }
+                    if op == "add")
+            }),
+            "the formatted overflow message must retain the native string-concat expansion"
         );
     }
 }

@@ -227,13 +227,12 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// `::` form (the spelling `canonical_struct_name` already yields for the
 /// field-read side) and compare.
 ///
-/// Normal non-header constructors now normalize at
-/// `Bookkeeper::intern_class_by_qualname`, while header-bearing structs retain
-/// their full base-chain walk (collapsing those early caused a measured +184
-/// phaseA cascade across `_io`/`_pickle`).  Keep this compare-time fallback for
-/// registry-absent or ambiguous constructor spellings: it fires only where
-/// `commonbase` is already None, which the base-bearing `W_*` structs never
-/// reach because they share `W_Root`.
+/// Constructors and field reads now normalize at
+/// `Bookkeeper::intern_class_by_qualname`, including header-bearing structs;
+/// normalization keeps the crate-relative module path so their full base-chain
+/// walk still runs.  Keep this compare-time fallback for registry-absent or
+/// ambiguous constructor spellings: it fires only where `commonbase` is
+/// already None.
 fn same_struct_identity(a: &str, b: &str) -> bool {
     fn identity(name: &str) -> String {
         if !name.contains("::")

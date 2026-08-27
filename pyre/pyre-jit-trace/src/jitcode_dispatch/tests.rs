@@ -677,8 +677,8 @@ fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
 
 #[test]
 fn gateway_positional_count_uses_rpython_signed() {
-    let count = named_jitcode("leading_non_null_count")
-        .expect("gateway positional-count helper jitcode");
+    let count =
+        named_jitcode("leading_non_null_count").expect("gateway positional-count helper jitcode");
     assert_eq!(count.calldescr.result_type, 'i');
     assert!(
         count.calldescr.result_signed,

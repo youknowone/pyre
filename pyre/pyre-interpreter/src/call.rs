@@ -2682,10 +2682,7 @@ pub(crate) fn bind_kwargs_to_signature(
                     break;
                 }
                 if !result[pi].is_null() {
-                    return Err(crate::PyError::type_error(format!(
-                        "{}() got multiple values for argument '{}'",
-                        fname, key
-                    )));
+                    return builtin_multiple_values_failure(fname, key);
                 }
                 result[pi] = *value;
                 matched = true;
@@ -2727,14 +2724,7 @@ pub(crate) fn bind_kwargs_to_signature(
     // argument.py:289 — too-many-positionals is raised last, after the
     // keyword-matching errors above.
     if too_many_args {
-        return Err(crate::PyError::type_error(format!(
-            "{}() takes {} positional argument{} but {} {} given",
-            fname,
-            n_pos_params,
-            if n_pos_params != 1 { "s" } else { "" },
-            n_pos,
-            if n_pos != 1 { "were" } else { "was" },
-        )));
+        return builtin_too_many_positional_failure(fname, n_pos_params as i64, n_pos as i64);
     }
 
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
@@ -2793,6 +2783,42 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     Ok(result)
+}
+
+/// Cold `ArgErrMultipleValues.getmsg` materialisation.
+///
+/// PyPy's `_match_signature` returns `ArgErrMultipleValues(argname)` and
+/// `Arguments.parse_obj` formats it only on the rejected-call path.  Pyre's
+/// `PyError` carries the eager message, so centralize that materialisation in
+/// the corresponding rejected-call helper instead of duplicating it in every
+/// generated gateway graph that calls the matcher.
+#[cold]
+fn builtin_multiple_values_failure(
+    fname: &str,
+    key: &Wtf8Buf,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    Err(PyError::type_error(format!(
+        "{}() got multiple values for argument '{}'",
+        fname, key
+    )))
+}
+
+/// Cold `ArgErrTooMany.getmsg` materialisation; see
+/// [`builtin_multiple_values_failure`].
+#[cold]
+fn builtin_too_many_positional_failure(
+    fname: &str,
+    expected: i64,
+    given: i64,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    Err(PyError::type_error(format!(
+        "{}() takes {} positional argument{} but {} {} given",
+        fname,
+        expected,
+        if expected != 1 { "s" } else { "" },
+        given,
+        if given != 1 { "were" } else { "was" },
+    )))
 }
 
 /// [`call_with_kwargs_in_ctx`] reached from a frame.  Installs the caller
@@ -3692,6 +3718,18 @@ fn log_call_error(message: &str) {
     let _ = message;
 }
 
+/// Cold `descroperation.py call` non-callable error materialisation.
+///
+/// Upstream raises this through `oefmt("'%T' object is not callable")`; the
+/// translated dispatch keeps all successful callable arms visible while this
+/// eager Rust message remains on the rejected arm only.
+fn not_callable_error(callable: PyObjectRef) -> PyError {
+    let type_name = crate::typedef::r#type(callable)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+        .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
+    PyError::type_error(format!("'{type_name}' object is not callable"))
+}
+
 pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     call_function_impl_raw(callable, args)
 }
@@ -3876,12 +3914,7 @@ pub fn call_function_impl_result(
             return call_function_impl_result(call_fn, &current_args);
         }
     }
-    let type_name = crate::typedef::r#type(callable)
-        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-        .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
-    Err(PyError::type_error(format!(
-        "'{type_name}' object is not callable"
-    )))
+    Err(not_callable_error(callable))
 }
 
 /// CPython: typeobject.c calculate_metaclass

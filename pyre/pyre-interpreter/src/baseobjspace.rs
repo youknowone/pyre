@@ -11644,6 +11644,40 @@ unsafe fn descr_not_settable_error(descr: PyObjectRef) -> crate::PyError {
     )
 }
 
+/// Cold message materialisation for `typedef.py Member.typecheck`.
+///
+/// Upstream keeps the receiver check in the translated descriptor path and
+/// constructs the `%N`/`%T` message through `oefmt` only after it fails.  All
+/// of pyre's Member entry points share the same error half, matching the one
+/// upstream method instead of duplicating message construction per entry.
+pub(crate) unsafe fn member_typecheck_error(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+) -> crate::PyError {
+    let w_cls = pyre_object::w_member_get_cls(descr);
+    crate::PyError::type_error(format!(
+        "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
+        pyre_object::w_member_get_name(descr),
+        pyre_object::w_type_get_name(w_cls),
+        pyre_object::type_name_of(obj),
+    ))
+}
+
+/// Cold empty-slot error from `Member.descr_member_get`.
+///
+/// `[3.14-spec]` PyPy `typedef.py:513-515` spells this through `%T`, which
+/// reports the bare type name.  CPython 3.14 exposes the heap type's qualified
+/// name here, pinned by `lib-python/3/test/test_descr.py:1311`; retain pyre's
+/// `getfulltypename` result while keeping eager message construction behind
+/// the same rejected-access boundary as upstream's `oefmt`.
+unsafe fn member_missing_error(obj: PyObjectRef, slot_name: &str) -> crate::PyError {
+    PyError::attribute_error(format!(
+        "'{}' object has no attribute '{}'",
+        getfulltypename(obj),
+        slot_name,
+    ))
+}
+
 /// Call a descriptor's __get__ method.
 ///
 /// PyPy: descroperation.py `space.get(w_descr, w_obj)` →
@@ -11739,13 +11773,7 @@ pub(crate) unsafe fn get(
         // typedef.py: self.typecheck(space, w_obj) → TypeError
         let w_cls = pyre_object::w_member_get_cls(descr);
         if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
-            let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(crate::PyError::type_error(format!(
-                "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                slot_name,
-                pyre_object::w_type_get_name(w_cls),
-                (*(*obj).ob_type).name,
-            )));
+            return Err(member_typecheck_error(descr, obj));
         }
         // CPython 3.14 `PyFunction_Type` exposes five `PyMemberDef`
         // descriptors whose values live in the native Function fields rather
@@ -11769,15 +11797,8 @@ pub(crate) unsafe fn get(
         // typedef.py:512-516: if w_result is None: raise
         // AttributeError("'%T' object has no attribute '%s'")
         if found.is_none() {
-            // An unset slot names the type by its `module.__qualname__`, which
-            // is what `test_descr.test_slots` pins; the bare `%T` name belongs
-            // to the misses `raiseattrerror` reports.
             let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(PyError::attribute_error(format!(
-                "'{}' object has no attribute '{}'",
-                getfulltypename(obj),
-                slot_name,
-            )));
+            return Err(member_missing_error(obj, slot_name));
         }
         return Ok(found);
     }
@@ -11841,13 +11862,7 @@ unsafe fn set(
         // typedef.py: self.typecheck(space, w_obj) → TypeError
         let w_cls = pyre_object::w_member_get_cls(descr);
         if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
-            let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(crate::PyError::type_error(format!(
-                "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                slot_name,
-                pyre_object::w_type_get_name(w_cls),
-                (*(*obj).ob_type).name,
-            )));
+            return Err(member_typecheck_error(descr, obj));
         }
         if pyre_object::w_member_is_direct(descr) {
             crate::typedef::direct_member_set(descr, obj, value)?;
@@ -11908,13 +11923,7 @@ unsafe fn delete(descr: PyObjectRef, obj: PyObjectRef) -> Result<(), crate::PyEr
     if pyre_object::is_member(descr) {
         let w_cls = pyre_object::w_member_get_cls(descr);
         if !w_cls.is_null() && is_type(w_cls) && !isinstance_w(obj, w_cls) {
-            let slot_name = pyre_object::w_member_get_name(descr);
-            return Err(crate::PyError::type_error(format!(
-                "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                slot_name,
-                pyre_object::w_type_get_name(w_cls),
-                (*(*obj).ob_type).name,
-            )));
+            return Err(member_typecheck_error(descr, obj));
         }
         if pyre_object::w_member_is_direct(descr) {
             crate::typedef::direct_member_delete(descr, obj)?;

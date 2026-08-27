@@ -438,6 +438,41 @@ impl CallTarget {
     }
 }
 
+/// Split a Rust-qualified type path at top-level `::` separators while
+/// preserving separators inside generic arguments as part of the owning
+/// segment.  Charon's named owner is already a structural path; reconstructing
+/// a synthetic ctor from a rendered instantiation such as
+/// `core::option::Option<Result<*mut m::Object, e::Error>>` must therefore
+/// yield `core`, `option`, `Option<Result<*mut m::Object, e::Error>>`, not
+/// split the payload's module paths into false owner segments.
+pub(crate) fn split_qualified_path(path: &str) -> Vec<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                if start < i {
+                    out.push(path[start..i].to_string());
+                }
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < path.len() {
+        out.push(path[start..].to_string());
+    }
+    out
+}
+
 impl fmt::Display for CallTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -7012,6 +7047,20 @@ mod tests {
             "Leaf",
         );
         assert_eq!(nested.path_segments(), Some(vec!["outer", "Inner", "Leaf"]));
+    }
+
+    #[test]
+    fn qualified_path_split_preserves_paths_inside_generic_arguments() {
+        assert_eq!(
+            split_qualified_path(
+                "core::option::Option<Result<*mut pyobject::PyObject,error::PyError>>"
+            ),
+            vec![
+                "core",
+                "option",
+                "Option<Result<*mut pyobject::PyObject,error::PyError>>",
+            ]
+        );
     }
 
     #[test]

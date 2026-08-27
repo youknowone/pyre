@@ -110,28 +110,46 @@ pub(crate) struct ClosureSelectSite {
     /// itself (identity), not a `__pos_0` field read.  (The closure `Args`
     /// tuple `__pos_0` write is unaffected — that is a real `Tuple` field.)
     pub niche: bool,
+    /// A closure whose declared result is `Result<T, PyError>` is translated
+    /// uniformly to the graph exception ABI: it returns `T` and raises for
+    /// `Err`.  These combinators retain that Result as data, so their
+    /// synthesized call must pass through `result_exc`'s catch-and-rewrap
+    /// caller rule before the combinator consumes it.  Carries the Result
+    /// instantiation suffix and its `Ok` payload kind.
+    pub call_once_result_exc: Option<(Option<String>, ValueType)>,
+}
+
+#[derive(Default)]
+pub(crate) struct ClosureSelectRewriteOutcome {
+    pub rewritten: usize,
+    pub result_exc_calls: Vec<(Variable, Option<String>, ValueType)>,
 }
 
 /// Rewrite every recorded closure-select call site into the discriminant
 /// diamond.  Fail-safe: a site whose block does not fit the residual-call shape
-/// is left untouched (Skip).  Returns the number of sites rewritten.
+/// is left untouched (Skip).  Returns the number of sites rewritten plus any
+/// synthesized scoped `call_once` results for the ordinary `result_exc`
+/// caller rule.
 pub(crate) fn rewire_closure_select_call_sites(
     graph: &mut FunctionGraph,
     sites: &[ClosureSelectSite],
-) -> usize {
-    let mut rewritten = 0;
+) -> ClosureSelectRewriteOutcome {
+    let mut outcome = ClosureSelectRewriteOutcome::default();
     for site in sites {
-        if rewire_one_closure_select_site(graph, site).is_ok() {
-            rewritten += 1;
+        if let Ok(result_exc_call) = rewire_one_closure_select_site(graph, site) {
+            outcome.rewritten += 1;
+            if let Some(call) = result_exc_call {
+                outcome.result_exc_calls.push(call);
+            }
         }
     }
-    rewritten
+    outcome
 }
 
 fn rewire_one_closure_select_site(
     graph: &mut FunctionGraph,
     site: &ClosureSelectSite,
-) -> Result<(), String> {
+) -> Result<Option<(Variable, Option<String>, ValueType)>, String> {
     let name = graph.name.clone();
     // Block A: the residual call producing `result_var`.
     let a = graph
@@ -245,11 +263,16 @@ fn rewire_one_closure_select_site(
     // --- `then_bb` (`Some`) ---
     let opt_in_then = map_source(&then_sources, &then_inputs, &opt)
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
-    let then_value = match site.kind {
+    let mut synthesized_result_exc = None;
+    let (then_value, then_finish_bb, then_finish_inputs) = match site.kind {
         // `or_else` forwards the whole receiver `Option` unchanged — no `__pos_0`.
-        ClosureCombinator::OrElse => opt_in_then,
+        ClosureCombinator::OrElse => (opt_in_then, then_bb, then_inputs.clone()),
         // `unwrap_or_else` forwards the bare payload.
-        ClosureCombinator::UnwrapOrElse => read_some_payload(graph, then_bb, opt_in_then, site),
+        ClosureCombinator::UnwrapOrElse => (
+            read_some_payload(graph, then_bb, opt_in_then, site),
+            then_bb,
+            then_inputs.clone(),
+        ),
         // `map`/`and_then`/`is_some_and` run the closure on the payload.
         ClosureCombinator::Map | ClosureCombinator::AndThen | ClosureCombinator::IsSomeAnd => {
             let payload = read_some_payload(graph, then_bb, opt_in_then, site);
@@ -264,7 +287,25 @@ fn rewire_one_closure_select_site(
                 site.call_result_ty.clone(),
                 &site.args_tuple_suffix,
             );
-            match site.kind {
+            let (finish_bb, finish_inputs, call_result) = if let Some((suffix, payload_ty)) =
+                &site.call_once_result_exc
+            {
+                let (finish_bb, finish_inputs) =
+                    graph.create_block_with_arg_vars(then_sources.len() + 1);
+                let mut args: Vec<LinkArg> =
+                    then_inputs.iter().cloned().map(LinkArg::Value).collect();
+                args.push(LinkArg::Value(call_result.clone()));
+                close_goto_mixed(graph, then_bb, finish_bb, args);
+                synthesized_result_exc = Some((call_result, suffix.clone(), payload_ty.clone()));
+                (
+                    finish_bb,
+                    finish_inputs[..then_sources.len()].to_vec(),
+                    finish_inputs[then_sources.len()].clone(),
+                )
+            } else {
+                (then_bb, then_inputs.clone(), call_result)
+            };
+            let value = match site.kind {
                 // `map` wraps the closure result back into `Some(U)` — except
                 // that a niche `Option` is a one-word pointer with no aggregate
                 // `__discriminant` / `__pos_0`, where `Some(x)` is `x` itself.
@@ -274,7 +315,7 @@ fn rewire_one_closure_select_site(
                     } else {
                         emit_option_variant(
                             graph,
-                            then_bb,
+                            finish_bb,
                             &site.result_option_owner,
                             1,
                             Some((
@@ -288,30 +329,39 @@ fn rewire_one_closure_select_site(
                 // `and_then`'s closure already returns `Option<U>`;
                 // `is_some_and`'s already returns the `bool`.
                 _ => call_result,
-            }
+            };
+            (value, finish_bb, finish_inputs)
         }
     };
-    let then_result = emit_narrow(graph, then_bb, then_value, &narrow_root);
+    let then_result = emit_narrow(graph, then_finish_bb, then_value, &narrow_root);
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
         &then_result,
         &then_sources,
-        &then_inputs,
+        &then_finish_inputs,
         &name,
     )?;
-    close_goto_mixed(graph, then_bb, b_target, then_link_args);
+    close_goto_mixed(graph, then_finish_bb, b_target, then_link_args);
 
     // --- `else_bb` (`None`) ---
-    let else_value = match site.kind {
+    let (else_value, else_finish_bb, else_finish_inputs) = match site.kind {
         // `map`/`and_then` build a fresh `None`.
         ClosureCombinator::Map | ClosureCombinator::AndThen => {
             // A niche `Option` is a one-word pointer with no aggregate
             // `__discriminant` / `__pos_0`: `None` is null.
             if site.result_niche {
-                graph.push_null_mut_ptr(else_bb)
+                (
+                    graph.push_null_mut_ptr(else_bb),
+                    else_bb,
+                    else_inputs.clone(),
+                )
             } else {
-                emit_option_variant(graph, else_bb, &site.result_option_owner, 0, None)
+                (
+                    emit_option_variant(graph, else_bb, &site.result_option_owner, 0, None),
+                    else_bb,
+                    else_inputs.clone(),
+                )
             }
         }
         // `is_some_and` yields the constant `false` — no closure, no `Option`.
@@ -321,14 +371,14 @@ fn rewire_one_closure_select_site(
                 result: Some(false_var.clone()),
                 kind: OpKind::ConstInt(0),
             });
-            false_var
+            (false_var, else_bb, else_inputs.clone())
         }
         // `unwrap_or_else`/`or_else` run their niladic closure and forward its
         // result (`T` for `unwrap_or_else`, `Option<T>` for `or_else`).
         ClosureCombinator::UnwrapOrElse | ClosureCombinator::OrElse => {
             let env_in_else = map_source(&else_sources, &else_inputs, &env)
                 .ok_or_else(|| format!("{name}: closure env not threaded into None arm"))?;
-            emit_call_once(
+            let call_result = emit_call_once(
                 graph,
                 else_bb,
                 env_in_else,
@@ -336,19 +386,35 @@ fn rewire_one_closure_select_site(
                 &site.call_once_owner,
                 site.call_result_ty.clone(),
                 &site.args_tuple_suffix,
-            )
+            );
+            if let Some((suffix, payload_ty)) = &site.call_once_result_exc {
+                let (finish_bb, finish_inputs) =
+                    graph.create_block_with_arg_vars(else_sources.len() + 1);
+                let mut args: Vec<LinkArg> =
+                    else_inputs.iter().cloned().map(LinkArg::Value).collect();
+                args.push(LinkArg::Value(call_result.clone()));
+                close_goto_mixed(graph, else_bb, finish_bb, args);
+                synthesized_result_exc = Some((call_result, suffix.clone(), payload_ty.clone()));
+                (
+                    finish_inputs[else_sources.len()].clone(),
+                    finish_bb,
+                    finish_inputs[..else_sources.len()].to_vec(),
+                )
+            } else {
+                (call_result, else_bb, else_inputs.clone())
+            }
         }
     };
-    let else_result = emit_narrow(graph, else_bb, else_value, &narrow_root);
+    let else_result = emit_narrow(graph, else_finish_bb, else_value, &narrow_root);
     let else_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
         &else_result,
         &else_sources,
-        &else_inputs,
+        &else_finish_inputs,
         &name,
     )?;
-    close_goto_mixed(graph, else_bb, b_target, else_link_args);
+    close_goto_mixed(graph, else_finish_bb, b_target, else_link_args);
 
     // A: drop the residual call (+ absorbed cast), read the discriminant, branch
     // on `bool(disc)` (Option tags None=0 / Some=1 → the Some arm is `then`).
@@ -391,7 +457,7 @@ fn rewire_one_closure_select_site(
         });
     }
     graph.set_branch(a_id, disc, then_bb, then_sources, else_bb, else_sources);
-    Ok(())
+    Ok(synthesized_result_exc)
 }
 
 /// Read `opt.__pos_0` (the `Some` payload) in `block`, returning the payload
@@ -523,6 +589,7 @@ mod tests {
             result_option_owner: RESULT_OPTION.into(),
             result_some_owner: RESULT_SOME.into(),
             result_niche,
+            call_once_result_exc: None,
         }
     }
 
@@ -547,8 +614,8 @@ mod tests {
         let (b, _b_args) = g.create_block_with_arg_vars(1);
         g.set_return(b, None);
         g.set_goto(a, b, vec![result.clone()]);
-        let rewritten = rewire_closure_select_call_sites(&mut g, &[site(kind, result)]);
-        assert_eq!(rewritten, 1, "the {method} site must be rewritten");
+        let outcome = rewire_closure_select_call_sites(&mut g, &[site(kind, result)]);
+        assert_eq!(outcome.rewritten, 1, "the {method} site must be rewritten");
         (g, a.0)
     }
 
@@ -588,10 +655,10 @@ mod tests {
     }
 
     fn count_ctors(g: &FunctionGraph) -> usize {
-        count_calls(
-            g,
-            |t| matches!(t, CallTarget::SyntheticTransparentCtor { name, .. } if name == "Option"),
-        )
+        count_calls(g, |t| {
+            matches!(t, CallTarget::SyntheticTransparentCtor { name, .. }
+                if matches!(name.as_str(), "Some" | "None"))
+        })
     }
 
     fn count_null_mut(g: &FunctionGraph) -> usize {
@@ -630,6 +697,78 @@ mod tests {
             vec!["Tuple".to_string(), RESULT_SOME.to_string()],
             "the Some(U) payload keys the result Some variant"
         );
+    }
+
+    #[test]
+    fn map_rewraps_a_scoped_result_closure_before_building_some() {
+        let mut g = FunctionGraph::new("test_closure_select_result");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map", Some(RECV_OPTION.into())),
+                    args: vec![opt, env],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _b_args) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+        let mut result_site = site(ClosureCombinator::Map, result);
+        result_site.call_result_ty = ValueType::Ref(None);
+        result_site.call_once_result_exc = Some((
+            Some("<*mut PyObject,PyError>".to_string()),
+            ValueType::Ref(Some("PyObject".to_string())),
+        ));
+
+        let outcome = rewire_closure_select_call_sites(&mut g, &[result_site]);
+        assert_eq!(outcome.rewritten, 1);
+        assert_eq!(outcome.result_exc_calls.len(), 1);
+        let result_outcome = crate::front::result_exc::rewire_result_exc_call_sites(
+            &mut g,
+            &outcome.result_exc_calls,
+            false,
+        )
+        .expect("the synthesized call has the ordinary custom-consumer shape");
+        assert_eq!(result_outcome.rewrapped, 1);
+
+        let call_block = g
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "call_once"
+                    )
+                })
+            })
+            .expect("call_once block");
+        assert!(
+            matches!(
+                call_block.exitswitch,
+                Some(crate::model::ExitSwitch::LastException)
+            ),
+            "the scoped closure call must use the graph exception ABI"
+        );
+        for variant in ["Ok", "Err"] {
+            assert_eq!(
+                count_calls(&g, |target| matches!(
+                    target,
+                    CallTarget::SyntheticTransparentCtor { name, .. } if name == variant
+                )),
+                1,
+                "the caller must rebuild exactly one Result::{variant} shell"
+            );
+        }
     }
 
     #[test]
@@ -678,10 +817,10 @@ mod tests {
         let (b, _b_args) = g.create_block_with_arg_vars(1);
         g.set_return(b, None);
         g.set_goto(a, b, vec![result.clone()]);
-        let rewritten =
+        let outcome =
             rewire_closure_select_call_sites(&mut g, &[site_with_result_niche(kind, result, true)]);
         assert_eq!(
-            rewritten, 1,
+            outcome.rewritten, 1,
             "the niche-result {method} site must be rewritten"
         );
         g
@@ -865,9 +1004,9 @@ mod tests {
             .unwrap();
         g.push_op_var(a, OpKind::ConstInt(9), true).unwrap();
         g.set_return(a, None);
-        let rewritten =
+        let outcome =
             rewire_closure_select_call_sites(&mut g, &[site(ClosureCombinator::Map, result)]);
-        assert_eq!(rewritten, 0, "a non-last-op call declines");
+        assert_eq!(outcome.rewritten, 0, "a non-last-op call declines");
         assert!(
             !residual_gone(&g, "map"),
             "residual call survives on decline"

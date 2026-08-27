@@ -516,7 +516,7 @@ fn build_layout_aggregate(
     size: Variable,
     align: Variable,
 ) {
-    let mut owner_path: Vec<String> = layout_owner.split("::").map(str::to_string).collect();
+    let mut owner_path = crate::model::split_qualified_path(layout_owner);
     let ctor_name = owner_path.pop().unwrap_or_default();
     let ctor_target = if owner_path.is_empty() {
         CallTarget::synthetic_transparent_ctor(ctor_name)

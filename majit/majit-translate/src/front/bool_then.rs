@@ -333,9 +333,11 @@ pub(crate) fn reproduce_exit_args(
 }
 
 /// Build an `Option` variant aggregate in `block` and return its value —
-/// the enum-root ctor + `__discriminant` write (+ `__pos_0` payload write
-/// for `Some`), the same transparent-ctor + `FieldWrite` chain
-/// `Rvalue::Aggregate` emits (`front::mir` `emit_tagged_pair_aggregate`).
+/// the concrete variant-subclass ctor + `__discriminant` write (+ `__pos_0`
+/// payload write for `Some`), the same transparent-ctor + `FieldWrite` chain
+/// a static `Rvalue::Aggregate` emits.  The two arm values union to their
+/// common enum base at the join; each arm itself retains the variant class
+/// that owns its fields (`rclass.py:82-88`).
 /// `disc` is the variant tag (`Some` = 1, `None` = 0); `payload` is
 /// `Some((some_owner, value, value_ty))` for `Some`, `None` for `None`.
 pub(crate) fn emit_option_variant(
@@ -346,7 +348,12 @@ pub(crate) fn emit_option_variant(
     payload: Option<(&str, Variable, ValueType)>,
 ) -> Variable {
     let res = graph.alloc_value_var();
-    push_option_ctor(graph, block, res.clone(), option_owner);
+    let variant = match disc {
+        0 => "None",
+        1 => "Some",
+        other => panic!("emit_option_variant: Option discriminant must be 0 or 1, got {other}"),
+    };
+    push_option_variant_ctor(graph, block, res.clone(), option_owner, variant);
     // `__discriminant` keys the enum root (tag offset 0 of every variant);
     // materialize the tag as a `ConstInt` value, matching the aggregate
     // path's `FieldWrite { value: Value(..) }` shape.
@@ -386,7 +393,7 @@ fn push_option_ctor(
     result: Variable,
     option_owner: &str,
 ) {
-    let mut owner_path: Vec<String> = option_owner.split("::").map(str::to_string).collect();
+    let mut owner_path = crate::model::split_qualified_path(option_owner);
     let ctor_name = owner_path.pop().unwrap_or_default();
     let ctor_target = if owner_path.is_empty() {
         CallTarget::synthetic_transparent_ctor(ctor_name)
@@ -399,6 +406,29 @@ fn push_option_ctor(
             target: ctor_target,
             args: Vec::new(),
             result_ty: ValueType::Ref(Some(option_owner.to_string())),
+        },
+    });
+}
+
+/// Push a statically-known `Option::Some` / `Option::None` subclass ctor.
+/// Keep the entire instantiated enum path as the owner and append the variant
+/// leaf; the flowspace adapter then interns it through
+/// `Bookkeeper::intern_enum_variant_host`, the same class object used by
+/// discriminant narrowing.
+fn push_option_variant_ctor(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    result: Variable,
+    option_owner: &str,
+    variant: &str,
+) {
+    let owner_path = crate::model::split_qualified_path(option_owner);
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(result),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor_with_owner(owner_path, variant),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some(format!("{option_owner}::{variant}"))),
         },
     });
 }
@@ -463,4 +493,80 @@ pub(crate) fn close_goto_mixed(
 ) {
     let link = Link::new_mixed(args, target, None);
     graph.set_control_flow_metadata(block, None, vec![link]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn static_option_aggregate_constructs_the_variant_subclass() {
+        let mut graph = FunctionGraph::new("static_option");
+        let block = graph.startblock;
+        let owner = "core::option::Option<Result<*mut pyobject::PyObject,error::PyError>>";
+        let payload = graph.alloc_value_var();
+        let result = emit_option_variant(
+            &mut graph,
+            block,
+            owner,
+            1,
+            Some((&format!("{owner}::Some"), payload, ValueType::Ref(None))),
+        );
+
+        match &graph.block(block).operations[0] {
+            SpaceOperation {
+                result: Some(actual),
+                kind:
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                        result_ty: ValueType::Ref(Some(result_root)),
+                        ..
+                    },
+            } => {
+                assert_eq!(actual, &result);
+                assert_eq!(name, "Some");
+                assert_eq!(
+                    owner_path,
+                    &[
+                        "core".to_string(),
+                        "option".to_string(),
+                        "Option<Result<*mut pyobject::PyObject,error::PyError>>".to_string(),
+                    ]
+                );
+                assert_eq!(result_root, &format!("{owner}::Some"));
+            }
+            other => panic!("static Option must construct its Some subclass: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_option_aggregate_keeps_the_enum_base() {
+        let mut graph = FunctionGraph::new("dynamic_option");
+        let block = graph.startblock;
+        let owner = "core::option::Option<Result<*mut pyobject::PyObject,error::PyError>>";
+        let result = graph.alloc_value_var();
+        let disc = graph.alloc_value_var();
+        emit_option_variant_dynamic(&mut graph, block, result.clone(), owner, disc, None);
+
+        match &graph.block(block).operations[0] {
+            SpaceOperation {
+                result: Some(actual),
+                kind:
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { name, owner_path },
+                        result_ty: ValueType::Ref(Some(result_root)),
+                        ..
+                    },
+            } => {
+                assert_eq!(actual, &result);
+                assert_eq!(
+                    name,
+                    "Option<Result<*mut pyobject::PyObject,error::PyError>>"
+                );
+                assert_eq!(owner_path, &["core".to_string(), "option".to_string()]);
+                assert_eq!(result_root, owner);
+            }
+            other => panic!("dynamic Option must construct its enum base: {other:?}"),
+        }
+    }
 }

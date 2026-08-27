@@ -16143,13 +16143,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         && pyre_object::is_type(w_cls)
                         && !crate::baseobjspace::isinstance_w(obj, w_cls)
                     {
-                        let slot_name = pyre_object::w_member_get_name(descr);
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                            slot_name,
-                            pyre_object::w_type_get_name(w_cls),
-                            pyre_object::type_name_of(obj),
-                        )));
+                        return Err(crate::baseobjspace::member_typecheck_error(descr, obj));
                     }
                 }
                 if unsafe { pyre_object::w_member_is_direct(descr) } {
@@ -16195,13 +16189,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         && pyre_object::is_type(w_cls)
                         && !crate::baseobjspace::isinstance_w(obj, w_cls)
                     {
-                        let slot_name = pyre_object::w_member_get_name(descr);
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                            slot_name,
-                            pyre_object::w_type_get_name(w_cls),
-                            pyre_object::type_name_of(obj),
-                        )));
+                        return Err(crate::baseobjspace::member_typecheck_error(descr, obj));
                     }
                 }
                 if unsafe { pyre_object::w_member_is_direct(descr) } {
@@ -16246,13 +16234,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         && pyre_object::is_type(w_cls)
                         && !crate::baseobjspace::isinstance_w(obj, w_cls)
                     {
-                        let slot_name = pyre_object::w_member_get_name(descr);
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                            slot_name,
-                            pyre_object::w_type_get_name(w_cls),
-                            pyre_object::type_name_of(obj),
-                        )));
+                        return Err(crate::baseobjspace::member_typecheck_error(descr, obj));
                     }
                 }
                 if unsafe { pyre_object::w_member_is_direct(descr) } {

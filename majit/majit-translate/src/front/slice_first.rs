@@ -1,4 +1,4 @@
-//! `<[T]>::first/get(slice, index)` → length-checked `Option` diamond.
+//! `<[T]>::first(slice)` and checked `get(start..)` → `Option` diamonds.
 //!
 //! ## Positioning
 //!
@@ -24,6 +24,12 @@
 //! the call's own block before the consumer's discriminant switch) cannot
 //! express `first`; a post-pass that splits block A into a guarded Some/None
 //! diamond can.
+//!
+//! The same control-flow skeleton handles the RangeFrom `get(start..)` form
+//! retained by the #346 slice-range port: its successful arm emits the
+//! ordinary RPython `getslice(start, None)` marker and its guard is
+//! `start <= len(slice)`.  Scalar `get(i)` belongs to the dedicated
+//! [`crate::front::slice_get`] pass from origin/main.
 //!
 //! ## Payload representation
 //!
@@ -91,7 +97,6 @@ pub(crate) struct SliceFirstSite {
 #[derive(Clone, Debug)]
 pub(crate) enum SliceAccess {
     First,
-    Index(Variable),
     RangeFrom { range: Variable, start: Variable },
 }
 
@@ -181,11 +186,6 @@ fn rewire_one_slice_first_site(
     // Capture the slice receiver and validate the recorded access operand.
     let slice = match (&graph.blocks[a].operations[ci].kind, &site.access) {
         (OpKind::Call { args, .. }, SliceAccess::First) if args.len() == 1 => args[0].clone(),
-        (OpKind::Call { args, .. }, SliceAccess::Index(recorded))
-            if args.len() == 2 && args[1] == *recorded =>
-        {
-            args[0].clone()
-        }
         (OpKind::Call { args, .. }, SliceAccess::RangeFrom { range, .. })
             if args.len() == 2 && args[1] == *range =>
         {
@@ -244,7 +244,6 @@ fn rewire_one_slice_first_site(
     }
     let success_operand = match &site.access {
         SliceAccess::First => None,
-        SliceAccess::Index(index) => Some(index),
         SliceAccess::RangeFrom { start, .. } => Some(start),
     };
     if let Some(operand) = success_operand
@@ -255,22 +254,16 @@ fn rewire_one_slice_first_site(
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(carried.len());
 
-    // `then_bb`: item = slice[0/i] or slice[start..]; opt = Some(item).
+    // `then_bb`: item = slice[0] or slice[start..]; opt = Some(item).
     let slice_in_then = map_source(&then_sources, &then_inputs, &slice)
         .ok_or_else(|| format!("{name}: slice not threaded into Some arm"))?;
     let elem = match &site.access {
-        SliceAccess::First | SliceAccess::Index(_) => {
-            let item_index = if let SliceAccess::Index(index) = &site.access {
-                map_source(&then_sources, &then_inputs, index)
-                    .ok_or_else(|| format!("{name}: slice index not threaded into Some arm"))?
-            } else {
-                let idx0 = graph.alloc_value_var();
-                graph.block_mut(then_bb).operations.push(SpaceOperation {
-                    result: Some(idx0.clone()),
-                    kind: OpKind::ConstInt(0),
-                });
-                idx0
-            };
+        SliceAccess::First => {
+            let item_index = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(item_index.clone()),
+                kind: OpKind::ConstInt(0),
+            });
             let elem = graph.alloc_value_var();
             graph.block_mut(then_bb).operations.push(SpaceOperation {
                 result: Some(elem.clone()),
@@ -357,10 +350,9 @@ fn rewire_one_slice_first_site(
         },
     });
     let cond = graph.alloc_value_var();
-    if let SliceAccess::Index(index) | SliceAccess::RangeFrom { start: index, .. } = &site.access {
-        // Rust's scalar slice index is `usize`.  Compare it with an unsigned
-        // view of the RPython list length, then let `rtype_getitem` perform
-        // its ordinary index conversion for the guarded element read.
+    if let SliceAccess::RangeFrom { start: index, .. } = &site.access {
+        // A RangeFrom start is `usize`.  Compare it with an unsigned view of
+        // the RPython list length; `start == len` is the valid empty suffix.
         let len_u = graph.alloc_value_var();
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(len_u.clone()),
@@ -380,11 +372,7 @@ fn rewire_one_slice_first_site(
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(cond.clone()),
             kind: OpKind::BinOp {
-                op: if matches!(&site.access, SliceAccess::RangeFrom { .. }) {
-                    "le".to_string()
-                } else {
-                    "lt".to_string()
-                },
+                op: "le".to_string(),
                 lhs: index.clone(),
                 rhs: len_u,
                 result_ty: ValueType::Int,
@@ -523,80 +511,6 @@ mod tests {
             })
             .count();
         assert_eq!(disc_writes, 2, "both arms write a discriminant");
-    }
-
-    /// A scalar slice item uses the integer register bank throughout the
-    /// guarded diamond.  This is the ordinary RPython `getitem` result shape,
-    /// not a pointer-to-slot and not a classed-instance-only special case.
-    #[test]
-    fn rewrite_lifts_scalar_get_with_unsigned_payload() {
-        let mut g = FunctionGraph::new("test_slice_get_u8");
-        let a = g.startblock;
-        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
-        let index = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
-        let opt = g
-            .push_op_var(
-                a,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            "core".into(),
-                            "slice".into(),
-                            "<Impl>".into(),
-                            "get".into(),
-                        ],
-                    },
-                    args: vec![slice, index.clone()],
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .unwrap();
-        let (b, _) = g.create_block_with_arg_vars(1);
-        g.set_return(b, None);
-        g.set_goto(a, b, vec![opt.clone()]);
-
-        let mut site = slice_first_site(opt);
-        site.access = SliceAccess::Index(index);
-        site.payload_ty = ValueType::Unsigned;
-        assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
-        assert!(
-            !g.blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments.last().map(String::as_str) == Some("get")
-                ))
-        );
-        assert!(
-            g.blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| matches!(
-                    &op.kind,
-                    OpKind::ArrayRead {
-                        item_ty: ValueType::Unsigned,
-                        ..
-                    }
-                ))
-        );
-        assert!(
-            g.blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .any(|op| matches!(
-                    &op.kind,
-                    OpKind::FieldWrite {
-                        field,
-                        ty: ValueType::Unsigned,
-                        ..
-                    } if field.name == "__pos_0"
-                ))
-        );
     }
 
     /// The production shape: an `Option<&RegisteredStruct>` result appends a

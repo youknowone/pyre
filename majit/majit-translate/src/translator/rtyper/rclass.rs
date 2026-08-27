@@ -5591,6 +5591,65 @@ mod tests {
     }
 
     #[test]
+    fn preminted_generic_enum_variant_repr_contains_payload_field() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let root = "option::Option<Vec<u8>>";
+        let variant = "option::Option<Vec<u8>>::Some";
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "option::Option::Some".to_string(),
+            vec![("__pos_0".to_string(), "??T".to_string())],
+        );
+        fields.fields.insert(
+            variant.to_string(),
+            vec![("__pos_0".to_string(), "Vec<u8>".to_string())],
+        );
+        ann.bookkeeper.set_struct_fields(Rc::new(fields));
+
+        let mut variants = HashMap::new();
+        variants.insert(
+            root.to_string(),
+            HashMap::from([(0, "Some".to_string()), (1, "None".to_string())]),
+        );
+        ann.bookkeeper
+            .set_enum_variant_by_discriminant(Rc::new(variants));
+
+        // CallRegistry::ensure_session projects every registry root first,
+        // then pre-mints the enum subtree before any subject is rtyped.
+        for name in ann.bookkeeper.struct_root_names() {
+            ann.bookkeeper
+                .getuniqueclassdef_for_struct_root(&name)
+                .expect("project struct root");
+        }
+        ann.bookkeeper.pre_register_enum_variant_classes();
+
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef_for_enum_variant(root, "Some")
+            .expect("resolve preminted Some classdef");
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)
+            .expect("build preminted Some repr");
+        Repr::setup(repr.as_ref()).expect("setup preminted Some repr");
+        assert!(
+            repr.fields().contains_key("__pos_0"),
+            "variant payload must be present when InstanceRepr is first set up"
+        );
+    }
+
+    #[test]
     fn instance_repr_pyerror_to_exc_object_emits_residual_direct_call() {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::annotator::model::{SomeInstance, SomeObject, SomeValue};
