@@ -5796,20 +5796,15 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     if contents.is_null() {
         decline!("contents-unbound");
     }
-    // A cell holds an arbitrary object, so baking its address needs the gate
-    // the other walker folds carry.  A RECORDED `ConstPtr` is forwarded at
-    // every later stage — the active-trace walk, the retrace and resume-data
-    // pools, and `remove_constptrs_in`, which turns each one into a
-    // `LoadFromGcTable` whose slot is a root.  The window this gate covers is
-    // the one before that: a freshly minted `ConstPtr` sits in the walker's
-    // own `registers_r` bank, which no registered root area walks, so a minor
-    // collection between the mint and the record leaves it pointing at the old
-    // address.  The only other address this fold bakes is the family's, and a
-    // family is a `Box::into_raw` leak outside the collector entirely, so the
-    // contents are the one edge that needs gating.
-    if majit_gc::can_move(majit_ir::GcRef(contents as usize)) {
-        decline!("contents-movable");
-    }
+    // A cell holds an arbitrary object, and baking its address needs no
+    // movability test.  A RECORDED `ConstPtr` is forwarded at every later
+    // stage — the active-trace walk, the retrace and resume-data pools, and
+    // `remove_constptrs_in`, which turns each one into a `LoadFromGcTable`
+    // whose slot is a root — and the window before that, while the mint sits
+    // in the walker's own `registers_r` bank, is covered by the
+    // `active_sym_registers` root area.  The only other address this fold
+    // bakes is the family's, and a family is a `Box::into_raw` leak outside
+    // the collector entirely.
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(
         ctx.trace_ctx,

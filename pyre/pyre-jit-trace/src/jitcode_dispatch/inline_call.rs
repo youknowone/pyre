@@ -174,11 +174,11 @@ unsafe fn kwonly_defaults_for_inline(
     // The version lives on the strategy box, so that is what the pin names and
     // what has to exist.  An ordinary dict has none.
     let strategy = unsafe { pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict) };
-    // The strategy box and every cell under it are baked, and a freshly minted
-    // `ConstPtr` sits in the walker's `registers_r` until it is recorded, which
-    // no registered root area walks.  Take only addresses a collection cannot
-    // move -- a definition's mapping is young, unlike the module namespaces the
-    // same fold usually runs against.
+    // The strategy box is baked AND named by raw address outside the trace --
+    // the emit installs the mapping's version marker against that address
+    // (`record_quasiimmut_field`) -- so this one keeps its movability test
+    // even though the `active_sym_registers` root area covers the bank.  A
+    // `malloc_typed` strategy box answers it for free.
     if strategy.is_null() || majit_gc::can_move(majit_ir::GcRef(strategy as usize)) {
         return None;
     }
@@ -203,7 +203,7 @@ unsafe fn kwonly_defaults_for_inline(
         let Some(stored) = crate::state::module_dict_cell_value_direct(dict, cell_slot) else {
             return None;
         };
-        if stored.is_null() || majit_gc::can_move(majit_ir::GcRef(stored as usize)) {
+        if stored.is_null() {
             return None;
         }
         let value = unsafe { pyre_object::celldict::unwrap_cell(stored) };

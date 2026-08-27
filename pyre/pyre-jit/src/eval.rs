@@ -4667,7 +4667,6 @@ fn build_gc() -> Box<MiniMarkGC> {
     }
     let _registered_synthetic_structs = majit_ir::descr::gc_cache()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .register_unresolved_struct_tids(|size, offsets| {
             gc.register_type(TypeInfo::with_gc_ptrs(size, offsets))
         });
@@ -5102,6 +5101,11 @@ fn register_thread_root_areas() {
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
             "walk_end",
+        );
+        register(
+            active_sym_registers_root_walker_area,
+            pyre_jit_trace::trace::capture_active_sym_root_area(),
+            "active_sym_registers",
         );
         register(
             mapdict_root_walker_area,
@@ -5981,6 +5985,19 @@ unsafe fn fbw_finish_concrete_root_walker_area(
     unsafe {
         pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_root_walker_area(data, visitor)
     };
+}
+
+/// The recording walk's own reference register banks, whose inline `ConstPtr`
+/// GcRefs nothing else forwards.  See
+/// `pyre_jit_trace::trace::walk_active_sym_register_area`.
+///
+/// # Safety
+/// `data` must be this mutator's `capture_active_sym_root_area()`.
+unsafe fn active_sym_registers_root_walker_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    unsafe { pyre_jit_trace::trace::walk_active_sym_register_area(data, visitor) };
 }
 
 unsafe fn walk_end_root_walker_area(

@@ -206,6 +206,44 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
         .unwrap_or(core::ptr::null_mut())
 }
 
+/// [`try_gc_alloc_stable_raw`]'s nursery twin — `malloc_fixedsize`
+/// (`framework.py:361-382`), the allocation every RPython constructor takes.
+///
+/// The two answer the same `null`-means-no-hook contract and neither collects,
+/// so a caller of either may read its field values before the call and store
+/// them after without rooting them across it.  They differ in what the address
+/// is worth afterwards.  This one is a nursery bump while the nursery has room,
+/// so the block is reclaimed by a minor collection instead of waiting for the
+/// major cycle — and it moves, so a caller holding the raw address across a
+/// collection owes it a root.  The stable twin buys the opposite: the old
+/// generation is mark-sweep and non-moving, which is what a caller needs when
+/// it publishes the address somewhere the collector does not walk — a host
+/// container box ([`crate::gc_storage`]), a blackhole register file — or when
+/// an `#[allow]`ed "never moves" reader downstream depends on it.
+///
+/// A nursery-full request spills to the old generation rather than collecting,
+/// so the block this hands back is never worse placed than the stable twin's.
+///
+/// Not for a constructor a compiled trace calls directly.  One bound in
+/// `jit_fnaddr` hands its block back in a machine register the gcmap does not
+/// describe as a reference, so a minor collection between the return and the
+/// store leaves the caller naming moved bytes, and the non-moving old
+/// generation is what stands in for that missing root today.
+/// `PYPY_GC_NURSERY=64K` tells the two apart in one run: routing
+/// `w_int_gc_alloc` here puts recycled nursery bytes in an old-gen
+/// `W_BaseException.w_start` (`type_name_surrogate_reject`,
+/// `site=minor_fixed_field_target`).
+///
+/// Residualised (`@dont_look_inside`, `rlib/jit.py`) for the same reason as its
+/// twin: the hook dispatch is process-global state the trace carries nothing by
+/// recording.
+#[majit_macros::dont_look_inside]
+pub fn try_gc_alloc_nursery_raw(type_id: u32, payload_size: usize) -> *mut u8 {
+    GcAllocOutcome::from_hook(try_gc_alloc(type_id, payload_size))
+        .allocated_or_abort(payload_size)
+        .unwrap_or(core::ptr::null_mut())
+}
+
 majit_gc::global_hook!(static GC_ALLOC_COLLECTING_HOOK: GcAllocHookFn);
 
 /// Install the *collecting* nursery allocation callback.

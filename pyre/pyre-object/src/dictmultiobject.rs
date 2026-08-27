@@ -5745,7 +5745,7 @@ fn w_dict_view_iterator_new_direction(
         reverse,
         start_strategy_id,
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
         dict_view_iterator_gc_type_id(),
         W_DICT_VIEW_ITERATOR_OBJECT_SIZE,
     );
@@ -5915,7 +5915,7 @@ pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
     let dict_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_dict);
     let raw =
-        crate::gc_hook::try_gc_alloc_stable_raw(W_DICT_VIEW_GC_TYPE_ID, W_DICT_VIEW_OBJECT_SIZE);
+        crate::gc_hook::try_gc_alloc_nursery_raw(W_DICT_VIEW_GC_TYPE_ID, W_DICT_VIEW_OBJECT_SIZE);
     let value = W_DictViewObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,

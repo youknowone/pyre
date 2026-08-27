@@ -44,8 +44,9 @@ pub fn w_method_new(
     // reachable only through it must be GC-traced; a `malloc_typed` method
     // is invisible to mark-sweep, whereas `register_pyre_class` registers
     // this layout's `ptr_offsets`, so mark-sweep follows the members. The
-    // write barrier below keeps the old-gen method in the remembered set so
-    // young members survive a later minor collection.
+    // write barrier below covers the nursery-full spill, where the shell is
+    // old-gen and its young members need the remembered set to survive a later
+    // minor collection.
     let _roots = crate::gc_roots::push_roots();
     let save_point = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_function);
@@ -55,14 +56,15 @@ pub fn w_method_new(
         ob_type: &METHOD_TYPE as *const PyType,
         w_class: get_instantiate(&METHOD_TYPE),
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE);
     let w_module = PY_NULL;
     if !raw.is_null() {
-        // Remember the old-gen shell before publishing nursery members:
-        // running the barrier after the stores would leave a movable `w_self`
-        // (notably a list) named by a slot no collection traces until it does.
-        // This is the same pre-store shape as tupleobject's stable shell plus
-        // young items block.
+        // Remember the shell before publishing nursery members: running the
+        // barrier after the stores would leave a movable `w_self` (notably a
+        // list) named by a slot no collection traces until it does. This is
+        // the same pre-store shape as tupleobject's stable shell plus young
+        // items block. A nursery shell answers the barrier in its `is_in_nursery`
+        // arm, so the call stands for the spill case alone.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
         for slot in save_point..save_point + 3 {
             let root = crate::gc_roots::shadow_stack_get(slot);

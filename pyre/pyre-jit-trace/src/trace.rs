@@ -427,6 +427,71 @@ pub fn walk_active_sym_exc_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) 
     }
 }
 
+/// Capture this mutator's [`ACTIVE_SYM_EXC`] cell for STW root walking.
+pub fn capture_active_sym_root_area() -> *const () {
+    ACTIVE_SYM_EXC.with(|c| c as *const _ as *const ())
+}
+
+/// Root the inline `ConstPtr` GcRefs a fold has parked in the active walk's
+/// reference register banks.
+///
+/// `MIFrame.registers_r` is an ordinary RPython list of `GCREF` upstream, so
+/// the collector traces and forwards it with every other field and a fold never
+/// has to ask where its result is going to sit.  Pyre mirrors that bank as a
+/// `Vec<OpRef>` on `PyreSym`, which nothing else reaches: `TraceCtx::const_ref`
+/// mints an `OpRef::ConstPtr` carrying an inline `GcRef`, and
+/// `write_residual_call_result_to_dst` parks it in the bank until an operation
+/// consumes it into the recorder — from there `walk_active_trace_refs` and the
+/// emit-time `LoadFromGcTable` rewrite take over.  A collection landing in that
+/// window used to move the object and leave the bank naming the old address,
+/// which is the hazard the `can_move` tests on the walker folds stood in for.
+///
+/// Only the innermost `PyreSym` is anchored, and that covers the window: a mint
+/// and the operation recording it sit inside one opcode's dispatch, while a
+/// re-entrant `trace_bytecode` can only open between opcodes.
+///
+/// One copy of the bank stays out of reach: `MIFrame.pre_opcode_registers_r`,
+/// the opcode-start rollback clone, hangs off the per-instruction wrapper
+/// rather than the anchor.  A rollback restores from it, so a `ConstPtr`
+/// carried in a clone taken before a collection is read forward stale — the
+/// same defect this area closes, one level down, and it needs an anchor of its
+/// own to close.
+///
+/// # Safety
+/// `data` must come from [`capture_active_sym_root_area`], and the owning
+/// mutator must be quiesced when a foreign collector thread calls this.  Unlike
+/// [`walk_active_sym_exc_roots`] this walk writes forwarded pointers back, so it
+/// reaches the banks through `addr_of_mut!` on the raw anchor rather than
+/// re-forming a whole `&mut PyreSym` alongside the tracer's.
+pub unsafe fn walk_active_sym_register_area(
+    data: *const (),
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let cell = unsafe { &*(data as *const std::cell::Cell<*mut PyreSym>) };
+    let sym_ptr = cell.get();
+    if sym_ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let bank = &mut *std::ptr::addr_of_mut!((*sym_ptr).registers_r);
+        for slot in bank.iter_mut() {
+            slot.walk_const_ptr_refs_mut(visitor);
+        }
+        // The bridge-setup overrides of the same bank, each of which a resume
+        // fills from `rd_consts` and can therefore carry an inline `ConstPtr`.
+        for bank in [
+            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_registers_r),
+            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_local_oprefs),
+            &mut *std::ptr::addr_of_mut!((*sym_ptr).bridge_stack_oprefs),
+        ] {
+            let Some(bank) = bank.as_mut() else { continue };
+            for slot in bank.iter_mut() {
+                slot.walk_const_ptr_refs_mut(visitor);
+            }
+        }
+    }
+}
+
 pub fn take_walk_end_restart_pc() -> Option<usize> {
     WALK_END_RESTART_PC.with(|c| c.replace(None))
 }
