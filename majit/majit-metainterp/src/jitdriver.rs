@@ -956,6 +956,51 @@ where
     }
 }
 
+/// The seed's entry for a dispatch JitCode that already names its own index.
+///
+/// Split out so the two numbering authorities read as the two cases they are:
+/// this one checks that the seed really is the table the dispatch came from,
+/// and returns its entry; the caller's copy is dropped.
+fn adopt_seeded_dispatch(
+    registry: &[std::sync::Arc<crate::jitcode::JitCode>],
+    index: usize,
+    dispatch: &crate::jitcode::JitCode,
+) -> std::sync::Arc<crate::jitcode::JitCode> {
+    let seeded = registry.get(index).unwrap_or_else(|| {
+        panic!(
+            "dispatch jitcode {:?} names index {index}, which the registry seed \
+             does not reach — it holds {} entries. A build-time table that \
+             numbers the portal has to hand it over through \
+             `RuntimeDescrTable::jitcodes()`, or the portal is registered \
+             against a list that is not the one its `j` operands index",
+            dispatch.name(),
+            registry.len(),
+        )
+    });
+    assert_eq!(
+        seeded.name(),
+        dispatch.name(),
+        "dispatch jitcode {:?} names index {index}, which the seed fills with \
+         {:?} — two graphs claim one slot, so the `j` operands written against \
+         it resolve to whichever of them the registry happens to hold",
+        dispatch.name(),
+        seeded.name(),
+    );
+    // A build-time shell resolves its `j` operands through the shared pool and
+    // carries no per-jitcode descrs, so there is nothing here for the walk to
+    // reach. A caller that has some is one whose callees were emitted at run
+    // time, and adopting would drop them unnumbered.
+    assert!(
+        dispatch.exec.descrs.is_empty(),
+        "dispatch jitcode {:?} is seeded at index {index} but carries {} \
+         run-time descrs; adopting the seed's entry would leave them out of \
+         the registry",
+        dispatch.name(),
+        dispatch.exec.descrs.len(),
+    );
+    std::sync::Arc::clone(seeded)
+}
+
 /// Flatten a dispatch JitCode and everything it can inline-call into the one
 /// flat `all_jitcodes` registry, returning it with the dispatch JitCode's
 /// `Arc`.
@@ -976,6 +1021,15 @@ where
 /// The walk starts at the dispatch JitCode, not at the seed: every seeded entry
 /// is already present, so its callees are too. It is depth-agnostic, so a
 /// nested inline helper stays correctly indexed without a parent-relative walk.
+///
+/// A dispatch JitCode the seed *already holds* is adopted at the index it
+/// names rather than appended. `codewriter.py make_jitcodes` numbers the
+/// portal graph in the same pass as every other graph, and `warmspot.py` reads
+/// it back as `metainterp_sd.jitcodes[portal_jd.index]` — upstream's portal is
+/// a seeded entry. A host that lowers its whole interpreter ahead of time
+/// hands over that shape; only one that mints the dispatch body at run time
+/// (`JitCodeBuilder`, the `#[jit_interp]` route) has an unnumbered portal to
+/// append.
 fn build_jitcode_registry(
     seed: &[std::sync::Arc<crate::jitcode::JitCode>],
     dispatch: crate::jitcode::JitCode,
@@ -984,6 +1038,15 @@ fn build_jitcode_registry(
     std::sync::Arc<crate::jitcode::JitCode>,
 ) {
     let mut registry = seed.to_vec();
+    if let Some(index) = dispatch.try_index() {
+        // The seed's own `Arc`, never the caller's copy: `codewriter.py:80
+        // all_jitcodes[jitcode.index] is jitcode` is the identity every `j`
+        // operand at `index` resolves through, and the driver's `mainjitcode`
+        // has to be that same object. Nothing is appended, so the registry is
+        // the seed — which the build-time table already numbered end to end.
+        let seeded = adopt_seeded_dispatch(&registry, index, &dispatch);
+        return (registry, seeded);
+    }
     let dispatch_position = registry.len();
     dispatch.set_index(dispatch_position);
     let dispatch_arc = std::sync::Arc::new(dispatch);
@@ -11020,12 +11083,23 @@ mod jitcode_registry_tests {
     /// A jitcode with a committed body, optionally already numbered the way a
     /// build-time table numbers its entries.
     fn jitcode(name: &str, prenumbered: Option<usize>) -> Arc<JitCode> {
+        Arc::new(jitcode_value(name, prenumbered))
+    }
+
+    /// The same, by value, for handing `build_jitcode_registry` the graph its
+    /// seed already holds.
+    ///
+    /// `JitCode` is deliberately not `Clone` — the runtime half is per-object
+    /// — so the seed's entry and the registered portal are two
+    /// `from_canonical` calls over one canonical body. That is exactly the
+    /// shape an LLBC embedder arrives with.
+    fn jitcode_value(name: &str, prenumbered: Option<usize>) -> JitCode {
         let core = majit_translate::jitcode::JitCode::new(name);
         core.set_body(Default::default());
         if let Some(index) = prenumbered {
             core.set_index(index);
         }
-        Arc::new(JitCode::from_canonical(core))
+        JitCode::from_canonical(core)
     }
 
     /// A dispatch jitcode that inline-calls each of `callees`.
@@ -11147,5 +11221,72 @@ mod jitcode_registry_tests {
     fn an_incomplete_seed_is_reported_before_the_set_once_invariant_trips() {
         let callee = jitcode("build_time_callee", Some(7));
         build_jitcode_registry(&[], dispatch_calling(&[callee]));
+    }
+
+    /// A portal the build-time table already numbered keeps that number.
+    ///
+    /// This is the LLBC shape: one lowering pass writes the portal and its
+    /// callees into a single table, so the portal arrives already seeded.
+    /// Appending it would ask `set_index` to name a second slot for a jitcode
+    /// that already names one, which aborts — every such host reached this
+    /// function and panicked instead of registering.
+    #[test]
+    fn a_seeded_dispatch_jitcode_is_adopted_at_the_index_it_names() {
+        let seed = seed();
+        let portal = jitcode_value("mainloop", Some(0));
+
+        let (registry, dispatch) = build_jitcode_registry(&seed, portal);
+
+        assert_eq!(dispatch.index(), 0, "the portal keeps the seed's number");
+        assert_eq!(registry.len(), seed.len(), "nothing is appended");
+        assert!(
+            std::sync::Arc::ptr_eq(&registry[0], &dispatch),
+            "`all_jitcodes[jitcode.index] is jitcode` — the driver's portal has \
+             to BE the registry entry, not a second object with the same body",
+        );
+        assert_self_indexed(&registry);
+    }
+
+    /// Adoption is keyed on the index the dispatch names, not on it being
+    /// first: a table whose driver names a portal in the middle registers the
+    /// entry at that position and no other.
+    #[test]
+    fn a_seeded_dispatch_is_adopted_wherever_the_table_put_it() {
+        let seed = seed();
+        let (registry, dispatch) = build_jitcode_registry(&seed, jitcode_value("add", Some(2)));
+        assert_eq!(dispatch.index(), 2);
+        assert_eq!(dispatch.name(), "add");
+        assert!(std::sync::Arc::ptr_eq(&registry[2], &dispatch));
+    }
+
+    /// Two graphs claiming one slot is not adoptable: the seed's entry and the
+    /// registered portal would be different bodies under one number, and every
+    /// `j` operand written against it resolves to whichever the registry holds.
+    #[test]
+    #[should_panic(expected = "two graphs claim one slot")]
+    fn a_seeded_slot_holding_another_graph_is_refused() {
+        let seed = seed();
+        build_jitcode_registry(&seed, jitcode_value("portal", Some(1)));
+    }
+
+    /// A dispatch numbered past the end of the seed names the method that
+    /// would have supplied the rest of the table.
+    #[test]
+    #[should_panic(expected = "does not reach")]
+    fn a_dispatch_numbered_above_the_seed_names_the_missing_table() {
+        let seed = seed();
+        build_jitcode_registry(&seed, jitcode_value("mainloop", Some(9)));
+    }
+
+    /// Adoption drops the caller's copy, so run-time descrs on it would never
+    /// be numbered. Refuse rather than lose them.
+    #[test]
+    #[should_panic(expected = "run-time descrs")]
+    fn a_seeded_dispatch_carrying_runtime_callees_is_refused() {
+        let seed = seed();
+        let helper = jitcode("helper", None);
+        let mut portal = jitcode_value("mainloop", Some(0));
+        portal.exec.descrs = vec![RuntimeBhDescr::JitCode(helper)];
+        build_jitcode_registry(&seed, portal);
     }
 }
