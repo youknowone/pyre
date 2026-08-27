@@ -215,7 +215,16 @@ from test.support.script_helper import assert_python_ok
 from test.support import threading_helper, import_helper
 from test.support.bytecode_helper import instructions_with_positions
 from opcode import opmap, opname
-from _testcapi import code_offset_to_line
+try:
+    from _testcapi import code_offset_to_line
+except ImportError:
+    # PyPy does not require its CPython C-API test extension to expose code
+    # locations.  Cross-check the two public code-object iterators directly.
+    def code_offset_to_line(code, offset):
+        for start, end, line in code.co_lines():
+            if start <= offset < end:
+                return line
+        return -1
 try:
     import _testinternalcapi
 except ModuleNotFoundError:

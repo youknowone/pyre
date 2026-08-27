@@ -57,7 +57,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_asyncgen": {
-      "dynasm": "CRASH"
+      "dynasm": "PASS"
     },
     "test.test_asyncio": {
       "cranelift": "PASS",
@@ -166,8 +166,7 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_code": {
-      "dynasm": "SKIP",
-      "reason": "implementation detail"
+      "dynasm": "PASS"
     },
     "test.test_code_module": {
       "cranelift": "PASS",
@@ -456,7 +455,8 @@
       "dynasm": "PASS"
     },
     "test.test_fileutils": {
-      "dynasm": "IMPORTERROR"
+      "dynasm": "SKIP",
+      "reason": "CPython internal test helper absent on PyPy"
     },
     "test.test_finalization": {
       "dynasm": "CRASH"
