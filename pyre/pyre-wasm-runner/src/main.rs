@@ -742,11 +742,11 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             }
             eprintln!("[jit-stats] abort_diag {}", parts.join(" "));
         }
-        // compile_bridge outcome tallies (diagnostic). 0=entered 1=declCALL_ASM
-        // 2=declMultiPeel 3=declNotDirect 4=declRefHome 5=BRIDGE_OK
-        // 6=loopClosing 7=srcHasPreamble 15=declCAHostTrampoline,
-        // 16=forced terminal-decline regression hook. 48=inline LABEL-resume
-        // layout decline.
+        // compile_bridge outcome tallies (diagnostic). POSITIONAL MIRROR of
+        // `majit_backend_wasm::BRIDGE_DIAG_LABELS`, which carries the legend
+        // for every slot; the runner links no majit crate, so a slot added
+        // there must be APPENDED here or its tally is bumped in the guest and
+        // reported by nobody.
         if let Ok(diag) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_jit_bridge_diag") {
             let labels = [
                 "entered",
@@ -805,6 +805,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_decl_no_trip_helper",
                 "inline_deferred",
                 "inline_trip_fired",
+                "inline_decl_defer_invalidation_guard",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -860,10 +861,24 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // PYRE_WASM_JIT_STATS, so printing them here would have kept them off
         // every gated wasm run.
         if let Ok(fbw) = instance.get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag") {
+            // POSITIONAL MIRROR of the ring geometry and bit layout in
+            // `pyre_jit_trace::trace::fbw_diag`. The runner links no pyre
+            // crate and decodes the ring by arithmetic on these, so a stale
+            // copy reads the wrong words and prints them as a walk outcome
+            // instead of failing. Named rather than spelled inline so the
+            // mirror is something a test can compare.
             const RING_BASE: u32 = 19;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
+            const FLAG_VALID: u64 = 0x1;
+            const FLAG_COMMITTED: u64 = 0x2;
+            const FLAG_BRIDGE: u64 = 0x4;
+            const SHIFT_EFFECTS: u32 = 8;
+            const SHIFT_JOURNAL: u32 = 24;
+            const SHIFT_EXEC_MF: u32 = 40;
+            const SHIFT_LEG: u32 = 56;
+            const FIELD_MASK: u64 = 0xffff;
             let mut slot = |i: u32| fbw.call(&mut store, i).unwrap_or(0);
             let walks = slot(0);
             // `fbw_diag::record` keeps the FIRST `RING_ENTRIES` walks and lets
@@ -888,19 +903,21 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                     }
                 }
                 let flags = slot(base + NAME_SLOTS);
-                if flags & 1 == 0 {
+                if flags & FLAG_VALID == 0 {
                     continue;
                 }
-                let field = |shift: u32| (flags >> shift) & 0xffff;
+                let field = |shift: u32| (flags >> shift) & FIELD_MASK;
                 eprintln!(
                     "[fbw-census] end={end} committed={} leg={} bridge={} exec_mf={} \
                      effects={} journaled={}",
-                    flags & (1 << 1) != 0,
-                    (flags >> 56) & 0xff,
-                    flags & (1 << 2) != 0,
-                    field(40),
-                    field(8),
-                    field(24),
+                    flags & FLAG_COMMITTED != 0,
+                    // The leg is the top byte, so the shift already isolates
+                    // it; the mask keeps the width of the read on the page.
+                    (flags >> SHIFT_LEG) & 0xff,
+                    flags & FLAG_BRIDGE != 0,
+                    field(SHIFT_EXEC_MF),
+                    field(SHIFT_EFFECTS),
+                    field(SHIFT_JOURNAL),
                 );
             }
         }
@@ -1176,11 +1193,10 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // to 0 when the export is absent, which reads as healthy. Hence the one
         // lookup feeding the refusal below, and hence this line — not the
         // counter line — being where those four keys are emitted now.
-        // Both arrays take their length from this one constant, so a label
-        // added without a slot (or the reverse) is a compile error rather than
-        // a `zip` that silently drops the tail.
-        const FBW_SLOTS: usize = 19;
-        let fbw_labels: [&str; FBW_SLOTS] = [
+        // The value array is built FROM the label array below, so a label
+        // added without a slot (or the reverse) is impossible to write rather
+        // than a `zip` that silently drops the tail.
+        let fbw_labels = [
             "fbw_walks",
             "fbw_rolled_back_with_effects",
             "fbw_midbody_latch",
@@ -1204,7 +1220,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
             .and_then(|f| {
-                let mut values = [0u64; FBW_SLOTS];
+                let mut values = fbw_labels.map(|_| 0u64);
                 for (slot, value) in values.iter_mut().enumerate() {
                     *value = f.call(&mut store, slot as u32)?;
                 }
@@ -1213,7 +1229,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             Ok(values) => values,
             Err(_) => {
                 missing.push("pyre_fbw_diag");
-                [0; FBW_SLOTS]
+                fbw_labels.map(|_| 0u64)
             }
         };
         if !missing.is_empty() {

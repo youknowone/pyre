@@ -238,7 +238,11 @@ impl FunctionQuasiImmutSlots {
 }
 
 /// Number of `?` entries in `function.py:34-42 _immutable_fields_`.
-pub const QUASI_IMMUT_SLOT_COUNT: usize = 9;
+///
+/// Anchored on the highest-numbered [`QuasiImmutSlot`] variant, so an entry
+/// added at the end of that enum extends the bound rather than needing the
+/// count restated here.
+pub const QUASI_IMMUT_SLOT_COUNT: usize = (QuasiImmutSlot::WKwDefs as usize) + 1;
 
 /// Which `_immutable_fields_` `?` entry a quasi-immutable operation names.
 ///

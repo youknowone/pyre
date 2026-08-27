@@ -60,7 +60,25 @@ pub struct BridgeVirtualCache<'a> {
     /// The guard's fail values, which `resume.py decode_ref` reads a TAGBOX
     /// operand out of (`cpu.get_ref_value(self.deadframe, num)`). Empty for
     /// the recording-only reader, which never needs a concrete.
+    ///
+    /// Int and float failargs only — a ref failarg is read out of
+    /// [`Self::fail_ref_roots`] instead.
     fail_values: &'a [i64],
+    /// The ref-typed fail values, indexed as `fail_values` is and registered
+    /// as resume-construction GC roots.
+    ///
+    /// `decode_ref` reads through `self.deadframe`, an object the collector
+    /// traces and updates, so upstream re-reads a moved address for free. A
+    /// slice copied out of the deadframe does not move with it, and this walk
+    /// allocates: a `bh_new` between the copy and the read collects, and the
+    /// store then targets — or writes — an address that has moved. Rooting
+    /// the copy restores what reading through the deadframe gave.
+    ///
+    /// Only ref-typed slots are carried; every other index holds 0, because
+    /// the root walker hands each slot to the collector as a `GcRef` and an
+    /// int that happens to land in the nursery range would be rewritten as if
+    /// it were a pointer.
+    fail_ref_roots: Vec<i64>,
     /// Addresses of the virtuals the applying reader has allocated, indexed by
     /// virtual number and registered as resume-construction GC roots.
     ///
@@ -108,6 +126,7 @@ impl<'a> BridgeVirtualCache<'a> {
             mint_raw_array_descr,
             executing: None,
             fail_values: &[],
+            fail_ref_roots: Vec::new(),
             concrete_roots: Vec::new(),
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         }
@@ -126,6 +145,7 @@ impl<'a> BridgeVirtualCache<'a> {
         ) -> majit_ir::DescrRef,
         allocator: &'a dyn crate::resume::BlackholeAllocator,
         fail_values: &'a [i64],
+        fail_types: &[majit_ir::Type],
     ) -> Self {
         // Built field by field rather than from `Self::new`: the cache
         // unregisters its roots in `Drop`, and a type that implements `Drop`
@@ -138,15 +158,28 @@ impl<'a> BridgeVirtualCache<'a> {
             mint_raw_array_descr,
             executing: Some(allocator),
             fail_values,
+            fail_ref_roots: fail_values
+                .iter()
+                .enumerate()
+                .map(|(i, &bits)| match fail_types.get(i) {
+                    Some(majit_ir::Type::Ref) => bits,
+                    _ => 0,
+                })
+                .collect(),
             concrete_roots: vec![0i64; size],
             roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         };
+        // SAFETY, both registrations: each buffer is heap-allocated at a fixed
+        // address, never resized after this point, and unregistered by `Drop`
+        // before the cache dies.
         if size > 0 {
-            // SAFETY: the buffer is heap-allocated at a fixed address, never
-            // resized after this point, and unregistered by `Drop` before the
-            // cache dies.
             unsafe {
                 majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
+        }
+        if !cache.fail_ref_roots.is_empty() {
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.fail_ref_roots);
             }
         }
         cache
@@ -183,6 +216,12 @@ impl<'a> BridgeVirtualCache<'a> {
     /// The guard's fail values, for resolving a TAGBOX operand's concrete.
     fn fail_values(&self) -> &'a [i64] {
         self.fail_values
+    }
+
+    /// The address a ref failarg currently lives at, read back through the
+    /// rooted copy so a collection since the guard failed is accounted for.
+    fn fail_ref_root(&self, index: usize) -> Option<i64> {
+        self.fail_ref_roots.get(index).copied()
     }
 
     pub fn get_any(&self, i: usize) -> Option<OpRef> {
@@ -386,11 +425,18 @@ fn operand_concrete(
         return Some(majit_ir::Value::Ref(majit_ir::GcRef(address as usize)));
     }
     if opref.is_input_arg() {
-        let bits = *cache.fail_values().get(opref.raw() as usize)?;
+        let index = opref.raw() as usize;
         return Some(match opref {
-            OpRef::InputArgRef(_) => majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)),
-            OpRef::InputArgFloat(_) => majit_ir::Value::Float(f64::from_bits(bits as u64)),
-            _ => majit_ir::Value::Int(bits),
+            // Through the roots, not through the copy: this walk allocates,
+            // and the address a ref failarg held when the guard failed is not
+            // the address it holds after a `bh_new` collected.
+            OpRef::InputArgRef(_) => {
+                majit_ir::Value::Ref(majit_ir::GcRef(cache.fail_ref_root(index)? as usize))
+            }
+            OpRef::InputArgFloat(_) => {
+                majit_ir::Value::Float(f64::from_bits(*cache.fail_values().get(index)? as u64))
+            }
+            _ => majit_ir::Value::Int(*cache.fail_values().get(index)?),
         });
     }
     ctx.box_value(opref)
@@ -1400,24 +1446,27 @@ pub fn seed_bridge_virtualizable_boxes(
         }
     }
     let mut boxes: Vec<OpRef> = Vec::with_capacity(expected + 1);
+    // `OpRef::NONE` is how the applying reader says it met a virtual kind it
+    // has no allocating twin for. Under that reader the box would name an
+    // object the heap does not hold, and every later vable op reads through
+    // this list, so the seed fails whole rather than binding one slot to
+    // nothing — the same rule `replay_pending_fields` applies. The recording
+    // reader is unaffected: a direct reader allocated for it, and an
+    // unresolved slot there is the pre-existing tolerated case.
     for slot in slots {
-        boxes.push(rebuilt_value_to_opref(
-            ctx,
-            slot,
-            rd_virtuals,
-            resume_data,
-            cache,
-        ));
+        let op = rebuilt_value_to_opref(ctx, slot, rd_virtuals, resume_data, cache);
+        if op.is_none() && cache.allocator().is_some() {
+            return false;
+        }
+        boxes.push(op);
     }
     // virtualizable.py:143-144 "the returned list is in the format expected of
     // virtualizable_boxes, so it ends in the virtualizable itself".
-    boxes.push(rebuilt_value_to_opref(
-        ctx,
-        identity,
-        rd_virtuals,
-        resume_data,
-        cache,
-    ));
+    let identity_op = rebuilt_value_to_opref(ctx, identity, rd_virtuals, resume_data, cache);
+    if identity_op.is_none() && cache.allocator().is_some() {
+        return false;
+    }
+    boxes.push(identity_op);
     values.push(identity_value);
     ctx.set_virtualizable_boxes_with_info(boxes, values, info, &array_lengths);
     // `rebuild_state_after_failure`'s trailing `self.synchronize_virtualizable()`

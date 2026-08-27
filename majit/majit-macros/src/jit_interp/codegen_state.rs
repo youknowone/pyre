@@ -3036,6 +3036,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                         majit_metainterp::default_bridge_array_descr,
                         __alloc,
                         fail_values,
+                        fail_types,
                     ),
                     None => majit_metainterp::BridgeVirtualCache::new(
                         __bridge_virtual_count,
@@ -3168,6 +3169,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                             let __op = majit_metainterp::materialize_bridge_virtual(
                                 ctx, *__vidx, rd_virtuals, resume_data, &mut __bridge_cache,
                             );
+                            // `OpRef::NONE` is the applying reader declining a
+                            // virtual kind it cannot allocate. Binding the field
+                            // to it would leave the walk reading a state field
+                            // the heap does not back, so raise the same decline
+                            // `replay_pending_fields` raises above.
+                            if __op.is_none() {
+                                ctx.mark_bridge_replay_incomplete();
+                            }
                             sym.set_state_field_ref(__k, __op);
                             if __dbg {
                                 eprintln!("  int scalar {} <- reg {} Virtual {}", __k, __target, __vidx);
@@ -3228,6 +3237,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                             let __op = majit_metainterp::materialize_bridge_virtual(
                                 ctx, *__vidx, rd_virtuals, resume_data, &mut __bridge_cache,
                             );
+                            // Int twin's reason, same remedy.
+                            if __op.is_none() {
+                                ctx.mark_bridge_replay_incomplete();
+                            }
                             sym.set_state_ref_field_ref(__j, __op);
                             if __dbg {
                                 eprintln!("  ref scalar {} <- reg {} Virtual {}", __j, __target, __vidx);

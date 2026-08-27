@@ -95,7 +95,80 @@ use std::sync::{Arc, Mutex};
 /// merge was attempted; 56 = eligible but not deferrable, because the region
 /// carries a `GUARD_NOT_INVALIDATED` whose dependencies would outlive the flag
 /// it reads.
-pub static BRIDGE_DIAG: [AtomicU64; 57] = [const { AtomicU64::new(0) }; 57];
+pub static BRIDGE_DIAG: [AtomicU64; BRIDGE_DIAG_LABELS.len()] =
+    [const { AtomicU64::new(0) }; BRIDGE_DIAG_LABELS.len()];
+
+/// Short key per [`BRIDGE_DIAG`] slot, in index order, spelling the legend
+/// above as something a reader can join against.
+///
+/// This array is the slot count — [`BRIDGE_DIAG`] takes its length from it —
+/// so a tally cannot be added without naming it. The wasm host mirrors these
+/// keys positionally (it links no majit crate) and prints them under
+/// `[jit-stats] bridge_diag`; without a declaration to compare against, a slot
+/// bumped here and unnamed there is simply never reported.
+///
+/// A few slots are legend entries that no site bumps today (a decline that was
+/// split finer, and the two `ml_*` sub-breakdowns). They keep their names so
+/// the indices below them do not move.
+pub const BRIDGE_DIAG_LABELS: &[&str] = &[
+    "entered",
+    "decl_callasm",
+    "decl_multipeel",
+    "decl_notdirect",
+    "decl_refhome",
+    "BRIDGE_OK",
+    "loopclosing",
+    "src_preamble",
+    "ml_descr_none",
+    "ml_unsafe_label",
+    "ml_arity_mismatch",
+    "decl_noadvance",
+    "ca_cell_set",
+    "ca_cells_zero",
+    "accepted_ca",
+    "decl_ca_trampoline",
+    "forced_ca_terminal_decline",
+    "ml_no_descr",
+    "ml_unpublished",
+    "pub_peeled",
+    "pub_flat",
+    "pub_flat_skipped",
+    "label_retracted",
+    "cl_entered",
+    "cl_ok",
+    "cl_decl_unsupported",
+    "cl_decl_host_reject",
+    "cell_set",
+    "cell_missing",
+    "cell_rebridge",
+    "reemit_failed",
+    "reemit_ok",
+    "inline_ok",
+    "inline_decl_not_direct",
+    "inline_decl_not_loop_closing",
+    "inline_decl_not_reemittable",
+    "inline_decl_already_owned",
+    "inline_decl_frame",
+    "inline_decl_not_header",
+    "inline_decl_no_loop_label",
+    "inline_decl_value_layout",
+    "inline_decl_ref_layout",
+    "inline_decl_missing_label",
+    "inline_decl_other",
+    "bridge_param_ok",
+    "bridge_param_decl_source_frame",
+    "bridge_param_decl_arity",
+    "bridge_param_label_suppressed",
+    "inline_decl_label_resume_layout",
+    "inline_decl_call_assembler",
+    "inline_decl_owner_invalidated",
+    "inline_decl_foreign_label",
+    "inline_ok_outside_loop",
+    "inline_decl_no_trip_helper",
+    "inline_deferred",
+    "inline_trip_fired",
+    "inline_decl_defer_invalidation_guard",
+];
 
 #[repr(u8)]
 #[derive(Clone, Copy)]

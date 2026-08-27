@@ -6879,9 +6879,9 @@ pub mod fbw_diag {
     /// `fbw_` for the full-body walk, `gate_` for the admission gates that run
     /// before it, `bridge_` for bridge setup.
     ///
-    /// The length is `RING_BASE` because the tallies are exactly the slots
-    /// below the ring.
-    pub const LABELS: [&str; RING_BASE] = [
+    /// This array is the tally count: `RING_BASE` is `LABELS.len()`, because
+    /// the tallies are exactly the slots below the ring.
+    pub const LABELS: &[&str] = &[
         "fbw_walks",
         "fbw_rolled_back_with_effects",
         "fbw_midbody_latch",
@@ -6910,7 +6910,7 @@ pub mod fbw_diag {
     ///
     /// `pyre-wasm-runner` decodes the ring through its OWN copy of this
     /// constant (`main.rs`); the two have to move together.
-    pub const RING_BASE: usize = 19;
+    pub const RING_BASE: usize = LABELS.len();
     pub const RING_ENTRIES: usize = 24;
     pub const RING_STRIDE: usize = 5;
     pub const NAME_SLOTS: usize = 4;
