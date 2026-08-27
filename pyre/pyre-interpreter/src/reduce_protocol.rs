@@ -55,7 +55,16 @@ fn handle(which: usize) -> PyObjectRef {
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
     let _ = pyre_object::gc_roots::pin_root(w_app_globals);
-    if let Err(e) = crate::importing::appleveldef_install(
+    // The source reads `sys.modules['copyreg']`, so it needs the same `sys`
+    // the program sees -- but binding the name through an import would read
+    // whatever the program left in `sys.modules['sys']`, and a `None` there
+    // is the sentinel that makes an import raise.  The interpreter's own
+    // module carries the same `modules` dict, so seeding it keeps what the
+    // source reads while taking the name out of the program's reach.
+    let Some(w_sys) = crate::importing::get_interpreter_sys_module() else {
+        panic!("reduce_protocol: no sys module to read `sys.modules` through");
+    };
+    if let Err(e) = crate::importing::appleveldef_install_seeded(
         pyre_object::gc_roots::shadow_stack_get(save_point),
         include_str!("reduce_protocol_app.py"),
         "reduce_protocol_app.py",
@@ -65,6 +74,7 @@ fn handle(which: usize) -> PyObjectRef {
         // only as their `__globals__['__name__']`.
         "__builtin__",
         &["reduce_1", "reduce_2", "get_slotvalues"],
+        &[("sys", w_sys)],
     ) {
         panic!("reduce_protocol: reduce_protocol_app.py — {e:?}");
     }
