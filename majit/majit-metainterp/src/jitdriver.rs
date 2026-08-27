@@ -4990,6 +4990,32 @@ impl<S: JitState> JitDriver<S> {
     /// therefore sited BEFORE the walk: once the walk has run, the tail has
     /// happened, and handing the same guard to the blackhole would apply it a
     /// second time.
+    /// Whether this guard's resume stream carries deferred heap writes.
+    ///
+    /// Read straight off the guard's own exit layout — the same lookup
+    /// `start_retrace_from_guard` makes for `retrace.storage`, but reachable
+    /// before a trace session exists, so a decline that turns on it does not
+    /// have to open one and tear it down.
+    fn guard_carries_pending_fields(
+        &self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) -> bool {
+        let Some(descr_fd) = descr_arc.as_fail_descr() else {
+            return false;
+        };
+        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
+            return false;
+        };
+        self.meta
+            .get_compiled_exit_layout_in_trace(
+                jct.green_key(),
+                descr_fd.trace_id(),
+                descr_fd.fail_index_per_trace(),
+            )
+            .and_then(|layout| layout.storage)
+            .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
+    }
+
     fn bridge_from_guard_resume_position(
         &mut self,
         descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -5003,6 +5029,31 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
+        // OPEN, and narrower than it was. The reader applies these guards'
+        // writes op-for-op as the blackhole does, and the virtualizable
+        // arrays are now written back from the resume stream, but a
+        // self-interpreting workload still reads one operand twice when these
+        // guards are served — and stops doing so when the virtualizable's
+        // banded arms are put out of reach, so what the walk resumes on is
+        // still described somewhere this entry does not restore. The scalars
+        // are the remaining candidate: they are carried by the state-field
+        // resume mechanism, disjoint from the array restore, and nothing
+        // writes them into the live state before the walk reads through them.
+        //
+        // Sited here rather than in the ladder below because
+        // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
+        // two readers per guard and never both: `start_bridge_tracing` asks
+        // for the applying one, which stores the deferred writes on its way
+        // in, and the blackhole arm this decline hands the guard to then
+        // stores them a second time.
+        if self.guard_carries_pending_fields(descr_arc) {
+            let why = GuardResumeDecline::ReplayIncomplete;
+            crate::mc_diag_bump(why.diag_slot());
+            if crate::majit_log_enabled() {
+                eprintln!("[bridge] guard-resume entry declined: {}", why.label());
+            }
+            return None;
+        }
         // No blackhole runs before this entry, so its replay is the one that
         // owes the guard's deferred writes to the heap.
         if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true) {
@@ -5026,6 +5077,15 @@ impl<S: JitState> JitDriver<S> {
             // other one is a decline.
             let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
             if frame.jitcode_index as usize != dispatch_index {
+                // Unlike the pending-fields decline this one cannot be
+                // hoisted: the frame it reads only exists once
+                // `rebuild_from_resumedata` has run, which is inside the call
+                // this rung is downstream of. A guard declined here therefore
+                // has had its virtuals allocated and its stores applied once
+                // before the blackhole applies them again — the re-application
+                // is idempotent (the stream carries the values, so neither
+                // pass reads what the other wrote) and the first set of
+                // virtuals becomes garbage.
                 return Err(Decline::ForeignJitcode);
             }
             // `resume.py _prepare_pendingfields` replays the guard's deferred
@@ -5047,27 +5107,9 @@ impl<S: JitState> JitDriver<S> {
             {
                 return Err(Decline::ReplayIncomplete);
             }
-            let has_pending = resume
-                .storage
-                .as_ref()
-                .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
             let fail_types = resume.fail_arg_types.clone();
             let values = frame.values.clone();
             let resume_pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
-            // OPEN, and narrower than it was. The reader applies these guards'
-            // writes op-for-op as the blackhole does, and the virtualizable
-            // arrays are now written back from the resume stream, but a
-            // self-interpreting workload still reads one operand twice when
-            // these guards are served — and stops doing so when the
-            // virtualizable's banded arms are put out of reach, so what the
-            // walk resumes on is still described somewhere this entry does
-            // not restore. The scalars are the remaining candidate: they are
-            // carried by the state-field resume mechanism, disjoint from the
-            // array restore above, and nothing writes them into the live
-            // state before the walk reads through them.
-            if has_pending {
-                return Err(Decline::ReplayIncomplete);
-            }
             let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
             let reg_indices = ctx
                 .bridge_reg_indices()

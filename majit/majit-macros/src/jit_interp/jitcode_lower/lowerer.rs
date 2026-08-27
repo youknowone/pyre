@@ -125,6 +125,13 @@ pub(super) struct Lowerer<'c> {
 pub(super) struct LowerSnapshot {
     statements: usize,
     op_metadata: usize,
+    /// The prebuild accumulator is a second emission stream, so it is
+    /// truncated with the first. An inline call pushes its helper's
+    /// `-live-` prebuild call here and its op into `statements`, and the two
+    /// are only meaningful together: a prebuild left behind by a refused
+    /// lowering registers liveness offsets for a jitcode the parent no
+    /// longer calls.
+    inline_liveness_prebuild: usize,
     next_reg: u16,
     next_label: u16,
     bindings: HashMap<String, Binding>,
@@ -284,6 +291,7 @@ impl<'c> Lowerer<'c> {
         LowerSnapshot {
             statements: self.statements.len(),
             op_metadata: self.op_metadata.len(),
+            inline_liveness_prebuild: self.inline_liveness_prebuild.len(),
             next_reg: self.next_reg,
             next_label: self.next_label,
             bindings: self.bindings.clone(),
@@ -295,6 +303,8 @@ impl<'c> Lowerer<'c> {
     pub(super) fn restore(&mut self, snapshot: LowerSnapshot) {
         self.statements.truncate(snapshot.statements);
         self.op_metadata.truncate(snapshot.op_metadata);
+        self.inline_liveness_prebuild
+            .truncate(snapshot.inline_liveness_prebuild);
         self.next_reg = snapshot.next_reg;
         self.next_label = snapshot.next_label;
         self.bindings = snapshot.bindings;
@@ -302,6 +312,15 @@ impl<'c> Lowerer<'c> {
 
     /// Run a lowering that emits before it can fail, and leave the stream
     /// untouched if it refuses.
+    ///
+    /// The stream is what is put back. The refusal-reason channels
+    /// (`body_failure_reason`, `nested_failure_reasons`) are deliberately not:
+    /// they are the diagnosis, and a refused attempt is often the only place
+    /// the deepest blocker is ever named. [`Self::take_body_failure_reason`]
+    /// joins them behind the reporting lowerer's own reason and dedups, so a
+    /// reason carried out of a discarded attempt can add a clause but can
+    /// never re-head the message — which is the same rule
+    /// [`Self::absorb_nested_failure`] exists to enforce.
     pub(super) fn transactional<T>(
         &mut self,
         lower: impl FnOnce(&mut Self) -> Option<T>,
@@ -375,9 +394,10 @@ impl<'c> Lowerer<'c> {
         } else {
             format_ident!("goto_if_not_int_is_true")
         };
-        // Both forms read an int-banked register per `assembler.py:217 'i'`
-        // argcode — encode the kind into the metadata `Register` so the
-        // liveness walker keeps it under Int.
+        // Both forms read an int-banked register: `assembler.py write_insn`
+        // takes a `Register` operand's argcode from `x.kind[0]`, which is
+        // `'i'` for the int bank — encode the kind into the metadata
+        // `Register` so the liveness walker keeps it under Int.
         self.emit_op(
             OpMeta::conditional_guard(Register::int(cond_reg), target.clone()),
             quote! { __builder.#branch(#cond_reg, #target); },
