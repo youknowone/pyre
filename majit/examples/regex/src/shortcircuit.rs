@@ -291,59 +291,84 @@
 //!
 //! # Throughput
 //!
-//! Median of 5 over 1048576 characters, one untimed warm-up first, all three
-//! rows measured in one process by one test. Three runs, one before the
-//! multi-frame bridge fix and two after it, each with the 1-minute load
-//! average it ran at — which is the only way these rows can be read:
+//! Absolute chars/s on this machine swings by 2x with load — the same binary
+//! read 56,208 and 203,740 on the branching row an hour apart — so every
+//! number below is either a ratio taken inside one loop or an A/B against a
+//! binary built from the same tree minutes apart. A standalone absolute row
+//! would not survive being quoted.
+//!
+//! ## Against RPython's own translated binaries
+//!
+//! `rpython_original/target.py` and `target_masking.py` are the same two
+//! spellings translated with `--opt=jit` and `--opt=2`. Three rounds, each
+//! running every binary once in the same loop so a load spike moves all six
+//! rows together; each row the median of five timed runs after one untimed
+//! warm-up, 1048576 characters at `n = 20`; the table the median of the three:
 //!
 //! ```text
-//!                        pre-fix        post-fix A      post-fix B
-//!   1-min load         7.7 -> 8.2      3.4 -> 50       34 -> 83
-//!   masking          46,889,491       17,327,682      17,382,474
-//!   no JIT at all     8,789,264        3,840,742       3,807,803
-//!   branching            22,034           10,154           9,407
-//!   masking / branching    2128x            1706x           1848x
-//!   no JIT  / branching     399x             378x            405x
+//!   1,048,576 chars, 93 nodes         majit    RPython jit   RPython C
+//!   &/|   jit_interp / target_masking 42,548,721  42,729,349  6,319,695
+//!   and/or shortcircuit / target         135,690     555,383  4,514,372
 //! ```
 //!
-//! **All three absolute rows fell by about the same factor** — masking 2.7x,
-//! no-JIT 2.3x, branching 2.2x — which is what a loaded machine does to every
-//! row at once and is not what a code change does to one of them. The ratios,
-//! which are taken inside a single process and so survive that, did not move:
-//! the verdict row reads 378x and 405x after the fix against 399x before it.
+//! **On the spelling the post reports, the two JITs are the same speed.** The
+//! post's numbers come from the adapted `&`/`|` matcher — part 2 says so — and
+//! on that row majit reads 1.00x of RPython. The headline ratio matches too:
+//! 42,548,721 / 4,514,372 = 9.4x against RPython's own 9.5x.
 //!
-//! So the fix does not show up here, and the reason is the bridge arithmetic
-//! above: `trace_eagerness` is 200, a 1M-character pass can grow at most a few
-//! thousand bridges, and the mark pattern has far more states than that. The
-//! branching portal stays about 400x slower than running the same algorithm
-//! with no JIT under it at all.
+//! **On the unadapted spelling both JITs lose to their own C, and this module
+//! loses harder.** RPython's `and`/`or` JIT is 8.2x slower than RPython
+//! translated to C. "Not particularly fast" is a property of the spelling, not
+//! of majit — upstream pays it in the same direction and the same order of
+//! magnitude. This module pays it 4.1x harder than upstream does, and that
+//! 4.1x is the one number in the table that is majit's own.
+//!
+//! ## What moved this module's row, and by how much
+//!
+//! The branching row was 10,154 and 9,407 chars/s when this module was
+//! written, at 1-minute load 3.4-50 and 34-83, with the masking row at
+//! 17.3M and the no-JIT row at 3.8M in the same two processes — so
+//! masking / branching read 1706x and 1848x, and no-JIT / branching 378x and
+//! 405x. Profiling that row found two majit defects, each fixed and each
+//! measured against a binary built from the same tree:
+//!
+//! * **The blackhole byte-interpreted `shift`.** `bhimpl_inline_call_*`
+//!   (`blackhole.py:1278-1319`) runs `cpu.bh_call_X(adr2int(jitcode.fnaddr),
+//!   ...)`: upstream's blackhole calls a callee, it does not interpret it.
+//!   `#[jit_inline]` staged its helper jitcode with `fnaddr = 0`, so the whole
+//!   ported `bhimpl_inline_call_*` family was unreachable and every deopt
+//!   walked `shift`'s 4-to-7-frame recursion opcode by opcode: 2,142 blackhole
+//!   ops per character, 319,567 blackhole frames entered over 4096 characters.
+//!   With the entry staged the way `call.py:167-169` builds one, 113 ops per
+//!   character and 20,236 frames — `bh-setpos == bh-frame`, so not one frame
+//!   is entered from `BC_INLINE_CALL` any more. A/B at 4096 characters:
+//!   172,269 against 62,900 chars/s.
+//!   `shift_carries_the_native_entry_the_blackhole_calls` is the gate.
+//! * **`OptContext::inputarg_refs` grew by the parent trace's length on every
+//!   bridge.** It holds the canonical `_forwarded` host per InputArg, and it
+//!   was a `Vec` indexed by absolute trace position — but a bridge enters with
+//!   `inputarg_base = parent_high_water`, so naming one of its inputargs grew
+//!   the vector across the whole parent trace, one `Rc` allocation per padding
+//!   slot, on every bridge the optimizer ran including the ones it declined.
+//!   `sample` put that growth and its matching frees at 56% of the run. A/B at
+//!   1M characters: 140,775 against 42,065 for one shared padding `Rc`, then
+//!   166,203 against 109,959 — six interleaved pairs, medians — for dropping
+//!   the positional `Vec` for a map so the growth term disappears rather than
+//!   becoming cheap. `optimizer.py` forwards on the box object
+//!   (`op.set_forwarded(newop)`) and keeps no positional side table at all.
+//!
+//! Neither fix touches how OFTEN the deopt happens, only what it costs: the
+//! rate is still 0.997 guard failures per character at 4096 and at 32768. The
+//! verdict survives both — the branching portal is still far slower than
+//! running the same algorithm with no JIT under it at all, because a character
+//! that misses every bridge still pays an interpreter round trip the plain
+//! matcher never pays.
 //!
 //! The in-process ratio the suite runs on every invocation, at 4096
-//! characters, is the one quantity that did move: 66x, 68x and 89x on dynasm
-//! before the fix; four runs after it, at 1-minute load 33 to 36, read 32x,
-//! 35x, 50x and 51x. The band moved and does not overlap, which is the
-//! direction the ten bridges predict; the spread inside it is the load, and
-//! neither band is a number to quote to two digits.
-//!
-//! The third row is what turns "slower" into a verdict, and the fix does not
-//! overturn it. The branching portal does not merely give back the JIT's win
-//! over the plain matcher: it is far slower than running the same algorithm
-//! with no JIT under it at all, because a character that misses every bridge
-//! still pays an interpreter round trip the plain matcher never pays. "Not
-//! particularly fast" is, here, orders of magnitude.
-//!
-//! Each column is three rows of one process, which is what makes the ratios
-//! worth quoting: the machine was never idle, and a ratio taken inside one run
-//! survives that where an absolute row does not. Earlier runs of the same
-//! source at higher load read 1716x, 1579x and 2336x — the branching row is
-//! the load-sensitive one and moves by up to 1.7x, while the finding does not.
-//!
-//! The 4096-character ratio is much smaller than the 1M one either way. It
-//! grows with input length because `matches` builds a fresh `JitDriver` per
-//! call, so at 4096 characters the masking row is still paying for a recording
-//! it only amortizes over a long input, while the branching row has far less
-//! to amortize it against — ten bridges that each serve one path, against a
-//! compiled loop that serves every character.
+//! characters, moved the same way and for the same reason: 66x, 68x and 89x on
+//! dynasm before the multi-frame bridge fix (19x on cranelift), 32x to 51x
+//! after it, 12x to 14x now. The masking row has one guard and does not fail
+//! it, so it did not move; the ratio fell by what the branching row gained.
 //!
 //! # The spelling the post's advice suggests literally
 //!
@@ -1327,8 +1352,8 @@ mod tests {
     /// `#[ignore]`d because at the branching portal's rate a single pass over
     /// 1M characters takes over a minute.
     ///
-    /// The ratio here is much smaller than the doc table's, and the reason is
-    /// worth stating rather than smoothing over: `matches` builds a fresh
+    /// The ratio here is smaller than the doc table's, and the reason is worth
+    /// stating rather than smoothing over: `matches` builds a fresh
     /// `JitDriver` per call, so every call re-records and re-compiles, and at
     /// 4096 characters that one-off recording is most of the masking row's
     /// wall clock. The branching row has far less to amortize it against — ten
@@ -1352,20 +1377,28 @@ mod tests {
             median(&sc),
             median(&mk),
         );
-        // Measured at this length: 66x, 68x and 89x on dynasm BEFORE the
-        // multi-frame bridge fix, 19x on cranelift; 32x, 35x, 50x and 51x on
-        // dynasm after it, at 1-minute load 33 to 36. The backends differ here
-        // and not in the op census because at 4096 characters this row is
-        // dominated by the ONE recording each `matches` call pays for, and
-        // cranelift compiles slower than dynasm. The floor stays 10x: low
-        // enough to clear cranelift under contention and to survive further
-        // bridging, and still far above the ~1x a lost finding would read.
+        // Measured at this length, on dynasm: 66x, 68x and 89x before the
+        // multi-frame bridge fix (19x on cranelift), 32x to 51x after it, and
+        // 12x to 14x now that the blackhole calls `shift` instead of
+        // interpreting it and the optimizer no longer grows `inputarg_refs`
+        // across the parent trace on every bridge. The branching row is the
+        // one those two fixes moved; the masking row has one guard and does
+        // not fail it, so it did not move, and the ratio fell by what the
+        // branching row gained. The backends differ here and not in the op
+        // census because at 4096 characters this row is dominated by the ONE
+        // recording each `matches` call pays for, and cranelift compiles
+        // slower than dynasm.
+        //
+        // The floor is 3x rather than 10x for that reason: 10x was set when
+        // the band was 32-51x and one run has since read 7.8x, which is the
+        // masking row's own spread at this length rather than a lost finding.
+        // 3x still clears cranelift under contention and is still far above
+        // the ~1x a lost finding would read.
         assert!(
-            ratio > 10.0,
+            ratio > 3.0,
             "masking was only {ratio:.1}x the branching rate at {} characters. \
-             The module doc reports 32-51x here on dynasm since the \
-             multi-frame bridge fix, 19x on cranelift before it and 1716x at \
-             1M, and under 10x that table is wrong rather than stale",
+             The module doc reports 12-14x here on dynasm, and under 3x that \
+             figure is wrong rather than stale",
             s.len(),
         );
     }

@@ -249,30 +249,80 @@ REGEX_LISTING=1 cargo test -p regex --no-default-features --features dynasm \
 The two listings are formatted differently — RPython's prints op names, majit's
 prints the whole operation — so they are read together, not `diff`ed.
 
-## Speed is measured, but not here
+## Speed, measured on both sides
 
-It is not a speed comparison. `meta_interp` runs the optimizer and the LLGraph
-backend, which executes traces in an interpreter; timing it would measure the
-harness. The RPython comparison is the trace-shape one above, and that one is
-exact.
+The census above is the trace-shape comparison and it is exact. This is the
+other half: how fast the two implementations actually scan the same 1,048,576
+characters against the same 93-node tree.
 
-`target.py` and `target_masking.py` are what would answer it on this side: a
-translated binary runs compiled traces natively, which is the row the post
-reports.
+`meta_interp` cannot answer it — `runner.py` runs the LLGraph backend, which
+executes traces in an interpreter, so timing it would measure the harness.
+Only a translated binary runs compiled traces natively, which is what
+`target.py` and `target_masking.py` are for:
 
 ```sh
 pypy <repo root>/rpython/bin/rpython --opt=jit target.py   # RPython + JIT
 pypy <repo root>/rpython/bin/rpython --opt=2   target.py   # translated to C
 ```
 
-Four binaries — two spellings times two optimization levels — would give the
-post's `and`/`or` claim its RPython-side reading and the JIT-over-C ratio its
-RPython-side denominator. **No such measurement has been taken here.** Each
-translation is a multi-hour build, and this README does not carry a number
-nothing ran. The targets are checked in so the measurement is a build away
-rather than a rewrite away.
+This README used to say that no such measurement had been taken and that each
+translation was a multi-hour build. Both halves were wrong: `--opt=jit` took
+**204s** and `--opt=2` **41s** here, so all four binaries — two spellings times
+two optimization levels — are a five-minute build.
 
-The post's headline *ratio* is measured, on the majit side, in one process:
+### The measurement
+
+Three rounds, each running every binary once in the same loop so a load spike
+moves all six rows together rather than one of them. Each row is the median of
+five timed runs after one untimed warm-up, over 1,048,576 characters at `n =
+20`; the table is the median of the three rounds. Machine at 1-minute load 19
+to 26 throughout.
+
+| 1,048,576 chars, 93 nodes | majit | RPython `--opt=jit` | RPython `--opt=2` (C) |
+|---|---:|---:|---:|
+| `&`/`\|` — `jit_interp.rs` / `target_masking.py` | **42,548,721** | **42,729,349** | 6,319,695 |
+| `and`/`or` — `shortcircuit.rs` / `target.py` | 135,690 | 555,383 | 4,514,372 |
+
+Two readings, and they are different readings.
+
+**On the spelling the post reports, the two JITs are the same speed.** The
+post's own numbers come from the adapted `&`/`|` matcher — part 2 says so
+outright — and on that row majit reads 1.00x of RPython. Its headline ratio is
+the same too: 42,548,721 / 4,514,372 = **9.4x** against RPython's own
+42,729,349 / 4,514,372 = **9.5x**, both against the post's 16,500,000 / 720,000
+= 22.9x on 2010 hardware.
+
+**On the unadapted spelling both JITs lose to their own C, and majit loses
+harder.** RPython's `and`/`or` JIT is **8.2x slower than RPython translated to
+C** (555,383 against 4,514,372). So "if you don't change the `and` and `or`
+... it's not particularly fast" is not a majit artifact and not a Rust
+artifact — it is a property of the spelling, and upstream pays it in the same
+direction and the same order of magnitude. majit pays it 4.1x harder than
+upstream does, which is the one gap in this table that is majit's own.
+
+`PYPYLOG=jit-summary:-` on the `and`/`or` build at 262,144 characters says
+where upstream's time goes: 1 loop, **1185 bridges**, `Tracing 0.145s` +
+`Backend 0.107s` out of `TOTAL 0.847s`. Even upstream spends 30% of that run
+compiling, and 1185 is a rate rather than a ceiling — `trace_eagerness` is 200,
+so a pass of `n` characters grows at most about `n / 200` bridges however many
+distinct mark patterns the tree has. majit is rate-limited by the same
+parameter and grows 84 over 32,768 characters.
+
+### One caveat about the majit column
+
+`matches()` builds a fresh `JitDriver` per call, so each of majit's five timed
+runs re-records and re-compiles; `target_masking.py` calls a module-level
+`jitdriver` and pays that once, in the warm-up. It shows: across the three
+rounds RPython's four rows move by 8% and majit's masking row moves by 2.5x
+(42.5M, 16.9M, 45.2M), which is compile-time variance rather than scan-time
+variance. The median is the row above; the low round is what a contended
+compile does to it. Every majit portal in the tree builds its driver per call,
+so this is a majit convention rather than something this example chose.
+
+### The majit-only ratio
+
+The post's headline ratio is also measured on the majit side alone, in one
+process, and that one runs in the normal suite:
 
 ```sh
 cargo test -p regex --release --no-default-features --features dynasm \
@@ -285,12 +335,13 @@ cargo test -p regex --release --no-default-features --features dynasm \
 [perf] majit JIT / no JIT = 5.5x   (the post's own: 16,500,000 / 720,000 = 22.9x)
 ```
 
-A ratio taken inside one run is the only quantity that travels off a machine;
-the absolute rows are sixteen years and two instruction sets from the post's.
-Ours is the smaller ratio because its denominator is better — `interp.rs`
-through `rustc -O`, against RPython's C backend in 2010. `--release` matters:
-a debug run reads about 9.0x because the denominator is unoptimized, and the
-test prints a banner saying so rather than letting that number be quoted.
+That ratio is smaller than the table's 9.4x because its denominator is
+`interp.rs` rather than RPython's C — and the table says those two are within
+10% of each other (majit's no-JIT row reads 4,175,067 against `target.py`'s
+4,514,372), so the two denominators are comparable and the two ratios are
+measuring the same thing at different lengths and loads. `--release` matters: a
+debug run reads about 9.0x because the denominator is unoptimized, and the test
+prints a banner saying so rather than letting that number be quoted.
 
 Cranelift reads 2.6x in the same conditions. The two backends agree op for op
 on every census above and differ only here — this row includes the one
