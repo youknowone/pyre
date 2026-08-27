@@ -63,7 +63,9 @@ fn structseq_registry() -> &'static Mutex<IndexMap<usize, StructSeqDescr>> {
 
 /// Whether `obj` is one of the heap types created by `structseqtype`.
 /// Structseq types are unacceptable as bases but, unlike most types with that
-/// flag, their constructor accepts the `sequence=` and `dict=` keywords.
+/// restriction, their constructor accepts the `sequence=` and `dict=`
+/// keywords.  The restriction belongs to `structseqtype`, not to tuple's
+/// shared TypeDef.
 pub(crate) fn is_structseq_type(obj: PyObjectRef) -> bool {
     structseq_registry()
         .lock()
@@ -833,8 +835,12 @@ fn make_heap_structseq_type(
         pyre_object::w_type_set_layout(cls, parent_layout);
         pyre_object::w_type_set_hasdict(cls, pyre_object::w_type_get_hasdict(base));
         pyre_object::w_type_set_weakrefable(cls, pyre_object::w_type_get_weakrefable(base));
-        // CPython's PyStructSequence types set no acceptable-base flag.
-        pyre_object::w_type_set_acceptable_as_base_class(cls, false);
+        // CPython's PyStructSequence types publish no BASETYPE flag.  Keep
+        // that projection per type: this app-level class shares tuple's
+        // TypeDef, which remains an acceptable base.  `check_and_find_best_base`
+        // mirrors `lib_pypy._structseq.structseqtype.__new__`'s per-structseq
+        // rejection.
+        pyre_object::w_type_suppress_cpython_basetype(cls);
 
         let base_mro = pyre_object::w_type_get_mro(base);
         let mut mro = vec![cls];
@@ -848,4 +854,22 @@ fn make_heap_structseq_type(
         pyre_object::typeobject::w_type_ready(cls);
     }
     pyre_object::gc_roots::shadow_stack_get(cls_slot)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn structseq_base_rejection_does_not_poison_tuple_typedef() {
+        crate::typedef::init_typeobjects();
+        let tuple_type = crate::typedef::gettypeobject(&pyre_object::pyobject::TUPLE_TYPE);
+        let structseq = super::make_struct_seq("test.StructSeq", &["value"]);
+
+        let structseq_bases = pyre_object::w_tuple_new(vec![structseq]);
+        let err = unsafe { crate::call::check_and_find_best_base(structseq_bases) }.unwrap_err();
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+
+        let tuple_bases = pyre_object::w_tuple_new(vec![tuple_type]);
+        let best = unsafe { crate::call::check_and_find_best_base(tuple_bases) }.unwrap();
+        assert!(std::ptr::eq(best, tuple_type));
+    }
 }

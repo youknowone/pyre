@@ -5380,7 +5380,7 @@ fn instance_layout(w_base: PyObjectRef) -> *const pyre_object::PyType {
     let layout = unsafe { pyre_object::w_type_get_layout_ptr(w_base) };
     match layout.is_null() {
         true => instance,
-        false => unsafe { (*layout).typedef },
+        false => unsafe { (*(*layout).typedef).instance_type },
     }
 }
 
@@ -5425,7 +5425,7 @@ fn resolve_metatype(
     let layout = unsafe { pyre_object::w_type_get_layout_ptr(w_metatype) };
     let laid_out_as_a_type = !layout.is_null()
         && std::ptr::eq(
-            unsafe { (*layout).typedef },
+            unsafe { (*(*layout).typedef).instance_type },
             &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
         );
     if !laid_out_as_a_type {

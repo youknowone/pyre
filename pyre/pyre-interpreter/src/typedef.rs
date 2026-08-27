@@ -2570,12 +2570,10 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
     // typeobject.py setup_builtin_type — root type gets its own Layout.
     unsafe {
         let layout = pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
-            typedef: &INSTANCE_TYPE as *const PyType,
+            typedef: pyre_object::typeobject::leak_interpreter_typedef(&INSTANCE_TYPE, true, false),
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
-            acceptable_as_base_class: true, // object has __new__
-            typedef_hasdict: false,         // object typedef declares no __dict__
             dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         pyre_object::w_type_set_layout(type_obj, layout);
@@ -2601,16 +2599,23 @@ fn new_typeobject_with_base(
 
 /// Create a builtin type with explicit layout PyType.
 ///
-/// typeobject.py setup_builtin_type parity: each builtin type
-/// gets its own Layout based on its instancetypedef. Types that share
-/// the same typedef as their base reuse the parent's Layout object.
+/// `setup_builtin_type` parity: each ordinary builtin call owns a distinct
+/// TypeDef even when its concrete Rust allocation type matches the base.
+/// The explicit `overridetypedef` route below is the only reuse path.
 fn new_typeobject_with_base_and_layout(
     name: &str,
     init: impl FnOnce(PyObjectRef),
     base: PyObjectRef,
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
-    new_typeobject_with_metatype_and_layout(name, init, base, layout_pytype, PY_NULL)
+    new_typeobject_with_metatype_and_layout(
+        name,
+        init,
+        base,
+        layout_pytype,
+        PY_NULL,
+        std::ptr::null(),
+    )
 }
 
 /// [`new_typeobject_with_base_and_layout`] for a type whose own type is not
@@ -2624,6 +2629,7 @@ fn new_typeobject_with_metatype_and_layout(
     base: PyObjectRef,
     layout_pytype: *const PyType,
     w_metatype: PyObjectRef,
+    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2675,13 +2681,20 @@ fn new_typeobject_with_metatype_and_layout(
     //   return Layout(instancetypedef, 0, base_layout=parent_layout)
     unsafe {
         let parent_layout = pyre_object::w_type_get_layout_ptr(base);
-        let reuse = if !parent_layout.is_null() {
-            std::ptr::eq((*parent_layout).typedef, layout_pytype)
-        } else {
-            false
-        };
         let has_dict = pyre_object::w_dict_getitem_str(ns, "__dict__").is_some();
         let has_weakref = pyre_object::w_dict_getitem_str(ns, "__weakref__").is_some();
+        let typedef = if overridetypedef.is_null() {
+            let has_new = pyre_object::w_dict_getitem_str(ns, "__new__").is_some();
+            let inherited_hasdict = !parent_layout.is_null() && (*(*parent_layout).typedef).hasdict;
+            pyre_object::typeobject::leak_interpreter_typedef(
+                layout_pytype,
+                has_new,
+                has_dict || inherited_hasdict,
+            )
+        } else {
+            overridetypedef
+        };
+        let reuse = !parent_layout.is_null() && std::ptr::eq((*parent_layout).typedef, typedef);
         let layout = if reuse {
             // A `dict` subclass keeps its entries in a reserved layout slot
             // rather than in the dict layout.  `create_all_slots` reserves
@@ -2697,27 +2710,19 @@ fn new_typeobject_with_metatype_and_layout(
             match crate::type_methods::base_owes_dict_backing(base) {
                 false => parent_layout,
                 true => pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
-                    typedef: layout_pytype,
+                    typedef: (*parent_layout).typedef,
                     nslots: (*parent_layout).nslots + 1,
                     newslotnames: vec![crate::type_methods::DICT_DATA_SLOT.to_string()],
                     base_layout: parent_layout,
-                    acceptable_as_base_class: (*parent_layout).acceptable_as_base_class,
-                    typedef_hasdict: (*parent_layout).typedef_hasdict,
                     dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
                 }),
             }
         } else {
-            let has_new = pyre_object::w_dict_getitem_str(ns, "__new__").is_some();
             pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
-                typedef: layout_pytype,
+                typedef,
                 nslots: 0,
                 newslotnames: vec![],
                 base_layout: parent_layout,
-                acceptable_as_base_class: has_new,
-                // typedef.py `hasdict = '__dict__' in rawdict` — a typedef
-                // that declares `__dict__` does its own dict management, so
-                // mapdict must not add a second one (typeobject.py:253-257).
-                typedef_hasdict: has_dict,
                 dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             })
         };
@@ -2756,27 +2761,33 @@ fn new_typeobject_with_metatype_and_layout(
 /// linearization (`compute_default_mro`).  Used for builtin exception
 /// classes with more than one base, e.g.
 /// `class UnsupportedOperation(OSError, ValueError)`.
-pub fn make_builtin_type_with_bases(
+pub fn make_builtin_type_with_bases_and_overridetypedef(
     name: &str,
     init: impl FnOnce(PyObjectRef),
     bases: &[PyObjectRef],
 ) -> PyObjectRef {
     let base = bases[0];
-    // A multi-base builtin class introduces no instance layout of its own, so
-    // it names the primary base's typedef and the reuse rule below hands back
-    // that same Layout.
-    let layout_pytype = unsafe {
+    // `_new_exception`-style classes use `applevel_subclasses_base` as
+    // TypeCache's `overridetypedef`, so they retain the primary real base's
+    // exact TypeDef and Layout.
+    let overridetypedef = unsafe {
         let parent_layout = pyre_object::w_type_get_layout_ptr(base);
         if parent_layout.is_null() {
-            &INSTANCE_TYPE as *const PyType
+            std::ptr::null()
         } else {
             (*parent_layout).typedef
         }
     };
-    make_builtin_type_with_bases_and_layout(name, init, bases, layout_pytype)
+    let layout_pytype = if overridetypedef.is_null() {
+        &INSTANCE_TYPE as *const PyType
+    } else {
+        unsafe { (*overridetypedef).instance_type }
+    };
+    make_builtin_type_with_bases_and_layout_owner(name, init, bases, layout_pytype, overridetypedef)
 }
 
-/// [`make_builtin_type_with_bases`] with an explicit interpreter TypeDef
+/// [`make_builtin_type_with_bases_and_overridetypedef`] with an explicit
+/// interpreter TypeDef
 /// identity for a concrete class that introduces its own instance Layout.
 ///
 /// PyPy `setup_builtin_type` receives the concrete `instancetypedef` even for
@@ -2789,6 +2800,22 @@ pub fn make_builtin_type_with_bases_and_layout(
     bases: &[PyObjectRef],
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
+    make_builtin_type_with_bases_and_layout_owner(
+        name,
+        init,
+        bases,
+        layout_pytype,
+        std::ptr::null(),
+    )
+}
+
+pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    bases: &[PyObjectRef],
+    layout_pytype: *const PyType,
+    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
+) -> PyObjectRef {
     let base = bases[0];
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -2797,29 +2824,43 @@ pub fn make_builtin_type_with_bases_and_layout(
     init(ns);
     let bases_tuple = w_tuple_new(bases.to_vec());
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    let type_obj = new_builtin_typeobject(name, bases_tuple, ns as *mut u8, layout_pytype, PY_NULL);
+    let parent_layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
+    let typedef = if overridetypedef.is_null() {
+        let has_new = unsafe { pyre_object::w_dict_getitem_str(ns, "__new__").is_some() };
+        let has_dict = unsafe { pyre_object::w_dict_getitem_str(ns, "__dict__").is_some() };
+        let inherited_hasdict = bases.iter().any(|&base| unsafe {
+            let layout = pyre_object::w_type_get_layout_ptr(base);
+            !layout.is_null() && (*(*layout).typedef).hasdict
+        });
+        pyre_object::typeobject::leak_interpreter_typedef(
+            layout_pytype,
+            has_new,
+            has_dict || inherited_hasdict,
+        )
+    } else {
+        overridetypedef
+    };
+    let type_obj = new_builtin_typeobject(
+        name,
+        bases_tuple,
+        ns as *mut u8,
+        unsafe { (*typedef).instance_type },
+        PY_NULL,
+    );
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
 
     unsafe {
-        let parent_layout = pyre_object::w_type_get_layout_ptr(base);
-        let reuse = if !parent_layout.is_null() {
-            std::ptr::eq((*parent_layout).typedef, layout_pytype)
-        } else {
-            false
-        };
+        let reuse = !parent_layout.is_null() && std::ptr::eq((*parent_layout).typedef, typedef);
         let has_dict = pyre_object::w_dict_getitem_str(ns, "__dict__").is_some();
         let has_weakref = pyre_object::w_dict_getitem_str(ns, "__weakref__").is_some();
         let layout = if reuse {
             parent_layout
         } else {
-            let has_new = pyre_object::w_dict_getitem_str(ns, "__new__").is_some();
             pyre_object::typeobject::leak_layout(pyre_object::typeobject::Layout {
-                typedef: layout_pytype,
+                typedef,
                 nslots: 0,
                 newslotnames: vec![],
                 base_layout: parent_layout,
-                acceptable_as_base_class: has_new,
-                typedef_hasdict: has_dict,
                 dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             })
         };
@@ -2850,7 +2891,7 @@ pub fn make_builtin_type_with_bases_and_layout(
 /// Create a named builtin type inheriting from `object`.
 ///
 /// Used by extension modules (e.g. _sre) to define their own types.
-/// typeobject.py `is_heaptype=False` — builtin type.
+/// `W_TypeObject.__init__` receives `is_heaptype=False` for a builtin TypeDef.
 pub fn make_builtin_type(name: &str, init: impl FnOnce(PyObjectRef)) -> PyObjectRef {
     new_typeobject_with_base(name, init, w_object())
 }
@@ -2868,15 +2909,56 @@ pub fn make_builtin_type_with_base(
 /// `layout_pytype` (the `*const PyType` stored in `ob_header.ob_type`
 /// for new instances).  Used for W_Root subclasses that allocate
 /// their own typed payload (e.g. `GetSetProperty`) rather than
-/// piggy-backing on `INSTANCE_TYPE`.  Mirrors `typeobject.py:1273-1280
-/// setup_builtin_type`'s explicit-layout branch.
+/// piggy-backing on `INSTANCE_TYPE`. Mirrors `setup_builtin_type`'s
+/// explicit-layout branch.
 pub fn make_builtin_type_with_layout(
     name: &str,
     init: impl FnOnce(PyObjectRef),
     base: PyObjectRef,
     layout_pytype: *const PyType,
 ) -> PyObjectRef {
-    new_typeobject_with_base_and_layout(name, init, base, layout_pytype)
+    make_builtin_type_with_layout_owner(name, init, base, layout_pytype, std::ptr::null())
+}
+
+/// `setup_builtin_type` with the separate allocation type and TypeCache
+/// `overridetypedef` inputs kept explicit.  A null override means the builtin
+/// owns a fresh TypeDef even when its Rust allocation type matches its base.
+pub(crate) fn make_builtin_type_with_layout_owner(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    base: PyObjectRef,
+    layout_pytype: *const PyType,
+    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
+) -> PyObjectRef {
+    new_typeobject_with_metatype_and_layout(
+        name,
+        init,
+        base,
+        layout_pytype,
+        PY_NULL,
+        overridetypedef,
+    )
+}
+
+/// PyPy `TypeCache.build`: construct a builtin type using an explicit
+/// `overridetypedef` such as an exception's `applevel_subclasses_base`.
+/// The resulting type reuses the base Layout only when that exact TypeDef is
+/// already its owner.
+pub fn make_builtin_type_with_overridetypedef(
+    name: &str,
+    init: impl FnOnce(PyObjectRef),
+    base: PyObjectRef,
+    overridetypedef: *const pyre_object::typeobject::InterpreterTypeDef,
+) -> PyObjectRef {
+    let layout_pytype = unsafe { (*overridetypedef).instance_type };
+    new_typeobject_with_metatype_and_layout(
+        name,
+        init,
+        base,
+        layout_pytype,
+        PY_NULL,
+        overridetypedef,
+    )
 }
 
 /// [3.14-spec] Project a CPython `PyType_From*Spec` owner onto a PyPy builtin
@@ -2908,7 +2990,20 @@ pub fn make_builtin_type_with_metatype(
     layout_pytype: *const PyType,
     w_metatype: PyObjectRef,
 ) -> PyObjectRef {
-    new_typeobject_with_metatype_and_layout(name, init, base, layout_pytype, w_metatype)
+    let parent_layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
+    let overridetypedef = if parent_layout.is_null() {
+        std::ptr::null()
+    } else {
+        unsafe { (*parent_layout).typedef }
+    };
+    new_typeobject_with_metatype_and_layout(
+        name,
+        init,
+        base,
+        layout_pytype,
+        w_metatype,
+        overridetypedef,
+    )
 }
 
 /// int.__new__(cls, *args) — PyPy: intobject.py descr__new__
@@ -31711,6 +31806,29 @@ mod tests {
                 expected,
                 "{name}.acceptable_as_base_class"
             );
+        }
+    }
+
+    #[test]
+    fn builtin_typedef_identity_is_not_the_rust_allocation_type() {
+        crate::typedef::init_typeobjects();
+        let object_layout =
+            unsafe { pyre_object::w_type_get_layout_ptr(crate::typedef::w_object()) };
+        let mappingproxy_layout = unsafe {
+            pyre_object::w_type_get_layout_ptr(crate::typedef::gettypeobject(
+                &pyre_object::MAPPING_PROXY_TYPE,
+            ))
+        };
+
+        unsafe {
+            assert!(std::ptr::eq(
+                (*(*object_layout).typedef).instance_type,
+                (*(*mappingproxy_layout).typedef).instance_type,
+            ));
+            assert!(!std::ptr::eq(
+                (*object_layout).typedef,
+                (*mappingproxy_layout).typedef,
+            ));
         }
     }
 

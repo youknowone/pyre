@@ -1122,6 +1122,12 @@ crate::py_module! {
         "get_fips_mode" / 0 = |_| Ok(w_int_new(0)),
     },
     extra_init: |ns| {
+        // [3.14-spec] PyPy owns `HMAC` as the ordinary app-level
+        // `lib_pypy._hashlib.HMAC` class.  CPython 3.14's `_hashlib.HMAC`
+        // rejects use as a base; retain the PyPy class relationship and
+        // suppress only that per-type public capability.
+        let hmac = crate::module_ns_get(ns, "HMAC").expect("_hashlib.HMAC installed");
+        unsafe { pyre_object::w_type_suppress_cpython_basetype(hmac) };
         let _roots = gc_roots::push_roots();
         let mapping_slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(w_dict_new());

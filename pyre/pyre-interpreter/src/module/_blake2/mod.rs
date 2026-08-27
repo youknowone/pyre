@@ -19,4 +19,14 @@ crate::py_module! {
     appleveldefs: {
         "_blake2_app.py" => ["blake2b", "blake2s"],
     },
+    extra_init: |ns| {
+        // [3.14-spec] Keep PyPy's app-level `_make_blake_type` classes and
+        // their object-owned state, but match CPython 3.14's immutable
+        // non-BASETYPE public types at the subclassing boundary.
+        for name in ["blake2b", "blake2s"] {
+            let ty = crate::module_ns_get(ns, name).expect("_blake2 app-level type installed");
+            crate::typedef::mark_cpython_heap_type(ty, true);
+            unsafe { pyre_object::w_type_suppress_cpython_basetype(ty) };
+        }
+    },
 }

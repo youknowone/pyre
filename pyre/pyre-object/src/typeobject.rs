@@ -9,40 +9,63 @@
 
 use crate::pyobject::*;
 
+/// `pypy/interpreter/typedef.py TypeDef` metadata used by
+/// `objspace/std/typeobject.py Layout`.
+///
+/// Layout identity and TypeDef identity are different axes in PyPy: derived
+/// layouts retain the interpreter class's TypeDef, while multiple types may
+/// share one Layout.  Keeping these TypeDef fields on Layout forces a layout
+/// clone when bootstrap adjusts `acceptable_as_base_class`, breaking that
+/// identity relationship.
+pub struct InterpreterTypeDef {
+    /// Pyre's allocation-vtable analogue of the RPython interpreter class.
+    pub instance_type: *const PyType,
+    acceptable_as_base_class: std::sync::atomic::AtomicBool,
+    pub hasdict: bool,
+}
+
+impl InterpreterTypeDef {
+    #[inline]
+    pub fn acceptable_as_base_class(&self) -> bool {
+        self.acceptable_as_base_class
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_acceptable_as_base_class(&self, value: bool) {
+        self.acceptable_as_base_class
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Allocate process-lifetime TypeDef metadata, matching PyPy's module-level
+/// `W_X.typedef` objects.
+pub fn leak_interpreter_typedef(
+    instance_type: *const PyType,
+    acceptable_as_base_class: bool,
+    hasdict: bool,
+) -> *const InterpreterTypeDef {
+    crate::lltype::malloc_raw(InterpreterTypeDef {
+        instance_type,
+        acceptable_as_base_class: std::sync::atomic::AtomicBool::new(acceptable_as_base_class),
+        hasdict,
+    })
+}
+
 /// typeobject.py Layout object.
 ///
 /// Immutable after creation. Shared between types that have the same
 /// instance layout (e.g. a class without __slots__ shares its base's layout).
 /// Identity comparison via pointer equality.
 pub struct Layout {
-    /// typeobject.py:113 — the typedef (PyType) that this layout is for.
-    pub typedef: *const PyType,
-    /// typeobject.py:114 — total number of extra slots.
+    /// `Layout.__init__` — the TypeDef that this layout is for.
+    pub typedef: *const InterpreterTypeDef,
+    /// `Layout.__init__` — total number of extra slots.
     pub nslots: u32,
-    /// typeobject.py:115 — sorted list of slot names introduced by this class.
+    /// `Layout.__init__` — sorted slot names introduced by this class.
     pub newslotnames: Vec<String>,
-    /// typeobject.py:116 — parent layout (identity comparison).
+    /// `Layout.__init__` — parent layout (identity comparison).
     pub base_layout: *const Layout,
-    /// typedef.py — `acceptable_as_base_class = '__new__' in rawdict`.
-    /// TODO: in RPython this lives on TypeDef, accessed
-    /// via `layout.typedef.acceptable_as_base_class`. Stored on Layout
-    /// here because Rust has no TypeDef struct yet — Layout.typedef is
-    /// `*const PyType` (≈ CLASSTYPE), and many types share INSTANCE_TYPE
-    /// but need different acceptable_as_base_class values.
-    /// Convergence: introduce a Rust TypeDef struct, move this field there.
-    pub acceptable_as_base_class: bool,
-    /// typedef.py — `hasdict = '__dict__' in rawdict`: whether the
-    /// low-level typedef already manages its own instance dict (so mapdict
-    /// must NOT add a second one, typeobject.py:255-257).
-    /// TODO: like `acceptable_as_base_class`, this belongs on a Rust TypeDef
-    /// struct (`layout.typedef.hasdict`). It is parked on Layout because
-    /// `typedef` is only a `*const PyType` tag. On the current shared-Layout
-    /// model every reachable instance layout reuses INSTANCE_TYPE's Layout
-    /// (whose typedef declares no `__dict__`), so this is `false` everywhere;
-    /// populating it `true` for the dict-managing typedefs (module/function/
-    /// staticmethod/classmethod) needs the distinct-TypeDef convergence and is
-    /// deferred with it.
-    pub typedef_hasdict: bool,
     /// Absolute slot index of the reserved [`DICT_DATA_SLOT`] payload for
     /// instances of this layout, or `-1` when no layout in the chain
     /// reserves one.
@@ -181,7 +204,7 @@ pub struct W_TypeObject {
     /// needs its own field instead of overloading the PyPy owner bit.
     pub flag_cpython_immutabletype: std::sync::atomic::AtomicBool,
     /// Suppress CPython's public `Py_TPFLAGS_BASETYPE` without changing
-    /// PyPy's load-bearing `Layout.acceptable_as_base_class` field.
+    /// PyPy's load-bearing `TypeDef.acceptable_as_base_class` field.
     ///
     /// PyPy can reject subclassing in a custom metaclass while leaving the
     /// ordinary app-level layout acceptable.  A CPython static counterpart
@@ -831,8 +854,9 @@ pub unsafe fn w_type_get_layout_ptr(obj: PyObjectRef) -> *const Layout {
 }
 
 /// typeobject.py get_full_instance_layout(self).
-/// Returns the Layout.typedef pointer (the PyType describing instance struct).
-/// For backward-compat with existing code that compares PyType pointers.
+/// Returns the allocation-vtable analogue held by `Layout.typedef`.
+/// Kept for existing code that needs the concrete Rust `PyType` rather than
+/// PyPy's distinct TypeDef identity.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -842,7 +866,7 @@ pub unsafe fn w_type_get_layout(obj: PyObjectRef) -> *const PyType {
     if layout.is_null() {
         &INSTANCE_TYPE as *const PyType
     } else {
-        (*layout).typedef
+        (*(*layout).typedef).instance_type
     }
 }
 
@@ -1500,13 +1524,24 @@ pub unsafe fn w_type_is_cpython_immutabletype(obj: PyObjectRef) -> bool {
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Suppress CPython's public BASETYPE bit while preserving PyPy's canonical
-/// layout-level subclassability field and all of its internal readers.
+/// Suppress CPython's per-type BASETYPE capability while preserving PyPy's
+/// canonical TypeDef-level subclassability field for every type that shares
+/// it.  The public flag projection and type-construction gate both read this
+/// narrower override.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_suppress_cpython_basetype(obj: PyObjectRef) {
     (*(obj as *mut W_TypeObject)).flag_cpython_suppress_basetype = true;
+}
+
+/// Read the per-type CPython BASETYPE suppression without consulting the
+/// shared PyPy TypeDef.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_is_cpython_basetype_suppressed(obj: PyObjectRef) -> bool {
+    (*(obj as *const W_TypeObject)).flag_cpython_suppress_basetype
 }
 
 /// typeobject.py `W_TypeObject.get_flags` — compute PyPy's public type flags
@@ -1561,7 +1596,7 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
         // fields; do not infer ownership merely from the public capability,
         // since module instances own their dict in the builtin layout.
         let layout = t.layout;
-        let typedef_hasdict = !layout.is_null() && (*layout).typedef_hasdict;
+        let typedef_hasdict = !layout.is_null() && (*(*layout).typedef).hasdict;
         if t.hasdict && !typedef_hasdict {
             flags |= MANAGED_DICT;
             // CPython's `type_ready_managed_dict` adds INLINE_VALUES only to
@@ -1688,8 +1723,8 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     flags
 }
 
-/// typedef.py:43 `acceptable_as_base_class` — read from Layout level.
-/// typeobject.py:1116: w_bestbase.layout.typedef.acceptable_as_base_class
+/// `TypeDef.__init__` owns `acceptable_as_base_class`; TypeDef identity is
+/// reached through `W_TypeObject.acceptable_as_base_class`'s Layout.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -1698,12 +1733,18 @@ pub unsafe fn w_type_get_acceptable_as_base_class(obj: PyObjectRef) -> bool {
     if layout.is_null() {
         true
     } else {
-        (*layout).acceptable_as_base_class
+        (*(*layout).typedef).acceptable_as_base_class()
     }
 }
 
-/// typedef.py:40 `hasdict` — read from Layout level.
-/// typeobject.py:255 `typedef = self.layout.typedef; ... not typedef.hasdict`.
+/// Whether the concrete allocation owner handles its TypeDef dictionary
+/// outside mapdict.  In PyPy this is exactly `self.layout.typedef.hasdict`:
+/// each RPython interpreter class named by that TypeDef supplies the native
+/// dict methods.  Pyre collapses app-level-shaped interpreter owners such as
+/// `_io.W_IOBase` onto the generic `W_ObjectObject`/`INSTANCE_TYPE` carrier;
+/// that carrier's dictionary is mapdict itself, so it must not be classified
+/// as an external native dict owner even when the preserved TypeDef metadata
+/// says `hasdict`.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -1712,7 +1753,8 @@ pub unsafe fn w_type_get_typedef_hasdict(obj: PyObjectRef) -> bool {
     if layout.is_null() {
         false
     } else {
-        (*layout).typedef_hasdict
+        let typedef = &*(*layout).typedef;
+        typedef.hasdict && !std::ptr::eq(typedef.instance_type, &INSTANCE_TYPE)
     }
 }
 
@@ -1758,33 +1800,20 @@ unsafe fn w_type_has_cpython_managed_weakref(obj: PyObjectRef) -> bool {
     }
     w_type_has_cpython_managed_weakref(bestbase)
 }
-/// Override acceptable_as_base_class by cloning the Layout.
-/// typedef.py:742,765,664 explicit overrides after initial creation.
-/// Layouts may be shared (reused from parent), so we clone to avoid
-/// corrupting the parent type's flag.
+/// Override `TypeDef.acceptable_as_base_class` in place.
+/// PyPy's `Function.typedef`, `Method.typedef`, and `PyCode.typedef` perform
+/// the same explicit override after TypeDef construction.
+/// The TypeDef is the semantic owner; changing this flag must not change
+/// Layout identity.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_acceptable_as_base_class(obj: PyObjectRef, v: bool) {
-    let old_layout = (*(obj as *const W_TypeObject)).layout;
-    if old_layout.is_null() {
+    let layout = (*(obj as *const W_TypeObject)).layout;
+    if layout.is_null() {
         return;
     }
-    let old = &*old_layout;
-    if old.acceptable_as_base_class == v {
-        return; // already correct
-    }
-    // Clone with new value to avoid mutating shared Layout.
-    let new_layout = leak_layout(Layout {
-        typedef: old.typedef,
-        nslots: old.nslots,
-        newslotnames: old.newslotnames.clone(),
-        base_layout: old.base_layout,
-        acceptable_as_base_class: v,
-        typedef_hasdict: old.typedef_hasdict,
-        dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
-    });
-    (*(obj as *mut W_TypeObject)).layout = new_layout;
+    (*(*layout).typedef).set_acceptable_as_base_class(v);
 }
 
 // ── Subclass tree (typeobject.py:640-689) ────────────────────────────
@@ -2041,22 +2070,19 @@ mod tests {
 
     #[test]
     fn test_layout_issublayout() {
+        let typedef = leak_interpreter_typedef(&INSTANCE_TYPE, true, false);
         let root = leak_layout(Layout {
-            typedef: &INSTANCE_TYPE,
+            typedef,
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
-            acceptable_as_base_class: true,
-            typedef_hasdict: false,
             dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         let child = leak_layout(Layout {
-            typedef: &INSTANCE_TYPE,
+            typedef,
             nslots: 1,
             newslotnames: vec!["x".to_string()],
             base_layout: root,
-            acceptable_as_base_class: true,
-            typedef_hasdict: false,
             dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         unsafe {
@@ -2069,18 +2095,41 @@ mod tests {
     #[test]
     fn test_layout_expand_equality() {
         let root = leak_layout(Layout {
-            typedef: &INSTANCE_TYPE,
+            typedef: leak_interpreter_typedef(&INSTANCE_TYPE, true, false),
             nslots: 1,
             newslotnames: vec!["x".to_string()],
             base_layout: std::ptr::null(),
-            acceptable_as_base_class: true,
-            typedef_hasdict: false,
             dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
         // Same Layout pointer → equal
         assert!(Layout::expands_equal(root, true, true, root, true, true));
         // Different hasdict → not equal
         assert!(!Layout::expands_equal(root, true, true, root, false, true));
+    }
+
+    #[test]
+    fn acceptable_as_base_class_mutates_typedef_without_replacing_layout() {
+        let typedef = leak_interpreter_typedef(&INSTANCE_TYPE, true, false);
+        let layout = leak_layout(Layout {
+            typedef,
+            nslots: 0,
+            newslotnames: vec![],
+            base_layout: std::ptr::null(),
+            dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
+        });
+        let w_base = w_type_new("Base", PY_NULL, std::ptr::null_mut());
+        let w_child = w_type_new("Child", PY_NULL, std::ptr::null_mut());
+
+        unsafe {
+            w_type_set_layout(w_base, layout);
+            w_type_set_layout(w_child, layout);
+            w_type_set_acceptable_as_base_class(w_child, false);
+
+            assert_eq!(w_type_get_layout_ptr(w_child), layout);
+            assert_eq!(w_type_get_layout_ptr(w_base), layout);
+            assert!(!w_type_get_acceptable_as_base_class(w_child));
+            assert!(!w_type_get_acceptable_as_base_class(w_base));
+        }
     }
 
     #[test]
@@ -2096,12 +2145,10 @@ mod tests {
         ) -> PyObjectRef {
             let w_type = w_type_new("C", PY_NULL, std::ptr::null_mut());
             let layout = leak_layout(Layout {
-                typedef,
+                typedef: leak_interpreter_typedef(typedef, true, typedef_hasdict),
                 nslots: 0,
                 newslotnames: vec![],
                 base_layout: std::ptr::null(),
-                acceptable_as_base_class: true,
-                typedef_hasdict,
                 dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             });
             w_type_set_layout(w_type, layout);
@@ -2130,10 +2177,19 @@ mod tests {
             let tuple_subclass = heap_type_with_layout(&TUPLE_TYPE, false);
             assert_eq!(w_type_get_flags(tuple_subclass) & MASK, MANAGED_DICT);
 
+            // A preserved PyPy TypeDef may say its RPython owner has a dict
+            // even though pyre represents that owner with generic
+            // W_ObjectObject storage.  Keep the public TypeDef projection,
+            // but route the physical dictionary through mapdict.
+            let collapsed_owner = heap_type_with_layout(&INSTANCE_TYPE, true);
+            assert_eq!(w_type_get_flags(collapsed_owner) & MASK, 0);
+            assert!(!w_type_get_typedef_hasdict(collapsed_owner));
+
             // A builtin typedef such as module owns its dict directly, so a
             // heap subtype sharing that layout has neither managed bit.
             let native_dict = heap_type_with_layout(&MODULE_TYPE, true);
             assert_eq!(w_type_get_flags(native_dict) & MASK, 0);
+            assert!(w_type_get_typedef_hasdict(native_dict));
         }
     }
 
@@ -2141,12 +2197,10 @@ mod tests {
     fn type_flags_project_managed_weakref_through_the_best_base_owner() {
         const MANAGED_WEAKREF: i64 = 1 << 3;
         let layout = leak_layout(Layout {
-            typedef: &INSTANCE_TYPE,
+            typedef: leak_interpreter_typedef(&INSTANCE_TYPE, true, false),
             nslots: 0,
             newslotnames: vec![],
             base_layout: std::ptr::null(),
-            acceptable_as_base_class: true,
-            typedef_hasdict: false,
             dict_data_slot: crate::typeobject::DICT_DATA_SLOT_UNRESOLVED,
         });
 

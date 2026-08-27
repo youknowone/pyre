@@ -281,6 +281,23 @@ fn acquire(
         ));
     }
 
+    // `Py_buffer.obj` is the exporter that owns this particular view, and a
+    // `bf_getbuffer` is allowed to redirect it away from the object the caller
+    // requested.  PyPy's `CPyBuffer.getndim`/`memory_attach` retain the filled
+    // buffer itself, so its `obj` remains authoritative.  Root that owner
+    // before allocating the memoryview header; using `w_obj` here made both
+    // `memoryview.obj` and `bf_releasebuffer` name the redirector instead.
+    let owner_slot = unsafe {
+        let raw = (*view).obj;
+        if raw.is_null() {
+            None
+        } else {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(pyobject::from_ref(raw));
+            Some(slot)
+        }
+    };
+
     let (address, length, itemsize, readonly, ndim) = unsafe {
         (
             (*view).buf as usize,
@@ -318,7 +335,9 @@ fn acquire(
     let _ = roots.pin_root(pyre_object::w_str_new(&format));
     let reload = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + index);
     let mv = pyre_object::memoryview::w_memoryview_alloc_header(false, true);
-    let r_obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let r_obj = owner_slot
+        .map(pyre_object::gc_roots::shadow_stack_get)
+        .unwrap_or_else(pyre_object::w_none);
     let built = carrier_for(
         Geometry {
             address,
@@ -455,17 +474,19 @@ fn release_c_view(view: *mut CPyBuffer) {
 /// `mv` must be a live memoryview and `backing` the object its view names.
 pub unsafe fn release_view(mv: PyObjectRef, backing: PyObjectRef) -> bool {
     use pyre_object::buffer::Buffer;
-    if slot_of(backing, getbuffer_of).is_null() {
-        return false;
-    }
     let carrier = unsafe { pyre_object::memoryview::w_memoryview_view(mv) };
     let Buffer::External { .. } = *carrier.backing() else {
         return false;
     };
     if let Some(view) = take_export(carrier as *const _ as usize) {
         release_c_view(view);
+        return true;
     }
-    true
+    // Preserve the pre-existing derived-view case: its cloned carrier has no
+    // table row of its own, but the C backing still identifies the native
+    // release path.  The table lookup comes first so a legacy export whose
+    // filled `Py_buffer.obj` is NULL is nevertheless freed.
+    !slot_of(backing, getbuffer_of).is_null()
 }
 
 // ── the buffer slots of a synthesized type mirror ───────────────────────
@@ -515,6 +536,14 @@ pub(super) fn declares_buffer(w_type: PyObjectRef) -> bool {
 /// C pointing at the bytes it was taken from.
 struct Export {
     view: *mut CPyObject,
+    /// Whether the input object whose owning reference is already in
+    /// `Py_buffer.obj` is a memoryview with one export count to release.  The
+    /// derived `view` above keeps the underlying bytes alive.  CPython 3.14
+    /// `memory_getbuf` also forbids releasing this source memoryview until
+    /// `PyBuffer_Release`; PyPy `W_MemoryView.buffer_w` deliberately omits
+    /// that count, so this is the caller-visible 3.14 lifetime rule over
+    /// PyPy's derived-view ownership shape.
+    source_is_memoryview: bool,
     format: Vec<u8>,
     shape: Vec<isize>,
     strides: Vec<isize>,
@@ -608,12 +637,21 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
     // Both references first: minting one can move what the other names.
     let holder = pyobject::make_ref(reload(view_slot));
     let exporter = pyobject::make_ref(reload(obj_slot));
+    let source_is_memoryview = unsafe {
+        if pyre_object::memoryview::is_w_memoryview(reload(obj_slot)) {
+            pyre_object::memoryview::w_memoryview_exports_incref(reload(obj_slot));
+            true
+        } else {
+            false
+        }
+    };
     let carrier = unsafe { pyre_object::memoryview::w_memoryview_view(reload(view_slot)) };
     let mut format = unsafe { carrier.format_str() }.as_bytes().to_vec();
     format.push(0);
     let widen = |dims: Vec<i64>| dims.into_iter().map(|extent| extent as isize).collect();
     let mut export = Box::new(Export {
         view: holder,
+        source_is_memoryview,
         format,
         shape: widen(unsafe { carrier.native_shape() }),
         strides: widen(unsafe { carrier.native_strides() }),
@@ -669,7 +707,7 @@ pub(super) unsafe extern "C" fn interp_bf_getbuffer(
 /// exporter's count, and it runs the `__release_buffer__` of a class written
 /// in Python on the way.
 pub(super) unsafe extern "C" fn interp_bf_releasebuffer(
-    _object: *mut CPyObject,
+    object: *mut CPyObject,
     view: *mut CPyBuffer,
 ) {
     if view.is_null() {
@@ -683,6 +721,12 @@ pub(super) unsafe extern "C" fn interp_bf_releasebuffer(
     let export = unsafe { Box::from_raw(internal as *mut Export) };
     release_acquired(unsafe { pyobject::from_ref(export.view) });
     unsafe { pyobject::decref(export.view) };
+    if export.source_is_memoryview && !object.is_null() {
+        // `PyBuffer_Release` clears/decrefs `view.obj` only after this slot
+        // returns, exactly as CPython `memory_releasebuf` relies on.
+        let source = unsafe { pyobject::from_ref(object) };
+        unsafe { pyre_object::memoryview::w_memoryview_exports_decref(source) };
+    }
 }
 
 /// Release a `memoryview` this layer acquired.  A release failure belongs to

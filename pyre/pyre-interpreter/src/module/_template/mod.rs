@@ -15,11 +15,16 @@ crate::py_module! {
     extra_init: |ns| {
         // `Template` and `Interpolation` are final: the C runtime types lack
         // `Py_TPFLAGS_BASETYPE`, so `class Sub(Template)` raises TypeError.
-        // App-level classes default to `acceptable_as_base_class=true`, so
-        // flip it off here to reject subclassing.
+        // These app-level classes retain object's TypeDef.  Suppress the
+        // CPython BASETYPE projection per type; mutating the shared TypeDef
+        // would make object itself unacceptable as a base.
         for name in ["Template", "Interpolation"] {
             if let Some(t) = crate::module_ns_get(ns, name) {
-                unsafe { pyre_object::w_type_set_acceptable_as_base_class(t, false) };
+                // CPython 3.14 exposes both as immutable non-heap types.
+                // Keep the PyPy app-level owner internally and project only
+                // the caller-visible static/immutable type capabilities.
+                crate::typedef::mark_cpython_static_extension_type(t);
+                unsafe { pyre_object::w_type_suppress_cpython_basetype(t) };
             }
         }
     },

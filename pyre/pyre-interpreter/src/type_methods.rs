@@ -6388,7 +6388,7 @@ pub unsafe fn base_owes_dict_backing(w_base: PyObjectRef) -> bool {
         }
         let layout = pyre_object::w_type_get_layout_ptr(w_base);
         let dict_typedef = &pyre_object::pyobject::DICT_TYPE as *const pyre_object::PyType;
-        if layout.is_null() || !std::ptr::eq((*layout).typedef, dict_typedef) {
+        if layout.is_null() || !std::ptr::eq((*(*layout).typedef).instance_type, dict_typedef) {
             return false;
         }
         // `Layout::dict_data_slot` already answers for the whole chain — it
