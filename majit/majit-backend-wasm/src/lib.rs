@@ -2995,8 +2995,22 @@ fn dead_frame_from_forced_frame(frame_ptr: usize) -> DeadFrame {
     let fail_descr =
         global_fail_descr(fail_index).expect("invalid fail_index from a forced wasm frame");
     let num_outputs = exit_slot_count(&fail_descr);
+    let types = fail_descr.fail_arg_types.as_slice();
     let raw_values: Vec<i64> = (0..num_outputs)
-        .map(|i| unsafe { *frame.add(1 + i) })
+        .map(|i| {
+            let word = unsafe { *frame.add(1 + i) };
+            // `emit_force_arm` publishes a Ref argument as `home_offset * 2 + 1`
+            // so the value is read out of the traced home slot a collection
+            // inside the bracketed call forwards, rather than out of an
+            // untraced copy in the exit slot. A literal is even (Ref pointers
+            // are 8-aligned; a null and a non-Ref argument are published as
+            // themselves).
+            if types.get(i) == Some(&majit_ir::Type::Ref) && word & 1 == 1 {
+                unsafe { *((frame_ptr + (word >> 1) as usize) as *const i64) }
+            } else {
+                word
+            }
+        })
         .collect();
     DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, 0))
 }
