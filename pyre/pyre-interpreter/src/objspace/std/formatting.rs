@@ -30,9 +30,9 @@ impl DeferredPercentError {
         }
     }
 
-    fn quantity(self) -> Option<CFormatError> {
+    fn before_conversion(self) -> Option<CFormatError> {
         match self {
-            Self::Quantity(error) => Some(error),
+            Self::Incomplete(error) | Self::Quantity(error) => Some(error),
             _ => None,
         }
     }
@@ -42,10 +42,9 @@ impl DeferredPercentError {
             Self::Unsupported(_) => {
                 unreachable!("the recovered unsupported spec raises after operand acquisition")
             }
-            Self::Quantity(_) => {
-                unreachable!("the recovered quantity spec raises before conversion acquisition")
+            Self::Incomplete(_) | Self::Quantity(_) => {
+                unreachable!("the recovered spec raises before conversion acquisition")
             }
-            Self::Incomplete(error) => error,
             Self::IncompleteMappingKey(_) if !is_mapping => {
                 return Err(PyError::type_error("format requires a mapping"));
             }
@@ -67,9 +66,14 @@ fn wtf8_prefix(fmt: &Wtf8, codepoints: usize) -> Wtf8Buf {
     prefix
 }
 
-fn wtf8_quantity_prefix(fmt: &Wtf8, error: CFormatError) -> Wtf8Buf {
+fn wtf8_acquisition_prefix(
+    fmt: &Wtf8,
+    error: CFormatError,
+    search_end: usize,
+    include_precision_star: bool,
+) -> Wtf8Buf {
     let codepoints: Vec<_> = fmt.code_points().collect();
-    let spec_start = (0..error.index)
+    let spec_start = (0..search_end)
         .filter(|&index| is_format_char(codepoints[index], '%'))
         .filter(|&index| {
             let prefix = wtf8_prefix(fmt, index + 1);
@@ -112,19 +116,43 @@ fn wtf8_quantity_prefix(fmt: &Wtf8, error: CFormatError) -> Wtf8Buf {
     }) {
         cursor += 1;
     }
-    if matches!(error.typ, CFormatErrorType::PrecisionTooBig)
+    if !matches!(error.typ, CFormatErrorType::WidthTooBig)
         && codepoints
             .get(cursor)
             .is_some_and(|&c| is_format_char(c, '*'))
     {
+        recovered.push_char('*');
+        cursor += 1;
+    } else {
+        while codepoints
+            .get(cursor)
+            .is_some_and(|c| c.to_u32() >= '0' as u32 && c.to_u32() <= '9' as u32)
+        {
+            cursor += 1;
+        }
+    }
+    if include_precision_star
+        && codepoints
+            .get(cursor)
+            .is_some_and(|&c| is_format_char(c, '.'))
+        && codepoints
+            .get(cursor + 1)
+            .is_some_and(|&c| is_format_char(c, '*'))
+    {
+        recovered.push_char('.');
         recovered.push_char('*');
     }
     recovered.push_char('s');
     recovered
 }
 
-fn bytes_quantity_prefix(fmt: &[u8], error: CFormatError) -> Vec<u8> {
-    let spec_start = (0..error.index)
+fn bytes_acquisition_prefix(
+    fmt: &[u8],
+    error: CFormatError,
+    search_end: usize,
+    include_precision_star: bool,
+) -> Vec<u8> {
+    let spec_start = (0..search_end)
         .filter(|&index| fmt[index] == b'%')
         .filter(|&index| {
             matches!(
@@ -157,8 +185,19 @@ fn bytes_quantity_prefix(fmt: &[u8], error: CFormatError) -> Vec<u8> {
     while fmt.get(cursor).is_some_and(|c| b"#0- +".contains(c)) {
         cursor += 1;
     }
-    if matches!(error.typ, CFormatErrorType::PrecisionTooBig) && fmt.get(cursor) == Some(&b'*') {
+    if !matches!(error.typ, CFormatErrorType::WidthTooBig) && fmt.get(cursor) == Some(&b'*') {
         recovered.push(b'*');
+        cursor += 1;
+    } else {
+        while fmt.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+    }
+    if include_precision_star
+        && fmt.get(cursor) == Some(&b'.')
+        && fmt.get(cursor + 1) == Some(&b'*')
+    {
+        recovered.extend_from_slice(b".*");
     }
     recovered.push(b's');
     recovered
@@ -176,11 +215,11 @@ fn bytes_quantity_prefix(fmt: &[u8], error: CFormatError) -> Vec<u8> {
 /// Replace only that unsupported character with `s` and stop there. The caller
 /// can execute every preceding spec and the recovered spec's operand-acquisition
 /// path, then surface the saved 3.14 error without formatting the operand.
-/// An incomplete trailing `%` or mapping key instead retains only the complete
-/// prefix, so its earlier conversions run before the saved parser error. An
-/// oversized width or precision retains a synthetic current spec through the
-/// mapping lookup and any width `*`, the stages PyPy reaches before rejecting
-/// the quantity.
+/// An incomplete mapping key retains only the complete prefix. Other incomplete
+/// specs and oversized quantities retain a synthetic current spec through the
+/// mapping lookup and the `*` operands which precede their error stage. This is
+/// the `parse_fmt` acquisition order without asking for the absent conversion
+/// operand.
 fn parse_wtf8_incremental(
     fmt: &Wtf8,
 ) -> Result<(CFormatWtf8, Option<DeferredPercentError>), PyError> {
@@ -191,22 +230,29 @@ fn parse_wtf8_incremental(
                 error.typ,
                 CFormatErrorType::WidthTooBig | CFormatErrorType::PrecisionTooBig
             ) {
-                let recovered = CFormatWtf8::parse_from_wtf8(&wtf8_quantity_prefix(fmt, error))
-                    .expect("the acquisition prefix of a deferred quantity error must parse");
+                let recovered = CFormatWtf8::parse_from_wtf8(&wtf8_acquisition_prefix(
+                    fmt,
+                    error,
+                    error.index,
+                    false,
+                ))
+                .expect("the acquisition prefix of a deferred quantity error must parse");
                 return Ok((recovered, Some(DeferredPercentError::Quantity(error))));
+            }
+            if matches!(error.typ, CFormatErrorType::IncompleteFormat) {
+                let recovered = CFormatWtf8::parse_from_wtf8(&wtf8_acquisition_prefix(
+                    fmt,
+                    error,
+                    fmt.code_points().count(),
+                    true,
+                ))
+                .expect("the acquisition prefix of an incomplete format must parse");
+                return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
             let (prefix_len, replacement, deferred) = match error.typ {
                 CFormatErrorType::UnsupportedFormatChar(_) => {
                     (error.index, true, DeferredPercentError::Unsupported(error))
                 }
-                CFormatErrorType::IncompleteFormat => (
-                    error
-                        .index
-                        .checked_sub(1)
-                        .expect("an incomplete format follows its percent sign"),
-                    false,
-                    DeferredPercentError::Incomplete(error),
-                ),
                 CFormatErrorType::UnmatchedKeyParentheses => (
                     error
                         .index
@@ -239,22 +285,29 @@ fn parse_bytes_incremental(
                 error.typ,
                 CFormatErrorType::WidthTooBig | CFormatErrorType::PrecisionTooBig
             ) {
-                let recovered = CFormatBytes::parse_from_bytes(&bytes_quantity_prefix(fmt, error))
-                    .expect("the acquisition prefix of a deferred quantity error must parse");
+                let recovered = CFormatBytes::parse_from_bytes(&bytes_acquisition_prefix(
+                    fmt,
+                    error,
+                    error.index,
+                    false,
+                ))
+                .expect("the acquisition prefix of a deferred quantity error must parse");
                 return Ok((recovered, Some(DeferredPercentError::Quantity(error))));
+            }
+            if matches!(error.typ, CFormatErrorType::IncompleteFormat) {
+                let recovered = CFormatBytes::parse_from_bytes(&bytes_acquisition_prefix(
+                    fmt,
+                    error,
+                    fmt.len(),
+                    true,
+                ))
+                .expect("the acquisition prefix of an incomplete format must parse");
+                return Ok((recovered, Some(DeferredPercentError::Incomplete(error))));
             }
             let (prefix_len, replacement, deferred) = match error.typ {
                 CFormatErrorType::UnsupportedFormatChar(_) => {
                     (error.index, true, DeferredPercentError::Unsupported(error))
                 }
-                CFormatErrorType::IncompleteFormat => (
-                    error
-                        .index
-                        .checked_sub(1)
-                        .expect("an incomplete format follows its percent sign"),
-                    false,
-                    DeferredPercentError::Incomplete(error),
-                ),
                 CFormatErrorType::UnmatchedKeyParentheses => (
                     error
                         .index
@@ -353,10 +406,12 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                         &mut spec,
                         w_value,
                         current_deferred
-                            .and_then(DeferredPercentError::quantity)
+                            .and_then(DeferredPercentError::before_conversion)
                             .is_none(),
                     )?;
-                    if let Some(error) = current_deferred.and_then(DeferredPercentError::quantity) {
+                    if let Some(error) =
+                        current_deferred.and_then(DeferredPercentError::before_conversion)
+                    {
                         return Err(PyError::value_error(error.to_string()));
                     }
                     w_value
@@ -367,7 +422,9 @@ pub(crate) unsafe fn str_format_percent(fmt: PyObjectRef, args: PyObjectRef) -> 
                         &mut spec.flags,
                     )?;
                     update_precision_from_tuple(&mut pos, &mut spec.precision)?;
-                    if let Some(error) = current_deferred.and_then(DeferredPercentError::quantity) {
+                    if let Some(error) =
+                        current_deferred.and_then(DeferredPercentError::before_conversion)
+                    {
                         return Err(PyError::value_error(error.to_string()));
                     }
                     let Some(v) = pos.next() else {
@@ -479,10 +536,12 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                         &mut spec,
                         value,
                         current_deferred
-                            .and_then(DeferredPercentError::quantity)
+                            .and_then(DeferredPercentError::before_conversion)
                             .is_none(),
                     )?;
-                    if let Some(error) = current_deferred.and_then(DeferredPercentError::quantity) {
+                    if let Some(error) =
+                        current_deferred.and_then(DeferredPercentError::before_conversion)
+                    {
                         return Err(PyError::value_error(error.to_string()));
                     }
                     if let Some(error) =
@@ -521,7 +580,9 @@ unsafe fn bytes_format_percent_inner(fmt: PyObjectRef, args: PyObjectRef) -> PyR
                 let current_deferred = deferred_error.filter(|_| parts.peek().is_none());
                 update_quantity_from_tuple(&mut pos, &mut spec.min_field_width, &mut spec.flags)?;
                 update_precision_from_tuple(&mut pos, &mut spec.precision)?;
-                if let Some(error) = current_deferred.and_then(DeferredPercentError::quantity) {
+                if let Some(error) =
+                    current_deferred.and_then(DeferredPercentError::before_conversion)
+                {
                     return Err(PyError::value_error(error.to_string()));
                 }
                 let Some(value) = pos.next() else {
@@ -1227,6 +1288,50 @@ mod tests {
         let error =
             unsafe { bytes_format_percent(w_bytes_from_bytes(b"%(x"), mapping).unwrap_err() };
         assert_error(error, PyErrorKind::ValueError, "incomplete format key");
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%s %10"), w_tuple_new(Vec::new())).unwrap_err()
+        };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string",
+        );
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%s %10"), w_tuple_new(vec![w_str_new("done")]))
+                .unwrap_err()
+        };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+
+        let error =
+            unsafe { str_format_percent(w_str_new("%*"), w_tuple_new(Vec::new())).unwrap_err() };
+        assert_error(
+            error,
+            PyErrorKind::TypeError,
+            "not enough arguments for format string",
+        );
+
+        let error = unsafe {
+            str_format_percent(w_str_new("%*"), w_tuple_new(vec![w_int_new(2)])).unwrap_err()
+        };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+
+        let mapping = w_dict_new();
+        unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_str_new("not an int")) };
+        let error = unsafe { str_format_percent(w_str_new("%(x).*"), mapping).unwrap_err() };
+        assert_error(error, PyErrorKind::TypeError, "* wants int");
+
+        let mapping = w_dict_new();
+        unsafe { w_dict_setitem_str_no_proxy(mapping, "x", w_int_new(2)) };
+        let error = unsafe { str_format_percent(w_str_new("%(x).*"), mapping).unwrap_err() };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format");
+
+        let error = unsafe {
+            bytes_format_percent(w_bytes_from_bytes(b"%.*"), w_tuple_new(vec![w_int_new(2)]))
+                .unwrap_err()
+        };
+        assert_error(error, PyErrorKind::ValueError, "incomplete format");
     }
 
     #[test]
