@@ -5623,10 +5623,21 @@ fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
     true
 }
 
-/// Opt-in until the `ForceQuasiImmutable` flush leg in `trace.rs` re-delivers
-/// an in-flight FOR_ITER item on its decline paths. `obj.attr = v` inside a
-/// loop is the most common statement in the corpus, so turning this on by
-/// default would make that dropped-iteration defect reachable.
+/// Opt-in, where `opimpl_jit_force_quasi_immutable` (pyjitpl.py) forces
+/// unconditionally.
+///
+/// The blocker this gate was written for is closed: the flush leg declined for
+/// want of a latched operand-stack mirror, the walk fell back to legacy replay,
+/// and the R1 never-double guard then refused to hand back the FOR_ITER item
+/// the loop header had consumed -- one lost iteration per abort. The class-body
+/// site now latches that mirror and the latched-flush check accepts a consumed
+/// run rather than a single consumed TOS, and `fbw_foriter_item_dropped` is
+/// gated at zero so the loss cannot come back unseen.
+///
+/// What is left before the gate can go is a measurement, not a repair: `obj.attr
+/// = v` inside a loop is the most common statement in the corpus, so turning
+/// this on by default changes the abort population corpus-wide and every
+/// affected jit-stats baseline with it.
 fn mapdict_qmut_force_enabled() -> bool {
     std::env::var_os("PYRE_QMUT_MAPDICT_FORCE").is_some()
 }
