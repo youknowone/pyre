@@ -5433,10 +5433,10 @@ pub(crate) fn residual_call_is_proven_truth(
 /// concrete writes are the ones that land.
 fn journal_walker_namespace_write<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    helper: majit_ir::PyreHelperKind,
+    helper: majit_ir::RuntimeHelperKind,
     r_args: &[OpRef],
 ) -> Option<()> {
-    use majit_ir::PyreHelperKind as K;
+    use majit_ir::RuntimeHelperKind as K;
     if !ctx.is_authoritative_executor {
         return None;
     }
@@ -7699,7 +7699,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        journal_walker_namespace_write(ctx, ei.pyre_helper, &r_args);
+        journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -9082,7 +9082,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        journal_walker_namespace_write(ctx, ei.pyre_helper, &r_args);
+        journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
@@ -9338,7 +9338,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         // A namespace write reaches the executor as an ordinary residual and
         // mutates the frame's dict in place; record what it displaces while the
         // write is still entirely ahead of the walk.
-        journal_walker_namespace_write(ctx, ei.pyre_helper, &r_args);
+        journal_walker_namespace_write(ctx, ei.runtime_helper, &r_args);
         let resid_exec = try_execute_residual_call_via_executor(
             ctx,
             call_opcode,
