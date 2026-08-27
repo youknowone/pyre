@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -39,11 +40,11 @@ impl ActivityClock {
     }
 
     fn ping(&self) {
-        *self.0.lock().expect("activity clock poisoned") = Instant::now();
+        *self.0.lock() = Instant::now();
     }
 
     fn since(&self) -> Duration {
-        self.0.lock().expect("activity clock poisoned").elapsed()
+        self.0.lock().elapsed()
     }
 }
 

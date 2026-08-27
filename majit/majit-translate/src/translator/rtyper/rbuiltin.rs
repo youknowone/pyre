@@ -38,10 +38,11 @@
 //!   those entry types must first be added as new `ExtRegistryEntry`
 //!   enum variants before `findbltintyper` can route them.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::translator::rtyper::rrange::{rtype_builtin_range, rtype_builtin_xrange};
 
@@ -538,10 +539,7 @@ pub type BuiltinTyperFn = fn(&HighLevelOp, &HashMap<String, usize>) -> RTypeResu
 /// registration call — downstream modules invoke
 /// `typer_for(host_obj, rtype_builtin_fn)` at startup.
 pub fn typer_for(func: HostObject, rtyper_func: BuiltinTyperFn) {
-    builtin_typer_map()
-        .lock()
-        .expect("BUILTIN_TYPER poisoned")
-        .insert(func, rtyper_func);
+    builtin_typer_map().lock().insert(func, rtyper_func);
 }
 
 /// Non-upstream helper: read-only registry lookup, used by
@@ -549,11 +547,7 @@ pub fn typer_for(func: HostObject, rtyper_func: BuiltinTyperFn) {
 /// can probe the registry without re-entering `findbltintyper`'s
 /// fallback branches.
 fn lookup_typer(func: &HostObject) -> Option<BuiltinTyperFn> {
-    builtin_typer_map()
-        .lock()
-        .expect("BUILTIN_TYPER poisoned")
-        .get(func)
-        .copied()
+    builtin_typer_map().lock().get(func).copied()
 }
 
 /// Qualname-keyed typer fallback for host callables that are Rust
@@ -4289,14 +4283,14 @@ mod tests {
         struct ObserverRepr {
             state: ReprState,
             lltype: LowLevelType,
-            captured: std::sync::Mutex<Option<ConstValue>>,
+            captured: parking_lot::Mutex<Option<ConstValue>>,
         }
         impl ObserverRepr {
             fn new() -> Arc<Self> {
                 Arc::new(ObserverRepr {
                     state: ReprState::new(),
                     lltype: LowLevelType::Signed,
-                    captured: std::sync::Mutex::new(None),
+                    captured: parking_lot::Mutex::new(None),
                 })
             }
         }
@@ -4318,7 +4312,7 @@ mod tests {
             }
             fn rtype_method(&self, _name: &str, hop: &HighLevelOp) -> RTypeResult {
                 if let Hlvalue::Constant(c) = &hop.args_v.borrow()[0] {
-                    *self.captured.lock().unwrap() = Some(c.value.clone());
+                    *self.captured.lock() = Some(c.value.clone());
                 }
                 hop.exception_cannot_occur().unwrap();
                 Ok(None)
@@ -4363,7 +4357,7 @@ mod tests {
 
         // ObserverRepr captured the rewritten arg0: bound method's
         // HostObject was replaced by its __self__.
-        let captured = observer.captured.lock().unwrap().clone().unwrap();
+        let captured = observer.captured.lock().clone().unwrap();
         match captured {
             ConstValue::HostObject(h) => assert_eq!(h, receiver),
             other => panic!("expected rewritten HostObject, got {other:?}"),

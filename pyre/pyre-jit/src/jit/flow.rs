@@ -41,12 +41,13 @@
 //! same core object shape (Variable, Constant, Link, Block, FunctionGraph,
 //! including the special return/except blocks and link exception extras).
 
+use parking_lot::Mutex;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{LazyLock, Mutex};
 
 use super::flatten::{IndirectCallTargets, Kind};
 
@@ -118,7 +119,7 @@ impl Variable {
     }
 
     pub fn name(&self) -> String {
-        let mut names = VARIABLE_NAMES.lock().unwrap();
+        let mut names = VARIABLE_NAMES.lock();
         let (prefix, mut nr) = {
             let state = names
                 .states
@@ -151,7 +152,6 @@ impl Variable {
     pub fn name_prefix(&self) -> String {
         VARIABLE_NAMES
             .lock()
-            .unwrap()
             .states
             .get(&self.id)
             .map(|state| state.name.clone())
@@ -161,7 +161,6 @@ impl Variable {
     pub fn renamed(&self) -> bool {
         VARIABLE_NAMES
             .lock()
-            .unwrap()
             .states
             .get(&self.id)
             .map(|state| state.name != DUMMYNAME)
@@ -169,7 +168,7 @@ impl Variable {
     }
 
     pub fn rename(&self, name: &str) {
-        let mut names = VARIABLE_NAMES.lock().unwrap();
+        let mut names = VARIABLE_NAMES.lock();
         let current_name = names
             .states
             .entry(self.id)

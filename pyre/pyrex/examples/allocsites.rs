@@ -34,7 +34,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::backtrace::Backtrace;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 /// Every allocation the program makes, whatever the configuration. Exact.
@@ -88,13 +88,13 @@ fn record_site() {
     let sig = interesting_frames(&format!("{bt}"));
     if !sig.is_empty() {
         match SITES.try_lock() {
-            Ok(mut guard) => {
+            Some(mut guard) => {
                 if let Some(map) = guard.as_mut() {
                     *map.entry(sig).or_insert(0) += 1;
                     CAPTURED.fetch_add(1, Relaxed);
                 }
             }
-            Err(_) => {
+            None => {
                 LOST_CONTENDED.fetch_add(1, Relaxed);
             }
         }
@@ -232,7 +232,7 @@ fn main() {
     BUDGET.store(env_u64("PYRE_ALLOCSITES_BUDGET", 20_000), Relaxed);
     EVERY.store(env_u64("PYRE_ALLOCSITES_EVERY", 1).max(1), Relaxed);
     ROWS.store(env_u64("PYRE_ALLOCSITES_ROWS", 40) as usize, Relaxed);
-    SITES.lock().unwrap().replace(HashMap::with_capacity(1024));
+    SITES.lock().replace(HashMap::with_capacity(1024));
     CAPTURE_ON.store(capture, Relaxed);
 
     // The real CLI. argv is this example's own, so everything after `--`
@@ -303,7 +303,7 @@ fn main() {
         );
     }
 
-    let map = SITES.lock().unwrap().take().unwrap_or_default();
+    let map = SITES.lock().take().unwrap_or_default();
     let mut rows: Vec<(String, u64)> = map.into_iter().collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1));
     let limit = ROWS.load(Relaxed);

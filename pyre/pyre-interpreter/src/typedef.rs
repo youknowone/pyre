@@ -2175,10 +2175,10 @@ fn leaked_method_owner(
     // Keyed by the layout test as well as the name: a type reached first
     // through the shared constructors takes an owner with no test, and a
     // later caller that does know the test must not be handed that one back.
-    static LEAKED: std::sync::Mutex<
+    static LEAKED: parking_lot::Mutex<
         Option<std::collections::HashMap<(String, bool), &'static crate::gateway::MethodOwner>>,
-    > = std::sync::Mutex::new(None);
-    let mut guard = LEAKED.lock().unwrap_or_else(|err| err.into_inner());
+    > = parking_lot::Mutex::new(None);
+    let mut guard = LEAKED.lock();
     let table = guard.get_or_insert_with(std::collections::HashMap::new);
     let key = (type_name.to_owned(), is_instance.is_some());
     if let Some(owner) = table.get(&key) {

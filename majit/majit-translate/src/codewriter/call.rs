@@ -6,8 +6,9 @@
 //! which should remain as opaque calls ("residual").  Also handles builtin
 //! (oopspec) and recursive (portal) call classification.
 
+use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use majit_ir::descr::{DescrRef, EffectInfo, ExtraEffect, OopSpecIndex};
 use majit_ir::value::Type;
@@ -2322,7 +2323,7 @@ impl CallControl {
                     .as_deref()
                     .is_some_and(|aid| self.immutable_array_types.contains(aid));
                 let cached: majit_ir::descr::DescrRef =
-                    majit_ir::descr::gc_cache().lock().unwrap().get_array_descr(
+                    majit_ir::descr::gc_cache().lock().get_array_descr(
                         majit_ir::descr::LLType::Array(path_hash_u64),
                         base_size,
                         item_size,
@@ -2645,7 +2646,7 @@ impl CallControl {
                 };
                 use majit_ir::descr::Descr;
                 let size_descr_arc = {
-                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mut gc = majit_ir::descr::gc_cache().lock();
                     gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
                 };
                 // Field-walk pass (PyPy `cpu.fielddescrof` per-tuple
@@ -2714,7 +2715,7 @@ impl CallControl {
                 // descr.py:228: index = heaptracker.get_fielddescr_index_in(
                 // STRUCT, fieldname).
                 let index_in_parent = field_pos_in(self, owner_root, field_name);
-                let descr = majit_ir::descr::gc_cache().lock().unwrap().get_field_descr(
+                let descr = majit_ir::descr::gc_cache().lock().get_field_descr(
                     struct_key,
                     field_name,
                     None,
@@ -2869,7 +2870,7 @@ impl CallControl {
                 let is_immutable = rank.map(|r| r.is_immutable()).unwrap_or(false);
                 let is_quasi_immutable = rank.map(|r| r.is_quasi_immutable()).unwrap_or(false);
                 let size_descr_arc = {
-                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mut gc = majit_ir::descr::gc_cache().lock();
                     gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
                 };
                 // Field-walk pass (same convergence pattern as
@@ -2898,7 +2899,7 @@ impl CallControl {
                     // an interior access and the direct field access agree
                     // (`descr.py:228`, one numberer per STRUCT).
                     let index_in_parent = field_pos_in(self, &elem_name, field_name);
-                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mut gc = majit_ir::descr::gc_cache().lock();
                     let mint = gc.get_field_descr(
                         struct_key,
                         field_name,
@@ -2927,7 +2928,7 @@ impl CallControl {
                 };
                 let array_key = majit_ir::descr::LLType::Array(array_id);
                 let cached: majit_ir::descr::DescrRef = {
-                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mut gc = majit_ir::descr::gc_cache().lock();
                     gc.get_array_descr(
                         array_key.clone(),
                         base_size,
@@ -2973,16 +2974,13 @@ impl CallControl {
                         }),
                     },
                 );
-                let descr = majit_ir::descr::gc_cache()
-                    .lock()
-                    .unwrap()
-                    .get_interiorfield_descr(
-                        array_key,
-                        field_name.to_string(),
-                        String::new(),
-                        array_descr,
-                        field_descr,
-                    );
+                let descr = majit_ir::descr::gc_cache().lock().get_interiorfield_descr(
+                    array_key,
+                    field_name.to_string(),
+                    String::new(),
+                    array_descr,
+                    field_descr,
+                );
                 descr.set_index(idx);
                 return Some((descr as majit_ir::descr::DescrRef, member));
             }
@@ -7083,9 +7081,7 @@ static SYMBOLIC_FNADDR_PATHS: OnceLock<Mutex<HashMap<i64, String>>> = OnceLock::
 
 fn record_symbolic_fnaddr(value: i64, description: String) {
     let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut paths = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut paths = registry.lock();
     paths
         .entry(value)
         .and_modify(|existing| {
@@ -7098,9 +7094,7 @@ fn record_symbolic_fnaddr(value: i64, description: String) {
 
 pub(crate) fn symbolic_fnaddr_paths_snapshot() -> Vec<(i64, String)> {
     let registry = SYMBOLIC_FNADDR_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
-    let paths = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let paths = registry.lock();
     let mut snapshot: Vec<_> = paths
         .iter()
         .map(|(&value, description)| (value, description.clone()))
@@ -8298,7 +8292,7 @@ fn all_interiorfielddescrs(
     // Path 1: actual layout from runtime (RPython: symbolic.get_field_token)
     if let Some(layout) = cc.struct_layout_for(struct_name) {
         let size_descr_arc = {
-            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+            let mut gc = majit_ir::descr::gc_cache().lock();
             // descr.py:108-118: vtable=0 here — pyre struct-array
             // interior fields are not GcStruct-of-Object so no vtable.
             // immutable_flag=false: defensive default; field-level
@@ -8366,7 +8360,7 @@ fn all_interiorfielddescrs(
             let fd: std::sync::Arc<dyn majit_ir::descr::FieldDescr> = match walked {
                 Some(fd) => fd,
                 None => {
-                    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                    let mut gc = majit_ir::descr::gc_cache().lock();
                     gc.get_field_descr(
                         struct_key.clone(),
                         name,
@@ -8386,7 +8380,7 @@ fn all_interiorfielddescrs(
                 }
             };
             let ifd = {
-                let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                let mut gc = majit_ir::descr::gc_cache().lock();
                 gc.get_interiorfield_descr(
                     array_key.clone(),
                     name.clone(),
@@ -8471,7 +8465,7 @@ fn all_interiorfielddescrs(
     // `gc_cache.get_field_descr` cache-miss-mint resolves
     // `parent_descr` to the size descr instead of `None` (`descr.py:238`).
     let size_descr_arc = {
-        let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+        let mut gc = majit_ir::descr::gc_cache().lock();
         gc.get_size_descr(struct_key.clone(), item_size, 0, false)
     };
     let mut result = Vec::new();
@@ -8501,7 +8495,7 @@ fn all_interiorfielddescrs(
         let fd: std::sync::Arc<dyn majit_ir::descr::FieldDescr> = match walked {
             Some(fd) => fd,
             None => {
-                let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+                let mut gc = majit_ir::descr::gc_cache().lock();
                 gc.get_field_descr(
                     struct_key.clone(),
                     name,
@@ -8521,7 +8515,7 @@ fn all_interiorfielddescrs(
             }
         };
         let ifd = {
-            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+            let mut gc = majit_ir::descr::gc_cache().lock();
             gc.get_interiorfield_descr(
                 array_key.clone(),
                 name.clone(),

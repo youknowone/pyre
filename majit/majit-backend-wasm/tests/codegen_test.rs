@@ -4007,7 +4007,7 @@ fn host_bridge_inputargs() -> Vec<InputArg> {
 /// The global fail-descr space is appended to under the assumption that no
 /// other compile interleaves (`failguard.rs register_fail_descrs`), which the
 /// single-threaded wasm host guarantees and a parallel test runner does not.
-static HOST_COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static HOST_COMPILE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn host_loop_inputargs() -> Vec<InputArg> {
     vec![
@@ -4028,7 +4028,7 @@ fn host_loop_inputargs() -> Vec<InputArg> {
 fn a_valid_owner_reaches_the_inline_trial() {
     use majit_backend::Backend;
 
-    let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _serialized = HOST_COMPILE_LOCK.lock();
     let mut backend = majit_backend_wasm::WasmBackend::new();
     // Through an `Arc`, with the compiled-loop token wired back to it the way
     // `make_jitcell_token` does: a deferred merge outlives the compile that
@@ -4096,7 +4096,7 @@ fn a_valid_owner_reaches_the_inline_trial() {
 fn a_bridge_compiled_after_the_owner_was_invalidated_starts_valid() {
     use majit_backend::Backend;
 
-    let _serialized = HOST_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _serialized = HOST_COMPILE_LOCK.lock();
     let mut backend = majit_backend_wasm::WasmBackend::new();
     let token = majit_backend::JitCellToken::new(1);
     let label_descr = majit_ir::make_loop_target_descr(71, false);

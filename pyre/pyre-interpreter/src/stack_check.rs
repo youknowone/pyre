@@ -215,14 +215,12 @@ pub(crate) mod test_support {
     /// stack, producing a spurious overflow. This lock also remains the
     /// single-threaded ownership boundary for the process-global JIT compiler
     /// state.
-    static STACK_AND_JIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static STACK_AND_JIT_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-    /// Acquire the shared test lock, tolerating poisoning so one failed test
-    /// does not cascade into the rest of the test binary.
-    pub(crate) fn stack_and_jit_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        STACK_AND_JIT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Acquire the shared test lock.  `parking_lot` has no poison flag, so one
+    /// failed test does not cascade into the rest of the test binary.
+    pub(crate) fn stack_and_jit_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        STACK_AND_JIT_TEST_LOCK.lock()
     }
 }
 
@@ -877,9 +875,9 @@ mod tests {
         TL_STACK_END.with(|c| c.get())
     }
 
-    /// Acquire the test mutex, tolerating poisoning so a single
+    /// Acquire the test mutex.  `parking_lot` does not poison, so a single
     /// previous-test panic doesn't cascade into every follow-up test.
-    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+    fn lock_tests() -> parking_lot::MutexGuard<'static, ()> {
         test_support::stack_and_jit_test_guard()
     }
 

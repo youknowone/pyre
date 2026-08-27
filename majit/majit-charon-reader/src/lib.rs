@@ -68,7 +68,7 @@ pub struct Llbc {
     /// another LLBC in the same linked translation input. Dependency LLBCs
     /// retain layout attributes but may expose the type body as `Opaque`; the
     /// defining crate supplies the missing one-field scalar shape.
-    transparent_scalar_kinds: std::sync::RwLock<Vec<(String, TransparentScalarKind)>>,
+    transparent_scalar_kinds: parking_lot::RwLock<Vec<(String, TransparentScalarKind)>>,
 }
 
 /// Register-bank shape of a `#[repr(transparent)]` scalar wrapper.
@@ -139,7 +139,7 @@ impl Llbc {
             file,
             dedup_adt,
             dedup_body,
-            transparent_scalar_kinds: std::sync::RwLock::new(Vec::new()),
+            transparent_scalar_kinds: parking_lot::RwLock::new(Vec::new()),
         })
     }
 
@@ -151,8 +151,7 @@ impl Llbc {
     ) {
         let mut kinds = self
             .transparent_scalar_kinds
-            .write()
-            .expect("transparent scalar registry poisoned");
+            .write();
         for (path, kind) in entries {
             match kinds.binary_search_by(|(known, _)| known.cmp(&path)) {
                 Ok(index) => assert_eq!(
@@ -168,8 +167,7 @@ impl Llbc {
     pub fn transparent_scalar_kind(&self, path: &str) -> Option<TransparentScalarKind> {
         let kinds = self
             .transparent_scalar_kinds
-            .read()
-            .expect("transparent scalar registry poisoned");
+            .read();
         let index = kinds
             .binary_search_by(|(known, _)| known.as_str().cmp(path))
             .ok()?;

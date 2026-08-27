@@ -17,8 +17,9 @@
 //! `Mutex<TimingState>` so concurrent threads sharing the profiler via
 //! `Arc` serialize on the same lock the GIL gives PyPy.
 
+use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 pub use std::time::Instant;
@@ -358,7 +359,7 @@ impl JitProfiler {
         //   ...
         //   self.current = []
         let now = Instant::now();
-        let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+        let mut state = self.timing.lock();
         state.starttime = Some(now);
         state.tk = None;
         state.t1 = Some(now);
@@ -375,7 +376,7 @@ impl JitProfiler {
     /// ```
     pub fn finish(&self) {
         {
-            let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+            let mut state = self.timing.lock();
             state.tk = Some(Instant::now());
         }
         self.print_stats();
@@ -396,7 +397,7 @@ impl JitProfiler {
     fn _print_stats(&self) {
         let snap = self.snapshot();
         let (starttime, tk) = {
-            let state = self.timing.lock().expect("JitProfiler timing poisoned");
+            let state = self.timing.lock();
             (state.starttime, state.tk)
         };
         let ns_to_secs = |ns: u64| ns as f64 / 1e9;
@@ -441,11 +442,7 @@ impl JitProfiler {
         intline("vecopt success", snap.opt_vectorized);
         // jitprof.py `if cpu is not None:` — pyre's tracker Arc
         // is always bound (a fresh one before `set_cpu_tracker`).
-        let tracker = self
-            .cpu_tracker
-            .lock()
-            .expect("JitProfiler cpu_tracker poisoned")
-            .clone();
+        let tracker = self.cpu_tracker.lock().clone();
         intline(
             "Total # of loops",
             tracker.total_compiled_loops.load(Ordering::Relaxed),
@@ -595,7 +592,7 @@ impl JitProfiler {
     /// `self.cpu.tracker` (jitprof.py:105-106) — `self.cpu` being the
     /// backend's `AbstractCPU` instance, not a process global.
     pub fn set_cpu_tracker(&self, tracker: Arc<CpuTotalTracker>) {
-        let mut slot = self.cpu_tracker.lock().expect("cpu_tracker poisoned");
+        let mut slot = self.cpu_tracker.lock();
         *slot = tracker;
     }
 
@@ -609,7 +606,7 @@ impl JitProfiler {
         F: FnOnce(&CpuTotalTracker) -> R,
     {
         let tracker = {
-            let slot = self.cpu_tracker.lock().expect("cpu_tracker poisoned");
+            let slot = self.cpu_tracker.lock();
             Arc::clone(&slot)
         };
         f(&tracker)
@@ -746,7 +743,7 @@ impl JitProfiler {
         //   self.counters[event] += 1
         //   self.current.append(event)
         let now = Instant::now();
-        let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+        let mut state = self.timing.lock();
         check_or_claim_owner_thread(&mut state, "start_event");
         if let (Some(t1), Some(&top_event)) = (state.t1, state.current.last()) {
             self.add_time(top_event, now.saturating_duration_since(t1));
@@ -772,7 +769,7 @@ impl JitProfiler {
         let popped_event;
         let t0;
         {
-            let mut state = self.timing.lock().expect("JitProfiler timing poisoned");
+            let mut state = self.timing.lock();
             check_or_claim_owner_thread(&mut state, "end_event");
             t0 = state.t1;
             state.t1 = Some(now);
@@ -1395,7 +1392,7 @@ mod tests {
         // `finish()` = `self.tk = timer(); print_stats()`; with MAJIT_LOG
         // unset the print side is a no-op, the tk mark still lands.
         prof.finish();
-        let state = prof.timing.lock().unwrap();
+        let state = prof.timing.lock();
         assert!(state.starttime.is_some());
         assert!(state.tk.is_some());
     }

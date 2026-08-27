@@ -23,7 +23,7 @@
 //! Each machine puts an opcode no arm matches into its program. Without one
 //! the default edge is never walked and none of this can appear.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
@@ -60,7 +60,7 @@ impl Recorder {
             "nothing compiled, so the warm answer was the interpreter's alone \
              and every claim below is vacuous",
         );
-        self.body.lock().unwrap().clone()
+        self.body.lock().clone()
     }
 }
 
@@ -98,7 +98,7 @@ fn dispatch_skip(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<SkipState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         SKIP.compiles.fetch_add(1, Ordering::Relaxed);
-        *SKIP.body.lock().unwrap() = opcodes.to_vec();
+        *SKIP.body.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = SkipState { acc: 0, ticks };
@@ -142,7 +142,7 @@ fn dispatch_work(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<WorkState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         WORKED.compiles.fetch_add(1, Ordering::Relaxed);
-        *WORKED.body.lock().unwrap() = opcodes.to_vec();
+        *WORKED.body.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = WorkState { acc: 0, ticks };
@@ -191,7 +191,7 @@ fn dispatch_exit(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<ExitState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         EXITED.compiles.fetch_add(1, Ordering::Relaxed);
-        *EXITED.body.lock().unwrap() = opcodes.to_vec();
+        *EXITED.body.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = ExitState { acc: 0, ticks };
@@ -239,7 +239,7 @@ fn dispatch_switch(program: &Bytecode, threshold: u32, ticks: i64) -> i64 {
     let mut driver: JitDriver<SwitchState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         SWITCHED.compiles.fetch_add(1, Ordering::Relaxed);
-        *SWITCHED.body.lock().unwrap() = opcodes.to_vec();
+        *SWITCHED.body.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = SwitchState { acc: 0, ticks };

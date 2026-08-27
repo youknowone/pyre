@@ -1767,7 +1767,8 @@ pub struct JitDriver<S: JitState> {
     /// `sync_liveness_info_from_shared_asm()`.  This preserves PyPy's
     /// `make_jitcodes() -> finish_setup()` order while keeping
     /// `MetaInterpStaticData.liveness_info` immutable during tracing.
-    shared_asm: std::sync::Arc<std::sync::Mutex<majit_translate::codewriter::assembler::Assembler>>,
+    shared_asm:
+        std::sync::Arc<parking_lot::Mutex<majit_translate::codewriter::assembler::Assembler>>,
     /// resume.py:1367 — CPU allocation backend for virtual materialization
     /// during blackhole resume. Registered by the embedding interpreter at
     /// startup.
@@ -2044,7 +2045,7 @@ impl<S: JitState> JitDriver<S> {
                 clippy::arc_with_non_send_sync,
                 reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
             )]
-            shared_asm: std::sync::Arc::new(std::sync::Mutex::new(
+            shared_asm: std::sync::Arc::new(parking_lot::Mutex::new(
                 majit_translate::codewriter::assembler::Assembler::new(),
             )),
         }
@@ -2059,7 +2060,7 @@ impl<S: JitState> JitDriver<S> {
     /// same underlying mutex.
     pub fn shared_asm(
         &self,
-    ) -> std::sync::Arc<std::sync::Mutex<majit_translate::codewriter::assembler::Assembler>> {
+    ) -> std::sync::Arc<parking_lot::Mutex<majit_translate::codewriter::assembler::Assembler>> {
         self.shared_asm.clone()
     }
 
@@ -2071,7 +2072,7 @@ impl<S: JitState> JitDriver<S> {
     /// the first trace clones it), after macro-emitted prebuild has
     /// registered every per-marker liveness entry.
     pub fn sync_liveness_info_from_shared_asm(&mut self) {
-        let asm_guard = self.shared_asm.lock().expect("shared_asm poisoned");
+        let asm_guard = self.shared_asm.lock();
         self.meta.sync_liveness_info(asm_guard.all_liveness());
     }
 
@@ -10279,17 +10280,15 @@ mod tests {
 
     #[test]
     fn test_hook_on_compile_fires_through_real_pipeline() {
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let compile_events: Arc<Mutex<Vec<(u64, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let events = compile_events.clone();
         driver.set_on_compile_loop(move |green_key, ops_before, ops_after, _opcodes| {
-            events
-                .lock()
-                .unwrap()
-                .push((green_key, ops_before, ops_after));
+            events.lock().push((green_key, ops_before, ops_after));
         });
 
         let key = 42u64;
@@ -10321,7 +10320,7 @@ mod tests {
         driver.meta.compile_loop(&[sum], ());
         assert!(driver.has_compiled_loop(key));
 
-        let events = compile_events.lock().unwrap();
+        let events = compile_events.lock();
         assert_eq!(events.len(), 1, "on_compile_loop should fire exactly once");
         assert_eq!(events[0].0, key, "green_key should match");
         assert!(events[0].1 > 0, "num_ops_before should be positive");
@@ -10493,14 +10492,15 @@ mod tests {
 
     #[test]
     fn test_hook_on_compile_bridge_fires_through_real_pipeline() {
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
 
         let mut driver = JitDriver::<TypedRestoreState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let bridge_events: Arc<Mutex<Vec<(u64, u32, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = bridge_events.clone();
         driver.meta.set_on_compile_bridge(move |gk, fi, nops| {
-            ev.lock().unwrap().push((gk, fi, nops));
+            ev.lock().push((gk, fi, nops));
         });
 
         let key = 50u64;
@@ -10560,7 +10560,7 @@ mod tests {
             "bridge should compile successfully"
         );
 
-        let events = bridge_events.lock().unwrap();
+        let events = bridge_events.lock();
         assert_eq!(
             events.len(),
             1,

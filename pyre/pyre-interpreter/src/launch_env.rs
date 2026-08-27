@@ -9,8 +9,9 @@
 //! permanently empty, so its host installs the relevant entries through
 //! [`set_launch_env`] and folds them over an all-default option block.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 /// The launcher options, as parsed from a command line and then folded with
 /// the environment by [`finalize`]. `app_main.py` keeps the same set in its
@@ -98,7 +99,7 @@ static LAUNCH_ENV: LazyLock<Mutex<Option<HashMap<String, Vec<u8>>>>> =
 /// restores the fold. Once installed the table is authoritative: a name missing
 /// from it is unset, never a fallback to the process environment.
 pub fn set_launch_env(entries: impl IntoIterator<Item = (String, Vec<u8>)>) {
-    *LAUNCH_ENV.lock().unwrap() = Some(entries.into_iter().collect());
+    *LAUNCH_ENV.lock() = Some(entries.into_iter().collect());
 }
 
 /// The names [`finalize`] reads, for a host that has to forward them to an
@@ -131,7 +132,7 @@ pub const LAUNCH_ENV_NAMES: &[&str] = &[
 /// otherwise from the process environment through the host seam. A seam error
 /// reads as unset, the same as a name the environment does not carry.
 fn read_raw(name: &str) -> Option<Vec<u8>> {
-    if let Some(table) = LAUNCH_ENV.lock().unwrap().as_ref() {
+    if let Some(table) = LAUNCH_ENV.lock().as_ref() {
         return table.get(name).cloned();
     }
     crate::host_seam::getenv(name.as_bytes()).ok().flatten()
@@ -177,7 +178,7 @@ fn locale_implies_utf8_mode() -> bool {
     // keeps the string cascade below. wasm32 has no locale database at all and
     // reaches the cascade the same way.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    if LAUNCH_ENV.lock().unwrap().is_none() {
+    if LAUNCH_ENV.lock().is_none() {
         rustpython_host_env::locale::setlocale(libc::LC_CTYPE, Some(c""));
         let effective = rustpython_host_env::locale::setlocale(libc::LC_CTYPE, None);
         return matches!(effective.as_deref(), None | Some(b"C") | Some(b"POSIX"));

@@ -13,7 +13,8 @@
 //! zero-cost via `Wtf8::as_str`.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
+use parking_lot::Mutex;
 
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
@@ -675,8 +676,7 @@ static STRING_INTERN_TABLE: LazyLock<Mutex<HashMap<Wtf8Buf, Box<usize>, Fnv1aBui
 pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
     let mut table = STRING_INTERN_TABLE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock();
     // Look the value up borrowed; only a first-time intern pays for the owned
     // key.  Re-interning an already-canonical value is the common case.
     if let Some(slot) = table.get(unsafe { w_str_get_wtf8(obj) }) {
@@ -710,8 +710,7 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
     let mut table = STRING_INTERN_TABLE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock();
     if let Some(slot) = table.get(value) {
         return **slot as PyObjectRef;
     }
@@ -761,8 +760,7 @@ pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
 pub unsafe fn is_interned_exact_str(obj: PyObjectRef) -> bool {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
     let table = STRING_INTERN_TABLE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock();
     table
         .get(unsafe { w_str_get_wtf8(obj) })
         .is_some_and(|slot| **slot as PyObjectRef == obj)
@@ -774,7 +772,6 @@ pub unsafe fn is_interned_exact_str(obj: PyObjectRef) -> bool {
 pub fn interned_size() -> usize {
     STRING_INTERN_TABLE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .len()
 }
 
@@ -788,7 +785,6 @@ pub fn interned_size() -> usize {
 pub fn interned_size_immortal() -> usize {
     STRING_INTERN_TABLE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
         .filter(|slot| !crate::gc_hook::try_gc_owns_object(***slot as *mut u8))
         .count()
@@ -802,8 +798,7 @@ pub fn interned_size_immortal() -> usize {
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     let mut table = STRING_INTERN_TABLE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .lock();
     if let Some(slot) = table.get(value) {
         return **slot as PyObjectRef;
     }

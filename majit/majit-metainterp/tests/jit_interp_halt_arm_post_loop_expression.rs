@@ -30,7 +30,7 @@ const EPILOGUE_BONUS: i64 = 100;
 /// compile.
 static COMPILES: AtomicUsize = AtomicUsize::new(0);
 
-static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 struct HaltPostLoopState {
     acc: i64,
@@ -121,7 +121,7 @@ fn interpret(n: i64) -> i64 {
 /// reading after the guard drops would reintroduce exactly the race the lock
 /// exists to remove.
 fn run(threshold: u32, n: i64) -> (i64, usize) {
-    let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = PROBE_LOCK.lock();
     COMPILES.store(0, Ordering::Relaxed);
     let got = dispatch_halt_post_loop(&program(), threshold, n);
     (got, COMPILES.load(Ordering::Relaxed))

@@ -18,11 +18,12 @@
 //!   `FunctionReprBase.call` — additional container kinds (`Struct`,
 //!   `Array`, `ForwardReference`) are not yet populated.
 
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use crate::annotator::model::KnownType;
 use crate::flowspace::model::{ConcretetypePlaceholder, ConstValue, GraphKey, GraphRef, Hlvalue};
@@ -1544,7 +1545,7 @@ impl Parentable {
         if !self.storage_live.load(Ordering::Relaxed) {
             return true;
         }
-        match &*self.parent.lock().unwrap() {
+        match &*self.parent.lock() {
             None => false,
             Some(link) => match link.wrparent.upgrade() {
                 None => panic!(
@@ -1620,7 +1621,7 @@ impl Parentable {
         } else {
             None
         };
-        *self.parent.lock().unwrap() = Some(ParentLink {
+        *self.parent.lock() = Some(ParentLink {
             wrparent,
             parent_type,
             parent_index,
@@ -1632,7 +1633,7 @@ impl Parentable {
     /// back the parent container object, running its `_check()` first when
     /// `check`. `None` for a container with no parent link.
     fn parentstructure(&self, check: bool) -> Option<_ptr_obj> {
-        let guard = self.parent.lock().unwrap();
+        let guard = self.parent.lock();
         let link = guard.as_ref()?;
         let parent = match link.wrparent.upgrade() {
             None => panic!(
@@ -1657,7 +1658,7 @@ impl Parentable {
     /// `None`), matching `_keepparent = None`.
     fn force_keepparent(&self) {
         let parent = self.parentstructure(false);
-        if let Some(link) = self.parent.lock().unwrap().as_mut() {
+        if let Some(link) = self.parent.lock().as_mut() {
             link.keepparent = parent;
         }
     }
@@ -1671,7 +1672,7 @@ impl Parentable {
     /// pointer comparison with a freed structure` retry that upstream
     /// `_subarray._makeptr` performs (lltype.py).
     fn parent_is(&self, candidate: &_ptr_obj) -> bool {
-        match self.parent.lock().unwrap().as_ref() {
+        match self.parent.lock().as_ref() {
             None => false,
             Some(link) => match link.wrparent.upgrade() {
                 Some(parent) => parent.same_arc(candidate),
@@ -1683,22 +1684,14 @@ impl Parentable {
     /// `_parentable._parent_index` (lltype.py) — `self`'s field name or
     /// item index inside its parent, or `None` when unparented.
     fn parent_index(&self) -> Option<ParentIndex> {
-        self.parent
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|l| l.parent_index.clone())
+        self.parent.lock().as_ref().map(|l| l.parent_index.clone())
     }
 
     /// `_parentable._parent_type` (lltype.py) — `typeOf(parent)`, or
     /// `None` when unparented. Read by the `_cast_to` up-cast walk to check
     /// the widened-to type against `PTRTYPE.TO`.
     fn parent_type(&self) -> Option<LowLevelType> {
-        self.parent
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|l| l.parent_type.clone())
+        self.parent.lock().as_ref().map(|l| l.parent_type.clone())
     }
 }
 
@@ -1855,7 +1848,7 @@ fn build_struct(type_: Struct, fields: Vec<(String, LowLevelValue)>) -> _struct 
     let s = _struct::from_parts(type_, fields);
     let parent_obj = _ptr_obj::Struct(s.clone());
     let parent_type = LowLevelType::Struct(Box::new(s.TYPE.clone()));
-    for (name, value) in s._fields.lock().unwrap().iter() {
+    for (name, value) in s._fields.lock().iter() {
         if let Some(child) = parentable_of(value) {
             let child_type = child_container_type(value)
                 .expect("a `_parentable` field is always a container value");
@@ -1886,7 +1879,7 @@ fn build_array(type_: ArrayContainer, items: Vec<LowLevelValue>) -> _array {
         ArrayContainer::FixedSizeArray(arr) => LowLevelType::FixedSizeArray(Box::new(arr.clone())),
     };
     let fixedsize = matches!(&a.TYPE, ArrayContainer::FixedSizeArray(_));
-    for (j, item) in a.items.lock().unwrap().iter().enumerate() {
+    for (j, item) in a.items.lock().iter().enumerate() {
         if let Some(child) = parentable_of(item) {
             let child_type = child_container_type(item)
                 .expect("a `_parentable` item is always a container value");
@@ -2694,14 +2687,13 @@ impl _struct {
     pub fn _getattr(&self, field_name: &str) -> Option<LowLevelValue> {
         self._fields
             .lock()
-            .unwrap()
             .iter()
             .find(|(name, _)| name == field_name)
             .map(|(_, value)| value.clone())
     }
 
     pub fn _setattr(&self, field_name: &str, value: LowLevelValue) -> bool {
-        let mut fields = self._fields.lock().unwrap();
+        let mut fields = self._fields.lock();
         let Some((_, slot)) = fields.iter_mut().find(|(name, _)| name == field_name) else {
             return false;
         };
@@ -2724,7 +2716,7 @@ impl _struct {
         // its own `Arc<Mutex<_fields>>` cell, and `LowLevelValue::Struct`
         // Clone shares the same Arc storage by `Arc::clone`.
         let inner = {
-            let fields = self._fields.lock().unwrap();
+            let fields = self._fields.lock();
             let Some((_, slot)) = fields.iter().find(|(name, _)| name == path[0]) else {
                 return false;
             };
@@ -2751,21 +2743,21 @@ impl _array {
     }
 
     pub fn getlength(&self) -> usize {
-        self.items.lock().unwrap().len()
+        self.items.lock().len()
     }
 
     pub fn getbounds(&self) -> (usize, usize) {
-        (0, self.items.lock().unwrap().len())
+        (0, self.items.lock().len())
     }
 
     /// `_array.shrinklength` (lltype.py): `del self.items[newlength:]`.
     pub fn shrinklength(&self, newlength: usize) {
-        self.items.lock().unwrap().truncate(newlength);
+        self.items.lock().truncate(newlength);
     }
 
     /// Cloned out of the lock guard — same rationale as `_struct::_getattr`.
     pub fn getitem(&self, index: usize) -> Option<LowLevelValue> {
-        self.items.lock().unwrap().get(index).cloned()
+        self.items.lock().get(index).cloned()
     }
 
     pub fn setitem(&self, index: usize, value: LowLevelValue) -> bool {
@@ -2780,7 +2772,7 @@ impl _array {
             self.OF(),
             typeOf_value(&value)
         );
-        let mut items = self.items.lock().unwrap();
+        let mut items = self.items.lock();
         let Some(slot) = items.get_mut(index) else {
             // `_array.setitem` special case (lltype.py): writing
             // `'\x00'` to the one slot past the end of an
@@ -4780,12 +4772,12 @@ impl ForwardReference {
                 "become() gives conflicting gckind, use the correct XxForwardReference".to_string(),
             );
         }
-        *self.target.lock().unwrap() = Some(realcontainertype);
+        *self.target.lock() = Some(realcontainertype);
         Ok(())
     }
 
     pub fn resolved(&self) -> Option<LowLevelType> {
-        self.target.lock().unwrap().clone()
+        self.target.lock().clone()
     }
 
     /// Pointer identity of the shared `become()` target cell. Stable and
@@ -5575,7 +5567,7 @@ pub fn runtime_type_info(p: &_ptr) -> Result<_ptr, String> {
     else {
         return Err("runtime_type_info() static RuntimeTypeInfo is not opaque".to_string());
     };
-    let query_funcptr = static_rtti.query_funcptr.lock().unwrap().clone();
+    let query_funcptr = static_rtti.query_funcptr.lock().clone();
     if let Some(query_funcptr) = query_funcptr {
         let PtrTarget::Func(func_t) = &query_funcptr._TYPE.TO else {
             return Err("runtime_type_info query_funcptr is not a function pointer".to_string());
@@ -5661,10 +5653,10 @@ pub fn attachRuntimeTypeInfo_with_ptrs(
     // guards upstream.
     let rtti_opaque = struct_t._runtime_type_info.as_ref().expect("checked above");
     if let Some(funcptr) = funcptr {
-        *rtti_opaque.query_funcptr.lock().unwrap() = Some(Box::new(funcptr));
+        *rtti_opaque.query_funcptr.lock() = Some(Box::new(funcptr));
     }
     if let Some(destrptr) = destrptr {
-        *rtti_opaque.destructor_funcptr.lock().unwrap() = Some(Box::new(destrptr));
+        *rtti_opaque.destructor_funcptr.lock() = Some(Box::new(destrptr));
     }
     let ptr_t = Ptr::from_container_type(RUNTIME_TYPE_INFO.clone())?;
     Ok(_ptr::new(
@@ -5793,7 +5785,7 @@ pub fn malloc(
         LowLevelType::Array(array_t) => {
             let items: Vec<LowLevelValue> = match n {
                 Some(n) => (0..n).map(|_| array_t.OF._defl()).collect(),
-                None => array_t._container_example().items.lock().unwrap().clone(),
+                None => array_t._container_example().items.lock().clone(),
             };
             _ptr_obj::Array(build_array(
                 ArrayContainer::Array((**array_t).clone()),
@@ -6482,7 +6474,6 @@ mod tests {
         assert_eq!(
             rtti.query_funcptr
                 .lock()
-                .unwrap()
                 .as_ref()
                 .map(|ptr| ptr._hashable_identity()),
             Some(query._hashable_identity())
@@ -6490,7 +6481,6 @@ mod tests {
         assert_eq!(
             rtti.destructor_funcptr
                 .lock()
-                .unwrap()
                 .as_ref()
                 .map(|ptr| ptr._hashable_identity()),
             Some(destr._hashable_identity())
@@ -6498,8 +6488,8 @@ mod tests {
         let Ok(Some(_ptr_obj::Opaque(attached_rtti))) = attached._obj0_value() else {
             panic!("attachRuntimeTypeInfo_with_ptrs must return the RTTI opaque pointer");
         };
-        assert!(attached_rtti.query_funcptr.lock().unwrap().is_some());
-        assert!(attached_rtti.destructor_funcptr.lock().unwrap().is_some());
+        assert!(attached_rtti.query_funcptr.lock().is_some());
+        assert!(attached_rtti.destructor_funcptr.lock().is_some());
     }
 
     #[test]

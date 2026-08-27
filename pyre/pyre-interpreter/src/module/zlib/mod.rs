@@ -12,7 +12,7 @@
 use pyre_native::zlib as backend;
 use pyre_object::*;
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// PyPy `interp_zlib.py Compress`: the stream and lock belong to the
 /// wrapper object.  The mapdict prefix preserves PyPy's ability to subclass
@@ -268,7 +268,7 @@ fn init_compress_type(ns: PyObjectRef) {
                     if this.backend.is_null() {
                         return Err(zlib_error("Error -2: inconsistent stream state"));
                     }
-                    let mut c = unsafe { &*this.backend }.lock().unwrap();
+                    let mut c = unsafe { &*this.backend }.lock();
                     let out = c.compress(&data).map_err(zlib_error)?;
                     Ok(bytesobject::w_bytes_from_bytes(&out))
                 },
@@ -311,7 +311,7 @@ fn init_compress_type(ns: PyObjectRef) {
                 if this.backend.is_null() {
                     return Err(zlib_error("Error -2: inconsistent stream state"));
                 }
-                let mut c = unsafe { &*this.backend }.lock().unwrap();
+                let mut c = unsafe { &*this.backend }.lock();
                 let out = c.flush(mode).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             }),
@@ -389,7 +389,7 @@ fn compress_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 "Compressor was already flushed",
             ));
         }
-        let mut compressor = unsafe { &*this.backend }.lock().unwrap();
+        let mut compressor = unsafe { &*this.backend }.lock();
         if compressor.is_finished() {
             return Err(crate::PyError::value_error(
                 "Compressor was already flushed",
@@ -482,7 +482,7 @@ fn decompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if this.backend.is_null() {
         return Err(zlib_error("Error -2: inconsistent stream state"));
     }
-    let mut d = unsafe { &*this.backend }.lock().unwrap();
+    let mut d = unsafe { &*this.backend }.lock();
     let out = d.decompress(&data, max_length).map_err(zlib_error)?;
     Ok(bytesobject::w_bytes_from_bytes(&out))
 }
@@ -563,7 +563,7 @@ fn init_decompress_type(ns: PyObjectRef) {
                 if this.backend.is_null() {
                     return Err(zlib_error("Error -2: inconsistent stream state"));
                 }
-                let mut d = unsafe { &*this.backend }.lock().unwrap();
+                let mut d = unsafe { &*this.backend }.lock();
                 let out = d.flush(length).map_err(zlib_error)?;
                 Ok(bytesobject::w_bytes_from_bytes(&out))
             }),
@@ -574,11 +574,7 @@ fn init_decompress_type(ns: PyObjectRef) {
         let data = if this.backend.is_null() {
             Vec::new()
         } else {
-            unsafe { &*this.backend }
-                .lock()
-                .unwrap()
-                .unused_data()
-                .to_vec()
+            unsafe { &*this.backend }.lock().unused_data().to_vec()
         };
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
@@ -587,18 +583,14 @@ fn init_decompress_type(ns: PyObjectRef) {
         let data = if this.backend.is_null() {
             Vec::new()
         } else {
-            unsafe { &*this.backend }
-                .lock()
-                .unwrap()
-                .unconsumed_tail()
-                .to_vec()
+            unsafe { &*this.backend }.lock().unconsumed_tail().to_vec()
         };
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
     decompress_getset(ns, "eof", |args| {
         let this = decompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
         Ok(w_bool_from(
-            !this.backend.is_null() && unsafe { &*this.backend }.lock().unwrap().eof(),
+            !this.backend.is_null() && unsafe { &*this.backend }.lock().eof(),
         ))
     });
 }
@@ -647,7 +639,7 @@ fn decompress_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 "Decompressor was already flushed",
             ));
         }
-        let decompressor = unsafe { &*this.backend }.lock().unwrap();
+        let decompressor = unsafe { &*this.backend }.lock();
         if decompressor.is_finished() {
             return Err(crate::PyError::value_error(
                 "Decompressor was already flushed",
@@ -775,7 +767,7 @@ fn zdecompress_decompress(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if this.backend.is_null() {
         return Err(zlib_error("Error -2: inconsistent stream state"));
     }
-    let mut d = unsafe { &*this.backend }.lock().unwrap();
+    let mut d = unsafe { &*this.backend }.lock();
     match d.decompress(&data, max_length) {
         Ok(out) => Ok(bytesobject::w_bytes_from_bytes(&out)),
         Err(backend::DecompressError::Zlib(m)) => Err(zlib_error(m)),
@@ -837,24 +829,20 @@ fn init_zdecompress_type(ns: PyObjectRef) {
         let data = if this.backend.is_null() {
             Vec::new()
         } else {
-            unsafe { &*this.backend }
-                .lock()
-                .unwrap()
-                .unused_data()
-                .to_vec()
+            unsafe { &*this.backend }.lock().unused_data().to_vec()
         };
         Ok(bytesobject::w_bytes_from_bytes(&data))
     });
     zdecompress_getset(ns, "eof", |args| {
         let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
         Ok(w_bool_from(
-            !this.backend.is_null() && unsafe { &*this.backend }.lock().unwrap().eof(),
+            !this.backend.is_null() && unsafe { &*this.backend }.lock().eof(),
         ))
     });
     zdecompress_getset(ns, "needs_input", |args| {
         let this = zdecompressor_this(args.get(1).copied().unwrap_or(PY_NULL))?;
         Ok(w_bool_from(
-            this.backend.is_null() || unsafe { &*this.backend }.lock().unwrap().needs_input(),
+            this.backend.is_null() || unsafe { &*this.backend }.lock().needs_input(),
         ))
     });
 }

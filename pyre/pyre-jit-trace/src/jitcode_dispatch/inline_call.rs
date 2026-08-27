@@ -810,9 +810,9 @@ fn log_descent_unlowered_helper_blockers(jitcode_index: usize) {
     if !fbw_inline_diag_enabled() {
         return;
     }
-    static LOGGED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
-        std::sync::Mutex::new(None);
-    let mut guard = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    static LOGGED: parking_lot::Mutex<Option<std::collections::HashSet<usize>>> =
+        parking_lot::Mutex::new(None);
+    let mut guard = LOGGED.lock();
     if !guard
         .get_or_insert_with(Default::default)
         .insert(jitcode_index)

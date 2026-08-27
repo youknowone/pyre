@@ -47,8 +47,9 @@
 
 #![allow(non_camel_case_types)]
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::annotator::model::{SomeValue, unionof};
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
@@ -1244,7 +1245,7 @@ pub fn getintegerrepr(lltype: &LowLevelType) -> Arc<IntegerRepr> {
             static INTEGER_REPRS: OnceLock<Mutex<HashMap<LowLevelType, Arc<IntegerRepr>>>> =
                 OnceLock::new();
             let cache = INTEGER_REPRS.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut cache = cache.lock().expect("integer repr cache poisoned");
+            let mut cache = cache.lock();
             cache
                 .entry(other.clone())
                 .or_insert_with(|| Arc::new(IntegerRepr::new(other.clone(), None)))

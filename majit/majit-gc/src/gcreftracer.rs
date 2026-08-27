@@ -52,7 +52,8 @@
 //! storage and there is nothing to turn off.
 
 use std::cell::Cell;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Weak};
+use parking_lot::RwLock;
 
 use majit_ir::GcRef;
 
@@ -169,7 +170,7 @@ impl GcTable {
 /// Append a live table to the registry, sweeping out tables whose loop
 /// tokens have already been freed.
 fn register_table(table: &Arc<GcTable>) {
-    let mut guard = LIVE_GC_TABLES.write().unwrap();
+    let mut guard = LIVE_GC_TABLES.write();
     guard.retain(|w| w.strong_count() > 0);
     guard.push(Arc::downgrade(table));
 }
@@ -184,7 +185,7 @@ fn walk_all_gc_tables(visitor: &mut dyn FnMut(&mut GcRef)) {
     // test's drop/observe window (which takes the write side) is never
     // interleaved with a walk. Compiles out in production.
     #[cfg(test)]
-    let _walk = GC_TABLE_WALK_LOCK.read().unwrap_or_else(|e| e.into_inner());
+    let _walk = GC_TABLE_WALK_LOCK.read();
     walk_all_gc_tables_inner(visitor);
 }
 
@@ -197,7 +198,7 @@ fn walk_all_gc_tables_inner(visitor: &mut dyn FnMut(&mut GcRef)) {
     // `walk_extra_roots`, `shadow_stack.rs`). Dead `Weak`s are
     // filtered by `upgrade`.
     let live: Vec<Arc<GcTable>> = {
-        let guard = LIVE_GC_TABLES.read().unwrap();
+        let guard = LIVE_GC_TABLES.read();
         guard.iter().filter_map(|w| w.upgrade()).collect()
     };
     for table in &live {
@@ -234,8 +235,7 @@ mod tests {
     #[test]
     fn trace_forwards_slots_in_place() {
         let _serialize = GC_TABLE_WALK_LOCK
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .write();
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // A moving collection relocates 0x1000 -> 0x9000.
         table.trace(&mut |r| {
@@ -261,8 +261,7 @@ mod tests {
         // runs the GC rewrite (loud-panic), so it has no moving-GC ref-const
         // path to cover.
         let _serialize = GC_TABLE_WALK_LOCK
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .write();
         let table = GcTable::from_gcrefs(&[GcRef(0x1000), GcRef(0x2000)]);
         // `base` is the value baked into the trace at compile time.
         let base = table.base_addr();
@@ -301,8 +300,7 @@ mod tests {
     #[test]
     fn dropping_table_deregisters_from_walk() {
         let _serialize = GC_TABLE_WALK_LOCK
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .write();
         // A sentinel unlikely to collide with any other test's table.
         const SENTINEL: GcRef = GcRef(0x0000_DEAD_BEEF);
         // The write side is already held, so count through the unlocked

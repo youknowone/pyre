@@ -18,6 +18,7 @@ web = ["dep:wasm-bindgen"]
 host-import = []
 
 [dependencies]
+parking_lot = { workspace = true }
 indexmap = { workspace = true }
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }

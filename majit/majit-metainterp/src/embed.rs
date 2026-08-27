@@ -30,9 +30,9 @@
 //!   reset safe. A reset outside a held lock hands each of two overlapping
 //!   consumers a fraction of the truth.
 
+use parking_lot::{Mutex, MutexGuard};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 use crate::{JitDriver, JitState, LoopBodyShape};
 
@@ -241,7 +241,7 @@ impl Census {
     /// reentrancy and binding warnings.
     #[must_use = "the window closes when the returned Census is dropped"]
     pub fn begin() -> Self {
-        let window = WINDOW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let window = WINDOW_LOCK.lock();
         LAST_OPS_AFTER.store(0, Ordering::Relaxed);
         LAST_HAS_JUMP.store(false, Ordering::Relaxed);
         LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);

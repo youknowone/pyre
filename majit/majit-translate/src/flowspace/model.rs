@@ -21,12 +21,13 @@
 //!   shared by every `Variable`) is a `static LazyLock<Mutex<...>>`;
 //!   Rust has no class-mutable-state, this is the minimum deviation.
 
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use indexmap::IndexMap;
 
@@ -54,14 +55,12 @@ fn record_block_address(block: &BlockRef) {
     let inserted = SEEN_BLOCK_ADDRS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .expect("block address-reuse detector mutex poisoned")
         .insert(addr);
     if !inserted {
         BLOCK_ADDR_REUSE.fetch_add(1, Ordering::Relaxed);
         REUSED_BLOCK_ADDRS
             .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()
-            .expect("reused-block address detector mutex poisoned")
             .insert(addr);
     }
 }
@@ -75,7 +74,6 @@ fn record_graph_address(graph: &GraphRef) {
     let inserted = SEEN_GRAPH_ADDRS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .expect("graph address-reuse detector mutex poisoned")
         .insert(addr);
     if !inserted {
         GRAPH_ADDR_REUSE.fetch_add(1, Ordering::Relaxed);
@@ -101,7 +99,6 @@ pub fn block_address_was_reused(block: &BlockRef) -> bool {
     REUSED_BLOCK_ADDRS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .expect("reused-block address detector mutex poisoned")
         .contains(&addr)
 }
 
@@ -392,7 +389,7 @@ impl HostObject {
     /// None.
     pub fn class_get(&self, name: &str) -> Option<ConstValue> {
         match &self.inner.kind {
-            HostObjectKind::Class { members, .. } => members.lock().unwrap().get(name).cloned(),
+            HostObjectKind::Class { members, .. } => members.lock().get(name).cloned(),
             _ => None,
         }
     }
@@ -401,7 +398,7 @@ impl HostObject {
     /// 경로에서 사용. Non-class 에 대해서는 no-op.
     pub fn class_set(&self, name: impl Into<String>, value: ConstValue) {
         if let HostObjectKind::Class { members, .. } = &self.inner.kind {
-            members.lock().unwrap().insert(name.into(), value);
+            members.lock().insert(name.into(), value);
         }
     }
 
@@ -409,9 +406,7 @@ impl HostObject {
     /// 빈 Vec.
     pub fn class_dict_keys(&self) -> Vec<String> {
         match &self.inner.kind {
-            HostObjectKind::Class { members, .. } => {
-                members.lock().unwrap().keys().cloned().collect()
-            }
+            HostObjectKind::Class { members, .. } => members.lock().keys().cloned().collect(),
             _ => Vec::new(),
         }
     }
@@ -422,7 +417,6 @@ impl HostObject {
         match &self.inner.kind {
             HostObjectKind::Class { members, .. } => members
                 .lock()
-                .unwrap()
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
@@ -434,7 +428,7 @@ impl HostObject {
     /// Non-class 는 false.
     pub fn class_has(&self, name: &str) -> bool {
         match &self.inner.kind {
-            HostObjectKind::Class { members, .. } => members.lock().unwrap().contains_key(name),
+            HostObjectKind::Class { members, .. } => members.lock().contains_key(name),
             _ => false,
         }
     }
@@ -495,7 +489,7 @@ impl HostObject {
     pub fn instance_get(&self, name: &str) -> Option<ConstValue> {
         match &self.inner.kind {
             HostObjectKind::Instance { instance_dict, .. } => {
-                instance_dict.lock().unwrap().get(name).cloned()
+                instance_dict.lock().get(name).cloned()
             }
             _ => None,
         }
@@ -506,7 +500,7 @@ impl HostObject {
     pub fn instance_dict_keys(&self) -> Vec<String> {
         match &self.inner.kind {
             HostObjectKind::Instance { instance_dict, .. } => {
-                instance_dict.lock().unwrap().keys().cloned().collect()
+                instance_dict.lock().keys().cloned().collect()
             }
             _ => Vec::new(),
         }
@@ -518,14 +512,14 @@ impl HostObject {
     /// that populate known attributes upfront.
     pub fn instance_set(&self, name: impl Into<String>, value: ConstValue) {
         if let HostObjectKind::Instance { instance_dict, .. } = &self.inner.kind {
-            instance_dict.lock().unwrap().insert(name.into(), value);
+            instance_dict.lock().insert(name.into(), value);
         }
     }
 
     /// Module member 조회 — upstream `getattr(module, name)`.
     pub fn module_get(&self, name: &str) -> Option<HostObject> {
         match &self.inner.kind {
-            HostObjectKind::Module { members } => members.lock().unwrap().get(name).cloned(),
+            HostObjectKind::Module { members } => members.lock().get(name).cloned(),
             _ => None,
         }
     }
@@ -533,7 +527,7 @@ impl HostObject {
     /// Module setter — module object bootstrap 과정에서만 사용.
     pub fn module_set(&self, name: impl Into<String>, value: HostObject) {
         if let HostObjectKind::Module { members } = &self.inner.kind {
-            members.lock().unwrap().insert(name.into(), value);
+            members.lock().insert(name.into(), value);
         }
     }
 
@@ -2367,7 +2361,7 @@ impl HostEnv {
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_RAW),
         );
 
-        let mut mods = self.modules.lock().unwrap();
+        let mut mods = self.modules.lock();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
         mods.insert("os.path".into(), os_path);
@@ -2427,7 +2421,7 @@ impl HostEnv {
 
     /// upstream `__import__(name, …)` — `flowcontext.py:660`.
     pub fn import_module(&self, name: &str) -> Option<HostObject> {
-        self.modules.lock().unwrap().get(name).cloned()
+        self.modules.lock().get(name).cloned()
     }
 
     /// Exception class 가 builtin 테이블에 있다면 그 HostObject 를
@@ -2788,7 +2782,7 @@ fn clean_name(name: &str) -> String {
     {
         cleaned.insert(0, '_');
     }
-    let mut nd = NAMESDICT.lock().unwrap();
+    let mut nd = NAMESDICT.lock();
     let entry = nd
         .entry(cleaned.clone())
         .or_insert_with(|| (cleaned.clone(), 0));
@@ -2942,7 +2936,7 @@ impl Variable {
         let mut nr = self._nr.get();
         let prefix = self._name.borrow().clone();
         if nr == -1 {
-            let mut nd = NAMESDICT.lock().unwrap();
+            let mut nd = NAMESDICT.lock();
             let entry = nd
                 .entry(prefix.clone())
                 .or_insert_with(|| (prefix.clone(), 0));

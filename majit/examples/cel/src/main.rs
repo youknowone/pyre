@@ -129,7 +129,7 @@ mod tests {
     ///
     /// Poison is discarded: a gate that fails an assertion panics with the lock
     /// held, and a poisoned mutex would turn one real failure into five.
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROBE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// The unroll-retry channel, read as a delta inside `PROBE_LOCK` — the same
     /// window the gates bracket their own counters in. The counters are
@@ -185,7 +185,7 @@ mod tests {
     }
 
     fn exclusive<T>(gate: impl FnOnce() -> T) -> T {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         let before = CENSUS_SLOTS.map(majit_metainterp::mc_diag);
         let r = gate();
         let after = CENSUS_SLOTS.map(majit_metainterp::mc_diag);

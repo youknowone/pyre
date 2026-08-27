@@ -28,7 +28,7 @@
 //! One `GetfieldGcR` per link without the declaration; with it, only the read
 //! whose base is the red `state.root` survives and the two below it are gone.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
@@ -88,7 +88,7 @@ macro_rules! machine {
             let mut driver: JitDriver<$state> = JitDriver::new(threshold);
             driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
                 $compiles.fetch_add(1, Ordering::Relaxed);
-                *$compiled.lock().unwrap() = opcodes.to_vec();
+                *$compiled.lock() = opcodes.to_vec();
             });
             let mut pc: usize = 0;
             let mut state = $state {
@@ -216,7 +216,7 @@ fn a_declared_ref_field_folds_where_an_undeclared_one_reloads() {
         PLAIN_COMPILES.load(Ordering::Relaxed) > 0,
         "the undeclared machine compiled nothing, so there is no denominator",
     );
-    let plain = PLAIN_COMPILED.lock().unwrap().clone();
+    let plain = PLAIN_COMPILED.lock().clone();
     let plain_reads = census(&plain, OpCode::GetfieldGcR);
     assert!(
         plain_reads > 0,
@@ -229,7 +229,7 @@ fn a_declared_ref_field_folds_where_an_undeclared_one_reloads() {
         DECLARED_COMPILES.load(Ordering::Relaxed) > 0,
         "the declared machine compiled nothing",
     );
-    let declared = DECLARED_COMPILED.lock().unwrap().clone();
+    let declared = DECLARED_COMPILED.lock().clone();
     let declared_reads = census(&declared, OpCode::GetfieldGcR);
 
     assert!(
@@ -251,7 +251,7 @@ fn a_declared_ref_field_folds_where_an_undeclared_one_reloads() {
 #[test]
 fn the_undeclared_mutable_field_still_stores() {
     let _ = dispatch_declared(&PROGRAM, 8, declared_chain(), TICKS);
-    let declared = DECLARED_COMPILED.lock().unwrap().clone();
+    let declared = DECLARED_COMPILED.lock().clone();
     assert!(
         census(&declared, OpCode::SetfieldGc) > 0,
         "`marked` is not declared; its store must remain: {declared:#?}",

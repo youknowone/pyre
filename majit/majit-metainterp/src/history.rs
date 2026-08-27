@@ -6,7 +6,8 @@
 ///
 /// Reference: rpython/jit/metainterp/history.py TreeLoop
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRc, OpRef, Type, Value};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// history.py get_const_ptr_for_string(s)
 ///
@@ -249,19 +250,19 @@ impl majit_ir::LoopTargetDescr for LoopTargetDescr {
     }
 
     fn target_arglocs(&self) -> Vec<majit_ir::TargetArgLoc> {
-        self.state.lock().unwrap().target_arglocs.clone()
+        self.state.lock().target_arglocs.clone()
     }
 
     fn set_target_arglocs(&self, arglocs: Vec<majit_ir::TargetArgLoc>) {
-        self.state.lock().unwrap().target_arglocs = arglocs;
+        self.state.lock().target_arglocs = arglocs;
     }
 
     fn original_jitcell_token_number(&self) -> Option<u64> {
-        self.state.lock().unwrap().original_jitcell_token_number
+        self.state.lock().original_jitcell_token_number
     }
 
     fn set_original_jitcell_token_number(&self, num: u64) {
-        self.state.lock().unwrap().original_jitcell_token_number = Some(num);
+        self.state.lock().original_jitcell_token_number = Some(num);
     }
 }
 

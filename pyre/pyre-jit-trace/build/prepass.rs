@@ -1233,7 +1233,6 @@ fn real_main() {
         // duplicates collapse through EffectInfo._cache identity.
         let mut cached_effect_infos: Vec<majit_ir::EffectInfo> = majit_ir::descr::gc_cache()
             .lock()
-            .unwrap()
             .snapshot_calls()
             .into_iter()
             .filter_map(|descr| {

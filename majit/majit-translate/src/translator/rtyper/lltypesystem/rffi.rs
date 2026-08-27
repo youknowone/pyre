@@ -7,8 +7,9 @@
 //! deferred until the corresponding RPython platform/type metadata is ported.
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
@@ -329,12 +330,12 @@ pub static _KEEPER_CACHE: LazyLock<Mutex<HashMap<LowLevelType, KeepaliveKeeper>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn _keeper_for_type(TP: LowLevelType) -> KeepaliveKeeper {
-    let mut cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    let mut cache = _KEEPER_CACHE.lock();
     cache.entry(TP).or_default().clone()
 }
 
 pub fn register_keepalive(TP: LowLevelType, obj: ConstValue) -> usize {
-    let mut cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    let mut cache = _KEEPER_CACHE.lock();
     let keeper = cache.entry(TP).or_default();
     if let Some(pos) = keeper.free_positions.pop() {
         keeper.stuff_to_keepalive[pos] = Some(obj);
@@ -347,7 +348,7 @@ pub fn register_keepalive(TP: LowLevelType, obj: ConstValue) -> usize {
 }
 
 pub fn get_keepalive_object(pos: usize, TP: LowLevelType) -> Option<ConstValue> {
-    let cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    let cache = _KEEPER_CACHE.lock();
     cache
         .get(&TP)
         .and_then(|keeper| keeper.stuff_to_keepalive.get(pos).cloned())
@@ -355,7 +356,7 @@ pub fn get_keepalive_object(pos: usize, TP: LowLevelType) -> Option<ConstValue> 
 }
 
 pub fn unregister_keepalive(pos: usize, TP: LowLevelType) {
-    let mut cache = _KEEPER_CACHE.lock().expect("_KEEPER_CACHE poisoned");
+    let mut cache = _KEEPER_CACHE.lock();
     if let Some(keeper) = cache.get_mut(&TP)
         && pos < keeper.stuff_to_keepalive.len()
     {

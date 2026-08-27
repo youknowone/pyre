@@ -12,7 +12,8 @@
 
 use crate::descr::DescrRef;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
+use parking_lot::Mutex;
 
 /// effectinfo.py `class UnsupportedFieldExc(Exception)`.
 #[derive(Debug, Clone)]
@@ -384,7 +385,7 @@ pub fn intern_effect_info(effect_info: EffectInfo) -> Arc<EffectInfoCell> {
     let mut effect_info = effect_info;
     effect_info.call_release_gil_target = EffectInfo::_NO_CALL_RELEASE_GIL_TARGET;
 
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = CACHE.lock();
     if let Some(existing) = cache.iter().find(|existing| existing.get() == &effect_info) {
         return existing.clone();
     }
@@ -411,8 +412,7 @@ pub fn intern_translated_effect_info(
     effect_info: EffectInfo,
 ) -> Arc<EffectInfoCell> {
     let mut translated = translated_effect_infos()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .lock();
     let slot = translated_id as usize;
     if translated.len() <= slot {
         translated.resize_with(slot + 1, || None);
@@ -431,7 +431,6 @@ pub fn intern_translated_effect_info(
 pub fn translated_effect_info(translated_id: u32) -> Option<Arc<EffectInfoCell>> {
     translated_effect_infos()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .get(translated_id as usize)
         .and_then(Clone::clone)
 }

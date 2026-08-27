@@ -810,7 +810,7 @@ mod lock_class {
     // so the wait must be the bare one-shot call that propagates spurious
     // wakeups.  `parking_lot`'s condition variable retries internally and
     // would swallow exactly the wakeup that carries the interrupt.
-    use std::sync::{Condvar, Mutex};
+    use parking_lot::{Condvar, Mutex};
 
     /// Native mutex acquisition is the residual `RPyThreadAcquireLock*`
     /// primitive (`rpython/rlib/rthread.py:60-90,160-200`).  Keep the Python
@@ -858,7 +858,7 @@ mod lock_class {
             // guard ends with the primitive, so the signal handlers the caller
             // runs on `RPY_LOCK_INTR` execute back inside the census.
             let _blocked = before_external_block();
-            let mut locked = lock_state(&self.locked);
+            let mut locked = self.locked.lock();
             let mut success;
             if !*locked {
                 success = RPY_LOCK_ACQUIRED;
@@ -874,19 +874,12 @@ mod lock_class {
                         if now >= deadline {
                             break;
                         }
-                        let (guard, timeout) = self
-                            .ready
-                            .wait_timeout(locked, deadline - now)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        locked = guard;
+                        let timeout = self.ready.wait_for(&mut locked, deadline - now);
                         if timeout.timed_out() {
                             break;
                         }
                     } else {
-                        locked = self
-                            .ready
-                            .wait(locked)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        self.ready.wait(&mut locked);
                     }
                     if *locked {
                         // We were woken up, but didn't get the lock.  We
@@ -916,7 +909,7 @@ mod lock_class {
         }
 
         fn release(&self) -> Result<(), crate::PyError> {
-            let mut locked = lock_state(&self.locked);
+            let mut locked = self.locked.lock();
             if !*locked {
                 return Err(crate::PyError::runtime_error("release unlocked lock"));
             }
@@ -926,7 +919,7 @@ mod lock_class {
         }
 
         fn locked(&self) -> bool {
-            *lock_state(&self.locked)
+            *self.locked.lock()
         }
 
         fn __enter__(&self) -> Result<PyObjectRef, crate::PyError> {
@@ -964,7 +957,7 @@ pub use lock_class::W_Lock;
 mod rlock_class {
     use super::*;
     // Same interrupt-detection requirement as `lock_class`.
-    use std::sync::{Condvar, Mutex};
+    use parking_lot::{Condvar, Mutex};
 
     #[derive(Default)]
     struct RLockState {
@@ -1021,7 +1014,7 @@ mod rlock_class {
         #[majit_macros::dont_look_inside]
         fn acquire_timed(&self, microseconds: i64, ident: i64) -> i64 {
             let _blocked = before_external_block();
-            let mut state = lock_state(&self.state);
+            let mut state = self.state.lock();
             let mut success;
             if state.count == 0 {
                 success = RPY_LOCK_ACQUIRED;
@@ -1037,19 +1030,12 @@ mod rlock_class {
                         if now >= deadline {
                             break;
                         }
-                        let (guard, timeout) = self
-                            .ready
-                            .wait_timeout(state, deadline - now)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        state = guard;
+                        let timeout = self.ready.wait_for(&mut state, deadline - now);
                         if timeout.timed_out() {
                             break;
                         }
                     } else {
-                        state = self
-                            .ready
-                            .wait(state)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        self.ready.wait(&mut state);
                     }
                     if state.count != 0 {
                         // Woken without the lock — probably a signal.
@@ -1075,7 +1061,7 @@ mod rlock_class {
             let microseconds = parse_acquire_args(blocking, timeout)?;
             let tid = current_ident();
             {
-                let mut state = lock_state(&self.state);
+                let mut state = self.state.lock();
                 if state.count > 0 && state.owner == tid {
                     state.count = state.count.checked_add(1).ok_or_else(|| {
                         crate::PyError::overflow_error("internal lock count overflowed")
@@ -1100,7 +1086,7 @@ mod rlock_class {
 
         fn release(&self) -> Result<(), crate::PyError> {
             let ident = current_ident();
-            let mut state = lock_state(&self.state);
+            let mut state = self.state.lock();
             if state.count == 0 || state.owner != ident {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
@@ -1115,16 +1101,16 @@ mod rlock_class {
         }
 
         fn locked(&self) -> bool {
-            lock_state(&self.state).count != 0
+            self.state.lock().count != 0
         }
 
         fn _is_owned(&self) -> bool {
-            let state = lock_state(&self.state);
+            let state = self.state.lock();
             state.count > 0 && state.owner == current_ident()
         }
 
         fn _recursion_count(&self) -> i64 {
-            let state = lock_state(&self.state);
+            let state = self.state.lock();
             if state.owner == current_ident() {
                 state.count
             } else {
@@ -1133,7 +1119,7 @@ mod rlock_class {
         }
 
         fn _release_save(&self) -> Result<PyObjectRef, crate::PyError> {
-            let mut state = lock_state(&self.state);
+            let mut state = self.state.lock();
             if state.count == 0 {
                 return Err(crate::PyError::runtime_error(
                     "cannot release un-acquired lock",
@@ -1164,7 +1150,7 @@ mod rlock_class {
             // than reported: restoring a saved state is not a place where a
             // signal may be delivered.
             while self.acquire_timed(-1, owner) != RPY_LOCK_ACQUIRED {}
-            lock_state(&self.state).count = count;
+            self.state.lock().count = count;
             Ok(())
         }
 
@@ -1179,7 +1165,7 @@ mod rlock_class {
         }
 
         fn __repr__(&self) -> String {
-            let state = lock_state(&self.state);
+            let state = self.state.lock();
             let locked = if state.count == 0 {
                 "unlocked"
             } else {

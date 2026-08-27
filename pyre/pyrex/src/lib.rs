@@ -1067,8 +1067,7 @@ fn maybe_print_jit_stats() {
         .staticdata
         .all_descrs()
         .lock()
-        .map(|d| d.len())
-        .unwrap_or(0);
+        .len();
     eprintln!(
         "[jit-stats] mc_diag {} all_descrs={all_descrs_len}",
         majit_metainterp::mc_diag_summary()

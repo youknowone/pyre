@@ -132,7 +132,7 @@ fn build() -> majit_metainterp::JitCode {
 fn cached_data_field() -> Option<(majit_ir::Type, usize, bool)> {
     use majit_ir::descr::FieldDescr as _;
     let type_id = majit_metainterp::__majit_struct_type_id::<PointerFieldStack>(false);
-    let cache = majit_ir::descr::gc_cache().lock().unwrap();
+    let cache = majit_ir::descr::gc_cache().lock();
     let descr = cache
         ._cache_field
         .get(&majit_ir::descr::LLType::Struct(type_id))
@@ -189,7 +189,7 @@ fn a_scalar_field_of_the_same_struct_is_still_a_scalar() {
     use majit_ir::descr::FieldDescr as _;
     let _jc = build();
     let type_id = majit_metainterp::__majit_struct_type_id::<PointerFieldStack>(false);
-    let cache = majit_ir::descr::gc_cache().lock().unwrap();
+    let cache = majit_ir::descr::gc_cache().lock();
     let size_field = cache
         ._cache_field
         .get(&majit_ir::descr::LLType::Struct(type_id))

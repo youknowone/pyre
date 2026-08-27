@@ -8,7 +8,7 @@
 //! Modeled after incminimark's minor/major collection.
 use majit_ir::GcRef;
 use std::collections::VecDeque;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 /// Monotonic source for the durations the collector reports to its hooks.
 ///
@@ -305,7 +305,7 @@ static SUPPLIED_ENV: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
 /// has none. Call before the first allocation: the values are read once, when
 /// the collector is built.
 pub fn set_supplied_env(entries: Vec<(String, String)>) {
-    *SUPPLIED_ENV.write().unwrap() = entries;
+    *SUPPLIED_ENV.write() = entries;
 }
 
 /// `std::env::var`, falling back to what the embedder supplied.
@@ -313,7 +313,7 @@ fn env_var(varname: &str) -> Option<String> {
     if let Ok(value) = std::env::var(varname) {
         return Some(value);
     }
-    let supplied = SUPPLIED_ENV.read().unwrap();
+    let supplied = SUPPLIED_ENV.read();
     supplied
         .iter()
         .find(|(name, _)| name == varname)
@@ -8994,7 +8994,7 @@ impl GcAllocator for MiniMarkGC {
 mod tests {
     use super::*;
 
-    static SHADOW_STACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SHADOW_STACK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// A supplied environment answers a name the process does not define, and
     /// yields to one it does. The name is not in [`GC_ENV_NAMES`], so a
@@ -9433,7 +9433,7 @@ mod tests {
     /// `free_young_rawmalloced_objects` releases the block.
     #[test]
     fn an_unreached_large_destructor_object_is_destroyed_at_the_minor() {
-        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
         DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let mut gc = test_gc(4096);
@@ -9468,7 +9468,7 @@ mod tests {
     /// address — a non-moving object has no forwarding address to translate.
     #[test]
     fn a_reached_large_destructor_object_is_promoted_not_destroyed() {
-        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
         DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let mut gc = test_gc(4096);
@@ -10208,7 +10208,7 @@ mod tests {
     /// `MemoryError` is per-thread now, so a normalising call no longer clears
     /// one a concurrently running test armed — serialise them instead, the way
     /// the destructor and shadow-stack tests serialise their own shared state.
-    static MAX_HEAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static MAX_HEAP_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// incminimark.py:2601-2615 `PYPY_GC_MAX` out-of-memory policy: a bounded
     /// major collection over `max_heap_size` signals OOM the first time
@@ -10217,7 +10217,7 @@ mod tests {
     /// threshold bounded, so the decision fires on an otherwise empty heap.
     #[test]
     fn bounded_max_heap_size_signals_oom_then_aborts() {
-        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAX_HEAP_TEST_LOCK.lock();
         let mut gc = test_gc(4096);
         // PYPY_GC_MAX = 1 byte (below min_heap_size), so set_major_threshold_from
         // caps at 1 and reports `bounded`.
@@ -10271,7 +10271,7 @@ mod tests {
     /// about.
     #[test]
     fn a_breach_while_the_memory_error_is_still_owed_is_not_a_second_arrival() {
-        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAX_HEAP_TEST_LOCK.lock();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(4096));
         let obj = gc.alloc_with_type(tid, 4096);
@@ -10319,7 +10319,7 @@ mod tests {
     /// still to be told.
     #[test]
     fn a_breach_owed_to_another_thread_arms_this_one_rather_than_silencing_it() {
-        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAX_HEAP_TEST_LOCK.lock();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(4096));
         let obj = gc.alloc_with_type(tid, 4096);
@@ -10384,7 +10384,7 @@ mod tests {
     /// program's only sign of a full heap becomes the abort on the next one.
     #[test]
     fn a_breach_with_no_allocation_waiting_defers_to_the_dispatch_loop() {
-        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAX_HEAP_TEST_LOCK.lock();
         let mut gc = test_gc(4096);
         // What separates this from the test above: no allocation is waiting, so
         // `threshold_reached(0)` decides on the heap as it stands, and the heap
@@ -10418,7 +10418,7 @@ mod tests {
     /// so a completed major collection leaves the OOM signals untouched.
     #[test]
     fn unbounded_heap_never_signals_oom() {
-        let _guard = MAX_HEAP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = MAX_HEAP_TEST_LOCK.lock();
         let mut gc = test_gc(4096);
         assert_eq!(gc.max_heap_size, 0.0);
         gc.pending_reserving_size = 4096;
@@ -10715,7 +10715,7 @@ mod tests {
     // the right object at the right time. A serializing lock keeps the
     // shared counter races-free under cargo's parallel test runner.
 
-    static DESTRUCTOR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static DESTRUCTOR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     static DESTRUCTOR_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static DESTRUCTOR_LAST_ADDR: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
@@ -10731,7 +10731,7 @@ mod tests {
 
     #[test]
     fn destructor_runs_on_nursery_death() {
-        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
         DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let mut gc = test_gc(4096);
@@ -10756,7 +10756,7 @@ mod tests {
 
     #[test]
     fn destructor_not_run_on_survival_then_run_on_oldgen_death() {
-        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
         DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let mut gc = test_gc(4096);
@@ -10784,7 +10784,7 @@ mod tests {
 
     #[test]
     fn destructor_survives_multiple_minors_no_double_count() {
-        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
         DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let mut gc = test_gc(4096);
@@ -10811,7 +10811,7 @@ mod tests {
 
     #[test]
     fn destructor_on_a_large_alloc_runs_on_major_death_after_promotion() {
-        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
         DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         // large_object_threshold = nursery/2 = 512; a 1024-byte payload
@@ -10842,7 +10842,7 @@ mod tests {
 
     #[test]
     fn no_destructor_means_no_list_entry() {
-        let _guard = DESTRUCTOR_TEST_LOCK.lock().unwrap();
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
         let mut gc = test_gc(4096);
         // A plain type (no destructor) is never recorded on either list.
         let tid = gc.register_type(TypeInfo::simple(16));
@@ -13752,7 +13752,7 @@ cache size\t: 8192 kB\n";
     /// into the fresh list, and keep `PINNED` set for good.
     #[test]
     fn test_old_parent_found_before_the_swap_stays_in_the_list() {
-        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         let mut gc = test_gc(4096);
         let child_tid = gc.register_type(TypeInfo::simple(16));
@@ -13846,7 +13846,7 @@ cache size\t: 8192 kB\n";
     /// without being told about it.
     #[test]
     fn minor_collection_rewrites_an_owner_root_slot() {
-        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
@@ -13877,7 +13877,7 @@ cache size\t: 8192 kB\n";
     /// to be pinned behind a heap allocation first.
     #[test]
     fn an_owner_root_survives_its_holder_being_moved() {
-        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
@@ -13903,7 +13903,7 @@ cache size\t: 8192 kB\n";
 
     #[test]
     fn test_incremental_cycle_marks_jitframe_shadow_stack_roots() {
-        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
@@ -13925,7 +13925,7 @@ cache size\t: 8192 kB\n";
 
     #[test]
     fn test_full_collection_marks_jitframe_shadow_stack_roots() {
-        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));

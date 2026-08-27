@@ -36,6 +36,7 @@ __execute-stage-probe = ["majit-backend-cranelift?/__execute-stage-probe"]
 __yield-stage-probe = []
 
 [dependencies]
+parking_lot = { workspace = true }
 majit-ir = { workspace = true }
 majit-trace = { workspace = true }
 majit-backend = { workspace = true }

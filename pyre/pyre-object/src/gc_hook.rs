@@ -42,22 +42,19 @@ use crate::PyObjectRef;
 /// descriptor's `&'static [usize]`, so a lookup copies a fat pointer with no
 /// allocation.
 static PYRE_CLASS_GC_OFFSETS: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::HashMap<usize, &'static [usize]>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    parking_lot::RwLock<std::collections::HashMap<usize, &'static [usize]>>,
+> = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
 /// Register a type's inline `gc_ptr_offsets` under its `PyType` pointer.
-/// Called only at single-threaded init; a poisoned lock silently drops the
-/// insert (init is the sole writer, so this cannot happen in practice).
+/// Called only at single-threaded init, which is the sole writer.
 pub fn register_pyre_class_offsets(pytype_ptr: usize, offsets: &'static [usize]) {
-    if let Ok(mut map) = PYRE_CLASS_GC_OFFSETS.write() {
-        map.insert(pytype_ptr, offsets);
-    }
+    PYRE_CLASS_GC_OFFSETS.write().insert(pytype_ptr, offsets);
 }
 
 /// Look up the registered inline `PyObjectRef` field offsets for `ob_type`.
 /// Returns `None` for a null `ob_type` or an unregistered type.  Takes a
 /// process-global read lock — cheap and alloc-free, safe while the collector
-/// is marking; a poisoned lock reads as `None`.
+/// is marking.
 ///
 /// The hash map is not the `AddressDict`/`AddressMap` an upstream reader might
 /// expect to see here.  Those are the collector's own address-to-address
@@ -82,11 +79,7 @@ pub unsafe fn offsets_for_pytype(
     if ob_type.is_null() {
         return None;
     }
-    PYRE_CLASS_GC_OFFSETS
-        .read()
-        .ok()?
-        .get(&(ob_type as usize))
-        .copied()
+    PYRE_CLASS_GC_OFFSETS.read().get(&(ob_type as usize)).copied()
 }
 
 /// Signature of the host-side GC allocation callback.
@@ -836,9 +829,9 @@ mod tests {
     //
     // The lock below only serializes the installers against each other; that is
     // what keeps the "unregistered/cleared -> None/false" assertions sound.
-    static HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn hook_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    fn hook_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        HOOK_TEST_LOCK.lock()
     }
 
     /// What the mock allocator was last asked for on this thread, and what it

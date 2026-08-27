@@ -24,7 +24,7 @@
 //! sits changes: nowhere, before the loop, inside the loop ahead of the merge
 //! point, and after the loop.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use majit_ir::OpCode;
@@ -59,7 +59,7 @@ impl Recorder {
             "nothing compiled, so the warm answer was the interpreter's alone \
              and every claim about the trace is vacuous",
         );
-        self.body.lock().unwrap().clone()
+        self.body.lock().clone()
     }
 }
 
@@ -97,7 +97,7 @@ fn dispatch_bare(program: &Bytecode, threshold: u32, ticks: i64, sel: i64) -> i6
     let mut driver: JitDriver<BareState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         BARE.compiles.fetch_add(1, Ordering::Relaxed);
-        *BARE.body.lock().unwrap() = opcodes.to_vec();
+        *BARE.body.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = BareState { acc: 0, ticks };
@@ -141,7 +141,7 @@ fn dispatch_setup_before(program: &Bytecode, threshold: u32, ticks: i64, sel: i6
     let mut driver: JitDriver<BeforeState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         BEFORE.compiles.fetch_add(1, Ordering::Relaxed);
-        *BEFORE.body.lock().unwrap() = opcodes.to_vec();
+        *BEFORE.body.lock() = opcodes.to_vec();
     });
     let label = match sel {
         0i64 => "zero",
@@ -194,7 +194,7 @@ fn dispatch_setup_in_loop(program: &Bytecode, threshold: u32, ticks: i64, sel: i
     let mut driver: JitDriver<InLoopState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         IN_LOOP.compiles.fetch_add(1, Ordering::Relaxed);
-        *IN_LOOP.body.lock().unwrap() = opcodes.to_vec();
+        *IN_LOOP.body.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = InLoopState { acc: 0, ticks };
@@ -247,7 +247,7 @@ fn dispatch_setup_after(program: &Bytecode, threshold: u32, ticks: i64, sel: i64
     let mut driver: JitDriver<AfterState> = JitDriver::new(threshold);
     driver.set_on_compile_loop(|_gk, _before, _after, opcodes| {
         AFTER.compiles.fetch_add(1, Ordering::Relaxed);
-        *AFTER.body.lock().unwrap() = opcodes.to_vec();
+        *AFTER.body.lock() = opcodes.to_vec();
     });
     let mut pc: usize = 0;
     let mut state = AfterState { acc: 0, ticks };

@@ -42,6 +42,7 @@ wasm-web = ["majit-backend-wasm/web"]
 wasm-host = ["majit-backend-wasm/host-import"]
 
 [dependencies]
+parking_lot = { workspace = true }
 indexmap = { workspace = true }
 rustc-hash = { workspace = true }
 pyre-object = { workspace = true }

@@ -831,7 +831,7 @@ fn make_call_descr_sized_with_cell(
         result_size,
         &effect_info,
     );
-    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+    let mut gc = majit_ir::descr::gc_cache().lock();
     gc.intern_call_descr_with(key, || {
         let descr: DescrRef = Arc::new(MetaCallDescr {
             heapcache_index: majit_ir::descr::next_call_descr_heapcache_index(),
@@ -1133,7 +1133,7 @@ mod set_effect_bitstrings_tests {
         };
         let descr = make_call_descr_with_effect(&[Type::Int, Type::Ref], Type::Float, ei);
 
-        let cached = majit_ir::descr::gc_cache().lock().unwrap().snapshot_calls();
+        let cached = majit_ir::descr::gc_cache().lock().snapshot_calls();
         // The descr we just constructed is in the cache. We also
         // tolerate the cache holding entries from earlier tests in the
         // same process; we only assert membership of OUR descr.

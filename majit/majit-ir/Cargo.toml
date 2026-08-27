@@ -18,6 +18,7 @@ jit-audits = []
 test-support = []
 
 [dependencies]
+parking_lot = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
 vecmap_rs = { workspace = true }

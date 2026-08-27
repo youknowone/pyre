@@ -4317,7 +4317,7 @@ struct PartsCacheBase {
     // PyPy's mutable list.  Readers clone one Arc, rather than cloning the
     // complete list on every formatting call, and never retain this lock
     // across a bigint allocation/GC safepoint.
-    parts_cache: std::sync::Mutex<std::sync::Arc<Vec<std::sync::Arc<RBigInt>>>>,
+    parts_cache: parking_lot::Mutex<std::sync::Arc<Vec<std::sync::Arc<RBigInt>>>>,
 }
 
 impl PartsCacheBase {
@@ -4339,7 +4339,7 @@ impl PartsCacheBase {
         Self {
             mindigits,
             lowest_part: curr,
-            parts_cache: std::sync::Mutex::new(std::sync::Arc::new(vec![std::sync::Arc::new(
+            parts_cache: parking_lot::Mutex::new(std::sync::Arc::new(vec![std::sync::Arc::new(
                 RBigInt::fromint(curr),
             )])),
         }
@@ -4361,7 +4361,7 @@ impl PartsCacheBase {
         Self {
             mindigits,
             lowest_part: curr,
-            parts_cache: std::sync::Mutex::new(std::sync::Arc::new(vec![std::sync::Arc::new(
+            parts_cache: parking_lot::Mutex::new(std::sync::Arc::new(vec![std::sync::Arc::new(
                 part,
             )])),
         }
@@ -4371,7 +4371,6 @@ impl PartsCacheBase {
     fn parts_snapshot(&self) -> std::sync::Arc<Vec<std::sync::Arc<RBigInt>>> {
         self.parts_cache
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
@@ -4399,8 +4398,7 @@ impl PartsCacheBase {
 
         let mut shared = self
             .parts_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         if std::sync::Arc::ptr_eq(&shared, expected) {
             *shared = extended;
         }
@@ -4410,14 +4408,14 @@ impl PartsCacheBase {
 
 type PartsCacheRef = std::sync::Arc<PartsCacheBase>;
 
-static PARTS_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<Option<PartsCacheRef>>>> =
+static PARTS_CACHE: std::sync::LazyLock<parking_lot::Mutex<Vec<Option<PartsCacheRef>>>> =
     std::sync::LazyLock::new(|| {
         // rbigint.py:3062-3064 constructs the 34-slot owner and immediately
         // fills slot 10 - 3 through `_parts_cache_10`.  Preserve that eager
         // content rather than treating decimal like the other lazy bases.
         let mut parts_cache = vec![None; 34];
         parts_cache[10 - 3] = Some(std::sync::Arc::new(PartsCacheBase::new_prebuilt_decimal()));
-        std::sync::Mutex::new(parts_cache)
+        parking_lot::Mutex::new(parts_cache)
     });
 
 /// Force construction of rbigint.py's module-global `_parts_cache` and
@@ -4435,8 +4433,7 @@ fn get_cached_parts(base: i64) -> PartsCacheRef {
     let index = base - 3;
     {
         let all = PARTS_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         if let Some(cache) = &all[index as usize] {
             return cache.clone();
         }
@@ -4448,14 +4445,12 @@ fn get_cached_parts(base: i64) -> PartsCacheRef {
     let initial_part = {
         let parts = initial
             .parts_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         parts[0].clone()
     };
     let _initial_root = unsafe { PendingPartsCacheDigitRoot::new(&initial_part) };
     let mut all = PARTS_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .lock();
     all[index as usize].get_or_insert(initial).clone()
 }
 
@@ -7237,8 +7232,7 @@ mod tests {
 
         let cache_from_owner = {
             let all = PARTS_CACHE
-                .lock()
-                .expect("rbigint process-global parts cache lock poisoned");
+                .lock();
             assert_eq!(all.len(), 34);
             all[10 - 3]
                 .as_ref()

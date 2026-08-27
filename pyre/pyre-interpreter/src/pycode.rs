@@ -627,8 +627,8 @@ pub struct PyCode {
     /// Owned via `Box::into_raw`; allocated once at construction sized
     /// to `code.names.len()`, never resized.  `null` when `code_ptr`
     /// is null or unaligned (test fixtures, gateway builtins).
-    pub globals_caches: *mut std::sync::Mutex<
-        Vec<Option<std::sync::Weak<std::sync::Mutex<pyre_object::celldict::GlobalCache>>>>,
+    pub globals_caches: *mut parking_lot::Mutex<
+        Vec<Option<std::sync::Weak<parking_lot::Mutex<pyre_object::celldict::GlobalCache>>>>,
     >,
     /// `mapdict.py self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     /// len(co_names_w)`.
@@ -889,14 +889,12 @@ pub unsafe fn w_code_filename_obj(w_code: PyObjectRef) -> PyObjectRef {
 /// the runtime GC hook is installed stay outside the collector; expose that
 /// fallback family through one small insertion-ordered registry. Ordinary
 /// runtime wrappers are managed stable-oldgen objects.
-static PREBUILT_CODE_ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<usize>>> =
+static PREBUILT_CODE_ROOTS: std::sync::OnceLock<parking_lot::Mutex<Vec<usize>>> =
     std::sync::OnceLock::new();
 
 fn register_prebuilt_code_root(code: PyObjectRef) {
-    let roots = PREBUILT_CODE_ROOTS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    let mut roots = roots
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let roots = PREBUILT_CODE_ROOTS.get_or_init(|| parking_lot::Mutex::new(Vec::new()));
+    let mut roots = roots.lock();
     let identity = code as usize;
     if !roots.contains(&identity) {
         roots.push(identity);
@@ -910,9 +908,7 @@ fn unregister_prebuilt_code_root(code: PyObjectRef) {
     let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
         return;
     };
-    let mut roots = roots
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut roots = roots.lock();
     roots.retain(|&identity| identity != code as usize);
 }
 
@@ -924,9 +920,7 @@ pub(crate) fn walk_prebuilt_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::Gc
     let Some(roots) = PREBUILT_CODE_ROOTS.get() else {
         return;
     };
-    let roots = roots
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let roots = roots.lock();
     for &code in roots.iter() {
         unsafe { crate::eval::walk_raw_code_roots(code as PyObjectRef, visitor) };
     }
@@ -1172,10 +1166,10 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
         let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
         let names_len = code_ref.names.len();
         let mut v: Vec<
-            Option<std::sync::Weak<std::sync::Mutex<pyre_object::celldict::GlobalCache>>>,
+            Option<std::sync::Weak<parking_lot::Mutex<pyre_object::celldict::GlobalCache>>>,
         > = Vec::with_capacity(names_len);
         v.resize_with(names_len, || None);
-        Box::into_raw(Box::new(std::sync::Mutex::new(v)))
+        Box::into_raw(Box::new(parking_lot::Mutex::new(v)))
     };
     // `mapdict.py self._mapdict_caches = [INVALID_CACHE_ENTRY] *
     // len(co_names_w)` — `None` is `INVALID_CACHE_ENTRY`.
@@ -3508,12 +3502,12 @@ enum CodeLocations {
 /// rows belong to the shared code object, and a raw `PyObjectRef` is not
 /// `Send`.
 static CODE_LOCATIONS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<usize, CodeLocations>>,
+    parking_lot::Mutex<std::collections::HashMap<usize, CodeLocations>>,
 > = std::sync::OnceLock::new();
 
 fn code_locations_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<usize, CodeLocations>> {
-    CODE_LOCATIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+-> &'static parking_lot::Mutex<std::collections::HashMap<usize, CodeLocations>> {
+    CODE_LOCATIONS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Release a freshly constructed code object's expanded `locations` array,
@@ -3533,9 +3527,7 @@ fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32
     // lock alone. A second wrapper over an already-released object must keep
     // the record the first made — re-deferring would abandon rows a reader has
     // since decoded.
-    let mut cache = code_locations_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = code_locations_cache().lock();
     let std::collections::hash_map::Entry::Vacant(entry) = cache.entry(code_ptr as usize) else {
         return;
     };
@@ -3552,9 +3544,7 @@ fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32
 /// Correct the first line number a released array is decoded against, leaving a
 /// code object that still holds its own array alone.
 fn record_deferred_locations_firstlineno(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32) {
-    let mut cache = code_locations_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = code_locations_cache().lock();
     if let Some(slot @ CodeLocations::Deferred(_)) = cache.get_mut(&(code_ptr as usize)) {
         *slot = CodeLocations::Deferred(firstlineno_raw);
     }
@@ -3575,9 +3565,7 @@ pub fn code_locations(code: &crate::CodeObject) -> &[(SourceLocation, SourceLoca
         return &code.locations;
     }
     let key = code as *const crate::CodeObject as usize;
-    let mut cache = code_locations_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = code_locations_cache().lock();
     let firstlineno_raw = match cache.get(&key) {
         Some(CodeLocations::Decoded(rows)) => return *rows,
         Some(CodeLocations::Deferred(firstlineno_raw)) => *firstlineno_raw,
@@ -3820,11 +3808,11 @@ pub fn instruction_can_start_a_line(code: &crate::CodeObject, pc: usize) -> bool
 /// decline the inline. Keys and values are `usize` because a raw
 /// `PyObjectRef` is not `Send`, as in `interp_sre`'s pattern registry.
 static LIVE_CODE_WRAPPERS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+    parking_lot::Mutex<std::collections::HashMap<usize, usize>>,
 > = std::sync::OnceLock::new();
 
-fn live_code_wrappers() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
-    LIVE_CODE_WRAPPERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+fn live_code_wrappers() -> &'static parking_lot::Mutex<std::collections::HashMap<usize, usize>> {
+    LIVE_CODE_WRAPPERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Record `wrapper` as the live wrapper for `code_ptr`, keeping the first one
@@ -3835,7 +3823,6 @@ pub fn register_live_code_wrapper(code_ptr: *const (), wrapper: PyObjectRef) {
     }
     live_code_wrappers()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(code_ptr as usize)
         .or_insert(wrapper as usize);
 }
@@ -3848,7 +3835,6 @@ pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
     }
     live_code_wrappers()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(code_ptr as usize))
         .map_or(PY_NULL, |&w| w as PyObjectRef)
 }
@@ -4094,21 +4080,13 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     let wrapper = obj_addr as PyObjectRef;
     unregister_prebuilt_code_root(wrapper);
     {
-        let mut wrappers = live_code_wrappers()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut wrappers = live_code_wrappers().lock();
         if wrappers.get(&(code.code_ptr as usize)).copied() == Some(wrapper as usize) {
             wrappers.remove(&(code.code_ptr as usize));
         }
     }
-    w_globals_stamped_codes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&obj_addr);
-    mapdict_method_cache_codes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&obj_addr);
+    w_globals_stamped_codes().lock().remove(&obj_addr);
+    mapdict_method_cache_codes().lock().remove(&obj_addr);
     if !code.cell_families.is_null() {
         // Only the slot table. The families themselves stay allocated: cells
         // created from this code may still be alive in a surviving closure,
@@ -4309,7 +4287,7 @@ pub unsafe fn w_code_cell_family(obj: PyObjectRef, slot: usize) -> *const CellFa
 pub unsafe fn w_code_globals_caches_get(
     obj: PyObjectRef,
     nameindex: usize,
-) -> Option<std::sync::Arc<std::sync::Mutex<pyre_object::celldict::GlobalCache>>> {
+) -> Option<std::sync::Arc<parking_lot::Mutex<pyre_object::celldict::GlobalCache>>> {
     if obj.is_null() {
         return None;
     }
@@ -4317,7 +4295,7 @@ pub unsafe fn w_code_globals_caches_get(
     if code.globals_caches.is_null() {
         return None;
     }
-    let vec = unsafe { &*code.globals_caches }.lock().unwrap();
+    let vec = unsafe { &*code.globals_caches }.lock();
     vec.get(nameindex)
         .and_then(|slot| slot.as_ref())
         .and_then(|w| w.upgrade())
@@ -4333,7 +4311,7 @@ pub unsafe fn w_code_globals_caches_get(
 pub unsafe fn w_code_globals_caches_set(
     obj: PyObjectRef,
     nameindex: usize,
-    cache: &std::sync::Arc<std::sync::Mutex<pyre_object::celldict::GlobalCache>>,
+    cache: &std::sync::Arc<parking_lot::Mutex<pyre_object::celldict::GlobalCache>>,
 ) {
     if obj.is_null() {
         return;
@@ -4342,7 +4320,7 @@ pub unsafe fn w_code_globals_caches_set(
     if code.globals_caches.is_null() {
         return;
     }
-    let mut vec = unsafe { &*code.globals_caches }.lock().unwrap();
+    let mut vec = unsafe { &*code.globals_caches }.lock();
     if let Some(slot) = vec.get_mut(nameindex) {
         *slot = Some(std::sync::Arc::downgrade(cache));
     }
@@ -4363,7 +4341,7 @@ pub unsafe fn w_code_globals_caches_len(obj: PyObjectRef) -> usize {
     if code.globals_caches.is_null() {
         return 0;
     }
-    unsafe { (*code.globals_caches).lock().unwrap().len() }
+    unsafe { (*code.globals_caches).lock().len() }
 }
 
 /// `mapdict.py/1546/1575 entry = pycode._mapdict_caches[nameindex]` — read
@@ -4415,10 +4393,7 @@ pub unsafe fn w_code_mapdict_caches_set(
         // `walk_mapdict_method_cache_gc` forwards the slot.
         if !entry.w_method.is_null() {
             if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
-                mapdict_method_cache_codes()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(obj as usize);
+                mapdict_method_cache_codes().lock().insert(obj as usize);
             }
             // The slot is reached only by `walk_mapdict_method_cache_gc`,
             // skipped on clean minors; record it before the store.
@@ -4436,12 +4411,12 @@ pub unsafe fn w_code_mapdict_caches_set(
 /// before the collector exists enters this registry and the extra-root
 /// walker forwards it from here (same family as `walk_method_cache_gc`).
 static MAPDICT_METHOD_CACHE_CODES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<usize>>,
+    parking_lot::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::OnceLock::new();
 
-fn mapdict_method_cache_codes() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+fn mapdict_method_cache_codes() -> &'static parking_lot::Mutex<std::collections::HashSet<usize>> {
     MAPDICT_METHOD_CACHE_CODES
-        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Code objects whose `w_globals` has been stamped
@@ -4458,11 +4433,12 @@ fn mapdict_method_cache_codes() -> &'static std::sync::Mutex<std::collections::H
 /// object forwards a dangling pointer.  This registry makes the slot a root of
 /// its own for that family, as [`MAPDICT_METHOD_CACHE_CODES`] does.
 static W_GLOBALS_STAMPED_CODES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashSet<usize>>,
+    parking_lot::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::OnceLock::new();
 
-fn w_globals_stamped_codes() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
-    W_GLOBALS_STAMPED_CODES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+fn w_globals_stamped_codes() -> &'static parking_lot::Mutex<std::collections::HashSet<usize>> {
+    W_GLOBALS_STAMPED_CODES
+        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Record `obj` as a code object holding a stamped `w_globals` slot.
@@ -4474,10 +4450,7 @@ fn register_w_globals_stamped_code(obj: PyObjectRef) {
     if pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
         return;
     }
-    w_globals_stamped_codes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(obj as usize);
+    w_globals_stamped_codes().lock().insert(obj as usize);
 }
 
 /// Forward the stamped `w_globals` slot of every registered code object.
@@ -4493,9 +4466,7 @@ fn register_w_globals_stamped_code(obj: PyObjectRef) {
 /// safepoint — that is what makes handing out `&mut code.w_globals` sound.
 #[majit_macros::dont_look_inside]
 pub fn walk_w_globals_stamped_code_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    let codes = w_globals_stamped_codes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let codes = w_globals_stamped_codes().lock();
     for &code in codes.iter() {
         let code = unsafe { &mut *(code as *mut PyCode) };
         if code.w_globals.is_null() {
@@ -4517,9 +4488,7 @@ pub fn walk_w_globals_stamped_code_roots(forward: &mut dyn FnMut(&mut PyObjectRe
 /// the thread that filled the slot.
 #[majit_macros::dont_look_inside]
 pub fn walk_mapdict_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    let codes = mapdict_method_cache_codes()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let codes = mapdict_method_cache_codes().lock();
     for &code in codes.iter() {
         let code = unsafe { &*(code as *const PyCode) };
         if code.mapdict_caches.is_null() {

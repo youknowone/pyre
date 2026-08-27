@@ -3072,7 +3072,7 @@ fn flatten_graph_impl<'a>(
     cpu: Option<&'a super::cpu::Cpu>,
     enforce_input_args: bool,
 ) -> SSARepr {
-    let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
+    let lowering_ctx = cpu.and_then(|c| *c.lowering_ctx.read());
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py flattener = GraphFlattener(graph, regallocs,
     // _include_all_exc_links, cpu)`.
@@ -9260,7 +9260,7 @@ mod tests {
         ]);
 
         let cpu = Cpu::new();
-        *cpu.lowering_ctx.write().unwrap() = Some(LoweringContext {
+        *cpu.lowering_ctx.write() = Some(LoweringContext {
             binary_op_fn_idx: 11,
             compare_op_fn_idx: 13,
             truth_fn_idx: 17,

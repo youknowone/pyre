@@ -26,9 +26,10 @@
 //! [`lookup`] match on the carrier shape directly. Adding a new
 //! upstream entry means adding a variant + match arm here.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::annotator::bookkeeper::Bookkeeper;
 use crate::annotator::model::{AnnotatorError, SomeBuiltin, SomeValue, s_none};
@@ -813,7 +814,7 @@ pub(crate) fn register_host_value(
     host: HostObject,
     entry: ExtRegistryEntry,
 ) -> Result<(), TyperError> {
-    let mut registry = host_value_registry().lock().unwrap();
+    let mut registry = host_value_registry().lock();
     if registry.contains_key(&host) {
         return Err(TyperError::message(format!(
             "duplicate extregistry value registration for {}",
@@ -831,7 +832,7 @@ pub(crate) fn register_host_value(
 /// duplicate registration call is tolerated since `populate_host_env`
 /// is itself OnceLock-gated.
 pub(crate) fn register_r_uint(host: HostObject) {
-    let mut registry = host_value_registry().lock().unwrap();
+    let mut registry = host_value_registry().lock();
     if !registry.contains_key(&host) {
         registry.insert(host.clone(), ExtRegistryEntry::ForType { instance: host });
     }
@@ -843,7 +844,7 @@ pub(crate) fn register_host_type(
     host_type: HostObject,
     entry: ExtRegistryEntry,
 ) -> Result<(), TyperError> {
-    let mut registry = host_type_registry().lock().unwrap();
+    let mut registry = host_type_registry().lock();
     if registry.contains_key(&host_type) {
         return Err(TyperError::message(format!(
             "duplicate extregistry type registration for {}",
@@ -890,13 +891,12 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     if host.qualname() == "longlong2float.longlong2float" {
         return Some(ExtRegistryEntry::LongLong2Float);
     }
-    if let Some(entry) = host_value_registry().lock().unwrap().get(host).cloned() {
+    if let Some(entry) = host_value_registry().lock().get(host).cloned() {
         return Some(entry);
     }
     let cls = host.instance_class()?;
     host_type_registry()
         .lock()
-        .unwrap()
         .get(cls)
         .cloned()
         .map(|entry| bind_lookup_instance(entry, host))
@@ -969,7 +969,7 @@ pub fn lookup(instance: &ConstValue) -> Option<ExtRegistryEntry> {
 /// first checks the HostObject registry dict populated by
 /// [`register_host_type`].
 pub fn is_registered_type(host: &HostObject) -> bool {
-    host_type_registry().lock().unwrap().contains_key(host)
+    host_type_registry().lock().contains_key(host)
 }
 
 /// RPython `extregistry.lookup_type(tp)` (extregistry.py).
@@ -987,7 +987,7 @@ pub fn is_registered_type(host: &HostObject) -> bool {
 /// the same AttributeError upstream produces. The Rust port encodes
 /// this via the `Option<_ptr>` slot on [`ExtRegistryEntry::Ptr`].
 pub fn lookup_type(host: &HostObject) -> Option<ExtRegistryEntry> {
-    host_type_registry().lock().unwrap().get(host).cloned()
+    host_type_registry().lock().get(host).cloned()
 }
 
 #[cfg(test)]

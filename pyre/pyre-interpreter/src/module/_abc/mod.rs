@@ -22,7 +22,7 @@ static INVALIDATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// of the process.  A `Vec` reallocation would move a word the collector still
 /// writes through, so the indirection is what makes the registration outlive
 /// the next push.
-static ROOTED_SLOTS: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(Vec::new());
+static ROOTED_SLOTS: parking_lot::Mutex<Vec<Box<usize>>> = parking_lot::Mutex::new(Vec::new());
 
 /// Keep an object this module will go on naming by address.
 ///
@@ -47,10 +47,7 @@ fn root_forever(obj: PyObjectRef) {
     let mut slot = Box::new(obj as usize);
     let root_slot = (&raw mut *slot) as *mut *mut u8;
     unsafe { pyre_object::gc_hook::try_gc_add_root(root_slot) };
-    ROOTED_SLOTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(slot);
+    ROOTED_SLOTS.lock().push(slot);
 }
 
 /// The app-level `SimpleWeakSet` (`app_abc.py`), stashed at module init

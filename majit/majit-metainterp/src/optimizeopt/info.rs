@@ -40,9 +40,6 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 /// the cache's, and the guard then fails on every object. A descr for such a
 /// struct has to say so with `headerless`, which is checked before this is
 /// called, rather than by leaving its `type_id` at 0.
-///
-/// A poisoned cache lock degrades to "unresolved", which declines; it must not
-/// abort.
 pub(crate) fn resolve_gc_tid(
     stamped_tid: u32,
     cache_key: u64,
@@ -57,7 +54,7 @@ pub(crate) fn resolve_gc_tid(
     if cache_key == 0 {
         return None;
     }
-    let cache = majit_ir::descr::gc_cache().lock().ok()?;
+    let cache = majit_ir::descr::gc_cache().lock();
     resolve(&cache, cache_key).filter(|&tid| tid != 0)
 }
 
@@ -2072,9 +2069,7 @@ mod tests {
         let cached_array: DescrRef =
             Arc::new(SimpleArrayDescr::new(0, 16, 8, array_tid, Type::Int));
         {
-            let mut cache = gc_cache()
-                .lock()
-                .expect("test GC cache must not be poisoned");
+            let mut cache = gc_cache().lock();
             cache._cache_size.insert(LLType::Struct(key), cached_struct);
             cache._cache_array.insert(LLType::Array(key), cached_array);
         }
@@ -2102,9 +2097,7 @@ mod tests {
             array_tid
         );
 
-        let mut cache = gc_cache()
-            .lock()
-            .expect("test GC cache must not be poisoned");
+        let mut cache = gc_cache().lock();
         cache._cache_size.remove(&LLType::Struct(key));
         cache._cache_array.remove(&LLType::Array(key));
     }

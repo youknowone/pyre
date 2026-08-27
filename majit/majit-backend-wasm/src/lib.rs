@@ -22,7 +22,8 @@ mod glue;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 /// Diagnostic-only `compile_bridge` outcome tallies, read out via the
 /// `pyre_jit_bridge_diag` guest export (the runner prints them at
@@ -248,22 +249,22 @@ pub fn inline_geometry_count() -> u64 {
 }
 
 pub fn inline_trial_errors() -> String {
-    INLINE_TRIAL_ERRORS.lock().unwrap().join(" | ")
+    INLINE_TRIAL_ERRORS.lock().join(" | ")
 }
 
 pub(crate) fn record_inline_decline(record: String) {
-    let mut log = INLINE_DECLINES.lock().unwrap();
+    let mut log = INLINE_DECLINES.lock();
     if log.len() < INLINE_DECLINE_LOG_CAP {
         log.push(record);
     }
 }
 
 pub fn inline_declines() -> String {
-    INLINE_DECLINES.lock().unwrap().join(" | ")
+    INLINE_DECLINES.lock().join(" | ")
 }
 
 fn record_inline_trial_error(error: &BackendError) {
-    let mut errors = INLINE_TRIAL_ERRORS.lock().unwrap();
+    let mut errors = INLINE_TRIAL_ERRORS.lock();
     if errors.len() < 3 {
         errors.push(error.to_string());
     }
@@ -364,7 +365,6 @@ fn alloc_trace_entry_census(trace_id: u64, key_count: usize) -> Option<TraceEntr
         let base = counts.as_mut_ptr() as usize as u32;
         TRACE_ENTRY_CENSUS
             .lock()
-            .unwrap()
             .push(TraceEntryCensus { trace_id, counts });
         Some(TraceEntryCensusStorage {
             trace_id,
@@ -381,7 +381,7 @@ fn alloc_trace_entry_census(trace_id: u64, key_count: usize) -> Option<TraceEntr
 
 /// Greppable, stable host readout of the guest-written entry counters.
 pub fn trace_entry_census_summary() -> String {
-    let census = TRACE_ENTRY_CENSUS.lock().unwrap();
+    let census = TRACE_ENTRY_CENSUS.lock();
     let mut total = 0u64;
     let mut report = String::new();
     for trace in census.iter() {

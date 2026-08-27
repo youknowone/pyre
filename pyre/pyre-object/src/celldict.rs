@@ -480,7 +480,7 @@ pub type ModuleDictEntries =
 /// [`ModuleDictEntries`] does.
 pub type GlobalCacheRegistry = std::collections::HashMap<
     String,
-    std::sync::Arc<std::sync::Mutex<GlobalCache>>,
+    std::sync::Arc<parking_lot::Mutex<GlobalCache>>,
     crate::dictmultiobject::StrKeyBuildHasher,
 >;
 
@@ -633,7 +633,7 @@ pub struct GlobalCache {
     ///
     /// As in PyPy, invalidation is tied to
     /// `ModuleDictStrategy.invalidate_caches` dropping the registry.
-    pub builtincache: Option<std::sync::Arc<std::sync::Mutex<GlobalCache>>>,
+    pub builtincache: Option<std::sync::Arc<parking_lot::Mutex<GlobalCache>>>,
 }
 
 impl GlobalCache {
@@ -677,10 +677,10 @@ impl GlobalCache {
 /// # Safety
 /// `cache.cell`, when present, must be a valid `PyObjectRef`.
 unsafe fn walk_one_global_cache(
-    cache: &std::sync::Arc<std::sync::Mutex<GlobalCache>>,
+    cache: &std::sync::Arc<parking_lot::Mutex<GlobalCache>>,
     visitor: &mut dyn FnMut(&mut PyObjectRef),
 ) {
-    let mut c = cache.lock().unwrap();
+    let mut c = cache.lock();
     if let Some(slot) = c.cell.as_mut() {
         walk_module_value_slot(slot, visitor);
     }
@@ -716,7 +716,7 @@ unsafe fn walk_one_global_cache(
 /// strategy-owned registry when multiple Python threads share a module.
 pub struct ModuleDictStrategy {
     pub version: VersionTag,
-    pub caches: std::sync::Mutex<Option<GlobalCacheRegistry>>,
+    pub caches: parking_lot::Mutex<Option<GlobalCacheRegistry>>,
     /// The hidden `mutate_version` field for `celldict.py:34
     /// _immutable_fields_ = ["version?"]`.  Each compiled loop whose trace
     /// promoted `self.version` (and folded a module-global lookup keyed on it)
@@ -759,7 +759,7 @@ impl ModuleDictStrategy {
     pub fn new() -> Self {
         Self {
             version: VersionTag::fresh(),
-            caches: std::sync::Mutex::new(None),
+            caches: parking_lot::Mutex::new(None),
             version_watchers: crate::quasiimmut::QuasiImmutField::new(),
         }
     }
@@ -841,8 +841,8 @@ impl ModuleDictStrategy {
         &mut self,
         storage: &ModuleDictStorage,
         key: &str,
-    ) -> std::sync::Arc<std::sync::Mutex<GlobalCache>> {
-        let mut cache_registry = self.caches.lock().unwrap();
+    ) -> std::sync::Arc<parking_lot::Mutex<GlobalCache>> {
+        let mut cache_registry = self.caches.lock();
         // `celldict.py`:
         //     if self.caches is None:
         //         cache = None
@@ -874,7 +874,7 @@ impl ModuleDictStrategy {
         // value pointer into walker-only storage (`walk_cache_cells`);
         // record the store like any other prebuilt-family write.
         crate::gc_roots::mark_prebuilt_roots_dirty();
-        let cache = std::sync::Arc::new(std::sync::Mutex::new(GlobalCache::new(cell)));
+        let cache = std::sync::Arc::new(parking_lot::Mutex::new(GlobalCache::new(cell)));
         caches.insert(key.to_string(), cache.clone());
         cache
     }
@@ -893,10 +893,10 @@ impl ModuleDictStrategy {
     /// the host `switch_to_object_strategy` helper on
     /// W_ModuleDictObject.
     pub fn invalidate_caches(&mut self) {
-        let mut cache_registry = self.caches.lock().unwrap();
+        let mut cache_registry = self.caches.lock();
         if let Some(caches) = cache_registry.as_mut() {
             for cache in caches.values() {
-                let mut c = cache.lock().unwrap();
+                let mut c = cache.lock();
                 c.cell = None;
                 c.valid = false;
                 c.builtincache = None;
@@ -1017,10 +1017,10 @@ impl ModuleDictStrategy {
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
         // round-trip.
-        if let Some(caches) = self.caches.lock().unwrap().as_mut()
+        if let Some(caches) = self.caches.lock().as_mut()
             && let Some(cache) = caches.get(key)
         {
-            cache.lock().unwrap().cell = Some(w_to_store);
+            cache.lock().cell = Some(w_to_store);
         }
     }
 
@@ -1060,13 +1060,13 @@ impl ModuleDictStrategy {
         key: &str,
     ) -> Option<PyObjectRef> {
         let removed = storage.remove(key)?;
-        if let Some(caches) = self.caches.lock().unwrap().as_mut()
+        if let Some(caches) = self.caches.lock().as_mut()
             && let Some(cache) = caches.get(key)
         {
             // `celldict.py:117-121`: zero out the per-key cache
             // so LOAD_GLOBAL falls through to the builtins
             // fallback (or NameError) on the next read.
-            cache.lock().unwrap().cell = None;
+            cache.lock().cell = None;
         }
         self.mutated();
         Some(removed)
@@ -1158,7 +1158,7 @@ impl ModuleDictStrategy {
     /// Each cached `GlobalCache.cell`, when present, must be a valid
     /// `PyObjectRef`.
     pub unsafe fn walk_cache_cells(&self, visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-        if let Some(caches) = self.caches.lock().unwrap().as_ref() {
+        if let Some(caches) = self.caches.lock().as_ref() {
             for cache in caches.values() {
                 walk_one_global_cache(cache, visitor);
             }

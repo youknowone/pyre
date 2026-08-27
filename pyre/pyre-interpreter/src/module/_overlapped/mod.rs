@@ -6,11 +6,12 @@
 //! The actual Win32/WinSock calls are the shared, pinned
 //! `rustpython_host_env::overlapped` implementation.
 
+use parking_lot::Mutex;
 use pyre_object::{PY_NULL, PyObject, PyObjectRef};
 use rustpython_host_env::{
     overlapped as host_overlapped, winapi as host_winapi, windows as host_windows,
 };
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OverlappedType {
@@ -240,7 +241,7 @@ fn retain_writable_buffer(
     let r_buffer = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let r_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
     set_object_refs(r_obj, r_buffer, r_owner, PY_NULL)?;
-    let mut state = native(r_obj)?.lock().unwrap();
+    let mut state = native(r_obj)?.lock();
     state.buffer_export_held = held;
     drop(roots);
     Ok(length)
@@ -248,7 +249,7 @@ fn retain_writable_buffer(
 
 fn release_writable_buffer(obj: PyObjectRef) -> Result<(), crate::PyError> {
     let owner = this(obj)?.w_buffer_owner;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     if state.buffer_export_held && !owner.is_null() {
         unsafe { crate::builtins::buffer_export_decref(owner) };
         state.buffer_export_held = false;
@@ -408,7 +409,7 @@ fn overlapped_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 fn overlapped_cancel(args: &[PyObjectRef]) -> crate::PyResult {
     method_arity(args, "cancel", 1, 1)?;
     let obj = arg(args, 0, "cancel")?;
-    let state = native(obj)?.lock().unwrap();
+    let state = native(obj)?.lock();
     if matches!(state.kind, OverlappedType::NotStarted) {
         return Ok(pyre_object::w_none());
     }
@@ -426,7 +427,7 @@ fn overlapped_getresult(args: &[PyObjectRef]) -> crate::PyResult {
         Some(w) => crate::baseobjspace::is_true(w)?,
         None => false,
     };
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     match state.kind {
         OverlappedType::None => {
             return Err(crate::PyError::value_error("operation not yet attempted"));
@@ -496,7 +497,7 @@ fn overlapped_read_file(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = arg(args, 0, "ReadFile")?;
     let handle = handle_w(arg(args, 1, "ReadFile")?)?;
     let size = u32_w(arg(args, 2, "ReadFile")?)?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle;
     state.kind = OverlappedType::Read;
@@ -516,13 +517,13 @@ fn overlapped_read_file_into(args: &[PyObjectRef]) -> crate::PyResult {
     let handle = handle_w(arg(args, 1, "ReadFileInto")?)?;
     let w_buffer = arg(args, 2, "ReadFileInto")?;
     {
-        let state = native(obj)?.lock().unwrap();
+        let state = native(obj)?.lock();
         operation_already_attempted(&state)?;
     }
     let length = retain_writable_buffer(obj, w_buffer)?;
     let size =
         u32::try_from(length).map_err(|_| crate::PyError::value_error("buffer too large"))?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     state.handle = handle;
     state.kind = OverlappedType::ReadInto;
     state.buffer = vec![0; usize::max(length, 1)];
@@ -542,7 +543,7 @@ fn overlapped_write_file(args: &[PyObjectRef]) -> crate::PyResult {
     let buffer = copied_read_buffer(arg(args, 2, "WriteFile")?, "WriteFile")?;
     let size =
         u32::try_from(buffer.len()).map_err(|_| crate::PyError::value_error("buffer too large"))?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle;
     state.kind = OverlappedType::Write;
@@ -565,7 +566,7 @@ fn overlapped_wsa_recv(args: &[PyObjectRef]) -> crate::PyResult {
         Some(w) => u32_w(w)?,
         None => 0,
     };
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle as host_overlapped::Handle;
     state.kind = OverlappedType::Read;
@@ -587,13 +588,13 @@ fn overlapped_wsa_recv_into(args: &[PyObjectRef]) -> crate::PyResult {
     let w_buffer = arg(args, 2, "WSARecvInto")?;
     let mut flags = u32_w(arg(args, 3, "WSARecvInto")?)?;
     {
-        let state = native(obj)?.lock().unwrap();
+        let state = native(obj)?.lock();
         operation_already_attempted(&state)?;
     }
     let length = retain_writable_buffer(obj, w_buffer)?;
     let size =
         u32::try_from(length).map_err(|_| crate::PyError::value_error("buffer too large"))?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     state.handle = handle as host_overlapped::Handle;
     state.kind = OverlappedType::ReadInto;
     state.buffer = vec![0; usize::max(length, 1)];
@@ -615,7 +616,7 @@ fn overlapped_wsa_send(args: &[PyObjectRef]) -> crate::PyResult {
     let flags = u32_w(arg(args, 3, "WSASend")?)?;
     let size =
         u32::try_from(buffer.len()).map_err(|_| crate::PyError::value_error("buffer too large"))?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle as host_overlapped::Handle;
     state.kind = OverlappedType::Write;
@@ -635,7 +636,7 @@ fn overlapped_accept_ex(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = arg(args, 0, "AcceptEx")?;
     let listen = isize_w(arg(args, 1, "AcceptEx")?)?;
     let accept = isize_w(arg(args, 2, "AcceptEx")?)?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     let address_size = core::mem::size_of::<host_overlapped::SocketAddrV6>() + 16;
     state.handle = listen as host_overlapped::Handle;
@@ -656,7 +657,7 @@ fn overlapped_connect_ex(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = arg(args, 0, "ConnectEx")?;
     let socket = isize_w(arg(args, 1, "ConnectEx")?)?;
     let (address, length) = parse_address(arg(args, 2, "ConnectEx")?)?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = socket as host_overlapped::Handle;
     state.kind = OverlappedType::Connect;
@@ -675,7 +676,7 @@ fn overlapped_disconnect_ex(args: &[PyObjectRef]) -> crate::PyResult {
     let obj = arg(args, 0, "DisconnectEx")?;
     let socket = isize_w(arg(args, 1, "DisconnectEx")?)?;
     let flags = u32_w(arg(args, 2, "DisconnectEx")?)?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = socket as host_overlapped::Handle;
     state.kind = OverlappedType::Disconnect;
@@ -693,7 +694,7 @@ fn overlapped_transmit_file(args: &[PyObjectRef]) -> crate::PyResult {
     let count = u32_w(arg(args, 5, "TransmitFile")?)?;
     let per_send = u32_w(arg(args, 6, "TransmitFile")?)?;
     let flags = u32_w(arg(args, 7, "TransmitFile")?)?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = socket as host_overlapped::Handle;
     state.kind = OverlappedType::TransmitFile;
@@ -714,7 +715,7 @@ fn overlapped_connect_named_pipe(args: &[PyObjectRef]) -> crate::PyResult {
     method_arity(args, "ConnectNamedPipe", 2, 2)?;
     let obj = arg(args, 0, "ConnectNamedPipe")?;
     let pipe = handle_w(arg(args, 1, "ConnectNamedPipe")?)?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = pipe;
     state.kind = OverlappedType::ConnectNamedPipe;
@@ -742,7 +743,7 @@ fn start_recv_from(
     mut flags: u32,
     kind: OverlappedType,
 ) -> crate::PyResult {
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle as host_overlapped::Handle;
     state.kind = kind;
@@ -787,7 +788,7 @@ fn overlapped_wsa_recv_from_into(args: &[PyObjectRef]) -> crate::PyResult {
         None => 0,
     };
     {
-        let state = native(obj)?.lock().unwrap();
+        let state = native(obj)?.lock();
         operation_already_attempted(&state)?;
     }
     let length = retain_writable_buffer(obj, w_buffer)?;
@@ -807,7 +808,7 @@ fn overlapped_wsa_send_to(args: &[PyObjectRef]) -> crate::PyResult {
     let (address, address_length) = parse_address(arg(args, 4, "WSASendTo")?)?;
     let size =
         u32::try_from(buffer.len()).map_err(|_| crate::PyError::value_error("buffer too large"))?;
-    let mut state = native(obj)?.lock().unwrap();
+    let mut state = native(obj)?.lock();
     operation_already_attempted(&state)?;
     state.handle = handle as host_overlapped::Handle;
     state.kind = OverlappedType::WriteTo;
@@ -873,24 +874,24 @@ fn init_overlapped_type(ns: PyObjectRef) {
         };
     }
     property(ns, "address", |args| {
-        let state = native(arg(args, 1, "address")?)?.lock().unwrap();
+        let state = native(arg(args, 1, "address")?)?.lock();
         Ok(pyre_object::w_int_new(
             &state.overlapped as *const _ as usize as i64,
         ))
     });
     property(ns, "pending", |args| {
-        let state = native(arg(args, 1, "pending")?)?.lock().unwrap();
+        let state = native(arg(args, 1, "pending")?)?.lock();
         Ok(pyre_object::w_bool_from(
             !host_overlapped::has_overlapped_io_completed(&state.overlapped)
                 && state.kind != OverlappedType::NotStarted,
         ))
     });
     property(ns, "error", |args| {
-        let state = native(arg(args, 1, "error")?)?.lock().unwrap();
+        let state = native(arg(args, 1, "error")?)?.lock();
         Ok(pyre_object::w_int_new(state.error as i64))
     });
     property(ns, "event", |args| {
-        let state = native(arg(args, 1, "event")?)?.lock().unwrap();
+        let state = native(arg(args, 1, "event")?)?.lock();
         Ok(w_uintptr(state.overlapped.hEvent as usize))
     });
 }
@@ -926,7 +927,7 @@ pub unsafe fn w_overlapped_dealloc(obj: PyObjectRef) {
     }
     let backend = unsafe { Box::from_raw(this.backend) };
     this.backend = std::ptr::null_mut();
-    let mut state = backend.lock().unwrap();
+    let mut state = backend.lock();
     let old_error = host_winapi::get_last_error();
     if !host_overlapped::has_overlapped_io_completed(&state.overlapped)
         && state.kind != OverlappedType::NotStarted

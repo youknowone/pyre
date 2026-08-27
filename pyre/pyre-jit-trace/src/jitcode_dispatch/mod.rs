@@ -3075,16 +3075,15 @@ impl DispatchError {
 /// only the thread that happened to print it and silently drop every decline
 /// the others took.  A `Mutex` is free at this rate — the map is touched only
 /// on the cold decline path, never on the hot trace path.
-static FBW_DECLINE_CENSUS: std::sync::Mutex<std::collections::BTreeMap<&'static str, usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static FBW_DECLINE_CENSUS: parking_lot::Mutex<std::collections::BTreeMap<&'static str, usize>> =
+    parking_lot::Mutex::new(std::collections::BTreeMap::new());
 
 /// Lock the census, recovering from poisoning: a `BTreeMap` of counters has no
 /// invariant a panicking writer can leave broken, and a diagnostic that goes
 /// silent after an unrelated panic is worse than one that keeps counting.
-fn census_map() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<&'static str, usize>> {
+fn census_map() -> parking_lot::MutexGuard<'static, std::collections::BTreeMap<&'static str, usize>> {
     FBW_DECLINE_CENSUS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Bump the decline count for `name` (a [`DispatchError::variant_name`] or

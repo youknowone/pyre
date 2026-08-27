@@ -6,7 +6,8 @@
 
 use crate::importing::host::{fs as host_fs, os as host_os};
 use pyre_object::PyObjectRef;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
+use parking_lot::Mutex;
 // Under sandbox, name libc through the seam facade so any direct syscall call
 // in this module is a compile error (only types/constants/pure fns resolve).
 #[cfg(feature = "sandbox")]
@@ -335,7 +336,7 @@ fn sysconf_names() -> &'static [(&'static str, i32)] {
 }
 
 pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+    let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock();
     let ApplevelForkCallbacks {
         before_w,
         parent_w,
@@ -351,7 +352,7 @@ pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)
 fn run_fork_callbacks(kind: &str) {
     let reverse = kind == "before";
     let initial_len = {
-        let callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+        let callbacks = APPLEVEL_FORK_CALLBACKS.lock();
         match kind {
             "before" => callbacks.before_w.len(),
             "parent" => callbacks.parent_w.len(),
@@ -366,7 +367,7 @@ fn run_fork_callbacks(kind: &str) {
     };
     for index in indices {
         let callback = {
-            let callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+            let callbacks = APPLEVEL_FORK_CALLBACKS.lock();
             match kind {
                 "before" => callbacks.before_w.get(index),
                 "parent" => callbacks.parent_w.get(index),
@@ -423,7 +424,7 @@ fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         }
     }
     {
-        let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock().unwrap();
+        let mut callbacks = APPLEVEL_FORK_CALLBACKS.lock();
         if let Some(callback) = before {
             callbacks.before_w.push(callback as usize);
         }
@@ -5998,8 +5999,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         body: impl FnOnce(&mut W_ScandirIterator) -> R,
     ) -> Option<R> {
         let _serialized = SCANDIR_IN_NEXT_SERIALIZER
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         W_ScandirIterator::from_obj(self_obj).map(body)
     }
 
@@ -7602,8 +7602,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     let blocked = crate::module::thread::before_external_block();
                     let fork_serial = FORK_SERIALIZER
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
+                        .lock();
                     drop(blocked);
                     run_fork_callbacks("before");
                     // pypy/module/imp/moduledef.py:45-47 registers the import
@@ -7679,8 +7678,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     let blocked = crate::module::thread::before_external_block();
                     let fork_serial = FORK_SERIALIZER
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
+                        .lock();
                     drop(blocked);
                     run_fork_callbacks("before");
                     let mut master_fd = -1;

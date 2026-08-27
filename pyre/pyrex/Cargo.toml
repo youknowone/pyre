@@ -65,6 +65,7 @@ cpyext = ["pyre-interpreter/cpyext"]
 seccomp = ["sandbox"]
 
 [dependencies]
+parking_lot = { workspace = true }
 pyre-object = { workspace = true }
 pyre-interpreter = { workspace = true }
 pyre-jit = { workspace = true }

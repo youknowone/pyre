@@ -5,7 +5,7 @@ use sha3::{
     Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256,
     digest::{ExtendableOutput, Update, XofReader},
 };
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 #[derive(Clone)]
 enum HashState {
@@ -236,7 +236,6 @@ pub unsafe fn state_update(storage: *mut usize, words: usize, data: &[u8]) {
     let state = unsafe { &*storage.cast::<LockedHashState>() };
     state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .update(data);
 }
 
@@ -250,7 +249,6 @@ pub unsafe fn state_digest(storage: *const usize, words: usize, length: usize) -
     let state = unsafe { &*storage.cast::<LockedHashState>() };
     state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .digest(length)
 }
 
@@ -265,7 +263,6 @@ pub unsafe fn state_copy(src: *const usize, dst: *mut usize, words: usize) {
     let source = unsafe { &*src.cast::<LockedHashState>() };
     let cloned = source
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     unsafe { dst.cast::<LockedHashState>().write(Mutex::new(cloned)) };
 }
@@ -455,7 +452,6 @@ pub unsafe fn hmac_state_update(storage: *mut usize, words: usize, data: &[u8]) 
     check_hmac_storage(storage, words);
     unsafe { &*storage.cast::<LockedHmacState>() }
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .update(data);
 }
 
@@ -468,7 +464,6 @@ pub unsafe fn hmac_state_digest(storage: *const usize, words: usize) -> Vec<u8> 
     check_hmac_storage(storage.cast_mut(), words);
     unsafe { &*storage.cast::<LockedHmacState>() }
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .digest()
 }
 
@@ -482,7 +477,6 @@ pub unsafe fn hmac_state_copy(src: *const usize, dst: *mut usize, words: usize) 
     check_hmac_storage(dst, words);
     let cloned = unsafe { &*src.cast::<LockedHmacState>() }
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     unsafe { dst.cast::<LockedHmacState>().write(Mutex::new(cloned)) };
 }

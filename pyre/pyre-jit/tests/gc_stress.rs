@@ -37,7 +37,7 @@ use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
 use pyre_jit::eval::{eval_with_jit, init_jit_hooks, reset_gc_fresh_for_test};
 
-static GC_STRESS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static GC_STRESS_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Shared harness body for every GC-stress program. Compiles and runs `program`
 /// (using `name` as its `sys.argv[0]` / filename) exactly as the `pyrex`
@@ -121,9 +121,9 @@ fn run_on_worker(
     // These tests share the process-global GC singleton and process-global
     // builtin type state (`object.weak_subclasses`, version tags), which are
     // not thread-safe, so run them one at a time regardless of cargo's
-    // parallel test scheduling. Poison-tolerant: one worker panicking must not
-    // wedge the rest.
-    let _serial = GC_STRESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // parallel test scheduling. `parking_lot` does not poison, so one worker
+    // panicking does not wedge the rest.
+    let _serial = GC_STRESS_SERIAL.lock();
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(move || run_harness(program, name, vacuity_label))
@@ -1739,7 +1739,7 @@ while i < 40:
 /// call; none does today, so nothing else in this binary covers it.
 #[test]
 fn tracing_sentinel_is_reminted_for_a_rebuilt_heap() {
-    let _serial = GC_STRESS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = GC_STRESS_SERIAL.lock();
     let handle = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         .spawn(|| {

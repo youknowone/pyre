@@ -321,15 +321,15 @@ impl ObjSpace {
 /// thread holds, which no import path does.  The shape is still the blocking
 /// one so that the single-thread assumption is not baked into the callers.
 pub struct Lock {
-    acquired: std::sync::Mutex<bool>,
-    released: std::sync::Condvar,
+    acquired: parking_lot::Mutex<bool>,
+    released: parking_lot::Condvar,
 }
 
 impl Lock {
     fn new() -> Self {
         Self {
-            acquired: std::sync::Mutex::new(false),
-            released: std::sync::Condvar::new(),
+            acquired: parking_lot::Mutex::new(false),
+            released: parking_lot::Condvar::new(),
         }
     }
 
@@ -345,7 +345,7 @@ impl Lock {
         // same STW.  The non-blocking form must remain a poll and needs no
         // transition.
         let _blocked = flag.then(crate::module::thread::before_external_block);
-        let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut acquired = self.acquired.lock();
         if !flag {
             if *acquired {
                 return false;
@@ -354,10 +354,7 @@ impl Lock {
             return true;
         }
         while *acquired {
-            acquired = self
-                .released
-                .wait(acquired)
-                .unwrap_or_else(|e| e.into_inner());
+            self.released.wait(&mut acquired);
         }
         *acquired = true;
         true
@@ -370,7 +367,7 @@ impl Lock {
     /// owns, which makes this an invariant of this crate rather than a
     /// Python-visible error.
     pub fn release(&self) {
-        let mut acquired = self.acquired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut acquired = self.acquired.lock();
         assert!(*acquired, "the lock was not previously acquired");
         *acquired = false;
         self.released.notify_one();

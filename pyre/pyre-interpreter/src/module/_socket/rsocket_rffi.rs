@@ -1061,11 +1061,9 @@ unsafe extern "C" {
 /// into one process-global record, so a second lookup on another thread
 /// invalidates the first one's answer. Hold this across both the lookup and
 /// the copying out of everything the caller needs.
-pub fn netdb_lock() -> std::sync::MutexGuard<'static, ()> {
-    static NETDB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    NETDB_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+pub fn netdb_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static NETDB_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    NETDB_LOCK.lock()
 }
 
 /// Read one slot of a `char **` array the resolver owns.

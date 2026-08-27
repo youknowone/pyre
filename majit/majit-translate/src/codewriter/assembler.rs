@@ -10,10 +10,10 @@
 //! subset. Descriptor operands are deduplicated through the RPython
 //! `_descr_dict` shape before bytecode emission.
 
+use parking_lot::Mutex;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt,
-    sync::Mutex,
 };
 
 use vecset::VecSet;
@@ -3772,9 +3772,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         .collect::<Vec<_>>();
     if !violating_fields.is_empty() {
         static WARNED_LAYOUT_OWNERS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-        let mut warned = WARNED_LAYOUT_OWNERS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut warned = WARNED_LAYOUT_OWNERS.lock();
         if warned.insert(layout_owner.to_string()) {
             let count = warned.len();
             let rows = violating_fields
@@ -5728,9 +5726,9 @@ mod tests {
                   the test; dropping it immediately re-opens the race"]
     fn register_struct_ids_serialized(
         table: HashMap<String, Option<majit_ir::descr::StructId>>,
-    ) -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ) -> parking_lot::MutexGuard<'static, ()> {
+        static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let guard = LOCK.lock();
         majit_ir::descr::register_struct_ids(table);
         guard
     }

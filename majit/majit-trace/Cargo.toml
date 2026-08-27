@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Trace management and warm-up state for majit JIT compiler"
 
 [dependencies]
+parking_lot = { workspace = true }
 indexmap = { workspace = true }
 majit-ir = { workspace = true }
 majit-backend = { workspace = true }

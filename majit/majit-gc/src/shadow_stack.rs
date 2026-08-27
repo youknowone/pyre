@@ -19,7 +19,8 @@
 //! load/store instructions (no function calls), exactly as in
 //! `_call_header_shadowstack`.
 use std::cell::{Cell, RefCell};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::OnceLock;
+use parking_lot::{Mutex, RwLock};
 
 use majit_ir::GcRef;
 
@@ -159,18 +160,18 @@ fn libc_jf_registry() -> &'static RwLock<indexmap::IndexSet<usize>> {
 /// Register a libc-allocated jitframe payload address. Must be called
 /// before pushing the jitframe onto the JF shadow stack.
 pub fn register_libc_jitframe(addr: usize) {
-    libc_jf_registry().write().unwrap().insert(addr);
+    libc_jf_registry().write().insert(addr);
 }
 
 /// Unregister a libc-allocated jitframe address. Call once the
 /// jitframe memory is about to be freed.
 pub fn unregister_libc_jitframe(addr: usize) {
-    libc_jf_registry().write().unwrap().swap_remove(&addr);
+    libc_jf_registry().write().swap_remove(&addr);
 }
 
 /// Check whether an address was registered as a libc-allocated jitframe.
 pub fn is_libc_jitframe(addr: usize) -> bool {
-    libc_jf_registry().read().unwrap().contains(&addr)
+    libc_jf_registry().read().contains(&addr)
 }
 
 /// Invoke the registered tracer if any. Returns true if tracer ran.
@@ -360,7 +361,7 @@ pub fn register_mutator() {
     let bh_regs_stack = BH_REGS_STACK.with(|stack| stack as *const _);
     let resume_ref_roots_stack = RESUME_REF_ROOTS_STACK.with(|stack| stack as *const _);
 
-    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let mut registry = MUTATOR_REGISTRY.lock();
     assert!(
         !registry.iter().any(|entry| entry.thread_id == thread_id),
         "mutator thread registered twice"
@@ -391,7 +392,7 @@ pub unsafe fn register_mutator_extra_area(
     name: &'static str,
 ) {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let mut registry = MUTATOR_REGISTRY.lock();
     let entry = registry
         .iter_mut()
         .find(|entry| entry.thread_id == thread_id)
@@ -417,7 +418,7 @@ pub unsafe fn register_mutator_extra_area(
 /// address it dereferences from `data`, never from caller TLS.
 pub unsafe fn register_mutator_pruner(prune: MutatorPrunerFn, data: *const ()) {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let mut registry = MUTATOR_REGISTRY.lock();
     let entry = registry
         .iter_mut()
         .find(|entry| entry.thread_id == thread_id)
@@ -438,7 +439,7 @@ pub fn prune_all_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>)
         crate::gc_sync::mutators_quiesced(),
         "prune_all_mutator_areas reaches foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     for mutator in registry.iter() {
         for pruner in mutator.pruners.iter() {
             // SAFETY: gc_sync has quiesced every registered owner, and each
@@ -457,7 +458,7 @@ pub fn prune_all_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>)
 /// cannot be classified.
 pub fn prune_my_mutator_areas(classify: &mut dyn FnMut(usize) -> Option<usize>) {
     let thread_id = std::thread::current().id();
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
         return;
     };
@@ -473,7 +474,7 @@ pub fn walk_all_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_extra_areas walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     for mutator in registry.iter() {
         for area in mutator.extra_areas.iter() {
             // SAFETY: gc_sync has quiesced every registered owner, and each
@@ -489,7 +490,7 @@ pub fn walk_all_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
 /// mutator have no per-thread areas and are a no-op.
 pub fn walk_my_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
     let thread_id = std::thread::current().id();
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     let Some(mutator) = registry.iter().find(|entry| entry.thread_id == thread_id) else {
         return;
     };
@@ -506,7 +507,7 @@ pub fn walk_my_extra_areas(mut visitor: impl FnMut(&mut GcRef)) {
 /// collector.
 pub fn unregister_mutator() {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let mut registry = MUTATOR_REGISTRY.lock();
     let index = registry
         .iter()
         .position(|entry| entry.thread_id == thread_id)
@@ -521,7 +522,7 @@ pub fn unregister_mutator() {
 /// per-thread root ownership.
 pub fn after_fork_child() {
     let thread_id = std::thread::current().id();
-    let mut registry = MUTATOR_REGISTRY.lock().unwrap();
+    let mut registry = MUTATOR_REGISTRY.lock();
     registry.retain(|entry| entry.thread_id == thread_id);
 }
 
@@ -776,7 +777,7 @@ pub fn walk_all_roots(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_roots walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     for mutator in registry.iter() {
         // SAFETY: every registered mutator is quiesced, and registry removal
         // precedes the owner's RUNNING decrement and TLS destruction.
@@ -1002,7 +1003,7 @@ pub fn walk_all_jf_roots(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_jf_roots walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     for mutator in registry.iter() {
         // SAFETY: the owning mutator is quiesced and cannot change the stack
         // or its backing allocation until the STW guard resumes it.
@@ -1179,7 +1180,7 @@ pub fn walk_all_bh_regs(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_bh_regs walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     for mutator in registry.iter() {
         // SAFETY: all owners are quiesced, and each registered slice remains
         // pinned until its owning blackhole frame pops the entry after resume.
@@ -1283,7 +1284,7 @@ pub fn walk_all_resume_ref_roots(mut visitor: impl FnMut(&mut GcRef)) {
         crate::gc_sync::mutators_quiesced(),
         "walk_all_resume_ref_roots walks foreign mutator TLS; caller must own collector-side STW",
     );
-    let registry = MUTATOR_REGISTRY.lock().unwrap();
+    let registry = MUTATOR_REGISTRY.lock();
     for mutator in registry.iter() {
         // SAFETY: the owner is quiesced and the registered slices stay pinned
         // for the complete resume-construction window.
@@ -1367,8 +1368,8 @@ const MAX_EXTRA_ROOT_WALKERS: usize = 8;
 /// Registered root walkers. Each slot is either `None` or a function
 /// pointer. We cap the count to keep the set stack-allocatable and
 /// avoid dynamic allocation in the GC hot path.
-static EXTRA_ROOT_WALKERS: std::sync::RwLock<[Option<ExtraRootWalkerFn>; MAX_EXTRA_ROOT_WALKERS]> =
-    std::sync::RwLock::new([None; MAX_EXTRA_ROOT_WALKERS]);
+static EXTRA_ROOT_WALKERS: parking_lot::RwLock<[Option<ExtraRootWalkerFn>; MAX_EXTRA_ROOT_WALKERS]> =
+    parking_lot::RwLock::new([None; MAX_EXTRA_ROOT_WALKERS]);
 
 /// Register an additional root walker.
 ///
@@ -1376,7 +1377,7 @@ static EXTRA_ROOT_WALKERS: std::sync::RwLock<[Option<ExtraRootWalkerFn>; MAX_EXT
 /// root source. Duplicate registrations are tolerated — the walker is
 /// only appended if not already present.
 pub fn register_extra_root_walker(walker: ExtraRootWalkerFn) {
-    let mut guard = EXTRA_ROOT_WALKERS.write().unwrap();
+    let mut guard = EXTRA_ROOT_WALKERS.write();
     for slot in guard.iter_mut() {
         match slot {
             Some(existing) if std::ptr::fn_addr_eq(*existing, walker) => return,
@@ -1401,7 +1402,7 @@ pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
     // triggers further allocation (and recursively a collection) does
     // not observe the lock held in write mode.
     let walkers = {
-        let guard = EXTRA_ROOT_WALKERS.read().unwrap();
+        let guard = EXTRA_ROOT_WALKERS.read();
         *guard
     };
     for walker in walkers.iter().flatten() {
@@ -1431,17 +1432,17 @@ pub type EphemeronMarkerFn = fn(&mut dyn FnMut(usize) -> Option<usize>, &mut Vec
 
 const MAX_EPHEMERON_PRUNERS: usize = 4;
 
-static EPHEMERON_PRUNERS: std::sync::RwLock<[Option<EphemeronPrunerFn>; MAX_EPHEMERON_PRUNERS]> =
-    std::sync::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
-static EPHEMERON_MARKERS: std::sync::RwLock<[Option<EphemeronMarkerFn>; MAX_EPHEMERON_PRUNERS]> =
-    std::sync::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
+static EPHEMERON_PRUNERS: parking_lot::RwLock<[Option<EphemeronPrunerFn>; MAX_EPHEMERON_PRUNERS]> =
+    parking_lot::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
+static EPHEMERON_MARKERS: parking_lot::RwLock<[Option<EphemeronMarkerFn>; MAX_EPHEMERON_PRUNERS]> =
+    parking_lot::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
 
 /// Register a side table whose entries must be dropped when their owner dies.
 ///
 /// Duplicate registrations are tolerated — the pruner is only appended if not
 /// already present.
 pub fn register_ephemeron_pruner(pruner: EphemeronPrunerFn) {
-    let mut guard = EPHEMERON_PRUNERS.write().unwrap();
+    let mut guard = EPHEMERON_PRUNERS.write();
     for slot in guard.iter_mut() {
         match slot {
             Some(existing) if std::ptr::fn_addr_eq(*existing, pruner) => return,
@@ -1459,7 +1460,7 @@ pub fn register_ephemeron_pruner(pruner: EphemeronPrunerFn) {
 }
 
 pub fn register_ephemeron_marker(marker: EphemeronMarkerFn) {
-    let mut guard = EPHEMERON_MARKERS.write().unwrap();
+    let mut guard = EPHEMERON_MARKERS.write();
     for slot in guard.iter_mut() {
         match slot {
             Some(existing) if std::ptr::fn_addr_eq(*existing, marker) => return,
@@ -1478,7 +1479,7 @@ pub fn register_ephemeron_marker(marker: EphemeronMarkerFn) {
 
 pub fn mark_ephemeron_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) -> Vec<GcRef> {
     let markers = {
-        let guard = EPHEMERON_MARKERS.read().unwrap();
+        let guard = EPHEMERON_MARKERS.read();
         *guard
     };
     let mut roots = Vec::new();
@@ -1498,7 +1499,7 @@ pub fn mark_ephemeron_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) -
 /// put the whole table back on the minor path.
 pub fn prune_ephemeron_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) {
     let pruners = {
-        let guard = EPHEMERON_PRUNERS.read().unwrap();
+        let guard = EPHEMERON_PRUNERS.read();
         *guard
     };
     for slot in pruners.iter().flatten() {
@@ -1513,9 +1514,9 @@ pub fn prune_ephemeron_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) 
 /// entry was made.
 pub type YoungOwnerReconcilerFn = fn(&mut dyn FnMut(usize) -> Option<usize>);
 
-static YOUNG_OWNER_RECONCILERS: std::sync::RwLock<
+static YOUNG_OWNER_RECONCILERS: parking_lot::RwLock<
     [Option<YoungOwnerReconcilerFn>; MAX_EPHEMERON_PRUNERS],
-> = std::sync::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
+> = parking_lot::RwLock::new([None; MAX_EPHEMERON_PRUNERS]);
 
 /// Register a side table that keys entries by the address of an owner that may
 /// still be in the nursery.
@@ -1528,7 +1529,7 @@ static YOUNG_OWNER_RECONCILERS: std::sync::RwLock<
 /// Duplicate registrations are tolerated — the reconciler is only appended if
 /// not already present.
 pub fn register_young_owner_reconciler(reconciler: YoungOwnerReconcilerFn) {
-    let mut guard = YOUNG_OWNER_RECONCILERS.write().unwrap();
+    let mut guard = YOUNG_OWNER_RECONCILERS.write();
     for slot in guard.iter_mut() {
         match slot {
             Some(existing) if std::ptr::fn_addr_eq(*existing, reconciler) => return,
@@ -1555,7 +1556,7 @@ pub fn register_young_owner_reconciler(reconciler: YoungOwnerReconcilerFn) {
 /// minor), not O(table).
 pub fn reconcile_young_owner_tables(classify: &mut dyn FnMut(usize) -> Option<usize>) {
     let reconcilers = {
-        let guard = YOUNG_OWNER_RECONCILERS.read().unwrap();
+        let guard = YOUNG_OWNER_RECONCILERS.read();
         *guard
     };
     for slot in reconcilers.iter().flatten() {
@@ -1621,7 +1622,7 @@ pub extern "C" fn majit_jf_shadow_stack_pop_to(depth: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     // Keep these tests serialized because some of them intentionally shrink
     // the current thread's capacity and then re-raise an expected panic.
@@ -1653,7 +1654,7 @@ mod tests {
 
     #[test]
     fn test_push_pop_roundtrip() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         let a = GcRef(0x1000);
         let b = GcRef(0x2000);
@@ -1672,7 +1673,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "shadow stack pop_to")]
     fn test_pop_to_above_depth_panics() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         push(GcRef(0x1000));
         // An unbalanced scope must not silently no-op: truncating past the
@@ -1682,7 +1683,7 @@ mod tests {
 
     #[test]
     fn test_walk_roots_updates() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         push(GcRef(0x1000));
         push(GcRef(0x2000));
@@ -1699,7 +1700,7 @@ mod tests {
 
     #[test]
     fn test_owner_roots_have_independent_fixed_slots() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         let lexical = push(GcRef(0x1000));
         let first = acquire_owner_root(GcRef(0x2000));
@@ -1725,7 +1726,7 @@ mod tests {
             visitor(slot);
         }
 
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         let mut root = GcRef(0x1000);
         register_mutator();
         // SAFETY: `root` remains valid until unregistration, and `walk_cell`
@@ -1753,7 +1754,7 @@ mod tests {
     /// entry was actually removed rather than merely emptied.
     #[test]
     fn test_mutator_teardown_releases_its_registry_entry() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         std::thread::spawn(|| {
             register_mutator();
             {
@@ -1771,7 +1772,7 @@ mod tests {
 
     #[test]
     fn test_extern_c_interface() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         let depth = majit_shadow_stack_push(0x3000);
         assert_eq!(depth, 0);
@@ -1788,7 +1789,7 @@ mod tests {
 
     #[test]
     fn test_jf_shadow_stack_push_pop() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         assert_eq!(jf_depth(), 0);
         let depth = push_jf(GcRef(0x1000));
@@ -1804,7 +1805,7 @@ mod tests {
 
     #[test]
     fn test_walk_jf_roots_updates_gcref() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         push_jf(GcRef(0x1000));
         push_jf(GcRef(0x2000));
@@ -1822,7 +1823,7 @@ mod tests {
 
     #[test]
     fn test_jf_top_ptr_reload() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         push_jf(GcRef(0xABCD));
         assert_eq!(jf_top_ptr(), GcRef(0xABCD));
@@ -1839,7 +1840,7 @@ mod tests {
 
     #[test]
     fn test_jf_flat_array_layout() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         // Verify the flat array layout matches RPython's [is_minor, jf_ptr] pairs
         clear();
         push_jf(GcRef(0xAAAA));
@@ -1861,7 +1862,7 @@ mod tests {
     /// shadow-stack backing buffer, not just raise a limit.
     #[test]
     fn test_increase_root_stack_depth_grows_backing_buffer() {
-        let _lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = TEST_MUTEX.lock();
         clear();
         // Populate a known jf_ptr that must survive the resize.
         push_jf(GcRef(0xDEADBEEF));
@@ -1908,7 +1909,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "jf shadow stack overflow")]
     fn test_jf_shadow_stack_overflow_panics() {
-        let lock = TEST_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = TEST_MUTEX.lock();
         clear();
         // Pre-shrink: the capacity atomic drives the assert; the
         // backing HEAP buffer is larger than 4 entries, so the

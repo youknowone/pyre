@@ -153,7 +153,7 @@ pub(crate) fn llstr(s: &[u8]) -> Result<_ptr, String> {
     let _ptr_obj::Struct(st) = obj else {
         return Err("llstr: malloc(STR) must produce a struct container".to_string());
     };
-    let fields = st._fields.lock().unwrap();
+    let fields = st._fields.lock();
     let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
         return Err("llstr: rpy_string container lacks a chars array".to_string());
     };
@@ -257,7 +257,7 @@ pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
         return None;
     };
-    let fields = st._fields.lock().unwrap();
+    let fields = st._fields.lock();
     // `chars` mirrors the read side of `llstr`'s per-index fill.
     let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
         return None;
@@ -12973,7 +12973,7 @@ mod tests {
         let Ok(Some(_ptr_obj::Array(arr))) = ptr._obj0_value() else {
             panic!("hex_chars LLPtr must target an Array container");
         };
-        let items = arr.items.lock().unwrap();
+        let items = arr.items.lock();
         assert_eq!(items.len(), 16);
         assert_eq!(items[0], LowLevelValue::Char('0'));
         assert_eq!(items[10], LowLevelValue::Char('a'));

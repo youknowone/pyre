@@ -15,9 +15,10 @@ mod imp {
     use super::PyObjectRef;
     use crate::module::_ctypes::{cdata, funcptr};
     use core::ffi::c_void;
+    use parking_lot::Mutex;
     use rustpython_host_env::ctypes as host_ctypes;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::LazyLock;
 
     struct ThunkUserdata {
         /// Address of the GC-rooted slot holding the `CFuncPtr` instance: the
@@ -81,10 +82,7 @@ mod imp {
         // A foreign caller may retain a callback pointer indefinitely; pyre has
         // no proof point for unregistering it, so the rooted slot and closure
         // intentionally live for the process lifetime.
-        CALLBACK_THUNKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(StoredThunk { slot, thunk });
+        CALLBACK_THUNKS.lock().push(StoredThunk { slot, thunk });
         Ok(Some(code))
     }
 

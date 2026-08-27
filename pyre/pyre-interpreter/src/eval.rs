@@ -3100,14 +3100,14 @@ unsafe fn load_global_via_cache(
             // which calls `_load_global` whose own fallback chain reads
             // the frame's picked builtin via `space.finditem_str`.
             let (cell_opt, valid, bc_opt) = {
-                let c = cache.lock().unwrap();
+                let c = cache.lock();
                 (c.cell, c.valid, c.builtincache.clone())
             };
             if let Some(v) = cell_opt {
                 return Ok(Some(unwrap_cell(v)));
             }
             if valid && let Some(bc) = bc_opt {
-                let bcell = bc.lock().unwrap().cell;
+                let bcell = bc.lock().cell;
                 if let Some(v) = bcell {
                     return Ok(Some(unwrap_cell(v)));
                 }
@@ -3163,7 +3163,7 @@ unsafe fn load_global_via_cache(
             crate::pycode::w_code_globals_caches_set(pycode, nameindex, &cache);
         }
         // `_LOAD_GLOBAL_cached` lines 296-298: cache.getvalue hit.
-        let cell_opt = cache.lock().unwrap().cell;
+        let cell_opt = cache.lock().cell;
         if let Some(v) = cell_opt {
             return Ok(Some(unwrap_cell(v)));
         }

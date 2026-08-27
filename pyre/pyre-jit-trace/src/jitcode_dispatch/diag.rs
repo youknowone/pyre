@@ -526,7 +526,7 @@ static FBW_DEPTH_HIST: [std::sync::atomic::AtomicU64; FBW_DEPTH_HIST_BUCKETS] = 
     const Z: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     [Z; FBW_DEPTH_HIST_BUCKETS]
 };
-static FBW_DEPTH_DEEPEST: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static FBW_DEPTH_DEEPEST: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
 
 /// `PYRE_FBW_DEPTH_CENSUS`: process-wide inline-walker descent depths and the
 /// `w_code` chain for the deepest entry. Off by default; the cached test is the
@@ -548,8 +548,7 @@ pub(crate) fn fbw_depth_census_record(framestack: &[InlineFrame]) {
 
     if depth > FBW_DEPTH_MAX.load(ordering) {
         let mut deepest = FBW_DEPTH_DEEPEST
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         if depth > FBW_DEPTH_MAX.load(ordering) {
             deepest.clear();
             deepest.extend(framestack.iter().map(|frame| frame.w_code));
@@ -564,8 +563,7 @@ pub fn fbw_depth_census_summary() -> String {
 
     let ordering = std::sync::atomic::Ordering::Relaxed;
     let deepest = FBW_DEPTH_DEEPEST
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .lock();
     let mut hist = String::new();
     for (idx, count) in FBW_DEPTH_HIST.iter().enumerate() {
         if idx != 0 {

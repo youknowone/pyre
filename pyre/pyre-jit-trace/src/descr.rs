@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -261,8 +261,7 @@ fn get_or_create_array_descr_with_full_id(
         array_type_id,
     };
     let mut cache = ARRAY_DESCR_REGISTRY
-        .lock()
-        .expect("ARRAY_DESCR_REGISTRY poisoned");
+        .lock();
     if let Some(existing) = cache.get(&key) {
         return existing.clone();
     }
@@ -279,7 +278,6 @@ fn get_or_create_array_descr_with_full_id(
         let gc_key = majit_ir::descr::LLType::Array(majit_ir::descr::path_hash(atid));
         if let Some(existing) = majit_ir::descr::gc_cache()
             .lock()
-            .unwrap()
             ._cache_array
             .get(&gc_key)
             .cloned()
@@ -5207,7 +5205,7 @@ static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGr
 /// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
 pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -5227,7 +5225,7 @@ pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, Descr
 /// the store as a field of the virtual exception.
 pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -5242,7 +5240,7 @@ pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
 /// later `e.<name> = ...` allocates the dictionary and side-exits.
 pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -5264,7 +5262,7 @@ pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
 /// Field descr for the plain `W_BaseException.suppress_context` byte.
 pub fn w_exception_suppress_context_descr(kind: ExcKind) -> DescrRef {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -5281,7 +5279,7 @@ pub fn w_exception_suppress_context_descr(kind: ExcKind) -> DescrRef {
 /// per-kind exception allocation descriptor with the other exception slots.
 pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -5416,7 +5414,7 @@ pub fn w_exception_attr_slot_descr(
 ) -> DescrRef {
     use pyre_interpreter::baseobjspace::ExceptionAttrSlot as Slot;
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -5452,7 +5450,7 @@ pub fn w_exception_attr_slot_descr(
 /// requested offset.
 pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock().unwrap();
+    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
     if cache[idx].is_none() {
         cache[idx] = Some(build_w_exception_group(kind));
     }
@@ -5781,7 +5779,6 @@ mod tests {
         assert_eq!(
             majit_ir::descr::gc_cache()
                 .lock()
-                .expect("gc_cache poisoned")
                 .resolve_struct_tid(exception.cache_key()),
             Some(W_BASE_EXCEPTION_GC_TYPE_ID)
         );
@@ -5795,7 +5792,6 @@ mod tests {
         // the slot a serialized `BhDescr` with no key lands on.
         let sentinel = majit_ir::descr::gc_cache()
             .lock()
-            .expect("gc_cache poisoned")
             .resolve_struct_tid(0);
         assert_ne!(sentinel, Some(W_BASE_EXCEPTION_GC_TYPE_ID));
         assert_ne!(
@@ -6753,7 +6749,6 @@ mod tests {
         let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("stringbuilder"));
         let resolved = majit_ir::descr::gc_cache()
             .lock()
-            .unwrap()
             ._cache_size
             .get(&key)
             .cloned()
@@ -6812,7 +6807,6 @@ mod tests {
         let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("stringpiece"));
         let resolved = majit_ir::descr::gc_cache()
             .lock()
-            .unwrap()
             ._cache_size
             .get(&key)
             .cloned()
@@ -7357,7 +7351,7 @@ fn field_descr_from_bh_field(
         if parent.type_id != 0 {
             let key = majit_ir::descr::LLType::Struct(parent.type_id);
             let field_key = field.field_key().to_string();
-            let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+            let mut gc = majit_ir::descr::gc_cache().lock();
             // `descr.py cache[STRUCT][fieldname]` hit.
             if let Some(fd) = gc
                 ._cache_field
@@ -7469,7 +7463,7 @@ pub fn make_struct_array_descr_full_keyed(
     // publication.
     let array_descr_dyn: DescrRef = if cache_key != 0 {
         let array_key = LLType::Array(cache_key);
-        let cached = gc_cache().lock().unwrap().get_array_descr(
+        let cached = gc_cache().lock().get_array_descr(
             array_key.clone(),
             base_size,
             item_size,
@@ -7562,7 +7556,7 @@ pub fn make_struct_array_descr_full_keyed(
                 .unwrap_or_else(|| interior.field.name.clone());
             let field_dyn: Arc<dyn majit_ir::descr::FieldDescr> = field_descr.clone();
             let ifd: DescrRef = if cache_key != 0 {
-                gc_cache().lock().unwrap().get_interiorfield_descr(
+                gc_cache().lock().get_interiorfield_descr(
                     LLType::Array(cache_key),
                     bare_name,
                     String::new(),
@@ -7912,7 +7906,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                     let key = majit_ir::descr::LLType::Struct(parent.type_id);
                     if let Some(fd) = majit_ir::descr::gc_cache()
                         .lock()
-                        .unwrap()
                         ._cache_field
                         .get(&key)
                         .and_then(|inner| inner.get(&field_key))
@@ -8111,7 +8104,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
                 let key = majit_ir::descr::LLType::Struct(*type_id);
                 let hit = majit_ir::descr::gc_cache()
                     .lock()
-                    .unwrap()
                     ._cache_size
                     .get(&key)
                     .cloned();
@@ -8287,7 +8279,6 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             if type_id != 0 {
                 majit_ir::descr::gc_cache()
                     .lock()
-                    .unwrap()
                     .get_interiorfield_descr(
                         majit_ir::descr::LLType::Array(type_id),
                         bare_name,
@@ -8481,7 +8472,6 @@ pub(crate) fn publish_effect_info_descr_mints(entries: &[majit_ir::effectinfo::D
                 Some(
                     majit_ir::descr::gc_cache()
                         .lock()
-                        .unwrap()
                         .get_interiorfield_descr(
                             array_key,
                             name.clone(),
@@ -8532,7 +8522,7 @@ fn mint_field(
     if let majit_ir::descr::LLType::Struct(cache_key) = &struct_key {
         force_declared_group(*cache_key);
     }
-    let mut gc = majit_ir::descr::gc_cache().lock().unwrap();
+    let mut gc = majit_ir::descr::gc_cache().lock();
     // Only an empty slot is this function's business: an unresolvable member is
     // by definition one nothing has filled, and a filled slot already belongs
     // to whoever published it. `get_field_descr` would return that owner's
@@ -8589,7 +8579,7 @@ fn mint_array(
     else {
         return None;
     };
-    Some(majit_ir::descr::gc_cache().lock().unwrap().get_array_descr(
+    Some(majit_ir::descr::gc_cache().lock().get_array_descr(
         array_key,
         *base_size,
         *item_size,
@@ -8640,7 +8630,7 @@ fn set_member_label(m: &majit_ir::effectinfo::DescrSetMember) -> String {
 }
 
 fn record_set_member_lookup(m: &majit_ir::effectinfo::DescrSetMember, out: &SetMemberLookup) {
-    let mut ledger = SET_MEMBER_LEDGER.lock().unwrap();
+    let mut ledger = SET_MEMBER_LEDGER.lock();
     match out {
         SetMemberLookup::Resolved(_) => ledger.resolved += 1,
         SetMemberLookup::AbsentContainer => {
@@ -8658,7 +8648,7 @@ fn record_set_member_lookup(m: &majit_ir::effectinfo::DescrSetMember, out: &SetM
 
 /// Snapshot of the [`SET_MEMBER_LEDGER`].
 pub fn set_member_ledger() -> SetMemberLedger {
-    let ledger = SET_MEMBER_LEDGER.lock().unwrap();
+    let ledger = SET_MEMBER_LEDGER.lock();
     SetMemberLedger {
         resolved: ledger.resolved,
         absent: ledger.absent.clone(),
@@ -8682,7 +8672,7 @@ pub fn set_member_ledger() -> SetMemberLedger {
 /// An empty result is the evidence that the gap is not being hit; a non-empty
 /// one names exactly which containers to publish eagerly next.
 pub fn stale_absent_containers() -> Vec<String> {
-    let members = SET_MEMBER_LEDGER.lock().unwrap().absent_members.clone();
+    let members = SET_MEMBER_LEDGER.lock().absent_members.clone();
     members
         .iter()
         .filter(|m| !matches!(descr_from_set_member(m), SetMemberLookup::AbsentContainer))
@@ -8732,7 +8722,7 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             ..
         } => {
             let struct_key = LLType::Struct(*struct_id);
-            let gc = gc_cache().lock().unwrap();
+            let gc = gc_cache().lock();
             match gc._cache_field.get(&struct_key) {
                 Some(inner) => match lookup_field_by_either_spelling(inner, field_name) {
                     Some(fd) => SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef),
@@ -8749,7 +8739,6 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
         majit_ir::effectinfo::DescrSetMember::Array { array_id, .. } => {
             match gc_cache()
                 .lock()
-                .unwrap()
                 ._cache_array
                 .get(&LLType::Array(*array_id))
             {
@@ -8758,7 +8747,7 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             }
         }
         majit_ir::effectinfo::DescrSetMember::InteriorField { array_id, name, .. } => {
-            let gc = gc_cache().lock().unwrap();
+            let gc = gc_cache().lock();
             let array_key = LLType::Array(*array_id);
             match gc
                 ._cache_interiorfield
@@ -9188,7 +9177,6 @@ mod set_member_lookup_tests {
 
         majit_ir::descr::gc_cache()
             .lock()
-            .unwrap()
             .register_keyed_size(
                 majit_ir::descr::LLType::Struct(published),
                 Arc::new(majit_ir::descr::SimpleSizeDescr::with_vtable(

@@ -813,7 +813,8 @@ mod tests {
     use super::*;
     use crate::config::translationoption::get_combined_translation_config;
     use crate::translator::translator::TranslationContext;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use parking_lot::{Mutex, MutexGuard};
+    use std::sync::OnceLock;
 
     static PYPY_SRCROOT_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -824,10 +825,7 @@ mod tests {
 
     impl PypySrcrootEnvGuard {
         fn set(value: Option<&str>) -> Self {
-            let lock = PYPY_SRCROOT_ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
+            let lock = PYPY_SRCROOT_ENV_LOCK.get_or_init(|| Mutex::new(())).lock();
             let prior = std::env::var("PYPY_SRCROOT").ok();
             // Process environment is global; these tests serialize the
             // mutation so parallel Rust tests cannot observe a half-fixture.

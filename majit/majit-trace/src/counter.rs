@@ -427,7 +427,7 @@ impl DeterministicJitCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     static DECAY_GENERATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -512,8 +512,7 @@ mod tests {
     #[test]
     fn test_tick_applies_every_pending_decay_generation() {
         let _generation_guard = DECAY_GENERATION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         counter.set_decay(40);
         let h = 3u64 << counter.shift;
@@ -534,8 +533,7 @@ mod tests {
     #[test]
     fn test_change_current_fraction_is_not_retro_decayed() {
         let _generation_guard = DECAY_GENERATION_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         let mut counter = JitCounter::new(DEFAULT_SIZE);
         counter.set_decay(40);
         let h = 4u64 << counter.shift;

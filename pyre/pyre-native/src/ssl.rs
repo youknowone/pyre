@@ -7,7 +7,8 @@
 
 use std::io::{Cursor, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Once};
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustls::client::ClientSessionStore;
@@ -660,8 +661,7 @@ pub unsafe fn context_add_verify_dir(context: *mut Context, path: &std::path::Pa
         context.capaths.push(path);
         *context
             .capath_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+            .lock() = None;
     }
 }
 
@@ -1956,8 +1956,7 @@ fn capath_certificates(context: &Context) -> Arc<Vec<Vec<u8>>> {
     let stamps = capath_stamps(context);
     let mut cache = context
         .capath_cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .lock();
     if let Some((cached_stamps, certificates)) = cache.as_ref()
         && cached_stamps == &stamps
     {
@@ -2056,24 +2055,20 @@ impl CapturingClientSessionStore {
             .set_tls12_session(session.server_name.clone(), session.value.clone());
         *self
             .latest_tls12
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            .lock() =
             Some((session.server_name.clone(), session.value.clone()));
         *self
             .public_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session.id.clone());
+            .lock() = Some(session.id.clone());
         *self
             .creation_time
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(session.creation_time);
+            .lock() = Some(session.creation_time);
     }
 
     fn ensure_metadata(&self) {
         let mut id = self
             .public_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         if id.is_none() {
             let mut bytes = vec![0u8; 32];
             let provider = rustls::crypto::CryptoProvider::get_default()
@@ -2085,8 +2080,7 @@ impl CapturingClientSessionStore {
         drop(id);
         let mut created = self
             .creation_time
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         if created.is_none() {
             *created = Some(
                 SystemTime::now()
@@ -2106,7 +2100,6 @@ impl CapturingClientSessionStore {
         let (server_name, value) = self
             .latest_tls12
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()?;
         self.ensure_metadata();
         Some(NativeSession {
@@ -2118,12 +2111,10 @@ impl CapturingClientSessionStore {
             id: self
                 .public_id
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()?,
             creation_time: self
                 .creation_time
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .unwrap_or(0),
             timeout: 43_200,
         })
@@ -2155,8 +2146,7 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
             .set_tls12_session(server_name.clone(), value.clone());
         *self
             .latest_tls12
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((server_name, value));
+            .lock() = Some((server_name, value));
         self.ensure_metadata();
     }
 
@@ -2170,7 +2160,6 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
         let session = self
             .latest_tls12
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .filter(|(known_name, _)| known_name == server_name)
             .map(|(_, value)| value.clone());
@@ -2181,8 +2170,7 @@ impl rustls::client::ClientSessionStore for CapturingClientSessionStore {
         self.inner.remove_tls12_session(server_name);
         let mut latest = self
             .latest_tls12
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .lock();
         if latest
             .as_ref()
             .is_some_and(|(known_name, _)| known_name == server_name)
@@ -2865,8 +2853,7 @@ impl rustls::KeyLog for CapturingKeyLog {
         if label == "CLIENT_RANDOM" {
             *self
                 .tls12_master_secret
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(secret.to_vec());
+                .lock() = Some(secret.to_vec());
         }
         let sink = self
             .sink
@@ -3252,7 +3239,6 @@ impl TlsConnection {
             .key_log
             .tls12_master_secret
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         let Some(secret) = secret else {
             return;
@@ -3278,7 +3264,6 @@ impl TlsConnection {
         self.key_log
             .tls12_master_secret
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         self.tls12_handshake_transcript.clear();
     }

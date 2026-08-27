@@ -31,7 +31,8 @@
 //! cross-graph identity sharing collapses the constant pool to a
 //! single slot per variant.
 
-use std::sync::{LazyLock, Mutex};
+use parking_lot::Mutex;
+use std::sync::LazyLock;
 
 use crate::flowspace::model::HostObject;
 use crate::model::{CallTarget, FunctionGraph, OpKind};
@@ -65,9 +66,7 @@ static UNIT_VARIANT_PREBUILT_INSTANCES: LazyLock<Mutex<Vec<(String, HostObject)>
 /// `OnceLock` instance — see
 /// `majit-translate/src/flowspace/model.rs`).
 pub(crate) fn intern_unit_variant_prebuilt_instance(qualname: &str) -> Option<HostObject> {
-    let mut cache = UNIT_VARIANT_PREBUILT_INSTANCES
-        .lock()
-        .expect("UNIT_VARIANT_PREBUILT_INSTANCES Mutex poisoned");
+    let mut cache = UNIT_VARIANT_PREBUILT_INSTANCES.lock();
     if let Some((_, instance)) = cache.iter().find(|(q, _)| q == qualname) {
         return Some(instance.clone());
     }

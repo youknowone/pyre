@@ -57,11 +57,12 @@
 
 #![allow(private_interfaces)]
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, ThreadId};
 
 use crate::annotator::model::{KnownType, SomeValue};
@@ -349,7 +350,7 @@ impl ReprState {
     /// panic on owner==current-thread.
     #[doc(hidden)]
     pub fn _force_inprogress_for_current_thread(&self) {
-        *self.owner.lock().unwrap() = Some(thread::current().id());
+        *self.owner.lock() = Some(thread::current().id());
         self.set(setupstate::InProgress);
     }
 }
@@ -491,7 +492,7 @@ pub trait Repr: Debug + std::any::Any {
                     // tests share `OnceLock`-backed singletons, so
                     // distinguish same-thread recursion (true bug)
                     // from cross-thread overlap (wait).
-                    if state.owner.lock().unwrap().as_ref() == Some(&me) {
+                    if state.owner.lock().as_ref() == Some(&me) {
                         panic!(
                             "recursive invocation of Repr setup(): {}",
                             self.repr_string()
@@ -522,9 +523,9 @@ pub trait Repr: Debug + std::any::Any {
             {
                 continue;
             }
-            *state.owner.lock().unwrap() = Some(me);
+            *state.owner.lock() = Some(me);
             let result = self._setup_repr();
-            *state.owner.lock().unwrap() = None;
+            *state.owner.lock() = None;
             match result {
                 Ok(()) => {
                     state.set(setupstate::Finished);

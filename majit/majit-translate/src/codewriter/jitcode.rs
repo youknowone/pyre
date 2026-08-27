@@ -2118,14 +2118,8 @@ impl BhDescr {
             None
         } else {
             match self {
-                BhDescr::Size { .. } => majit_ir::descr::gc_cache()
-                    .lock()
-                    .expect("gc_cache poisoned")
-                    .resolve_struct_tid(raw),
-                BhDescr::Array { .. } => majit_ir::descr::gc_cache()
-                    .lock()
-                    .expect("gc_cache poisoned")
-                    .resolve_array_tid(raw),
+                BhDescr::Size { .. } => majit_ir::descr::gc_cache().lock().resolve_struct_tid(raw),
+                BhDescr::Array { .. } => majit_ir::descr::gc_cache().lock().resolve_array_tid(raw),
                 _ => None,
             }
         };
@@ -2147,14 +2141,8 @@ impl BhDescr {
             None
         } else {
             match self {
-                BhDescr::Size { .. } => majit_ir::descr::gc_cache()
-                    .lock()
-                    .expect("gc_cache poisoned")
-                    .resolve_struct_tid(raw),
-                BhDescr::Array { .. } => majit_ir::descr::gc_cache()
-                    .lock()
-                    .expect("gc_cache poisoned")
-                    .resolve_array_tid(raw),
+                BhDescr::Size { .. } => majit_ir::descr::gc_cache().lock().resolve_struct_tid(raw),
+                BhDescr::Array { .. } => majit_ir::descr::gc_cache().lock().resolve_array_tid(raw),
                 _ => None,
             }
         };
@@ -2503,13 +2491,9 @@ mod tests {
         let planted = majit_ir::descr::make_size_descr_full(0, 328, 31);
         majit_ir::descr::gc_cache()
             .lock()
-            .expect("gc_cache poisoned")
             .register_keyed_size(majit_ir::descr::LLType::Struct(0), planted);
         assert_eq!(
-            majit_ir::descr::gc_cache()
-                .lock()
-                .expect("gc_cache poisoned")
-                .resolve_struct_tid(0),
+            majit_ir::descr::gc_cache().lock().resolve_struct_tid(0),
             Some(31),
             "the plant must occupy the sentinel slot, or this test proves nothing"
         );
@@ -2528,7 +2512,6 @@ mod tests {
         let keyed = majit_ir::descr::make_size_descr_full(0, 24, 9);
         majit_ir::descr::gc_cache()
             .lock()
-            .expect("gc_cache poisoned")
             .register_keyed_size(majit_ir::descr::LLType::Struct(key), keyed);
         assert_eq!(size_descr_with_key(24, key).resolve_gc_tid(), 9);
     }

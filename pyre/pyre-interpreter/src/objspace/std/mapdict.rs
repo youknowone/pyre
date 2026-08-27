@@ -13,11 +13,12 @@ use parking_lot::ReentrantMutex;
 use pyre_object::PyObjectRef;
 use pyre_object::quasiimmut::QuasiImmutField;
 
+use parking_lot::Mutex;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 // PyPy serializes mapdict map/storage transitions with the GIL.  Pyre is
 // free-threaded, so use narrow address-striped reentrant locks around the same
@@ -4334,9 +4335,7 @@ unsafe fn get_new_attr(
     // (mapdict.py:149-156). Map nodes are process-global in pyre, so keep the
     // lookup, holder construction, and insertion under one lock: parallel
     // interpreters must intern exactly one transition for a given key.
-    let mut cache = unsafe { (*self_node).cache_attrs() }
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut cache = unsafe { (*self_node).cache_attrs() }.lock();
     if let Some(&holder) = cache.get(&key) {
         return holder;
     }
@@ -4365,7 +4364,6 @@ unsafe fn find_branch_to_move_into(
     loop {
         let holder = unsafe { (*current).cache_attrs() }
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
             .get(&key)
             .copied();
         let reached_top = match holder {
@@ -4419,9 +4417,7 @@ unsafe fn find_branch_to_move_into_readonly(
     let mut current = self_node;
     loop {
         let holder = {
-            let cache = unsafe { (*current).cache_attrs() }
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let cache = unsafe { (*current).cache_attrs() }.lock();
             cache
                 .iter()
                 .find(|((cached_name, cached_kind), _)| {
@@ -4856,25 +4852,19 @@ static WEAKREF_TABLE_YOUNG: LazyLock<Mutex<HashSet<usize>>> =
 
 fn note_young_owner(young: &Mutex<HashSet<usize>>, key: PyObjectRef) {
     if majit_gc::gc_is_nursery_object(key as usize) {
-        young.lock().unwrap().insert(key as usize);
+        young.lock().insert(key as usize);
     }
 }
 
 fn instance_dict_insert(key: PyObjectRef, w_dict: PyObjectRef) {
-    INSTANCE_DICT
-        .lock()
-        .unwrap()
-        .insert(key as usize, w_dict as usize);
-    INSTANCE_DICT_PENDING.lock().unwrap().insert(key as usize);
+    INSTANCE_DICT.lock().insert(key as usize, w_dict as usize);
+    INSTANCE_DICT_PENDING.lock().insert(key as usize);
     note_young_owner(&INSTANCE_DICT_YOUNG, key);
 }
 
 fn weakref_table_insert(key: PyObjectRef, value: PyObjectRef) {
-    WEAKREF_TABLE
-        .lock()
-        .unwrap()
-        .insert(key as usize, value as usize);
-    WEAKREF_TABLE_PENDING.lock().unwrap().insert(key as usize);
+    WEAKREF_TABLE.lock().insert(key as usize, value as usize);
+    WEAKREF_TABLE_PENDING.lock().insert(key as usize);
     note_young_owner(&WEAKREF_TABLE_YOUNG, key);
 }
 
@@ -5593,7 +5583,6 @@ pub fn _obj_getdict(self_ref: PyObjectRef) -> PyObjectRef {
     } else {
         let existing = INSTANCE_DICT
             .lock()
-            .unwrap()
             .get(&(self_ref as usize))
             .copied()
             .map(|dict| dict as PyObjectRef);
@@ -5710,13 +5699,12 @@ fn snapshot_root_entries(
     if !minor {
         return table
             .lock()
-            .unwrap()
             .iter()
             .map(|(&key, &value)| (key, value as PyObjectRef))
             .collect();
     }
-    let keys = std::mem::take(&mut *pending.lock().unwrap());
-    let table = table.lock().unwrap();
+    let keys = std::mem::take(&mut *pending.lock());
+    let table = table.lock();
     keys.into_iter()
         .filter_map(|key| table.get(&key).map(|&value| (key, value as PyObjectRef)))
         .collect()
@@ -5741,7 +5729,7 @@ pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>
         (&INSTANCE_DICT, &INSTANCE_DICT_PENDING),
         (&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING),
     ] {
-        let mut table = table.lock().unwrap();
+        let mut table = table.lock();
         let dead: Vec<usize> = table
             .keys()
             .copied()
@@ -5750,7 +5738,7 @@ pub fn prune_dead_owner_entries(classify: &mut dyn FnMut(usize) -> Option<usize>
         if dead.is_empty() {
             continue;
         }
-        let mut pending = pending.lock().unwrap();
+        let mut pending = pending.lock();
         for key in dead {
             table.remove(&key);
             pending.remove(&key);
@@ -5778,14 +5766,14 @@ pub fn reconcile_young_owner_entries(classify: &mut dyn FnMut(usize) -> Option<u
         (&WEAKREF_TABLE, &WEAKREF_TABLE_PENDING, &WEAKREF_TABLE_YOUNG),
     ] {
         let keys: Vec<usize> = {
-            let mut young = young.lock().unwrap();
+            let mut young = young.lock();
             std::mem::take(&mut *young).into_iter().collect()
         };
         if keys.is_empty() {
             continue;
         }
-        let mut table = table.lock().unwrap();
-        let mut pending = pending.lock().unwrap();
+        let mut table = table.lock();
+        let mut pending = pending.lock();
         let mut still_young = Vec::new();
         for key in keys {
             match classify(key) {
@@ -5809,7 +5797,7 @@ pub fn reconcile_young_owner_entries(classify: &mut dyn FnMut(usize) -> Option<u
             }
         }
         if !still_young.is_empty() {
-            young.lock().unwrap().extend(still_young);
+            young.lock().extend(still_young);
         }
     }
 }
@@ -5829,7 +5817,6 @@ pub fn mark_live_side_table_entries(
     for table in [&INSTANCE_DICT, &WEAKREF_TABLE] {
         let entries: Vec<(usize, usize)> = table
             .lock()
-            .unwrap()
             .iter()
             .map(|(&owner, &value)| (owner, value))
             .collect();
@@ -5852,7 +5839,7 @@ fn apply_root_rekeys(table: &Mutex<HashMap<usize, usize>>, rekeys: Vec<(usize, u
     if rekeys.is_empty() {
         return;
     }
-    let mut table = table.lock().unwrap();
+    let mut table = table.lock();
     for (key, new_key, value) in rekeys {
         if new_key == key {
             if let Some(slot) = table.get_mut(&key) {
@@ -5935,7 +5922,7 @@ pub unsafe fn walk_mapdict_roots_area(_data: *const (), mut visitor: impl FnMut(
     }
     apply_root_rekeys(&INSTANCE_DICT, dict_rekeys);
     if !dict_offgc.is_empty() {
-        INSTANCE_DICT_PENDING.lock().unwrap().extend(dict_offgc);
+        INSTANCE_DICT_PENDING.lock().extend(dict_offgc);
     }
 
     // The weakref walk visits the lifeline pointer and stops there, so it needs
@@ -6055,7 +6042,6 @@ pub fn getweakref(self_ref: PyObjectRef) -> Option<PyObjectRef> {
     } else {
         WEAKREF_TABLE
             .lock()
-            .unwrap()
             .get(&(self_ref as usize))
             .copied()
             .map(|value| value as PyObjectRef)
@@ -6089,7 +6075,7 @@ pub fn delweakref(self_ref: PyObjectRef) {
     if unsafe { has_mapdict_storage(self_ref) } {
         unsafe { instance_del_weakref_slot(self_ref) };
     } else {
-        WEAKREF_TABLE.lock().unwrap().remove(&(self_ref as usize));
+        WEAKREF_TABLE.lock().remove(&(self_ref as usize));
     }
 }
 
@@ -6266,7 +6252,6 @@ mod tests {
         assert_eq!(
             unsafe { (*(term_addr as MapRef)).cache_attrs() }
                 .lock()
-                .unwrap()
                 .len(),
             64
         );
@@ -6916,7 +6901,7 @@ mod tests {
             let addr = obj_ref as usize;
             // Never entered INSTANCE_DICT (no getdict call), proving storage
             // forwarding is decoupled from wrapper materialisation.
-            let in_instance_dict = INSTANCE_DICT.lock().unwrap().contains_key(&addr);
+            let in_instance_dict = INSTANCE_DICT.lock().contains_key(&addr);
             assert!(!in_instance_dict);
 
             let mut seen: Vec<PyObjectRef> = Vec::new();
@@ -6965,7 +6950,7 @@ mod tests {
             // stored in the SPECIAL slot, not INSTANCE_DICT.
             assert_eq!(instance_get_dict_slot(obj_ref), Some(w1));
             let addr = obj_ref as usize;
-            let in_instance_dict = INSTANCE_DICT.lock().unwrap().contains_key(&addr);
+            let in_instance_dict = INSTANCE_DICT.lock().contains_key(&addr);
             assert!(!in_instance_dict);
             // identity stable across repeated access.
             let w2 = _obj_getdict(obj_ref);
@@ -7393,7 +7378,7 @@ mod tests {
         assert_eq!(keys_of(&snapshot), [0x10, 0x20, 0x30]);
         // A major moves nothing, so it must not retire the keys a later minor
         // still owes a visit to.
-        assert_eq!(pending.lock().unwrap().len(), 1);
+        assert_eq!(pending.lock().len(), 1);
     }
 
     #[test]
@@ -7402,7 +7387,7 @@ mod tests {
         let pending = pending(&[0x20, 0x30]);
         let snapshot = snapshot_root_entries(&table, &pending, true);
         assert_eq!(keys_of(&snapshot), [0x20, 0x30]);
-        assert!(pending.lock().unwrap().is_empty());
+        assert!(pending.lock().is_empty());
         // Drained: the entries are old by now and reached through their own
         // write barrier, so the next minor visits nothing.
         assert!(snapshot_root_entries(&table, &pending, true).is_empty());
@@ -7422,7 +7407,7 @@ mod tests {
         // 0x10's owner moved to 0x11 and its value to 0xA1; 0x20 stayed put but
         // its value moved.
         apply_root_rekeys(&table, vec![(0x10, 0x11, 0xA1), (0x20, 0x20, 0xB1)]);
-        let table = table.lock().unwrap();
+        let table = table.lock();
         assert_eq!(table.get(&0x10), None);
         assert_eq!(table.get(&0x11), Some(&0xA1));
         assert_eq!(table.get(&0x20), Some(&0xB1));
@@ -7432,6 +7417,6 @@ mod tests {
     fn rekey_of_an_entry_deleted_during_the_walk_reinserts_nothing() {
         let table = table(&[]);
         apply_root_rekeys(&table, vec![(0x10, 0x11, 0xA1), (0x20, 0x20, 0xB1)]);
-        assert!(table.lock().unwrap().is_empty());
+        assert!(table.lock().is_empty());
     }
 }

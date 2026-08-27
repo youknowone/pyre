@@ -2273,11 +2273,10 @@ fn jit_execute(caller: &mut Caller<'_, Host>, func_id: u32, frame_ptr: u32) -> R
 /// plausible value instead of a trap, and only surfaces much later as a wrong
 /// result. Say the slot out loud here so it surfaces at the call instead.
 fn report_dead_call_slot(func_ptr: u32) {
-    static SEEN: std::sync::Mutex<Option<std::collections::BTreeSet<u32>>> =
-        std::sync::Mutex::new(None);
+    static SEEN: parking_lot::Mutex<Option<std::collections::BTreeSet<u32>>> =
+        parking_lot::Mutex::new(None);
     if SEEN
         .lock()
-        .unwrap()
         .get_or_insert_with(Default::default)
         .insert(func_ptr)
     {
@@ -2290,9 +2289,9 @@ fn report_dead_call_slot(func_ptr: u32) {
 
 /// Dispatch a residual call requested by a running trace.
 // PROBE(PYRE_WASM_CALL_HIST): temporary per-callee crossing histogram.
-static PROBE_CALL_HIST: std::sync::Mutex<
+static PROBE_CALL_HIST: parking_lot::Mutex<
     Option<std::collections::BTreeMap<(&'static str, u32), u64>>,
-> = std::sync::Mutex::new(None);
+> = parking_lot::Mutex::new(None);
 
 /// Whether `PYRE_WASM_CALL_HIST` was set, read once.
 ///
@@ -2309,13 +2308,13 @@ fn probe_call_hist_enabled() -> bool {
 /// them. Only the path is kept: resolving costs a re-read and a parse of the
 /// whole module, which is worth paying once at exit and never when the probe
 /// is off.
-static PROBE_CALL_HIST_MODULE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+static PROBE_CALL_HIST_MODULE: parking_lot::Mutex<Option<PathBuf>> = parking_lot::Mutex::new(None);
 
 fn probe_call_hist_note_module(module_path: &Path) {
     if !probe_call_hist_enabled() {
         return;
     }
-    *PROBE_CALL_HIST_MODULE.lock().unwrap() = Some(module_path.to_path_buf());
+    *PROBE_CALL_HIST_MODULE.lock() = Some(module_path.to_path_buf());
 }
 
 /// Symbol for each function-table slot the histogram can report.
@@ -2333,7 +2332,7 @@ fn probe_call_hist_slot_names() -> std::collections::BTreeMap<u32, String> {
     use wasmparser::{ElementItems, ElementKind, Name, Operator, Payload};
 
     let mut out = std::collections::BTreeMap::new();
-    let path = PROBE_CALL_HIST_MODULE.lock().unwrap().clone();
+    let path = PROBE_CALL_HIST_MODULE.lock().clone();
     let Some(path) = path else { return out };
     let Ok(bytes) = std::fs::read(&path) else {
         return out;
@@ -2401,7 +2400,7 @@ pub(crate) fn probe_call_hist_dump() {
     if !probe_call_hist_enabled() {
         return;
     }
-    let g = PROBE_CALL_HIST.lock().unwrap();
+    let g = PROBE_CALL_HIST.lock();
     let Some(m) = g.as_ref() else { return };
     let total: u64 = m.values().sum();
     let mut v: Vec<_> = m.iter().collect();
@@ -2460,7 +2459,7 @@ fn jit_call_trampoline_inner(
 
     let func_ptr = read_u32(&memory, &*caller, call_area + 8);
     if probe_call_hist_enabled() {
-        let mut g = PROBE_CALL_HIST.lock().unwrap();
+        let mut g = PROBE_CALL_HIST.lock();
         *g.get_or_insert_with(Default::default)
             .entry((source, func_ptr))
             .or_insert(0) += 1;

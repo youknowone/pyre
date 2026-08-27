@@ -168,7 +168,7 @@ mod tests {
         let Ok(Some(_ptr_obj::Array(arr))) = ptr._obj0_value() else {
             panic!("hex_chars LLPtr must target an Array container");
         };
-        let items = arr.items.lock().unwrap();
+        let items = arr.items.lock();
         assert_eq!(items[0], LowLevelValue::Char('0'));
         assert_eq!(items[10], LowLevelValue::Char('a'));
         assert_eq!(items[15], LowLevelValue::Char('f'));

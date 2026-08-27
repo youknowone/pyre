@@ -334,6 +334,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]
@@ -423,6 +424,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]
@@ -993,6 +995,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]
@@ -1425,6 +1428,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]
@@ -1958,6 +1962,7 @@ dependencies = [
  "majit-ir",
  "majit-trace",
  "majit-translate",
+ "parking_lot",
  "rustc-hash",
 ]
 
@@ -1970,6 +1975,7 @@ dependencies = [
  "majit-gc",
  "majit-ir",
  "majit-translate",
+ "parking_lot",
  "smallvec",
  "wasm-bindgen",
  "wasm-encoder 0.245.1",
@@ -1981,6 +1987,7 @@ dependencies = [
 name = "majit-charon-reader"
 version = "0.0.2"
 dependencies = [
+ "parking_lot",
  "serde",
  "serde_json",
 ]
@@ -1992,6 +1999,7 @@ dependencies = [
  "indexmap",
  "libc",
  "majit-ir",
+ "parking_lot",
  "region",
 ]
 
@@ -2000,6 +2008,7 @@ name = "majit-ir"
 version = "0.0.2"
 dependencies = [
  "indexmap",
+ "parking_lot",
  "serde",
  "smallvec",
  "vecmap-rs",
@@ -2031,6 +2040,7 @@ dependencies = [
  "majit-macros",
  "majit-trace",
  "majit-translate",
+ "parking_lot",
  "rustc-hash",
  "smallvec",
  "vecset",
@@ -2045,6 +2055,7 @@ dependencies = [
  "majit-macros",
  "malachite-bigint",
  "num-traits",
+ "parking_lot",
 ]
 
 [[package]]
@@ -2056,6 +2067,7 @@ dependencies = [
  "majit-backend",
  "majit-gc",
  "majit-ir",
+ "parking_lot",
  "smallvec",
  "vecset",
 ]
@@ -2070,6 +2082,7 @@ dependencies = [
  "majit-charon-reader",
  "majit-ir",
  "md-5",
+ "parking_lot",
  "proc-macro2",
  "quote",
  "rustc-hash",
@@ -2767,6 +2780,7 @@ dependencies = [
  "majit-trace",
  "majit-translate",
  "num-traits",
+ "parking_lot",
  "pyre-interpreter",
  "pyre-jit-trace",
  "pyre-object",
@@ -2794,6 +2808,7 @@ dependencies = [
  "majit-trace",
  "majit-translate",
  "mimalloc",
+ "parking_lot",
  "pyre-interpreter",
  "pyre-object",
  "rustpython-wtf8",
@@ -2830,6 +2845,7 @@ dependencies = [
  "der",
  "flate2",
  "md-5",
+ "parking_lot",
  "pem-rfc7468",
  "pkcs8",
  "rustls",
@@ -2867,6 +2883,7 @@ version = "0.0.2"
 dependencies = [
  "indexmap",
  "libc",
+ "parking_lot",
  "tempfile",
 ]
 
@@ -2890,6 +2907,7 @@ name = "pyre-wasm-runner"
 version = "0.0.2"
 dependencies = [
  "getrandom 0.4.3",
+ "parking_lot",
  "rustc-demangle",
  "sha2 0.10.9",
  "wasmi",
@@ -2917,6 +2935,7 @@ dependencies = [
  "majit-gc",
  "majit-metainterp",
  "mimalloc",
+ "parking_lot",
  "pyre-interpreter",
  "pyre-jit",
  "pyre-object",
@@ -4010,6 +4029,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]
@@ -4019,6 +4039,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]
@@ -4063,6 +4084,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]
@@ -4081,6 +4103,7 @@ dependencies = [
  "majit-ir",
  "majit-macros",
  "majit-metainterp",
+ "parking_lot",
 ]
 
 [[package]]

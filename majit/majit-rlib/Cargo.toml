@@ -7,6 +7,7 @@ repository.workspace = true
 description = "RPython rlib runtime support library"
 
 [dependencies]
+parking_lot = { workspace = true }
 majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-macros = { workspace = true }

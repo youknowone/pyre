@@ -7,10 +7,11 @@
 //! - `check_sys_modules()` — consult the module cache
 //! - `import_all_from()` — IMPORT_STAR handler
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, LazyLock, Mutex, OnceLock,
+    Arc, LazyLock, OnceLock,
     atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
 // `Path` and `PathBuf` both appear in the host_env-independent module-search
@@ -174,7 +175,7 @@ static SOURCE_PROVIDER: LazyLock<Mutex<Option<Arc<dyn SourceProvider>>>> =
 /// provider answers every probe.
 #[cfg(feature = "host_env")]
 pub fn install_source_provider(provider: Arc<dyn SourceProvider>) {
-    *SOURCE_PROVIDER.lock().unwrap() = Some(provider);
+    *SOURCE_PROVIDER.lock() = Some(provider);
 }
 
 /// Run `f` against the installed provider, lazily defaulting to the platform's
@@ -185,7 +186,7 @@ pub fn install_source_provider(provider: Arc<dyn SourceProvider>) {
 #[cfg(feature = "host_env")]
 fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
     let provider = {
-        let mut slot = SOURCE_PROVIDER.lock().unwrap();
+        let mut slot = SOURCE_PROVIDER.lock();
         slot.get_or_insert_with(default_source_provider).clone()
     };
     f(&*provider)
@@ -562,7 +563,7 @@ pub fn register_builtin_module(
     name: &'static str,
     init: fn(PyObjectRef) -> Result<(), crate::PyError>,
 ) {
-    BUILTIN_MODULES.lock().unwrap().insert(
+    BUILTIN_MODULES.lock().insert(
         name,
         BuiltinModuleDef {
             init,
@@ -578,7 +579,7 @@ pub fn register_collectible_builtin_module(
     name: &'static str,
     init: fn(PyObjectRef) -> Result<(), crate::PyError>,
 ) {
-    BUILTIN_MODULES.lock().unwrap().insert(
+    BUILTIN_MODULES.lock().insert(
         name,
         BuiltinModuleDef {
             init,
@@ -596,7 +597,7 @@ pub fn register_builtin_module_with_startup(
     init: fn(PyObjectRef) -> Result<(), crate::PyError>,
     startup: fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>,
 ) {
-    BUILTIN_MODULES.lock().unwrap().insert(
+    BUILTIN_MODULES.lock().insert(
         name,
         BuiltinModuleDef {
             init,
@@ -618,7 +619,6 @@ pub fn register_builtin_module_with_startup(
 pub fn builtin_module_names() -> Vec<&'static str> {
     let mut names: Vec<&'static str> = BUILTIN_MODULES
         .lock()
-        .unwrap()
         .keys()
         .copied()
         // Frozen importlib's BuiltinImporter consults this tuple before
@@ -1606,7 +1606,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, cra
     // The registry key outlives the module, which is what lets the sweep below
     // hand the name to `BuiltinCode.module` without copying it.
     let (static_name, module_def) = {
-        let table = BUILTIN_MODULES.lock().unwrap();
+        let table = BUILTIN_MODULES.lock();
         let Some((static_name, def)) = table.get_key_value(name) else {
             return Ok(None);
         };
@@ -2034,11 +2034,7 @@ fn startup_builtin_module_impl(
     let mod_slot = shadow_stack_len();
     let _ = pin_root(module);
 
-    let startup = BUILTIN_MODULES
-        .lock()
-        .unwrap()
-        .get(name)
-        .and_then(|d| d.startup);
+    let startup = BUILTIN_MODULES.lock().get(name).and_then(|d| d.startup);
     if let Some(startup) = startup {
         startup(shadow_stack_get(mod_slot), execution_context)?;
     }
@@ -2114,20 +2110,20 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     // code can mutate `sys.path`.  Module origins are absolute canonical paths,
     // so store the canonical absolute form here for the directory comparison to
     // hold for a relative script argument or a symlinked working directory.
-    *SYS_PATH_0.lock().unwrap() = Some(canonical_startup_dir(script_dir));
+    *SYS_PATH_0.lock() = Some(canonical_startup_dir(script_dir));
 
     // `pymain_run_python` prepends `sys.path[0]` only after `site` has run, so
     // `site.removeduppaths()` never absolutizes the `-c` / REPL empty entry into
     // the cwd.  Stage the entry here; `add_sys_path_0` performs the insert.
     // `-P` (safe_path) suppresses it entirely.
-    *SYS_PATH_0_PENDING.lock().unwrap() = (!safe_path_flag()).then(|| path0.to_os_string());
+    *SYS_PATH_0_PENDING.lock() = (!safe_path_flag()).then(|| path0.to_os_string());
 
     // The search path is a filesystem's, so a build with no host filesystem
     // seeds none: `SYS_PATH` is `host_env`'s and so is every entry that could
     // go in it.
     #[cfg(feature = "host_env")]
     {
-        let mut path = SYS_PATH.lock().unwrap();
+        let mut path = SYS_PATH.lock();
         path.clear();
         // PYTHONPATH entries head the seed and precede the stdlib
         // (pathconfig.c), split on the platform path-list separator.  Honoured
@@ -2157,7 +2153,7 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
 /// directory under safe-path modes, but the package-run branch still prepends
 /// the accepted run target so `runpy` can find `__main__`.
 pub fn restage_sys_path_0(path0: &std::ffi::OsStr) {
-    *SYS_PATH_0_PENDING.lock().unwrap() = Some(path0.to_os_string());
+    *SYS_PATH_0_PENDING.lock() = Some(path0.to_os_string());
 }
 
 /// Process-wide path configuration computed before `sys` exposes any path.
@@ -2385,7 +2381,7 @@ fn restore_double_root(_original: &Path, normalized: PathBuf) -> PathBuf {
     not(target_arch = "wasm32")
 ))]
 fn find_invoked_executable() -> PathBuf {
-    let argv0 = SYS_ORIG_ARGV.lock().unwrap().first().cloned();
+    let argv0 = SYS_ORIG_ARGV.lock().first().cloned();
     if let Some(argv0) = argv0 {
         let mut candidate = PathBuf::from(argv0);
         #[cfg(windows)]
@@ -2976,7 +2972,7 @@ pub fn add_sys_path(dir: &Path) {
     let entry = crate::gateway::fsdecode_os_str_wtf8(dir.as_os_str());
     if get_interpreter_sys_module().is_none() {
         {
-            let mut path = SYS_PATH.lock().unwrap();
+            let mut path = SYS_PATH.lock();
             let pb = dir.to_path_buf();
             if !path.contains(&pb) {
                 path.push(pb);
@@ -3026,13 +3022,13 @@ pub fn add_sys_path(dir: &Path) {
 pub fn add_sys_path_0() {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
-    let Some(entry) = SYS_PATH_0_PENDING.lock().unwrap().take() else {
+    let Some(entry) = SYS_PATH_0_PENDING.lock().take() else {
         return;
     };
     // No `sys` yet (an embedder that never imports `site`): stage at the front
     // of the seed instead, which `create_sys_path_list` flushes in order.
     if get_interpreter_sys_module().is_none() {
-        SYS_PATH.lock().unwrap().insert(0, PathBuf::from(entry));
+        SYS_PATH.lock().insert(0, PathBuf::from(entry));
         return;
     }
     // Pin the new entry before any further allocation (`get_sys_module` and the
@@ -3106,15 +3102,14 @@ fn sys_modules_dict_entry(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> 
 /// instead of tracing into it (`@dont_look_inside`, the `sys_modules_dict`
 /// shape).  The mutating and GC-walking users keep the raw static.
 ///
-/// The read is poison-tolerant, following the `get_interpreter_sys_module`
-/// spelling this replaces: a poisoned mutex means another thread panicked
-/// while holding it, and a `HashMap<String, usize>` has no invariant a panic
-/// mid-`insert`/`remove` could leave broken.
+/// The read takes the guard unconditionally, following the
+/// `get_interpreter_sys_module` spelling this replaces: `parking_lot` hands a
+/// panicking thread's lock straight on, and a `HashMap<String, usize>` has no
+/// invariant a panic mid-`insert`/`remove` could leave broken.
 #[majit_macros::dont_look_inside]
 pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
     SYS_MODULES
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(name)
         .copied()
         .map(|module| module as PyObjectRef)
@@ -3221,12 +3216,9 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     // function receives the finished module.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     if !majit_gc::gc_owns_object(module as usize) {
-        MODULE_DICT_ROOTS.lock().unwrap().insert(module as usize);
+        MODULE_DICT_ROOTS.lock().insert(module as usize);
     }
-    SYS_MODULES
-        .lock()
-        .unwrap()
-        .insert(name.to_string(), module as usize);
+    SYS_MODULES.lock().insert(name.to_string(), module as usize);
     // Keep the Python-visible sys.modules dict in sync.  The read is fresh —
     // the collector walks that cell — but the `dict` moves, and the key string
     // minted below can be the collection that moves it.
@@ -3250,7 +3242,7 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
 /// `import ssl` (missing `_ssl`) leaves a broken `ssl` shell behind, and
 /// the next `import ssl` succeeds with no `SSLWantReadError`, etc.
 pub fn remove_sys_module(name: &str) {
-    SYS_MODULES.lock().unwrap().remove(name);
+    SYS_MODULES.lock().remove(name);
     let dict = sys_modules_dict();
     if !dict.is_null() {
         unsafe {
@@ -3346,7 +3338,7 @@ pub unsafe fn walk_module_dicts_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
 /// `visitor` must tolerate being called on every movable module-dict value
 /// slot reachable here.
 unsafe fn walk_bound_module_dicts(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    for &module in MODULE_DICT_ROOTS.lock().unwrap().iter() {
+    for &module in MODULE_DICT_ROOTS.lock().iter() {
         let module = module as PyObjectRef;
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
             continue;
@@ -3551,11 +3543,11 @@ pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_BYTES_WARNING.store(flags.bytes_warning, Ordering::Relaxed);
     SYS_DONT_WRITE_BYTECODE.store(flags.dont_write_bytecode, Ordering::Relaxed);
     SYS_FAULTHANDLER.store(flags.faulthandler, Ordering::Relaxed);
-    *SYS_PYCACHE_PREFIX.lock().unwrap() = flags.pycache_prefix.clone();
+    *SYS_PYCACHE_PREFIX.lock() = flags.pycache_prefix.clone();
     SYS_UNBUFFERED.store(flags.unbuffered, Ordering::Relaxed);
-    *SYS_XOPTIONS.lock().unwrap() = flags.xoptions.clone();
-    *SYS_WARNOPTIONS.lock().unwrap() = flags.warnoptions.clone();
-    *SYS_STDIO_ENCODING.lock().unwrap() = flags.stdio_encoding.clone();
+    *SYS_XOPTIONS.lock() = flags.xoptions.clone();
+    *SYS_WARNOPTIONS.lock() = flags.warnoptions.clone();
+    *SYS_STDIO_ENCODING.lock() = flags.stdio_encoding.clone();
 }
 
 /// Whether the launcher resolved `-X faulthandler` / `-X dev` /
@@ -3570,12 +3562,12 @@ pub fn faulthandler_flag() -> bool {
 /// `sys.pycache_prefix`, which is what `_bootstrap_external.cache_from_source`
 /// computes the bytecode path from.
 pub fn pycache_prefix() -> Option<std::ffi::OsString> {
-    SYS_PYCACHE_PREFIX.lock().unwrap().clone()
+    SYS_PYCACHE_PREFIX.lock().clone()
 }
 
 /// Raw `-X` values recorded by the launcher, in command-line order.
 pub fn xoptions() -> Vec<std::ffi::OsString> {
-    SYS_XOPTIONS.lock().unwrap().clone()
+    SYS_XOPTIONS.lock().clone()
 }
 
 pub fn bytes_warning_flag() -> i64 {
@@ -3613,11 +3605,11 @@ pub fn unbuffered_flag() -> bool {
 }
 
 pub fn warnoptions() -> Vec<std::ffi::OsString> {
-    SYS_WARNOPTIONS.lock().unwrap().clone()
+    SYS_WARNOPTIONS.lock().clone()
 }
 
 pub fn stdio_encoding() -> Option<String> {
-    SYS_STDIO_ENCODING.lock().unwrap().clone()
+    SYS_STDIO_ENCODING.lock().clone()
 }
 
 /// `app_main.py sys.orig_argv[:] = [executable] + argv`: the launcher's
@@ -3625,11 +3617,11 @@ pub fn stdio_encoding() -> Option<String> {
 /// Held in the host's spelling for the same reason `set_sys_argv` takes it —
 /// an argument with no UTF-8 form has to survive to the decode.
 pub fn set_sys_orig_argv(argv: Vec<std::ffi::OsString>) {
-    *SYS_ORIG_ARGV.lock().unwrap() = argv;
+    *SYS_ORIG_ARGV.lock() = argv;
 }
 
 pub fn sys_orig_argv() -> Vec<std::ffi::OsString> {
-    SYS_ORIG_ARGV.lock().unwrap().clone()
+    SYS_ORIG_ARGV.lock().clone()
 }
 
 pub fn quiet_flag() -> bool {
@@ -3726,7 +3718,7 @@ pub fn set_sys_modules_dict(dict: PyObjectRef) {
     let dict_slot = roots.base();
     let _ = roots.pin_root(dict);
     // Populate with all modules already in the cache.
-    for (name, &module) in SYS_MODULES.lock().unwrap().iter() {
+    for (name, &module) in SYS_MODULES.lock().iter() {
         let w_key = pyre_object::w_str_new(name);
         unsafe {
             pyre_object::w_dict_store(roots.get(dict_slot), w_key, module as PyObjectRef);
@@ -3784,7 +3776,7 @@ fn find_module(
     }
 
     // Check builtin modules first (PyPy: space.builtin_modules check in find_module)
-    let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
+    let is_builtin = BUILTIN_MODULES.lock().contains_key(partname);
     if is_builtin {
         return Ok(Some(FindInfo::Builtin));
     }
@@ -3815,7 +3807,7 @@ fn find_module(
     if let Some(dirs) = parent_dirs {
         return Ok(find_in_dirs(partname, dirs));
     }
-    let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
+    let is_builtin = BUILTIN_MODULES.lock().contains_key(partname);
     if is_builtin {
         return Ok(Some(FindInfo::Builtin));
     }
@@ -3827,7 +3819,7 @@ fn find_module(
     partname: &str,
     _parent_dirs: Option<&[PathBuf]>,
 ) -> Result<Option<FindInfo>, crate::PyError> {
-    let is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(partname);
+    let is_builtin = BUILTIN_MODULES.lock().contains_key(partname);
     if is_builtin {
         return Ok(Some(FindInfo::Builtin));
     }
@@ -4005,13 +3997,13 @@ fn find_in_sys_path(partname: &str) -> Result<Option<FindInfo>, crate::PyError> 
             // falls back to the native seed so the stdlib stays importable.
             #[cfg(windows)]
             let found = found.or_else(|| {
-                let path = SYS_PATH.lock().unwrap();
+                let path = SYS_PATH.lock();
                 find_in_dirs(partname, &path)
             });
             found
         }
         None => {
-            let path = SYS_PATH.lock().unwrap();
+            let path = SYS_PATH.lock();
             find_in_dirs(partname, &path)
         }
     })
@@ -4034,7 +4026,6 @@ pub(crate) fn create_sys_path_list() -> PyObjectRef {
     ensure_stdlib_path();
     let items: Vec<PyObjectRef> = SYS_PATH
         .lock()
-        .unwrap()
         .iter()
         .map(|d| crate::gateway::fsdecode_os_str(d.as_os_str()))
         .collect();
@@ -4756,7 +4747,7 @@ fn load_part(
     // `importlib.machinery` can override the filesystem search.
     // PyPy: interp_import.importhook consults sys.builtin_module_names by
     // the fully-qualified name.
-    let full_is_builtin = BUILTIN_MODULES.lock().unwrap().contains_key(modulename);
+    let full_is_builtin = BUILTIN_MODULES.lock().contains_key(modulename);
     if full_is_builtin {
         // `pypy/interpreter/module.py Module.__init__` keeps a single
         // `Module` per imported module name; `space.builtin` IS the
@@ -6094,7 +6085,7 @@ pub(crate) fn is_possibly_shadowing(origin: &rustpython_wtf8::Wtf8) -> bool {
     if safe_path_flag() {
         return false;
     }
-    let Some(sys_path_0) = SYS_PATH_0.lock().unwrap().clone() else {
+    let Some(sys_path_0) = SYS_PATH_0.lock().clone() else {
         return false;
     };
     let sep = std::path::MAIN_SEPARATOR as u8;
