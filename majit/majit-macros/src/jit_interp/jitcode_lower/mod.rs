@@ -13,7 +13,8 @@ pub use api::GeneratedJitCodeBody;
 #[allow(unused_imports)]
 pub(crate) use api::{
     CallerLocalLayout, assign_caller_local_layout, generate_inline_helper_jitcode_with_calls,
-    inline_helper_param_counts, inline_helper_param_layout,
+    inline_helper_arg_classes, inline_helper_param_counts, inline_helper_param_layout,
+    inline_return_kind_class,
     try_generate_jitcode_body_parts_with_caller_bindings,
     try_generate_jitcode_pc_return_body_with_caller_bindings,
 };

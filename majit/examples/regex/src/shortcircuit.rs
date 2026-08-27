@@ -683,6 +683,38 @@ pub fn matches(root: *mut NodeRec, s: &[u8], threshold: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// `shift` must reach the blackhole as a CALL, not as bytes to interpret.
+    ///
+    /// `bhimpl_inline_call_*` (`blackhole.py:1278-1319`) runs
+    /// `cpu.bh_call_X(adr2int(jitcode.fnaddr), ..., jitcode.calldescr)`, so the
+    /// whole 93-node walk this helper performs is one call from the blackhole's
+    /// point of view. That only happens if the helper's jitcode carries the
+    /// entry `JitCode(name, fnaddr, calldescr)` (`call.py:167-169`) names, and
+    /// nothing else in the crate would notice its absence: without it the
+    /// answers are identical and only the cost moves, which is exactly the
+    /// shape a benchmark reports as noise.
+    ///
+    /// The signature is pinned with it. `collect_call_args` walks
+    /// `arg_classes` to put the per-kind lists back into declaration order, so
+    /// a wrong string there does not fail to call — it calls with the
+    /// arguments transposed.
+    #[test]
+    fn shift_carries_the_native_entry_the_blackhole_calls() {
+        let mut asm = majit_metainterp::Assembler::default();
+        let jitcode = super::__majit_inline_jitcode_shift_with_asm(&mut asm);
+        assert_ne!(
+            jitcode.fnaddr, 0,
+            "`shift` has no native entry, so every blackhole resume byte-interprets \
+             its whole recursive descent",
+        );
+        let body = jitcode.try_body().expect("a finished jitcode has a body");
+        assert_eq!(
+            body.calldescr.arg_classes, "rii",
+            "`shift(n: usize, c: i64, mark: i64)` is one Ref then two Ints, in that order",
+        );
+        assert_eq!(body.calldescr.result_type, 'i');
+    }
     use super::*;
     use crate::regex::{bench_regex, count, lower, nonmatching, vectors};
     use majit_ir::OpCode;

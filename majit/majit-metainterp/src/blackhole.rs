@@ -11891,6 +11891,28 @@ fn handler_inline_call_nested_ext(
         })
         .clone();
 
+    // `bhimpl_inline_call_*` (blackhole.py:1278-1319) does not interpret a
+    // callee.  It runs `cpu.bh_call_X(adr2int(jitcode.fnaddr), args_i, args_r,
+    // args_f, jitcode.calldescr)`, so a whole callee subtree — a recursive tree
+    // walk included — executes as compiled code in ONE call.  Upstream's
+    // blackhole never byte-interprets a callee, and the ten canonical
+    // `inline_call_*` handlers in this file are the same thing for the bytes a
+    // build-time jitcode emits.
+    //
+    // `JitCodeBuilder::set_native_entry` stages that pair for a
+    // `#[jit_inline]` helper: the Rust function the macro re-emits IS the
+    // program the body was lowered from, so calling it answers what running
+    // the bytes answers.  Where it did not stage one — a `match`-arm fragment,
+    // which is a shape upstream does not have, or a body carrying an opcode
+    // whose operand comes from this interpreter rather than from the heap
+    // (`JitCodeBuilder::native_entry_denied`) — `fnaddr` is 0 and the nested
+    // interpreter below runs it, which is where every callee went before.
+    if is_callable_fnaddr(sub_jitcode.fnaddr)
+        && let Some(body) = sub_jitcode.try_body()
+    {
+        return inline_call_native(bh, code, p, num_args, sub_jitcode.fnaddr, &body.calldescr);
+    }
+
     // The callee frame is seated before the argument triples are decoded so
     // each one can be copied where it is read, with no list in between.  The
     // frame itself comes from `bh`'s scratch slot when this frame has already
@@ -12001,6 +12023,90 @@ fn handler_inline_call_nested_ext(
     callee.reset_for_inline_reuse();
     bh.inline_callee_scratch = Some(callee);
     outcome
+}
+
+/// The native arm of `BC_INLINE_CALL`: `bhimpl_inline_call_irf_*`
+/// (`blackhole.py:1306-1319`) over the operands `inline_call_nested_ext/P`
+/// spells them with.
+///
+/// `p` is positioned at the first argument triple; the return is the post-op
+/// cursor, the same one the canonical handlers return.
+fn inline_call_native(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+    num_args: usize,
+    fnaddr: i64,
+    calldescr: &majit_translate::jitcode::BhCallDescr,
+) -> Result<usize, DispatchError> {
+    let mut p = p;
+    // `descr.py create_call_stub` places arguments by declaration position,
+    // and `collect_call_args` recovers that position by walking `arg_classes`
+    // and taking the next value from the matching per-kind list.  So the lists
+    // have to be in declaration order WITHIN each kind, which is not the order
+    // the triples are emitted in — a caller groups them by kind and
+    // `check_inline_call_arg_classes` documents that the two disagree.
+    //
+    // The callee register each triple names IS that position:
+    // `inline_helper_param_layout` hands register k of a bank to the k'th
+    // parameter of that kind.  Place by it.
+    let mut args_i = vec![0i64; num_args];
+    let mut args_r = vec![0i64; num_args];
+    let mut args_f = vec![0i64; num_args];
+    let (mut len_i, mut len_r, mut len_f) = (0usize, 0usize, 0usize);
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let caller_src = jitcode::read_reg(code, &mut p) as usize;
+        let callee_dst = jitcode::read_reg(code, &mut p) as usize;
+        let (bank, len, value) = match kind {
+            JitArgKind::Int => (&mut args_i, &mut len_i, bh.registers_i[caller_src]),
+            JitArgKind::Ref => (&mut args_r, &mut len_r, bh.registers_r[caller_src]),
+            JitArgKind::Float => (&mut args_f, &mut len_f, bh.registers_f[caller_src]),
+        };
+        bank[callee_dst] = value;
+        *len = (*len).max(callee_dst + 1);
+    }
+    args_i.truncate(len_i);
+    args_r.truncate(len_r);
+    args_f.truncate(len_f);
+
+    let return_i = decode_return_slot_at(code, &mut p);
+    let return_r = decode_return_slot_at(code, &mut p);
+    let return_f = decode_return_slot_at(code, &mut p);
+
+    // A raise inside the callee reaches this side through the cell, exactly as
+    // it does for a residual call and for the canonical `inline_call_*`
+    // handlers above; clearing it first is what makes a stale value from an
+    // earlier call unable to be read as this one's.
+    BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    match calldescr.result_type {
+        'i' => {
+            let result = bh.bhimpl_inline_call_irf_i(fnaddr, &args_i, &args_r, &args_f, calldescr);
+            check_residual_call_exception_after(bh, p)?;
+            if let Some(dst) = return_i {
+                bh.registers_i[dst] = result;
+            }
+        }
+        'r' => {
+            let result = bh.bhimpl_inline_call_irf_r(fnaddr, &args_i, &args_r, &args_f, calldescr);
+            check_residual_call_exception_after(bh, p)?;
+            if let Some(dst) = return_r {
+                bh.registers_r[dst] = result.0 as i64;
+            }
+        }
+        'f' => {
+            let result = bh.bhimpl_inline_call_irf_f(fnaddr, &args_i, &args_r, &args_f, calldescr);
+            check_residual_call_exception_after(bh, p)?;
+            if let Some(dst) = return_f {
+                bh.registers_f[dst] = result.to_bits() as i64;
+            }
+        }
+        _ => {
+            bh.bhimpl_inline_call_irf_v(fnaddr, &args_i, &args_r, &args_f, calldescr);
+            check_residual_call_exception_after(bh, p)?;
+        }
+    }
+    Ok(p)
 }
 
 /// Mirror of `BlackholeInterpreter::decode_return_slot` for handler

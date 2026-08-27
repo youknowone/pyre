@@ -2668,11 +2668,51 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         stmts
     };
 
+    // `call.py:167-169` `JitCode(name, fnaddr, calldescr)`: the helper's own
+    // translated function is the entry `bhimpl_inline_call_*`
+    // (`blackhole.py:1278-1319`) calls instead of interpreting the body. The
+    // Rust fn re-emitted above IS that function, so the address of an
+    // `extern "C"` trampoline over it is the same program the jitcode encodes;
+    // `emit_helper_call_target_fn` already builds one for the residual-call
+    // policies, with the widened `-> i64` result `bh_call_i_dispatch` reads.
+    //
+    // A helper it declines — a generic, or a parameter type the trampoline
+    // cannot carry — is left at `fnaddr = 0`, which is the byte-interpreted
+    // path this expansion had before.
+    let native_entry = match emit_helper_call_target_fn(&func) {
+        Ok(Some((trace_target, _concrete, wrapper))) => {
+            let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func) {
+                Ok(classes) => classes,
+                Err(err) => return err.to_compile_error().into(),
+            };
+            let result_class =
+                jit_interp::jitcode_lower::inline_return_kind_class(helper.return_kind);
+            Some((wrapper, trace_target, arg_classes, result_class))
+        }
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let (native_entry_fn, set_native_entry) = match &native_entry {
+        Some((wrapper, target, arg_classes, result_class)) => (
+            quote! { #wrapper },
+            quote! {
+                __builder.set_native_entry(
+                    #target as *const () as usize as i64,
+                    #arg_classes,
+                    #result_class,
+                );
+            },
+        ),
+        None => (quote! {}, quote! {}),
+    };
+
     let expanded = quote! {
         #(#attrs)*
         #vis #sig {
             #block
         }
+
+        #native_entry_fn
 
         // Inline helper jitcodes register
         // per-marker liveness triples through the caller-supplied
@@ -2696,6 +2736,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             // nothing: a declined helper reports `""` and the reader has no way
             // to tell which of a consumer's dozens it was.
             __builder.set_name(#helper_source_name);
+            #set_native_entry
             #(#ensure_param_regs)*
             #helper_body
             #helper_return
