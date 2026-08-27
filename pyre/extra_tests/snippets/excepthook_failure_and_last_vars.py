@@ -33,6 +33,29 @@ assert done.stderr.index("hook exploded") < done.stderr.index(
     "Original exception was:"
 ), done.stderr
 
+# `display_exception` reads the live `sys.stderr`, so an application that
+# replaced the stream reads the whole report on it and the stream underneath
+# stays empty.
+done = run(
+    "import atexit, io, sys\n"
+    "cap = io.StringIO()\n"
+    "sys.stderr = cap\n"
+    "atexit.register(lambda: sys.stdout.write(cap.getvalue()))\n"
+    "def hook(t, v, tb):\n"
+    "    raise RuntimeError('hook exploded')\n"
+    "sys.excepthook = hook\n"
+    "raise ValueError('original boom')\n"
+)
+assert done.returncode == 1, (done.returncode, done.stderr)
+assert done.stderr == "", done.stderr
+assert "RuntimeError: hook exploded" in done.stdout, done.stdout
+assert "Original exception was:" in done.stdout, done.stdout
+assert "ValueError: original boom" in done.stdout, done.stdout
+assert done.stdout.index("hook exploded") < done.stdout.index(
+    "Original exception was:"
+), done.stdout
+
+
 # A hook that is not callable fails the same way.
 done = run("import sys\nsys.excepthook = 42\nraise ValueError('original boom')\n")
 assert done.returncode == 1, done.returncode

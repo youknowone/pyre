@@ -3940,6 +3940,84 @@ pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
     }
 }
 
+/// `display_exception`'s `stderr = sys.stderr` — the banner lines its failure
+/// arm prints go to the stream the application configured, not to the host seam
+/// beneath it.  A stream set to `None` disables the report the way
+/// `PyErr_Display` does; only a missing `sys` or a failing lookup falls through
+/// to the seam, because treating the two alike leaks the write past a
+/// configured sink.
+pub(crate) fn emit_report_to_sys_stderr(buf: &[u8]) {
+    let stream = crate::importing::get_sys_module("sys")
+        .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
+    let Some(stream) = stream else {
+        emit_report_to_host_stderr(buf);
+        return;
+    };
+    if stream.is_null() || unsafe { pyre_object::is_none(stream) } {
+        return;
+    }
+    // The write runs Python, so the stream is published and read back from its
+    // slot: a Rust local would still name the address it had before the
+    // allocation below moved the object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(stream);
+    // Every caller passes a literal this file holds, so the bytes are
+    // well-formed WTF-8; the lossy read is the last resort for a byte no writer
+    // put there.
+    let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
+        Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
+        None => pyre_object::w_str_new(&String::from_utf8_lossy(buf)),
+    };
+    // Read the stream back after that allocation, not before it.
+    let result = crate::baseobjspace::call_method(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        "write",
+        &[w_text],
+    );
+    if result.is_null() {
+        let _ = crate::call::take_call_error();
+        emit_report_to_host_stderr(buf);
+    }
+}
+
+/// `originalexcepthook` for an exception a Rust caller holds: `sys.excepthook`'s
+/// default is the renderer that reaches the live `sys.stderr`, and
+/// `display_exception` hands it each report its failure arm prints.  A hook that
+/// cannot render leaves the host seam as the last sink, which is where a report
+/// with nowhere else to go belongs.
+fn report_through_default_excepthook(failure: &mut PyError) {
+    let exc = failure.to_exc_object();
+    if exc.is_null() {
+        eprint_exception(failure, true);
+        return;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let w_type = crate::baseobjspace::exception_getclass(exc);
+    let _ = pyre_object::gc_roots::pin_root(if w_type.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_type
+    });
+    let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+    let _ = pyre_object::gc_roots::pin_root(if w_tb.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_tb
+    });
+    let reported = crate::builtins::sys_excepthook(&[
+        pyre_object::gc_roots::shadow_stack_get(sp + 1),
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        pyre_object::gc_roots::shadow_stack_get(sp + 2),
+    ]);
+    if reported.is_err() {
+        eprint_exception(failure, true);
+    }
+}
+
 /// `pythonrun.c _PyErr_Print` for a caller holding the exception rather than
 /// the thread's indicator: every top-level run reports through `sys.excepthook`,
 /// so an application's own hook is what reports the failure it was installed
@@ -3949,26 +4027,16 @@ pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
 ///
 /// `false` says there was no hook to reach, which is `_PyErr_PrintEx`'s
 /// `sys.excepthook is missing` arm, and the caller prints the exception itself.
-/// A hook that runs and fails has still reported: its own failure is named as
-/// unraisable, exactly as upstream does, and this answers `true` rather than
-/// printing the exception a second time.
+/// A hook that runs and fails is reported here instead: the failure and the
+/// original both go through the default hook, which is `display_exception`'s
+/// `originalexcepthook`, so this answers `true` and the caller prints nothing.
 pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
     let Some(sys) = crate::importing::get_sys_module("sys") else {
         return false;
     };
-    // A missing name is a hook that is not there; `None` is a hook that is,
-    // and calling it is what reports it.
-    let Ok(hook) = crate::baseobjspace::getattr_str(sys, "excepthook") else {
-        return false;
-    };
-    if hook.is_null() {
-        return false;
-    }
     let _roots = pyre_object::gc_roots::push_roots();
     let sys_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(sys);
-    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(hook);
     // Materialising the instance is what gives the hook something to report;
     // the `PyError`'s own fields are raw and this collector does not scan them,
     // so each of the three arguments is pinned as it is taken.
@@ -4012,6 +4080,22 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         );
         drop(stored);
     }
+    // `display_exception` resolves the hook only once those stores are in
+    // place, so a `sys` whose attribute lookup runs Python -- a module class
+    // with its own `__getattribute__` -- reads the names already written.
+    // A missing name is a hook that is not there; `None` is a hook that is,
+    // and calling it is what reports it.
+    let Ok(hook) = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sys_slot),
+        "excepthook",
+    ) else {
+        return false;
+    };
+    if hook.is_null() {
+        return false;
+    }
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(hook);
     let arguments = [
         pyre_object::gc_roots::shadow_stack_get(type_slot),
         pyre_object::gc_roots::shadow_stack_get(exc_slot),
@@ -4021,15 +4105,29 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         pyre_object::gc_roots::shadow_stack_get(hook_slot),
         &arguments,
     );
-    if let Err(failure) = reported {
+    if let Err(mut failure) = reported {
         // `display_exception`'s `except BaseException` arm: the hook is named
-        // as the thing that failed, its own report is printed, and the answer
-        // is that the exception has *not* been reported -- the caller prints it
-        // below the `Original exception was:` header this leaves behind.
-        emit_report_to_host_stderr(b"Error calling sys.excepthook:\n");
-        eprint_exception(&failure, true);
-        emit_report_to_host_stderr(b"\nOriginal exception was:\n");
-        return false;
+        // as the thing that failed and its own report follows, both on the live
+        // `sys.stderr` the arm reads -- an application that replaced the stream
+        // is where its diagnostics belong, and the host seam beneath it would
+        // miss a capture buffer entirely.
+        emit_report_to_sys_stderr(b"Error calling sys.excepthook:\n");
+        report_through_default_excepthook(&mut failure);
+        emit_report_to_sys_stderr(b"\nOriginal exception was:\n");
+        // The arm falls out of the `try` into `originalexcepthook(etype,
+        // evalue, etraceback)`, so the original is reported from here onto that
+        // same stream.  Leaving it to the caller would split one report across
+        // two sinks, because the caller's printer writes to the seam.
+        if crate::builtins::sys_excepthook(&[
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            pyre_object::gc_roots::shadow_stack_get(tb_slot),
+        ])
+        .is_err()
+        {
+            eprint_exception(err, true);
+        }
+        return true;
     }
     true
 }
