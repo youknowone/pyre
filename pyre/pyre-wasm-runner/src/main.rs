@@ -1016,6 +1016,12 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "guard_resume_decline_replay_incomplete",
                 "guard_resume_decline_regcount",
                 "guard_resume_decline_unreadable_reg",
+                "guard_resume_decline_unregistered_jitcode",
+                "guard_resume_decline_no_inline_call_site",
+                "guard_resume_decline_call_not_jitcode",
+                "guard_resume_decline_callee_mismatch",
+                "guard_resume_decline_return_slot",
+                "guard_resume_decline_reserved_identity",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

@@ -1872,6 +1872,10 @@ enum GuardResumeDecline {
     /// The callee ends in a typed return but the call that pushed it has no
     /// slot of that kind, so the pop would have nowhere to put the result.
     CalleeReturnSlotMismatch,
+    /// The resume spans more than one frame and the sym reserves an
+    /// identity-only int range, which the snapshot trim blanked in every
+    /// frame below the root and nothing re-derives.
+    ReservedIdentitySlots,
 }
 
 impl GuardResumeDecline {
@@ -1888,6 +1892,7 @@ impl GuardResumeDecline {
             GuardResumeDecline::CallSiteNotAJitcode => 90,
             GuardResumeDecline::CallSiteCalleeMismatch => 91,
             GuardResumeDecline::CalleeReturnSlotMismatch => 92,
+            GuardResumeDecline::ReservedIdentitySlots => 93,
         }
     }
 
@@ -5152,7 +5157,9 @@ impl<S: JitState> JitDriver<S> {
             // for dualtape (identity in a sub-frame's int reg 2, the scalar
             // `pb` in the root's).
             //
-            // So refuse, and refuse HERE: returning `None` falls through to
+            // So refuse, and refuse HERE: this rung's decline leaves through
+            // the same arm as every other one, which returns `None` from
+            // `bridge_from_guard_resume_position` and so falls through to
             // `compile.py:711 resume_in_blackhole`, which rebuilds every frame
             // itself. That is what main did for every multi-frame resume, and
             // it is the upstream shape — `pyjitpl.py _handle_guard_failure`
@@ -5160,7 +5167,9 @@ impl<S: JitState> JitDriver<S> {
             // abort from inside the walk would NOT do: the walk publishes its
             // handoff only after `run_to_end`, so an early return leaves both
             // handoffs empty and the caller resumes at the loop header with no
-            // blackhole at all.
+            // blackhole at all. The walk has not started here — `merge_point`
+            // is below — so the teardown the arm performs is of the trace
+            // session `start_bridge_tracing` opened, not of a walk in flight.
             //
             // `None` — every symbol that has not opted in via `split_dispatch`
             // — reserves no identity-only register, so nothing was blanked and
@@ -5175,7 +5184,7 @@ impl<S: JitState> JitDriver<S> {
                         resume.frames.len(),
                     );
                 }
-                return None;
+                return Err(Decline::ReservedIdentitySlots);
             }
             // `resume.py:1338` `jitcode = jitcodes[jitcode_pos]`: the position
             // is an offset into the jitcode the frame NAMES. Entering a

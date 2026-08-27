@@ -1858,6 +1858,13 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     "guard_resume_decline_call_not_jitcode",
     "guard_resume_decline_callee_mismatch",
     "guard_resume_decline_return_slot",
+    // 93 = the resume spans more than one frame and the sym reserves an
+    // identity-only int range. Unlike 88-92 this is not a disagreement: the
+    // snapshot trim blanked those registers in every frame below the root and
+    // nothing re-derives them, so a nonzero tally is a workload property of a
+    // `split_dispatch` symbol, not a defect. Only a symbol that opts in can
+    // raise it; every other one reserves nothing and never reaches the test.
+    "guard_resume_decline_reserved_identity",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
