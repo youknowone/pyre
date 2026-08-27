@@ -165,7 +165,7 @@ fn rewire_one_closure_select_site(
                 },
                 Some(narrowed),
             ) if segments.len() == 2
-                && segments[0] == "__cast_instance_intrinsic"
+                && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
                 && args.len() == 1
                 && args[0] == site.result_var =>
             {

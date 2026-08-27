@@ -1,6 +1,4 @@
-//! cel-majit de-risk probes (issue #357) — one binary gathering the
-//! meta-tracing kill-tests / prototypes that used to be separate examples
-//! (celprobe / celpolicy / celcolumn / celcolscalar / celfloat).
+//! CEL-shaped majit probes collected into one binary.
 //!
 //! Each probe is a self-contained `#[jit_interp]` register machine over an
 //! i64-word bytecode, gated 3-way (clean interp == JIT-off == JIT-on) and then
@@ -19,7 +17,9 @@
 //!   * float     — float register machines (acc/dot/compute, count, two-bank)
 //!
 //! RELEASE ONLY: the i64-wrap and bit-exact-float equality gates need overflow
-//! checks off.
+//! checks off. That applies to the `#[test]`s at the bottom of this file as much
+//! as to the binary, so they self-ignore under `debug_assertions` and CI runs
+//! them from a dedicated `cargo test --release -p cel` step.
 
 mod colscalar;
 mod column;
@@ -32,7 +32,7 @@ mod probe;
 /// the `#[jit_interp]` macro recognizes, the JIT thresholds, the compile/abort
 /// counters the drivers bump, and the timing median.
 pub mod common {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// The env: an i64-word bytecode stream (8-byte elements).
     pub type Code = [i64];
@@ -48,6 +48,16 @@ pub mod common {
     /// Hot loops majit compiled / traces it aborted — evidence the JIT tier ran.
     pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
     pub static ABORTS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Shape of the most recently compiled loop body, from
+    /// `LoopBodyShape::of(opcodes)` in the `on_compile_loop` hook.
+    ///
+    /// `COMPILES` counts that a trace was minted; these two say whether the
+    /// body it minted does anything. A dispatch that lowers nothing still
+    /// compiles a loop whose whole optimized body is `Finish()`, so a count
+    /// alone cannot separate a working tier from a dead one.
+    pub static LAST_HAS_JUMP: AtomicBool = AtomicBool::new(false);
+    pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 
     /// Raw native-memory load intrinsics recognized by the `#[jit_interp]` proc
     /// macro (lowered to `raw_load_i` / `raw_load_f`); at the interpreter tier
@@ -93,5 +103,173 @@ fn main() {
             which.unwrap_or_default()
         );
         std::process::exit(2);
+    }
+}
+
+/// Each probe's correctness + tier-liveness gate, run as a test.
+///
+/// Every gate the five probes carry already existed; until this module they were
+/// reachable only through `main`, so `cargo test -p cel` compiled the crate and
+/// ran nothing. These tests call the gate halves only — the timing loops
+/// (`probe` alone times 9 interleaved rounds over 20M rows) stay in the binary.
+///
+/// The gates assert three-way agreement (clean interpreter == JIT-off ==
+/// JIT-on), that JIT-off compiles nothing, and that JIT-on compiles at least one
+/// loop. That last one is tier liveness and nothing more: `compiles >= 1` counts
+/// TRACES, not work, and an empty dispatch still compiles a trace whose whole
+/// optimized body is `Finish()`. No assertion here inspects a compiled body.
+#[cfg(test)]
+mod tests {
+    /// `common::COMPILES` / `common::ABORTS` are process-global and every gate
+    /// brackets its runs with `store(0)` … `load()`, so two gates on libtest's
+    /// parallel threads read each other's compiles. The guard is held across the
+    /// whole gate call, which is what puts the counter loads — they happen
+    /// inside the gate — inside the lock. A load taken after the guard dropped
+    /// would observe a concurrent test's compile.
+    ///
+    /// Poison is discarded: a gate that fails an assertion panics with the lock
+    /// held, and a poisoned mutex would turn one real failure into five.
+    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The unroll-retry channel, read as a delta inside `PROBE_LOCK` — the same
+    /// window the gates bracket their own counters in. The counters are
+    /// process-global and CUMULATIVE, so an absolute read would carry every
+    /// other gate's events, which is what the lock exists to prevent.
+    ///
+    /// The two unroll counters are stages of one retry sequence and must not be
+    /// summed. Their interpretation is defined beside `MC_DIAG_LABELS`.
+    ///
+    /// The slots are looked up by LABEL and their indices fall out, because an
+    /// index re-stated beside a hand-written name is free to drift from it and
+    /// these indices have moved before. The printed name comes from
+    /// `MC_DIAG_LABELS` for the same reason, as does the gate name from
+    /// libtest's thread name — a harness that does not name its threads reports
+    /// `unknown` rather than a plausible-looking guess.
+    const CENSUS_SLOTS: [usize; 3] = [
+        mc_diag_slot("unroll_cancelled_invalid_loop"),
+        mc_diag_slot("unroll_free_retry_rescued"),
+        mc_diag_slot("unroll_free_retry_failed"),
+    ];
+
+    /// The index of `label` in `MC_DIAG_LABELS`, resolved at compile time.
+    ///
+    /// A label renamed or removed upstream fails the BUILD here. The census
+    /// prints `MC_DIAG_LABELS[slot]` beside every count, so a wrong index reads
+    /// back as internally consistent and cannot announce itself at runtime.
+    const fn mc_diag_slot(label: &str) -> usize {
+        let mut slot = 0;
+        while slot < majit_metainterp::MC_DIAG_LABELS.len() {
+            if str_eq(majit_metainterp::MC_DIAG_LABELS[slot], label) {
+                return slot;
+            }
+            slot += 1;
+        }
+        panic!("no MC_DIAG slot carries this label");
+    }
+
+    /// `str` carries no const `==`.
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let a = a.as_bytes();
+        let b = b.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn exclusive<T>(gate: impl FnOnce() -> T) -> T {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = CENSUS_SLOTS.map(majit_metainterp::mc_diag);
+        let r = gate();
+        let after = CENSUS_SLOTS.map(majit_metainterp::mc_diag);
+        let thread = std::thread::current();
+        let counts = CENSUS_SLOTS
+            .iter()
+            .enumerate()
+            .map(|(i, &slot)| {
+                format!(
+                    "{}={}",
+                    majit_metainterp::MC_DIAG_LABELS[slot],
+                    after[i] - before[i]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "[unroll-census] gate={} {counts}",
+            thread.name().unwrap_or("unknown")
+        );
+
+        // CEL's generated dispatch arms should not fall back to abort stubs.
+        // Check the shared registry once after each gate rather than duplicating
+        // the set of generated interpreter names in every probe.
+        let degraded: Vec<(&str, &str, &str)> = majit_metainterp::degraded_dispatch_arms()
+            .iter()
+            .map(|a| (a.interp, a.arm, a.reason))
+            .collect();
+        assert_eq!(
+            degraded,
+            Vec::new(),
+            "dispatch arms degraded to abort stubs, seen after gate {}: \
+             {degraded:?}. The registry is cumulative and never cleared, so the \
+             gate named is where this was NOTICED and not necessarily the one \
+             that installed the arm — every later gate reports it too.",
+            thread.name().unwrap_or("unknown")
+        );
+        r
+    }
+
+    // Why every test below self-ignores under `debug_assertions`: the gates
+    // compare i64 results that wrap and floats that must match bit-for-bit
+    // across three execution paths, and in a debug profile the arithmetic panics
+    // on overflow instead of wrapping — see the module header. `cargo test --all`
+    // is debug, so that leg reports these ignored; the dedicated release step in
+    // `.github/workflows/pyre-ci.yml` is what actually runs them. Left out of CI
+    // the crate is back to being unable to fail, only now with a green badge.
+    //
+    // The reason string is spelled out at each site rather than shared through a
+    // `macro_rules!`: `#[ignore = mac!()]` compiles and then silently reports a
+    // bare `ignored` with no reason at all.
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release only: wrapping i64 arithmetic")]
+    fn probe_gates() {
+        // 20M rows in the binary; the gate proves the same three properties at
+        // any row count past the trace threshold of 8.
+        exclusive(|| crate::probe::run_gates(300_000));
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release only: wrapping i64 arithmetic")]
+    fn policy_gates() {
+        exclusive(crate::policy::run_gates);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release only: wrapping i64 arithmetic")]
+    fn column_gates() {
+        exclusive(crate::column::run_gates);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release only: wrapping i64 arithmetic")]
+    fn colscalar_gates() {
+        exclusive(crate::colscalar::run_gates);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release only: bit-exact float and wrapping i64 arithmetic"
+    )]
+    fn float_gates() {
+        exclusive(crate::float::run_gates);
     }
 }

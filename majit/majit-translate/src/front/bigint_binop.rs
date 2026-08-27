@@ -26,7 +26,11 @@
 
 /// The `#[dont_look_inside]` residual's module path (in `pyre-interpreter`),
 /// matching its `jit_fnaddr` binding.
-const RESIDUAL_MODULE: [&str; 3] = ["pyre_interpreter", "objspace", "descroperation"];
+const RESIDUAL_MODULE: [&str; 3] = [
+    crate::runtime_names::crates::INTERPRETER,
+    "objspace",
+    "descroperation",
+];
 
 /// If `segments` is an RBigInt binary-operator impl-method path
 /// (`[…, "<Impl>", op]` or `[…, "rbigint", "RBigInt", op]` for one of the
@@ -134,7 +138,10 @@ pub(crate) fn bigint_comparison_residual_for_method(leaf: &str) -> Option<Vec<St
         "ge" => "jit_bigint_ge",
         _ => return None,
     };
-    let mut path = vec!["pyre_object".to_string(), "longobject".to_string()];
+    let mut path = vec![
+        crate::runtime_names::crates::OBJECT.to_string(),
+        "longobject".to_string(),
+    ];
     path.push(residual_leaf.to_string());
     Some(path)
 }
@@ -168,7 +175,12 @@ mod tests {
     }
 
     fn desc(residual: &str) -> Vec<String> {
-        segs(&["pyre_interpreter", "objspace", "descroperation", residual])
+        segs(&[
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ])
     }
 
     #[test]
@@ -259,7 +271,11 @@ mod tests {
         ] {
             assert_eq!(
                 bigint_comparison_residual_path(&segs(&["rbigint", "RBigInt", op])),
-                Some(segs(&["pyre_object", "longobject", residual]))
+                Some(segs(&[
+                    crate::runtime_names::crates::OBJECT,
+                    "longobject",
+                    residual
+                ]))
             );
         }
     }

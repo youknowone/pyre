@@ -192,6 +192,34 @@ pub trait JitPolicy {
                 func.name
             );
         }
+        // A `false` here is the policy's refusal to let this callee become
+        // a JitCode, and it reaches the caller as a bare `bool` — four
+        // structurally different clauses collapsed into one answer.
+        // `unsafe_loopy_graphs` already records ONE of them (and only when
+        // `res` was still true at that point), so it cannot stand in for
+        // the rest.  Re-derive which clause refused; guarded on the census
+        // so the extra predicate calls never run on the decision path they
+        // measure.
+        if !res && crate::decline::enabled() {
+            let reason = if !see_function {
+                if jit_look_inside_hint(&func.hints) == Some(false) {
+                    "dont_look_inside-hint"
+                } else if self._reject_function(func) {
+                    "elidable-hint"
+                } else {
+                    "look_inside_function-said-no"
+                }
+            } else if contains_loop {
+                "loop-without-unroll_safe"
+            } else {
+                "unsupported-variable-type"
+            };
+            crate::decline::record(
+                crate::decline::gate::LOOK_INSIDE_GRAPH,
+                reason,
+                format_args!("{}", func.name),
+            );
+        }
         res
     }
 }

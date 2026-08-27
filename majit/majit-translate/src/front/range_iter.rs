@@ -384,7 +384,7 @@ fn range_builtin_call(result: Variable, start: Variable, end: Variable) -> Space
         result: Some(result),
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__majit_range".to_string()],
+                segments: vec![crate::runtime_names::shims::RANGE.to_string()],
             },
             args: vec![start, end],
             result_ty: ValueType::Ref(None),
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(rewritten, 1, "the range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
-            count_calls_ending(&g, &["__majit_range"]),
+            count_calls_ending(&g, &[crate::runtime_names::shims::RANGE]),
             1,
             "one range() builtin emitted"
         );
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(rewritten, 1, "two-hop range for-loop must be diverted");
         assert_eq!(count_range_ctors(&g), 0, "range ctor removed");
         assert_eq!(
-            count_calls_ending(&g, &["__majit_range"]),
+            count_calls_ending(&g, &[crate::runtime_names::shims::RANGE]),
             1,
             "one range() builtin emitted"
         );
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(rewritten, 0, "a second range consumer declines the divert");
         assert_eq!(count_range_ctors(&g), 1, "range ctor survives");
         assert_eq!(
-            count_calls_ending(&g, &["__majit_range"]),
+            count_calls_ending(&g, &[crate::runtime_names::shims::RANGE]),
             0,
             "no range() builtin emitted"
         );

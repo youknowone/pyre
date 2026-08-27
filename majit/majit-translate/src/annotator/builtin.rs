@@ -298,12 +298,12 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // of the looked-inside set (the `<T as GcType>::type_id()` accessor wall).
     analyzer_for(
         &mut reg,
-        "pyre_object.lltype.malloc_typed",
+        crate::runtime_names::modules::MALLOC_TYPED,
         malloc_typed_alloc,
     );
     analyzer_for(
         &mut reg,
-        "pyre_object.lltype.malloc_typed_managed",
+        crate::runtime_names::modules::MALLOC_TYPED_MANAGED,
         malloc_typed_alloc,
     );
     // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
@@ -311,7 +311,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // as a builtin keeps its `Box::new` / `Box::into_raw` body out of the
     // looked-inside set (neither has an analyser), the same boundary the
     // `malloc_typed` registration draws around `GcType::type_id`.
-    analyzer_for(&mut reg, "pyre_object.lltype.malloc_raw", malloc_raw_alloc);
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::modules::MALLOC_RAW,
+        malloc_raw_alloc,
+    );
     // Rust `std::ptr::eq(p, q) -> bool` — registered under the dotted
     // qualname that `HostEnv::bootstrap` assigns to the HOST_ENV stub
     // (`flowspace/model.rs`'s `bootstrap_std_modules`).  Lowers identity
@@ -344,14 +348,18 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // assigns (which also keys the `BUILTIN_TYPER` entry on the same Arc).
     analyzer_for(
         &mut reg,
-        "__cast_instance_intrinsic",
+        crate::runtime_names::shims::CAST_INSTANCE,
         cast_instance_intrinsic,
     );
     // `__cast_address_intrinsic` — the erasing twin.  `p as *mut u8` lowers to
     // a simple_call against this stub so the pointee class is dropped
     // instead of riding along on a value whose declared type is a bare
     // byte pointer.
-    analyzer_for(&mut reg, "__cast_address_intrinsic", cast_address_intrinsic);
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::shims::CAST_ADDRESS,
+        cast_address_intrinsic,
+    );
     // Rust `String::new()` / `String::with_capacity(n)` construct an empty
     // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
     // `String.new` / `String.with_capacity` HOST_ENV stubs do not reach the
@@ -1415,7 +1423,7 @@ fn cast_address_intrinsic(
             "__cast_address_intrinsic expects exactly one positional pointer argument",
         ));
     }
-    let can_be_none = arg_at(args_s, 0, "__cast_address_intrinsic").can_be_none();
+    let can_be_none = arg_at(args_s, 0, crate::runtime_names::shims::CAST_ADDRESS).can_be_none();
     Ok(SomeValue::Instance(super::model::SomeInstance::new(
         None,
         can_be_none,
@@ -1478,7 +1486,7 @@ fn cast_instance_intrinsic(
     // Carry the operand's nullability onto the downcast result instead
     // of unconditionally narrowing to non-None: a downcast of a nullable
     // pointer is itself nullable.
-    let operand = arg_at(args_s, 0, "__cast_instance_intrinsic");
+    let operand = arg_at(args_s, 0, crate::runtime_names::shims::CAST_INSTANCE);
     let can_be_none = match operand {
         SomeValue::Instance(inst) => inst.can_be_none,
         SomeValue::None_(_) => true,

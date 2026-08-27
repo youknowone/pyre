@@ -485,11 +485,10 @@ fn normalize_unary_op_name(source_name: &str) -> Result<String, TyperError> {
         // `operation.py add_operator('bool', 1, ..)` and emitted
         // by `flowcontext.py UNARY_NOT` /
         // `:766-777 JUMP_IF_*_OR_POP` as the discriminator before a
-        // `guessbool` fork.  Pyre's frontend emits
-        // `OpKind::UnaryOp { op: "bool", .. }` from the `&&` / `||`
-        // short-circuit desugar,
-        // mirroring `build_flow.rs` `lower_short_circuit`.
-        // Pass through unchanged.
+        // `guessbool` fork.  Pyre emits it from
+        // `model::FunctionGraph::set_branch`, which wraps every branch
+        // condition in `OpKind::UnaryOp { op: "bool", .. }` before
+        // installing it as the exitswitch.  Pass through unchanged.
         "bool" => Ok("bool".to_string()),
         // `invert` — PyPy `add_operator('invert', 1, .., pure=True)` at
         // `operation.py:474`, emitted by `flowcontext.py:188-191
@@ -1768,7 +1767,9 @@ pub fn translate_op(
                     // to a `cast_pointer`.  The callable resolves through
                     // the `__cast_instance_intrinsic` HOST_ENV singleton so its
                     // Arc identity matches the `BUILTIN_TYPER` key.
-                    if segments.len() == 2 && segments[0] == "__cast_instance_intrinsic" {
+                    if segments.len() == 2
+                        && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
+                    {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
                                 "__cast_instance_intrinsic requires exactly one operand, got {}",
@@ -1776,7 +1777,7 @@ pub fn translate_op(
                             )));
                         }
                         let callable_host = HOST_ENV
-                            .lookup_builtin("__cast_instance_intrinsic")
+                            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
                             .ok_or_else(|| {
                                 TyperError::message(
                                     "__cast_instance_intrinsic missing from HOST_ENV bootstrap"
@@ -1799,8 +1800,10 @@ pub fn translate_op(
                     // `simple_call(callable, operand)`; resolving through the
                     // HOST_ENV singleton keeps the Arc identity that keys its
                     // `BUILTIN_TYPER` entry, which a single-segment path
-                    // consulting the `CallRegistry` first would lose.
-                    if segments.len() == 1 && segments[0] == "__cast_address_intrinsic" {
+                    // consulting the `PyreCallRegistry` first would lose.
+                    if segments.len() == 1
+                        && segments[0] == crate::runtime_names::shims::CAST_ADDRESS
+                    {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
                                 "__cast_address_intrinsic requires exactly one operand, got {}",
@@ -1808,7 +1811,7 @@ pub fn translate_op(
                             )));
                         }
                         let callable_host = HOST_ENV
-                            .lookup_builtin("__cast_address_intrinsic")
+                            .lookup_builtin(crate::runtime_names::shims::CAST_ADDRESS)
                             .ok_or_else(|| {
                                 TyperError::message(
                                     "__cast_address_intrinsic missing from HOST_ENV bootstrap"
@@ -1842,7 +1845,7 @@ pub fn translate_op(
                     // Arc identity that keys `rtype_builtin_range`
                     // (`rrange.py:96-126`), the same discipline the
                     // `__cast_instance_intrinsic` arm above documents.
-                    if segments.len() == 1 && segments[0] == "__majit_range" {
+                    if segments.len() == 1 && segments[0] == crate::runtime_names::shims::RANGE {
                         let callable_host = HOST_ENV.lookup_builtin("range").ok_or_else(|| {
                             TyperError::message("range missing from HOST_ENV bootstrap".to_string())
                         })?;
@@ -1870,14 +1873,18 @@ pub fn translate_op(
                     // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py),
                     // which `rtype_newstringbuilder` honours — no arg selects
                     // `ll_new(INIT_SIZE)`, the size arg threads `ll_new(n)`.
-                    if segments.len() == 1 && segments[0] == "__majit_stringbuilder_new" {
+                    if segments.len() == 1
+                        && segments[0] == crate::runtime_names::shims::STRINGBUILDER_NEW
+                    {
                         return Ok(vec![FlowspaceOp::new("newstringbuilder", arg_hls, result)]);
                     }
                     // `__majit_stringbuilder_append(recv, piece)` →
                     // `getattr(recv, "append") + simple_call(bound, piece)`,
                     // reaching `StringBuilderRepr::rtype_method("append")`
                     // (rstring.py) — identical to the `Vec::push` arm.
-                    if segments.len() == 1 && segments[0] == "__majit_stringbuilder_append" {
+                    if segments.len() == 1
+                        && segments[0] == crate::runtime_names::shims::STRINGBUILDER_APPEND
+                    {
                         if arg_hls.len() != 2 {
                             return Err(TyperError::message(format!(
                                 "__majit_stringbuilder_append requires exactly two args \
@@ -1916,7 +1923,9 @@ pub fn translate_op(
                     // `StringBuilderRepr::rtype_method("build")`
                     // (rstring.py) → `SomeString` — identical to the
                     // `slice.reverse` arm (no extra args on the bound method).
-                    if segments.len() == 1 && segments[0] == "__majit_stringbuilder_build" {
+                    if segments.len() == 1
+                        && segments[0] == crate::runtime_names::shims::STRINGBUILDER_BUILD
+                    {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
                                 "__majit_stringbuilder_build requires exactly one receiver arg, \
@@ -2679,7 +2688,7 @@ pub fn translate_op(
                     // trait is a registered dispatch family.
                     let getattr_receiver = if let Some(base_root) = base_root {
                         let callable_host = HOST_ENV
-                            .lookup_builtin("__cast_instance_intrinsic")
+                            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
                             .ok_or_else(|| {
                                 TyperError::message(
                                     "__cast_instance_intrinsic missing from HOST_ENV bootstrap"
@@ -4902,10 +4911,7 @@ mod tests {
     #[test]
     #[ignore]
     fn bind_kwargs_to_signature_has_no_residual_vec_from_elem_after_adaptation() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = majit_charon_reader::Llbc::load(path).expect("load real LLBC");
         let legacy = crate::front::mir::lower_function(&llbc, "bind_kwargs_to_signature")
             .expect("lower bind_kwargs_to_signature");
@@ -5382,7 +5388,7 @@ mod tests {
             result: Some(vars[1].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__majit_stringbuilder_new".into()],
+                    segments: vec![crate::runtime_names::shims::STRINGBUILDER_NEW.into()],
                 },
                 args: vec![],
                 result_ty: ValueType::Ref(None),
@@ -5445,7 +5451,7 @@ mod tests {
             result: Some(vars[3].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__majit_stringbuilder_append".into()],
+                    segments: vec![crate::runtime_names::shims::STRINGBUILDER_APPEND.into()],
                 },
                 args: vec![vars[1].clone(), vars[2].clone()],
                 result_ty: ValueType::Void,
@@ -5488,7 +5494,7 @@ mod tests {
             result: Some(vars[2].clone()),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["__majit_stringbuilder_build".into()],
+                    segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.into()],
                 },
                 args: vec![vars[1].clone()],
                 result_ty: ValueType::Ref(None),
@@ -5581,7 +5587,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![
-                        "pyre_object".into(),
+                        crate::runtime_names::crates::OBJECT.into(),
                         "pyobject".into(),
                         "ll_issubclass".into(),
                     ],
@@ -5625,7 +5631,7 @@ mod tests {
             kind: OpKind::Call {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![
-                        "pyre_object".into(),
+                        crate::runtime_names::crates::OBJECT.into(),
                         "pyobject".into(),
                         "ll_isinstance".into(),
                     ],

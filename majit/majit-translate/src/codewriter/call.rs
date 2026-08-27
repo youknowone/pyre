@@ -20,6 +20,23 @@ use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
 
+// Decline-census gate names.  Declared in `crate::decline::gate` so a
+// gate name cannot exist without the recorder that consumes it; aliased
+// here for readability at the call sites.
+//
+// `FIND_ALL_GRAPHS` is the discovery walk that decides which callees
+// become candidates, and so which can become a `JitCode` at all — a
+// callee it skips never reaches the codewriter, and every later gate is
+// silent about it.  `GUESS_CALL_KIND` is the per-call-site half: where
+// the first answers "was this callee ever a candidate", this one answers
+// "was this particular call site allowed to enter it".  `WRAPPER_FAMILY`
+// seeds the BFS, so a wrapper missing from it is a whole gateway body
+// discovery never starts from.
+use crate::decline::gate::{
+    FIND_ALL_GRAPHS as BFS_GATE, GUESS_CALL_KIND as CALLKIND_GATE,
+    WRAPPER_FAMILY as WRAPPER_FAMILY_GATE,
+};
+
 // ── Graph-based analyzers (RPython effectinfo.py + canraise.py) ────
 //
 // RPython uses BoolGraphAnalyzer subclasses that traverse call graphs
@@ -1382,17 +1399,40 @@ pub struct CallControl {
     /// itself carries the immutability.  Pyre annotates per-field; the
     /// summary collapses field-level marks to type-level lookup keys.
     pub immutable_array_types: HashSet<String>,
-    /// Metadata-only registration carrier — `(segments,
-    /// Signature, return_lltype)` for every `unsafe fn` and unsafe
-    /// impl-method discovered by the LLBC/module-path pipeline.  These
-    /// callees cannot lower their bodies (`build_flow.rs:215` rejects
-    /// `sig.unsafety.is_some()` because raw-pointer ops are not
-    /// modelled), but `OpKind::Call::FunctionPath` sites still need
-    /// the path registered in `CallRegistry`.  Populated by `lib.rs`
-    /// from `program.unsafe_fn_stubs` via
-    /// `front::mir::collect_unsafe_fn_stubs_from_llbc`; consumed by
-    /// `translator::rtyper::cutover::register_unsafe_fn_stubs` from
-    /// `dual_gate_registry` after the function-graph populate pass.
+    /// Metadata-only registration carrier — `(name_path segments,
+    /// Signature, return token)`.  Populated in `lib.rs` from
+    /// `program.unsafe_fn_stubs`, which chains
+    /// `front::mir::collect_unsafe_fn_stubs_from_llbc` (local `unsafe fn`s
+    /// whose return projects to a token
+    /// `translator::rtyper::cutover::residual_return_shell` can model)
+    /// with `front::mir::collect_marked_class_ctor_stubs_from_llbc` (the
+    /// `#[pyre_class]` `<Owner>::allocate[_stable]` constructors) — so the
+    /// contents are wider than the field name says.
+    /// `CodeWriter::dual_gate_registry` hands the carrier to
+    /// `cutover::populate_call_registry_from_call_graphs`, which seeds it
+    /// through `cutover::register_unsafe_fn_stubs` *between* that
+    /// function's alias-explosion and callee-lift passes.
+    ///
+    /// What a stub buys is a KEY, not a body.  It registers the
+    /// crate-included `name_path()` split on `::`, verbatim and
+    /// un-aliased — the spelling an `OpKind::Call::FunctionPath` site
+    /// emits — where the `function_graphs` pass registers the
+    /// crate-stripped `{module_path, name}` plus its alias fan-out.
+    /// `register_unsafe_fn_stubs` yields to any key already present, so
+    /// the two never fight.  Measured on the `pyre-jit-trace` prepass over
+    /// the production LLBC set: 10837 specs, 3296 already resolved and
+    /// skipped, 7541 newly registered — the new ones led by impl methods
+    /// spelled with an `<Impl>` segment and by raw-pointer / allocation
+    /// plumbing.
+    ///
+    /// An `unsafe fn` is NOT held back from body lowering: no gate reads
+    /// `signature.is_unsafe` anywhere except the collector above, and
+    /// `front::mir::build_semantic_program_from_llbc` over
+    /// `build/llbc/pyre-object.ullbc` lowers 1445 of the 1445 unsafe fns
+    /// that carry a body — `is_generic_alias` and `is_union` among them.
+    /// A stub therefore stands in for a missing registry key, and for the
+    /// declarations Charon emits with no body at all; it does not stand in
+    /// for a body some gate refused.
     pub unsafe_fn_stubs: Vec<(
         Vec<String>,
         crate::flowspace::argument::Signature,
@@ -3835,7 +3875,14 @@ impl CallControl {
         while let Some(path) = todo.pop() {
             let graph = match self.function_graphs.get(&path) {
                 Some(g) => g.clone(),
-                None => continue,
+                None => {
+                    crate::decline::record(
+                        BFS_GATE,
+                        "seeded-path-has-no-graph",
+                        format_args!("{path}"),
+                    );
+                    continue;
+                }
             };
             // RPython call.py:77-90: scan all Call ops in the graph.
             // For each call, check guess_call_kind (with BFS-aware
@@ -3855,7 +3902,14 @@ impl CallControl {
                         OpKind::IndirectCall { graphs, .. } => match graphs {
                             Some(graphs) if graphs.is_empty() => builtin_wrappers.clone(),
                             Some(graphs) => graphs.clone(),
-                            None => continue,
+                            None => {
+                                crate::decline::record(
+                                    BFS_GATE,
+                                    "indirect-family-unknown",
+                                    format_args!("in {path}"),
+                                );
+                                continue;
+                            }
                         },
                         // Same indirect_call site, spelled the way it
                         // exists *before* `rpbc::lower_indirect_calls`
@@ -3897,7 +3951,27 @@ impl CallControl {
                         OpKind::Call { target, .. } => {
                             let callee_path = match self.target_to_path(target) {
                                 Some(path) => path,
-                                None => continue,
+                                None => {
+                                    // The single widest silent refusal in the
+                                    // pipeline: a call whose target resolves to
+                                    // no registered path at all.  Upstream has
+                                    // no analogue — `funcobj.graph` is an
+                                    // object reference that either exists or is
+                                    // `None` (call.py:127), never a name lookup
+                                    // that can miss — so a miss here means the
+                                    // callee was never lowered into
+                                    // `function_graphs`, not that a gate judged
+                                    // it.  Every gate downstream of this point
+                                    // is therefore never consulted for this
+                                    // callee, which is exactly the reading that
+                                    // a bare `continue` cannot support.
+                                    crate::decline::record(
+                                        BFS_GATE,
+                                        "callee-target-unresolvable",
+                                        format_args!("{target:?} in {path}"),
+                                    );
+                                    continue;
+                                }
                             };
                             // `call.py:119-120`
                             // jitdriver_sd_from_portal_runner_ptr → recursive.
@@ -3906,6 +3980,15 @@ impl CallControl {
                                 .iter()
                                 .any(|jd| jd.portal_graph == callee_path)
                             {
+                                // Not a refusal — the portal is already a
+                                // candidate and re-walking it would loop —
+                                // but recorded so the BFS's skip rows add up
+                                // to every call site it saw.
+                                crate::decline::record(
+                                    BFS_GATE,
+                                    "callee-is-portal-recursive",
+                                    format_args!("{callee_path} in {path}"),
+                                );
                                 continue;
                             }
                             // `call.py:129-134`
@@ -3917,6 +4000,11 @@ impl CallControl {
                                 .func_effects(&callee_path)
                                 .is_some_and(|f| f.close_stack)
                             {
+                                crate::decline::record(
+                                    BFS_GATE,
+                                    "callee-close-stack-residual",
+                                    format_args!("{callee_path} in {path}"),
+                                );
                                 continue;
                             }
                             // `call.py:135-136`
@@ -3925,6 +4013,11 @@ impl CallControl {
                                 .func_effects(&callee_path)
                                 .is_some_and(|f| f.oopspec.is_some())
                             {
+                                crate::decline::record(
+                                    BFS_GATE,
+                                    "callee-oopspec-builtin",
+                                    format_args!("{callee_path} in {path}"),
+                                );
                                 continue;
                             }
                             // `#[pyre_class]`'s `allocate`/`allocate_stable`
@@ -3943,10 +4036,19 @@ impl CallControl {
                                 callee_path.last_segment(),
                                 Some("allocate") | Some("allocate_stable")
                             ) {
+                                crate::decline::record(
+                                    BFS_GATE,
+                                    "callee-pyre-class-ctor",
+                                    format_args!("{callee_path} in {path}"),
+                                );
                                 continue;
                             }
                             vec![callee_path]
                         }
+                        // Not a call operation.  This arm is the population
+                        // filter, not a decline: recording it would count
+                        // every arithmetic op in every graph and drown the
+                        // rows that are about call sites.
                         _ => continue,
                     };
                     for callee_path in callees {
@@ -3956,9 +4058,25 @@ impl CallControl {
                         }
                         // A target with no registered graph is upstream's
                         // `funcobj.graph is None` → residual (call.py:127).
+                        //
+                        // In upstream that condition is a property of the
+                        // callable (an `external`/`llhelper` funcptr genuinely
+                        // has no graph).  Here it also covers a callee whose
+                        // body the front end never lowered — the two are
+                        // indistinguishable from inside this loop, which is
+                        // precisely why the count has to exist: it turns "no
+                        // jitcode appeared" into "this named path had no
+                        // registered graph at BFS time".
                         let graph_ref = match self.function_graphs.get(&callee_path) {
                             Some(g) => g,
-                            None => continue,
+                            None => {
+                                crate::decline::record(
+                                    BFS_GATE,
+                                    "callee-has-no-registered-graph",
+                                    format_args!("{callee_path} in {path}"),
+                                );
+                                continue;
+                            }
                         };
                         // RPython call.py:84,87: callee must satisfy
                         // policy.look_inside_graph(graph). Synthesize a
@@ -3982,6 +4100,19 @@ impl CallControl {
                         if policy.look_inside_graph(&func) {
                             self.candidate_graphs.insert(callee_path.clone());
                             todo.push(callee_path);
+                        } else {
+                            // `policy.py look_inside_graph` said no —
+                            // a `dont_look_inside` / `elidable` hint, or a
+                            // loop without `unroll_safe`.  Upstream and pyre
+                            // agree on this one, so it is the decline row a
+                            // reader wants to see NON-empty: a zero here with
+                            // a non-zero `callee-has-no-registered-graph`
+                            // means the policy never got a say.
+                            crate::decline::record(
+                                BFS_GATE,
+                                "callee-policy-declined",
+                                format_args!("{callee_path} in {path}"),
+                            );
                         }
                     }
                 }
@@ -4403,6 +4534,11 @@ impl CallControl {
                 }
                 // call.py:129-134 _gctransformer_hint_close_stack_ → 'residual'
                 if self.func_effects(p).is_some_and(|f| f.close_stack) {
+                    crate::decline::record(
+                        CALLKIND_GATE,
+                        "residual-close-stack",
+                        format_args!("{p}"),
+                    );
                     return CallKind::Residual;
                 }
                 // call.py `hasattr(targetgraph.func, 'oopspec')` → 'builtin'
@@ -4427,6 +4563,35 @@ impl CallControl {
         // RPython `call.py:137-139` — both direct_call (fall-through)
         // and indirect_call reach this final classification.
         if self.graphs_from(op).is_none() {
+            // THE residual/JitCode fork.  `graphs_from` answers `None` for
+            // three structurally different reasons and the caller cannot
+            // tell them apart from the `CallKind::Residual` it gets back,
+            // so re-derive which one it was — but only when the census is
+            // on, so the classification never runs on the hot path it
+            // measures.
+            if crate::decline::enabled() {
+                let reason = match &op.kind {
+                    OpKind::Call { target, .. } => match self.target_to_path(target) {
+                        // The path resolved but `find_all_graphs` never put
+                        // it in the candidate set.  Cross-reference the
+                        // `find_all_graphs_bfs` rows to see which of its
+                        // gates dropped it — or, if none did, that the BFS
+                        // never reached this call site at all.
+                        Some(_) => "residual-callee-not-a-candidate",
+                        // No registered path for the target: nothing was
+                        // ever lowered under this name.
+                        None => "residual-target-unresolvable",
+                    },
+                    OpKind::IndirectCall { graphs: None, .. } => "residual-indirect-family-unknown",
+                    OpKind::IndirectCall { .. } => "residual-indirect-family-no-candidate",
+                    // `graphs_from` answers `None` for every non-call op.
+                    // Callers only classify call sites, so reaching here
+                    // means a caller asked about something else; name it
+                    // rather than folding it into a call-shaped reason.
+                    _ => "residual-not-a-call-op",
+                };
+                crate::decline::record(CALLKIND_GATE, reason, format_args!("{:?}", op.kind));
+            }
             CallKind::Residual
         } else {
             CallKind::Regular
@@ -4832,7 +4997,7 @@ impl CallControl {
         if let Some(path) = &wrapper_path
             && path
                 .last_segment()
-                .is_some_and(|leaf| leaf.starts_with("__majit_wrap_"))
+                .is_some_and(|leaf| leaf.starts_with(crate::runtime_names::shims::WRAP_PREFIX))
         {
             return symbolic_fnaddr_for_path(path);
         }
@@ -5215,9 +5380,28 @@ impl CallControl {
             std::collections::BTreeMap::new();
         for (path, &fnaddr) in &self.function_fnaddrs {
             let Some(leaf) = path.last_segment() else {
+                crate::decline::record(
+                    WRAPPER_FAMILY_GATE,
+                    "fnaddr-path-has-no-leaf",
+                    format_args!("{fnaddr:#x}"),
+                );
                 continue;
             };
-            if !leaf.starts_with("__majit_wrap_") || !self.function_graphs.contains_key(path) {
+            // The `__majit_wrap_` test is the population filter — every
+            // non-wrapper fnaddr in the binary fails it — so it is not
+            // recorded.  The missing-graph test that follows IS a decline:
+            // a generated wrapper published an address but no graph, so it
+            // cannot join the PBC family and every indirect site that would
+            // have dispatched to it stays residual.
+            if !leaf.starts_with(crate::runtime_names::shims::WRAP_PREFIX) {
+                continue;
+            }
+            if !self.function_graphs.contains_key(path) {
+                crate::decline::record(
+                    WRAPPER_FAMILY_GATE,
+                    "wrapper-has-no-registered-graph",
+                    format_args!("{path}"),
+                );
                 continue;
             }
             by_address.entry(fnaddr).or_default().push(path.clone());
@@ -9381,7 +9565,11 @@ mod tests {
     #[test]
     fn symbolic_fnaddr_for_segments_matches_known_box_str_constant_hash() {
         assert_eq!(
-            symbolic_fnaddr_for_segments(["pyre_object", "unicodeobject", "box_str_constant",]),
+            symbolic_fnaddr_for_segments([
+                crate::runtime_names::crates::OBJECT,
+                "unicodeobject",
+                "box_str_constant",
+            ]),
             0x7add_7d44_e51a_324c,
         );
     }

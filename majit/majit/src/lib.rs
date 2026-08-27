@@ -38,6 +38,11 @@ pub use majit_backend as backend;
 #[cfg(feature = "cranelift")]
 pub use majit_backend_cranelift as cranelift;
 
+/// Dynasm backend: native code generation. Present under the `dynasm`
+/// feature, which is what pulls the backend crate in.
+#[cfg(feature = "dynasm")]
+pub use majit_backend_dynasm as dynasm;
+
 /// Meta-interpreter: JitDriver, MetaInterp, JitState, resume, blackhole.
 pub use majit_metainterp as metainterp;
 

@@ -12,32 +12,9 @@
 /// trace of the countdown loop aborts and nothing is ever compiled. Declaring
 /// the greens is also what gives the merge point a green pc to report, which the
 /// `; state` close needs to name a resume position.
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use majit_metainterp::embed::Census;
 
 pub type Bytecode = [u8];
-
-/// Hot loops majit compiled. The only positive evidence the JIT tier is alive:
-/// a green suite, byte-identical output and an exact trip count are all
-/// satisfied by an interpreter answering alone. Before `greens = [pc, program]`
-/// was declared this example ran its whole suite green at `Traces compiled: 0`.
-pub static COMPILES: AtomicUsize = AtomicUsize::new(0);
-
-/// Ops in the last compiled loop body after optimization.
-///
-/// `COMPILES > 0` is necessary but NOT sufficient: an entirely empty dispatch
-/// still compiles a trace — one whose whole optimized body is `Finish()`, i.e.
-/// `ops_after == 1`. A compile counter counts TRACES, not WORK. This is the
-/// term that separates a compiled loop from a compiled nothing.
-pub static LAST_OPS_AFTER: AtomicUsize = AtomicUsize::new(0);
-
-/// Shape of the last compiled loop body — see [`majit_metainterp::LoopBodyShape`].
-///
-/// Held as two flags rather than the struct itself so the recording stays
-/// lock-free on the compile path; the probe rebuilds the struct inside the same
-/// lock window it reads the counters in, because this is as process-global as
-/// they are.
-pub static LAST_HAS_JUMP: AtomicBool = AtomicBool::new(false);
-pub static LAST_ALWAYS_FAILS: AtomicBool = AtomicBool::new(false);
 
 #[expect(
     dead_code,
@@ -87,13 +64,9 @@ const NEWSTR: u8 = 7;
 pub fn mainloop(program: &Bytecode, initial_value: i64, threshold: u32) -> i64 {
     let mut driver: majit_metainterp::JitDriver<TlaState> =
         majit_metainterp::JitDriver::new(threshold);
-    driver.set_on_compile_loop(|_green_key, _ops_before, ops_after, opcodes| {
-        COMPILES.fetch_add(1, Ordering::Relaxed);
-        LAST_OPS_AFTER.store(ops_after, Ordering::Relaxed);
-        let shape = majit_metainterp::LoopBodyShape::of(opcodes);
-        LAST_HAS_JUMP.store(shape.has_jump, Ordering::Relaxed);
-        LAST_ALWAYS_FAILS.store(shape.has_always_fails, Ordering::Relaxed);
-    });
+    // Every counter the tier gate reads, plus the last body's op count and
+    // shape, off the driver callbacks. `Census::begin` opens a window over them.
+    Census::install(&mut driver);
     let mut pc: usize = 0;
     let stacksize: i32 = 0;
     let mut state = TlaState {
@@ -220,49 +193,30 @@ mod tests {
         vec![DUP, CONST_INT, 1, SUB, DUP, JUMP_IF, 1, POP, RETURN]
     }
 
-    /// [`COMPILES`] is process-global, so under the default parallel libtest
-    /// runner a concurrent `run` lands inside [`compile_probe`]'s
-    /// store/run/load window and the probe reads someone else's compile. The
-    /// lock therefore covers *every* call that can compile, not just the
-    /// probe's own — [`run_jit`] and [`compile_probe`] are the only two ways a
-    /// test may enter the JIT, and neither may call the other (a plain mutex
-    /// re-entered on one thread deadlocks).
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// For tests that assert only on the result. They still compile, so they
-    /// must not run inside the probe's window. See [`PROBE_LOCK`].
+    /// must not run inside another test's census window — the window is what
+    /// makes [`compile_probe`]'s numbers this run's rather than the process's.
+    ///
+    /// [`Census::begin`] is the only lock here, and it is not reentrant:
+    /// [`run_jit`] and [`compile_probe`] are the only two ways a test may enter
+    /// the JIT, and neither may call the other.
     fn run_jit(bc: &[u8], arg: i64) -> i64 {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _census = Census::begin();
         let mut jit = JitTlaInterp::new();
         jit.run(bc, interp::WObject::Int(arg)).int_value()
     }
 
-    /// Run with both counters reset, returning `(result, compiles, ops_after)`.
+    /// Run inside a census window, returning `(result, counts)`.
     ///
-    /// [`LAST_OPS_AFTER`] is read here rather than at the call site, and reset
-    /// here rather than nowhere. Both counters are process-global, so both need
-    /// the same treatment [`PROBE_LOCK`] exists to give [`COMPILES`]: a load
-    /// taken after the guard drops can observe a concurrent test's compile, and
-    /// a counter that is never stored to zero retains whatever the last compile
-    /// anywhere in the process left behind. Unreset, a zero from this probe is
+    /// The window is what separates this run's compiles from every other test's:
+    /// the counters behind it are process-global, so an absolute read carries
+    /// whatever the rest of the binary left behind, and a zero from it would be
     /// indistinguishable from an inherited value.
-    fn compile_probe(bc: &[u8], arg: i64) -> (i64, usize, usize, majit_metainterp::LoopBodyShape) {
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        COMPILES.store(0, Ordering::Relaxed);
-        LAST_OPS_AFTER.store(0, Ordering::Relaxed);
-        LAST_HAS_JUMP.store(false, Ordering::Relaxed);
-        LAST_ALWAYS_FAILS.store(false, Ordering::Relaxed);
+    fn compile_probe(bc: &[u8], arg: i64) -> (i64, majit_metainterp::embed::CensusCounts) {
+        let census = Census::begin();
         let mut jit = JitTlaInterp::new();
         let got = jit.run(bc, interp::WObject::Int(arg)).int_value();
-        (
-            got,
-            COMPILES.load(Ordering::Relaxed),
-            LAST_OPS_AFTER.load(Ordering::Relaxed),
-            majit_metainterp::LoopBodyShape {
-                has_jump: LAST_HAS_JUMP.load(Ordering::Relaxed),
-                has_always_fails: LAST_ALWAYS_FAILS.load(Ordering::Relaxed),
-            },
-        )
+        (got, census.counts())
     }
 
     #[test]
@@ -294,15 +248,15 @@ mod tests {
     ///    and even an exact absolute trip count are all satisfied by the
     ///    interpreter answering alone; this example ran its entire suite green
     ///    at `Traces compiled: 0` before `greens = [pc, program]` was declared.
-    /// 2. `degraded_dispatch_arms()` empty. An arm whose body did not lower is
-    ///    an abort stub, so any trace reaching it aborts. The list is populated
-    ///    at dispatch-JitCode install time and names the arm, which an abort
-    ///    count cannot: `trace action at pc=N -> Abort` reports the trace-START
-    ///    pc, not the arm that caused it.
+    /// 2. No degraded dispatch arm. An arm whose body did not lower is an abort
+    ///    stub, so any trace reaching it aborts. The registry is populated at
+    ///    dispatch-JitCode install time and names the arm, which an abort count
+    ///    cannot: `trace action at pc=N -> Abort` reports the trace-START pc,
+    ///    not the arm that caused it.
     ///
-    /// The list is a process-wide registry, so it is filtered to this machine's
-    /// `state = TlaState`. It is read *after* a run, because nothing installs
-    /// the dispatch JitCode until the interpreter is entered.
+    /// The registry is process-wide, so the assertion is asked about this
+    /// machine's `state = TlaState`. It runs *after* a run, because nothing
+    /// installs the dispatch JitCode until the interpreter is entered.
     ///
     /// The subject is `count_to`, not `countdown`, so that the *result* assertion
     /// is itself an absolute trip count: `count_to(n)` returns the number of
@@ -313,7 +267,9 @@ mod tests {
     #[test]
     fn jit_tier_is_alive() {
         const N: i64 = 1001;
-        let (got, compiles, ops_after, shape) = compile_probe(&count_to_bytecode(N), 0);
+        let (got, counts) = compile_probe(&count_to_bytecode(N), 0);
+        let (compiles, ops_after) = (counts.loops_compiled, counts.last_ops_after);
+        let shape = counts.last_loop_body_shape;
         // The body actually closes a loop — see `LoopBodyShape`. A compile
         // count and an op count together still accept a body that bails out on
         // its first pass; this is the term that does not. Sound HERE because
@@ -330,22 +286,14 @@ mod tests {
              describe ran {got} passes rather than {N}"
         );
 
-        let degraded: Vec<&str> = majit_metainterp::degraded_dispatch_arms()
-            .iter()
-            .filter(|a| a.interp == "TlaState")
-            .map(|a| a.arm)
-            .collect();
         // `greens = [pc, program]` means a degraded arm aborts only traces that
-        // reach that arm, rather than disabling the whole dispatch loop. This
-        // assertion pins the stronger property that every exercised arm lowers.
-        assert!(
-            degraded.is_empty(),
-            "dispatch arms degraded to abort stubs: {degraded:?} — every trace \
-             that reaches one aborts. With `greens = [pc, program]` declared, \
-             that costs the traces reaching those arms, not the dispatch loop \
-             as a whole; the arms this crate exercises are still expected to \
-             lower, so a non-empty set is a regression and not a trade-off"
-        );
+        // reach that arm, rather than disabling the whole dispatch loop. The
+        // empty pin is still the right one here: the arms this crate exercises
+        // are all expected to lower, so a non-empty set is a regression and not
+        // a trade-off. The pin also carries the denominator, which a bare
+        // emptiness check over the registry cannot — an uninstalled portal
+        // produces the same empty list a healthy one does.
+        majit_metainterp::embed::assert_degraded_dispatch_arms("TlaState", &[]);
 
         // Zero-vs-nonzero is the property; a later change that legitimately
         // mints more than one artifact is not this regression.

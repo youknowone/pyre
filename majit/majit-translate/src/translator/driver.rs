@@ -2602,6 +2602,10 @@ mod tests {
         );
     }
 
+    /// Re-enabling this test requires injectable input and output as well as an
+    /// injectable `CheckpointRuntime`. On the no-fork path the `auto` token is
+    /// discarded and the prompt reads input before consulting the runtime, so
+    /// a runtime seam alone cannot prevent a blocking or repeated EOF read.
     #[test]
     fn task_database_c_sets_translator_frozen_before_c_backend_leaf() {
         let td = TranslationDriver::new_default().expect("driver");

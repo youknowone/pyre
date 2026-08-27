@@ -2457,6 +2457,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &lo.slice_first_sites,
             )
         };
+        // The `<[T]>::get(slice, i)` bounds-checked `Option<&T>` diamond
+        // rewrite (`front::slice_get`) splits the residual `get` call block
+        // into a guarded `Some`/`None` diamond (`if i < len(slice)`), same
+        // post-lowering shape and fail-safe contract as `slice_first`, of
+        // which it is the general case; gate the reachability sweep on an
+        // actual rewrite.
+        let slice_get_rewritten = if lo.slice_get_sites.is_empty() {
+            0
+        } else {
+            crate::front::slice_get::rewire_slice_get_call_sites(&mut lo.graph, &lo.slice_get_sites)
+        };
         // The `saturating_sub` clamp rewrite (`front::saturating_sub`) splits
         // the residual `saturating_sub` call block into an `if a < b { 0 } else
         // { a - b }` diamond, same post-lowering shape and fail-safe contract as
@@ -2571,6 +2582,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || option_try_stats.rewritten > 0
             || bool_then_rewritten > 0
             || slice_first_rewritten > 0
+            || slice_get_rewritten > 0
             || saturating_sub_rewritten > 0
             || unwrap_or_rewritten > 0
             || unwrap_rewritten > 0
@@ -3157,6 +3169,11 @@ struct Lowering<'a> {
     /// after the body lowering completes (see
     /// [`crate::front::slice_first::SliceFirstSite`]).
     slice_first_sites: Vec<crate::front::slice_first::SliceFirstSite>,
+    /// `<[T]>::get(slice, i)` call sites recorded for the bounds-checked
+    /// `Option<&T>` diamond the `front::slice_get` post-pass synthesizes
+    /// after the body lowering completes (see
+    /// [`crate::front::slice_get::SliceGetSite`]).
+    slice_get_sites: Vec<crate::front::slice_get::SliceGetSite>,
     /// `{uN}::saturating_sub(a, b)` call sites recorded for the unsigned clamp
     /// diamond (`if a < b { 0 } else { a - b }`) the
     /// `front::saturating_sub` post-pass synthesizes after body lowering (see
@@ -3414,6 +3431,7 @@ impl<'a> Lowering<'a> {
             option_try_sites: Vec::new(),
             bool_then_sites: Vec::new(),
             slice_first_sites: Vec::new(),
+            slice_get_sites: Vec::new(),
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
@@ -5467,7 +5485,7 @@ impl<'a> Lowering<'a> {
             result: Some(result.clone()),
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
-                    segments: vec!["__majit_stringbuilder_build".to_string()],
+                    segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.to_string()],
                 },
                 args: vec![builder],
                 result_ty: ValueType::Ref(None),
@@ -5542,13 +5560,16 @@ impl<'a> Lowering<'a> {
         let (segments, result_ty) =
             if src_root.is_some() && tyref_is_raw_byte_ptr(dest_ty, self.llbc) {
                 (
-                    vec!["__cast_address_intrinsic".to_string()],
+                    vec![crate::runtime_names::shims::CAST_ADDRESS.to_string()],
                     ValueType::Ref(None),
                 )
             } else {
                 let root = tyref_class_root(dest_ty, self.llbc)?;
                 (
-                    vec!["__cast_instance_intrinsic".to_string(), root.clone()],
+                    vec![
+                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                        root.clone(),
+                    ],
                     ValueType::Ref(Some(root)),
                 )
             };
@@ -5819,7 +5840,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![
-                                        "__cast_instance_intrinsic".to_string(),
+                                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                         root.clone(),
                                     ],
                                 },
@@ -6007,7 +6028,7 @@ impl<'a> Lowering<'a> {
                                 kind: OpKind::Call {
                                     target: CallTarget::FunctionPath {
                                         segments: vec![
-                                            "__cast_instance_intrinsic".to_string(),
+                                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                             owner.clone(),
                                         ],
                                     },
@@ -6115,7 +6136,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![
-                                    "__cast_instance_intrinsic".to_string(),
+                                    crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                     root.clone(),
                                 ],
                             },
@@ -6157,7 +6178,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![
-                                    "__cast_instance_intrinsic".to_string(),
+                                    crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                     root.clone(),
                                 ],
                             },
@@ -7611,29 +7632,51 @@ impl<'a> Lowering<'a> {
                 let element_is_addressable = element_scalar.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
-                if args.len() == 2
+                let index_leg = args.len() == 2
                     && (workspace_index
-                        || (element_is_addressable
-                            && ((self.is_vec_index_call(&reg)
-                                && (!is_vec_index_mut_regular(&reg, self.llbc)
-                                    || add_dest_used_only_as_single_deref(
-                                        self.body, dest_local,
-                                    )))
-                                || (self
-                                    .is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
-                                    && (!self.is_slice_scalar_index_mut_call(&reg)
-                                        || add_dest_used_only_as_single_deref(
-                                            self.body, dest_local,
-                                        ))))))
-                {
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    // `Index::index(_mut)` returns `&T`/`&mut T`, while
-                    // RPython's getarrayitem returns `T`.  Preserve that
-                    // pointee kind: treating the reference wrapper itself as
-                    // the item makes an integer Vec load flow into
-                    // `int_mul/ri>i`.
+                        || (self.is_vec_index_call(&reg)
+                            && (!is_vec_index_mut_regular(&reg, self.llbc)
+                                || add_dest_used_only_as_single_deref(self.body, dest_local)))
+                        || (self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                            && (!self.is_slice_scalar_index_mut_call(&reg)
+                                || add_dest_used_only_as_single_deref(self.body, dest_local))));
+                // The element kind and the ARRAY identity are decided above the
+                // gate, not at the emit below, because the gate turns on the
+                // identity: minting one is one of the two ways the element's
+                // width reaches the descr.  One expression has to answer both
+                // questions or a later edit desynchronises them, admitting an
+                // element whose width the descr never learns.
+                //
+                // `Index::index(_mut)` returns `&T`/`&mut T`, while RPython's
+                // getarrayitem returns `T`.  Preserve that pointee kind:
+                // treating the reference wrapper itself as the item makes an
+                // integer Vec load flow into `int_mul/ri>i`.
+                //
+                // The `pyre_`-fenced workspace arm has exactly three element
+                // banks — `FixedObjectArray`, `IntArray`, `FloatArray` — so a
+                // `*mut PyObject` element there IS the length-prefixed object
+                // block that `set_ref` and the `swap` decomposition name, and
+                // this read has to share their descr or a cached element
+                // survives their store.  The `Vec<T>` and slice legs reach
+                // object pointers that are not that block, and they keep the
+                // identity-less descr, which `arraydescrof_concrete` mints
+                // locally without a cache publish.
+                //
+                // Unlike the `swap` arm, the item kind is sound evidence here.
+                // The `Ref(None)` fallback that forced `swap` onto a positive
+                // `output_type_is_objectptr` proof is reached when
+                // `monomorphize:false` leaves a `TypeVar` at the call site; the
+                // impls behind this arm are non-generic inherent/trait impls on
+                // three concrete types, so `call.dest.ty` is a resolved
+                // associated `Output` at every one and never lands on that
+                // fallback.
+                //
+                // Outside that arm the element is whatever the receiver spells,
+                // and an int-banked one narrower than 8 bytes needs its
+                // identity for `get_type_flag` to be reachable at all
+                // ([`narrow_item_array_type_id`]); a `Vec<u8>` read strides by
+                // 8 without it.
+                let index_element = index_leg.then(|| {
                     let item_ty = tyref_deref_value_type(&call.dest.ty, self.llbc);
                     // The `pyre_`-fenced workspace arm has exactly three
                     // element banks — `FixedObjectArray`, `IntArray`,
@@ -7663,8 +7706,60 @@ impl<'a> Lowering<'a> {
                         // same array — which is what lets the width travel.
                         // A thin-pointer element stays unnamed: it is the one
                         // shape the identity-less mint already sizes right.
-                        element_scalar.as_deref().map(|elem| format!("[{elem}]"))
+                        //
+                        // The element spelling is the authority wherever it
+                        // resolves, so only one name reaches the cache key for
+                        // a given element.  Where it does not resolve, an
+                        // int-banked receiver can still say what it holds:
+                        // `arraydescrof_concrete`'s identity-less arm has no
+                        // element name to hand `get_type_flag` and banks every
+                        // non-`Ref` element at 8 bytes, so a narrow int read
+                        // through such a receiver would stride past its
+                        // neighbours.
+                        element_scalar
+                            .as_deref()
+                            .map(|elem| format!("[{elem}]"))
+                            .or_else(|| {
+                                if !matches!(
+                                    item_ty,
+                                    ValueType::Int | ValueType::Unsigned | ValueType::Bool
+                                ) {
+                                    return None;
+                                }
+                                first_arg_ty
+                                    .as_ref()
+                                    .and_then(|ty| narrow_item_array_type_id(ty, self.llbc))
+                            })
                     };
+                    (item_ty, array_type_id)
+                });
+                // `ArrayRead` addresses its element as `base + index *
+                // itemsize`, so the op is sound only where that itemsize is the
+                // element's real width.  Two disjoint proofs supply it:
+                //
+                // * the ARRAY identity minted above, which gives
+                //   `arraydescrof_concrete` an element name to hand
+                //   `get_type_flag` and so stamps the true width — this is the
+                //   narrow-int case, `Vec<u8>` striding 1 and `Vec<i16>` 2;
+                // * `element_is_addressable`, for an element the identity-less
+                //   descr already describes: a scalar names its own spelling,
+                //   and a thin pointer IS the one target word that arm assumes.
+                //
+                // An element neither proof can name falls through to the
+                // residual call, where Rust computes the address itself.
+                // `ValueType` cannot stand in for either: `Unsigned` is one
+                // width-less variant spanning `u8` through `usize`, and every
+                // non-primitive shape flattens to `Ref(None)`, so a `Vec<u8>`
+                // and a `Vec<String>` are indistinguishable there while
+                // striding 1 and 24 bytes.  The workspace arm needs no proof:
+                // its `pyre_` fence admits exactly the three element banks
+                // named above, all of them one word.
+                if let Some((item_ty, array_type_id)) = index_element
+                    && (workspace_index || array_type_id.is_some() || element_is_addressable)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayRead {
@@ -7938,7 +8033,9 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
-                                segments: vec!["__majit_stringbuilder_new".to_string()],
+                                segments: vec![
+                                    crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
+                                ],
                             },
                             args,
                             result_ty: ValueType::Ref(None),
@@ -8002,7 +8099,10 @@ impl<'a> Lowering<'a> {
                             result: Some(void),
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
-                                    segments: vec!["__majit_stringbuilder_append".to_string()],
+                                    segments: vec![
+                                        crate::runtime_names::shims::STRINGBUILDER_APPEND
+                                            .to_string(),
+                                    ],
                                 },
                                 args: vec![acc_val, args[piece_i].clone()],
                                 result_ty: ValueType::Void,
@@ -8048,7 +8148,7 @@ impl<'a> Lowering<'a> {
                             kind: OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec![
-                                        "__cast_instance_intrinsic".to_string(),
+                                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                                         root.clone(),
                                     ],
                                 },
@@ -8710,7 +8810,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::Call {
                             target: CallTarget::FunctionPath {
                                 segments: vec![
-                                    "pyre_object".to_string(),
+                                    crate::runtime_names::crates::OBJECT.to_string(),
                                     "longobject".to_string(),
                                     "jit_bigint_from_i64".to_string(),
                                 ],
@@ -9435,7 +9535,7 @@ impl<'a> Lowering<'a> {
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
-                            "__cast_instance_intrinsic".to_string(),
+                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                             "RBigInt".to_string(),
                         ],
                     },
@@ -9900,6 +10000,26 @@ impl<'a> Lowering<'a> {
         {
             self.slice_first_sites.push(site);
         }
+        // Capture `<[T]>::get(slice, i)` sites for the bounds-checked
+        // `Option<&T>` diamond `front::slice_get` synthesizes.  `get` is the
+        // general case of `first` — the same foreign leaf, the same raw
+        // `FunctionPath` segments and the same unregistered-callee census Skip
+        // — with the subscript in `args[1]`.  `recognize_slice_get_site` pins
+        // the scalar `SliceIndex` instantiation off that operand's type, so a
+        // range instantiation (whose payload is a sub-slice) and any other
+        // resolution miss both leave the residual call.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "get"])
+            && let Some(site) =
+                self.recognize_slice_get_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
+        {
+            self.slice_get_sites.push(site);
+        }
         // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
         // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
         // foreign leaf (its `Self` is a primitive integer, so `lower_call`
@@ -10139,7 +10259,10 @@ impl<'a> Lowering<'a> {
                 result: Some(narrowed.clone()),
                 kind: OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".to_string(), root.clone()],
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                            root.clone(),
+                        ],
                     },
                     args: vec![result_var.clone()],
                     result_ty: ValueType::Ref(Some(root)),
@@ -10495,7 +10618,7 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![
-                        "__cast_instance_intrinsic".to_string(),
+                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
                         "Constants".to_string(),
                     ],
                 },
@@ -12357,6 +12480,75 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve a recognized `<[T]>::get(slice, i)` call into a
+    /// [`crate::front::slice_get::SliceGetSite`] — the same `Option` enum root
+    /// + `Some` variant owners [`Self::recognize_slice_first_site`] resolves,
+    /// plus the `SliceIndex` instantiation gate `first` has no need of.
+    ///
+    /// `<[T]>::get` is generic over `SliceIndex`, and only its scalar
+    /// instantiation returns `Option<&T>`.  Every range one (`Range`,
+    /// `RangeTo`, `RangeFrom`, `RangeFull`, `RangeInclusive`,
+    /// `RangeToInclusive`) returns `Option<&[T]>`, whose payload is a
+    /// SUB-SLICE: an element read at the range's start would hand the consumer
+    /// a `T` where a `[T]` is expected.  Pin the scalar one by the index
+    /// operand's declared `usize` — the same discriminator
+    /// [`Self::is_slice_scalar_index_call`] uses to separate `<[T]>::index`'s
+    /// scalar impl from its range ones.  A literal subscript arrives as an
+    /// `Operand::Const`, for which no `index_ty` is captured, so it declines
+    /// too: the residual call and its census Skip both survive.
+    ///
+    /// [`Self::option_residual_narrow_root`] refuses the range forms a second
+    /// time — a `[T]` payload is the `Slice` builtin, which has no ADT def-id
+    /// and so no registered narrow root — and is load-bearing for `get` for
+    /// the reason it is for `first`: it is exactly the shape `lower_call`
+    /// appends a trailing `__pyre_cast_instance` narrowing to, the cast the
+    /// post-pass absorbs and re-applies per arm.  It also declines a
+    /// value-slice `Option<u8>` / `Option<i64>` cleanly.
+    fn recognize_slice_get_site(
+        &self,
+        dest_ty: &TyRef,
+        index_ty: Option<&TyRef>,
+        result_var: &Variable,
+    ) -> Option<crate::front::slice_get::SliceGetSite> {
+        if index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) != Some("Usize") {
+            crate::decline::record_named(
+                crate::decline::gate::SLICE_GET_SITE,
+                "index-not-usize",
+                &self.graph.name,
+            );
+            return None;
+        }
+        if self.option_residual_narrow_root(dest_ty).is_none() {
+            crate::decline::record_named(
+                crate::decline::gate::SLICE_GET_SITE,
+                "payload-has-no-narrow-root",
+                &self.graph.name,
+            );
+            return None;
+        }
+        let Some((option_owner, some_owner, payload_ty)) =
+            self.resolve_bool_then_option_dest(dest_ty)
+        else {
+            crate::decline::record_named(
+                crate::decline::gate::SLICE_GET_SITE,
+                "dest-not-a-resolvable-option",
+                &self.graph.name,
+            );
+            return None;
+        };
+        crate::decline::observe_accept(
+            crate::decline::gate::SLICE_GET_SITE,
+            "site-recognized (ACCEPT, not a decline)",
+            &self.graph.name,
+        );
+        Some(crate::front::slice_get::SliceGetSite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            payload_ty,
+        })
+    }
+
     /// Resolve a recognized `{uN}::saturating_sub(a, b)` call into a
     /// [`crate::front::saturating_sub::SaturatingSubSite`].  Gated on an
     /// **unsigned** result type (`saturating_sub` returns the receiver `uN`):
@@ -13417,7 +13609,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![
-                        "pyre_object".to_string(),
+                        crate::runtime_names::crates::OBJECT.to_string(),
                         "longobject".to_string(),
                         "jit_bigint_to_i64_value_or_zero".to_string(),
                     ],
@@ -13431,7 +13623,7 @@ impl<'a> Lowering<'a> {
             OpKind::Call {
                 target: CallTarget::FunctionPath {
                     segments: vec![
-                        "pyre_object".to_string(),
+                        crate::runtime_names::crates::OBJECT.to_string(),
                         "longobject".to_string(),
                         "jit_bigint_to_i64_fits".to_string(),
                     ],
@@ -14680,7 +14872,10 @@ fn str_builder_append_args(llbc: &Llbc, reg: &RegularCall) -> Option<(usize, usi
         // under `pyre_interpreter::display`; the `Wtf8Buf` impl resolves to the
         // `Wtf8Buf` owner.  Both append `self` (arg 0) onto the `&mut Wtf8Buf`
         // accumulator (arg 1).
-        "push_onto" => (np.split("::").take(2).eq(["pyre_interpreter", "display"])
+        "push_onto" => (np
+            .split("::")
+            .take(2)
+            .eq([crate::runtime_names::crates::INTERPRETER, "display"])
             || deref_impl_owner_leaf(llbc, fd).as_deref() == Some("Wtf8Buf"))
         .then_some((1, 0)),
         _ => None,
@@ -15966,16 +16161,15 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// `(path-segments, Signature, FUNC.RESULT token)` for every local `unsafe
 /// fn` / unsafe impl-method whose return type projects to a token
 /// [`crate::translator::rtyper::cutover::residual_return_shell`] can model.
-/// These callees cannot lower their bodies (raw-pointer access the
-/// flowspace adapter does not model), but downstream
-/// `OpKind::Call::FunctionPath` sites still need their signature
-/// registered so the dual gate does not Skip with "not registered in
-/// CallRegistry".
+/// Being `unsafe` does not hold a body back from lowering — no gate reads
+/// `signature.is_unsafe` outside this collector.  What an unsafe callee is
+/// missing is a registry key under the spelling its
+/// `OpKind::Call::FunctionPath` sites emit; without one the dual gate Skips
+/// with "not registered in CallRegistry".
 ///
-/// An `unsafe fn` is never lowered, so it never enters
-/// `CallControl::function_graphs` and its call sites already residualize
-/// whether or not it is registered here — registration changes only
-/// whether the *caller* can annotate past the call.  That is why the
+/// A stub supplies that key and nothing else: the entry's graph is a
+/// one-link return shell carrying the declared result, so what registration
+/// changes is whether the *caller* can annotate past the call.  That is why the
 /// result token is projected through the same
 /// [`dont_look_inside_return_token`] the `@jit.dont_look_inside` residual
 /// path uses: both describe one residual boundary's declared result, and
@@ -16000,7 +16194,12 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// names come from the Charon body locals, falling back to `arg{N}`.
 /// A return type `residual_return_shell` declines surfaces no entry,
 /// preserving the original "not registered" Skip for that fn.
-pub(crate) fn collect_unsafe_fn_stubs_from_llbc(
+///
+/// `pub` so `test_cel_census`'s registration classifier can ask this
+/// collector which paths the stub channel holds instead of mirroring the
+/// accept filters below — a mirror that drifts labels a declined fn
+/// registered, which is the one direction that hides residue.
+pub fn collect_unsafe_fn_stubs_from_llbc(
     llbc: &Llbc,
 ) -> Vec<(
     Vec<String>,
@@ -18640,6 +18839,46 @@ fn array_projection_metadata(ty: &TyRef, llbc: &Llbc) -> (Option<String>, bool) 
     }
     let nolength = crate::front::typestr::nolength_from_array_type_id(Some(identity.as_str()));
     (Some(identity), nolength)
+}
+
+/// ARRAY identity for a scalar element read whose element is an integer
+/// narrower than the 8 bytes the identity-less descr arm assumes.
+///
+/// `ValueType` banks `u8` / `u16` / `u32` / `bool` together with the
+/// word-wide integers as one width-less `Unsigned`, so an `ArrayRead` that
+/// carries no identity reaches `arraydescrof_concrete`'s third arm and
+/// strides every int-banked element by 8.  `get_type_flag` already returns
+/// the real width, but it is keyed on the element spelling and that arm has
+/// none — recovering the spelling from the receiver is what routes the read
+/// onto it.  Same identity role as [`array_projection_metadata`], reached
+/// from a `Index::index` callsite instead of a `ProjectionElem::Index`.
+///
+/// Declines unless the spelling round-trips:
+///
+/// * `nolength_from_array_type_id` must read `false` on it, agreeing with
+///   the `nolength: false` the callers stamp.  `get_array_descr` answers a
+///   cache hit with the descr the first mint built and drops the later
+///   `base_size`/`nolength`, so an identity shared with a header-less mint
+///   would hand one of the two the other's base.
+/// * `get_type_flag` must bank the named element as an integer narrower
+///   than 8 bytes.  Everything else — pointers, floats, structs, `String`,
+///   and the unknown-name fallback — keeps `None`.
+///
+/// A `None` here is not on its own a decline: the callsite also admits an
+/// element `element_is_addressable` proves the identity-less third arm already
+/// describes — a scalar spelling or a thin pointer.  An element
+/// neither answers for — a multi-word aggregate, `String`, a fat pointer —
+/// reaches no `ArrayRead` at all and stays a residual call.
+fn narrow_item_array_type_id(receiver: &TyRef, llbc: &Llbc) -> Option<String> {
+    let identity = tyref_to_ast_string(receiver, llbc);
+    if identity.starts_with("??")
+        || crate::front::typestr::nolength_from_array_type_id(Some(identity.as_str()))
+    {
+        return None;
+    }
+    let elem = crate::codewriter::call::extract_element_type_from_str(&identity)?;
+    let (_, item_type, item_size) = crate::codewriter::call::get_type_flag(&elem);
+    (item_type == majit_ir::value::Type::Int && item_size < 8).then_some(identity)
 }
 
 /// Recursive worker for [`tyref_to_ast_string`] operating on a raw
@@ -22920,10 +23159,7 @@ mod tests {
     fn random_genrand32_fixed_array_keeps_concrete_identity() {
         use crate::model::{OpKind, ValueType};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let fd = llbc
             .iter_local_fns()
@@ -22969,10 +23205,7 @@ mod tests {
     fn random_wrapper_narrows_nullable_self_to_w_random() {
         use crate::model::{CallTarget, OpKind, ValueType};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let fd = llbc
             .iter_local_fns()
@@ -23011,7 +23244,7 @@ mod tests {
                 target: CallTarget::FunctionPath { segments },
                 result_ty: ValueType::Ref(Some(root)),
                 ..
-            } if segments == &["__cast_instance_intrinsic".to_string(), "W_Random".to_string()]
+            } if segments == &[crate::runtime_names::shims::CAST_INSTANCE.to_string(), "W_Random".to_string()]
                 && root == "W_Random"
         ));
     }
@@ -24777,10 +25010,7 @@ mod tests {
     fn real_stack_underflow_fmt_chain_collapses_to_str_concat() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "stack_underflow_error")
             .expect("lower stack_underflow_error");
@@ -24852,10 +25082,7 @@ mod tests {
     fn arguments_from_str_nonconst_alias_real_constructor_args() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
             super::lower_function(&llbc, "constructor_args").expect("lower constructor_args");
@@ -24900,10 +25127,7 @@ mod tests {
     fn constants_wrapper_access_matches_real_interpreter_llbc() {
         use crate::model::{CallTarget, OpKind, ValueType};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(&llbc);
         assert_eq!(
@@ -25235,10 +25459,7 @@ mod tests {
     fn fold_size_const_real_function_object_size() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
             super::lower_function(&llbc, "function_new_impl").expect("lower function_new_impl");
@@ -25284,10 +25505,7 @@ mod tests {
     fn iter_next_fold_real_call_function_impl_result() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "call_function_impl_result")
             .expect("lower call_function_impl_result");
@@ -25353,10 +25571,7 @@ mod tests {
     fn is_some_fold_real_callable_w() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "callable_w").expect("lower callable_w");
 
@@ -25403,10 +25618,7 @@ mod tests {
     fn or_else_fold_real_space_int() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "space_int").expect("lower space_int");
 
@@ -25459,10 +25671,7 @@ mod tests {
     fn range_contains_fold_real_int_census_sites() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
 
         for fname in ["setitem_bytearray", "byte_w", "c_int_w"] {
@@ -25533,10 +25742,7 @@ mod tests {
     fn range_contains_fold_real_declines_float_range() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "complex_pow").expect("lower complex_pow");
 
@@ -25576,10 +25782,7 @@ mod tests {
     fn bigint_i64_try_from_real_declines_u32_result() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "char_arg").expect("lower char_arg");
 
@@ -26745,10 +26948,7 @@ mod tests {
     #[ignore]
     fn fmt_collapse_long_literal_real_space_int() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         for fname in ["space_int", "space_index"] {
             let graph = super::lower_function(&llbc, fname)
@@ -26795,10 +26995,7 @@ mod tests {
     #[ignore]
     fn option_try_recast_break_arm_real_lookup() {
         use crate::model::{CallTarget, ExitCase, ExitSwitch, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "lookup").expect("lower lookup");
         let branch_calls = graph
@@ -26860,10 +27057,7 @@ mod tests {
     #[ignore]
     fn vec_index_mut_fill_user_function_args_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "fill_user_function_args")
             .expect("lower fill_user_function_args");
@@ -26907,10 +27101,7 @@ mod tests {
     #[ignore]
     fn saturating_sub_generic_alias_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "generic_alias_class_getitem")
             .expect("lower generic_alias_class_getitem");
@@ -26960,10 +27151,7 @@ mod tests {
     #[ignore]
     fn is_some_and_is_mmap_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "is_mmap").expect("lower is_mmap");
         let residual = graph
@@ -27002,10 +27190,7 @@ mod tests {
     #[ignore]
     fn set_ref_set_locals_w_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
         let residual = graph
@@ -27050,10 +27235,7 @@ mod tests {
     #[ignore]
     fn we_are_jitted_lookup_in_type_where_real() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "lookup_in_type_where")
             .expect("lower lookup_in_type_where");
@@ -27111,10 +27293,7 @@ mod tests {
     #[ignore]
     fn call_intrinsic_1_debug_enum_fmt_real() {
         use crate::model::{CallTarget, ExitSwitch, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
             super::lower_function(&llbc, "call_intrinsic_1").expect("lower call_intrinsic_1");
@@ -27185,7 +27364,7 @@ mod tests {
             }
         }
 
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
+        let path = crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC;
         let bytes = std::fs::read(path).expect("read checked-in corpus LLBC");
         let mut file: serde_json::Value =
             serde_json::from_slice(&bytes).expect("parse checked-in corpus JSON");
@@ -27370,10 +27549,7 @@ mod tests {
     fn niche_option_gettypeobject_folds_to_ptr_null_test() {
         use crate::model::OpKind;
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "gettypeobject").expect("lower gettypeobject");
 
@@ -27440,10 +27616,7 @@ mod tests {
     #[ignore]
     fn niche_option_match_switch_closes_with_bool_exitcase() {
         use crate::model::{ExitCase, ExitSwitch, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "object_functionstr_type_name")
             .expect("lower object_functionstr_type_name");
@@ -27511,10 +27684,7 @@ mod tests {
     fn fieldless_enum_eq_fold_real_strategy_is() {
         use crate::model::{CallTarget, OpKind};
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "pyre_object::dictmultiobject::strategy_is")
             .expect("lower strategy_is");
@@ -27547,10 +27717,7 @@ mod tests {
     #[ignore]
     fn shared_ref_niche_option_get_w_locals_no_pos0_read() {
         use crate::model::OpKind;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "get_w_locals").expect("lower get_w_locals");
         let pos0_reads = graph
@@ -27575,10 +27742,7 @@ mod tests {
     #[ignore]
     fn mut_ref_niche_option_set_chunk_size_still_no_pos0_read() {
         use crate::model::OpKind;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         // Any &mut-self __majit_wrap setter; set__CHUNK_SIZE takes `&mut self`.
         let graph =
@@ -27607,10 +27771,7 @@ mod tests {
     #[ignore]
     fn object_items_slice_keeps_residual_from_raw_parts_not_header_alias() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
         let graph =
             super::lower_function(&llbc, "object_items_slice").expect("lower object_items_slice");
@@ -27641,10 +27802,7 @@ mod tests {
     #[ignore]
     fn rbigint_digits_still_folds_capacity_length_view() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
         let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
         let graph = super::lower_function(&llbc, "rbigint::<Impl>::digits")
             .or_else(|_| super::lower_function(&llbc, "digits"))
@@ -27732,10 +27890,7 @@ mod tests {
     #[test]
     #[ignore]
     fn sized_gate_rejects_unsized_wtf8_accepts_sized_wstruct() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let target = std::env::var("TARGET").unwrap_or_default();
 
@@ -27772,10 +27927,7 @@ mod tests {
     #[ignore]
     fn str_slice_args_option_wtf8_not_niche_folded() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "str_slice_args").expect("lower str_slice_args");
         // The niche discriminant fold emits `ne(base, null_mut())`; a declined
@@ -27809,10 +27961,7 @@ mod tests {
     #[ignore]
     fn call_function_impl_result_has_no_residual_array_index() {
         use crate::model::OpKind;
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "call_function_impl_result")
             .expect("lower call_function_impl_result");
@@ -27853,10 +28002,7 @@ mod tests {
     #[ignore]
     fn bind_kwargs_scalar_slice_indexes_lower_to_array_reads() {
         use crate::model::{CallTarget, OpKind};
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
-        );
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
             .expect("lower bind_kwargs_to_signature");

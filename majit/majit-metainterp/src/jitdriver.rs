@@ -546,6 +546,198 @@ fn portal_rca_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_PORTAL_RCA").is_some())
 }
 
+// ── warm-entry stage probe ───────────────────────────────────────────────
+//
+// A measurement arm, never a shipping one, and behind a cargo feature for that
+// reason: a default build has neither the load below nor the loops it feeds.
+// Inside the feature the arms are selected at RUN time, because what one stage
+// costs against another is a difference that has to be taken inside ONE binary
+// — two `cargo build` invocations admit compile drift and stale binaries, and
+// neither is visible in the numbers they produce.
+
+/// Extra passes of one stage of a warm compiled entry.
+///
+/// A compiled entry that finds its artifact already there spends ~100 ns
+/// arriving, and four fifths of that is inside [`JitDriver::back_edge_internal`]
+/// below. No clock can be put inside it: `Instant::now()` costs a fifth of the
+/// budget on the box these were taken on, so five of them would report the
+/// clock. Each stage is timed by REPETITION instead — the same entry with every
+/// count at zero, then again with one count at `k`, and the difference over `k`
+/// is that stage. Everything the two arms share cancels out of it.
+///
+/// Only stages that are IDEMPOTENT under repetition can be read this way, and
+/// the warm entry has one that is emphatically not: **the call**.
+/// `execute_assembler_at_dispatch_key` builds the frame, enters the compiled
+/// trace and decodes the deadframe it returns (`get_latest_descr_arc` and
+/// `decode_exit_slots` are inside it, not after it). It RUNS THE PROGRAM: a
+/// second pass would execute the trace again from state the first one already
+/// advanced, and would leave through a different exit. There is no honest
+/// repeatable form of it, so none is offered — the call is what the residual
+/// is, together with the handful of one-shot moves named on the fields below.
+#[cfg(feature = "__back-edge-stage-probe")]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct BackEdgeStageRepeats {
+    /// Extra gate consultations: `entry_procedure_token` (only for a caller
+    /// that did not arrive carrying one, which is the shape the gate itself
+    /// takes), `get_compiled_meta(..).cloned()`, [`JitDriver::driver_descriptor_for`]
+    /// and `is_compatible`. All four answer the same thing every time they are
+    /// asked on one entry, which is what makes them repeatable.
+    ///
+    /// NOT in this stage, and left in the residual: `resolve_cell_key`, which a
+    /// carrying caller skips altogether, and
+    /// `take_single_pass_label_entry_dispatch_key_for_back_edge`, which TAKES
+    /// the slot — a second call finds it empty, answers `None`, and prices the
+    /// other branch rather than this one.
+    pub gate: u16,
+    /// Extra refills of the entry-argument buffers: `sync_before`,
+    /// `extract_live_values_into`, `live_values_match_descriptor`,
+    /// `extend_compiled_live_values_into`, and the buffer clears.
+    ///
+    /// The clears belong to the stage rather than to the machinery:
+    /// [`JitDriver::take_entry_scratch`] does exactly them once per entry, and
+    /// a refill that skipped them would append to the previous pass instead of
+    /// repeating it. What is NOT in the stage is that function's own
+    /// `mem::take` — a second take hands back the defaulted struct.
+    ///
+    /// Armed only for an entry that extracted its arguments from state. One
+    /// that arrived with `direct_live_values` ran none of this.
+    pub marshal_in: u16,
+    /// Extra `restore_values` + `sync_after` on the values a completed run left
+    /// behind.
+    ///
+    /// Armed only on the arms that reach them — a FINISH or a normal back-edge
+    /// JUMP. A guard failure goes to `handle_fail` and reaches neither.
+    /// `restore_values` is skipped for a FINISH exactly as the shipping arm
+    /// skips it: those exit slots are the portal's return value and not the
+    /// loop-carried state.
+    ///
+    /// NOT in this stage: `entry_scratch_out`, which moves the buffers back
+    /// into the driver, and the `drop(result)` on the guard-failure path. Both
+    /// run once by construction.
+    pub marshal_out: u16,
+    /// Extra passes of the same loop with NO stage in it: the counter, and the
+    /// one optimization barrier every stage's loop also carries. Subtracting it
+    /// is what leaves a stage's own cost rather than its cost plus the
+    /// machinery that made it repeat.
+    pub barrier: u16,
+}
+
+#[cfg(feature = "__back-edge-stage-probe")]
+impl BackEdgeStageRepeats {
+    fn pack(self) -> u64 {
+        (self.gate as u64)
+            | (self.marshal_in as u64) << 16
+            | (self.marshal_out as u64) << 32
+            | (self.barrier as u64) << 48
+    }
+
+    fn unpack(packed: u64) -> Self {
+        Self {
+            gate: packed as u16,
+            marshal_in: (packed >> 16) as u16,
+            marshal_out: (packed >> 32) as u16,
+            barrier: (packed >> 48) as u16,
+        }
+    }
+}
+
+/// The counts the next warm entry runs with, on every thread.
+///
+/// Process-wide rather than thread-local, for the reason the jitframe pool's
+/// arm is (`set_jitframe_pool`): what it selects is a strategy, not a state, and
+/// a harness flipping arms between two timed batches wants the flip to hold for
+/// whichever thread the next entry runs on.
+///
+/// Four counts packed into one word so the entry path takes exactly ONE relaxed
+/// load, which every arm pays and which therefore cancels out of the difference
+/// between two of them. There is no unseeded state and no environment gate to
+/// seed one from: all-zero is the shipping shape, and
+/// [`set_back_edge_stage_repeats`] is the only way out of it.
+#[cfg(feature = "__back-edge-stage-probe")]
+static BACK_EDGE_STAGE_REPEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A stage of the warm compiled entry that the probe can amplify.
+///
+/// The variants are the field order of [`BackEdgeStageRepeats`], and each one's
+/// discriminant is its slot in [`BACK_EDGE_STAGE_PASSES`]. `Barrier` is the arm
+/// the other three are differenced against.
+#[cfg(feature = "__back-edge-stage-probe")]
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum BackEdgeStage {
+    Gate = 0,
+    MarshalIn = 1,
+    MarshalOut = 2,
+    Barrier = 3,
+}
+
+#[cfg(feature = "__back-edge-stage-probe")]
+impl BackEdgeStage {
+    const COUNT: usize = 4;
+}
+
+/// Amplified passes actually executed, one slot per [`BackEdgeStage`].
+#[cfg(feature = "__back-edge-stage-probe")]
+static BACK_EDGE_STAGE_PASSES: [std::sync::atomic::AtomicU64; BackEdgeStage::COUNT] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Set the repeat counts for subsequent warm entries, answering what they were.
+///
+/// A setter and not a wrapper around one entry: the entry's whole cost is read
+/// through the frontend's own door, so the stages have to be read through it
+/// too, or the parts and the whole are about different doors.
+#[cfg(feature = "__back-edge-stage-probe")]
+pub fn set_back_edge_stage_repeats(repeats: BackEdgeStageRepeats) -> BackEdgeStageRepeats {
+    BackEdgeStageRepeats::unpack(
+        BACK_EDGE_STAGE_REPEATS.swap(repeats.pack(), std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Amplified passes since the process started, as
+/// `[gate, marshal_in, marshal_out, barrier]` — the field order of
+/// [`BackEdgeStageRepeats`].
+///
+/// The witness that an arm was REACHED. Two arms that ran the same code differ
+/// by nothing but the box, and a stage figure taken off such a pair describes
+/// the box; these counts are what tells the two cases apart without a clock.
+#[cfg(feature = "__back-edge-stage-probe")]
+pub fn back_edge_stage_passes() -> [u64; BackEdgeStage::COUNT] {
+    let read = |stage: BackEdgeStage| {
+        BACK_EDGE_STAGE_PASSES[stage as usize].load(std::sync::atomic::Ordering::Relaxed)
+    };
+    [
+        read(BackEdgeStage::Gate),
+        read(BackEdgeStage::MarshalIn),
+        read(BackEdgeStage::MarshalOut),
+        read(BackEdgeStage::Barrier),
+    ]
+}
+
+/// One relaxed load per warm entry. Both arms pay it.
+#[cfg(feature = "__back-edge-stage-probe")]
+#[inline]
+fn back_edge_stage_repeats() -> BackEdgeStageRepeats {
+    BackEdgeStageRepeats::unpack(BACK_EDGE_STAGE_REPEATS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Tally one call's worth of amplified passes for a stage.
+///
+/// Once per call rather than once per pass, and the barrier arm pays it too, so
+/// the read-modify-write cancels out of every stage's difference instead of
+/// being amplified `k`-fold into it.
+#[cfg(feature = "__back-edge-stage-probe")]
+#[inline]
+fn count_back_edge_stage_passes(stage: BackEdgeStage, repeats: u16) {
+    if repeats != 0 {
+        BACK_EDGE_STAGE_PASSES[stage as usize]
+            .fetch_add(repeats as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn format_rca_live_values(labels: Option<&[String]>, values: &[Value]) -> String {
     let mut out = String::new();
     for (idx, value) in values.iter().enumerate() {
@@ -4932,10 +5124,15 @@ impl<S: JitState> JitDriver<S> {
             self.arm_single_pass_label_entry_on_next_back_edge(state);
             self.discard_single_pass_resume();
             // A terminal dispatch return means the interpreted function has
-            // returned. The hook `break`s out of the native loop for it; the
-            // back edge's own spelling of that is the out-of-range position
-            // its caller assigns to `pc`, which fails the loop's `pc < len`.
-            if self.take_single_pass_finish() {
+            // returned, so the native dispatch loop must EXIT rather than
+            // resume at a position. `single_pass_finish` is how that is said,
+            // and it is deliberately left standing here for the caller to
+            // consume: the `#[jit_interp]` expansion of both markers reads it
+            // straight after the call and `break`s on it, which is the only
+            // exit a dispatch loop is required to have. The `usize::MAX`
+            // beside it is a position no program holds, so a caller that
+            // ignores the flag fails loudly instead of resuming somewhere.
+            if self.meta.single_pass_finish {
                 return Some(usize::MAX);
             }
             return Some(pc);
@@ -5074,6 +5271,15 @@ impl<S: JitState> JitDriver<S> {
         // `EnterJitAssembler` carries `:483`'s read past `maybe_compile_and_run`
         // and into the executor. The meta below is still fetched here because
         // its VALUE is needed, not just its presence.
+        // Read once per entry, ahead of every stage, so no stage's difference
+        // carries it. See [`BackEdgeStageRepeats`]; a default build has neither
+        // this load nor the loops it feeds.
+        #[cfg(feature = "__back-edge-stage-probe")]
+        let stage_repeats = back_edge_stage_repeats();
+        // Which shape the gate below takes, recorded before the token is moved
+        // into it, so the amplified gate can take the same one.
+        #[cfg(feature = "__back-edge-stage-probe")]
+        let carried_token = carried_procedure_token.is_some();
         if let Some(procedure_token) =
             carried_procedure_token.or_else(|| self.meta.entry_procedure_token(green_key))
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
@@ -5087,6 +5293,36 @@ impl<S: JitState> JitDriver<S> {
             if !state.is_compatible(&compiled_meta) {
                 self.meta.invalidate_loop(green_key);
                 return None;
+            }
+            // Stage E1, and the barrier the other stages are differenced
+            // against. The gate above has just run, so every consultation it
+            // makes is repeated here in the same order and under the same
+            // condition rather than being reordered into a shape the entry
+            // never takes.
+            #[cfg(feature = "__back-edge-stage-probe")]
+            {
+                count_back_edge_stage_passes(BackEdgeStage::Gate, stage_repeats.gate);
+                for _ in 0..stage_repeats.gate {
+                    let token = if carried_token {
+                        None
+                    } else {
+                        self.meta.entry_procedure_token(green_key)
+                    };
+                    let repeat_meta = self.meta.get_compiled_meta(green_key).cloned();
+                    let repeat_descriptor = self.driver_descriptor_for(state, &compiled_meta);
+                    let compatible = state.is_compatible(&compiled_meta);
+                    // Without this the four answers are dead and the loop
+                    // prices nothing.
+                    std::hint::black_box((token, repeat_meta, repeat_descriptor, compatible));
+                    std::hint::black_box(&mut *state);
+                }
+                // The same loop and the same barrier with no stage in them, so
+                // what the amplification itself costs is subtracted rather than
+                // reported as a stage.
+                count_back_edge_stage_passes(BackEdgeStage::Barrier, stage_repeats.barrier);
+                for _ in 0..stage_repeats.barrier {
+                    std::hint::black_box(&mut *state);
+                }
             }
             if !self.sync_before(state, &compiled_meta, vable) {
                 return None;
@@ -5104,6 +5340,49 @@ impl<S: JitState> JitDriver<S> {
             // order; state-extracted ones are in state-field order and have to be
             // mapped before a dispatch-key entry can use them.
             let values_are_label_ordered = direct_live_values.is_some();
+            // Stage E2, ahead of the shipping refill rather than after it: each
+            // pass ENDS with the clears `take_entry_scratch` performs, so the
+            // buffers the real extraction below fills are in exactly the state
+            // it would have found them in, whatever any pass answered.
+            #[cfg(feature = "__back-edge-stage-probe")]
+            if !values_are_label_ordered {
+                count_back_edge_stage_passes(BackEdgeStage::MarshalIn, stage_repeats.marshal_in);
+                for _ in 0..stage_repeats.marshal_in {
+                    let synced = self.sync_before(state, &compiled_meta, vable);
+                    state.extract_live_values_into(
+                        &compiled_meta,
+                        &mut scratch.live_values,
+                        &mut scratch.raw,
+                        &mut scratch.types,
+                    );
+                    let matched = Self::live_values_match_descriptor(
+                        descriptor.as_deref(),
+                        &scratch.live_values,
+                        state.state_field_layout().total_live_values(),
+                    );
+                    let extended = self.extend_compiled_live_values_into(
+                        green_key,
+                        state,
+                        &compiled_meta,
+                        vable,
+                        &mut scratch.live_values,
+                        &mut scratch.vable_static,
+                        &mut scratch.vable_arrays,
+                    );
+                    // Answered and not acted on: the shipping pass below takes
+                    // the decision, and a probe pass that declined would only
+                    // mean this stage cannot be amplified on this shape.
+                    std::hint::black_box((synced, matched, extended));
+                    std::hint::black_box(&mut *state);
+                    scratch.live_values.clear();
+                    scratch.raw.clear();
+                    scratch.types.clear();
+                    scratch.vable_static.clear();
+                    for array in &mut scratch.vable_arrays {
+                        array.clear();
+                    }
+                }
+            }
             if let Some(values) = direct_live_values {
                 scratch.live_values.extend(values);
             } else {
@@ -5263,6 +5542,21 @@ impl<S: JitState> JitDriver<S> {
                      typed_values={:?}",
                     result.is_finish, result.fail_index, result.typed_values
                 );
+            }
+
+            // Stage E4, before the arm split, so it prices one pair of calls
+            // rather than a different pair per outcome — and before the FINISH
+            // arm takes the exit values out from under it.
+            #[cfg(feature = "__back-edge-stage-probe")]
+            if result.is_finish || result.fail_index == u32::MAX {
+                count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
+                for _ in 0..stage_repeats.marshal_out {
+                    if !result.is_finish && !result.typed_values.is_empty() {
+                        state.restore_values(&result.meta, &result.typed_values);
+                    }
+                    self.sync_after(state, &result.meta, vable);
+                    std::hint::black_box(&mut *state);
+                }
             }
 
             if result.is_finish {
@@ -6519,6 +6813,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.set_on_guard_failure(f);
     }
 
+    /// Set a callback for swallowed compilation panics.
+    ///
+    /// `f` receives `(green_key)`. The tally this mirrors lives on the driver
+    /// and is otherwise readable only through [`Self::get_stats`], which a
+    /// process-global reader cannot window.
+    pub fn set_on_internal_compile_panic(&mut self, f: impl Fn(u64) + Send + 'static) {
+        self.meta.set_on_internal_compile_panic(f);
+    }
+
     /// Set a callback fired immediately before a call enters compiled code.
     /// `f` receives `(green_key, target_pc)`.
     ///
@@ -7061,6 +7364,17 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.meta.has_compiled_loop(green_key)
+    }
+
+    /// [`Self::has_compiled_loop`] with both flag reads removed, so an
+    /// amplified arm can price the cell lookup and the `Weak::upgrade`/drop
+    /// pair without them. A cost probe with a deliberately weaker answer than
+    /// the door's -- see `WarmState::probe_cell_token_upgrades`. Nothing may
+    /// route on it.
+    #[cfg(feature = "__yield-stage-probe")]
+    #[inline]
+    pub fn probe_cell_token_upgrades(&self, green_key: u64) -> bool {
+        self.meta.probe_cell_token_upgrades(green_key)
     }
 
     /// Whether the warm-entry runner can actually execute the code at this
@@ -9316,6 +9630,88 @@ mod tests {
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 1);
         assert_eq!(stats.bridges_compiled, 1);
+    }
+
+    /// A [`Census`](crate::embed::Census) reading must report the bridge while
+    /// the driver that compiled it is STILL ALIVE.
+    ///
+    /// The census counters are process-global and the bridge tally is not: it
+    /// lives on the driver. Reading it only out of drivers already handed to
+    /// `Census::absorb` is correct for a one-shot driver and reports zero
+    /// forever for a pool, which is the shape every real embedder has — and a
+    /// zero there is indistinguishable from "no bridge was compiled". So this
+    /// asserts the count with the driver held, and never absorbs it.
+    ///
+    /// It repeats the pipeline of the test above rather than sharing it,
+    /// because what is under test is the OTHER half: that `Census::install`
+    /// wires `set_on_compile_bridge` at all. A driver built by that test would
+    /// pass this one with the hook missing.
+    #[test]
+    fn test_census_counts_a_bridge_from_a_live_driver() {
+        use crate::embed::Census;
+
+        let mut driver = JitDriver::<TypedRestoreState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        Census::install(&mut driver);
+
+        let census = Census::begin();
+        assert_eq!(
+            census.counts().bridges_compiled,
+            0,
+            "the window opens before anything has compiled"
+        );
+
+        let key = 51u64;
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[1]),
+            BackEdgeAction::StartedTracing
+        ));
+        let sum = {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let c1 = ctx.const_int(1);
+            let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum], 0, 0);
+            ctx.set_fail_args(g, &[sum]);
+            sum
+        };
+        driver.meta.compile_loop(&[sum], ());
+        assert!(driver.has_compiled_loop(key));
+
+        let fail_index = 0u32;
+        assert!(driver.meta.start_retrace(key, fail_index, &[0]));
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing bridge");
+            let i0 = OpRef::input_arg_int(0);
+            let c2 = ctx.const_int(2);
+            ctx.record_op(OpCode::IntAdd, &[i0, c2]);
+        }
+        let trace_id = driver
+            .meta
+            .compiled_root_trace_id(key)
+            .expect("compiled loop should have a root trace_id");
+        assert_eq!(
+            driver
+                .meta
+                .close_bridge(key, trace_id, fail_index, &[OpRef::input_arg_int(0)]),
+            crate::pyjitpl::BridgeCompileResult::Compiled,
+        );
+
+        let counts = census.counts();
+        assert_eq!(
+            counts.bridges_compiled, 1,
+            "the driver is still alive and holds the only bridge tally: {counts}"
+        );
+        assert_eq!(
+            counts.bridges_compiled,
+            driver.get_stats().bridges_compiled,
+            "the callback count and the driver's own tally are the same number"
+        );
     }
 
     #[test]

@@ -7,9 +7,12 @@
 //! returning `*mut RBigInt`, exactly like the arithmetic residuals in
 //! [`crate::front::bigint_binop`].
 
-const RESIDUAL_MODULE: [&str; 2] = ["pyre_object", "longobject"];
-const RAISING_SCALAR_RESIDUAL_MODULE: [&str; 3] =
-    ["pyre_interpreter", "objspace", "descroperation"];
+const RESIDUAL_MODULE: [&str; 2] = [crate::runtime_names::crates::OBJECT, "longobject"];
+const RAISING_SCALAR_RESIDUAL_MODULE: [&str; 3] = [
+    crate::runtime_names::crates::INTERPRETER,
+    "objspace",
+    "descroperation",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScalarResult {
@@ -68,10 +71,14 @@ pub(crate) fn clone_residual_for_method(leaf: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(
-        ["pyre_object", "longobject", "jit_bigint_clone"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::OBJECT,
+            "longobject",
+            "jit_bigint_clone",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -94,10 +101,14 @@ pub(crate) fn long_box_residual_path(segments: &[String]) -> Option<Vec<String>>
         return None;
     }
     Some(
-        ["pyre_object", "longobject", "w_long_from_raw"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::OBJECT,
+            "longobject",
+            "w_long_from_raw",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -173,10 +184,15 @@ pub(crate) fn int_binop_residual_for_method(leaf: &str) -> Option<Vec<String>> {
         _ => return None,
     };
     Some(
-        ["pyre_interpreter", "objspace", "descroperation", residual]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -193,10 +209,15 @@ pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<Strin
         _ => return None,
     };
     Some(
-        ["pyre_interpreter", "objspace", "descroperation", residual]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -223,10 +244,15 @@ pub(crate) fn pow_nomod_residual_path(segments: &[String]) -> Option<Vec<String>
         return None;
     }
     Some(
-        ["pyre_interpreter", "objspace", "descroperation", residual]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -250,10 +276,15 @@ pub(crate) fn lshift_count_residual_path(segments: &[String]) -> Option<Vec<Stri
         return None;
     }
     Some(
-        ["pyre_interpreter", "objspace", "descroperation", residual]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -262,16 +293,19 @@ pub(crate) fn lshift_count_residual_path(segments: &[String]) -> Option<Vec<Stri
 /// pure residual so Malachite never enters the translated arithmetic graph.
 pub(crate) fn compiler_bigint_residual_path(segments: &[String]) -> Option<Vec<String>> {
     if !segments.ends_with(&[
-        "pyre_interpreter".to_string(),
+        crate::runtime_names::crates::INTERPRETER.to_string(),
         "compiler_bigint_to_rbigint".to_string(),
     ]) {
         return None;
     }
     Some(
-        ["pyre_interpreter", "jit_compiler_bigint_to_rbigint"]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "jit_compiler_bigint_to_rbigint",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -331,10 +365,15 @@ pub(crate) fn divmod_projection_residual_path(segments: &[String]) -> Option<Vec
         return None;
     }
     Some(
-        ["pyre_interpreter", "objspace", "descroperation", residual]
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
     )
 }
 
@@ -388,11 +427,19 @@ mod tests {
     fn maps_signed_and_unsigned_word_constructors() {
         assert_eq!(
             constructor_residual_path(&segs(&["rbigint", "RBigInt", "fromint"]), false),
-            Some(segs(&["pyre_object", "longobject", "jit_bigint_from_i64"]))
+            Some(segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "longobject",
+                "jit_bigint_from_i64"
+            ]))
         );
         assert_eq!(
             constructor_residual_path(&segs(&["rbigint", "RBigInt", "from"]), true),
-            Some(segs(&["pyre_object", "longobject", "jit_bigint_from_u64"]))
+            Some(segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "longobject",
+                "jit_bigint_from_u64"
+            ]))
         );
     }
 
@@ -412,21 +459,33 @@ mod tests {
     fn maps_only_the_exact_clone_method() {
         assert_eq!(
             clone_residual_for_method("clone"),
-            Some(segs(&["pyre_object", "longobject", "jit_bigint_clone"]))
+            Some(segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "longobject",
+                "jit_bigint_clone"
+            ]))
         );
         assert!(clone_residual_for_method("clone_from").is_none());
     }
 
     #[test]
     fn maps_translated_long_boxing_to_pointer_abi() {
-        let expected = segs(&["pyre_object", "longobject", "w_long_from_raw"]);
+        let expected = segs(&[
+            crate::runtime_names::crates::OBJECT,
+            "longobject",
+            "w_long_from_raw",
+        ]);
         for leaf in [
             "w_long_new",
             "w_long_new_fresh_rbigint_handle",
             "box_bigint_constant",
         ] {
             assert_eq!(
-                long_box_residual_path(&segs(&["pyre_object", "longobject", leaf])),
+                long_box_residual_path(&segs(&[
+                    crate::runtime_names::crates::OBJECT,
+                    "longobject",
+                    leaf
+                ])),
                 Some(expected.clone())
             );
         }
@@ -434,7 +493,14 @@ mod tests {
             long_box_residual_path(&segs(&["other", "longobject", "w_long_new"])).is_some(),
             "crate prefix is intentionally irrelevant; module/leaf and exact argument type identify the call"
         );
-        assert!(long_box_residual_path(&segs(&["pyre_object", "other", "w_long_new"])).is_none());
+        assert!(
+            long_box_residual_path(&segs(&[
+                crate::runtime_names::crates::OBJECT,
+                "other",
+                "w_long_new"
+            ]))
+            .is_none()
+        );
     }
 
     #[test]
@@ -442,14 +508,22 @@ mod tests {
         assert_eq!(
             scalar_residual_for_method("get_sign"),
             Some((
-                segs(&["pyre_object", "longobject", "jit_bigint_sign_i64"]),
+                segs(&[
+                    crate::runtime_names::crates::OBJECT,
+                    "longobject",
+                    "jit_bigint_sign_i64"
+                ]),
                 ScalarResult::Int
             ))
         );
         assert_eq!(
             scalar_residual_for_method("is_zero"),
             Some((
-                segs(&["pyre_object", "longobject", "jit_bigint_is_zero"]),
+                segs(&[
+                    crate::runtime_names::crates::OBJECT,
+                    "longobject",
+                    "jit_bigint_is_zero"
+                ]),
                 ScalarResult::Bool
             ))
         );
@@ -457,7 +531,7 @@ mod tests {
             scalar_residual_for_method("bit_length"),
             Some((
                 segs(&[
-                    "pyre_interpreter",
+                    crate::runtime_names::crates::INTERPRETER,
                     "objspace",
                     "descroperation",
                     "jit_bigint_bit_length",
@@ -481,7 +555,7 @@ mod tests {
             assert_eq!(
                 int_binop_residual_for_method(method),
                 Some(segs(&[
-                    "pyre_interpreter",
+                    crate::runtime_names::crates::INTERPRETER,
                     "objspace",
                     "descroperation",
                     residual,
@@ -505,7 +579,7 @@ mod tests {
             assert_eq!(
                 int_comparison_residual_for_method(method),
                 Some(segs(&[
-                    "pyre_interpreter",
+                    crate::runtime_names::crates::INTERPRETER,
                     "objspace",
                     "descroperation",
                     residual,
@@ -520,13 +594,13 @@ mod tests {
     fn maps_nomod_pow_result_seam_to_pointer_abi() {
         assert_eq!(
             pow_nomod_residual_path(&segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "bigint_pow_nomod",
             ])),
             Some(segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "jit_bigint_pow_nomod",
@@ -537,13 +611,13 @@ mod tests {
         );
         assert_eq!(
             pow_nomod_residual_path(&segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "bigint_int_pow_nomod",
             ])),
             Some(segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "jit_bigint_int_pow_nomod",
@@ -555,13 +629,13 @@ mod tests {
     fn maps_lshift_result_seam_to_pointer_abi() {
         assert_eq!(
             lshift_count_residual_path(&segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "bigint_lshift_count",
             ])),
             Some(segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "jit_bigint_lshift_count",
@@ -569,13 +643,13 @@ mod tests {
         );
         assert_eq!(
             lshift_count_residual_path(&segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "bigint_lshift_int_int_result",
             ])),
             Some(segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "objspace",
                 "descroperation",
                 "jit_bigint_lshift_int_int_result",
@@ -591,11 +665,11 @@ mod tests {
     fn maps_only_the_compiler_bigint_conversion_seam() {
         assert_eq!(
             compiler_bigint_residual_path(&segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "compiler_bigint_to_rbigint",
             ])),
             Some(segs(&[
-                "pyre_interpreter",
+                crate::runtime_names::crates::INTERPRETER,
                 "jit_compiler_bigint_to_rbigint",
             ]))
         );
@@ -614,13 +688,13 @@ mod tests {
         ] {
             assert_eq!(
                 divmod_projection_residual_path(&segs(&[
-                    "pyre_interpreter",
+                    crate::runtime_names::crates::INTERPRETER,
                     "objspace",
                     "descroperation",
                     source,
                 ])),
                 Some(segs(&[
-                    "pyre_interpreter",
+                    crate::runtime_names::crates::INTERPRETER,
                     "objspace",
                     "descroperation",
                     residual,

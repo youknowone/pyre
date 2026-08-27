@@ -235,8 +235,13 @@ comment at the site citing both sides.
 
 ## Before committing
 
-- `cargo test --all --features dynasm`. The feature flag is mandatory: without it
-  `majit-metainterp` emits `compile_error!` and every error after it is noise.
+- `cargo test --all --no-default-features --features dynasm`. Both halves matter.
+  `--features dynasm` selects a backend; `--no-default-features` is what keeps the
+  selection consistent across crates. With default features on, the workspace's
+  example interpreters default to `cranelift` and supply it to the one shared
+  `majit-metainterp`, while `pyre-jit` compiles in its dynasm registrations — so
+  the binary dispatches through one backend and holds the other's hooks. Nothing
+  emits an error; the tests simply run against a mismatched pair.
 - `python3 pyre/check.py` — every backend the host can build. A perf regression
   is a finding to explain, not an automatic veto: if the slower code is the
   line-by-line port and the faster was a shortcut, **the port stands** — record

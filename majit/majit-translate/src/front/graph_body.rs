@@ -133,7 +133,7 @@ fn borrowed(rows: &[(String, i64)]) -> Vec<(&str, i64)> {
 mod tests {
     use super::*;
 
-    const CORPUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
+    const CORPUS: &str = crate::runtime_names::artifacts::CHARON_CORPUS_ULLBC;
 
     /// Rewrite every `id: N` in `s` to the position at which that id was
     /// first seen across the graph, so two lowerings that differ only in

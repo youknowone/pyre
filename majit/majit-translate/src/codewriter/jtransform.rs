@@ -3878,8 +3878,9 @@ impl<'a> Transformer<'a> {
         // from its erasure than from its downcast, so it folds the same
         // way: the operand alias, no jitcode op.
         if let CallTarget::FunctionPath { segments } = target
-            && ((segments.len() == 2 && segments[0] == "__cast_instance_intrinsic")
-                || (segments.len() == 1 && segments[0] == "__cast_address_intrinsic"))
+            && ((segments.len() == 2 && segments[0] == crate::runtime_names::shims::CAST_INSTANCE)
+                || (segments.len() == 1
+                    && segments[0] == crate::runtime_names::shims::CAST_ADDRESS))
             && args.len() == 1
         {
             return RewriteResult::Identity(args[0].clone());
@@ -10931,7 +10932,7 @@ mod tests {
 
         let mut cc = CallControl::new();
         cc.setup_jitdriver(
-            CallPath::from_segments(["jit_artifact", "other_portal"]),
+            CallPath::from_segments([crate::runtime_names::crates::JIT, "other_portal"]),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -10940,7 +10941,8 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let portal_graph = CallPath::from_segments(["jit_artifact", "eval_loop_jit"]);
+        let portal_graph =
+            CallPath::from_segments([crate::runtime_names::crates::JIT, "eval_loop_jit"]);
         cc.setup_jitdriver(
             portal_graph.clone(),
             vec![
@@ -11952,7 +11954,7 @@ mod tests {
     fn ptr_null_builtin_rewrites_to_null_ref_constant() {
         for path in [
             vec!["core", "ptr", "null_mut"],
-            vec!["pyre_object", "pyobject", "PY_NULL"],
+            vec![crate::runtime_names::crates::OBJECT, "pyobject", "PY_NULL"],
         ] {
             let config = GraphTransformConfig::default();
             let mut graph = FunctionGraph::new("ptr_null_constant");

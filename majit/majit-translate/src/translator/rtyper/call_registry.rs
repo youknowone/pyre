@@ -1251,7 +1251,10 @@ mod tests {
             signature(&["self"]),
         );
         let resolved = registry
-            .lookup_with_leaf_match(&FunctionPathKey::from_segments(["pyre_object", "is_none"]))
+            .lookup_with_leaf_match(&FunctionPathKey::from_segments([
+                crate::runtime_names::crates::OBJECT,
+                "is_none",
+            ]))
             .expect("free-fn-shape query must resolve via leaf-match");
         assert!(
             Rc::ptr_eq(&resolved, &free_fn),
@@ -1273,8 +1276,10 @@ mod tests {
             FunctionPathKey::from_segments(["resoperation", "OpRef", "is_none"]),
             signature(&["self"]),
         );
-        let resolved = registry
-            .lookup_with_leaf_match(&FunctionPathKey::from_segments(["pyre_object", "is_none"]));
+        let resolved = registry.lookup_with_leaf_match(&FunctionPathKey::from_segments([
+            crate::runtime_names::crates::OBJECT,
+            "is_none",
+        ]));
         assert!(
             resolved.is_none(),
             "free-fn-shape query must NOT silently latch onto an impl-method \

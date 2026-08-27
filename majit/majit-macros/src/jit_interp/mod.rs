@@ -1785,13 +1785,143 @@ pub fn transform_jit_interp(config: JitInterpConfig, func: ItemFn) -> TokenStrea
     let trace_fn = codegen_trace::generate_trace_fn(&config, &func);
     let state_impl = codegen_state::generate_jit_state(&config, &func);
     let merge_wrapper = generate_merge_wrapper(&config, &func);
+    let green_key_fn = generate_green_key_fn(&config, &func);
     let transformed_fn = transform_function(&config, &func);
 
     quote! {
         #state_impl
         #trace_fn
         #merge_wrapper
+        #green_key_fn
         #transformed_fn
+    }
+}
+
+/// Emit `__majit_green_key_<fn>`, which builds the key a merge point of this
+/// interpreter files under, for a caller OUTSIDE the mainloop.
+///
+/// A door that wants to ask whether some position is already compiled has to
+/// name that position the way the merge point names it. Without this builder
+/// the door has to write the layout out by hand: seed, one `green_uhash_step`
+/// per slot, in the order `[target, ..greens]` with the pc substituted into the
+/// greens. `majit_ir::pypyjit_greenkey` is the same function hard-coded for one
+/// consumer's three greens, so a consumer with a different green list cannot
+/// reach it; its own documentation says why open-coding the layout is a hazard
+/// — "a swapped slot still hashes to something, just not to the same cell".
+///
+/// The failure is silent and total: the door files under a key nothing else
+/// can name, so its probe answers no forever and the artifact it was guarding
+/// is never entered. Nothing counts it, because a tier that never enters
+/// compiled code still returns the right answers.
+///
+/// Emitted only where it can be spelled without guessing:
+///
+/// * Every green must be a plain identifier. The helper's parameters ARE those
+///   identifiers, so an expression green has no name to take, and passing the
+///   expression's value positionally would reintroduce the ordering hazard this
+///   exists to remove.
+/// * No green may carry a type tag. A tagged green lowers through an explicit
+///   cast (`(#expr) as i64`), which does not compile against the generic
+///   parameter the untagged path takes.
+///
+/// Where either does not hold, no helper appears and a consumer keeps whatever
+/// it does today — this adds a way to be right, it does not take one away.
+///
+/// The greens are the attribute's, so this describes the DEFAULT layout. A
+/// merge point that overrides `greens` in its own marker args is not described
+/// by it.
+fn generate_green_key_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
+    if !config.greens_declared || config.greens.is_empty() {
+        return quote! {};
+    }
+    if config.green_type_tags.iter().any(Option::is_some) {
+        return quote! {};
+    }
+    let ident_of = |expr: &Expr| -> Option<Ident> {
+        match expr {
+            Expr::Path(path)
+                if path.qself.is_none()
+                    && path.attrs.is_empty()
+                    && path.path.segments.len() == 1
+                    && path.path.segments[0].arguments.is_none() =>
+            {
+                Some(path.path.segments[0].ident.clone())
+            }
+            _ => None,
+        }
+    };
+    let Some(greens) = config
+        .greens
+        .iter()
+        .map(&ident_of)
+        .collect::<Option<Vec<Ident>>>()
+    else {
+        return quote! {};
+    };
+
+    // The marker's own position argument leads, then each declared green with
+    // the arming position substituted for `pc` — the same list
+    // `green_key_expr` folds at the merge point, and in the same order. Here
+    // the target IS the pc, so the substitution is the identity and a green
+    // spelled `pc` simply names the leading parameter a second time.
+    let pc: Ident = syn::parse_quote!(pc);
+    let slots: Vec<Ident> = std::iter::once(pc.clone()).chain(greens).collect();
+
+    // One parameter per DISTINCT slot, in first-appearance order. A green that
+    // repeats — `greens = [pc, program]` is the common case, and its slot list
+    // is `[pc, pc, program]` — is read twice from one argument rather than
+    // asked for twice, which is what `Copy` is for.
+    let mut params: Vec<Ident> = Vec::new();
+    for slot in &slots {
+        if !params.contains(slot) {
+            params.push(slot.clone());
+        }
+    }
+
+    // A green that names one of the mainloop's own parameters is typed as that
+    // parameter, not generically. It matters most for the case it was written
+    // for: a `Ref` green keys on POINTER IDENTITY, so a door holding the same
+    // bytes under a different reference type — `&Vec<u8>` where the mainloop
+    // took `&[u8]` — hashes to a different cell and probes forever for a key
+    // nothing files under. A concrete parameter makes that a type error at the
+    // door instead. Greens that name a local (`pc`, usually) have no declared
+    // type to take and stay generic.
+    let declared_ty = |name: &Ident| -> Option<syn::Type> {
+        func.sig.inputs.iter().find_map(|arg| match arg {
+            syn::FnArg::Typed(pat) => match &*pat.pat {
+                syn::Pat::Ident(id) if id.ident == *name => Some((*pat.ty).clone()),
+                _ => None,
+            },
+            syn::FnArg::Receiver(_) => None,
+        })
+    };
+    let param_decls: Vec<TokenStream> = params
+        .iter()
+        .map(|name| match declared_ty(name) {
+            Some(ty) => quote! { #name: #ty },
+            None => quote! { #name: impl majit_ir::GreenAsI64 + ::core::marker::Copy },
+        })
+        .collect();
+
+    let fn_name = quote::format_ident!("__majit_green_key_{}", func.sig.ident);
+    let n = slots.len();
+    quote! {
+        #[doc(hidden)]
+        #[allow(non_snake_case)]
+        pub fn #fn_name(
+            #(#param_decls),*
+        ) -> (u64, [(i64, majit_ir::GreenType); #n]) {
+            let __slots = [
+                #(<_ as majit_ir::GreenAsI64>::__green_repr(#slots)),*
+            ];
+            let mut __hash: u64 = majit_ir::GREEN_UHASH_SEED;
+            let mut __i = 0usize;
+            while __i < #n {
+                __hash = majit_ir::green_uhash_step(__hash, __slots[__i].1, __slots[__i].0);
+                __i += 1;
+            }
+            (__hash, __slots)
+        }
     }
 }
 
@@ -2833,6 +2963,11 @@ fn rewrite_body(
 
     struct MarkerRewriter {
         merge_fn_name: Ident,
+        /// Whether this body's `jit_merge_point!` carries the `; state`
+        /// single-executor close. `take_single_pass_finish` is set only by that
+        /// machinery, so it is also what decides whether the back edge below
+        /// has a terminal-return exit to emit.
+        single_pass_close: bool,
         default_greens: Vec<Expr>,
         /// Whether the attribute spelled a `greens` key. `default_greens` being
         /// empty does not answer this: an omitted key and `greens = []` both
@@ -2931,13 +3066,13 @@ fn rewrite_body(
                                         &mut #state,
                                     );
                                     // Push the walk-final loop-carried virt-array
-                                    // element values into native `state` too. The
-                                    // walk mutates the array on the trace-ctx
-                                    // shadow only; native `state`'s array is
-                                    // frozen at trace-start (synchronize_
-                                    // virtualizable skips the RustVec write-back
-                                    // during tracing). Without this the compiled-
-                                    // loop seed (extract_live reads native state)
+                                    // element values into native `state` too. A
+                                    // field embedding a Rust `Vec` by value is
+                                    // carved out of `synchronize_virtualizable`,
+                                    // so its array stays frozen at trace-start
+                                    // and this is its only writer; without it the
+                                    // compiled-loop seed (extract_live reads
+                                    // native state)
                                     // reflects the trace-start array and the loop
                                     // re-executes the peeled iteration, double-
                                     // firing any side-effecting residual. No-op
@@ -3221,10 +3356,38 @@ fn rewrite_body(
                                     #driver_expr.back_edge(#target_expr, #state_expr, #env_expr, #pre_run_expr)
                                 }
                             };
+                            // The back edge's spelling of the
+                            // `jit_merge_point!` hook's terminal-return exit. A
+                            // guard that bridges enters the walk at the guard's
+                            // own position, so the walk reaches the interpreted
+                            // function's return here just as it can at a merge
+                            // point; the position reported alongside names
+                            // nothing to resume at, and assigning it to
+                            // `#pc_expr` decodes an out-of-range index in any
+                            // dispatch loop not bottom-tested on its program
+                            // length.
+                            //
+                            // Emitted only for a body whose merge point carries
+                            // `; state`, because only that machinery ever sets
+                            // the flag. A bare `jit_merge_point!()` body would
+                            // get a `break` that can never be taken, and a bare
+                            // `break` gives an expression-position dispatch
+                            // `loop` the type `()` — so an unconditional
+                            // emission stops such a body from compiling at all.
+                            let single_pass_finish_exit: TokenStream = if self.single_pass_close {
+                                quote! {
+                                    if #driver_expr.take_single_pass_finish() {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                TokenStream::new()
+                            };
                             let back_edge: TokenStream = quote! {
                                 {
                                     let __back_edge_resume = #call;
                                     #finish_drain
+                                    #single_pass_finish_exit
                                     if let Some(__resume_pc) = __back_edge_resume {
                                         #pc_expr = __resume_pc;
                                         continue;
@@ -3250,8 +3413,35 @@ fn rewrite_body(
     }
 
     let mut cloned_block = block.clone();
+    // Whether any `jit_merge_point!` in this body carries `; state`. Read
+    // before the rewrite because the back edge and the merge point are separate
+    // statements visited in source order, and a dispatch loop reaches its back
+    // edge inside an opcode arm that can precede the merge point in the tree.
+    struct SinglePassCloseScan {
+        found: bool,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for SinglePassCloseScan {
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            let path_str = mac
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if path_str == "jit_merge_point" || path_str.ends_with("::jit_merge_point") {
+                let args = syn::parse2::<MergePointArgs>(mac.tokens.clone()).unwrap_or_default();
+                self.found |= args.state.is_some();
+            }
+            syn::visit::visit_macro(self, mac);
+        }
+    }
+    let mut scan = SinglePassCloseScan { found: false };
+    syn::visit::Visit::visit_block(&mut scan, &cloned_block);
+
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
+        single_pass_close: scan.found,
         default_greens: default_greens.to_vec(),
         greens_declared,
         default_green_type_tags: default_green_type_tags.to_vec(),

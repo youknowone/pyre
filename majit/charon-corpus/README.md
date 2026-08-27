@@ -81,7 +81,8 @@ out in issue #97:
 
 The corpus also includes a header-first object model. These functions pin
 lowering decisions that otherwise fail by leaving a residual call or an
-untyped field access rather than raising an error:
+untyped field access rather than raising an error, so each is pinned by an
+assertion in `majit-translate/tests/test_mir_frontend.rs`:
 
 | Function              | Premise it pins                                       |
 |-----------------------|-------------------------------------------------------|
@@ -97,11 +98,23 @@ only data field is `typeptr`. The two-word allocation can fuse when its
 allocation can fuse from its declared layout because no class word exists to
 disagree with the type pointer.
 
+Both shapes are carried because `resolve_header_plan` has an arm for each, and
+a corpus holding only the two-word shape can never reach the second: the match
+lands on the stored `w_class` before `header_declares_no_class_word` is
+consulted.
+
 The fixture's `object_model::get_instantiate` helper pins the single-argument
 class-lookup contract recognized by `model.rs`. The one-word header does not
 use this helper. `_immutable_fields_W_IntObject` preserves the marker shape
-harvested by `front::llbc_hints`.
+harvested by `front::llbc_hints`; `lower_function` runs upstream of that
+consumer, so no assertion in `test_mir_frontend.rs` covers it. Every other
+identity in the corpus is named after no host, so a fixture cannot tell a
+general recogniser apart from one conformed to a particular host.
 
+`corpus.ullbc` is regenerated in place whenever this fixture is edited, and it
+embeds the source verbatim, so counts taken against an older artefact — op
+censuses, lowered-graph totals, local-fn counts — are not comparable across a
+regeneration. Re-measure rather than subtract.
 
 ## Findings
 

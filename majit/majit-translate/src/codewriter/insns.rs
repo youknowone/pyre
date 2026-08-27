@@ -401,6 +401,29 @@ pub const BC_INT_ADD_JUMP_IF_OVF: u8 = 231;
 pub const BC_INT_SUB_JUMP_IF_OVF: u8 = 232;
 pub const BC_INT_MUL_JUMP_IF_OVF: u8 = 233;
 
+// pyre-only `arraybase_vable/rdd>i` — the address of item 0 of a
+// virtualizable array field, as an integer.  Argcode and operand layout are
+// the same `rdd>i` triple as its sibling `arraylen_vable` (BC_ARRAYLEN_VABLE =
+// 74), so `read_vable_arraylen` decodes both.
+//
+// Nothing emits this opcode. It is defined, decoded, walked, and wired into the
+// blackhole, but it is not a working feature.
+// The only intended emitter is a `#[jit_interp]` macro lowering for
+// `state.<varr>.as_mut_ptr()`, which is deliberately held back: with it
+// applied, tl's `jit_residual_not_double_executed` runs the ROLL residual 7
+// times where the program contains 40, and returns 17 where the interpreter
+// returns 0. The remaining resume-position defect must be fixed before adding
+// the emitter.
+//
+// RPython has no counterpart, and the reason is the interesting part: upstream
+// never needs the base as a *value* because every `*_vable` op resolves it
+// internally from `(fdescr, adescr)` off the live virtualizable.  The op exists
+// only to hand that address to a residual call, which is an escape — the callee
+// can permute items that are the trace's own SSA values.  Executing it
+// therefore also marks the current `TraceCtx` as escaped, and the enclosing
+// CALL_MAY_FORCE aborts with ABORT_ESCAPE before the trace reaches a backend.
+pub const BC_ARRAYBASE_VABLE: u8 = 234;
+
 // `switch/id` — RPython `blackhole.py` `bhimpl_switch` —
 // table-of-cases dispatch keyed by an int register + a descr selecting
 // the case table.
@@ -1275,6 +1298,13 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // pyre's Rust port hits this only on `dyn Trait` calls, where the
     // backend epic must look up the vtable slot itself.
     m.insert("vtable_method_ptr/rd>i", BC_VTABLE_METHOD_PTR);
+    // pyre-only `arraybase_vable/rdd>i` — address of item 0 of a
+    // virtualizable array field.  Registered here rather than in
+    // `wellknown_bh_insns` beside `arraylen_vable` because RPython has no
+    // such op: upstream resolves the base inside each `*_vable` op and never
+    // materialises it as a value.  See [`BC_ARRAYBASE_VABLE`] for why
+    // producing it is by definition an escape.
+    m.insert("arraybase_vable/rdd>i", BC_ARRAYBASE_VABLE);
     m
 }
 

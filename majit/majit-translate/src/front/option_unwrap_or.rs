@@ -147,7 +147,8 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
                     result_ty,
                 },
                 Some(narrowed),
-            ) if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+            ) if segments.first().map(String::as_str)
+                == Some(crate::runtime_names::shims::CAST_INSTANCE)
                 && args.as_slice() == std::slice::from_ref(&site.result_var) =>
             {
                 (Some((segments.clone(), result_ty.clone())), narrowed)
@@ -507,7 +508,10 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.into(),
+                            "PyObject".into(),
+                        ],
                     },
                     args: vec![result.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -546,7 +550,7 @@ mod tests {
             .flat_map(|blk| &blk.operations)
             .filter(|op| {
                 matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic"))
+                    if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE))
             })
             .count();
         assert_eq!(arm_casts, 2, "each diamond arm narrows its payload");

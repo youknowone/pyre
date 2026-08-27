@@ -117,6 +117,13 @@ cover the condition they diagnose.
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_DECLINE_LOG`
+
+- Read sites: 1 — `majit/majit-translate/src/decline.rs`
+- Accessor: `level()`
+- What it does: Census of the lowering gates' silent declines. Unset, `0`, or empty disables it; any other value counts declines per (gate, reason) and prints runtime reasons; `2` additionally prints one line per decline event. `MAJIT_MIR_FRONTEND_DEBUG` is accepted as an alias at the counter level.
+- Retirement condition: retire when the decline counts are no longer needed to steer cel lowering coverage.
+
 ### `MAJIT_DIAG`
 
 - Read sites: 1 — `majit/majit-metainterp/src/lib.rs`
@@ -140,8 +147,8 @@ cover the condition they diagnose.
 
 ### `MAJIT_DUMP_CLIF`
 
-- Read sites: 2 — `majit/majit-backend-cranelift/src/compiler.rs`
-- Accessor: read inline in `do_compile()`, at both sites
+- Read sites: 4 — `majit/majit-backend-cranelift/src/compiler.rs`
+- Accessor: read inline in `do_compile()`, at all four sites — two for the trace body, two for the host-callable entry wrapper
 - What it does: **UNRECORDED** — no doc comment at the read site.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
@@ -170,7 +177,7 @@ cover the condition they diagnose.
 
 - Read sites: 2 — `majit/majit-ir/src/descr.rs`, `pyre/pyre-jit-trace/build.rs`
 - Accessor: `field_mint_trace_enabled()`; the build script also declares it as a rerun input and bypasses its code-generation cache while enabled
-- What it does: Setting it to `1` prints descriptor-mint disagreements and keeps the analyzer live so those diagnostics cannot be hidden by a restored artifact cache. Unset is inert.
+- What it does: Setting it to `1` prints field-descriptor mint disagreements (`cache_hit_disagree`, `ei_descr_mint_disagree`) and keeps the analyzer live so those diagnostics cannot be hidden by a restored artifact cache. Unset is inert.
 - Retirement condition: Remove when field and size descriptor identity no longer has fallback or disagreement paths to diagnose.
 
 ### `MAJIT_FIELD_POS_UNRESOLVED`
@@ -251,6 +258,13 @@ cover the condition they diagnose.
 - Accessor: `majit_j2plan_log_enabled()`; also read inline in `_assemble()`
 - What it does: Whether `MAJIT_J2PLAN_LOG` is set, cached at first access.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
+
+### `MAJIT_JITFRAME_POOL`
+
+- Read sites: 1 — `majit/majit-backend/src/deadframe.rs`
+- Accessor: `seed_jitframe_pool_arm()`, behind `jitframe_pool_enabled()`
+- What it does: Selects which arm allocates the jitframe a compiled entry runs on, for backends that build frames out of the Rust heap rather than the GC nursery. `0` selects `FrameHeapOwner::OWNED`, one `calloc`/`free` pair per entry; anything else, including leaving it unset, selects the pooled per-thread free list. Read once and latched, so it names a strategy for the process rather than a per-entry state; `set_jitframe_pool` overrides it for a harness that can call in.
+- Retirement condition: when the owned arm is retired — it exists to be differenced against the pooled one, and a build with no second arm has nothing to select.
 
 ### `MAJIT_LEAF3_PROV`
 
@@ -411,7 +425,7 @@ cover the condition they diagnose.
 
 - Read sites: 2 — `majit/majit-translate/src/lib.rs`, `pyre/pyre-jit-trace/build.rs`
 - Accessor: `struct_layout_census_enabled()`; the build script also declares it as a rerun input and bypasses its code-generation cache while enabled
-- What it does: Setting it to `1` reports structure IDs that resolve to multiple spellings or conflicting concrete layouts during translation. Unset is inert.
+- What it does: Setting it to `1` reports structure IDs that resolve to multiple spellings or conflicting concrete layouts during translation, as `conflict`, `variant` and `summary` lines. Unset is inert.
 - Retirement condition: Remove when one structure ID cannot collect conflicting layouts by construction.
 
 ### `MAJIT_TLDBG`

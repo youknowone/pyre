@@ -296,7 +296,6 @@ pub fn w_number_add(a: *mut ObjectHeader, b: *mut ObjectHeader) -> i64 {
 #[allow(non_upper_case_globals)]
 pub const _immutable_fields_W_IntObject: &str = "intval";
 
-
 // A host-registered callback table.
 
 /// The callback a host installs at run time. A bare `fn` pointer, so the set
@@ -325,6 +324,84 @@ pub fn host_registry_dispatch(reg: &HostRegistry, x: i64) -> i64 {
 pub fn host_registry_dispatch_optional(reg: &HostRegistry, x: i64) -> i64 {
     match reg.maybe_slot {
         Some(f) => f(x),
+        None => 0,
+    }
+}
+
+// 9. An array whose element is a by-value aggregate.
+//
+// `v[i]` on a `Vec<T>` with a scalar subscript resolves to
+// `<Vec<T> as Index<usize>>::index`, which `front::mir`'s
+// `is_vec_index_call` (`vec_index_regular_leaf`) intercepts: the call site
+// lowers eagerly to an `ArrayRead` and records an `IndexElemAlias` for the
+// paired write and for the projections off the element, leaving no residual
+// call. That arm gates on the *index* type and never on the *element* type —
+// `item_ty` is whatever `tyref_deref_value_type(call.dest.ty)` answers — so
+// the element bank it produces for a multi-word by-value ADT is decided by
+// `tyref_to_value_type`'s fallback rather than by a deliberate arm.
+//
+// `SlotValue` carries an integer variant, a raw-pointer variant and a
+// two-field variant. None of the three leaves a niche free, so the enum is a
+// genuine tag-plus-payload aggregate several words wide and not a wrapper the
+// front end can collapse to its inner bank (`tyref_transparent_inner_value_type`,
+// `tyref_is_fieldless_enum_free`).
+//
+// The fallback bank is `ValueType::Ref(None)`, the `Vec` leg ships no
+// `array_type_id`, and `arraydescrof_concrete` therefore hands the read a
+// one-word `item_size`. The index spelling is UNSOUND over this element type —
+// see `an_aggregate_element_array_read_is_given_a_one_word_item_size` in
+// `majit-translate/tests/test_mir_frontend.rs` for the full chain. These four
+// functions are what witnesses it.
+pub enum SlotValue {
+    Int(i64),
+    Object(*const ObjectHeader),
+    Pair { lhs: i64, rhs: i64 },
+}
+
+/// The treatment: read one element by scalar index and match it. The
+/// discriminant read and the per-variant payload reads all land on the
+/// `ArrayRead` result, so this is the shape that says whether the alias
+/// projections carry an aggregate element. They do not — this is the spelling
+/// whose descr strides by one word, not a spelling to copy.
+#[inline(never)]
+pub fn aggregate_slot_index(v: &Vec<SlotValue>, i: usize) -> i64 {
+    match &v[i] {
+        SlotValue::Int(x) => *x,
+        SlotValue::Object(h) => unsafe { (*(**h).ob_type).kind as i64 },
+        SlotValue::Pair { lhs, rhs } => *lhs + *rhs,
+    }
+}
+
+/// The control: the same body over `<[T]>::get`, reached by deref coercion
+/// from the `Vec`. Its `Option<&SlotValue>` destination is what
+/// `recognize_slice_get_site` accepts or declines, so the call either becomes
+/// `front::slice_get`'s bounds-checked diamond or stays residual — either way
+/// it is a different lowering from the index arm. If it is not, the pair
+/// discriminates nothing and neither function grades the index arm. Given the
+/// index arm's descr, the residual outcome is also the *safe* one: real Rust
+/// keeps computing the element address at the real stride.
+#[inline(never)]
+pub fn aggregate_slot_get(v: &Vec<SlotValue>, i: usize) -> i64 {
+    match v.get(i) {
+        Some(SlotValue::Int(x)) => *x,
+        Some(SlotValue::Object(h)) => unsafe { (*(**h).ob_type).kind as i64 },
+        Some(SlotValue::Pair { lhs, rhs }) => *lhs + *rhs,
+        None => 0,
+    }
+}
+
+/// The same two spellings over an element bank the index arm is already
+/// known to serve, so a difference between the two pairs is attributable to
+/// the element kind and not to the fixture.
+#[inline(never)]
+pub fn scalar_slot_index(v: &Vec<i64>, i: usize) -> i64 {
+    v[i]
+}
+
+#[inline(never)]
+pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
+    match v.get(i) {
+        Some(x) => *x,
         None => 0,
     }
 }

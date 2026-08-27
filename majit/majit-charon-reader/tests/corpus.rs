@@ -30,7 +30,8 @@ fn loads_fixture_corpus() {
     // `w_new_type_only_int`, `w_number_add`, `w_int_add`,
     // `lltype::malloc_typed`, the fixture's `object_model::get_instantiate`, and
     // the initializer bodies for `INT_CLASS`, `DOUBLE_CLASS`, and
-    // `_immutable_fields_W_IntObject`.
+    // `_immutable_fields_W_IntObject` — a `static`/`const` carries its
+    // initializer as a function body, so it lands in `iter_local_fns` too.
     //
     // + 2 for the host-registered callback table: `host_registry_dispatch`
     // and `host_registry_dispatch_optional`. `HostCallback` is a type alias,
@@ -38,7 +39,11 @@ fn loads_fixture_corpus() {
     //
     // + 2 for the iterator element-kind pair, `slice_of_refs_sum` and
     // `array_of_refs_sum`.
-    assert_eq!(local_count, 26, "26 local fns expected");
+    //
+    // + 4 for the aggregate-element array read and its controls:
+    // `aggregate_slot_index`, `aggregate_slot_get`, `scalar_slot_index` and
+    // `scalar_slot_get`. `SlotValue` is a type, so it contributes no body.
+    assert_eq!(local_count, 30, "30 local fns expected");
 }
 
 #[test]

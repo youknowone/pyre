@@ -9,7 +9,11 @@
 use crate::flowspace::model::Variable;
 use crate::model::{BlockId, CallTarget, FunctionGraph, LinkArg, OpKind};
 
-const BOX_STR_CONSTANT_PATH: [&str; 3] = ["pyre_object", "unicodeobject", "box_str_constant"];
+const BOX_STR_CONSTANT_PATH: [&str; 3] = [
+    crate::runtime_names::crates::OBJECT,
+    "unicodeobject",
+    "box_str_constant",
+];
 
 fn is_box_str_constant_call(kind: &OpKind) -> Option<&Variable> {
     let OpKind::Call {

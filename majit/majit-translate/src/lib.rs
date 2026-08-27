@@ -32,6 +32,10 @@ pub mod annotator;
 )]
 pub mod codewriter;
 pub mod config;
+// Decline census — no upstream counterpart.  Upstream gates that cannot
+// lower a shape raise a named error (`jtransform.py _handle_list_call`);
+// every gate here declines silently, so the refusals are counted instead.
+pub mod decline;
 #[cfg_attr(
     test,
     expect(
@@ -98,6 +102,7 @@ mod parse;
     )
 )]
 pub mod pipeline;
+mod runtime_names;
 // `translator/` is the RPython-orthodox port home — see
 // `translator/mod.rs` for the contract.  Currently hosts
 // `translator/rtyper/{rclass.rs, rpbc.rs}`, the `rpython/rtyper/` 1:1
@@ -748,6 +753,12 @@ fn analyze_pipeline_from_module_paths(
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
     static_addrs: HostStaticAddrs<'_>,
 ) -> pipeline::ProgramPipelineResult {
+    // Dump the decline census when this run ends — on the normal return
+    // AND on the unwind, since a pipeline that panics on an undigestible
+    // shape is exactly the run whose silent refusals a reader needs.
+    // Silent unless `MAJIT_DECLINE_LOG` / `PYRE_MIR_FRONTEND_DEBUG` is
+    // set, so default output is unchanged.
+    let _decline_census = decline::CensusScope::new("analyze_pipeline");
     let mut prof = PhaseProfiler::new();
     macro_rules! mark_phase {
         ($name:literal) => {
@@ -1105,10 +1116,9 @@ fn analyze_pipeline_from_module_paths(
     // `dual_gate_registry` register every `unsafe fn` / unsafe
     // impl-method as a stub-pygraph entry in CallRegistry, covering
     // the bulk of the "not registered in CallRegistry" Skip cluster
-    // dominated by `pyre_object::is_*` predicates whose body lowering is
-    // intentionally rejected (raw-pointer access the flowspace adapter
-    // does not model — only a typed signature stub is registered).
-    // Sourced from Charon via
+    // dominated by `pyre_object::is_*` predicates.  What a stub adds is the
+    // registry key those call sites spell, not a body the lowering refused
+    // — see `CallControl::unsafe_fn_stubs`.  Sourced from Charon via
     // `front::mir::collect_unsafe_fn_stubs_from_llbc`, populated on the
     // SemanticProgram in `build_semantic_program_via_active_frontend`.
     call_control.unsafe_fn_stubs = program.unsafe_fn_stubs.clone();

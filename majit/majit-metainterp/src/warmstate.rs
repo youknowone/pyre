@@ -505,7 +505,14 @@ fn default_enable_opts() -> Vec<String> {
 /// compile, `compile.py done_compiling`) is the open question; reading it
 /// needed `trace_id` next to `fail_index`, since an index is allocated per
 /// trace and a bridge re-uses the numbers of the loop it hangs off.
-const MAX_TRACE_ABORT_COUNT: u32 = 5;
+///
+/// Public because an embedder that demotes a key of its own on repeated
+/// aborts has to agree with this ceiling, and the consumers that do
+/// restated the literal instead.  Sharing it makes the NUMBERS agree, not
+/// the COUNTS: this one is per green key and latches with `>=`, so a host
+/// counter keyed on anything coarser reaches 5 for reasons this one did
+/// not.
+pub const MAX_TRACE_ABORT_COUNT: u32 = 5;
 
 /// rlib/jit.py:599 disable_unrolling = 200
 const DEFAULT_DISABLE_UNROLLING: u32 = 200;
@@ -1481,6 +1488,28 @@ impl WarmEnterState {
     pub fn get_procedure_token(&self, cell_key: u64) -> Option<Arc<JitCellToken>> {
         self.cell_by_key(cell_key)
             .and_then(|cell| cell.get_procedure_token())
+    }
+
+    /// [`Self::get_procedure_token`] with the two flag reads taken OUT: the
+    /// cell lookup, the `Weak::upgrade`, and the drop of the `Arc` it
+    /// produced, and nothing else.
+    ///
+    /// A measurement reader with no production caller and no upstream
+    /// counterpart. It exists because the shipping predicate fuses two
+    /// separable costs into one function -- `get_procedure_token` performs the
+    /// refcount pair AND reads `invalidated` -- so no arm built from the public
+    /// API can say which of them a sibling-door scan is paying for. Differenced
+    /// against `has_compiled_loop`, this one leaves the flag reads.
+    ///
+    /// The answer is deliberately WEAKER than the shipping predicate's: an
+    /// invalidated token still upgrades, so this returns `true` where the door
+    /// would decide `false`. That is why it is a cost probe and never a
+    /// decision -- nothing may route on it.
+    #[cfg(feature = "__yield-stage-probe")]
+    pub fn probe_cell_token_upgrades(&self, cell_key: u64) -> bool {
+        self.cell_by_key(cell_key)
+            .and_then(|cell| cell.loop_token.as_ref())
+            .is_some_and(|weak| weak.upgrade().is_some())
     }
 
     /// `warmstate.py` — resolve the cell by `comparekey`, then read its

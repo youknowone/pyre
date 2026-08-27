@@ -35,6 +35,15 @@
 //!   threaded through metainterp optimizers.
 //! * `io_buffer`, `jit_state`, `trace_ctx`, and `parity` are pyre
 //!   runtime/test boundaries with no same-named upstream file.
+//! * `intrinsics` has no same-named upstream file: it is the untraced half of
+//!   the intrinsics `#[jit_interp]` rewrites while tracing, whose traced half
+//!   lives in the macro lowerer. RPython needs no such module because it
+//!   lowers `rawstorage.py` / `longlong2float.py` / `rarithmetic.py` at rtype
+//!   time from the one definition each already has.
+//! * `embed` has no same-named upstream file: it holds the per-run census an
+//!   interpreter would otherwise rebuild around the driver callbacks. The
+//!   upstream equivalent is split between `warmspot.py`'s test harness and
+//!   `jitprof.py`, neither of which is a library surface an embedder calls.
 //! * `jitcode` and `recorder` are transitional runtime ABI boundaries
 //!   around canonical translate-side `jitcode.py` / `opencoder.py`
 //!   ports; their module docs describe the remaining migration path.
@@ -106,6 +115,7 @@ pub mod counter;
 pub use majit_backend::model as cpu;
 pub use majit_ir::Value;
 pub use majit_ir::debug;
+pub mod embed;
 pub mod execute_and_record;
 pub mod executor;
 pub mod gc;
@@ -113,6 +123,7 @@ pub mod graphpage;
 pub mod greenfield;
 pub mod heapcache;
 pub mod history;
+pub mod intrinsics;
 pub(crate) mod io_buffer;
 pub mod jit;
 mod jit_state;
@@ -187,7 +198,22 @@ pub use jitdriver::{
     drive_multi_frame_blackhole, drive_single_frame_blackhole, no_bridge_enabled, spdiag_enabled,
     trace_continuation_suspended,
 };
+// The warm-entry stage probe, which an embedder drives from its own harness —
+// the split has to be read through the frontend's own door, so the counts are
+// set from outside and the door is left the shipping one.
+#[cfg(feature = "__back-edge-stage-probe")]
+pub use jitdriver::{BackEdgeStageRepeats, back_edge_stage_passes, set_back_edge_stage_repeats};
+// The compiled-run split, which reaches one crate further down than the rest of
+// this probe: the frame build it prices is the backend's, so the count for that
+// one arm is set through `majit_backend` and only its loop is in the backend.
 pub use majit_backend::CompiledTraceInfo;
+#[cfg(feature = "__execute-stage-probe")]
+pub use majit_backend::deadframe::{frame_build_passes, set_frame_build_repeats};
+#[cfg(feature = "__execute-stage-probe")]
+pub use pyjitpl::{
+    ExecuteStageRepeats, call_shot_totals, execute_stage_clock_floor_ns, execute_stage_passes,
+    reset_call_shot_totals, set_execute_stage_repeats,
+};
 pub use pyjitpl::{eval_binop_f, eval_binop_i, eval_float_cmp, eval_unary_f, eval_unary_i};
 // Re-export the canonical translate-side Assembler so macro-emitted
 // state-field JIT setup (e.g. `__JitMeta_<fn>::install_canonical_liveness`)
@@ -777,39 +803,16 @@ pub fn dispatch_arm_census() -> Vec<DispatchArmCensus> {
 
 /// Panic unless `interp`'s portal was installed AND none of its arms degraded.
 ///
-/// This is the gate every consumer would otherwise write, denominator and all.
-/// Reading `degraded_dispatch_arms()` alone cannot be that gate: it passes on
-/// an empty registry, and an empty registry is also what a portal that was
-/// never built produces. The census settles which one happened, so the two
-/// failures get two different messages instead of one silent pass.
+/// The zero case of [`embed::assert_degraded_dispatch_arms`], which is where
+/// the implementation and the reasoning live. Reach for the general form
+/// whenever the answer is not zero: a machine with a known lowering gap has a
+/// non-empty degraded set today, and this spelling can only fail on it.
 ///
-/// Call it after whatever installs the portal. `#[jit_interp]` records both
-/// facts at install, not at trace time, so running the machine is not required
-/// — but nothing is recorded until the portal is built at least once.
+/// Call it after whatever installs the portal. Both facts are recorded at
+/// install, not at trace time, so running the machine is not required — but
+/// nothing is recorded until the portal is built at least once.
 pub fn assert_no_degraded_dispatch_arms(interp: &str) {
-    let census = dispatch_arm_census();
-    let Some(entry) = census.iter().find(|e| e.interp == interp) else {
-        panic!(
-            "no dispatch-arm census for `{interp}`: its portal was never \
-             installed in this process, so an empty degraded list says nothing \
-             about it. Build the dispatch JitCode (or run the machine) first. \
-             Recorded machines: {:?}",
-            census.iter().map(|e| e.interp).collect::<Vec<_>>()
-        );
-    };
-    let degraded: Vec<DegradedDispatchArm> = degraded_dispatch_arms()
-        .into_iter()
-        .filter(|e| e.interp == interp)
-        .collect();
-    assert!(
-        degraded.is_empty(),
-        "{} of `{interp}`'s {} dispatch arms lowered to an abort stub. Every \
-         trace that reaches one of these opcodes aborts, once per threshold, \
-         forever: {:#?}",
-        degraded.len(),
-        entry.arms,
-        degraded
-    );
+    embed::assert_degraded_dispatch_arms(interp, &[]);
 }
 
 /// A declared field key that no access site asked about.
@@ -1399,6 +1402,12 @@ pub fn green_key_hash_typed(values: &[i64], types: &[majit_ir::GreenType]) -> u6
 // ── we_are_jitted / JIT mode flag ──
 // Re-exported from majit-codegen so both meta and backend can access it.
 pub use majit_backend::{JittedGuard, set_jitted, we_are_jitted};
+
+// ── jitframe allocation arm ──
+// An embedder measuring the compiled entry needs to select the arm from its own
+// harness, and `majit-backend` is not one of its dependencies — every embedder
+// reaches the backends through this crate.
+pub use majit_backend::deadframe::{jitframe_pool_counts, set_jitframe_pool};
 
 // ── rstack criticalcode hooks ──
 // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start/stop.

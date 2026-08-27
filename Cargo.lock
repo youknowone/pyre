@@ -1905,6 +1905,7 @@ version = "0.0.2"
 dependencies = [
  "majit-backend",
  "majit-backend-cranelift",
+ "majit-backend-dynasm",
  "majit-gc",
  "majit-ir",
  "majit-macros",

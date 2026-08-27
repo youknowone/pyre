@@ -796,14 +796,14 @@ mod tests {
     fn an_opaque_name_at_one_line_joins_across_artefacts() {
         let declaring = part(
             &[
-                (1, "pyre::pyframe::<Impl>::new", 40),
+                (1, crate::runtime_names::symbols::PYFRAME_NEW, 40),
                 (2, "pyre::caller", 9),
             ],
             &[(2, 1)],
         );
         let defining = part(
             &[
-                (1, "pyre::pyframe::<Impl>::new", 40),
+                (1, crate::runtime_names::symbols::PYFRAME_NEW, 40),
                 (7, "pyre::allocates", 80),
             ],
             &[(1, 7)],
@@ -825,14 +825,14 @@ mod tests {
     fn one_opaque_spelling_at_two_lines_stays_two_functions() {
         let a = part(
             &[
-                (1, "pyre::pyframe::<Impl>::new", 40),
+                (1, crate::runtime_names::symbols::PYFRAME_NEW, 40),
                 (2, "pyre::caller", 9),
             ],
             &[(2, 1)],
         );
         let b = part(
             &[
-                (1, "pyre::pyframe::<Impl>::new", 512),
+                (1, crate::runtime_names::symbols::PYFRAME_NEW, 512),
                 (7, "pyre::allocates", 80),
             ],
             &[(1, 7)],
@@ -853,12 +853,12 @@ mod tests {
     fn a_key_repeated_inside_one_artefact_is_not_a_join_key() {
         let a = part(
             &[
-                (1, "pyre::pyframe::<Impl>::new", 40),
-                (2, "pyre::pyframe::<Impl>::new", 40),
+                (1, crate::runtime_names::symbols::PYFRAME_NEW, 40),
+                (2, crate::runtime_names::symbols::PYFRAME_NEW, 40),
             ],
             &[],
         );
-        let b = part(&[(1, "pyre::pyframe::<Impl>::new", 40)], &[]);
+        let b = part(&[(1, crate::runtime_names::symbols::PYFRAME_NEW, 40)], &[]);
         let joined = Joined::build(&[&a, &b]);
         assert_eq!(joined.joined_names, 0);
         assert_eq!(joined.ambiguous_names, 1);
@@ -880,8 +880,8 @@ mod tests {
     /// `project` answers in the asked artefact's own def ids.
     #[test]
     fn project_maps_a_joined_node_back_onto_one_artefacts_ids() {
-        let a = part(&[(1, "pyre::pyframe::<Impl>::new", 40)], &[]);
-        let b = part(&[(5, "pyre::pyframe::<Impl>::new", 40)], &[]);
+        let a = part(&[(1, crate::runtime_names::symbols::PYFRAME_NEW, 40)], &[]);
+        let b = part(&[(5, crate::runtime_names::symbols::PYFRAME_NEW, 40)], &[]);
         let joined = Joined::build(&[&a, &b]);
         let node = node_of(&joined, 0, 1);
         assert_eq!(

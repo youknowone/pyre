@@ -158,7 +158,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
                 },
                 Some(narrowed),
             ) if segments.len() == 2
-                && segments[0] == "__cast_instance_intrinsic"
+                && segments[0] == crate::runtime_names::shims::CAST_INSTANCE
                 && args.len() == 1
                 && args[0] == site.result_var =>
             {
@@ -401,7 +401,10 @@ pub(crate) fn emit_narrow(
         result: Some(narrowed.clone()),
         kind: OpKind::Call {
             target: CallTarget::FunctionPath {
-                segments: vec!["__cast_instance_intrinsic".to_string(), root.clone()],
+                segments: vec![
+                    crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                    root.clone(),
+                ],
             },
             args: vec![value],
             result_ty: ValueType::Ref(Some(root.clone())),
@@ -532,7 +535,10 @@ mod tests {
                 a,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
-                        segments: vec!["__cast_instance_intrinsic".into(), "PyObject".into()],
+                        segments: vec![
+                            crate::runtime_names::shims::CAST_INSTANCE.into(),
+                            "PyObject".into(),
+                        ],
                     },
                     args: vec![result.clone()],
                     result_ty: ValueType::Ref(Some("PyObject".into())),
@@ -567,7 +573,7 @@ mod tests {
                 matches!(
                     &op.kind,
                     OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                        if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+                        if segments.first().map(String::as_str) == Some(crate::runtime_names::shims::CAST_INSTANCE)
                 )
             })
             .count();

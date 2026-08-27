@@ -1443,10 +1443,30 @@ where
     /// escaped during this CALL_MAY_FORCE.  Returns the still-rooted
     /// [`ActiveStandardVirtualizable`] so the caller can read the heap object
     /// before dropping the shadow-stack root.
+    ///
+    /// Two signals meet here.  The token check is the upstream one and answers
+    /// "did the callee force the virtualizable".  It cannot answer for a callee
+    /// handed the array's raw base address: such a callee never touches the
+    /// token, and an `#[jit_interp]` machine has no token to touch
+    /// (`without_vable_token`), so the check returns `false` for precisely the
+    /// calls most able to invalidate the trace. `TraceCtx` carries that case
+    /// from the array-base lowering to this post-call check.
     fn escaped_standard_virtualizable(
+        ctx: &mut TraceCtx,
         active: Option<ActiveStandardVirtualizable>,
     ) -> Option<ActiveStandardVirtualizable> {
-        active.filter(|active| unsafe { active.info.tracing_after_residual_call(active.obj_ptr()) })
+        // Drained before the `filter`, and unconditionally: with no active
+        // virtualizable there is nothing to filter, and a signal left standing
+        // would abort the next, unrelated residual call.
+        let raw_base_escape = ctx.take_raw_vable_base_escape();
+        active.filter(|active| {
+            // Evaluated first and not short-circuited past: on a token-bearing
+            // virtualizable this call is what clears the token back to NONE,
+            // and skipping it would trip the `== 0` assert in
+            // `tracing_before_residual_call` at the next call instead.
+            let forced = unsafe { active.info.tracing_after_residual_call(active.obj_ptr()) };
+            forced || raw_base_escape
+        })
     }
 
     fn finalize_standard_virtualizable_may_force(
@@ -1455,7 +1475,7 @@ where
         sym: &mut S,
         active: Option<ActiveStandardVirtualizable>,
     ) -> TraceAction {
-        if let Some(active) = Self::escaped_standard_virtualizable(active) {
+        if let Some(active) = Self::escaped_standard_virtualizable(ctx, active) {
             // pyjitpl.py `self.load_fields_from_virtualizable()` runs
             // BEFORE the abort: the residual call forced the virtualizable and
             // wrote its fields through the heap object, so the tracing-time
@@ -5276,6 +5296,28 @@ where
                     .and_then(|lengths| lengths.get(array_idx).copied())
                     .unwrap_or(0);
                 self.set_int_reg(dest, Some(result), Some(len as i64));
+            }
+            jitcode::insns::BC_ARRAYBASE_VABLE => {
+                // Same `rdd>i` operand triple as `arraylen_vable` above, hence
+                // the shared decoder.
+                let (vable_reg, array_idx, dest) = {
+                    let frame = self.frames.current_mut();
+                    frame.read_vable_arraylen()
+                };
+                let Some((_vable_opref, fdescr, _adescr)) =
+                    self.vable_array_descrs(ctx, vable_reg, array_idx)
+                else {
+                    return TraceAction::Abort;
+                };
+                let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
+                // An unresolvable base aborts rather than defaulting: the walk
+                // really executes the residual call this address feeds, so a
+                // placeholder would be handed to a live callee.
+                let Some((result, addr)) = ctx.vable_arraybase_vable(vable_struct_ptr, fdescr)
+                else {
+                    return TraceAction::Abort;
+                };
+                self.set_int_reg(dest, Some(result), Some(addr));
             }
             jitcode::insns::BC_HINT_FORCE_VIRTUALIZABLE => {
                 let vable_reg = self.frames.current_mut().next_reg() as usize;
