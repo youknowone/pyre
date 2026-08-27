@@ -61,6 +61,13 @@ cover the condition they diagnose.
 - What it does: `MAJIT_BH_NULL_ARG`: report a null ref argument about to be handed to a residual call, with the jitcode coordinate, before the callee can dereference it.  Some ABIs pass a legitimate null sentinel (e.g. the CallFn `null_or_self` slot), so this reports rather than aborts.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
+### `MAJIT_BRIDGE_BAIL`
+
+- Read sites: 1 — `pyre/pyre-jit/src/call_jit.rs`
+- Accessor: `bridge_bail_stage()`, consulted at three points of `trace_and_compile_from_bridge()`
+- What it does: `MAJIT_BRIDGE_BAIL=<stage>`: return `ResumeBlackhole` from `trace_and_compile_from_bridge` at a chosen point inside the guard-failure entry, so a wrong answer that only appears with bridges on can be attributed to one prefix of what the attempt does.  `MAJIT_NO_BRIDGE` and `MAJIT_MAX_BRIDGES` name WHICH bridge; this names which STEP of it.  1 = before `decode_and_restore_guard_failure`; 2 = after it; 3 = after the frame's `last_instr` is repointed.  Stage 1 is the control and has to reproduce `MAJIT_NO_BRIDGE=1` exactly.  Off by default.
+- Retirement condition: Remove when a bridge attempt cannot leave a heap effect behind the rollback it falls into, so a bisect over the attempt's steps has nothing left to find.
+
 ### `MAJIT_BRIDGE_DEBUG`
 
 - Read sites: 5 — `majit/majit-macros/src/jit_interp/codegen_state.rs`, `majit/majit-metainterp/src/lib.rs`
