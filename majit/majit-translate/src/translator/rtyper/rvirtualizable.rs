@@ -24,11 +24,29 @@ use crate::translator::rtyper::lltypesystem::lltype::{self, _ptr, LowLevelType};
 /// An injected op would land in a list the production path discards.
 ///
 /// The field set itself is therefore declared out of band, as a data table
-/// (`pyre-jit-trace/src/virtualizable_spec.rs`, consumed through
-/// `GraphTransformConfig::vable_fields` in `pyre-jit-trace/build.rs`), the
-/// same way `_immutable_fields_` is handled. What has no counterpart is the
-/// force injection: the frame forces are placed by hand at the consumers
-/// that need them (`pyre-interpreter` `sys.getframe`, `f_locals`, `f_back`).
+/// (`pyre-jit-trace/src/virtualizable_spec.rs`), the same way
+/// `_immutable_fields_` is handled.
+///
+/// That table reaches the RUNTIME jitcode path — `pyre-jit`'s `codewriter.rs`
+/// and `flatten.rs`, and the `majit-ir` field descrs — and it does NOT reach
+/// this crate's `GraphTransformConfig`. Every production construction of that
+/// config is `GraphTransformConfig::default()`, whose `vable_fields` and
+/// `vable_arrays` are empty, and the only writer of either is
+/// `majit-translate/tests/test_fast2locals_codewriter.rs`. So in the LLBC
+/// codewriter the whole array protocol is inert by construction:
+/// `jtransform.rs check_no_vable_array` returns at its
+/// `vable_array_vars.is_empty()` guard before it can reject anything, and
+/// `rewrite_op_getfield`'s `VableFieldRead` arm never fires. Arming it is the
+/// unported work, not a missing call site.
+///
+/// What has no counterpart either way is the force injection: the frame
+/// forces are placed by hand at the consumers that need them
+/// (`pyre-interpreter` `sys.getframe`, `f_locals`, `f_back`). The marker
+/// `executioncontext::jit_force_virtualizable` is what lets
+/// `jtransform.rs rewrite_op_jit_force_virtualizable` delete such a call from
+/// a looked-inside graph, and it keys on the CALL TARGET's name rather than on
+/// `vable_fields`, which is why that half works while the array protocol above
+/// stays inert.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VirtualizableInstanceRepr {
     pub top_of_virtualizable_hierarchy: bool,
