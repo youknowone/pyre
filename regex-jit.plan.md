@@ -1976,10 +1976,28 @@ docs had called `jit_interp` "the post's portal" and `shortcircuit` "the
 control". Both module docs, `main.rs`'s row names, and this document now say
 which is which.
 
-The 153-vs-176 gap is one spelling difference, not a missing optimization: majit
-emits `IntIsTrue` ahead of each guard where an RPython guard takes its condition
-directly. `runner.py --listing` and `REGEX_LISTING=1` on the census test print
-the two peeled bodies op by op for reading side by side.
+The 153-vs-176 gap is the port's integer typing, and it accounts for every one of
+the 23 ops. RPython carries the marks as `Bool`: a `Bool` local *is* a branch
+condition, so `flatten.py` emits a plain `goto_if_not` and `opimpl_goto_if_not`
+hands the box straight to `generate_guard`, and a `Bool` field is stored without
+a mask. Our `NodeRec.marked` is `u8` and `shift` carries marks as `i64`, so
+`if mark != 0` is a real `IntIsTrue` (24 — one per guard whose condition is not
+already a comparison) and `n.marked = m as u8` is a real `IntAnd(m, 255)` (2
+survive, on the two live `Char` marks). 24 + 2, less RPython's one extra
+`guard_false` and its two zero-cost `debug_merge_point`s, is 23.
+
+Neither is a majit shortfall. `rewrite.py optimize_INT_IS_TRUE` folds only when
+the argument's bounds are `is_bool()`, and a one-byte unsigned field read is
+[0, 255] — upstream's `FieldDescr.get_integer_min`/`get_integer_max` answer the
+same for `lltype.Bool`, which is `FLAG_UNSIGNED` at size 1. The fold arm is
+ported and fires elsewhere. The two `IntAnd` are the same story from the other
+end: `and_x_c_in_range` would remove `int_and(x, 255)` for `x` bounded [0, 1],
+but the `IntEq` producing it is a postponed pure op forced out after its
+consumer was optimized, so `make_bool` had not run yet. Upstream never meets the
+pattern because it never masks a `Bool`.
+
+`runner.py --listing` and `REGEX_LISTING=1` on the census test print the two
+peeled bodies op by op for reading side by side.
 
 Two RPython-side traps worth recording. `get_stats` lives in
 `rpython.jit.metainterp.warmspot`, not in `history`. And the annotator rejects a

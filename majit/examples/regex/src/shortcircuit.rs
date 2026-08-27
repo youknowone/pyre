@@ -59,11 +59,43 @@
 //! remark tells you to write, and this module is what the post's code does
 //! before you take that advice.
 //!
-//! The bodies are 153 ops (RPython) against 176 (here), and the 23 are one
-//! spelling difference: majit emits `IntIsTrue` ahead of each guard where an
-//! RPython guard takes its condition directly. `REGEX_LISTING=1` on the census
-//! test prints both peeled bodies op by op, and `runner.py --listing` prints
-//! RPython's, for diffing.
+//! # Where the 23 remaining ops come from
+//!
+//! 153 ops (RPython) against 176 (here). The difference is the port's integer
+//! typing, and it accounts for every one of the 23.
+//!
+//! RPython carries the marks as `Bool`. A `Bool` local *is* a branch
+//! condition, so `flatten.py` emits a plain `goto_if_not` and
+//! `pyjitpl.py opimpl_goto_if_not` hands that box straight to
+//! `generate_guard` — no truth test. A `Bool` field is likewise stored as it
+//! stands, with no mask.
+//!
+//! Our `NodeRec.marked` is a `u8` and `shift` carries marks as `i64`, so both
+//! conversions become real operations:
+//!
+//! * `if mark != 0` is an `IntIsTrue` — **24** of them, exactly one per guard
+//!   whose condition is not already a comparison (26 guards, less the loop
+//!   exit's `IntLt` and one `SetfieldGc`-fed guard); and
+//! * `n.marked = m as u8` is an `IntAnd(m, 255)` — **2** survive, on the two
+//!   live `Char` marks.
+//!
+//! 24 + 2, less RPython's one extra `guard_false` and its two zero-cost
+//! `debug_merge_point`s, is 23.
+//!
+//! This is not a place majit falls short of RPython. `rewrite.py
+//! optimize_INT_IS_TRUE` folds the test only when the argument's bounds are
+//! `is_bool()`, and a one-byte unsigned field read is [0, 255] — upstream's
+//! own `FieldDescr.get_integer_min` / `get_integer_max` answer the same for
+//! `lltype.Bool`, since it is `FLAG_UNSIGNED` at size 1. The fold arm is
+//! ported and fires elsewhere; it has nothing to fire on here. The two
+//! `IntAnd` are the same story from the other end: `autogenintrules.py`'s
+//! `and_x_c_in_range` would remove `int_and(x, 255)` for an `x` bounded by
+//! [0, 1], but the `IntEq` producing that `x` is a postponed pure op forced
+//! out *after* its consumer was optimized, so `make_bool` had not run on it
+//! yet. Upstream never meets the pattern, because it never masks a `Bool`.
+//!
+//! `REGEX_LISTING=1` on the census test prints both peeled bodies op by op,
+//! and `runner.py --listing` prints RPython's, for diffing.
 //!
 //! # The measurements
 //!

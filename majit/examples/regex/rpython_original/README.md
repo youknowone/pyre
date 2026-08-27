@@ -101,11 +101,41 @@ crate's `shortcircuit.rs` carries 26; `jit_interp.rs` carries 1. So
 `jit_interp.rs` is the adapted variant the remark asks for — an A/B of the
 remark rather than a second copy of the post. Both module docs now say so.
 
-## The 23 ops that differ
+## Where the 23 remaining ops come from
 
-153 against 176 is one spelling difference, not a missing optimization: majit
-emits an `IntIsTrue` ahead of each guard where an RPython guard takes its
-condition directly. To read them side by side:
+153 against 176 is the port's integer typing, and it accounts for every one of
+the 23.
+
+RPython carries the marks as `Bool`. A `Bool` local *is* a branch condition, so
+`flatten.py` emits a plain `goto_if_not` and `pyjitpl.py opimpl_goto_if_not`
+hands that box straight to `generate_guard` — no truth test — and a `Bool` field
+is stored as it stands, with no mask.
+
+Our `NodeRec.marked` is a `u8` and `shift` carries marks as `i64`, so both
+conversions become real operations:
+
+* `if mark != 0` is an `IntIsTrue` — **24**, exactly one per guard whose
+  condition is not already a comparison (26 guards, less the loop exit's
+  `IntLt` and one `SetfieldGc`-fed guard); and
+* `n.marked = m as u8` is an `IntAnd(m, 255)` — **2** survive, on the two live
+  `Char` marks.
+
+24 + 2, less RPython's one extra `guard_false` and its two zero-cost
+`debug_merge_point`s, is 23.
+
+This is not a place majit falls short of RPython. `rewrite.py
+optimize_INT_IS_TRUE` folds the test only when the argument's bounds are
+`is_bool()`, and a one-byte unsigned field read is [0, 255] — upstream's own
+`FieldDescr.get_integer_min` / `get_integer_max` answer the same for
+`lltype.Bool`, which is `FLAG_UNSIGNED` at size 1. The fold arm is ported and
+fires elsewhere; it has nothing to fire on here. The two `IntAnd` are the same
+story from the other end: `autogenintrules.py`'s `and_x_c_in_range` would remove
+`int_and(x, 255)` for an `x` bounded by [0, 1], but the `IntEq` producing that
+`x` is a postponed pure op forced out *after* its consumer was optimized, so
+`make_bool` had not run on it yet. Upstream never meets the pattern, because it
+never masks a `Bool`.
+
+To read the two bodies side by side:
 
 ```sh
 PYTHONPATH=/path/to/pyre pypy runner.py 20 4096 --listing
