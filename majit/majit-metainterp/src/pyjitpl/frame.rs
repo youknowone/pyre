@@ -954,6 +954,17 @@ impl MIFrame {
                     // declines any multi-frame bridge for a symbol that
                     // reserves these slots.
                     //
+                    // Neither the trim nor that decline runs anywhere today.
+                    // `dualtape` is the only `split_dispatch` symbol in the
+                    // tree, and across its whole suite, debug and release,
+                    // this branch is taken zero times: its tier gates are
+                    // still `#[ignore]`d, so nothing records a guard inside an
+                    // inlined dispatch arm and no snapshot is built with more
+                    // than one frame. `dualtape`'s
+                    // `the_reserved_identity_trim_and_its_decline_are_unreached`
+                    // holds both counters at 0 and names the re-derivation
+                    // that has to be written when one of them moves.
+                    //
                     // Blank the range UNCONDITIONALLY. An earlier version also
                     // required `self.int_regs[idx].is_none()`, on the premise
                     // that a sub-frame's identity slots are always unwritten
@@ -969,6 +980,22 @@ impl MIFrame {
                     // `int_identity_slots_end()` — see that method: the latter
                     // spans the virt arrays' live element counts, and blanking
                     // those would drop ordinary working registers.
+                    //
+                    // Count the slots this actually TAKES something away from.
+                    // The range is `num_scalars` int state-field slots plus the
+                    // one vable-identity slot, so a blanked slot that held a
+                    // live box is a state field the resumed frame will read
+                    // back as zero through `load_state_field/di`. A slot
+                    // already holding a constant loses nothing. `MC_DIAG` 93
+                    // counts the guards the bridge walk refuses over this
+                    // range; this is the quantity that says whether the
+                    // blackhole arm 93 hands them to can read a fabricated
+                    // zero.
+                    if self.int_regs[idx].is_some_and(|op| !op.is_constant()) {
+                        crate::mc_diag_bump(crate::mc_diag_slot(
+                            "inline_frame_trim_blanked_live_int",
+                        ));
+                    }
                     SnapshotTagged::Const(0, Type::Int)
                 } else if idx < num_regs_i {
                     let opref = self.int_regs[idx]

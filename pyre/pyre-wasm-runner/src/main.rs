@@ -1022,6 +1022,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "guard_resume_decline_callee_mismatch",
                 "guard_resume_decline_return_slot",
                 "guard_resume_decline_reserved_identity",
+                "inline_frame_trim_blanked_live_int",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {

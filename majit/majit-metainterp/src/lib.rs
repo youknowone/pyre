@@ -1865,6 +1865,14 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // `split_dispatch` symbol, not a defect. Only a symbol that opts in can
     // raise it; every other one reserves nothing and never reaches the test.
     "guard_resume_decline_reserved_identity",
+    // 94 = the inline-frame snapshot trim blanked a reserved identity slot
+    // that held a LIVE (non-constant) box. 93 counts the guards the bridge
+    // walk refuses because of the trim; this counts the slots the trim
+    // actually took something away from, which is the quantity that decides
+    // whether the blackhole arm 93 hands those guards to can read a fabricated
+    // zero through `load_state_field/di`. A slot that already held a constant
+    // loses nothing, so it is not counted.
+    "inline_frame_trim_blanked_live_int",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
@@ -1946,6 +1954,40 @@ pub fn guard_census_summary(top: usize) -> String {
         "guard_census distinct={} total={total} top={heaviest}",
         rows.len()
     )
+}
+
+/// The index of `label` in [`MC_DIAG_LABELS`], resolved at compile time.
+///
+/// A bump site that spells its slot as a literal reads back as internally
+/// consistent when the number is wrong: every reader prints
+/// `MC_DIAG_LABELS[slot]` beside the count, so the wrong tally is announced
+/// under the wrong name and nothing disagrees. Naming the label instead makes
+/// a renamed or removed slot fail the BUILD at the bump site.
+pub const fn mc_diag_slot(label: &str) -> usize {
+    // `str` carries no const `==`.
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let a = a.as_bytes();
+        let b = b.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut slot = 0;
+    while slot < MC_DIAG_LABELS.len() {
+        if str_eq(MC_DIAG_LABELS[slot], label) {
+            return slot;
+        }
+        slot += 1;
+    }
+    panic!("no MC_DIAG slot carries this label");
 }
 
 /// Read an `MC_DIAG` tally (saturating). Surfaced via `pyre_jit_mc_diag`.

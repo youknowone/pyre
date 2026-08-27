@@ -232,6 +232,79 @@ mod tests {
         assert!(end > base, "an empty range is spelled `None`, not `Some`");
     }
 
+    /// The reserved-identity machinery is DECLARED here and RUNS NOWHERE.
+    ///
+    /// `split_dispatch = true` above makes this the only symbol in the tree
+    /// that reserves an identity-only int range, so it is the only one whose
+    /// sub-frames the inline-frame snapshot trim
+    /// (`pyjitpl/frame.rs get_list_of_active_snapshot_boxes`) can blank and the
+    /// only one the bridge walk can refuse over
+    /// (`jitdriver.rs GuardResumeDecline::ReservedIdentitySlots`).
+    ///
+    /// Measured across this whole suite, debug and release: the trim's branch
+    /// is taken ZERO times and the decline fires ZERO times, because
+    /// `build_state_field_snapshot` is never reached with more than one frame
+    /// — `jit_tier_shape_gate` and `jit_tier_liveness_gate` are still
+    /// `#[ignore]`d and the `[` / `]` arms still lower degraded, so nothing
+    /// here records a guard inside an inlined dispatch arm.
+    ///
+    /// That is why both counters are gated at 0 rather than at "some". The
+    /// trim replaces a sub-frame's int state-field slots with `Const(0)`, and
+    /// nothing re-derives them: a resumed frame reading one back through
+    /// `load_state_field/di` gets a fabricated zero. The bridge arm refuses
+    /// such a guard outright; the blackhole arm it hands them to does not.
+    /// So the day this symbol's traces do close a loop, this test fails and
+    /// says which of the two counters moved — which is the signal that the
+    /// re-derivation (`pyjitpl.py rebuild_state_after_failure`, off
+    /// `TraceCtx::virtualizable_boxes`) has to be written before the machinery
+    /// can be trusted.
+    #[test]
+    fn the_reserved_identity_trim_and_its_decline_are_unreached() {
+        let blanked = majit_metainterp::mc_diag_slot("inline_frame_trim_blanked_live_int");
+        let declined = majit_metainterp::mc_diag_slot("guard_resume_decline_reserved_identity");
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = (
+            majit_metainterp::mc_diag(blanked),
+            majit_metainterp::mc_diag(declined),
+        );
+        let mut programs: Vec<Vec<u8>> = vec![
+            b"++++++++++[->+<*}*{]".to_vec(),
+            b"+++++++[-*}*{]".to_vec(),
+            b"++++++++[->+>+<<*}*}*{{]".to_vec(),
+            b"+++>+<*}*".to_vec(),
+        ];
+        // The two trip counts `trip_count_gate` uses, which are what actually
+        // gets this portal hot; the short programs above never compile.
+        for n in [1001usize, 1002] {
+            let mut p = vec![b'+'; n];
+            p.extend_from_slice(b"[-*}*{]");
+            programs.push(p);
+        }
+        let mut nested = vec![b'+'; 1001];
+        nested.extend_from_slice(b"[->[*]<]");
+        programs.push(nested);
+        for code in &programs {
+            let _ = JitDualInterp::new().run(code);
+        }
+        let after = (
+            majit_metainterp::mc_diag(blanked),
+            majit_metainterp::mc_diag(declined),
+        );
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (0, 0),
+            "the reserved-identity trim blanked {} live int slot(s) and the \
+             bridge walk declined {} guard(s) over the reserved range. Both \
+             read 0 when this gate was written. A nonzero count means this \
+             portal now records guards inside an inlined dispatch arm, so the \
+             sub-frame state fields the trim replaces with Const(0) are \
+             reachable — write the re-derivation off \
+             `TraceCtx::virtualizable_boxes` before raising this bound",
+            after.0 - before.0,
+            after.1 - before.1,
+        );
+    }
+
     fn run_locked(code: &[u8]) -> i64 {
         let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         JitDualInterp::new().run(code)
