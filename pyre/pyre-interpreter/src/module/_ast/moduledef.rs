@@ -256,6 +256,165 @@ fn node_fields(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// `Parser/Python.asdl`: one type spelling per entry in [`node_fields`].
+/// Keeping the ASDL `?`/`*` markers here lets the generated type setup below
+/// build the same union and `list[...]` objects as CPython 3.14
+/// `add_ast_annotations`, while the owner/type creation order remains PyPy's
+/// `State.make_new_type` order.
+fn node_field_types(name: &str) -> &'static [&'static str] {
+    match name {
+        "Module" => &["stmt*", "type_ignore*"],
+        "Interactive" => &["stmt*"],
+        "Expression" => &["expr"],
+        "FunctionType" => &["expr*", "expr"],
+        "FunctionDef" | "AsyncFunctionDef" => &[
+            "identifier", "arguments", "stmt*", "expr*", "expr?", "string?", "type_param*",
+        ],
+        "ClassDef" => &[
+            "identifier", "expr*", "keyword*", "stmt*", "expr*", "type_param*",
+        ],
+        "Return" => &["expr?"],
+        "Delete" => &["expr*"],
+        "Assign" => &["expr*", "expr", "string?"],
+        "TypeAlias" => &["expr", "type_param*", "expr"],
+        "AugAssign" => &["expr", "operator", "expr"],
+        "AnnAssign" => &["expr", "expr", "expr?", "int"],
+        "For" | "AsyncFor" => &["expr", "expr", "stmt*", "stmt*", "string?"],
+        "While" | "If" => &["expr", "stmt*", "stmt*"],
+        "With" | "AsyncWith" => &["withitem*", "stmt*", "string?"],
+        "Match" => &["expr", "match_case*"],
+        "Raise" => &["expr?", "expr?"],
+        "Try" | "TryStar" => &["stmt*", "excepthandler*", "stmt*", "stmt*"],
+        "Assert" => &["expr", "expr?"],
+        "Import" => &["alias*"],
+        "ImportFrom" => &["identifier?", "alias*", "int?"],
+        "Global" | "Nonlocal" => &["identifier*"],
+        "Expr" => &["expr"],
+        "Pass" | "Break" | "Continue" => &[],
+        "BoolOp" => &["boolop", "expr*"],
+        "NamedExpr" => &["expr", "expr"],
+        "BinOp" => &["expr", "operator", "expr"],
+        "UnaryOp" => &["unaryop", "expr"],
+        "Lambda" => &["arguments", "expr"],
+        "IfExp" => &["expr", "expr", "expr"],
+        "Dict" => &["expr*", "expr*"],
+        "Set" => &["expr*"],
+        "ListComp" | "SetComp" | "GeneratorExp" => &["expr", "comprehension*"],
+        "DictComp" => &["expr", "expr", "comprehension*"],
+        "Await" | "YieldFrom" => &["expr"],
+        "Yield" => &["expr?"],
+        "Compare" => &["expr", "cmpop*", "expr*"],
+        "Call" => &["expr", "expr*", "keyword*"],
+        "FormattedValue" => &["expr", "int", "expr?"],
+        "Interpolation" => &["expr", "constant", "int", "expr?"],
+        "JoinedStr" | "TemplateStr" => &["expr*"],
+        "Constant" => &["constant", "string?"],
+        "Attribute" => &["expr", "identifier", "expr_context"],
+        "Subscript" => &["expr", "expr", "expr_context"],
+        "Starred" => &["expr", "expr_context"],
+        "Name" => &["identifier", "expr_context"],
+        "List" | "Tuple" => &["expr*", "expr_context"],
+        "Slice" => &["expr?", "expr?", "expr?"],
+        "ExceptHandler" => &["expr?", "identifier?", "stmt*"],
+        "MatchValue" => &["expr"],
+        "MatchSingleton" => &["constant"],
+        "MatchSequence" | "MatchOr" => &["pattern*"],
+        "MatchMapping" => &["expr*", "pattern*", "identifier?"],
+        "MatchClass" => &["expr", "pattern*", "identifier*", "pattern*"],
+        "MatchStar" => &["identifier?"],
+        "MatchAs" => &["pattern?", "identifier?"],
+        "TypeIgnore" => &["int", "string"],
+        "TypeVar" => &["identifier", "expr?", "expr?"],
+        "ParamSpec" | "TypeVarTuple" => &["identifier", "expr?"],
+        "comprehension" => &["expr", "expr", "expr*", "int"],
+        "arguments" => &["arg*", "arg*", "arg?", "arg*", "expr*", "arg?", "expr*"],
+        "arg" => &["identifier", "expr?", "string?"],
+        "keyword" => &["identifier?", "expr"],
+        "alias" => &["identifier", "identifier?"],
+        "withitem" => &["expr", "expr?"],
+        "match_case" => &["pattern", "expr?", "stmt*"],
+        _ => &[],
+    }
+}
+
+fn asdl_base_type(ns: PyObjectRef, name: &str) -> PyObjectRef {
+    match name {
+        "identifier" | "string" => crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
+        "int" => crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
+        "constant" => crate::typedef::w_object(),
+        _ => crate::module_ns_get(ns, name)
+            .unwrap_or_else(|| panic!("_ast ASDL field type {name} was not registered")),
+    }
+}
+
+fn asdl_field_type(ns: PyObjectRef, spelling: &str) -> crate::PyResult {
+    let (base_name, marker) = if let Some(base) = spelling.strip_suffix('*') {
+        (base, '*')
+    } else if let Some(base) = spelling.strip_suffix('?') {
+        (base, '?')
+    } else {
+        (spelling, ' ')
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let base_slot = roots.base();
+    let _ = roots.pin_root(asdl_base_type(ns, base_name));
+    match marker {
+        '*' => crate::_pypy_generic_alias::make_generic_alias(
+            crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+            roots.get(base_slot),
+        ),
+        '?' => crate::_pypy_generic_alias::create_union(
+            roots.get(base_slot),
+            pyre_object::w_none(),
+        ),
+        _ => Ok(roots.get(base_slot)),
+    }
+}
+
+/// [3.14-spec] PyPy `State.make_new_type` publishes no field-type metadata,
+/// while the pinned `lib-python/3/test/test_ast/test_ast.py`
+/// `AST_Tests.test_arguments` requires the exact public mapping.  CPython 3.14
+/// `add_ast_annotations` attaches it after every ASDL type exists and binds the
+/// same dictionary under both names; keep PyPy's generated type owner/order and
+/// add only that observable metadata here.
+fn install_field_types(ns: PyObjectRef, name: &str) {
+    let fields = node_fields(name);
+    let types = node_field_types(name);
+    assert_eq!(fields.len(), types.len(), "ASDL field/type count for {name}");
+
+    let roots = pyre_object::gc_roots::push_roots();
+    let type_slot = roots.base();
+    let _ = roots.pin_root(crate::module_ns_get(ns, name).expect("_ast node type registered"));
+    let dict_slot = type_slot + 1;
+    let _ = roots.pin_root(pyre_object::w_dict_new());
+    for (&field, &spelling) in fields.iter().zip(types) {
+        let value_roots = pyre_object::gc_roots::push_roots();
+        let value_slot = value_roots.base();
+        let _ = value_roots.pin_root(
+            asdl_field_type(ns, spelling).expect("construct _ast ASDL field type"),
+        );
+        let key = pyre_object::w_str_new(field);
+        crate::baseobjspace::setitem(
+            roots.get(dict_slot),
+            key,
+            value_roots.get(value_slot),
+        )
+        .expect("set _ast ASDL field type");
+    }
+    crate::baseobjspace::setattr_str(
+        roots.get(type_slot),
+        "_field_types",
+        roots.get(dict_slot),
+    )
+    .expect("set _field_types on _ast node type");
+    crate::baseobjspace::setattr_str(
+        roots.get(type_slot),
+        "__annotations__",
+        roots.get(dict_slot),
+    )
+    .expect("set __annotations__ on _ast node type");
+}
+
 fn node_attributes(name: &str) -> Option<&'static [&'static str]> {
     match name {
         "AST" => Some(&[]),
@@ -279,26 +438,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // the host `_ast.Module.__module__` is likewise `'ast'`).
     let make = |name: &str, base: PyObjectRef| -> PyObjectRef {
         // A `dict` header moves, and every store below allocates: the key
-        // string, the value, and the dict's own storage when it grows.  Both
-        // namespace dicts are pinned the moment they are built — the second
-        // pin takes the slot after the first — and the word is read back out
-        // of its slot at every use.
+        // string, the value, and the dict's own storage when it grows.
         let roots = pyre_object::gc_roots::push_roots();
         let dict_slot = roots.base();
         let _ = roots.pin_root(pyre_object::w_dict_new());
-        let field_types_slot = dict_slot + 1;
-        let _ = roots.pin_root(pyre_object::w_dict_new());
         // `make_type` builds ONE tuple of field names and binds it to both
         // `_fields` and `__match_args__`, so `Expr._fields is
-        // Expr.__match_args__`.  It is pinned here, beside the two namespace
-        // dicts, because the first store of it allocates a key string and can
-        // grow the dict it lands in.
-        let fields_slot = field_types_slot + 1;
+        // Expr.__match_args__`. It is pinned beside the namespace dict because
+        // the first store allocates a key string and can grow it.
+        let fields_slot = dict_slot + 1;
         let _ = roots.pin_root(tuple_of_names(node_fields(name)));
         // The value arrives already built.  Call arguments evaluate left to
         // right, so reading a dict slot inline with an allocating value
         // expression would read the slot first and hand over a pre-move word.
-        // `_field_types` is a `dict` too, so the value is rooted as well.
         let put = |target_slot: usize, key: &str, value: PyObjectRef| -> crate::PyResult {
             let value_roots = pyre_object::gc_roots::push_roots();
             let value_slot = value_roots.base();
@@ -313,8 +465,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // resolves positional sub-patterns through `__match_args__`, so a
         // `case ast.Expr(expr)` only reaches a field when the node type carries
         // the same field order `_fields` reports.
-        let fields_slot = dict_slot + 2;
-        let _ = roots.pin_root(tuple_of_names(node_fields(name)));
         put(dict_slot, "_fields", roots.get(fields_slot))
             .expect("set _fields on _ast type namespace");
         // Without this name a class pattern carrying positional sub-patterns
@@ -335,12 +485,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             put(dict_slot, field, pyre_object::w_none())
                 .expect("set optional AST field default");
         }
-        for &field in node_fields(name) {
-            put(field_types_slot, field, crate::typedef::w_object())
-                .expect("set _field_types item");
-        }
-        put(dict_slot, "_field_types", roots.get(field_types_slot))
-            .expect("set _field_types on _ast type namespace");
         // `type_descr_new` reads the metatype off the first argument, the way
         // `descr__new__` takes it as a parameter beside `arguments_w`.  Every
         // other caller reaches it through an attribute lookup that supplies
@@ -419,11 +563,24 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     // Leaf node types that are direct AST subclasses (no further subclasses).
-    for name in &[
+    let standalone = &[
         "comprehension", "arguments", "arg", "keyword", "alias", "withitem", "match_case",
-    ] {
+    ];
+    for name in standalone {
         let t = make(name, ast);
         crate::module_ns_store(ns, name, t);
+    }
+
+    // CPython's generated `add_ast_annotations` runs only after every type has
+    // been created because, for example, FunctionDef refers to `arguments`
+    // and `type_param` types declared later in the ASDL traversal.
+    for (_, members) in groups {
+        for name in *members {
+            install_field_types(ns, name);
+        }
+    }
+    for name in standalone {
+        install_field_types(ns, name);
     }
 
     // CPython 3.14 `ast_state.Load_singleton`: every omitted expression
