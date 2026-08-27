@@ -1977,7 +1977,7 @@ fn ca_complete_after_bridge_walk(
     // handle_blackhole_result performs.
     if ca_adopted_frame != 0 && ca_adopted_frame == callee_frame {
         let frame = unsafe { &mut *(ca_adopted_frame as *mut PyFrame) };
-        return match crate::eval::portal_runner_result(frame) {
+        return match crate::eval::portal_body_result(frame) {
             Ok(result) => Some(result as i64),
             Err(mut err) => {
                 let exc_obj = err.to_exc_object();
@@ -3264,7 +3264,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             let exc_obj = err.to_exc_object();
             if exc_obj != pyre_object::PY_NULL {
                 // Symmetric with the `ContinueRunningNormally` arm's
-                // `portal_runner_result` error fall-through below and with
+                // `portal_body_result` error fall-through below and with
                 // `lib.rs::jit_exc_raise` — every backend's blackhole resume
                 // publishes the pending exception, not just cranelift.
                 store_jit_exception(exc_obj as i64);
@@ -3328,7 +3328,7 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             // at its peak stack use.  Re-derive the depth from the resume pc —
             // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
             crate::eval::correct_resume_vsd(frame, next_instr);
-            match crate::eval::portal_runner_result(frame) {
+            match crate::eval::portal_body_result(frame) {
                 Ok(result) => Some(result as i64),
                 Err(mut err) => {
                     let exc_obj = err.to_exc_object();

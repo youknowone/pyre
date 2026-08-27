@@ -156,25 +156,25 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
     // owes the same refusal, because the enter is no longer performed only
     // here: `try_walker_call_assembler_self_recursive`
     // (`pyre-jit-trace/src/jitcode_dispatch/inline_call.rs`) records it ahead
-    // of its CALL_ASSEMBLER, and the force and deopt legs hand that same,
-    // already-entered frame back to the portal.  Already entered means there
-    // is nothing to link; the guard still has to restore what `leave` would,
-    // which is this frame's own `f_backref`.
-    let already_entered = !ec.is_null()
-        && std::ptr::eq(
+    // of its CALL_ASSEMBLER, and the force and deopt legs can hand that same,
+    // already-entered frame to a portal helper.  Already entered means this
+    // guard owns neither the link nor its matching restore; the surrounding
+    // `ExecutionContext.enter`/`leave` scope owns both.
+    let enters_chain = !ec.is_null()
+        && !std::ptr::eq(
             crate::executioncontext::vref_referent(unsafe { (*ec).topframeref }),
             frame as *mut PyFrame,
         );
-    let previous_ec_top = match (ec.is_null(), already_entered) {
-        (true, _) => std::ptr::null_mut(),
-        (false, true) => frame.f_backref,
-        (false, false) => unsafe {
+    let previous_ec_top = if enters_chain {
+        unsafe {
             let top = (*ec).topframeref;
             (*ec).topframeref = frame as *mut PyFrame;
             top
-        },
+        }
+    } else {
+        std::ptr::null_mut()
     };
-    if !already_entered {
+    if enters_chain || ec.is_null() {
         // Barrier for the same reason as `ExecutionContext::enter`: this is a
         // traced `Type::Ref` store and `frame` can be an old-generation frame
         // taking a young predecessor.
@@ -190,7 +190,19 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
             previous_ec_top
         };
     }
-    push_current_frame_previous_root(previous, ec, previous_ec_top)
+    // A guard that did not write the execution-context chain owns no restore
+    // either.  The surrounding `ExecutionContext.enter`/`leave` pair keeps
+    // ownership of an already-entered frame; restoring its predecessor here
+    // would unlink the live outer activation when this guard is dropped.
+    push_current_frame_previous_root(
+        previous,
+        if enters_chain {
+            ec
+        } else {
+            std::ptr::null_mut()
+        },
+        previous_ec_top,
+    )
 }
 
 /// Install only the TLS current-frame root.
@@ -5530,6 +5542,36 @@ mod tests {
         let mut frame = PyFrame::new(code);
         let result = frame.execute_frame(None, None);
         (result, frame)
+    }
+
+    // Compiled code can record `ExecutionContext.enter` before handing the
+    // same frame to a portal helper.  Installing the TLS current-frame root in
+    // that helper must neither relink the frame nor unlink the surrounding
+    // activation when the guard is dropped.
+    #[test]
+    fn test_install_current_frame_does_not_own_an_already_entered_chain() {
+        let _ = run_exec_frame("pass");
+        let code = compile_exec("pass").expect("compile failed");
+        let mut frame = PyFrame::new(code);
+        let frame_ptr = frame.as_mut_ptr();
+        let ec = unsafe { (*frame_ptr).execution_context as *mut PyExecutionContext };
+        assert!(!ec.is_null(), "the frame must carry an execution context");
+        let outer_top = unsafe { (*ec).topframeref };
+
+        unsafe { (*ec).enter(frame_ptr) };
+        let linked_backref = unsafe { (*frame_ptr).f_backref };
+        assert_eq!(linked_backref, outer_top);
+
+        {
+            let _guard = install_current_frame(unsafe { &mut *frame_ptr });
+            assert_eq!(unsafe { (*frame_ptr).f_backref }, linked_backref);
+        }
+        assert_eq!(
+            unsafe { (*ec).topframeref },
+            frame_ptr,
+            "the outer enter/leave scope, not the TLS guard, owns the unlink",
+        );
+        unsafe { (*ec).topframeref = outer_top };
     }
 
     // A frame value slot may hold a `JitVirtualRef`, whose leading magic word

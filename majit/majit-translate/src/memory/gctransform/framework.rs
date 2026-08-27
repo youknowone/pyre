@@ -174,7 +174,7 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     "call_jit::bh_call_self_recursive_portal",
     "eval::portal_runner",
     "eval::portal_runner_dispatch",
-    "eval::portal_runner_result",
+    "eval::portal_body_result",
     "eval::portal_activation_result",
     "eval::portal_activation_bracketed",
     "eval::enter_portal",

@@ -1451,6 +1451,14 @@ impl TraceCtx {
         virtual_obj: OpRef,
         virtual_obj_ptr: usize,
     ) -> (OpRef, *mut u8) {
+        // virtualref.py `virtual_ref_during_tracing(real_object)` starts with
+        // `assert real_object`: the tracing-time vref exists to name a live
+        // object, and one built over a null would carry a null `forced` that
+        // every non-forcing reader resolves as "still virtual".
+        assert_ne!(
+            virtual_obj_ptr, 0,
+            "opimpl_virtual_ref requires the tracing-time real object"
+        );
         // pyjitpl.py:1804 `vref = vrefinfo.virtual_ref_during_tracing(box)`.
         let vref_ptr = self
             .metainterp_sd

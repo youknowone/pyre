@@ -3431,6 +3431,23 @@ pub(crate) fn walker_ec_leave(
 /// allocation) and is exactly what [`pyre_interpreter::PyExecutionContext::enter`]
 /// stores.
 ///
+/// ⛔ Recording a `VIRTUAL_REF` here instead — the spelling
+/// [`walker_ec_enter`] uses — is not available to this fold, and the
+/// difference is the callee's exit, not the enter.  `optimize_VIRTUAL_REF`
+/// seeds the materialized `JitVirtualRef` with `forced = NULL`
+/// (`virtualize.py:129`), and pyre's two portal doors resolve `topframeref`
+/// through `executioncontext::vref_referent`, which reads `forced` WITHOUT
+/// forcing.  An unforced vref therefore answers NULL at both:
+/// `install_current_frame` (`pyre-interpreter/src/eval.rs`) reads that as
+/// "not yet entered" and re-links the callee onto its own vref, and
+/// `leave_compiled_frame_chain` (`pyre-jit/src/call_jit.rs`) reads it as
+/// "not my frame" and silently declines the restore.  [`walker_ec_enter`]'s
+/// callee is inlined and reaches neither door; this fold's callee reaches
+/// both — `compile_tmp_callback` routes its CALL_ASSEMBLER through
+/// `ll_portal_runner_shim`, and the force/deopt legs call
+/// `jit_force_callee_frame`.  Publishing a vref here needs a signal those
+/// doors can decide without forcing, which does not exist yet.
+///
 /// Upstream reaches `ec.enter` on this path too: `interp_jit.py` puts
 /// `jit_merge_point` on `PyFrame.dispatch`, so the CALL_ASSEMBLER that
 /// replaces the callee's merge point is recorded with `pyframe.py
@@ -3486,6 +3503,55 @@ fn record_ec_leave_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_e
         &[callee_ec, f_backref],
         crate::descr::ec_topframeref_descr(),
     );
+}
+
+#[cfg(test)]
+mod portal_frame_chain_tests {
+    use super::*;
+
+    /// The fold's recorded `enter` publishes the callee frame itself, and its
+    /// recorded `leave` restores `f_backref` — neither takes a vref.
+    ///
+    /// The op shape is the contract, because the two portal doors this fold's
+    /// callee reaches (`install_current_frame` and `leave_compiled_frame_chain`)
+    /// resolve `topframeref` through `vref_referent`, which reads
+    /// `JitVirtualRef.forced` without forcing.  `optimize_VIRTUAL_REF` seeds
+    /// that field with `CONST_NULL` (`virtualize.py:129`), so a `VIRTUAL_REF`
+    /// recorded here would answer NULL at both doors: the first re-links the
+    /// callee onto its own vref, the second declines the restore.  See
+    /// [`record_ec_enter_frame_chain`] for the full argument.
+    #[test]
+    fn the_recorded_enter_and_leave_take_no_virtual_ref() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let frame = OpRef::input_arg_ref(0);
+        let ec = OpRef::input_arg_ref(1);
+
+        record_ec_enter_frame_chain(&mut ctx, frame, ec);
+        record_ec_leave_frame_chain(&mut ctx, frame, ec);
+        assert_eq!(
+            ctx.virtualref_boxes_len(),
+            0,
+            "this level holds no vref, so it owes no virtual_ref_finish and \
+             must not leave `virtualref_boxes` unbalanced at the loop header",
+        );
+
+        let tree_loop = ctx.into_tree_loop();
+        let opcodes: Vec<OpCode> = tree_loop.ops.iter().map(|op| op.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                // `frame.f_backref = self.topframeref`
+                OpCode::GetfieldGcR,
+                OpCode::SetfieldGc,
+                // `self.topframeref = jit.virtual_ref(frame)`, whose
+                // interpreter-level reading is the frame pointer itself
+                OpCode::SetfieldGc,
+                // `self.topframeref = frame.f_backref`
+                OpCode::GetfieldGcR,
+                OpCode::SetfieldGc,
+            ],
+        );
+    }
 }
 
 /// Resolve the generated builtin-wrapper argument slice's array-item
