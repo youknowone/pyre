@@ -71,10 +71,22 @@ pub fn io_buffer_write_fmt(args: fmt::Arguments<'_>) {
 }
 
 /// Flush the JIT I/O buffer to stdout.
+///
+/// The gate inlines and the work does not: this runs on every exit from
+/// compiled code, and on a build that buffers no I/O the whole call is one
+/// relaxed load and a not-taken branch — which is only true if the caller can
+/// see the load, rather than reaching it through a call.
+#[inline]
 pub fn io_buffer_commit() {
     if !io_buffer_possibly_nonempty() {
         return;
     }
+    io_buffer_commit_slow();
+}
+
+#[cold]
+#[inline(never)]
+fn io_buffer_commit_slow() {
     JIT_IO_BUFFER.with(|buf| {
         let mut b = buf.borrow_mut();
         if !b.is_empty() {
@@ -87,11 +99,18 @@ pub fn io_buffer_commit() {
     });
 }
 
-/// Discard the JIT I/O buffer contents.
+/// Discard the JIT I/O buffer contents. Split like [`io_buffer_commit`].
+#[inline]
 pub fn io_buffer_discard() {
     if !io_buffer_possibly_nonempty() {
         return;
     }
+    io_buffer_discard_slow();
+}
+
+#[cold]
+#[inline(never)]
+fn io_buffer_discard_slow() {
     JIT_IO_BUFFER.with(|buf| {
         buf.borrow_mut().clear();
     });

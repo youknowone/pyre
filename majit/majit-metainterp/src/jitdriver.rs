@@ -489,6 +489,7 @@ impl Drop for TraceContinuationSuspendGuard {
 /// reason [`no_bridge_enabled`] is — a frontend that owns state the diagnostic
 /// is about has to report it from its own side, and a variable that only the
 /// metainterp honours reads as broken when a frontend's half stays silent.
+#[inline]
 pub fn spdiag_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_SPDIAG").is_some())
@@ -541,6 +542,7 @@ fn failvals_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_FAILVALS").is_some())
 }
+#[inline]
 fn portal_rca_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_PORTAL_RCA").is_some())
@@ -5495,7 +5497,7 @@ impl<S: JitState> JitDriver<S> {
                         state.state_field_layout().total_live_values(),
                     );
                     let extended = self.extend_compiled_live_values_into(
-                        green_key,
+                        &procedure_token,
                         state,
                         &compiled_meta,
                         vable,
@@ -5536,7 +5538,7 @@ impl<S: JitState> JitDriver<S> {
                 }
 
                 if !self.extend_compiled_live_values_into(
-                    green_key,
+                    &procedure_token,
                     state,
                     &compiled_meta,
                     vable,
@@ -5638,7 +5640,11 @@ impl<S: JitState> JitDriver<S> {
             pre_run();
 
             let selected_dispatch_key = dispatch_key.unwrap_or(0);
-            if portal_rca_enabled() {
+            // One read for the pair below. The flag is fixed at process start,
+            // but the compiled run sits between the two sites and is opaque to
+            // the optimizer, so asking twice is two loads and two calls.
+            let portal_rca = portal_rca_enabled();
+            if portal_rca {
                 let labels = state.debug_state_live_labels(&compiled_meta);
                 eprintln!(
                     "[portal-rca][compiled-entry] green_key={green_key} target_pc={target_pc} \
@@ -5669,7 +5675,7 @@ impl<S: JitState> JitDriver<S> {
             // this point.
             self.entry_scratch_out(scratch);
             let mut result = result?;
-            if portal_rca_enabled() {
+            if portal_rca {
                 eprintln!(
                     "[portal-rca][compiled-exit] green_key={green_key} \
                      dispatch_key={selected_dispatch_key} is_finish={} fail_index={} \
@@ -6724,7 +6730,7 @@ impl<S: JitState> JitDriver<S> {
     /// declining caller sees the buffer it passed.
     fn extend_compiled_live_values_into(
         &self,
-        green_key: u64,
+        procedure_token: &majit_backend::JitCellToken,
         state: &S,
         meta: &S::Meta,
         virtualizable: Option<&JitDriverVar>,
@@ -6733,13 +6739,15 @@ impl<S: JitState> JitDriver<S> {
         arrays: &mut Vec<Vec<i64>>,
     ) -> bool {
         // `warmstate.py:188 cell.loop_token` is the single PyPy source of
-        // truth for the entry-path inputarg shape; route through
-        // `warm_state.get_compiled` so this site never consults pyre's
-        // `compiled_loops` side table (the retirement target).
-        let Some(compiled) = self.meta.warm_state_ref().get_compiled(green_key) else {
-            return false;
-        };
-        let compiled_inputs = compiled.inputarg_types().len();
+        // truth for the entry-path inputarg shape, and this token IS what
+        // `warm_state.get_compiled` returns — so the shape still comes off the
+        // cell and never off pyre's `compiled_loops` side table (the
+        // retirement target). Arrives resolved for the reason `sync_before`
+        // gives: `warmstate.py maybe_compile_and_run` reads the cell's token
+        // once and carries the object into `execute_assembler`, where asking
+        // the celltable again costs a walk, a `Weak::upgrade` and an `Arc`
+        // drop for one length.
+        let compiled_inputs = procedure_token.inputarg_types().len();
         if compiled_inputs <= live_values.len() {
             return true;
         }
@@ -6781,10 +6789,13 @@ impl<S: JitState> JitDriver<S> {
         virtualizable: Option<&JitDriverVar>,
         mut live_values: Vec<Value>,
     ) -> Option<Vec<Value>> {
+        // The cold form keeps the lookup: its callers hold a green key and no
+        // token.
+        let procedure_token = self.meta.warm_state_ref().get_compiled(green_key)?;
         let mut statics = Vec::new();
         let mut arrays = Vec::new();
         self.extend_compiled_live_values_into(
-            green_key,
+            &procedure_token,
             state,
             meta,
             virtualizable,
