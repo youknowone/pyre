@@ -8141,7 +8141,7 @@ fn overlay_stream_ref_slots(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) {
     for &(pos, slot) in stream_slots {
         let (box_ref, value) = bridge_decode_box(
@@ -8191,7 +8191,7 @@ fn reconstruct_inline_recipe(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
     in_a_call: bool,
     pending_ref_array_writes: &[PendingRefArrayWrite],
 ) -> Option<ReconstructRecipe> {
@@ -8908,7 +8908,7 @@ fn bridge_decode_box(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> (OpRef, majit_ir::Value) {
     use majit_ir::resumedata::RebuiltValue;
     let callinfocollection = ctx.callinfocollection.clone();
@@ -8985,7 +8985,7 @@ fn prepare_bridge_pending_fields(
     fail_values: &[i64],
     fail_types: &[Type],
     backend: &dyn majit_backend::Backend,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> Vec<PendingRefArrayWrite> {
     let mut pending_ref_array_writes = Vec::new();
     let Some(storage) = resume_data.storage.as_ref() else {
@@ -9154,12 +9154,16 @@ fn prepare_bridge_pending_fields(
             // asserts only the fieldbox is virtual), so the bridge-body read hits
             // the plain get heapcache path with no on-hit sanity load, and the
             // replayed store runs at bridge entry before any body op.
+            // The direct reader that preceded this entry applied these writes
+            // already, so this cache is the recording-only one and the call
+            // records without storing.
             majit_metainterp::emit_pending_field_op(
                 ctx,
                 target_op,
                 value_op,
                 pending.item_index,
                 descr,
+                cache,
             );
         }
     }
@@ -9178,7 +9182,7 @@ fn decode_tagged_concrete(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> i64 {
     use majit_ir::resumedata::{
         NULLREF, TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, UNINITIALIZED_TAG, untag,
@@ -9295,7 +9299,7 @@ fn decode_tagged_for_kind(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> i64 {
     decode_tagged_concrete(
         tagged,
@@ -9320,7 +9324,7 @@ fn setfield_concrete_from_tagged(
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) {
     let descr = bh_field_descr_from_info(fd);
     match fd.field_type {
@@ -9381,7 +9385,7 @@ fn setarrayitem_concrete_from_tagged(
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) {
     if arraydescr.is_array_of_pointers() {
         let value = decode_tagged_for_kind(
@@ -9449,7 +9453,7 @@ fn setinteriorfield_concrete_from_tagged(
     num_failargs: i32,
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) {
     let ifd = interior_descr
         .as_interior_field_descr()
@@ -9549,7 +9553,7 @@ fn materialize_concrete_virtual_ptr(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> majit_ir::GcRef {
     if let Some(cached) = cache.get_concrete_ptr(vidx) {
         return cached;
@@ -9970,7 +9974,7 @@ fn materialize_concrete_virtual_int(
     storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     backend: &dyn majit_backend::Backend,
     callinfocollection: Option<&std::sync::Arc<majit_ir::CallInfoCollection>>,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> i64 {
     if let Some(cached) = cache.get_concrete_int(vidx) {
         return cached;
@@ -10157,6 +10161,14 @@ impl JitState for PyreJitState {
     type Meta = PyreMeta;
     type Sym = PyreSym;
     type Env = PyreEnv;
+
+    /// `sync_virtualizable_after_guard_failure` has already run by the time
+    /// bridge setup is reached: guard-failure recovery selects it through
+    /// `ResumeVableMode::GuardFailureSync`, and it writes each slot through
+    /// `value_to_static_vable_bits` / `value_to_vable_array_item_bits`, which
+    /// box an unwrapped `Value::Int` / `Value::Float` back into an object
+    /// before it lands in a slot the frame reads as one.
+    const SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE: bool = true;
 
     fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {
         let num_locals = self.local_count();
@@ -10441,9 +10453,22 @@ impl JitState for PyreJitState {
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         fail_values: &[i64],
         fail_types: &[Type],
+        executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
     ) {
         if resume_data.frames.is_empty() {
             return;
+        }
+        // This walk still records without applying, so it can serve an entry
+        // that asked for the applying reader only while there is nothing to
+        // apply. A guard carrying deferred heap writes has to keep going
+        // through the arm that applies them.
+        if executing.is_some()
+            && resume_data
+                .storage
+                .as_ref()
+                .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
+        {
+            ctx.mark_bridge_replay_incomplete();
         }
 
         // virtualizable.py load_list_of_boxes parity: decode each
@@ -14365,6 +14390,7 @@ mod tests {
             None,
             &fail_values,
             &fail_types,
+            None,
         );
 
         assert_eq!(sym.valuestackdepth, 3);

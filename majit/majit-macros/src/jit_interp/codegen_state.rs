@@ -3010,6 +3010,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
                 fail_values: &[i64],
                 fail_types: &[majit_ir::Type],
+                executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
             ) {
                 use majit_ir::resumedata::RebuiltValue;
                 use majit_metainterp::JitCodeSym as _;
@@ -3028,16 +3029,27 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 // commits inline; without this replay the bridge reads size>chain
                 // and dereferences a NULL node head. Runs independent of the
                 // frame-register seeding below (which may decline).
-                let mut __bridge_cache = majit_metainterp::BridgeVirtualCache::new(
-                    rd_virtuals.map_or(0, |v| v.len()),
-                    majit_metainterp::default_bridge_array_descr,
-                );
-                majit_metainterp::replay_pending_fields(
+                let __bridge_virtual_count = rd_virtuals.map_or(0, |v| v.len());
+                let mut __bridge_cache = match executing {
+                    Some(__alloc) => majit_metainterp::BridgeVirtualCache::executing(
+                        __bridge_virtual_count,
+                        majit_metainterp::default_bridge_array_descr,
+                        __alloc,
+                        fail_values,
+                    ),
+                    None => majit_metainterp::BridgeVirtualCache::new(
+                        __bridge_virtual_count,
+                        majit_metainterp::default_bridge_array_descr,
+                    ),
+                };
+                if !majit_metainterp::replay_pending_fields(
                     ctx,
                     resume_data,
                     rd_virtuals,
                     &mut __bridge_cache,
-                );
+                ) {
+                    ctx.mark_bridge_replay_incomplete();
+                }
                 #seed_bridge_vable
                 #rebind_bridge_vable_identity
                 let frame = match resume_data.frames.first() {

@@ -114,6 +114,22 @@ pub(super) struct Lowerer<'c> {
     pub(super) inline_arm_tail_stmt: bool,
 }
 
+/// Everything a failed lowering has to put back.
+///
+/// A lowerer that emits before it can know whether it will succeed —
+/// every construct whose branch target must exist before its body is
+/// lowered — owes the caller an unchanged stream when it refuses. What it
+/// leaves behind otherwise is a `__builder.new_label()` with no
+/// `mark_label`, and the jitcode assembler can only report that at the
+/// end, as a label referenced by a `goto` that names no position.
+pub(super) struct LowerSnapshot {
+    statements: usize,
+    op_metadata: usize,
+    next_reg: u16,
+    next_label: u16,
+    bindings: HashMap<String, Binding>,
+}
+
 impl<'c> Lowerer<'c> {
     pub(super) fn new(config: Option<&'c LowererConfig>) -> Self {
         let call_policies = config.map(|cfg| cfg.calls.clone()).unwrap_or_default();
@@ -264,6 +280,40 @@ impl<'c> Lowerer<'c> {
     /// already consumed therefore leaves the counter alone; it is put back by
     /// `try_inline_dispatch_arm`, which discards the statement stream in the
     /// same block.
+    pub(super) fn snapshot(&self) -> LowerSnapshot {
+        LowerSnapshot {
+            statements: self.statements.len(),
+            op_metadata: self.op_metadata.len(),
+            next_reg: self.next_reg,
+            next_label: self.next_label,
+            bindings: self.bindings.clone(),
+        }
+    }
+
+    /// Truncate the statements and roll the label counter back together, the
+    /// pairing [`Self::alloc_label`] requires.
+    pub(super) fn restore(&mut self, snapshot: LowerSnapshot) {
+        self.statements.truncate(snapshot.statements);
+        self.op_metadata.truncate(snapshot.op_metadata);
+        self.next_reg = snapshot.next_reg;
+        self.next_label = snapshot.next_label;
+        self.bindings = snapshot.bindings;
+    }
+
+    /// Run a lowering that emits before it can fail, and leave the stream
+    /// untouched if it refuses.
+    pub(super) fn transactional<T>(
+        &mut self,
+        lower: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        let snapshot = self.snapshot();
+        let lowered = lower(self);
+        if lowered.is_none() {
+            self.restore(snapshot);
+        }
+        lowered
+    }
+
     pub(super) fn alloc_label(&mut self) -> syn::Ident {
         let label = self.next_label;
         self.next_label = self.next_label.saturating_add(1);
@@ -303,12 +353,34 @@ impl<'c> Lowerer<'c> {
     }
 
     pub(super) fn emit_conditional_guard(&mut self, cond_reg: u16, target: &Ident) {
-        // `goto_if_not_int_is_true` reads an int-banked register per
-        // `assembler.py:217 'i'` argcode — encode the kind into the
-        // metadata `Register` so the liveness walker keeps it under Int.
+        self.emit_conditional_guard_negatable(cond_reg, target, false);
+    }
+
+    /// The branch RPython writes as `goto_if_not_<opname>`: fall through
+    /// when the condition holds, take `target` otherwise.
+    ///
+    /// `negated` selects the `int_is_zero` form, which is the shape `!cond`
+    /// reaches flatten as. `jtransform.py` renames `bool_not` to
+    /// `int_is_zero`, and `optimize_goto_if_not` folds that operation into
+    /// the block's exitswitch rather than materialising its result, so the
+    /// negation costs a different branch opname and nothing else.
+    pub(super) fn emit_conditional_guard_negatable(
+        &mut self,
+        cond_reg: u16,
+        target: &Ident,
+        negated: bool,
+    ) {
+        let branch = if negated {
+            format_ident!("goto_if_not_int_is_zero")
+        } else {
+            format_ident!("goto_if_not_int_is_true")
+        };
+        // Both forms read an int-banked register per `assembler.py:217 'i'`
+        // argcode — encode the kind into the metadata `Register` so the
+        // liveness walker keeps it under Int.
         self.emit_op(
             OpMeta::conditional_guard(Register::int(cond_reg), target.clone()),
-            quote! { __builder.goto_if_not_int_is_true(#cond_reg, #target); },
+            quote! { __builder.#branch(#cond_reg, #target); },
         );
     }
 

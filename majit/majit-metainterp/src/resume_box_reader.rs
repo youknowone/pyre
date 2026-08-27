@@ -37,16 +37,59 @@ pub fn default_bridge_array_descr(
 /// only virtual kind whose descr is minted rather than looked up in a parent
 /// `SizeDescr`); descr identity is the consumer's gccache concern, so it is
 /// injected rather than fixed in core.
-pub struct BridgeVirtualCache {
+pub struct BridgeVirtualCache<'a> {
     virtuals_ptr_cache: Vec<Option<OpRef>>,
     virtuals_int_cache: Vec<Option<OpRef>>,
     concrete_ptr_cache: Vec<Option<majit_ir::GcRef>>,
     concrete_int_cache: Vec<Option<i64>>,
     mint_raw_array_descr:
         fn(usize, usize, Option<usize>, majit_ir::Type, bool) -> majit_ir::DescrRef,
+    /// The applying half of resume.py's reader pair, present only for the
+    /// entry `ResumeDataBoxReader` serves upstream: one that no direct reader
+    /// preceded.  `allocate_with_vtable` there is
+    /// `metainterp.execute_new_with_vtable` and `setfield` is
+    /// `metainterp.execute_setfield_gc` — `execute_and_record`, which applies
+    /// to the heap AND records; `ResumeDataDirectReader` is the same walk with
+    /// `cpu.bh_*` and no recording.
+    ///
+    /// `None` is the recording-only reader, which upstream has no counterpart
+    /// for and which is sound only because the direct reader has already run
+    /// for this guard: applying again would allocate a SECOND set of virtuals
+    /// and record an identity the interpreter does not hold.
+    executing: Option<&'a dyn crate::resume::BlackholeAllocator>,
+    /// The guard's fail values, which `resume.py decode_ref` reads a TAGBOX
+    /// operand out of (`cpu.get_ref_value(self.deadframe, num)`). Empty for
+    /// the recording-only reader, which never needs a concrete.
+    fail_values: &'a [i64],
+    /// Addresses of the virtuals the applying reader has allocated, indexed by
+    /// virtual number and registered as resume-construction GC roots.
+    ///
+    /// resume.py keeps each freshly allocated virtual in `virtuals_cache`,
+    /// an ordinary RPython object and therefore a root, and its own comment
+    /// says why: `allocate()` must fill the cache "as soon as they have the
+    /// object, before they fill its fields", because a later allocation in the
+    /// same walk can collect. Between one `bh_new` and the store that
+    /// publishes its result nothing else refers to that object, so without
+    /// these roots the second virtual of a two-virtual guard collects the
+    /// first. The length is fixed at construction, so the registered slice
+    /// never moves, and the collector writes forwarded addresses back through
+    /// it — always read the address back from here, never from a copy.
+    concrete_roots: Vec<i64>,
+    /// Root-stack depth to unwind to, captured before this cache registered
+    /// anything. Equal to the entry depth for the recording-only reader, whose
+    /// unwind is then a no-op.
+    roots_depth: usize,
 }
 
-impl BridgeVirtualCache {
+impl Drop for BridgeVirtualCache<'_> {
+    fn drop(&mut self) {
+        majit_gc::shadow_stack::pop_resume_ref_roots_to(self.roots_depth);
+    }
+}
+
+impl<'a> BridgeVirtualCache<'a> {
+    /// The recording-only reader, for a bridge entered after a direct reader
+    /// has already applied this guard's writes.
     pub fn new(
         size: usize,
         mint_raw_array_descr: fn(
@@ -63,7 +106,83 @@ impl BridgeVirtualCache {
             concrete_ptr_cache: vec![None; size],
             concrete_int_cache: vec![None; size],
             mint_raw_array_descr,
+            executing: None,
+            fail_values: &[],
+            concrete_roots: Vec::new(),
+            roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
         }
+    }
+
+    /// `ResumeDataBoxReader`: the same walk, applying each write through
+    /// `allocator` as it records it.
+    pub fn executing(
+        size: usize,
+        mint_raw_array_descr: fn(
+            usize,
+            usize,
+            Option<usize>,
+            majit_ir::Type,
+            bool,
+        ) -> majit_ir::DescrRef,
+        allocator: &'a dyn crate::resume::BlackholeAllocator,
+        fail_values: &'a [i64],
+    ) -> Self {
+        // Built field by field rather than from `Self::new`: the cache
+        // unregisters its roots in `Drop`, and a type that implements `Drop`
+        // cannot be moved out of by struct-update syntax.
+        let mut cache = Self {
+            virtuals_ptr_cache: vec![None; size],
+            virtuals_int_cache: vec![None; size],
+            concrete_ptr_cache: vec![None; size],
+            concrete_int_cache: vec![None; size],
+            mint_raw_array_descr,
+            executing: Some(allocator),
+            fail_values,
+            concrete_roots: vec![0i64; size],
+            roots_depth: majit_gc::shadow_stack::resume_ref_roots_depth(),
+        };
+        if size > 0 {
+            // SAFETY: the buffer is heap-allocated at a fixed address, never
+            // resized after this point, and unregistered by `Drop` before the
+            // cache dies.
+            unsafe {
+                majit_gc::shadow_stack::push_resume_ref_roots(&mut cache.concrete_roots);
+            }
+        }
+        cache
+    }
+
+    /// Publish a freshly allocated virtual as a root and remember which
+    /// `OpRef` names it, so later operands resolve to the address the
+    /// collector is maintaining rather than to a copy taken before it moved.
+    fn set_concrete_root(&mut self, vidx: usize, address: i64) {
+        if let Some(slot) = self.concrete_roots.get_mut(vidx) {
+            *slot = address;
+        }
+    }
+
+    /// The address a materialized virtual currently lives at, by the `OpRef`
+    /// the recording half minted for it.
+    fn concrete_root_of(&self, opref: OpRef) -> Option<i64> {
+        let vidx = self
+            .virtuals_ptr_cache
+            .iter()
+            .position(|slot| *slot == Some(opref))?;
+        match self.concrete_roots.get(vidx) {
+            Some(0) | None => None,
+            Some(address) => Some(*address),
+        }
+    }
+
+    /// The allocator the applying half stores through, or `None` when this is
+    /// the recording-only reader.
+    pub fn allocator(&self) -> Option<&'a dyn crate::resume::BlackholeAllocator> {
+        self.executing
+    }
+
+    /// The guard's fail values, for resolving a TAGBOX operand's concrete.
+    fn fail_values(&self) -> &'a [i64] {
+        self.fail_values
     }
 
     pub fn get_any(&self, i: usize) -> Option<OpRef> {
@@ -156,7 +275,7 @@ pub fn decode_fieldnum(
     tagged: i16,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> OpRef {
     use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
     // resume.py `decode_box` dispatches purely on the tag bits;
@@ -248,12 +367,82 @@ pub fn decode_fieldnum(
     }
 }
 
+/// resume.py `decode_ref` / `decode_int` / `decode_float`, concrete half.
+///
+/// The box reader reads a TAGBOX operand straight out of the deadframe
+/// (`cpu.get_ref_value(self.deadframe, num)`), so an input-arg `OpRef`
+/// resolves against the guard's fail values. Everything else — a pool
+/// constant, or a virtual this walk has just allocated — carries its concrete
+/// on the shadow the recording half already stamped.
+fn operand_concrete(
+    ctx: &crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    opref: OpRef,
+) -> Option<majit_ir::Value> {
+    // `decode_ref` reads a TAGBOX operand out of the deadframe and nothing
+    // else, so the guard's fail values win for an input arg — a shadow carried
+    // on the OpRef describes some earlier run of the same slot.
+    if let Some(address) = cache.concrete_root_of(opref) {
+        return Some(majit_ir::Value::Ref(majit_ir::GcRef(address as usize)));
+    }
+    if opref.is_input_arg() {
+        let bits = *cache.fail_values().get(opref.raw() as usize)?;
+        return Some(match opref {
+            OpRef::InputArgRef(_) => majit_ir::Value::Ref(majit_ir::GcRef(bits as usize)),
+            OpRef::InputArgFloat(_) => majit_ir::Value::Float(f64::from_bits(bits as u64)),
+            _ => majit_ir::Value::Int(bits),
+        });
+    }
+    ctx.box_value(opref)
+}
+
+/// resume.py `ResumeDataBoxReader.setfield` applying half.
+///
+/// `metainterp.execute_setfield_gc` executes the store as well as recording
+/// it, dispatching on `descr.is_pointer_field()` / `is_float_field()` — the
+/// same three-way split `ResumeDataDirectReader.setfield` makes over
+/// `cpu.bh_setfield_gc_{r,f,i}`.
+///
+/// Returns `false` when the store cannot be applied: a target or value whose
+/// concrete this walk never learned, or a value whose bank disagrees with the
+/// field's. A recorded write whose heap half did not happen would leave the
+/// bridge reading state the interpreter does not hold, so the caller must fail
+/// the whole entry rather than carry on.
+fn apply_setfield(
+    ctx: &crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    allocator: &dyn crate::resume::BlackholeAllocator,
+    struct_op: OpRef,
+    value_op: OpRef,
+    info: &majit_ir::FieldDescrInfo,
+) -> bool {
+    use majit_ir::Value;
+    let Some(Value::Ref(target)) = operand_concrete(ctx, cache, struct_op) else {
+        return false;
+    };
+    let Some(value) = operand_concrete(ctx, cache, value_op) else {
+        return false;
+    };
+    let target = target.as_usize() as i64;
+    match (info.field_type, value) {
+        (majit_ir::Type::Ref, Value::Ref(r)) => {
+            allocator.bh_setfield_gc_r(target, r.as_usize() as i64, info)
+        }
+        (majit_ir::Type::Float, Value::Float(f)) => {
+            allocator.bh_setfield_gc_f(target, f.to_bits() as i64, info)
+        }
+        (majit_ir::Type::Int, Value::Int(i)) => allocator.bh_setfield_gc_i(target, i, info),
+        _ => return false,
+    }
+    true
+}
+
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> OpRef {
     use majit_ir::OpCode;
     use majit_ir::resumedata::{TAG_CONST_OFFSET, TAGBOX, TAGCONST, TAGINT, TAGVIRTUAL, untag};
@@ -292,8 +481,8 @@ pub fn materialize_bridge_virtual(
         parent_descr: majit_ir::DescrRef,
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         resume_data: &crate::jit_state::ResumeDataResult,
-        cache: &mut BridgeVirtualCache,
-    ) {
+        cache: &mut BridgeVirtualCache<'_>,
+    ) -> bool {
         // resume.py setfields — range(len(fielddescrs)), index
         // fieldnums[i]. The len-equality assert (resume.py:606) is in
         // debug_prints, not this allocate path: a short fieldnums raises
@@ -306,6 +495,13 @@ pub fn materialize_bridge_virtual(
             }
             let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
             if value.is_none() {
+                // The recording reader can leave a field it could not decode to
+                // whatever the allocation already holds; the applying one
+                // cannot, because that field is the heap the bridge resumes
+                // against.
+                if cache.allocator().is_some() {
+                    return false;
+                }
                 continue;
             }
             // resume.py self.setfields → decoder.setfield(struct,
@@ -322,7 +518,21 @@ pub fn materialize_bridge_virtual(
                 .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
             ctx.profiler()
                 .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
+            // `execute_and_record` reaches `_record_helper`, whose
+            // `invalidate_caches` is `mark_escaped` alone for a store
+            // (`clear_caches_not_necessary` answers true for SETFIELD_GC).
+            // Recording the store without it leaves a struct that
+            // `allocate_struct` had just flagged unescaped still flagged so
+            // after it was written into one that is not, and the walk that
+            // follows keeps folding its fields across calls that can reach it.
+            ctx.heap_cache_mut()
+                .mark_escaped(OpCode::SetfieldGc, None, &[struct_op, value]);
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[struct_op, value], field_descr.clone());
+            if let Some(allocator) = cache.allocator()
+                && !apply_setfield(ctx, cache, allocator, struct_op, value, fd_info)
+            {
+                return false;
+            }
             // Bridge virtual rematerialisation — `upd.setfield(valuebox)`
             // parity: cache stores the Box identity (`value` OpRef).
             // Cache-hit readers resolve the intrinsic value via
@@ -335,6 +545,18 @@ pub fn materialize_bridge_virtual(
             // return `None` so the downstream sanity check skips.
             ctx.heapcache_setfield_cached(struct_op, fd_info.index, value);
         }
+        true
+    }
+
+    // Only `VStructInfo` has its applying twin wired here (`bh_new` plus the
+    // `setfields` stores). Recording a NEW the heap does not hold would give
+    // the trace an identity the interpreter cannot resume against, so the
+    // applying reader declines every other kind instead. The recording reader
+    // is unaffected: a direct reader has already allocated for it.
+    if cache.allocator().is_some()
+        && !matches!(entry.as_ref(), majit_ir::RdVirtualInfo::VStructInfo { .. })
+    {
+        return OpRef::NONE;
     }
 
     match entry.as_ref() {
@@ -358,7 +580,7 @@ pub fn materialize_bridge_virtual(
             // resume.py decoder.virtuals_cache.set_ptr(index, struct)
             cache.set_ptr(vidx, new_op);
             // resume.py self.setfields(decoder, struct)
-            setfields(
+            if !setfields(
                 ctx,
                 new_op,
                 fielddescrs,
@@ -367,7 +589,9 @@ pub fn materialize_bridge_virtual(
                 rd_virtuals,
                 resume_data,
                 cache,
-            );
+            ) {
+                return OpRef::NONE;
+            }
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} VirtualInfo → OpRef::from_raw({})",
@@ -393,10 +617,26 @@ pub fn materialize_bridge_virtual(
                 .count_ops(OpCode::New, crate::counters::RECORDED_OPS);
             let new_op = ctx.record_op_with_descr(OpCode::New, &[], struct_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
-            // resume.py decoder.virtuals_cache.set_ptr(index, struct)
+            // resume.py `allocate_struct` is `metainterp.execute_new(typedescr)`
+            // for the box reader and `cpu.bh_new(typedescr)` for the direct one:
+            // both allocate, and only the first also records. Stamping the
+            // concrete onto the recorded OpRef is what makes the object the
+            // trace names and the object the interpreter resumes against the
+            // same one.
+            // resume.py decoder.virtuals_cache.set_ptr(index, struct), which
+            // its own comment requires BEFORE the fields are filled: the cache
+            // is what keeps the object reachable across the allocations
+            // `setfields` may itself perform.
             cache.set_ptr(vidx, new_op);
+            if let Some(allocator) = cache.allocator() {
+                let ptr = allocator.bh_new(&struct_descr);
+                if ptr == 0 {
+                    return OpRef::NONE;
+                }
+                cache.set_concrete_root(vidx, ptr);
+            }
             // resume.py self.setfields(decoder, struct)
-            setfields(
+            if !setfields(
                 ctx,
                 new_op,
                 fielddescrs,
@@ -405,7 +645,9 @@ pub fn materialize_bridge_virtual(
                 rd_virtuals,
                 resume_data,
                 cache,
-            );
+            ) {
+                return OpRef::NONE;
+            }
             if crate::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-virtual] vidx={} VStructInfo → OpRef::from_raw({})",
@@ -875,7 +1117,7 @@ pub fn rebuilt_value_to_opref(
     v: &majit_ir::resumedata::RebuiltValue,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
 ) -> OpRef {
     use majit_ir::resumedata::RebuiltValue;
     match v {
@@ -902,7 +1144,8 @@ pub fn emit_pending_field_op(
     value_op: OpRef,
     item_index: i32,
     descr: &majit_ir::DescrRef,
-) {
+    cache: &BridgeVirtualCache<'_>,
+) -> bool {
     use majit_ir::OpCode;
     if item_index < 0 {
         // resume.py `_prepare_pendingfields` replays through
@@ -911,9 +1154,33 @@ pub fn emit_pending_field_op(
             .count_ops(OpCode::SetfieldGc, crate::counters::OPS);
         ctx.profiler()
             .count_ops(OpCode::SetfieldGc, crate::counters::RECORDED_OPS);
+        // `_record_helper`'s `invalidate_caches`, which for a store is
+        // `mark_escaped` alone — see the same call in `setfields`.
+        ctx.heap_cache_mut()
+            .mark_escaped(OpCode::SetfieldGc, None, &[target_op, value_op]);
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[target_op, value_op], descr.clone());
+        if let Some(allocator) = cache.allocator() {
+            let Some(fd) = descr.as_field_descr() else {
+                return false;
+            };
+            let info = majit_ir::FieldDescrInfo {
+                index: descr.index(),
+                offset: fd.offset(),
+                field_type: fd.field_type(),
+                field_size: fd.field_size(),
+            };
+            if !apply_setfield(ctx, cache, allocator, target_op, value_op, &info) {
+                return false;
+            }
+        }
         ctx.heapcache_setfield_cached(target_op, descr.index(), value_op);
     } else {
+        // No applying twin is wired for the array element form, so a reader
+        // that must apply declines rather than record a write the heap will
+        // not have.
+        if cache.allocator().is_some() {
+            return false;
+        }
         let index_op = ctx.const_int(item_index as i64);
         ctx.profiler()
             .count_ops(OpCode::SetarrayitemGc, crate::counters::OPS);
@@ -926,6 +1193,7 @@ pub fn emit_pending_field_op(
         );
         ctx.heapcache_setarrayitem(target_op, index_op, descr.index(), value_op);
     }
+    true
 }
 
 /// resume.py `_prepare_pendingfields` (box-reader flavour): replay the
@@ -938,14 +1206,14 @@ pub fn replay_pending_fields(
     ctx: &mut crate::TraceCtx,
     resume_data: &crate::jit_state::ResumeDataResult,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
-    cache: &mut BridgeVirtualCache,
-) {
+    cache: &mut BridgeVirtualCache<'_>,
+) -> bool {
     let __diag = std::env::var_os("MAJIT_BRIDGE_DIAG").is_some();
     let Some(storage) = resume_data.storage.as_ref() else {
         if __diag {
             eprintln!("[replay] storage=None (no pendingfields replayed)");
         }
-        return;
+        return true;
     };
     if __diag {
         eprintln!(
@@ -963,6 +1231,9 @@ pub fn replay_pending_fields(
                     "[replay]   pending item_index={} descr=None SKIP",
                     pending.item_index
                 );
+            }
+            if cache.allocator().is_some() {
+                return false;
             }
             continue;
         };
@@ -1003,6 +1274,9 @@ pub fn replay_pending_fields(
                     value_op.is_none()
                 );
             }
+            if cache.allocator().is_some() {
+                return false;
+            }
             continue;
         }
         if __diag {
@@ -1012,8 +1286,11 @@ pub fn replay_pending_fields(
                 value_op.raw()
             );
         }
-        emit_pending_field_op(ctx, target_op, value_op, pending.item_index, descr);
+        if !emit_pending_field_op(ctx, target_op, value_op, pending.item_index, descr, cache) {
+            return false;
+        }
     }
+    true
 }
 
 /// `pyjitpl.py rebuild_state_after_failure`:
@@ -1043,7 +1320,7 @@ pub fn seed_bridge_virtualizable_boxes(
     info: &crate::virtualizable::VirtualizableInfo,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     resume_data: &crate::jit_state::ResumeDataResult,
-    cache: &mut BridgeVirtualCache,
+    cache: &mut BridgeVirtualCache<'_>,
     fail_values: &[i64],
 ) -> bool {
     use majit_ir::resumedata::RebuiltValue;

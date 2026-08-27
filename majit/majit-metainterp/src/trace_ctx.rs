@@ -719,6 +719,14 @@ pub struct TraceCtx {
     /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
     /// that only receive `TraceCtx`.
     pub(crate) bridge_source_is_exception_guard: bool,
+    /// Set when a bridge-entry resume replay ran as the applying reader and
+    /// met a write it could not apply. The trace then holds recorded writes
+    /// whose heap half did not happen, so the entry that asked for that reader
+    /// must decline rather than resume against a heap it half-described.
+    ///
+    /// Only `resume.py`'s box reader can raise it: the recording-only walk has
+    /// nothing to apply and leaves it false.
+    pub(crate) bridge_replay_incomplete: bool,
 }
 
 /// A decoded-but-not-yet-built description of one inlined
@@ -1767,6 +1775,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
+            bridge_replay_incomplete: false,
         }
     }
 
@@ -1863,6 +1872,7 @@ impl TraceCtx {
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
             bridge_source_is_exception_guard: false,
+            bridge_replay_incomplete: false,
         }
     }
 
@@ -2049,6 +2059,18 @@ impl TraceCtx {
     /// wrapping the same producer `Rc`.
     pub fn operand_for(&self, opref: OpRef) -> majit_ir::operand::Operand {
         self.recorder.box_for_operand(opref)
+    }
+
+    /// Report that the applying half of the bridge-entry replay could not
+    /// finish. See [`TraceCtx::bridge_replay_incomplete`].
+    pub fn mark_bridge_replay_incomplete(&mut self) {
+        self.bridge_replay_incomplete = true;
+    }
+
+    /// Whether [`TraceCtx::mark_bridge_replay_incomplete`] fired for this
+    /// bridge entry.
+    pub fn bridge_replay_incomplete(&self) -> bool {
+        self.bridge_replay_incomplete
     }
 
     pub fn box_value(&self, opref: OpRef) -> Option<Value> {
@@ -2785,6 +2807,29 @@ impl TraceCtx {
     /// identity untouched. No-op when the heap pointer, `virtualizable_info`,
     /// or `virtualizable_values` is unavailable.
     pub fn synchronize_virtualizable(&self) {
+        self.write_virtualizable_back(true);
+    }
+
+    /// The same write at the one moment the carve-out below does not apply:
+    /// `pyjitpl.py rebuild_state_after_failure`'s closing
+    /// `self.synchronize_virtualizable()`.
+    ///
+    /// A guard has just failed out of compiled code and nothing has run the
+    /// outer executor since, so the resume stream is the only description of
+    /// the virtualizable that exists and every field is this write's to make —
+    /// including the arrays an executor would otherwise own. A frontend whose
+    /// own guard-failure recovery already performed it does not reach here;
+    /// `JitState::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE` is how it
+    /// says so.
+    pub fn synchronize_virtualizable_after_guard_failure(&self) {
+        self.write_virtualizable_back(false);
+    }
+
+    /// `virtualizable.py write_boxes` over the whole shadow.
+    ///
+    /// `skip_outer_owned_arrays` is the tracing-time carve-out described at
+    /// its own test below; the guard-failure caller clears it.
+    fn write_virtualizable_back(&self, skip_outer_owned_arrays: bool) {
         let Some(heap_ptr) = self.virtualizable_heap_ptr else {
             return;
         };
@@ -2826,12 +2871,14 @@ impl TraceCtx {
         // clobber the outer executor's writes. The heap is authoritative, so
         // skip the write-back during tracing — the resume path performs its
         // own field-aware flush on guard failure.
-        if info.array_fields.iter().any(|a| {
-            matches!(
-                a.storage,
-                crate::virtualizable::VableArrayStorage::RustVec { .. }
-            )
-        }) {
+        if skip_outer_owned_arrays
+            && info.array_fields.iter().any(|a| {
+                matches!(
+                    a.storage,
+                    crate::virtualizable::VableArrayStorage::RustVec { .. }
+                )
+            })
+        {
             return;
         }
         // Safety: `heap_ptr` is cached at trace/bridge entry from

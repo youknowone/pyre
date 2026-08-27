@@ -1443,7 +1443,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Number of `MC_DIAG` slots. Declared once so the counter array and
 /// `MC_DIAG_LABELS` cannot drift in length — a mismatch is a compile error.
-pub const MC_DIAG_SLOTS: usize = 83;
+pub const MC_DIAG_SLOTS: usize = 88;
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
@@ -1820,6 +1820,28 @@ pub const MC_DIAG_LABELS: [&str; MC_DIAG_SLOTS] = [
     // answer would have charged: that many loops retired and made
     // non-inlinable by an opcode reached from a guard.
     "bridge_abort_permanent",
+    // `bridge_from_guard_resume_position` declines, one slot per rung of the
+    // ladder it runs BEFORE the walk. Every rung ends in the same
+    // `abort_trace`, and slot 41 holds that abort together with the
+    // unclassified default, so a single total here would reproduce exactly the
+    // ambiguity these slots exist to remove. 83 = nothing to enter at (no
+    // rebuilt resume data, no frame, no position, or no live session); 84 =
+    // the frame names a jitcode other than the dispatch one, whose positions
+    // are offsets into different code; 85 = the applying reader met a write it
+    // has no applying twin for, so the trace records a store the heap did not
+    // receive; 86 = the
+    // register-index count and the rebuilt-value count disagree; 87 = a live
+    // register holds a virtual or nothing at all, and the walk executes.
+    //
+    // 85 and 87 are properties of the guard the failing trace stopped at, not
+    // of this driver: they say the blackhole arm is the one that can serve it.
+    // 83, 84 and 86 are shape disagreements, and a nonzero one is worth
+    // reading as a defect rather than as a workload property.
+    "guard_resume_decline_no_state",
+    "guard_resume_decline_foreign_jitcode",
+    "guard_resume_decline_replay_incomplete",
+    "guard_resume_decline_regcount",
+    "guard_resume_decline_unreadable_reg",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

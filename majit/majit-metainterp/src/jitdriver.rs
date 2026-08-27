@@ -1794,6 +1794,54 @@ fn bank_span(bank_len: usize, base: usize, count: usize) -> std::ops::Range<usiz
     start..(start + count).min(bank_len)
 }
 
+/// Why [`JitDriver::bridge_from_guard_resume_position`] gave the guard's own
+/// position up and handed the failure to the blackhole arm instead.
+///
+/// Its ladder runs before the walk and every rung ends in the same
+/// `abort_trace`, which is counted under one `Counters.ABORT_*` id that the
+/// unclassified default also uses. The rung is therefore only knowable at the
+/// point it is chosen; carrying it out of the closure is what lets
+/// [`Self::diag_slot`] tally each one separately.
+#[derive(Clone, Copy)]
+enum GuardResumeDecline {
+    /// No rebuilt resume data, no frame in it, no position to convert, or no
+    /// live trace session to seed — there is nothing to enter at.
+    NoResumeState,
+    /// The frame names a jitcode other than the dispatch one. A position is an
+    /// offset into the jitcode the frame NAMES, so entering a different one
+    /// there lands mid-instruction in unrelated code.
+    ForeignJitcode,
+    /// The applying reader met a write it has no applying twin for, so the
+    /// trace records a store the heap did not receive.
+    ReplayIncomplete,
+    /// The register-index count and the rebuilt-value count disagree, so the
+    /// two sides read different liveness and no per-register pairing off them
+    /// is trustworthy.
+    RegCountMismatch,
+    /// A live register holds a virtual, which has no concrete value, or nothing
+    /// at all. The walk executes, so a register it cannot read a value out of
+    /// is not one it can run past.
+    UnreadableRegister,
+}
+
+impl GuardResumeDecline {
+    /// The `MC_DIAG` slot this rung is tallied in.
+    const fn diag_slot(self) -> usize {
+        match self {
+            GuardResumeDecline::NoResumeState => 83,
+            GuardResumeDecline::ForeignJitcode => 84,
+            GuardResumeDecline::ReplayIncomplete => 85,
+            GuardResumeDecline::RegCountMismatch => 86,
+            GuardResumeDecline::UnreadableRegister => 87,
+        }
+    }
+
+    /// The same rung, for the log line that names it without a slot legend.
+    const fn label(self) -> &'static str {
+        crate::MC_DIAG_LABELS[self.diag_slot()]
+    }
+}
+
 impl<S: JitState> JitDriver<S> {
     /// Create a new JitDriver with the given hot-counting threshold.
     pub fn new(threshold: u32) -> Self {
@@ -4955,52 +5003,81 @@ impl<S: JitState> JitDriver<S> {
         // position to re-enter at; every other JitState resumes through its
         // own frontend.
         let dispatch = self.dispatch_jitcode().cloned()?;
-        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc) {
+        // No blackhole runs before this entry, so its replay is the one that
+        // owes the guard's deferred writes to the heap.
+        if !self.start_bridge_tracing(descr_arc, state, env, raw_values, target_pc, true) {
             return None;
         }
         // From here the trace session is LIVE, so a decline has to tear it
         // down rather than return through it.
-        let seeded = (|| {
-            let resume = self.resume_data_result.as_ref()?;
-            let frame = resume.frames.first()?;
+        type Seeded = (usize, Vec<crate::jit_state::GuardResumeReg>);
+        let seeded = (|| -> Result<Seeded, GuardResumeDecline> {
+            use GuardResumeDecline as Decline;
+            let resume = self
+                .resume_data_result
+                .as_ref()
+                .ok_or(Decline::NoResumeState)?;
+            let frame = resume.frames.first().ok_or(Decline::NoResumeState)?;
             // `resume.py:1338` `jitcode = jitcodes[jitcode_pos]`: the position
             // is an offset into the jitcode the frame NAMES. Entering a
             // different one at that offset lands mid-instruction in unrelated
             // code, and the walk decodes whatever byte is there. Only the
             // dispatch jitcode is enterable here, so a frame that names any
             // other one is a decline.
-            if frame.jitcode_index as usize != dispatch.try_index()? {
-                return None;
+            let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
+            if frame.jitcode_index as usize != dispatch_index {
+                return Err(Decline::ForeignJitcode);
             }
             // `resume.py _prepare_pendingfields` replays the guard's deferred
-            // heap writes through `execute_and_record` — it applies them to the
-            // heap AND puts them in the trace. majit's replay
-            // (`replay_pending_fields`) only records: the applying half was the
-            // blackhole's, because until now a bridge was only ever started
-            // after the blackhole had run. Entering at the guard skips the
-            // blackhole, so nothing applies them, and the interpreter resumes
-            // against a heap where the elided half of a push is missing — a
-            // committed size with a null chain.
+            // heap writes through `execute_and_record`, which applies them to
+            // the heap AND puts them in the trace. This entry asked for that
+            // applying reader, so a guard carrying deferred writes is served
+            // here rather than declined — but only as far as the reader has an
+            // applying twin for what it meets. Where it did not, it recorded a
+            // write it could not perform, and resuming would run against a heap
+            // that half-describes what the trace says.
             //
-            // Decline while that half is missing. The blackhole arm is then the
-            // answer for these guards, which is where they were already served.
-            if resume
+            // Decline exactly there. The blackhole arm applies all of them,
+            // which is where these guards were served before.
+            if self
+                .meta
+                .tracing
+                .as_ref()
+                .is_some_and(|ctx| ctx.bridge_replay_incomplete())
+            {
+                return Err(Decline::ReplayIncomplete);
+            }
+            let has_pending = resume
                 .storage
                 .as_ref()
-                .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
-            {
-                return None;
-            }
+                .is_some_and(|storage| !storage.rd_pendingfields.is_empty());
             let fail_types = resume.fail_arg_types.clone();
             let values = frame.values.clone();
-            let resume_pc = usize::try_from(frame.pc).ok()?;
-            let ctx = self.meta.tracing.as_mut()?;
-            let reg_indices = ctx.bridge_reg_indices()?.clone();
+            let resume_pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
+            // OPEN, and narrower than it was. The reader applies these guards'
+            // writes op-for-op as the blackhole does, and the virtualizable
+            // arrays are now written back from the resume stream, but a
+            // self-interpreting workload still reads one operand twice when
+            // these guards are served — and stops doing so when the
+            // virtualizable's banded arms are put out of reach, so what the
+            // walk resumes on is still described somewhere this entry does
+            // not restore. The scalars are the remaining candidate: they are
+            // carried by the state-field resume mechanism, disjoint from the
+            // array restore above, and nothing writes them into the live
+            // state before the walk reads through them.
+            if has_pending {
+                return Err(Decline::ReplayIncomplete);
+            }
+            let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
+            let reg_indices = ctx
+                .bridge_reg_indices()
+                .ok_or(Decline::NoResumeState)?
+                .clone();
             // `consume_boxes` fills every live register of the frame, so a
             // count that disagrees means the two sides read different
             // liveness and no per-register pairing off them is trustworthy.
             if reg_indices.total_len() != values.len() {
-                return None;
+                return Err(Decline::RegCountMismatch);
             }
             let banks: [(majit_ir::Type, &Vec<u32>, usize); 3] = [
                 (majit_ir::Type::Int, &reg_indices.int, 0),
@@ -5036,7 +5113,9 @@ impl<S: JitState> JitDriver<S> {
                         // register it cannot read a value out of is not a
                         // register it can run past — decline the whole frame
                         // rather than enter it half-seeded.
-                        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => return None,
+                        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => {
+                            return Err(Decline::UnreadableRegister);
+                        }
                     };
                     regs.push(crate::jit_state::GuardResumeReg {
                         bank,
@@ -5046,14 +5125,26 @@ impl<S: JitState> JitDriver<S> {
                     });
                 }
             }
-            Some((resume_pc, regs))
+            Ok((resume_pc, regs))
         })();
-        let Some((resume_pc, regs)) = seeded else {
-            self.meta.abort_trace(false);
-            self.clear_tracing_session_state();
-            self.resume_data_result = None;
-            self.last_bridge_is_exception_guard = false;
-            return None;
+        let (resume_pc, regs) = match seeded {
+            Ok(seeded) => seeded,
+            Err(why) => {
+                crate::mc_diag_bump(why.diag_slot());
+                if crate::majit_log_enabled() {
+                    eprintln!("[bridge] guard-resume entry declined: {}", why.label());
+                }
+                // The ladder above already decided; it is the abort that cannot
+                // see which rung chose. Name the reason here so the
+                // `abort_trace` below tallies a bridge given up rather than
+                // falling into the unclassified default, which shares its id.
+                self.meta.stage_abort_reason(crate::counters::ABORT_BRIDGE);
+                self.meta.abort_trace(false);
+                self.clear_tracing_session_state();
+                self.resume_data_result = None;
+                self.last_bridge_is_exception_guard = false;
+                return None;
+            }
         };
 
         self.bridge_entered_at_guard_resume = true;
@@ -6166,8 +6257,17 @@ impl<S: JitState> JitDriver<S> {
                             && !portal_crn_handled
                             && pc != usize::MAX
                         {
-                            let bridge_ok =
-                                self.start_bridge_tracing(&descr_arc, state, env, &raw_values, pc);
+                            let bridge_ok = self.start_bridge_tracing(
+                                &descr_arc,
+                                state,
+                                env,
+                                &raw_values,
+                                pc,
+                                // The blackhole above already applied this
+                                // guard's writes; recording is the whole
+                                // job here.
+                                false,
+                            );
                             if crate::majit_log_enabled() {
                                 eprintln!(
                                     "[bridge] start_bridge_tracing (green resume) key={} trace={} fail={} resume_pc={} ok={}",
@@ -7933,6 +8033,10 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         raw_fail_values: &[i64],
         resume_pc: usize,
+        // Which half of `resume.py`'s reader pair the entry needs: true for an
+        // entry no direct reader preceded, so the replay must apply each write
+        // as `execute_and_record` does as well as record it.
+        execute_replay: bool,
     ) -> bool {
         majit_metainterp::mc_diag_bump(12); // start_bridge_tracing entered
         // Same reason as the primary trace entry: the bridge compile decodes
@@ -8019,28 +8123,24 @@ impl<S: JitState> JitDriver<S> {
         //     `ctx.virtualizable_boxes` / `virtualizable_values` /
         //     `virtualizable_array_lengths` from resume-decoded values.
         //
-        // TODO (`pyjitpl.py:3437 self.synchronize_
-        // virtualizable()`): the live PyFrame's vable static fields and
-        // array items are written from the resume data by pyre's
-        // separate guard-failure recovery path
-        // (`pyre-jit/src/eval.rs`'s `sync_virtualizable_after_guard_failure`
-        // selected via `ResumeVableMode::GuardFailureSync`), which fires
-        // BEFORE bridge tracing starts. The trailing
-        // `synchronize_virtualizable()` call inside `rebuild_state_after_
-        // failure` is therefore already satisfied by the time
-        // `setup_bridge_sym` runs.  An additional direct call to
-        // `ctx.synchronize_virtualizable()` cannot be wired today because
-        // `trace_ctx.rs`'s `synchronize_virtualizable` uses `value_to_raw_bits` while
-        // `sync_virtualizable_after_guard_failure` uses field-aware
-        // `value_to_static_vable_bits` / `value_to_vable_array_item_bits`
-        // (pyre/pyre-jit/src/eval.rs) — the Ref-array-slot
-        // auto-boxing of `Value::Int` / `Value::Float` via
-        // `pyre_object::intobject::w_int_new` cannot move into
-        // majit-metainterp without violating the majit ⊥ pyre crate
-        // boundary. Unifying the two writers (likely via a
-        // VTypeFieldConvert trait threaded into TraceCtx) is a separate
-        // epic; see `pyre-jit-trace::state::setup_bridge_sym` tail for
-        // the in-tree diagnosis.
+        //   * `pyjitpl.py:3437 self.synchronize_virtualizable()`, the
+        //     routine's closing line, writes those same vable boxes back
+        //     onto the live virtualizable. It is
+        //     `ctx.synchronize_virtualizable_after_guard_failure()` below,
+        //     fired once `setup_bridge_sym` has seeded the boxes and only on
+        //     an entry that asked to apply — an entry the blackhole preceded
+        //     has already had them written.
+        //
+        //     A frontend whose own guard-failure recovery performs that
+        //     write before bridge tracing starts declares
+        //     `JitState::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE` and
+        //     is skipped here. That is not a preference: this writer
+        //     converts every slot through `value_to_raw_bits`, while a
+        //     frontend whose Ref array slots hold boxed integers and floats
+        //     needs a field-aware conversion that allocates through its own
+        //     object model, which cannot be reached from this crate.
+        //     Unifying the two (likely a field-convert trait threaded into
+        //     `TraceCtx`) is a separate epic.
         let resume_data_result = S::rebuild_from_resumedata(
             &mut trace_meta,
             &retrace.fail_types,
@@ -8313,6 +8413,16 @@ impl<S: JitState> JitDriver<S> {
                 .sym
                 .as_mut()
                 .expect("bridge: sym must be live after S::create_sym");
+            // `Send` is the driver's storage bound, not the reader's, so drop
+            // it here rather than push it onto the `JitState` contract.
+            let replay_allocator: Option<&dyn crate::resume::BlackholeAllocator> = if execute_replay
+            {
+                self.blackhole_allocator
+                    .as_deref()
+                    .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
+            } else {
+                None
+            };
             let ctx = self
                 .meta
                 .tracing
@@ -8321,6 +8431,23 @@ impl<S: JitState> JitDriver<S> {
             if let Some(idx) = bridge_reg_indices {
                 ctx.set_bridge_reg_indices(idx);
             }
+            // An entry that asked to apply and has no allocator to apply
+            // through cannot fall back to recording only: nothing else will
+            // write this guard's deferred stores.
+            //
+            // Only where there are any. `ResumeDataBoxReader` allocates and
+            // stores for the virtuals and the pending fields the stream
+            // carries and for nothing else, so a guard carrying neither asks
+            // the allocator for nothing and is served whether one exists or
+            // not.
+            if execute_replay
+                && replay_allocator.is_none()
+                && retrace.storage.as_deref().is_some_and(|storage| {
+                    !storage.rd_pendingfields.is_empty() || !storage.rd_virtuals.is_empty()
+                })
+            {
+                ctx.mark_bridge_replay_incomplete();
+            }
             S::setup_bridge_sym(
                 sym,
                 ctx,
@@ -8328,7 +8455,19 @@ impl<S: JitState> JitDriver<S> {
                 retrace.storage.as_deref().map(|s| s.rd_virtuals.as_slice()),
                 &raw_values,
                 &retrace.fail_types,
+                replay_allocator,
             );
+            // `pyjitpl.py rebuild_state_after_failure` tail: the call above is
+            // `rebuild_from_resumedata`, which leaves the virtualizable
+            // described by the trace's boxes and by nothing else — the object
+            // itself still holds whatever the compiled loop last spilled into
+            // it. Upstream closes the same routine by writing those boxes
+            // back, and an entry that asked to apply is the entry upstream
+            // reaches it from: no blackhole ran ahead of it, so no one else
+            // has written them.
+            if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
+                ctx.synchronize_virtualizable_after_guard_failure();
+            }
         }
         self.bridge_body_start_op_count = self.meta.tracing.as_ref().map(|ctx| ctx.num_ops());
         self.meta.begin_trace_session(trace_meta);
@@ -9760,8 +9899,14 @@ mod tests {
         let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
         drop(failure);
 
-        let started =
-            driver.start_bridge_tracing(&descr_arc, &mut NonTraceableState, &(), &fail_values, 0);
+        let started = driver.start_bridge_tracing(
+            &descr_arc,
+            &mut NonTraceableState,
+            &(),
+            &fail_values,
+            0,
+            false,
+        );
         assert!(!started);
         assert!(!driver.meta.is_tracing());
     }

@@ -3590,7 +3590,18 @@ pub fn trace_and_compile_from_bridge(
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.start_bridge_tracing(descr_arc, &mut jit_state, &env, raw_values, resume_pc)
+        driver.start_bridge_tracing(
+            descr_arc,
+            &mut jit_state,
+            &env,
+            raw_values,
+            resume_pc,
+            // `decode_and_restore_guard_failure` has already walked this
+            // guard's resume data applying every write — `replay_pending_fields`
+            // for the deferred stores, `ResumeVableMode::GuardFailureSync` for
+            // the virtualizable — so the replay owes recording only.
+            false,
+        )
     };
     if !started {
         if majit_metainterp::majit_log_enabled() {
