@@ -7,10 +7,27 @@ use pyre_object::PyObjectRef;
 
 const LOCATION_ATTRIBUTES: &[&str] = &["lineno", "col_offset", "end_lineno", "end_col_offset"];
 
-// CPython 3.14 `ast_state.Load_singleton`, the default for an omitted
-// `expr_context` field.  PyPy keeps generated AST type state process-wide;
-// keep the one movable instance in a registered process-lifetime root slot.
+// CPython 3.14 `ast_state.AST_type` / `Load_singleton`.  PyPy's `State` keeps
+// the generated AST types process-wide; keep both movable objects in
+// registered process-lifetime root slots.
 static LOAD_SINGLETON: std::sync::OnceLock<Box<usize>> = std::sync::OnceLock::new();
+static AST_TYPE: std::sync::OnceLock<Box<usize>> = std::sync::OnceLock::new();
+
+fn register_ast_type(value: PyObjectRef) {
+    let _ = AST_TYPE.get_or_init(|| {
+        let mut slot = Box::new(value as usize);
+        let root = (&mut *slot) as *mut usize as *mut *mut u8;
+        unsafe { pyre_object::gc_hook::try_gc_add_root(root) };
+        slot
+    });
+}
+
+#[majit_macros::dont_look_inside]
+fn ast_type() -> PyObjectRef {
+    **AST_TYPE
+        .get()
+        .expect("_ast AST type initialized before AST operations") as PyObjectRef
+}
 
 fn register_load_singleton(value: PyObjectRef) {
     let _ = LOAD_SINGLETON.get_or_init(|| {
@@ -62,6 +79,195 @@ fn ast_fields_owner_name(w_type: PyObjectRef) -> String {
 
 fn ast_field_repr(field: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     unsafe { crate::display::py_repr_wtf8(field) }
+}
+
+fn ast_repr_type_name(object: PyObjectRef) -> String {
+    let w_type = crate::typedef::r#type(object)
+        .expect("AST instance has a live type")
+        .as_ptr();
+    if std::ptr::eq(w_type, ast_type()) {
+        // CPython's generated root has the static tp_name `ast.AST`; PyPy's
+        // W_AST TypeDef owns the same root while generated children use their
+        // unqualified ASDL names.
+        "ast.AST".to_owned()
+    } else {
+        unsafe { pyre_object::w_type_get_name(w_type) }.to_owned()
+    }
+}
+
+fn is_ast_instance(object: PyObjectRef) -> bool {
+    let Some(w_type) = crate::typedef::r#type(object) else {
+        return false;
+    };
+    unsafe { pyre_object::w_type_issubtype(w_type.as_ptr(), ast_type()) }
+}
+
+// CPython publishes both methods through `AST_type_slots` (`Py_tp_init` /
+// `Py_tp_repr`), while PyPy's `TypeDef` turns `interp2app(W_AST.descr_*)` into
+// the corresponding wrapper descriptors.  The generated AST root is a heap
+// type built after the ordinary builtin-owner table, so bind its owner
+// explicitly as it is minted.
+static AST_METHOD_OWNER: crate::gateway::MethodOwner = crate::gateway::MethodOwner {
+    type_name: "ast.AST",
+    is_instance: Some(is_ast_instance),
+};
+
+fn ast_slot_wrapper(
+    name: &'static str,
+    function: crate::gateway::BuiltinCodeFn,
+    arity: Option<u16>,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let wrapper = match arity {
+        Some(arity) => crate::gateway::make_slot_wrapper_with_arity(name, function, arity),
+        None => crate::gateway::make_slot_wrapper(name, function),
+    };
+    let wrapper_slot = roots.base();
+    let _ = roots.pin_root(wrapper);
+    let code = unsafe { crate::function::getcode(roots.get(wrapper_slot)) } as PyObjectRef;
+    unsafe { crate::gateway::builtin_code_set_owner(code, &AST_METHOD_OWNER) };
+    let qualname = pyre_object::w_str_new(&format!("AST.{name}"));
+    unsafe {
+        crate::function::function_set_qualname(roots.get(wrapper_slot), qualname);
+        crate::function::function_set_objclass(roots.get(wrapper_slot), ast_type());
+    }
+    roots.get(wrapper_slot)
+}
+
+/// CPython 3.14 `ast_repr_list`, expressed through PyPy object-space sequence
+/// operations.  In particular, list/tuple subclasses keep their `__len__`
+/// and `__getitem__` overrides, and only the first and last items are read.
+fn ast_repr_list(
+    sequence: PyObjectRef,
+    depth: i64,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let sequence_slot = roots.base();
+    let _ = roots.pin_root(sequence);
+    let sequence = || roots.get(sequence_slot);
+    let length = crate::baseobjspace::len_w(sequence())?;
+    if length == 0 {
+        return unsafe { crate::display::py_repr_wtf8(sequence()) };
+    }
+
+    // Allocate and root the index before re-reading the movable sequence for
+    // the object-space call.
+    let first_index_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_int_new(0));
+    let first = crate::baseobjspace::getitem(sequence(), roots.get(first_index_slot))?;
+    let first_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(first);
+    let last_slot = if length > 1 {
+        let last_index_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_int_new(length - 1));
+        let last = crate::baseobjspace::getitem(sequence(), roots.get(last_index_slot))?;
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(last);
+        Some(slot)
+    } else {
+        None
+    };
+
+    let is_list = unsafe { pyre_object::is_list(sequence()) };
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.push_str(if is_list { "[" } else { "(" });
+    for index in 0..std::cmp::min(length, 2) {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        let item = if index == 0 {
+            roots.get(first_slot)
+        } else {
+            roots.get(last_slot.expect("second AST sequence item was rooted"))
+        };
+        if is_ast_instance(item) {
+            out.push_wtf8(&ast_repr_max_depth(item, depth - 1)?);
+        } else {
+            out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(item)? });
+        }
+        if index == 0 && length > 2 {
+            out.push_str(", ...");
+        }
+    }
+    out.push_str(if is_list { "]" } else { ")" });
+    Ok(out)
+}
+
+/// [3.14-spec] PyPy `W_AST` has no custom repr and no JIT/immutability hint on
+/// the definition; the pinned 3.14 `AST_Tests.test_repr` observes the generated
+/// `ast_repr_max_depth` surface.  Keep PyPy's W_AST owner, subtype tests and
+/// object-space dispatch while porting that bounded formatting walk literally.
+fn ast_repr_max_depth(
+    object: PyObjectRef,
+    depth: i64,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = roots.base();
+    let _ = roots.pin_root(object);
+    let object = || roots.get(object_slot);
+    let type_name = ast_repr_type_name(object());
+    if depth <= 0 {
+        return Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
+            "{type_name}(...)"
+        )));
+    }
+    let Some(_guard) = crate::display::ReprGuard::enter(object()) else {
+        return Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
+            "{type_name}(...)"
+        )));
+    };
+
+    let w_type = crate::typedef::r#type(object())
+        .expect("AST instance has a live type")
+        .as_ptr();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_type);
+    let fields = crate::baseobjspace::getattr_str(roots.get(type_slot), "_fields")?;
+    let fields_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(fields);
+    let num_fields = crate::baseobjspace::len_w(roots.get(fields_slot))?;
+    if num_fields == 0 {
+        return Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
+            "{type_name}()"
+        )));
+    }
+
+    let mut out = rustpython_wtf8::Wtf8Buf::from_string(format!("{type_name}("));
+    for index in 0..num_fields {
+        let index_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_int_new(index));
+        let name =
+            crate::baseobjspace::getitem(roots.get(fields_slot), roots.get(index_slot))?;
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(name);
+        let value = crate::baseobjspace::getattr(object(), roots.get(name_slot))?;
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(value);
+        let value = roots.get(value_slot);
+        let value_repr = if unsafe { pyre_object::is_list(value) || pyre_object::is_tuple(value) }
+        {
+            ast_repr_list(value, depth)?
+        } else if is_ast_instance(value) {
+            ast_repr_max_depth(value, depth - 1)?
+        } else {
+            unsafe { crate::display::py_repr_wtf8(value)? }
+        };
+
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_wtf8(crate::baseobjspace::text_wtf8_w(roots.get(name_slot))?);
+        out.push_str("=");
+        out.push_wtf8(&value_repr);
+    }
+    out.push_str(")");
+    Ok(out)
+}
+
+fn ast_repr(args: &[PyObjectRef]) -> crate::PyResult {
+    Ok(pyre_object::w_str_from_wtf8_managed(ast_repr_max_depth(
+        args[0], 3,
+    )?))
 }
 
 fn ast_warn(message: rustpython_wtf8::Wtf8Buf) -> Result<(), crate::PyError> {
@@ -702,16 +908,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // generated AST types report `__module__ == "ast"` (astcompiler/ast.py;
     // the host `_ast.Module.__module__` is likewise `'ast'`).
     let make = |name: &str, base: PyObjectRef, variants: Option<&[&str]>| -> PyObjectRef {
-        // A `dict` header moves, and every store below allocates: the key
-        // string, the value, and the dict's own storage when it grows.
+        // PyPy `State.make_new_type` keeps `w_base` and `w_dict` as wrapped
+        // objects across every allocation in the body.  Publish both here:
+        // the base is also a movable heap type, not a Rust-stable descriptor.
         let roots = pyre_object::gc_roots::push_roots();
-        let dict_slot = roots.base();
+        let base_slot = roots.base();
+        let _ = roots.pin_root(base);
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(pyre_object::w_dict_new());
         // `make_type` builds ONE tuple of field names and binds it to both
         // `_fields` and `__match_args__`, so `Expr._fields is
         // Expr.__match_args__`. It is pinned beside the namespace dict because
         // the first store allocates a key string and can grow it.
-        let fields_slot = dict_slot + 1;
+        let fields_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(tuple_of_names(node_fields(name)));
         // The value arrives already built.  Call arguments evaluate left to
         // right, so reading a dict slot inline with an allocating value
@@ -754,10 +963,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // `descr__new__` takes it as a parameter beside `arguments_w`.  Every
         // other caller reaches it through an attribute lookup that supplies
         // one; this one builds the argument list by hand, so it names `type`.
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_str_new(name));
+        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_tuple_new(vec![roots.get(base_slot)]));
         let args = [
             crate::typedef::w_type(),
-            pyre_object::w_str_new(name),
-            pyre_object::w_tuple_new(vec![base]),
+            roots.get(name_slot),
+            roots.get(bases_slot),
             roots.get(dict_slot),
         ];
         let typ = crate::builtins::type_descr_new(&args).expect("_ast heap type creation");
@@ -780,13 +993,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     // Root: AST(object).
     let ast = make("AST", crate::typedef::w_object(), None);
+    register_ast_type(ast);
+    let method_roots = pyre_object::gc_roots::push_roots();
+    let init_slot = method_roots.base();
+    let _ = method_roots.pin_root(ast_slot_wrapper("__init__", ast_init, None));
+    let repr_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = method_roots.pin_root(ast_slot_wrapper("__repr__", ast_repr, Some(1)));
     crate::baseobjspace::setattr_str(
-        ast,
+        ast_type(),
         "__init__",
-        crate::make_builtin_function("__init__", ast_init),
+        method_roots.get(init_slot),
     )
     .expect("set AST.__init__");
-    crate::module_ns_store(ns, "AST", ast);
+    crate::baseobjspace::setattr_str(
+        ast_type(),
+        "__repr__",
+        method_roots.get(repr_slot),
+    )
+    .expect("set AST.__repr__");
+    crate::module_ns_store(ns, "AST", ast_type());
 
     // Abstract groups (direct AST subclasses) and their concrete members,
     // per the ASDL grammar.
@@ -834,10 +1059,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("type_param", &["TypeVar", "ParamSpec", "TypeVarTuple"]),
     ];
     for (group, members) in groups {
-        let g = make(group, ast, Some(members));
-        crate::module_ns_store(ns, group, g);
+        let g = make(group, ast_type(), Some(members));
+        let group_roots = pyre_object::gc_roots::push_roots();
+        let group_slot = group_roots.base();
+        let _ = group_roots.pin_root(g);
+        crate::module_ns_store(ns, group, group_roots.get(group_slot));
         for m in *members {
-            let t = make(m, g, None);
+            let t = make(m, group_roots.get(group_slot), None);
             crate::module_ns_store(ns, m, t);
         }
     }
@@ -847,7 +1075,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "comprehension", "arguments", "arg", "keyword", "alias", "withitem", "match_case",
     ];
     for name in standalone {
-        let t = make(name, ast, None);
+        let t = make(name, ast_type(), None);
         crate::module_ns_store(ns, name, t);
     }
 
