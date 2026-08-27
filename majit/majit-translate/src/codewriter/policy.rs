@@ -176,17 +176,30 @@ pub trait JitPolicy {
         //   - `res` is False (loops or unsupported types mean
         //     `look_inside_graph` decided not to trace into it),
         //   - `graph.access_directly` is True (annotator set this because
-        //     an argument carried the `access_directly` flag, see
+        //     an ARGUMENT carried the `access_directly` flag, see
         //     `default_specialize` in `rpython/annotator/specialize.py`).
         //
         // Turning the call into a residual call while the function
         // accesses a virtualizable would silently desynchronise the
         // virtualizable from the JIT's view; upstream therefore aborts
-        // translation loudly. Pyre carries the same flag on
-        // `SemanticFunction.access_directly` (populated by the
-        // annotator-to-front bridge once it lands) so the gate fires the
-        // moment the same invariant breaks.
-        if see_function && !res && func.access_directly {
+        // translation loudly. Pyre carries the same flag where upstream
+        // does, on the graph: `FunctionGraph::access_directly`, beside
+        // `hints`. It has to live there because this gate is reached from
+        // the codewriter's BFS, which holds a registered `FunctionGraph`
+        // and synthesizes the `SemanticFunction` around it — a field on
+        // the front end's own record never travels here. The flowspace
+        // pipeline writes the flag through `description.rs
+        // default_specialize`; on the LLBC path nothing sets it yet, and
+        // `FunctionGraph::access_directly` records what a bridge there
+        // would have to propagate.
+        //
+        // This is the first of upstream's two gates on the flag. The
+        // second, `warmspot.py check_access_directly_sanity`, walks
+        // everything reachable from the entry point and asserts that no
+        // graph outside the JIT graph set is `access_directly`; it has no
+        // port here, and would answer vacuously until something sets the
+        // flag on the production path.
+        if see_function && !res && func.graph.access_directly {
             panic!(
                 "access_directly on a function which we don't see: {}",
                 func.name
@@ -398,7 +411,6 @@ mod tests {
             self_ty_root: None,
             hints: hints.into_iter().map(|h| h.to_string()).collect(),
             module_path: String::new(),
-            access_directly: false,
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
@@ -435,6 +447,52 @@ mod tests {
         assert!(policy.look_inside_function(&other));
     }
 
+    /// `policy.py:71-83`: a graph the codewriter refuses to look inside must
+    /// not be `access_directly`. Pins the carrier as well as the gate — the
+    /// flag has to reach here on the `FunctionGraph`, because the production
+    /// caller (`call.rs`) synthesizes the `SemanticFunction` around a
+    /// registered graph and can put nothing else on it.
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn access_directly_on_a_loopy_graph_aborts() {
+        let mut policy = DefaultJitPolicy::new();
+        let mut g = FunctionGraph::new("loopy");
+        let entry = g.startblock;
+        g.set_goto(entry, entry, Vec::new());
+        g.access_directly = true;
+        policy.look_inside_graph(&SemanticFunction {
+            name: "loopy".into(),
+            graph: g,
+            return_type: None,
+            self_ty_root: None,
+            hints: vec![],
+            module_path: String::new(),
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        });
+    }
+
+    /// The same graph without the flag is an ordinary decline, not an abort.
+    #[test]
+    fn a_loopy_graph_without_the_flag_only_declines() {
+        let mut policy = DefaultJitPolicy::new();
+        let mut g = FunctionGraph::new("loopy");
+        let entry = g.startblock;
+        g.set_goto(entry, entry, Vec::new());
+        assert!(!policy.look_inside_graph(&SemanticFunction {
+            name: "loopy".into(),
+            graph: g,
+            return_type: None,
+            self_ty_root: None,
+            hints: vec![],
+            module_path: String::new(),
+            trait_root: None,
+            trait_qualified: None,
+            returns_objectptr: false,
+        }));
+    }
+
     #[test]
     fn unroll_safe_disables_loop_rejection() {
         let mut policy = DefaultJitPolicy::new();
@@ -449,7 +507,6 @@ mod tests {
             self_ty_root: None,
             hints: vec![],
             module_path: String::new(),
-            access_directly: false,
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,
@@ -466,7 +523,6 @@ mod tests {
             self_ty_root: None,
             hints: vec!["unroll_safe".into()],
             module_path: String::new(),
-            access_directly: false,
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,

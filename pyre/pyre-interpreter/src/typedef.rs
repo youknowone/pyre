@@ -8186,13 +8186,7 @@ fn init_frame_type(ns: PyObjectRef) {
     // getdictscope/locals2fast machinery.
     let locals_getter = make_builtin_function_with_arity(
         "f_locals",
-        |args| {
-            let f = frame_ptr(args[1]);
-            if f.is_null() {
-                return Ok(pyre_object::w_none());
-            }
-            unsafe { &mut *f }.fget_getdictscope()
-        },
+        crate::pyframe::descr_typecheck_fget_getdictscope,
         2,
     );
     unsafe {

@@ -75,13 +75,6 @@ pub struct SemanticFunction {
     /// "elidable" → _elidable_function_
     /// "loopinvariant" → _jit_loop_invariant_
     pub hints: Vec<String>,
-    /// RPython `graph.access_directly` (flowspace attribute set by the
-    /// annotator's `default_specialize` rewrite — see
-    /// `description.rs` + `pygraph.rs`). Carried into
-    /// `SemanticFunction` so `policy::look_inside_graph` can port the
-    /// `policy.py:71-83` virtualizable safety gate without reaching back
-    /// into the PyGraph layer.
-    pub access_directly: bool,
     /// Trait name when this function is an `impl Trait for Type {…}`
     /// method, the trait's name when this is a trait default-body
     /// method, otherwise `None` (free function or inherent impl).
@@ -486,7 +479,6 @@ mod tests {
             self_ty_root: None,
             module_path: String::new(),
             hints: Vec::new(),
-            access_directly: false,
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,

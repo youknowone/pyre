@@ -1451,6 +1451,13 @@ impl<'a> Transformer<'a> {
                 let label = target.to_string();
                 self.rewrite_op_hint(op, kind, args, &label, graph_name)
             }
+            // `jtransform.py rewrite_op_jit_force_virtualizable`: the
+            // rtyper-injected op, not `hint(x, force_virtualizable=True)`.
+            // The front lowers the stand-in helper as a Call; dispatch it
+            // here so it never reaches residual `CallMayForce`.
+            OpKind::Call { target, args, .. } if is_jit_force_virtualizable_target(target) => {
+                self.rewrite_op_jit_force_virtualizable(args, graph_name)
+            }
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
@@ -2792,6 +2799,26 @@ impl<'a> Transformer<'a> {
                 },
             }],
         )
+    }
+
+    /// `jtransform.py rewrite_op_jit_force_virtualizable`.
+    ///
+    /// Upstream files `vable_flags[v_inst]` from the injected op's third
+    /// argument (the annotator flags) and returns `[]`.  Pyre's stand-in
+    /// helper takes only the instance — it is the residual-path force,
+    /// not a flag carrier — so there is nothing to file.  Deleting the
+    /// call is the whole rewrite: the interpreter copy of the helper
+    /// still runs when the graph is residualized.
+    fn rewrite_op_jit_force_virtualizable(
+        &mut self,
+        _args: &[crate::flowspace::model::Variable],
+        graph_name: &str,
+    ) -> RewriteResult {
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: "rewrite: jit_force_virtualizable(...) → []".to_string(),
+        });
+        RewriteResult::Replace(Vec::new())
     }
 
     /// RPython: `Transformer.rewrite_op_hint(op)`.
@@ -4216,6 +4243,27 @@ impl<'a> Transformer<'a> {
 
         // jtransform.py:487-511 — oopspec dispatch by prefix.
         if let Some(base) = user_oopspec.as_deref() {
+            // jtransform.py:495-496 — `virtual_ref*` → `_handle_virtual_ref_call`,
+            // whose whole body is
+            // `return SpaceOperation(oopspec_name, list(args), op.result)`:
+            // the call becomes the `virtual_ref` / `virtual_ref_finish`
+            // OPERATION, so it carries no calldescr and therefore no
+            // `oopspecindex` at all.
+            //
+            // majit-translate has no `OpKind` for either opname and no
+            // `insns.rs` byte to assemble one, so the port stops here instead
+            // of continuing down the call path. It used to fall through to
+            // `map_user_oopspec_to_index`, which answered
+            // `JitForceVirtualizable` — the one index whose
+            // `optimizeopt/virtualize.rs` `CALL_N` arm removes the call
+            // unconditionally, whatever `is_virtual` says. Nothing registers
+            // this oopspec today, so the wrong answer was unreachable rather
+            // than wrong on a live trace.
+            if base.starts_with("virtual_ref") {
+                unimplemented!(
+                    "_handle_virtual_ref_call: {base:?} has no OpKind (jtransform.py:495)"
+                );
+            }
             // jtransform.py:497 — jit.* oopspecs → __handle_jit_call
             if base.starts_with("jit.") {
                 // `jit.not_in_trace` discards the decoded args (see
@@ -7597,6 +7645,12 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
         .and_then(crate::hints::classify_hint_segments)
 }
 
+/// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
+/// Matched on the leaf so both a free helper and a method spelling rewrite.
+fn is_jit_force_virtualizable_target(target: &CallTarget) -> bool {
+    target.path_segments().and_then(|segs| segs.last().copied()) == Some("jit_force_virtualizable")
+}
+
 /// Match a `CallEffectOverride` pattern against a call target.
 ///
 /// The match is loose only in the asymmetric receiver-root direction:
@@ -7825,8 +7879,10 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
     let base = spec.split('(').next().unwrap_or(spec).trim();
     match base {
         // All jit.* oopspecs are intercepted by _handle_jit_call() before
-        // reaching this function. Remaining oopspecs map to OS_* indices.
-        "virtual_ref" | "virtual_ref_finish" => OopSpecIndex::JitForceVirtualizable,
+        // reaching this function, and `virtual_ref*` by the
+        // `_handle_virtual_ref_call` arm beside it — upstream gives those two
+        // no `oopspecindex`, because it turns them into operations rather than
+        // calls. Remaining oopspecs map to OS_* indices.
         "raw_free" => OopSpecIndex::RawFree,
         // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
@@ -10500,6 +10556,61 @@ mod tests {
         );
         assert!(matches!(
             ops[2].kind,
+            OpKind::VableFieldRead { field_index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn transform_graph_deletes_jit_force_virtualizable() {
+        let mut graph = FunctionGraph::new("demo");
+        let frame_var = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, frame_var.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(["jit_force_virtualizable"]),
+                args: vec![frame_var.clone()],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::FieldRead {
+                base: frame_var,
+                field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_graph(
+            &graph,
+            &GraphTransformConfig {
+                vable_fields: vec![VirtualizableFieldDescriptor::new(
+                    "next_instr",
+                    Some("Frame".into()),
+                    0,
+                )],
+                ..Default::default()
+            },
+        );
+
+        let ops = &result.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OpKind::Call { .. } | OpKind::VableForce { .. })),
+            "jit_force_virtualizable must be deleted, not residualized or kept as VableForce: {ops:?}"
+        );
+        assert!(
+            matches!(ops[0].kind, OpKind::Live),
+            "virtualizable read must be led by -live-, got {:?}",
+            ops[0].kind
+        );
+        assert!(matches!(
+            ops[1].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
         ));
     }

@@ -5504,6 +5504,20 @@ pub struct FunctionGraph {
     /// carrier directly. Empty for graphs with no hints (the common case
     /// and all `FunctionGraph::new` fixtures).
     pub hints: Vec<String>,
+    /// RPython `graph.access_directly`, on the graph for the same reason
+    /// `hints` is: `policy.py look_inside_graph` reads it off the graph, and
+    /// the codewriter's BFS reaches a callee as a `FunctionGraph` and
+    /// synthesizes the `SemanticFunction` around it, so a field anywhere else
+    /// cannot travel to the gate.
+    ///
+    /// Upstream writes it at exactly one place, `specialize.py
+    /// default_specialize`, for a graph whose ARGUMENT annotation arrived
+    /// carrying the flag that the `hint` ExtRegistryEntry in `rlib/jit.py`
+    /// mints on `SomeInstance.flags`. The flowspace pipeline ports that on
+    /// `PyGraph::access_directly`; on the LLBC path nothing sets this yet.
+    /// See `front::semantic::SemanticFunction` for what a bridge there would
+    /// have to propagate.
+    pub access_directly: bool,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
     /// (all unset) for `FunctionGraph::new` fixtures; production
@@ -5573,6 +5587,7 @@ impl FunctionGraph {
             owner_root: None,
             source_identity: None,
             hints: Vec::new(),
+            access_directly: false,
             func: FuncEffects::default(),
         }
     }
