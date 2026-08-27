@@ -54,6 +54,15 @@ pub struct JitDriverSpec {
     /// `_JIT_ENTER_FUNCTYPE.ARGS` information warmspot uses upstream.
     #[serde(default)]
     pub red_types: Vec<String>,
+    /// Register the driver against a `warmspot.py
+    /// split_graph_and_record_jitdriver` copy of the portal graph, split
+    /// before its `jit_merge_point`, instead of against the graph that
+    /// contains the marker.
+    ///
+    /// Off by default: with it off `register_configured_jitdrivers` passes
+    /// the configured path through unchanged and no graph copy is made.
+    #[serde(default)]
+    pub split_portal: bool,
 }
 
 /// Configuration for the full analysis pipeline.
@@ -301,6 +310,7 @@ mod tests {
                 autoreds: false,
                 virtualizables: Vec::new(),
                 red_types: Vec::new(),
+                split_portal: false,
             }],
             register_trait_families: Vec::new(),
         };

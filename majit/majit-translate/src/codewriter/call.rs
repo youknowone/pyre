@@ -551,6 +551,9 @@ pub struct JitDriverStaticData {
     pub red_types: Vec<String>,
     /// Portal graph path.
     pub portal_graph: CallPath,
+    /// `warmspot.py split_graph_and_record_jitdriver`: graph containing the
+    /// marker before the split portal copy was made.
+    pub jit_merge_point_in: CallPath,
     /// RPython: `jd.mainjitcode` (call.py:147) — `Arc<JitCode>` shell for
     /// the portal. Set by `grab_initial_jitcodes()`. Matches the
     /// metainterp-side `JitDriverStaticData.mainjitcode` shape so the
@@ -3273,7 +3276,7 @@ impl CallControl {
     /// full driver registration; production seeds via `setup_jitdriver`.
     pub fn mark_portal(&mut self, path: CallPath) {
         self.setup_jitdriver(
-            path,
+            path.clone(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -3281,6 +3284,7 @@ impl CallControl {
             false,
             Vec::new(),
             Vec::new(),
+            path,
         );
     }
 
@@ -3330,6 +3334,7 @@ impl CallControl {
         autoreds: bool,
         virtualizables: Vec<String>,
         red_types: Vec<String>,
+        jit_merge_point_in: CallPath,
     ) {
         let index = self.jitdrivers_sd.len();
         debug_assert!(
@@ -3360,6 +3365,7 @@ impl CallControl {
             virtualizables,
             red_types,
             portal_graph,
+            jit_merge_point_in,
             mainjitcode: None,
             index_of_virtualizable: -1,
             virtualizable_info: None,
@@ -4020,11 +4026,10 @@ impl CallControl {
                             };
                             // `call.py:119-120`
                             // jitdriver_sd_from_portal_runner_ptr → recursive.
-                            if self
-                                .jitdrivers_sd
-                                .iter()
-                                .any(|jd| jd.portal_graph == callee_path)
-                            {
+                            if self.jitdrivers_sd.iter().any(|jd| {
+                                jd.portal_graph == callee_path
+                                    || jd.jit_merge_point_in == callee_path
+                            }) {
                                 // Not a refusal — the portal is already a
                                 // candidate and re-walking it would loop —
                                 // but recorded so the BFS's skip rows add up
@@ -4573,7 +4578,11 @@ impl CallControl {
             let path = self.target_to_path(target);
             if let Some(ref p) = path {
                 // call.py jitdriver_sd_from_portal_runner_ptr(funcptr)
-                if self.jitdrivers_sd.iter().any(|jd| &jd.portal_graph == p) {
+                if self
+                    .jitdrivers_sd
+                    .iter()
+                    .any(|jd| &jd.portal_graph == p || &jd.jit_merge_point_in == p)
+                {
                     return CallKind::Recursive;
                 }
                 // call.py:129-134 _gctransformer_hint_close_stack_ → 'residual'
@@ -11276,6 +11285,7 @@ mod tests {
             false,
             vec![],
             vec![],
+            CallPath::from_segments(["portal_runner"]),
         );
         cc
     }
@@ -11312,6 +11322,7 @@ mod tests {
             false,
             vec![],
             vec![],
+            CallPath::from_segments(["portal_runner_b"]),
         );
         cc.jitdrivers_sd[0].virtualizable_info = Some(std::sync::Arc::new(StubVInfo {
             vtypeptr_id: 0xabcd,
@@ -11383,6 +11394,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into(), "ExecutionContext".into()],
+            CallPath::from_segments(["execute_opcode_step"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
         // warmspot.py:534-538 — `index_of_virtualizable = reds.index('frame')`
@@ -11410,6 +11422,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
     }
@@ -11427,6 +11440,7 @@ mod tests {
             false,
             vec![],
             vec![],
+            CallPath::from_segments(["portal"]),
         );
         cc.jitdrivers_sd[0].virtualizable_info = Some(std::sync::Arc::new(StubVInfo {
             vtypeptr_id: 0xfeed,
@@ -11452,6 +11466,7 @@ mod tests {
             false,
             vec![],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal_with_greenfield"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
         let gfinfo = cc.jitdrivers_sd[0]
@@ -11480,6 +11495,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal_a"]),
         );
         cc.setup_jitdriver(
             CallPath::from_segments(["portal_b"]),
@@ -11490,6 +11506,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal_b"]),
         );
         let mut factory_calls: Vec<String> = Vec::new();
         cc.make_virtualizable_infos(|_jd_idx, vtypeptr_token| {
@@ -11529,6 +11546,7 @@ mod tests {
             false,
             vec!["frame".into()],
             vec!["PyFrame".into()],
+            CallPath::from_segments(["portal"]),
         );
         cc.make_virtualizable_infos(|_, _| None);
         assert!(cc.jitdrivers_sd[0].virtualizable_info.is_none());

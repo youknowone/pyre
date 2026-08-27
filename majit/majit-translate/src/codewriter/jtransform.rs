@@ -524,7 +524,7 @@ struct ResolvedCallResult {
 /// loop_header}`. This enum keeps the upstream key distinction inside
 /// the dispatch hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JitMarkerKey {
+pub(crate) enum JitMarkerKey {
     JitMergePoint,
     /// `can_enter_jit` aliases to `handle_jit_marker__loop_header`
     /// (jtransform.py:1723).
@@ -569,7 +569,7 @@ fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
         .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
 }
 
-fn jit_marker_key_from_target(
+pub(crate) fn jit_marker_key_from_target(
     target: &CallTarget,
     driver_roots: &[String],
 ) -> Option<JitMarkerKey> {
@@ -11490,6 +11490,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            CallPath::from_segments(["pyre_jit", "other_portal"]),
         );
         let portal_graph =
             CallPath::from_segments([crate::runtime_names::crates::JIT, "eval_loop_jit"]);
@@ -11506,6 +11507,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            portal_graph.clone(),
         );
         let resolved_driver = cc
             .jitdriver_sd_from_portal_graph(&portal_graph)
@@ -11607,6 +11609,7 @@ mod tests {
             true,
             Vec::new(),
             Vec::new(),
+            crate::parse::CallPath::from_segments(["autoreds_portal"]),
         );
         let mut transformer = Transformer::new(&config)
             .with_callcontrol(&mut cc)
@@ -11634,6 +11637,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            crate::parse::CallPath::from_segments(["portal"]),
         );
 
         cc.set_jitdriver_active(0, false);
@@ -11801,6 +11805,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            CallPath::from_segments(["test", "portal"]),
         );
 
         let config = GraphTransformConfig::default();
@@ -11970,6 +11975,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
         );
 
         let config = GraphTransformConfig::default();
@@ -12029,6 +12035,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            CallPath::from_segments(["eval", "eval_loop_jit"]),
         );
 
         let config = GraphTransformConfig::default();
@@ -12077,6 +12084,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            CallPath::from_segments(["test", "portal"]),
         );
 
         let config = GraphTransformConfig::default();

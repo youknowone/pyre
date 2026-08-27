@@ -204,11 +204,12 @@ impl DeterminismCheck {
     }
 }
 
-const LOWERING_GATE_ENV: [&str; 5] = [
+const LOWERING_GATE_ENV: [&str; 6] = [
     "PYRE_DYN_INDIRECT",
     "MAJIT_FNPTR_INDIRECT",
     "MAJIT_MIR_FRAMESTATE",
     "PYRE_OPTION_RESIDUAL_NARROW",
+    "PYRE_PORTAL_SPLIT",
     "PYRE_TUPLE_PER_SHAPE_CLASSDEF",
 ];
 
@@ -234,6 +235,16 @@ fn forward_engine_env_aliases() {
             unsafe { std::env::set_var(engine_name, value) };
         }
     }
+}
+
+/// `PYRE_PORTAL_SPLIT=1` registers the `eval::eval_loop_jit` driver against a
+/// `warmspot.py split_graph_and_record_jitdriver` copy of the portal graph
+/// split before its `jit_merge_point`, instead of against the graph holding
+/// the marker.  Listed in `LOWERING_GATE_ENV` above, which is both hashed
+/// into `codegen_cache_key` and emitted as `cargo::rerun-if-env-changed`:
+/// without both, flipping this serves the cached metadata snapshot.
+fn portal_split_enabled() -> bool {
+    std::env::var("PYRE_PORTAL_SPLIT").is_ok_and(|value| value == "1")
 }
 
 /// Entry of the real build: the translation prepass over the LLBC set.
@@ -1040,6 +1051,7 @@ fn real_main() {
                         .iter()
                         .map(|name| (*name).to_string())
                         .collect(),
+                    split_portal: portal_split_enabled(),
                 },
                 majit_translate::JitDriverSpec {
                     // pypy/interpreter/baseobjspace.py `_unpackiterable_unknown_length`;
@@ -1055,6 +1067,9 @@ fn real_main() {
                     autoreds: true,
                     virtualizables: vec![],
                     red_types: vec![],
+                    // `autoreds` drivers are not split; see the citation in
+                    // `majit_translate::register_configured_jitdrivers`.
+                    split_portal: false,
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

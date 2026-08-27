@@ -1,0 +1,535 @@
+//! Rich-model graph transformations from `translator/unsimplify.py`.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::codewriter::type_state::ConcreteType;
+use crate::flowspace::model::Variable;
+use crate::model::{BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
+
+/// Best available spelling for one variable: the `Input`-op source name if
+/// the graph carries one, else the `Variable` name prefix, else its identity.
+fn var_label(graph: &FunctionGraph, var: &Variable) -> String {
+    graph
+        .value_name_for(var)
+        .or_else(|| var.renamed().then(|| var.name_prefix()))
+        .unwrap_or_else(|| format!("<unnamed id={}>", var.id()))
+}
+
+/// Short human label for one operation: the opcode spelling where the model
+/// carries one (`BinOp`/`UnaryOp`/`Call`/`Input`), else the `OpKind` variant
+/// name.
+fn op_label(op: &SpaceOperation) -> String {
+    match &op.kind {
+        crate::model::OpKind::BinOp { op, .. } | crate::model::OpKind::UnaryOp { op, .. } => {
+            op.clone()
+        }
+        crate::model::OpKind::Input { name, .. } => format!("Input {name}"),
+        crate::model::OpKind::Call { target, .. } => match target.path_segments() {
+            Some(segments) => format!("call {}", segments.join("::")),
+            None => "call".to_string(),
+        },
+        other => {
+            // Every `OpKind` variant's `Debug` starts with its own name.
+            let debug = format!("{other:?}");
+            let end = debug.find([' ', '(', '{']).unwrap_or(debug.len());
+            debug[..end].to_string()
+        }
+    }
+}
+
+/// Where `var` is produced: the operation that results in it, or the
+/// block whose `inputargs` it enters through.
+fn definition_site(graph: &FunctionGraph, var: &Variable) -> String {
+    if let Some(site) = producing_op(graph, var) {
+        return format!("defined by {site}");
+    }
+    for block in &graph.blocks {
+        let Some(position) = block.inputargs.iter().position(|arg| arg.id() == var.id()) else {
+            continue;
+        };
+        // A block inputarg has no defining op in this graph; the value it
+        // stands for is whatever each predecessor passes in that slot, so
+        // resolve one hop back through the incoming links.
+        let mut incoming: Vec<String> = Vec::new();
+        for pred in &graph.blocks {
+            for link in &pred.exits {
+                if link.target != block.id {
+                    continue;
+                }
+                let origin = match link.args.get(position) {
+                    Some(LinkArg::Value(source)) => {
+                        producing_op(graph, source).unwrap_or_else(|| format!("id={}", source.id()))
+                    }
+                    Some(other) => format!("{other:?}"),
+                    None => "<link arity mismatch>".to_string(),
+                };
+                incoming.push(format!("from block {} as {origin}", pred.id.0));
+            }
+        }
+        let mut site = format!("enters as inputarg {position} of block {}", block.id.0);
+        if !incoming.is_empty() {
+            site.push_str(&format!(" ({})", incoming.join("; ")));
+        }
+        return site;
+    }
+    "no definition site found in this graph".to_string()
+}
+
+/// `block N op I \`label\`` for the operation whose result is `var`.
+fn producing_op(graph: &FunctionGraph, var: &Variable) -> Option<String> {
+    for block in &graph.blocks {
+        for (index, op) in block.operations.iter().enumerate() {
+            if op.result.as_ref().is_some_and(|res| res.id() == var.id()) {
+                return Some(format!(
+                    "`{}` at block {} op {index}",
+                    op_label(op),
+                    block.id.0,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Every use of a variable at or after the split point, keyed by
+/// `Variable::id`: the moved operations first, then the block's outgoing
+/// link arguments and exit switch.
+///
+/// `links` and `exitswitch` must be the pre-rename snapshots — `split_block`
+/// rewrites both to the fresh copies before the `_forcelink` check runs.
+fn use_sites(
+    moved_source: &[SpaceOperation],
+    links: &[Link],
+    exitswitch: &Option<ExitSwitch>,
+) -> Vec<(u64, String)> {
+    let mut uses: Vec<(u64, String)> = Vec::new();
+    for (index, op) in moved_source.iter().enumerate() {
+        for arg in crate::inline::op_variable_refs(&op.kind) {
+            uses.push((arg.id(), format!("op {index} `{}`", op_label(op))));
+        }
+    }
+    for link in links {
+        for (position, arg) in link.args.iter().enumerate() {
+            if let LinkArg::Value(source) = arg {
+                uses.push((
+                    source.id(),
+                    format!("link arg {position} to block {}", link.target.0),
+                ));
+            }
+        }
+    }
+    match exitswitch {
+        Some(ExitSwitch::Value(var)) => uses.push((var.id(), "exitswitch".to_string())),
+        Some(ExitSwitch::Fused { opname, args }) => {
+            for var in args {
+                uses.push((var.id(), format!("exitswitch `{opname}`")));
+            }
+        }
+        Some(ExitSwitch::LastException) | None => {}
+    }
+    uses
+}
+
+/// `translator/unsimplify.py split_block` for the rich model graph.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable Variable identity; concretetype/name cells do not participate"
+)]
+pub(crate) fn split_block(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    index: usize,
+    forcelink: Option<&[Variable]>,
+) -> BlockId {
+    assert!(
+        index <= graph.block(block).operations.len(),
+        "split_block: index out of range (got {}, len={})",
+        index,
+        graph.block(block).operations.len(),
+    );
+
+    // `unsimplify.py split_block`: `varmap.keys()` is consumed in first-
+    // insertion order, so keep that order independently of HashMap iteration.
+    let mut varmap_order: Vec<Variable> = Vec::new();
+    let mut varmap: HashMap<Variable, Variable> = HashMap::new();
+    let mut vars_produced_in_new_block: HashSet<Variable> = HashSet::new();
+
+    fn intern_var(
+        var: &Variable,
+        varmap_order: &mut Vec<Variable>,
+        varmap: &mut HashMap<Variable, Variable>,
+        vars_produced_in_new_block: &HashSet<Variable>,
+    ) {
+        if vars_produced_in_new_block.contains(var) {
+            return;
+        }
+        if !varmap.contains_key(var) {
+            varmap_order.push(var.clone());
+            varmap.insert(var.clone(), var.copy());
+        }
+    }
+
+    fn get_new_name(
+        var: &Variable,
+        varmap_order: &mut Vec<Variable>,
+        varmap: &mut HashMap<Variable, Variable>,
+        vars_produced_in_new_block: &HashSet<Variable>,
+    ) -> Variable {
+        if vars_produced_in_new_block.contains(var) {
+            return var.clone();
+        }
+        intern_var(var, varmap_order, varmap, vars_produced_in_new_block);
+        varmap
+            .get(var)
+            .cloned()
+            .expect("split_block: interned Variable missing from varmap")
+    }
+
+    let moved_source = graph.block(block).operations[index..].to_vec();
+    let mut moved_operations = Vec::with_capacity(moved_source.len());
+    for op in &moved_source {
+        // `unsimplify.py split_block`: operands are interned before the op is
+        // rewritten, and the result becomes produced only after that rewrite.
+        for arg in crate::inline::op_variable_refs(&op.kind) {
+            intern_var(
+                &arg,
+                &mut varmap_order,
+                &mut varmap,
+                &vars_produced_in_new_block,
+            );
+        }
+        let remap_var = |var: &Variable| varmap.get(var).cloned().unwrap_or_else(|| var.clone());
+        moved_operations.push(SpaceOperation {
+            result: op.result.clone(),
+            kind: crate::inline::remap_op_kind(&op.kind, &remap_var),
+        });
+        if let Some(result) = &op.result {
+            vars_produced_in_new_block.insert(result.clone());
+        }
+    }
+
+    let (mut links, exitswitch) = {
+        let old = graph.block_mut(block);
+        (std::mem::take(&mut old.exits), old.exitswitch.take())
+    };
+    // The `_forcelink` diagnostic below reports use sites in the caller's own
+    // variable identities; the loops that follow rewrite `links` and
+    // `exitswitch` in place to the fresh copies, so snapshot them first.
+    let pre_rename_links = forcelink.is_some().then(|| links.clone());
+    let pre_rename_exitswitch = forcelink.is_some().then(|| exitswitch.clone());
+    for link in &mut links {
+        for arg in &mut link.args {
+            if Some(&*arg) == link.last_exception.as_ref()
+                || Some(&*arg) == link.last_exc_value.as_ref()
+            {
+                continue;
+            }
+            if let LinkArg::Value(var) = arg {
+                *var = get_new_name(
+                    var,
+                    &mut varmap_order,
+                    &mut varmap,
+                    &vars_produced_in_new_block,
+                );
+            }
+        }
+    }
+    let renamed_exitswitch = exitswitch.map(|switch| match switch {
+        ExitSwitch::Value(var) => ExitSwitch::Value(get_new_name(
+            &var,
+            &mut varmap_order,
+            &mut varmap,
+            &vars_produced_in_new_block,
+        )),
+        ExitSwitch::LastException => ExitSwitch::LastException,
+        ExitSwitch::Fused { opname, args } => ExitSwitch::Fused {
+            opname,
+            args: args
+                .iter()
+                .map(|var| {
+                    get_new_name(
+                        var,
+                        &mut varmap_order,
+                        &mut varmap,
+                        &vars_produced_in_new_block,
+                    )
+                })
+                .collect(),
+        },
+    });
+
+    let linkargs = if let Some(forcelink) = forcelink {
+        assert_eq!(
+            index, 0,
+            "unsimplify.py split_block _forcelink requires index == 0"
+        );
+        let linkargs = forcelink.to_vec();
+        let missing: Vec<&Variable> = varmap_order
+            .iter()
+            .filter(|var| !linkargs.contains(var))
+            .collect();
+        if !missing.is_empty() {
+            let uses = use_sites(
+                &moved_source,
+                pre_rename_links.as_deref().unwrap_or(&[]),
+                pre_rename_exitswitch.as_ref().unwrap_or(&None),
+            );
+            let offenders: Vec<String> = missing
+                .iter()
+                .map(|var| {
+                    let name = var_label(graph, var);
+                    let mut where_used: Vec<&str> = uses
+                        .iter()
+                        .filter(|(id, _)| *id == var.id())
+                        .map(|(_, site)| site.as_str())
+                        .collect();
+                    where_used.dedup();
+                    format!(
+                        "  {name} (id={}, kind={:?})\n    {}\n    used after the split point by: {}",
+                        var.id(),
+                        FunctionGraph::concretetype_of(var),
+                        definition_site(graph, var),
+                        if where_used.is_empty() {
+                            "<none found>".to_string()
+                        } else {
+                            where_used.join(", ")
+                        },
+                    )
+                })
+                .collect();
+            let names: Vec<String> = missing.iter().map(|var| var_label(graph, var)).collect();
+            // The Void `same_as` re-creation arm is unported because the rich
+            // model has no `same_as` counterpart. A Void `kind=` below is the
+            // signal to port that operation before allowing the split.
+            assert!(
+                !missing
+                    .iter()
+                    .any(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Void),
+                "unsimplify.py split_block recreates Void _forcelink survivors with `same_as`; \
+                 the rich model has no `same_as` counterpart to port it onto.\n\
+                 Offending variables:\n{}",
+                offenders.join("\n"),
+            );
+            panic!(
+                "The variable {} was not explicitly listed in _forcelink.  \
+                 This issue can be caused by a jitdriver.jit_merge_point() where some variable \
+                 containing an int or str or instance is actually known to be constant, e.g. \
+                 always 42.\n\
+                 Each variable below is defined before the split point and still live after it, \
+                 but is neither a green nor a red of the driver; the graph must be restructured \
+                 so that it is recomputed after the marker, or declared in the driver.\n\
+                 Offending variables ({} of them):\n{}",
+                names.join(", "),
+                missing.len(),
+                offenders.join("\n"),
+            );
+        }
+        linkargs
+    } else {
+        varmap_order.clone()
+    };
+
+    let new_inputargs = linkargs
+        .iter()
+        .map(|var| {
+            get_new_name(
+                var,
+                &mut varmap_order,
+                &mut varmap,
+                &vars_produced_in_new_block,
+            )
+        })
+        .collect();
+    let newblock = graph.create_block();
+    {
+        let new = graph.block_mut(newblock);
+        // Set inputargs before constructing the old block's checked Link.
+        new.inputargs = new_inputargs;
+        new.operations = moved_operations;
+        new.exitswitch = renamed_exitswitch;
+    }
+    graph.recloseblock(newblock, links);
+
+    let link = Link::from_variables(graph, linkargs, newblock, None);
+    {
+        let old = graph.block_mut(block);
+        old.operations.truncate(index);
+        old.exitswitch = None;
+    }
+    graph.recloseblock(block, vec![link]);
+    newblock
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codewriter::type_state::ConcreteType;
+    use crate::model::{OpKind, ValueType};
+
+    fn unary(operand: &Variable, result: &Variable) -> SpaceOperation {
+        SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::UnaryOp {
+                op: "int_neg".into(),
+                operand: operand.clone(),
+                result_ty: ValueType::Int,
+            },
+        }
+    }
+
+    fn graph_with_ops(
+        inputargs: Vec<Variable>,
+        operations: Vec<SpaceOperation>,
+        returned: Variable,
+    ) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("split_fixture");
+        let start = graph.startblock;
+        graph.block_mut(start).inputargs = inputargs;
+        let returnblock = graph.returnblock;
+        graph.block_mut(returnblock).inputargs = vec![returned.copy()];
+        graph.block_mut(start).operations = operations;
+        let exit = Link::from_variables(&graph, vec![returned], returnblock, None);
+        graph.recloseblock(start, vec![exit]);
+        graph
+    }
+
+    #[test]
+    fn split_at_zero_moves_all_operations() {
+        let a = Variable::named("a");
+        let r = Variable::named("r");
+        let mut graph = graph_with_ops(vec![a.clone()], vec![unary(&a, &r)], r);
+        let old = graph.startblock;
+
+        let new = split_block(&mut graph, old, 0, None);
+
+        assert!(graph.block(old).operations.is_empty());
+        assert_eq!(graph.block(new).operations.len(), 1);
+        assert_eq!(graph.block(old).exits[0].args, vec![LinkArg::Value(a)]);
+        assert_ne!(
+            graph.block(new).inputargs[0].id(),
+            graph.block(old).inputargs[0].id()
+        );
+    }
+
+    #[test]
+    fn split_in_middle_threads_intermediate() {
+        let a = Variable::named("a");
+        let middle = Variable::named("middle");
+        let result = Variable::named("result");
+        let mut graph = graph_with_ops(
+            vec![a.clone()],
+            vec![unary(&a, &middle), unary(&middle, &result)],
+            result,
+        );
+        let old = graph.startblock;
+
+        let new = split_block(&mut graph, old, 1, None);
+
+        assert_eq!(graph.block(old).operations.len(), 1);
+        assert_eq!(graph.block(new).operations.len(), 1);
+        assert_eq!(
+            graph.block(old).exits[0].args,
+            vec![LinkArg::Value(middle.clone())]
+        );
+        let OpKind::UnaryOp { operand, .. } = &graph.block(new).operations[0].kind else {
+            panic!("moved operation must remain UnaryOp")
+        };
+        assert_eq!(operand, &graph.block(new).inputargs[0]);
+        assert_ne!(operand.id(), middle.id());
+    }
+
+    #[test]
+    fn split_at_end_moves_original_exits() {
+        let a = Variable::named("a");
+        let result = Variable::named("result");
+        let mut graph = graph_with_ops(vec![a.clone()], vec![unary(&a, &result)], result.clone());
+        let old = graph.startblock;
+
+        let new = split_block(&mut graph, old, 1, None);
+
+        assert_eq!(graph.block(old).operations.len(), 1);
+        assert!(graph.block(new).operations.is_empty());
+        assert_eq!(graph.block(old).exits[0].args, vec![LinkArg::Value(result)]);
+        assert_eq!(graph.block(new).exits.len(), 1);
+    }
+
+    #[test]
+    fn split_with_forcelink_uses_explicit_order() {
+        let a = Variable::named("a");
+        let b = Variable::named("b");
+        let result = Variable::named("result");
+        let mut graph = graph_with_ops(
+            vec![a.clone(), b.clone()],
+            vec![SpaceOperation {
+                result: Some(result.clone()),
+                kind: OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            result,
+        );
+        let old = graph.startblock;
+
+        let new = split_block(&mut graph, old, 0, Some(&[b.clone(), a.clone()]));
+
+        assert_eq!(
+            graph.block(old).exits[0].args,
+            vec![LinkArg::Value(b), LinkArg::Value(a)]
+        );
+        assert_eq!(graph.block(new).inputargs.len(), 2);
+    }
+
+    #[test]
+    fn split_with_forcelink_panic_locates_every_offender() {
+        let kept = Variable::named("kept");
+        let missing = Variable::named("missing_red");
+        FunctionGraph::set_concretetype_of_inline(&missing, ConcreteType::Signed);
+        let result = Variable::named("result");
+        let mut graph = graph_with_ops(
+            vec![kept.clone(), missing.clone()],
+            vec![unary(&missing, &result)],
+            result,
+        );
+        let naming_block = graph.create_block();
+        graph
+            .block_mut(naming_block)
+            .operations
+            .push(SpaceOperation {
+                result: Some(missing),
+                kind: OpKind::Input {
+                    name: "missing_red".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+            });
+        let old = graph.startblock;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            split_block(&mut graph, old, 0, Some(&[kept]))
+        }))
+        .expect_err("a live-across variable outside _forcelink must fail the split");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("split_block panics with a formatted String");
+
+        // The diagnostic has to be actionable on its own: which value, what
+        // kind it is, where it comes from, and what still needs it.
+        assert!(message.contains("missing_red"), "{message}");
+        assert!(message.contains("kind=Signed"), "{message}");
+        assert!(
+            message.contains("defined by `Input missing_red` at block"),
+            "{message}"
+        );
+        assert!(
+            message.contains("used after the split point by: op 0 `int_neg`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Offending variables (1 of them)"),
+            "{message}"
+        );
+    }
+}

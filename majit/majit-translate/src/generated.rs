@@ -238,6 +238,7 @@ fn build() -> AllJitCodes {
                     autoreds: false,
                     virtualizables: vec!["frame".to_string()],
                     red_types: vec!["PyFrame".to_string(), "ExecutionContext".to_string()],
+                    split_portal: false,
                 }],
                 register_trait_families: Vec::new(),
             },
