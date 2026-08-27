@@ -649,7 +649,6 @@ pub fn install_builtin_modules() {
     // Core pyre modules backed by `interpleveldefs` tables.
     pyre_install_module!(math);
     pyre_install_module!(cmath);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(time);
     pyre_install_module!(sys);
     // `moduledef.py applevel_name = '_operator'` — the interp-level table

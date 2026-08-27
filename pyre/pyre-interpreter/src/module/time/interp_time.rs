@@ -12,8 +12,9 @@ use crate::host_seam::sys as libc;
 #[cfg(feature = "host_env")]
 use rustpython_host_env::time as host_time;
 use std::sync::OnceLock;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
-#[cfg(not(feature = "host_env"))]
+#[cfg(not(any(feature = "host_env", target_arch = "wasm32")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Number of fields in `time.struct_time` as seen by C extensions.
@@ -23,37 +24,94 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// count is the same everywhere.
 pub const STRUCT_TM_ITEMS: i64 = 11;
 
+/// The clock a target reads when it has none of its own.
+///
+/// wasm32 has neither a `SystemTime` nor an `Instant`: both panic rather than
+/// answer, which is why `time` was kept out of the module registry there at
+/// all.  The embedder that supplies the filesystem through
+/// [`crate::importing::SourceProvider`] supplies the clock through this.
+#[cfg(target_arch = "wasm32")]
+pub trait ClockProvider: Send + Sync {
+    /// Nanoseconds since the unix epoch.
+    fn wall_nanos(&self) -> i128;
+    /// Nanoseconds on a clock that does not go backwards, counted from an
+    /// origin this only has to keep fixed.
+    fn monotonic_nanos(&self) -> i128;
+    /// Block until `nanos` nanoseconds have passed.
+    fn sleep_nanos(&self, nanos: u64);
+}
+
+#[cfg(target_arch = "wasm32")]
+static CLOCK_PROVIDER: OnceLock<std::sync::Arc<dyn ClockProvider>> = OnceLock::new();
+
+/// Install the clock this module reads.  The wasm bootstrap installs one
+/// before the first `import time`; with none installed every clock reads zero,
+/// which is what a target with no clock can honestly report and is still
+/// non-decreasing.
+#[cfg(target_arch = "wasm32")]
+pub fn install_clock_provider(provider: std::sync::Arc<dyn ClockProvider>) {
+    let _ = CLOCK_PROVIDER.set(provider);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn with_clock<R>(f: impl FnOnce(&dyn ClockProvider) -> R, unclocked: R) -> R {
+    match CLOCK_PROVIDER.get() {
+        Some(provider) => f(&**provider),
+        None => unclocked,
+    }
+}
+
 /// Process-start `Instant` used as the monotonic-clock origin whenever
 /// `clock_gettime(CLOCK_MONOTONIC)` is unavailable.  Keeping a single
 /// baseline preserves `time.monotonic()`'s non-decreasing guarantee.
+#[cfg(not(target_arch = "wasm32"))]
 fn monotonic_baseline() -> Instant {
     static BASELINE: OnceLock<Instant> = OnceLock::new();
     *BASELINE.get_or_init(Instant::now)
 }
 
 fn monotonic_seconds() -> f64 {
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(target_arch = "wasm32")]
     {
-        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
-            return d.as_secs_f64();
-        }
+        with_clock(|clock| clock.monotonic_nanos(), 0) as f64 / 1e9
     }
-    monotonic_baseline().elapsed().as_secs_f64()
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        #[cfg(all(unix, feature = "host_env"))]
+        {
+            if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
+                return d.as_secs_f64();
+            }
+        }
+        monotonic_baseline().elapsed().as_secs_f64()
+    }
 }
 
 /// Wall-clock seconds since the unix epoch, falling back to 0 on
 /// `SystemTimeError`.  Routes through `host_env::time` when enabled.
 pub(crate) fn duration_since_epoch() -> std::time::Duration {
+    #[cfg(all(target_arch = "wasm32", not(feature = "sandbox")))]
+    {
+        let nanos = with_clock(|clock| clock.wall_nanos(), 0).max(0) as u128;
+        std::time::Duration::new(
+            (nanos / 1_000_000_000) as u64,
+            (nanos % 1_000_000_000) as u32,
+        )
+    }
     #[cfg(feature = "sandbox")]
     {
         let secs = crate::host_seam::ops::time().unwrap_or(0.0).max(0.0);
         std::time::Duration::from_secs_f64(secs)
     }
-    #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
     {
         host_time::duration_since_system_now().unwrap_or_default()
     }
-    #[cfg(not(any(feature = "host_env", feature = "sandbox")))]
+    #[cfg(not(any(feature = "host_env", feature = "sandbox", target_arch = "wasm32")))]
     {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -218,7 +276,22 @@ pub fn sleep(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
     }
-    #[cfg(not(any(all(unix, feature = "host_env"), feature = "sandbox")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "sandbox")))]
+    {
+        // The guest has no scheduler of its own, so the wait is the
+        // embedder's to take.
+        let _blocking = crate::module::thread::before_external_block();
+        with_clock(
+            |clock| clock.sleep_nanos(dur.as_nanos().min(u64::MAX as u128) as u64),
+            (),
+        );
+        Ok(w_none())
+    }
+    #[cfg(not(any(
+        all(unix, feature = "host_env"),
+        feature = "sandbox",
+        target_arch = "wasm32"
+    )))]
     {
         let _blocking = crate::module::thread::before_external_block();
         std::thread::sleep(dur);
@@ -238,13 +311,20 @@ pub fn perf_counter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 /// Monotonic clock as integer nanoseconds.
 pub(crate) fn monotonic_nanos() -> i128 {
-    #[cfg(all(unix, feature = "host_env"))]
+    #[cfg(target_arch = "wasm32")]
     {
-        if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
-            return d.as_nanos() as i128;
-        }
+        with_clock(|clock| clock.monotonic_nanos(), 0)
     }
-    monotonic_baseline().elapsed().as_nanos() as i128
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        #[cfg(all(unix, feature = "host_env"))]
+        {
+            if let Ok(d) = host_time::clock_gettime(host_time::ClockId::CLOCK_MONOTONIC) {
+                return d.as_nanos() as i128;
+            }
+        }
+        monotonic_baseline().elapsed().as_nanos() as i128
+    }
 }
 
 /// time.monotonic_ns() → int
@@ -299,7 +379,18 @@ pub fn get_time_info(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         "thread_time" => ("GetThreadTimes()", true, false),
         _ => return Err(crate::PyError::value_error("unknown clock")),
     };
-    #[cfg(not(windows))]
+    // The guest makes no syscall: every clock is a question put to the
+    // embedder, and `process_time` is the monotonic one because that is the
+    // only clock this target has.
+    #[cfg(target_arch = "wasm32")]
+    let (implementation, monotonic, adjustable) = match name_str {
+        "time" => ("ClockProvider::wall_nanos()", false, true),
+        "monotonic" | "perf_counter" | "process_time" => {
+            ("ClockProvider::monotonic_nanos()", true, false)
+        }
+        _ => return Err(crate::PyError::value_error("unknown clock")),
+    };
+    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
     let (implementation, monotonic, adjustable) = match name_str {
         "time" => ("clock_gettime(CLOCK_REALTIME)", false, true),
         "monotonic" | "perf_counter" => {
@@ -487,9 +578,9 @@ fn process_time_nanos() -> Result<i128, crate::PyError> {
 
 #[cfg(not(any(all(unix, feature = "host_env"), all(windows, feature = "host_env"))))]
 fn process_time_nanos() -> Result<i128, crate::PyError> {
-    // No host clock available; fall back to the monotonic baseline so
-    // the value is still non-decreasing.
-    Ok(monotonic_baseline().elapsed().as_nanos() as i128)
+    // No process clock available; report the monotonic one, which is
+    // non-decreasing and is the only clock this target has.
+    Ok(monotonic_nanos())
 }
 
 /// `GetThreadTimes`' kernel + user total for the calling thread — the
