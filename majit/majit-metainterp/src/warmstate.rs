@@ -2400,6 +2400,21 @@ impl WarmEnterState {
                 }
                 return false;
             }
+            // The same two gates the untyped twin runs, in the same order
+            // (`warmstate.py maybe_compile_and_run`). An invalidated procedure
+            // token has to reach `cleanup_chain` below rather than take any
+            // early return, and the abort ceiling has to answer at the
+            // function-entry door too: its caller runs `decay_all_counters()`
+            // on the way to `force_start_tracing*`, so a latched cell that
+            // keeps firing the threshold decays every OTHER location's counter
+            // once per function entry. A latched cell that is ALSO dead takes
+            // the cleanup path instead.
+            let dead_token =
+                cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none();
+            if !dead_token && cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                crate::mc_diag_bump(81); // abort_ceiling_refused
+                return false;
+            }
             if cell.flags & jc_flags::TEMPORARY != 0 {
                 crate::mc_diag_bump(25);
                 return self.counter.tick(bucket, self.increment_function_threshold);
@@ -2413,7 +2428,7 @@ impl WarmEnterState {
                     return true;
                 }
             }
-            if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
+            if dead_token {
                 cleanup_dead_token_cell = true;
             }
         }
