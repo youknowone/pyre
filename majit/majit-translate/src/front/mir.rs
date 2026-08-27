@@ -30103,6 +30103,106 @@ mod tests {
         );
     }
 
+    /// A translated opcode helper is a PyPy frame method, not a generic
+    /// classdef-less reference.  Its receiver is the per-frame red argument
+    /// that owns `pycode`, globals, and locals, so the front must retain the
+    /// concrete `PyFrame` root on the corresponding Input operation.
+    #[test]
+    #[ignore]
+    fn opcode_impl_receiver_keeps_pyframe_input_root() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::pop_value")
+            .expect("lower eval::<Impl>::pop_value");
+        let receiver = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Input { class_root, .. }
+                    if op.result.as_ref() == graph.block(graph.startblock).inputargs.first() =>
+                {
+                    class_root.as_deref()
+                }
+                _ => None,
+            });
+        assert_eq!(
+            receiver,
+            Some("PyFrame"),
+            "opcode impl receiver must retain the concrete per-frame red identity"
+        );
+
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                &[llbc],
+                crate::HostStaticAddrs::default(),
+                &[],
+                &["pop_value", "pop_top", "build_list", "opcode_build_list"],
+            )
+            .expect("build filtered opcode program");
+        let pyframe_roots: Vec<_> = program
+            .struct_fields
+            .fields
+            .keys()
+            .filter(|root| root.rsplit("::").next() == Some("PyFrame"))
+            .cloned()
+            .collect();
+        assert!(
+            pyframe_roots.len() > 1,
+            "fixture must exercise more than one lookup spelling"
+        );
+        let mut pyframe_ids: Vec<_> = pyframe_roots
+            .iter()
+            .map(|root| {
+                program
+                    .struct_ids
+                    .get(root)
+                    .copied()
+                    .flatten()
+                    .expect("every qualified PyFrame alias has an identity")
+            })
+            .collect();
+        pyframe_ids.sort();
+        pyframe_ids.dedup();
+        assert_eq!(
+            pyframe_ids.len(),
+            1,
+            "all PyFrame lookup spellings must name one class identity"
+        );
+
+        let mut trait_impl_owners = crate::TraitImplOwners::new();
+        for function in &program.functions {
+            let (Some(trait_qualified), Some(owner)) =
+                (&function.trait_qualified, &function.self_ty_root)
+            else {
+                continue;
+            };
+            trait_impl_owners
+                .entry(trait_qualified.clone())
+                .or_default()
+                .insert(owner.clone());
+        }
+        let unique_impls = crate::unique_trait_impl_roots(&program, trait_impl_owners);
+        let frame_owner = unique_impls
+            .iter()
+            .find(|(trait_name, _)| trait_name.ends_with("::OpcodeStepExecutor"))
+            .map(|(_, owner)| owner)
+            .expect("OpcodeStepExecutor has one concrete owner");
+        assert!(
+            frame_owner.ends_with("::PyFrame"),
+            "the production unique-impl census must preserve the qualified frame owner: \
+             {frame_owner:?}"
+        );
+        assert_eq!(
+            program.struct_ids.get(frame_owner).copied().flatten(),
+            Some(pyframe_ids[0]),
+            "the retained owner spelling must resolve to the frame's StructId"
+        );
+    }
+
     #[test]
     fn niche_option_raw_scalar_ptr_remains_aggregate() {
         let payload = serde_json::json!({
