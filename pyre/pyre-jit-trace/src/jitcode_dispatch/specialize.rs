@@ -142,8 +142,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
 
     fbw_count_executed_residual(false, true);
     let exc_concrete = ConcreteValue::Ref(exc);
-    ctx.last_exc_value = Some(raised);
-    ctx.last_exc_value_concrete = exc_concrete;
+    ctx.set_last_exc_value(raised, exc_concrete);
     ctx.fbw_mode.class_of_last_exc_is_const = true;
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
     DispatchOutcome::SubRaise {
@@ -15004,8 +15003,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     // delivers the pending raise to the live frame.  The class IS proven
     // constant here — the `NewWithVtable` vtable pins it.
     fbw_count_executed_residual(true, true);
-    ctx.last_exc_value = Some(new_op);
-    ctx.last_exc_value_concrete = ConcreteValue::Ref(exc);
+    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
     ctx.fbw_mode.class_of_last_exc_is_const = true;
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
 
@@ -15238,8 +15236,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 
     fbw_built_exc_insert(new_op);
     fbw_count_executed_residual(true, true);
-    ctx.last_exc_value = Some(new_op);
-    ctx.last_exc_value_concrete = ConcreteValue::Ref(exc);
+    ctx.set_last_exc_value(new_op, ConcreteValue::Ref(exc));
     ctx.fbw_mode.class_of_last_exc_is_const = true;
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
 
@@ -15418,7 +15415,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         }
     };
     // A PUSH_EXC_INFO store publishes the exception being handled, which IS the
-    // tracked active exception (`ctx.last_exc_value`, the walker's mirror of
+    // tracked active exception (`ctx.last_exc_value()`, the walker's mirror of
     // RPython `metainterp.last_exc_box`).  The graph-side codewriter binds the
     // popped `exc_value`'s producer to a `last_exc_value` re-read for exactly
     // this reason (`codewriter.rs` PushExcInfo arm), but that producer is
@@ -15438,7 +15435,7 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
         && (store_concrete.is_null() || !unsafe { pyre_object::is_exception(store_concrete) })
     {
         if let (Some(tracked_op), ConcreteValue::Ref(tracked_obj)) =
-            (ctx.last_exc_value, ctx.last_exc_value_concrete)
+            (ctx.last_exc_value(), ctx.last_exc_value_concrete())
         {
             if !tracked_obj.is_null() && unsafe { pyre_object::is_exception(tracked_obj) } {
                 store_op = tracked_op;

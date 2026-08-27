@@ -430,7 +430,7 @@ pub(crate) fn latch_abort_blackhole<Sym: WalkSym>(
         latchdbg!("origin={origin} not-authoritative");
         return false;
     }
-    let last_exc_value = match ctx.last_exc_value_concrete {
+    let last_exc_value = match ctx.last_exc_value_concrete() {
         ConcreteValue::Ref(value) => value as i64,
         _ => 0,
     };
@@ -4445,9 +4445,11 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             // consumed value into TLS as well.  An
             // uncaught raise is carried by the trace's exception FINISH; an
             // aborted walk re-executes the live opcode.
-            ctx.last_exc_value = Some(ctx.trace_ctx.const_ref(bh_exc));
-            ctx.last_exc_value_concrete =
-                ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef);
+            let bh_exc_box = ctx.trace_ctx.const_ref(bh_exc);
+            ctx.set_last_exc_value(
+                bh_exc_box,
+                ConcreteValue::Ref(bh_exc as usize as pyre_object::PyObjectRef),
+            );
             // `execute_raised(..., constant=False)`:
             // a residual exception has not had its class proven by a guard yet.
             ctx.fbw_mode.class_of_last_exc_is_const = false;
@@ -5869,8 +5871,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // opimpl_catch_exception assert (pyjitpl.py) relies on it.
     // Clear at the arm entry so declined/folded paths uphold the same
     // invariant as the concrete-execution success arm.
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    ctx.clear_last_exc_value();
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (mut r_args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
     // #62: env-gated recognition probe (no-op unless PYRE_DIAG_INLINE_RECOG
@@ -7232,9 +7233,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
                 // `*_return`) onto an exception path and confuse the
                 // optimizer's guard-fail snapshot.
                 let exc = ctx
-                    .last_exc_value
+                    .last_exc_value()
                     .expect("resid_raised implies last_exc_value seeded by the Err branch");
-                let exc_concrete = ctx.last_exc_value_concrete;
+                let exc_concrete = ctx.last_exc_value_concrete();
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
@@ -7283,8 +7284,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py) clear_exception at every
     // residual-call entry; see dispatch_residual_call_iRd_kind.
-    let saved_last_exc_value = ctx.last_exc_value;
-    let saved_last_exc_value_concrete = ctx.last_exc_value_concrete;
+    let saved_last_exc_value = ctx.last_exc_value();
+    let saved_last_exc_value_concrete = ctx.last_exc_value_concrete();
     let preserve_last_exc_for_handler =
         saved_last_exc_value.is_some() && reads_last_exc_before_next_catch(code, op.next_pc);
     if !preserve_last_exc_for_handler {
@@ -8262,8 +8263,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     let folded =
                         try_walker_fold_check_exc_match(ctx, op.pc, &r_args, dst, dst_bank)?;
                     if folded.is_some() && keep_last_exc_for_handler {
-                        ctx.last_exc_value = saved_last_exc_value;
-                        ctx.last_exc_value_concrete = saved_last_exc_value_concrete;
+                        ctx.restore_last_exc_value(
+                            saved_last_exc_value,
+                            saved_last_exc_value_concrete,
+                        );
                     }
                     folded
                 } else if (op_tag == 8 || op_tag == 9) && ctx.is_authoritative_executor {
@@ -8487,9 +8490,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 // `finishframe_exception()` immediately after emitting
                 // GUARD_EXCEPTION — see iRd_kind for the full rationale.
                 let exc = ctx
-                    .last_exc_value
+                    .last_exc_value()
                     .expect("resid_raised implies last_exc_value seeded by the Err branch");
-                let exc_concrete = ctx.last_exc_value_concrete;
+                let exc_concrete = ctx.last_exc_value_concrete();
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
@@ -8550,8 +8553,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // execute_varargs (pyjitpl.py) clear_exception at every
     // residual-call entry; see dispatch_residual_call_iRd_kind.
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    ctx.clear_last_exc_value();
     let funcptr = read_int_reg(code, op, 0, ctx)?;
     let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
     let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
@@ -8730,9 +8732,9 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
                 // `finishframe_exception()` immediately after emitting
                 // GUARD_EXCEPTION — see iRd_kind for the full rationale.
                 let exc = ctx
-                    .last_exc_value
+                    .last_exc_value()
                     .expect("resid_raised implies last_exc_value seeded by the Err branch");
-                let exc_concrete = ctx.last_exc_value_concrete;
+                let exc_concrete = ctx.last_exc_value_concrete();
                 return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc));
             } else {
                 ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);

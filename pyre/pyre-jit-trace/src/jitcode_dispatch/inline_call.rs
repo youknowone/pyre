@@ -2153,9 +2153,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         // handler catches it).
         walker_record_guard_exception(ctx, op.pc);
         let exc = ctx
-            .last_exc_value
+            .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
-        let exc_concrete = ctx.last_exc_value_concrete;
+        let exc_concrete = ctx.last_exc_value_concrete();
         return Ok(Some((
             DispatchOutcome::SubRaise { exc, exc_concrete },
             op.next_pc,
@@ -2397,9 +2397,9 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     if exec_raised {
         walker_record_guard_exception(ctx, op.pc);
         let exc = ctx
-            .last_exc_value
+            .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
-        let exc_concrete = ctx.last_exc_value_concrete;
+        let exc_concrete = ctx.last_exc_value_concrete();
         return Ok(Some((
             DispatchOutcome::SubRaise { exc, exc_concrete },
             op.next_pc,
@@ -3867,8 +3867,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         },
         DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
-                ctx.last_exc_value = Some(exc);
-                ctx.last_exc_value_concrete = exc_concrete;
+                ctx.set_last_exc_value(exc, exc_concrete);
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
                 Ok(Some((
@@ -6176,8 +6175,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             trace_ctx: ctx.trace_ctx,
             is_top_level: false,
             sub_jitcode_lookup: callee_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: inline_outer_entry_py_pc,
             outer_resume_marker_jit_pc: inline_outer_resume_marker_jit_pc,
             outer_jitcode_index: inline_outer_jc_index,
@@ -6804,8 +6801,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     true,
                     emit_runtime,
                 );
-                ctx.last_exc_value = Some(exc);
-                ctx.last_exc_value_concrete = exc_concrete;
+                ctx.set_last_exc_value(exc, exc_concrete);
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
                 Ok(Some((
@@ -7484,12 +7480,12 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
                 Err(mut err) => {
                     let exc = err.to_exc_object();
                     fbw_count_executed_residual(true, true);
-                    ctx.last_exc_value_concrete = ConcreteValue::Ref(exc);
+                    ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
                     ctx.fbw_mode.class_of_last_exc_is_const = false;
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
                     walker_record_guard_exception(ctx, op.pc);
                     let exc_box = ctx
-                        .last_exc_value
+                        .last_exc_value()
                         .expect("guard_exception seeds last_exc_value");
                     return Ok(Some((
                         DispatchOutcome::SubRaise {
@@ -8872,8 +8868,7 @@ pub(crate) fn finish_inline_callee_return<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     result: Option<OpRef>,
 ) -> Option<OpRef> {
-    ctx.last_exc_value = None;
-    ctx.last_exc_value_concrete = ConcreteValue::Null;
+    ctx.clear_last_exc_value();
     result
 }
 
@@ -9055,8 +9050,6 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
             trace_ctx: ctx.trace_ctx,
             is_top_level: false,
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-            last_exc_value: None,
-            last_exc_value_concrete: ConcreteValue::Null,
             entry_py_pc: ctx.entry_py_pc,
             outer_resume_marker_jit_pc: ctx.outer_resume_marker_jit_pc,
             outer_jitcode_index: ctx.outer_jitcode_index,
@@ -9226,14 +9219,11 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                     true,
                     emit_runtime,
                 );
-                ctx.last_exc_value = Some(exc);
-                // Thread the callee's concrete
-                // exception across the frame boundary.  Without this a
-                // downstream `raise/r` / `reraise/` in the caller's
-                // handler would read `Null` and skip GUARD_CLASS,
-                // losing the class-known pin that the callee's leg had
-                // already established.
-                ctx.last_exc_value_concrete = exc_concrete;
+                // `finishframe_exception` hands the handler the exception
+                // the callee raised, concrete shadow included, so a
+                // downstream `raise/r` / `reraise/` in the caller's handler
+                // keeps the class-known pin the callee's leg established.
+                ctx.set_last_exc_value(exc, exc_concrete);
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
@@ -9429,14 +9419,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                     true,
                     emit_runtime,
                 );
-                ctx.last_exc_value = Some(exc);
-                // Thread the callee's concrete
-                // exception across the frame boundary.  Without this a
-                // downstream `raise/r` / `reraise/` in the caller's
-                // handler would read `Null` and skip GUARD_CLASS,
-                // losing the class-known pin that the callee's leg had
-                // already established.
-                ctx.last_exc_value_concrete = exc_concrete;
+                // `finishframe_exception` hands the handler the exception
+                // the callee raised, concrete shadow included, so a
+                // downstream `raise/r` / `reraise/` in the caller's handler
+                // keeps the class-known pin the callee's leg established.
+                ctx.set_last_exc_value(exc, exc_concrete);
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
@@ -9613,14 +9600,11 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                     true,
                     emit_runtime,
                 );
-                ctx.last_exc_value = Some(exc);
-                // Thread the callee's concrete
-                // exception across the frame boundary.  Without this a
-                // downstream `raise/r` / `reraise/` in the caller's
-                // handler would read `Null` and skip GUARD_CLASS,
-                // losing the class-known pin that the callee's leg had
-                // already established.
-                ctx.last_exc_value_concrete = exc_concrete;
+                // `finishframe_exception` hands the handler the exception
+                // the callee raised, concrete shadow included, so a
+                // downstream `raise/r` / `reraise/` in the caller's handler
+                // keeps the class-known pin the callee's leg established.
+                ctx.set_last_exc_value(exc, exc_concrete);
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
