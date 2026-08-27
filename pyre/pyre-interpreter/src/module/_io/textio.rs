@@ -527,7 +527,7 @@ impl W_TextIOWrapper {
             let mut decoder =
                 super::call_method_result(codec, "incrementaldecoder", &[self.w_errors])?;
             if self.readuniversal {
-                let io = crate::importing::get_sys_module("_io").ok_or_else(|| {
+                let io = crate::importing::get_builtin_module("_io").ok_or_else(|| {
                     crate::PyError::runtime_error("_io module is not initialized")
                 })?;
                 let decoder_type =

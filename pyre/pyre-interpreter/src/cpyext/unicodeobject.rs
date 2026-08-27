@@ -1149,8 +1149,7 @@ pub unsafe extern "C" fn PyUnicode_FSConverter(
     let Some(value) = super::object::argument(argument) else {
         return 0;
     };
-    let Some(path) = super::pyerrors::trap(crate::module::posix::interp_posix::fspath(value))
-    else {
+    let Some(path) = super::pyerrors::trap(crate::module::posix::fspath(value)) else {
         return 0;
     };
     let bytes = if unsafe { pyre_object::bytesobject::is_bytes(path) } {
@@ -1185,8 +1184,7 @@ pub unsafe extern "C" fn PyUnicode_FSDecoder(
     let Some(value) = super::object::argument(argument) else {
         return 0;
     };
-    let Some(path) = super::pyerrors::trap(crate::module::posix::interp_posix::fspath(value))
-    else {
+    let Some(path) = super::pyerrors::trap(crate::module::posix::fspath(value)) else {
         return 0;
     };
     let text = if unsafe { pyre_object::unicodeobject::is_str(path) } {

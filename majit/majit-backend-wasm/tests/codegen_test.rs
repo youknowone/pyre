@@ -485,6 +485,7 @@ fn build_module_with_frame(
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame,
         ca: codegen::CaParams::default(),
@@ -734,6 +735,7 @@ fn build_module_with_write_barrier_target(
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         // The allocated trace keeps both Ref inputs live across New; reserve
         // their homes in the shared helper geometry.  The value count is the
@@ -1253,6 +1255,7 @@ fn test_cold_guard_recovery_preserves_nonzero_base_and_typed_bits() {
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
@@ -1516,6 +1519,7 @@ fn inline_region_inputs(
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
@@ -1685,6 +1689,7 @@ fn inlined_bridge_carrying_an_unarmed_call_assembler_declines() {
             trace_entry_census: None,
             inline_trip: None,
             external_jump_slot: 0,
+            external_jump_wide_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
             ca,
@@ -1897,6 +1902,7 @@ fn inlined_bridge_emission_is_independent_of_the_regions_own_numbering() {
             trace_entry_census: None,
             inline_trip: None,
             external_jump_slot: 0,
+            external_jump_wide_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
             ca: codegen::CaParams::default(),
@@ -2206,6 +2212,7 @@ fn zero_arity_parameter_entry_is_structurally_type_zero() {
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
@@ -2606,6 +2613,7 @@ fn test_guard_not_invalidated_loads_runtime_flag() {
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
@@ -2987,6 +2995,7 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
@@ -3237,6 +3246,132 @@ fn peeled_loop_exports_a_narrow_shim_beside_its_wide_entry() {
         codegen::has_label_param_entry(&inputargs, &ops, one_more, None),
         "one slot past the arity is the smallest frame the shim can read"
     );
+}
+
+/// A loop-closing bridge whose target published a wide entry hands the jump
+/// arguments over as parameters. The narrow entry is a shim that loads
+/// `FROZEN_LABEL_PARAM_ARITY` frame slots and tail-calls the wide one, so
+/// writing the args into those slots first is a round trip through memory that
+/// the target undoes instruction for instruction.
+///
+/// The dispatch key still travels through the frame: it selects the entry
+/// `br_table` arm, which runs before any parameter is read.
+#[test]
+fn a_loop_closing_jump_passes_its_args_to_a_published_wide_entry() {
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
+    let const_1 = OpRef::const_int(1);
+    let constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+
+    // No LABEL of its own, so the terminal JUMP closes into a separate module.
+    let ops = vec![
+        make_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), const_1],
+            OpRef::int_op(1),
+        ),
+        Op::new(OpCode::Jump, &[rb(OpRef::int_op(1))]),
+    ];
+
+    let (narrow_bytes, _) = build_external_jump_module(&inputargs, &ops, &constants, 7, 3, 0);
+    let (wide_bytes, _) = build_external_jump_module(&inputargs, &ops, &constants, 7, 3, 8);
+    validate_wasm(&narrow_bytes);
+    validate_wasm(&wide_bytes);
+
+    let (narrow_stores, narrow_call) = external_jump_tail(&narrow_bytes);
+    let (wide_stores, wide_call) = external_jump_tail(&wide_bytes);
+
+    assert_eq!(
+        narrow_call,
+        Some((7, 0)),
+        "without a wide entry the JUMP tail-calls the narrow slot as type 0"
+    );
+    assert_eq!(
+        narrow_stores, 2,
+        "the narrow arm writes one jump arg and the dispatch key"
+    );
+    assert_eq!(
+        wide_stores, 1,
+        "only the dispatch key still goes through the frame"
+    );
+
+    let (types, ..) = module_shape(&wide_bytes);
+    let (wide_slot, wide_type) = wide_call.expect("the wide arm tail-calls its target");
+    assert_eq!(wide_slot, 8, "the JUMP names the published wide slot");
+    assert_eq!(
+        types[wide_type as usize],
+        (1 + majit_backend_wasm::FROZEN_LABEL_PARAM_ARITY, 1),
+        "the call type is the target's parameter entry: frame_ptr plus the \
+         fixed label parameters"
+    );
+}
+
+/// `build_module_default` for a trace that closes into another module.
+fn build_external_jump_module(
+    inputargs: &[InputArg],
+    ops: &[Op],
+    constants: &indexmap::IndexMap<u32, i64>,
+    external_jump_slot: u32,
+    external_jump_key: u32,
+    external_jump_wide_slot: u32,
+) -> (Vec<u8>, Vec<codegen::GuardExit>) {
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs: inputargs.iter().map(InputArg::fresh_value_copy).collect(),
+        ops: ops.to_vec(),
+        inlined_bridges: Vec::new(),
+        constants: constants.clone(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb_fn_ptr: 0,
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        fail_index_base: 0,
+        bridge_cells_base: 1,
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot,
+        external_jump_wide_slot,
+        external_jump_key,
+        frame: codegen::FrameGeometry::fixed(),
+        ca: codegen::CaParams::default(),
+    };
+    let (bytes, guards, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    (bytes, guards)
+}
+
+/// `i64.store` count of the module's body, and the `(table slot, type index)`
+/// of the JUMP's `return_call_indirect`.
+///
+/// The FIRST one: the body's ops are emitted before the guard-dispatch
+/// epilogue, whose own tail call is type 0 through a slot it loaded from a
+/// cell rather than a baked constant.
+fn external_jump_tail(bytes: &[u8]) -> (usize, Option<(i32, u32)>) {
+    let mut stores = 0usize;
+    let mut last_const: Option<i32> = None;
+    let mut call = None;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload.unwrap() {
+            let mut operators = body.get_operators_reader().unwrap();
+            while let Ok(op) = operators.read() {
+                match op {
+                    wasmparser::Operator::I64Store { .. } => stores += 1,
+                    wasmparser::Operator::I32Const { value } => last_const = Some(value),
+                    wasmparser::Operator::ReturnCallIndirect { type_index, .. }
+                        if call.is_none() =>
+                    {
+                        call = last_const.map(|slot| (slot, type_index));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (stores, call)
 }
 
 #[test]
@@ -3688,6 +3823,7 @@ fn test_non_moving_descr_allocates_through_the_oldgen_helper() {
             trace_entry_census: None,
             inline_trip: None,
             external_jump_slot: 0,
+            external_jump_wide_slot: 0,
             external_jump_key: 0,
             frame: codegen::FrameGeometry::fixed(),
             ca: codegen::CaParams::default(),
@@ -4719,6 +4855,7 @@ fn region_closing_at_the_header_permutes_two_ref_label_args() {
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),
@@ -4914,6 +5051,7 @@ fn run_header_region_repro(full_arity: bool, region_guard: RegionGuard) {
         trace_entry_census: None,
         inline_trip: None,
         external_jump_slot: 0,
+        external_jump_wide_slot: 0,
         external_jump_key: 0,
         frame: codegen::FrameGeometry::fixed(),
         ca: codegen::CaParams::default(),

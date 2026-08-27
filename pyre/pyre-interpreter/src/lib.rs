@@ -1221,7 +1221,8 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(181, typed::<crate::pycode::W_PositionsIterObject>()),
         subclass_range_alias(182, typed::<crate::pycode::W_BranchesIterObject>()),
         // Native-only posix aliases 183 and 184 preserve `build_gc`'s rclass
-        // registration order after the unconditional aliases.
+        // registration order after the unconditional aliases.  `scandir` has
+        // no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
         subclass_range_alias(183, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]

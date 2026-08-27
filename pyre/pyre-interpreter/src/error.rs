@@ -1119,6 +1119,12 @@ impl PyError {
                     .into_owned();
             }
         }
+        // wasm32 has no error table behind `from_raw_os_error`, which answers
+        // every code with the same placeholder.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(msg) = crate::builtins::wasm_errno::strerror(errno) {
+            return msg.to_string();
+        }
         let full = std::io::Error::from_raw_os_error(errno).to_string();
         match full.rfind(" (os error ") {
             Some(idx) => full[..idx].to_string(),

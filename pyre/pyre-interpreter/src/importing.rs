@@ -13,12 +13,10 @@ use std::sync::{
     Arc, LazyLock, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
-// `Path` is used only by the host_env source/package loaders; keep it gated
-// so an host_env-off build does not warn on an unused import. `PathBuf`
-// appears in the host_env-independent module-search surface
-// (`SYS_PATH`, `find_module`, `parent_package_path`, `load_part`) and must
-// stay in scope unconditionally.
-#[cfg(feature = "host_env")]
+// `Path` and `PathBuf` both appear in the host_env-independent module-search
+// surface — `SYS_PATH`, `find_module`, `parent_package_path`, `load_part`,
+// and `init_sys_path`, which every host calls — so both stay in scope
+// unconditionally.
 use std::path::Path;
 // `normalize_lexically` walks a path a component at a time to collapse `.`
 // and `..`; it is reached only from the executable-discovery arm.
@@ -73,7 +71,17 @@ pub(crate) mod host {
             std::process::id()
         }
         pub fn isatty(fd: i32) -> bool {
-            unsafe { libc::isatty(fd) != 0 }
+            // wasm32 has no descriptor table to ask, and no `libc::isatty` to
+            // ask it with.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = fd;
+                return false;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            unsafe {
+                libc::isatty(fd) != 0
+            }
         }
         pub fn rename(
             from: impl AsRef<std::path::Path>,
@@ -118,6 +126,33 @@ pub trait SourceProvider: Send + Sync {
     /// Read the whole file at `path` as raw bytes.  Source files carry a BOM
     /// or a PEP 263 cookie, so decoding belongs to the caller, not here.
     fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>>;
+    /// Byte length of the regular file at `path`.
+    ///
+    /// Defaults to the length of a whole read, which every provider can
+    /// answer; one that knows the size without transferring the bytes
+    /// overrides it.
+    fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+        Ok(self.read_to_bytes(path)?.len() as u64)
+    }
+    /// Entry names of the directory at `path`, in the order the seam reports
+    /// them, each as the filesystem's own bytes.
+    ///
+    /// Names are bytes rather than text because a directory entry need not
+    /// have a UTF-8 spelling and `listdir` still has to return it: the caller
+    /// decides between `bytes` and a surrogateescape-decoded `str` from the
+    /// type of the path it was given.
+    ///
+    /// Defaults to refusing: enumeration is the one filesystem question a
+    /// provider built to answer `import`'s probes need not be able to answer,
+    /// and `posix.listdir` turns the refusal into the OSError its caller
+    /// expects rather than inventing an empty directory.
+    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this source provider cannot list a directory",
+        ))
+    }
 }
 
 #[cfg(feature = "host_env")]
@@ -154,6 +189,24 @@ fn with_source_provider<R>(f: impl FnOnce(&dyn SourceProvider) -> R) -> R {
 #[cfg(feature = "host_env")]
 pub fn read_source_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     with_source_provider(|p| p.read_to_bytes(path))
+}
+
+/// Whether the seam sees `path` as a directory, and the size it reports for a
+/// regular file — the two probes `posix.stat` answers from on a target whose
+/// only view of a filesystem is this seam.
+#[cfg(feature = "host_env")]
+pub fn source_is_dir(path: &Path) -> bool {
+    with_source_provider(|p| p.is_dir(path))
+}
+
+#[cfg(feature = "host_env")]
+pub fn source_file_size(path: &Path) -> std::io::Result<u64> {
+    with_source_provider(|p| p.file_size(path))
+}
+
+#[cfg(feature = "host_env")]
+pub fn source_list_dir(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+    with_source_provider(|p| p.list_dir(path))
 }
 
 /// [`read_source_bytes`] decoded as plain UTF-8, for callers that hold a
@@ -214,6 +267,14 @@ impl SourceProvider for HostFsProvider {
     }
     fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         host_fs::read(path)
+    }
+    fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+        host_fs::metadata(path).map(|meta| meta.len())
+    }
+    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+        host_fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.file_name().as_encoded_bytes().to_vec()))
+            .collect()
     }
 }
 
@@ -647,7 +708,10 @@ pub fn install_builtin_modules() {
     // module literally named `posix` does not exist. os.py picks `os.name` and
     // the `path` module (posixpath vs ntpath) from which of the two names is in
     // `sys.builtin_module_names`.
-    #[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+    // wasm32's arm answers from the import source seam, which only `host_env`
+    // builds; without one there is nothing for `posix` to report and the name
+    // stays out of `sys.builtin_module_names` too.
+    #[cfg(all(not(windows), any(not(target_arch = "wasm32"), feature = "host_env")))]
     pyre_install_module!(posix);
     #[cfg(windows)]
     pyre_install_module!("nt"(posix));
@@ -2003,6 +2067,10 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     // `-P` (safe_path) suppresses it entirely.
     *SYS_PATH_0_PENDING.lock().unwrap() = (!safe_path_flag()).then(|| path0.to_os_string());
 
+    // The search path is a filesystem's, so a build with no host filesystem
+    // seeds none: `SYS_PATH` is `host_env`'s and so is every entry that could
+    // go in it.
+    #[cfg(feature = "host_env")]
     {
         let mut path = SYS_PATH.lock().unwrap();
         path.clear();
@@ -2816,6 +2884,30 @@ fn sys_modules_blocks(name: &str) -> bool {
 /// Look up a loaded module by name through [`check_sys_modules`].
 pub fn get_sys_module(name: &str) -> Option<PyObjectRef> {
     check_sys_modules(name)
+}
+
+/// `space.getbuiltinmodule(name)` — the module object for a registered builtin,
+/// minted on the first ask.
+///
+/// `sys.modules` holds what has been imported; `space.builtin_modules` holds
+/// every builtin the space was built with, and `getbuiltinmodule` creates the
+/// module the first time one is named.  An interpreter-level reader of pyre's
+/// own builtin needs the second: `_io`'s newline decoder is an app-level class
+/// that lives on the `_io` module object and nowhere else, so a program that
+/// never imported `_io` would otherwise not be able to open a text file.
+pub fn get_builtin_module(name: &str) -> Option<PyObjectRef> {
+    if let Some(module) = check_sys_modules(name) {
+        return Some(module);
+    }
+    // Minting runs the module's `startup` hook, which is handed the execution
+    // context and may import through it — `array`'s registers the type with
+    // `_collections_abc.MutableSequence`.  The live context is what
+    // `getbuiltinmodule` would have run under anyway, so it is what this
+    // reader hands over rather than a null nothing on that path may
+    // dereference.
+    create_builtin_module(name, crate::call::getexecutioncontext())
+        .ok()
+        .flatten()
 }
 
 /// Return the interpreter-owned `sys` module, bypassing the Python-visible

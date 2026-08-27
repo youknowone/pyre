@@ -438,83 +438,6 @@ fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     Ok(pyre_object::w_none())
 }
 
-/// `posix.stat_result` — a real structseq (tuple subclass) so `st[0]`,
-/// `len(st)`, iteration and `isinstance(st, tuple)` all work, matching
-/// `posixmodule.c` `stat_result_desc`.  The 10 sequence slots hold the
-/// integer fields, with the integer-seconds times at 7..10 under the
-/// hidden `_integer_atime`/`_integer_mtime`/`_integer_ctime` names; the
-/// float `st_atime`/`st_mtime`/`st_ctime`, the `st_*_ns` integers, and the
-/// `st_blksize`/`st_blocks`/`st_rdev` block-device fields are named-only
-/// extras.
-fn stat_result_seq_type() -> PyObjectRef {
-    static STAT_RESULT_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *STAT_RESULT_SEQ_TYPE.get_or_init(|| {
-        crate::_structseq::make_struct_seq_with_extra(
-            // Dotted name → `__name__` "stat_result", repr "os.stat_result(...)".
-            "os.stat_result",
-            // `app_posix.py:20-37` — slots 7..10 are the hidden integer
-            // timestamps; the float `st_atime`/`st_mtime`/`st_ctime` are
-            // named-only extras, never indexable.
-            &[
-                "st_mode",
-                "st_ino",
-                "st_dev",
-                "st_nlink",
-                "st_uid",
-                "st_gid",
-                "st_size",
-                "_integer_atime",
-                "_integer_mtime",
-                "_integer_ctime",
-            ],
-            // `app_posix.py:38-69` — named-only extras ordered by their
-            // `structseqfield` index (11..13, 20..23, 40..42, 50..52).
-            // `structseq_descr_new` fills surplus sequence items into
-            // this list in order, so the list order must match PyPy's
-            // index sort, not the build-time population order.
-            &[
-                // float times, indices 11..13.
-                "st_atime",
-                "st_mtime",
-                "st_ctime",
-                // `app_posix.py:45-52` — present where the platform's
-                // `struct stat` carries them (every Unix target),
-                // indices 20..23.
-                #[cfg(unix)]
-                "st_blksize",
-                #[cfg(unix)]
-                "st_blocks",
-                #[cfg(unix)]
-                "st_rdev",
-                // `rposix_stat.py` exposes `st_flags` where the C
-                // `struct stat` carries it (BSD family / macOS).
-                #[cfg(target_os = "macos")]
-                "st_flags",
-                // `build_stat_result` (interp_posix.py) +
-                // `rposix_stat.py STAT_FIELDS += ALL_STAT_FIELDS[-3:]`
-                // — the sub-second nanosecond remainders, indices 40..42.
-                "nsec_atime",
-                "nsec_mtime",
-                "nsec_ctime",
-                // full nanosecond timestamps, indices 50..52.
-                "st_atime_ns",
-                "st_mtime_ns",
-                "st_ctime_ns",
-                // The Windows members of `stat_result_fields`, which sit
-                // after every time and platform extra there too.
-                #[cfg(windows)]
-                "st_birthtime",
-                #[cfg(windows)]
-                "st_birthtime_ns",
-                #[cfg(windows)]
-                "st_file_attributes",
-                #[cfg(windows)]
-                "st_reparse_tag",
-            ],
-        ) as usize
-    }) as PyObjectRef
-}
-
 /// `os.terminal_size` structseq — `(columns, lines)`.
 fn terminal_size_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1039,8 +962,7 @@ fn normpath_and_size(buf: &mut [u16], seps: PathSeps) -> usize {
                     while p3 != min_p2 && buf[p3 - 1] != sep {
                         p3 -= 1;
                     }
-                    if p2 == min_p2
-                        || (buf[p3] == DOT && buf[p3 + 1] == DOT && is_sep(buf, p3 + 2))
+                    if p2 == min_p2 || (buf[p3] == DOT && buf[p3 + 1] == DOT && is_sep(buf, p3 + 2))
                     {
                         // Previous segment is also ../, so append instead.
                         // Relative path does not absorb ../ at min_p2 as well.
@@ -1103,10 +1025,7 @@ fn wide_with_nul(text: &rustpython_wtf8::Wtf8) -> Vec<u16> {
 /// `nonstrict` is what lifts the embedded-null rejection: the two callers fold
 /// and split the name as text and hand it to nobody, so a null is a character
 /// like any other there.
-fn nonstrict_wide_path(
-    obj: PyObjectRef,
-    func: &str,
-) -> Result<(Vec<u16>, bool), crate::PyError> {
+fn nonstrict_wide_path(obj: PyObjectRef, func: &str) -> Result<(Vec<u16>, bool), crate::PyError> {
     // `path_converter` reads a `str` argument's own wide units
     // (`PyUnicode_AsWideCharString`) and reaches the filesystem codec only for
     // `bytes`. Taking a `str` through the codec anyway costs a
@@ -1193,7 +1112,8 @@ mod win_nt {
     fn arg_path(
         args: &[PyObjectRef],
         func: &str,
-    ) -> Result<(widestring::WideCString, bool, crate::gateway::FsEncodedPath), crate::PyError> {
+    ) -> Result<(widestring::WideCString, bool, crate::gateway::FsEncodedPath), crate::PyError>
+    {
         let Some(&arg) = args.first() else {
             return Err(crate::PyError::type_error(format!(
                 "{func}() missing required argument 'path'"
@@ -1289,10 +1209,7 @@ mod win_nt {
             Ok(path) => Ok(Some(path)),
             Err(mut error) => match crate::builtins::lookup_exc_class("ValueError") {
                 Some(value_error)
-                    if crate::eval::check_exc_match_against(
-                        error.to_exc_object(),
-                        value_error,
-                    ) =>
+                    if crate::eval::check_exc_match_against(error.to_exc_object(), value_error) =>
                 {
                     Ok(None)
                 }
@@ -1586,77 +1503,6 @@ fn create_environ() -> pyre_object::PyObjectRef {
     pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
-/// `posix_fspath` / `PyOS_FSPath` — `str` and `bytes` pass through unchanged
-/// (the protocol's identity case); any other object has `type(path).__fspath__`
-/// bound before it is called.
-pub(crate) fn fspath(
-    arg: pyre_object::PyObjectRef,
-) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    // `str` and `bytes` only — a `bytearray` is a readable buffer and not a
-    // path, so it goes on to be rejected below.
-    unsafe {
-        if pyre_object::is_str(arg) || pyre_object::bytesobject::is_bytes(arg) {
-            return Ok(arg);
-        }
-    }
-    let roots = pyre_object::gc_roots::push_roots();
-    let arg_slot = pyre_object::gc_roots::shadow_stack_len();
-    let arg = pyre_object::gc_roots::pin_root(arg);
-    let path_type = crate::typedef::r#type(arg);
-    if let Some(pt) = path_type
-        && let Some(fspath_descr) =
-            unsafe { crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__") }
-    {
-        let fspath_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(fspath_descr);
-        // PyPy's `interp_posix._fspath` binds `__fspath__` before calling it;
-        // a non-descriptor is its own value.
-        let fspath_fn = unsafe {
-            crate::baseobjspace::get(
-                pyre_object::gc_roots::shadow_stack_get(fspath_slot),
-                pyre_object::gc_roots::shadow_stack_get(arg_slot),
-                pt.as_ptr(),
-            )?
-        }
-        .unwrap_or_else(|| pyre_object::gc_roots::shadow_stack_get(fspath_slot));
-        let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
-        // A `None` left on the type switches the protocol off the way
-        // `__hash__ = None` does, so the object is turned away as not
-        // path-like and named by its own type.  `_fspath` instead calls what
-        // it found, which reports `NoneType` as not callable.
-        if unsafe { pyre_object::is_none(fspath_fn) } {
-            return Err(crate::PyError::type_error(format!(
-                "expected str, bytes or os.PathLike object, not {}",
-                crate::gateway::short_type_name(arg)
-            )));
-        }
-        pyre_object::gc_roots::shadow_stack_set(fspath_slot, fspath_fn);
-        let result = crate::call::call_function_impl_result(
-            pyre_object::gc_roots::shadow_stack_get(fspath_slot),
-            &[],
-        )?;
-        let result_slot = pyre_object::gc_roots::shadow_stack_len();
-        let result = pyre_object::gc_roots::pin_root(result);
-        // The protocol is only satisfied by what a path can be, so an answer
-        // that is neither names the object that gave it and the type it gave.
-        if unsafe { pyre_object::is_str(result) || pyre_object::bytesobject::is_bytes(result) } {
-            return Ok(result);
-        }
-        return Err(crate::PyError::type_error(format!(
-            "expected {}.__fspath__() to return str or bytes, not {}",
-            crate::gateway::short_type_name(pyre_object::gc_roots::shadow_stack_get(arg_slot)),
-            crate::gateway::short_type_name(result)
-        )));
-    }
-    let arg = pyre_object::gc_roots::shadow_stack_get(arg_slot);
-    let error = crate::PyError::type_error(format!(
-        "expected str, bytes or os.PathLike object, not {}",
-        crate::gateway::short_type_name(arg)
-    ));
-    drop(roots);
-    Err(error)
-}
-
 /// posix stub — PyPy: pypy/module/posix/ interp_posix.py
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
@@ -1704,8 +1550,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // Through the same decoder the name reaches the API by, so a
             // lone surrogate is counted as the one unit it is written as
             // rather than as whatever a lossy decode substitutes for it.
-            let units =
-                |bytes: &[u8]| crate::typedef::fsdecode_wtf8_total(bytes).encode_wide().count();
+            let units = |bytes: &[u8]| {
+                crate::typedef::fsdecode_wtf8_total(bytes)
+                    .encode_wide()
+                    .count()
+            };
             if units(name) + 1 + units(value) > MAX_ENV {
                 return Err(crate::PyError::value_error(format!(
                     "the environment variable is longer than {MAX_ENV} characters"
@@ -2806,21 +2655,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .map_err(|_| crate::PyError::value_error("embedded null in path"))
     }
 
-    /// A filesystem name reported back to the caller: `bytes` when the path
-    /// argument was `bytes` (`posixmodule.c path_converter`), else `str`.
-    ///
-    /// The name arrives as raw bytes because `readdir`'s `d_name` is handed
-    /// back unchanged. Both arms keep it openable: bytes mode returns it
-    /// verbatim, and the `str` arm takes the filesystem decoding
-    /// (`interp_posix.py space.newfilename(f)`), so a name like
-    /// `b"bad_\xff"` still names the file on disk instead of carrying U+FFFD.
-    fn fs_name_obj(bytes_mode: bool, name: &[u8]) -> PyObjectRef {
-        if bytes_mode {
-            pyre_object::bytesobject::w_bytes_from_bytes(&crate::gateway::fs_result_bytes(name))
-        } else {
-            crate::gateway::fsdecode_filename_bytes(name)
-        }
-    }
+    // Both arms name their directory entries the same way, so the one
+    // implementation lives beside the `stat_result` they also share.
+    use super::fs_name_obj;
 
     /// interp_posix.py `unwrap_fd`.
     ///
@@ -4271,8 +4108,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             path_helper_fn(
                 "_getvolumepathname",
                 |args| {
-                    let (bound, _) =
-                        bind_path_args(args, "_getvolumepathname", &["path"], 1, &[])?;
+                    let (bound, _) = bind_path_args(args, "_getvolumepathname", &["path"], 1, &[])?;
                     win_nt::_getvolumepathname(&[bound[0].expect("path is required")])
                 },
                 "($module, /, path)",
@@ -4627,7 +4463,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "fspath",
         crate::make_builtin_function_with_arity(
             "fspath",
-            |args| fspath(args.first().copied().unwrap_or(pyre_object::w_none())),
+            |args| super::fspath(args.first().copied().unwrap_or(pyre_object::w_none())),
             1,
         ),
     );
@@ -4997,7 +4833,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             extras.push(("st_birthtime", pyre_object::w_float_new(birthtime_f)));
             extras.push(("st_birthtime_ns", w_time_ns(f.birthtime_ns)));
         }
-        crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
+        crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
     }
     /// Build a `stat_result` from the sandbox wire `StatBuf` (sandbox build
     /// only, hence unix-only): the controller delivers the 10 protocol fields
@@ -5053,7 +4889,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ];
         #[cfg(target_os = "macos")]
         extras.push(("st_flags", pyre_object::w_int_new(st.st_flags as i64)));
-        crate::_structseq::new_instance_with_extra(stat_result_seq_type(), seq, extras)
+        crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
     }
     /// `os.stat(path, *, dir_fd=None, follow_symlinks=True)` /
     /// `os.lstat(path, *, dir_fd=None)` — `follow_symlinks` is keyword-only,
@@ -5217,12 +5053,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     /// `entry.inode()` and `os.stat(entry.path).st_ino` disagreeing.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
     fn win_stat_fields(path: &[u8], follow_symlinks: bool) -> std::io::Result<StatFields> {
-        let wide = widestring::WideCString::from_os_str(&*os_str_from_bytes(path)).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "embedded null character in path",
-            )
-        })?;
+        let wide =
+            widestring::WideCString::from_os_str(&*os_str_from_bytes(path)).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "embedded null character in path",
+                )
+            })?;
         rustpython_host_env::nt::win32_xstat(&wide, follow_symlinks)
             .map(|st| stat_fields_from_statstruct(&st))
     }
@@ -5381,8 +5218,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     WinFindData {
                         file_attributes: data.dwFileAttributes,
                         reserved0: data.dwReserved0,
-                        file_size: ((data.nFileSizeHigh as u64) << 32)
-                            | (data.nFileSizeLow as u64),
+                        file_size: ((data.nFileSizeHigh as u64) << 32) | (data.nFileSizeLow as u64),
                         creation_ticks: filetime_ticks(data.ftCreationTime),
                         last_access_ticks: filetime_ticks(data.ftLastAccessTime),
                         last_write_ticks: filetime_ticks(data.ftLastWriteTime),
@@ -6269,10 +6105,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }
 
         let message = match unsafe { crate::display::py_repr_wtf8(self_obj) } {
-            Ok(repr) => format!(
-                "unclosed scandir iterator {}",
-                repr.to_string_lossy()
-            ),
+            Ok(repr) => format!("unclosed scandir iterator {}", repr.to_string_lossy()),
             Err(_) => "unclosed scandir iterator".to_string(),
         };
         if let Err(mut error) =
@@ -6332,9 +6165,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             // from an immutable module type spec.
             crate::typedef::mark_cpython_heap_type(tp, true);
             pyre_object::pyobject::set_instantiate(
-                unsafe {
-                    &*<W_ScandirIterator as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE
-                },
+                unsafe { &*<W_ScandirIterator as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
                 tp,
             );
             unsafe { pyre_object::w_type_set_hasuserdel(tp, true) };
@@ -6533,8 +6364,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         let it_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let it = pyre_object::gc_roots::shadow_stack_get(it_slot);
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
-        let iterator = W_ScandirIterator::from_obj(it)
-            .expect("freshly allocated posix.ScandirIterator");
+        let iterator =
+            W_ScandirIterator::from_obj(it).expect("freshly allocated posix.ScandirIterator");
         iterator.entries = list;
         iterator.open = true;
         unsafe { pyre_object::gc_hook::try_gc_write_barrier(it as *mut u8) };
@@ -6731,7 +6562,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // stat_result type — structseq (tuple subclass). Exported so that
     // `posix.stat_result` and `isinstance(os.stat(p), os.stat_result)` work.
-    crate::module_ns_store(ns, "stat_result", stat_result_seq_type());
+    crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::module_ns_store(
         ns,
@@ -7288,7 +7119,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "setgroups",
                 |args| {
                     let Some(&w_list) = args.first() else {
-                        return Err(crate::PyError::type_error("setgroups() requires 1 argument"));
+                        return Err(crate::PyError::type_error(
+                            "setgroups() requires 1 argument",
+                        ));
                     };
                     // interp_posix.py:1053-1064 — the list is unpacked as any
                     // iterable and each element read with `c_uid_t_w`, which is
@@ -9985,8 +9818,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             for index in 0..items.len() {
                                 let item =
                                     pyre_object::gc_roots::shadow_stack_get(items_base + index);
-                                let Some(buffer) =
-                                    crate::baseobjspace::simple_buffer_bytes(item)?
+                                let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(item)?
                                 else {
                                     return Err(crate::PyError::type_error(format!(
                                         "sendfile() {name} items must be bytes-like"
@@ -10009,18 +9841,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // An empty sequence is indistinguishable from an absent
                     // one at the syscall boundary, independently for headers
                     // and trailers.
-                    let header_slices = header_buffers.as_ref().map(|buffers| {
-                        buffers
-                            .iter()
-                            .map(Vec::as_slice)
-                            .collect::<Vec<&[u8]>>()
-                    });
-                    let trailer_slices = trailer_buffers.as_ref().map(|buffers| {
-                        buffers
-                            .iter()
-                            .map(Vec::as_slice)
-                            .collect::<Vec<&[u8]>>()
-                    });
+                    let header_slices = header_buffers
+                        .as_ref()
+                        .map(|buffers| buffers.iter().map(Vec::as_slice).collect::<Vec<&[u8]>>());
+                    let trailer_slices = trailer_buffers
+                        .as_ref()
+                        .map(|buffers| buffers.iter().map(Vec::as_slice).collect::<Vec<&[u8]>>());
                     // `sendfile(2)` on this host spends the length cell on the
                     // header and the file together — "the value of len argument
                     // indicates the maximum number of bytes in the header
@@ -11863,9 +11689,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             Ok(argv)
         }
 
-        fn spawn_wide_refs(
-            values: &[widestring::WideCString],
-        ) -> Vec<&widestring::WideCStr> {
+        fn spawn_wide_refs(values: &[widestring::WideCString]) -> Vec<&widestring::WideCStr> {
             values.iter().map(|value| value.as_ucstr()).collect()
         }
 
@@ -11918,9 +11742,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                         .into_iter()
                         .map(|entry| {
                             widestring::WideCString::from_os_str(&*os_str_from_bytes(&entry))
-                                .map_err(|_| {
-                                    crate::PyError::value_error("embedded null character")
-                                })
+                                .map_err(|_| crate::PyError::value_error("embedded null character"))
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     ensure_drive_current_directory();
@@ -12063,9 +11885,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_builtin_function_with_arity(
                 "lchmod",
                 |args| {
-                    let path = crate::gateway::fsencode_path_or_fd_w(
-                        args[0], "lchmod", false,
-                    )?;
+                    let path = crate::gateway::fsencode_path_or_fd_w(args[0], "lchmod", false)?;
                     let mode = crate::baseobjspace::c_int_w(args[1])? as u32;
                     let wide = wide_path(&path.as_bytes)?;
                     // `os_lchmod_impl` runs the same call outside the
@@ -13094,13 +12914,38 @@ mod normpath_tests {
             ("\\\\server\\share", "\\\\server\\share", "", ""),
             ("\\\\server\\share\\", "\\\\server\\share", "\\", ""),
             ("\\\\server\\share\\dir", "\\\\server\\share", "\\", "dir"),
-            ("\\\\server\\share\\..\\dir", "\\\\server\\share", "\\", "..\\dir"),
-            ("\\\\server\\share\\dir\\..\\..", "\\\\server\\share", "\\", "dir\\..\\.."),
-            ("//server/share/dir/../..", "//server/share", "/", "dir/../.."),
+            (
+                "\\\\server\\share\\..\\dir",
+                "\\\\server\\share",
+                "\\",
+                "..\\dir",
+            ),
+            (
+                "\\\\server\\share\\dir\\..\\..",
+                "\\\\server\\share",
+                "\\",
+                "dir\\..\\..",
+            ),
+            (
+                "//server/share/dir/../..",
+                "//server/share",
+                "/",
+                "dir/../..",
+            ),
             ("//server/share/../..", "//server/share", "/", "../.."),
             ("\\\\?\\C:\\foo\\..\\bar", "\\\\?\\C:", "\\", "foo\\..\\bar"),
-            ("\\\\?\\UNC\\server\\share\\dir\\..", "\\\\?\\UNC\\server\\share", "\\", "dir\\.."),
-            ("//?/unc/server/share/dir/..", "//?/unc/server/share", "/", "dir/.."),
+            (
+                "\\\\?\\UNC\\server\\share\\dir\\..",
+                "\\\\?\\UNC\\server\\share",
+                "\\",
+                "dir\\..",
+            ),
+            (
+                "//?/unc/server/share/dir/..",
+                "//?/unc/server/share",
+                "/",
+                "dir/..",
+            ),
             ("\\\\.\\device\\x\\..", "\\\\.\\device", "\\", "x\\.."),
             ("\\\\.\\device", "\\\\.\\device", "", ""),
             ("\\\\", "\\\\", "", ""),
@@ -13208,13 +13053,38 @@ mod normpath_tests {
             ("\\\\server\\share", "", "", "\\\\server\\share"),
             ("\\\\server\\share\\", "", "", "\\\\server\\share\\"),
             ("\\\\server\\share\\dir", "", "", "\\\\server\\share\\dir"),
-            ("\\\\server\\share\\..\\dir", "", "", "\\\\server\\share\\..\\dir"),
-            ("\\\\server\\share\\dir\\..\\..", "", "", "\\\\server\\share\\dir\\..\\.."),
-            ("//server/share/dir/../..", "", "//", "server/share/dir/../.."),
+            (
+                "\\\\server\\share\\..\\dir",
+                "",
+                "",
+                "\\\\server\\share\\..\\dir",
+            ),
+            (
+                "\\\\server\\share\\dir\\..\\..",
+                "",
+                "",
+                "\\\\server\\share\\dir\\..\\..",
+            ),
+            (
+                "//server/share/dir/../..",
+                "",
+                "//",
+                "server/share/dir/../..",
+            ),
             ("//server/share/../..", "", "//", "server/share/../.."),
             ("\\\\?\\C:\\foo\\..\\bar", "", "", "\\\\?\\C:\\foo\\..\\bar"),
-            ("\\\\?\\UNC\\server\\share\\dir\\..", "", "", "\\\\?\\UNC\\server\\share\\dir\\.."),
-            ("//?/unc/server/share/dir/..", "", "//", "?/unc/server/share/dir/.."),
+            (
+                "\\\\?\\UNC\\server\\share\\dir\\..",
+                "",
+                "",
+                "\\\\?\\UNC\\server\\share\\dir\\..",
+            ),
+            (
+                "//?/unc/server/share/dir/..",
+                "",
+                "//",
+                "?/unc/server/share/dir/..",
+            ),
             ("\\\\.\\device\\x\\..", "", "", "\\\\.\\device\\x\\.."),
             ("\\\\.\\device", "", "", "\\\\.\\device"),
             ("\\\\", "", "", "\\\\"),
@@ -13328,7 +13198,10 @@ mod normpath_tests {
             ("//server/share/dir/../..", "\\\\server\\share\\"),
             ("//server/share/../..", "\\\\server\\share\\"),
             ("\\\\?\\C:\\foo\\..\\bar", "\\\\?\\C:\\bar"),
-            ("\\\\?\\UNC\\server\\share\\dir\\..", "\\\\?\\UNC\\server\\share\\"),
+            (
+                "\\\\?\\UNC\\server\\share\\dir\\..",
+                "\\\\?\\UNC\\server\\share\\",
+            ),
             ("//?/unc/server/share/dir/..", "\\\\?\\unc\\server\\share\\"),
             ("\\\\.\\device\\x\\..", "\\\\.\\device\\"),
             ("\\\\.\\device", "\\\\.\\device"),
@@ -13438,11 +13311,17 @@ mod normpath_tests {
             ("\\\\server\\share\\", "\\\\server\\share\\"),
             ("\\\\server\\share\\dir", "\\\\server\\share\\dir"),
             ("\\\\server\\share\\..\\dir", "\\\\server\\share\\..\\dir"),
-            ("\\\\server\\share\\dir\\..\\..", "\\\\server\\share\\dir\\..\\.."),
+            (
+                "\\\\server\\share\\dir\\..\\..",
+                "\\\\server\\share\\dir\\..\\..",
+            ),
             ("//server/share/dir/../..", "//server"),
             ("//server/share/../..", "//"),
             ("\\\\?\\C:\\foo\\..\\bar", "\\\\?\\C:\\foo\\..\\bar"),
-            ("\\\\?\\UNC\\server\\share\\dir\\..", "\\\\?\\UNC\\server\\share\\dir\\.."),
+            (
+                "\\\\?\\UNC\\server\\share\\dir\\..",
+                "\\\\?\\UNC\\server\\share\\dir\\..",
+            ),
             ("//?/unc/server/share/dir/..", "//?/unc/server/share"),
             ("\\\\.\\device\\x\\..", "\\\\.\\device\\x\\.."),
             ("\\\\.\\device", "\\\\.\\device"),

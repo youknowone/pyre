@@ -93,11 +93,25 @@ fn warn_category_w_source(
     // `_warnings` module, so a warning raised before that point has nowhere to
     // be matched.  Report it unfiltered rather than turn a warning into an
     // error out of the operator that issued it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let msg_slot = crate::module::_warnings::pin_root_slot(w_msg);
+    let source_slot = crate::module::_warnings::pin_root_slot(source);
+    // A startup that never imports `_warnings` would leave the State absent
+    // for the whole run, so the fallback below would answer every warning the
+    // process ever raises.  Install it at the first warning that could use it
+    // instead, once the category the caller named exists — before that the
+    // exception hierarchy is not up and the fallback is the right answer
+    // anyway.  `install_state` may allocate, so re-read both operands after it.
+    if !crate::module::_warnings::state_is_readable()
+        && crate::builtins::lookup_exc_class(category_name).is_some()
+    {
+        crate::module::_warnings::install_state();
+    }
+    let w_msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
+    let source = pyre_object::gc_roots::shadow_stack_get(source_slot);
     let Some(category) = crate::builtins::lookup_exc_class(category_name)
         .filter(|_| crate::module::_warnings::state_is_readable())
     else {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let w_msg = pyre_object::gc_roots::pin_root(w_msg);
         let text = crate::baseobjspace::text_w(w_msg)
             .map(|text| text.to_string())
             .unwrap_or_default();

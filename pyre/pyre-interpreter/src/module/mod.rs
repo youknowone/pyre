@@ -121,7 +121,6 @@ pub mod mmap;
 #[cfg(all(windows, feature = "host_env"))]
 pub mod msvcrt;
 pub mod operator;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod posix;
 #[cfg(all(unix, not(feature = "sandbox")))]
 pub mod pwd;

@@ -7248,7 +7248,7 @@ fn errno_is_eshutdown(_e: i32) -> bool {
 /// Kept in sync with the `errno` module's host_env-off fallback so the errno →
 /// OSError-subclass remap selects the subclass a given `errno.X` value implies.
 #[cfg(target_arch = "wasm32")]
-mod wasm_errno {
+pub(crate) mod wasm_errno {
     pub const EAGAIN: i32 = 35;
     pub const EWOULDBLOCK: i32 = 35;
     pub const EINPROGRESS: i32 = 36;
@@ -7260,6 +7260,7 @@ mod wasm_errno {
     pub const ECONNRESET: i32 = 54;
     pub const EEXIST: i32 = 17;
     pub const ENOENT: i32 = 2;
+    pub const ENOTSUP: i32 = 45;
     pub const EISDIR: i32 = 21;
     pub const ENOTDIR: i32 = 20;
     pub const EINTR: i32 = 4;
@@ -7267,6 +7268,38 @@ mod wasm_errno {
     pub const EPERM: i32 = 1;
     pub const ESRCH: i32 = 3;
     pub const ETIMEDOUT: i32 = 60;
+
+    /// The message `strerror` reports for one of the values above.
+    ///
+    /// wasm32 has no `strerror` and no OS error table behind
+    /// `io::Error::from_raw_os_error`, which answers every code with the same
+    /// placeholder — so an `OSError` the guest raises would read
+    /// `[Errno 2] operation successful`.  The texts are the ones the numbers
+    /// were taken from, so an errno and its message keep naming the same
+    /// condition.
+    pub fn strerror(errno: i32) -> Option<&'static str> {
+        Some(match errno {
+            EPERM => "Operation not permitted",
+            ENOENT => "No such file or directory",
+            ESRCH => "No such process",
+            EINTR => "Interrupted system call",
+            ECHILD => "No child processes",
+            EACCES => "Permission denied",
+            EEXIST => "File exists",
+            ENOTDIR => "Not a directory",
+            EISDIR => "Is a directory",
+            EPIPE => "Broken pipe",
+            EAGAIN => "Resource temporarily unavailable",
+            EINPROGRESS => "Operation now in progress",
+            EALREADY => "Operation already in progress",
+            ENOTSUP => "Operation not supported",
+            ECONNABORTED => "Software caused connection abort",
+            ECONNRESET => "Connection reset by peer",
+            ETIMEDOUT => "Operation timed out",
+            ECONNREFUSED => "Connection refused",
+            _ => return None,
+        })
+    }
 }
 
 /// On Windows `ETIMEDOUT` above is the Winsock code, and the runtime's own
@@ -19109,7 +19142,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))]
     {
         let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
-            #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+            #[cfg(not(feature = "host_env"))]
             {
                 // Sandbox-intentional: with the host_env feature off the
                 // interpreter must not reach `std::fs` directly.  Callers in
@@ -19120,6 +19153,24 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 return Err(crate::PyError::not_implemented(
                     "open() for reading requires host_env feature",
                 ));
+            }
+            #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+            {
+                // wasm32 has no filesystem of its own, so a read goes through
+                // the embedder's, over the same `SourceProvider` seam `import`
+                // resolves modules with: `open()` reaches exactly the files an
+                // import could, and no others.
+                let _ = binary;
+                match crate::importing::read_source_bytes(std::path::Path::new(&path)) {
+                    Ok(bytes) => bytes,
+                    Err(_e) if writing => Vec::new(),
+                    Err(e) => {
+                        return Err(crate::PyError::os_error_syscall(
+                            io_error_posix_errno(&e, 2),
+                            resolved_path.w_path(),
+                        ));
+                    }
+                }
             }
             #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
             let read_result = rustpython_host_env::fs::read(&path);

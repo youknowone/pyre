@@ -272,6 +272,12 @@ mod host_fs_provider {
         /// Read the file at `path` into `[buf, buf+cap)`; return bytes written
         /// (clamped to `cap`), or -1 on error.
         fn host_read(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32) -> i64;
+        /// Write the directory's entry names into `[buf, buf+cap)`,
+        /// NUL-separated, and return the whole list's byte length (without
+        /// writing if it exceeds `cap`), or -1 if `path` is not a readable
+        /// directory.
+        fn host_list_dir(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32)
+        -> i64;
     }
 
     struct HostFsProvider;
@@ -281,9 +287,59 @@ mod host_fs_provider {
             let p = path.to_string_lossy();
             unsafe { host_file_size(p.as_ptr(), p.len() as u32) >= 0 }
         }
+        fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+            let p = path.to_string_lossy();
+            let size = unsafe { host_file_size(p.as_ptr(), p.len() as u32) };
+            match size < 0 {
+                true => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{}", path.display()),
+                )),
+                false => Ok(size as u64),
+            }
+        }
         fn is_dir(&self, path: &Path) -> bool {
             let p = path.to_string_lossy();
             unsafe { host_is_dir(p.as_ptr(), p.len() as u32) != 0 }
+        }
+        fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+            let p = path.to_string_lossy();
+            let call = |buf: &mut [u8]| unsafe {
+                host_list_dir(
+                    p.as_ptr(),
+                    p.len() as u32,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                )
+            };
+            let not_found =
+                || std::io::Error::new(std::io::ErrorKind::NotFound, format!("{}", path.display()));
+            let mut buf = Vec::new();
+            // The host reports the whole list's length whether or not it fitted
+            // and writes nothing when it did not, so an answer longer than the
+            // buffer is a directory that grew between the two reads and has to
+            // be asked again rather than parsed out of bytes the host never
+            // touched.  Two rounds suffice unless it keeps growing, which is
+            // what the bound is for.
+            for _ in 0..8 {
+                let size = call(&mut buf);
+                if size < 0 {
+                    return Err(not_found());
+                }
+                let size = size as usize;
+                if size <= buf.len() {
+                    buf.truncate(size);
+                    if buf.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    return Ok(buf.split(|byte| *byte == 0).map(<[u8]>::to_vec).collect());
+                }
+                buf = vec![0u8; size];
+            }
+            Err(std::io::Error::other(format!(
+                "host_list_dir: {} kept growing",
+                path.display()
+            )))
         }
         fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             let p = path.to_string_lossy();
@@ -742,7 +798,15 @@ fn run_python_impl(source: &str) -> String {
     {
         use pyre_interpreter::launch_env::{self, LaunchFlags};
         launch_env::set_launch_env(LAUNCH_ENV.with(|e| e.borrow().clone()));
-        match launch_env::finalize(LaunchFlags::default()) {
+        // `-B`, because the seam this target sees a filesystem through reads
+        // and does not write.  The source loader would otherwise try to cache
+        // the bytecode of every module it compiles, and `_write_atomic` reaches
+        // for `posix.open`, which no read-only `posix` publishes.
+        let flags = LaunchFlags {
+            dont_write_bytecode: true,
+            ..LaunchFlags::default()
+        };
+        match launch_env::finalize(flags) {
             Ok(flags) => {
                 pyre_interpreter::importing::set_no_site(flags.no_site);
                 pyre_interpreter::importing::set_runtime_flags(&flags);
@@ -851,6 +915,19 @@ fn run_python_impl(source: &str) -> String {
     let canonical = frame.get_w_globals();
     let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
     pyre_interpreter::importing::set_sys_module("__main__", main_module);
+
+    // Create `sys` before user code runs, as `run_script_path` does. Nothing on
+    // this entry point imports it otherwise, and the interpreter reads it
+    // directly for its own work: `_warnings.show_warning` writes through
+    // `sys.stderr` and gives up silently when the module is absent, so every
+    // warning raised before the first `import sys` disappeared.
+    let _ = pyre_interpreter::importing::importhook(
+        "sys",
+        canonical,
+        pyre_object::PY_NULL,
+        0,
+        pyre_interpreter::call::getexecutioncontext(),
+    );
 
     // catch_unwind to capture panics from JIT as error messages
     let eval_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

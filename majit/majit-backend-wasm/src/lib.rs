@@ -3305,6 +3305,7 @@ impl majit_backend::Backend for WasmBackend {
             // tail-calls its target loop and is deliberately not re-emittable.
             external_jump_slot: entry_bridge_target.map_or(0, |t| t.func_handle),
             external_jump_key: entry_bridge_target.map_or(0, |t| t.key),
+            external_jump_wide_slot: entry_bridge_target.map_or(0, |t| t.wide_slot),
             frame,
             ca: ca_targets.as_ref().map_or_else(
                 || codegen::CaParams {
@@ -3773,6 +3774,7 @@ impl majit_backend::Backend for WasmBackend {
         }
         let mut external_jump_key: u32 = 0;
         let mut external_jump_slot: u32 = source_func_handle;
+        let mut external_jump_wide_slot: u32 = 0;
         let mut resumes_at_loop_header = false;
         if bridge_is_loop_closing {
             let target =
@@ -3780,6 +3782,7 @@ impl majit_backend::Backend for WasmBackend {
             if let Some(t) = target {
                 external_jump_key = t.key;
                 external_jump_slot = t.func_handle;
+                external_jump_wide_slot = t.wide_slot;
                 resumes_at_loop_header = t.is_last_label;
             }
             if target.is_none() {
@@ -4175,6 +4178,7 @@ impl majit_backend::Backend for WasmBackend {
             inline_trip,
             external_jump_slot,
             external_jump_key,
+            external_jump_wide_slot,
             frame: source_frame,
             ca: ca_params,
         };

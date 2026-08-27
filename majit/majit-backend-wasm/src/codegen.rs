@@ -2458,6 +2458,12 @@ pub struct ModuleBuildInputs {
     pub inline_trip: Option<InlineTripProbe>,
     pub external_jump_slot: u32,
     pub external_jump_key: u32,
+    /// The target loop's `trace_wide` table slot, when it published one. The
+    /// slot the host appends beside `external_jump_slot` holds a fixed-arity
+    /// parameter entry, so a loop-closing JUMP can hand its args over as wasm
+    /// parameters instead of writing them to frame slots the target's narrow
+    /// shim would immediately read back. `0` = the target has no wide entry.
+    pub external_jump_wide_slot: u32,
     pub frame: FrameGeometry,
     pub ca: CaParams,
 }
@@ -2580,6 +2586,7 @@ impl Clone for ModuleBuildInputs {
             inline_trip: self.inline_trip,
             external_jump_slot: self.external_jump_slot,
             external_jump_key: self.external_jump_key,
+            external_jump_wide_slot: self.external_jump_wide_slot,
             frame: self.frame,
             ca: self.ca.clone(),
         }
@@ -2732,6 +2739,7 @@ pub fn build_wasm_module(
         inline_trip,
         external_jump_slot,
         external_jump_key,
+        external_jump_wide_slot,
         frame,
         ca,
     } = inputs;
@@ -3101,7 +3109,10 @@ pub fn build_wasm_module(
         );
         idx
     });
-    let label_param_entry_type_idx = label_param_entry.then(|| {
+    // Declared by the module that *defines* a parameter entry and by one that
+    // only *calls* another module's: a loop-closing JUMP naming a published
+    // wide slot needs the callee's type to `return_call_indirect` it.
+    let label_param_type_idx = (label_param_entry || *external_jump_wide_slot != 0).then(|| {
         let idx = next_type_idx;
         next_type_idx += 1;
         types.ty().function(
@@ -3243,9 +3254,11 @@ pub fn build_wasm_module(
 
     // Function section
     let mut functions = FunctionSection::new();
-    if let Some(idx) = label_param_entry_type_idx {
+    if label_param_entry {
+        // The narrow shim keeps type 0 so the host and every type-0 indirect
+        // call still enter here; the wide entry follows it.
         functions.function(0);
-        functions.function(idx);
+        functions.function(label_param_type_idx.expect("a parameter entry declares its own type"));
     } else {
         functions.function(bridge_entry_type_idx.unwrap_or(0));
     }
@@ -3310,6 +3323,9 @@ pub fn build_wasm_module(
         *fail_index_base,
         *external_jump_slot,
         *external_jump_key,
+        label_param_type_idx
+            .filter(|_| *external_jump_wide_slot != 0)
+            .map(|type_idx| (*external_jump_wide_slot, type_idx)),
         *frame,
         residual_max_arity.map(|_| residual_type_base),
         &typed_residual_type_indices,
@@ -3380,6 +3396,11 @@ fn build_function(
     // target's entry `br_table` lands on that label's resume loader. `0` when
     // the target is not peeled (no dispatch reads the slot).
     external_jump_key: u32,
+    // `(wide table slot, wasm type index)` of the target's fixed-arity
+    // parameter entry, when it published one. The terminal external JUMP then
+    // passes its args as parameters instead of through the frame slots the
+    // target's narrow shim reads back.
+    external_jump_wide: Option<(u32, u32)>,
     frame: FrameGeometry,
     // Base wasm type index of the `(i64×n)->i64` residual-call types (type
     // `residual_type_base + n` for arity `n`), or `None` when the trace has no
@@ -4062,24 +4083,21 @@ fn build_function(
             OpCode::Jump if !has_loop => {
                 // A JUMP in a trace with no local LABEL closes back into a
                 // *separate* loop module (a loop-closing bridge). There is no
-                // enclosing `loop` to `br` to, so re-enter the loop the way
-                // `execute_token` does: write the jump args — the loop's next
-                // inputargs, in inputarg order — into the loop's frame input
-                // slots, then `return_call_indirect` the loop's table slot. The
-                // tail call reuses this frame instead of nesting, so the
-                // loop⇄bridge cycle holds at constant stack depth.
+                // enclosing `loop` to `br` to, so hand the jump args — the
+                // loop's next inputargs, in inputarg order — to the target and
+                // `return_call_indirect` its table slot. The tail call reuses
+                // this frame instead of nesting, so the loop⇄bridge cycle holds
+                // at constant stack depth.
                 //
-                // The jump args are this bridge's SSA locals (or constants); the
-                // input slots are a disjoint frame region from any Ref home slot
-                // a resolve might load, so storing each pair in turn cannot feed
-                // a clobbered read (unlike the local back-edge's parallel move
-                // into shared loop locals).
+                // A target that published a parameter entry takes them as wasm
+                // parameters; otherwise they go through the frame input slots
+                // the way `execute_token` fills them. The jump args are this
+                // bridge's SSA locals (or constants), and the input slots are a
+                // disjoint frame region from any Ref home slot a resolve might
+                // load, so storing each pair in turn cannot feed a clobbered
+                // read (unlike the local back-edge's parallel move into shared
+                // loop locals).
                 let jump_args = op.getarglist();
-                for (i, jump_arg) in jump_args.iter().enumerate() {
-                    sink.local_get(0); // frame_ptr
-                    emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
-                    sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
-                }
                 // Set the resume-at-LABEL dispatch key so a peeled target
                 // re-enters at the JUMP's target LABEL — skipping the code
                 // before it — instead of re-running the function from its
@@ -4088,12 +4106,54 @@ fn build_function(
                 // target's entry `br_table` lands on that label's resume
                 // loader. Harmless for a non-peeled target, which has no
                 // dispatch and ignores the slot (`external_jump_key` 0).
-                sink.local_get(0); // frame_ptr
-                sink.i64_const(external_jump_key as i64); // dispatch key
-                sink.i64_store(mem64(frame.dispatch_key_ofs));
-                sink.local_get(0); // frame_ptr argument to the loop
-                sink.i32_const(external_jump_slot as i32); // table slot
-                sink.return_call_indirect(0, 0); // table 0, type 0: (i32) -> i32
+                //
+                // The key travels through the frame either way: it selects the
+                // entry `br_table` arm, which runs before any parameter is
+                // read, so it is not one of the values the wide entry takes.
+                let store_dispatch_key = |sink: &mut PeepSink<'_, '_>| {
+                    sink.local_get(0); // frame_ptr
+                    sink.i64_const(external_jump_key as i64); // dispatch key
+                    sink.i64_store(mem64(frame.dispatch_key_ofs));
+                };
+                if let Some((wide_slot, wide_type_idx)) = external_jump_wide
+                    .filter(|_| jump_args.len() <= crate::FROZEN_LABEL_PARAM_ARITY)
+                {
+                    // The target's narrow entry is a shim that loads
+                    // `FROZEN_LABEL_PARAM_ARITY` frame slots and tail-calls the
+                    // wide one, so storing the args here only to have them read
+                    // straight back is a round trip through memory. Both its
+                    // entry input loader and every LABEL resume loader read the
+                    // parameters, so hand the values over directly.
+                    store_dispatch_key(&mut sink);
+                    sink.local_get(0); // frame_ptr argument to the loop
+                    for k in 0..crate::FROZEN_LABEL_PARAM_ARITY {
+                        match jump_args.get(k) {
+                            Some(jump_arg) => {
+                                emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref())
+                            }
+                            // `compile_bridge` accepts this JUMP only when its
+                            // arity equals the target label's argument count,
+                            // and the loader reads exactly that many, so the
+                            // parameters past it are never read. They exist to
+                            // make one function type serve every arity.
+                            None => {
+                                sink.i64_const(0);
+                            }
+                        }
+                    }
+                    sink.i32_const(wide_slot as i32); // wide table slot
+                    sink.return_call_indirect(0, wide_type_idx);
+                } else {
+                    for (i, jump_arg) in jump_args.iter().enumerate() {
+                        sink.local_get(0); // frame_ptr
+                        emit_resolve(&mut sink, constants, value_types, jump_arg.to_opref());
+                        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+                    }
+                    store_dispatch_key(&mut sink);
+                    sink.local_get(0); // frame_ptr argument to the loop
+                    sink.i32_const(external_jump_slot as i32); // table slot
+                    sink.return_call_indirect(0, 0); // table 0, type 0: (i32) -> i32
+                }
             }
 
             OpCode::Jump => {

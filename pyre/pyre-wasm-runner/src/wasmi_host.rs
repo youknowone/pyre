@@ -337,6 +337,20 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
              -> i64 { host_read(&mut caller, path_ptr, path_len, buf_ptr, buf_cap) },
         )
         .map_err(estr)?;
+    linker
+        .func_wrap(
+            "pyre_host",
+            "host_list_dir",
+            |mut caller: Caller<'_, Host>,
+             path_ptr: u32,
+             path_len: u32,
+             buf_ptr: u32,
+             buf_cap: u32|
+             -> i64 {
+                host_list_dir(&mut caller, path_ptr, path_len, buf_ptr, buf_cap)
+            },
+        )
+        .map_err(estr)?;
 
     Ok(linker)
 }
@@ -365,6 +379,55 @@ fn host_stdlib_root(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -
         return -1;
     }
     bytes.len() as i64
+}
+
+/// `pyre_host.host_list_dir`: write the host directory's entry names into the
+/// wasm buffer, NUL-separated, and answer the whole list's byte length.
+///
+/// The length is reported whether or not it fitted, so an undersized buffer is
+/// a retry rather than a truncation — the same protocol `host_stdlib_root`
+/// uses. Names travel as the filesystem's own bytes, NUL being the one byte no
+/// name can contain, so one with no UTF-8 spelling still reaches the guest and
+/// is decoded there the way every other target decodes a filename.
+fn host_list_dir(
+    caller: &mut Caller<'_, Host>,
+    path_ptr: u32,
+    path_len: u32,
+    buf_ptr: u32,
+    buf_cap: u32,
+) -> i64 {
+    let Some(path) = host_path(caller, path_ptr, path_len) else {
+        return -1;
+    };
+    let Ok(entries) = std::fs::read_dir(&path) else {
+        return -1;
+    };
+    let mut packed: Vec<u8> = Vec::new();
+    for entry in entries {
+        // An error raised part-way through the walk leaves a listing that is
+        // short without saying so, which the guest would report as the whole
+        // directory.
+        let Ok(entry) = entry else {
+            return -1;
+        };
+        if !packed.is_empty() {
+            packed.push(0);
+        }
+        packed.extend_from_slice(entry.file_name().as_encoded_bytes());
+    }
+    if packed.len() > buf_cap as usize {
+        return packed.len() as i64;
+    }
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    if memory
+        .write(&mut *caller, buf_ptr as usize, &packed)
+        .is_err()
+    {
+        return -1;
+    }
+    packed.len() as i64
 }
 
 /// `pyre_host.host_read`: read the host file into the wasm-provided buffer.
