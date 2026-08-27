@@ -429,9 +429,10 @@ header declaring it wrongly.
   `tp_setattro`, `tp_descr_get` and `tp_descr_set`;
 - heap types: `PyType_FromSpec`, `PyType_FromSpecWithBases`,
   `PyType_FromModuleAndSpec`, `PyType_GetSlot`, `PyType_GetName` and
-  `PyType_GetQualName`, with every `typeslots.h` identifier except
-  `Py_tp_vectorcall` and `Py_tp_token`, which name a type field pyre never
-  reads;
+  `PyType_GetQualName`, with every `typeslots.h` identifier, `Py_tp_token` and
+  `Py_tp_vectorcall` included -- the latter answering `Type(...)` ahead of
+  `__new__`/`__init__` the way `PyType_Type`'s own
+  `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` arrange for it;
 - the `tp_as_number`, `tp_as_sequence` and `tp_as_mapping` tables, each slot
   becoming the dunder `slotdefs.py` names for it, and the `PyNumber_*`,
   `PySequence_*` and `PyMapping_*` entry points (`cpyext/number.rs`,
@@ -622,11 +623,12 @@ Known divergences, each documented at its definition:
 
 ## What remains
 
-5. The *dispatch* half of vectorcall -- a type declaring
-   `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
-   `tp_call`, which such a type is required to have
-   (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
-   pyre does not take; and the remaining generated API. Of the 746 public
+5. The *instance* half of vectorcall -- a type declaring
+   `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` has its instances
+   called through `tp_call`, which such a type is required to have
+   (`type_ready_pre_checks`), so that slot is an optimisation pyre does not
+   take.  The type-level `tp_vectorcall`, which names no offset and has no
+   `tp_call` to fall back to, is dispatched; and the remaining generated API. Of the 746 public
    `PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
    `Include/*.h` -- public meaning the declared name does not begin with an
    underscore -- 460 are present, counting every form `Python.h` offers one

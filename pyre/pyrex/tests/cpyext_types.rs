@@ -398,6 +398,38 @@ assert len(s) == 21
 s.code = 4
 assert s.double() == 8
 
+# ── Py_tp_vectorcall: the class object's own call ──────────────────────
+# The slot answers `Type(...)` instead of `__new__`/`__init__`, and this
+# fixture stores a different value down each path so the caller can tell
+# which one ran.
+assert m.Vectored().value == 1
+
+made = m.Vectored.__new__(m.Vectored)
+made.__init__()
+assert made.value == 2
+
+# The slot takes no arguments, and refuses them by its own count.
+for call in (lambda: m.Vectored(1), lambda: m.Vectored(k=1)):
+    try:
+        call()
+    except IndexError as error:
+        assert 'takes no arguments' in str(error), error
+    else:
+        raise AssertionError('the vectorcall accepted arguments')
+
+# It is the type's own field: a class derived from it is built the ordinary
+# way, which is the pair.
+class Derived(m.Vectored):
+    pass
+
+assert Derived().value == 2
+assert m.vectored_slot(m.Vectored) is True
+assert m.vectored_slot(m.Spec) is False
+
+# A loop is what the tracer records, and it must answer as the first call did.
+for _ in range(2000):
+    assert m.Vectored().value == 1
+
 # ── the module and the token a spec type carries ───────────────────────
 module, by_def_is_module, module_name, qualified = m.type_owner(m.Spec)
 assert module is m

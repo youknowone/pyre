@@ -3407,6 +3407,9 @@ fn call_with_kwargs_in_ctx_impl(
         if let Some(result) = type_call_special_case(current_type(), pos_args, !kwargs.is_empty()) {
             return result;
         }
+        if let Some(result) = type_call_vectorcall(current_type(), pos_args, kwargs) {
+            return result;
+        }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
         // The `function`, `memoryview`, deque iterator, and `_lzma` stream
@@ -3898,6 +3901,54 @@ pub(crate) fn check_type_instantiable(w_type: PyObjectRef) -> Result<(), PyError
     Ok(())
 }
 
+/// `Py_tp_vectorcall` — the class object's own call, which answers `Type(...)`
+/// ahead of `__new__` and `__init__`.
+///
+/// `PyType_Type` declares `Py_TPFLAGS_HAVE_VECTORCALL` with
+/// `tp_vectorcall_offset == offsetof(PyTypeObject, tp_vectorcall)`, so a class
+/// is called through that field by the same rule any other instance is, and
+/// reaches `type_call` only when the field is null.  It is the type's own and
+/// is not inherited, so a class derived from one that carries it takes the
+/// ordinary route.
+///
+/// Only `PyType_Ready` arms the flag, so every type this runtime defines and
+/// every class written in Python answers `None` on the first test.
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+fn type_call_vectorcall(
+    w_type: PyObjectRef,
+    args: &[PyObjectRef],
+    kwargs: &[(Wtf8Buf, PyObjectRef)],
+) -> Option<PyResult> {
+    if !unsafe { pyre_object::typeobject::w_type_has_vectorcall(w_type) } {
+        return None;
+    }
+    let keywords: Vec<(String, PyObjectRef)> = kwargs
+        .iter()
+        .map(|(name, value)| (name.to_string_lossy().into_owned(), *value))
+        .collect();
+    Some(crate::cpyext::typeobject::type_vectorcall(
+        w_type, args, &keywords,
+    ))
+}
+
+/// A build without the C layer has nothing that arms the flag.
+#[cfg(not(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+)))]
+fn type_call_vectorcall(
+    _w_type: PyObjectRef,
+    _args: &[PyObjectRef],
+    _kwargs: &[(Wtf8Buf, PyObjectRef)],
+) -> Option<PyResult> {
+    None
+}
+
 /// `type.__call__(cls, *args)` — the metaclass-level instantiation entry
 /// (`typeobject.c type_call`).  Runs `__new__`/`__init__` directly, WITHOUT
 /// re-dispatching through the metaclass (a custom metaclass `__call__` that
@@ -3963,6 +4014,15 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
     };
 
     if let Some(result) = type_call_special_case(current_type(), args, false) {
+        return match result {
+            Ok(value) => value,
+            Err(error) => {
+                set_call_error(error);
+                PY_NULL
+            }
+        };
+    }
+    if let Some(result) = type_call_vectorcall(current_type(), args, &[]) {
         return match result {
             Ok(value) => value,
             Err(error) => {
@@ -5633,6 +5693,9 @@ fn type_descr_call_with_mode(
         }
     };
 
+    if let Some(result) = type_call_vectorcall(current_type(), args, &[]) {
+        return result;
+    }
     check_type_instantiable(current_type())?;
     // Step 1: Look up __new__ via type MRO → allocate instance.
     // PyPy: typeobject.py descr_call → `w_newtype, w_newdescr =

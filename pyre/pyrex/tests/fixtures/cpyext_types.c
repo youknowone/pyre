@@ -1817,6 +1817,84 @@ static PyType_Spec spec_spec = {
     spec_slots,
 };
 
+/* ── Vectored: a spec naming `Py_tp_vectorcall` ─────────────────────── */
+
+/* The type exposes a `tp_new`/`tp_init` pair *and* a call of its own, and
+   the two deliberately store different values so the caller can see which
+   one ran.  A real vectorcall must answer exactly as the pair does; this
+   one does not, which is the whole of what it is for. */
+
+typedef struct {
+    PyObject_HEAD
+    long value;
+} VectoredObject;
+
+static PyObject *vectored_vectorcall(PyObject *self, PyObject *const *args,
+                                     size_t nargsf, PyObject *kwnames)
+{
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    if (kwnames != NULL || nargs != 0) {
+        /* The count and the names both arrive, so both are reported. */
+        return PyErr_Format(PyExc_IndexError,
+                            "Vectored() takes no arguments (%zd given)",
+                            nargs + (kwnames == NULL ? 0 : PyTuple_GET_SIZE(kwnames)));
+    }
+    (void)args;
+    VectoredObject *made = PyObject_New(VectoredObject, (PyTypeObject *)self);
+    if (made == NULL) {
+        return NULL;
+    }
+    made->value = 1;
+    return (PyObject *)made;
+}
+
+static PyObject *vectored_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    if (PyTuple_GET_SIZE(args) || kwds) {
+        return PyErr_Format(PyExc_IndexError, "Vectored() takes no arguments");
+    }
+    return (PyObject *)PyObject_New(VectoredObject, type);
+}
+
+static int vectored_init(PyObject *self, PyObject *args, PyObject *kwds)
+{
+    if (PyTuple_GET_SIZE(args) || kwds) {
+        PyErr_Format(PyExc_IndexError, "Vectored() takes no arguments");
+        return -1;
+    }
+    ((VectoredObject *)self)->value = 2;
+    return 0;
+}
+
+static PyMemberDef vectored_members[] = {
+    {"value", Py_T_LONG, offsetof(VectoredObject, value), 0, "which path ran"},
+    {NULL, 0, 0, 0, NULL},
+};
+
+static PyType_Slot vectored_slots[] = {
+    {Py_tp_new, vectored_new},
+    {Py_tp_init, vectored_init},
+    {Py_tp_vectorcall, vectored_vectorcall},
+    {Py_tp_members, vectored_members},
+    {0, NULL},
+};
+
+static PyType_Spec vectored_spec = {
+    "cpyext_types.Vectored",
+    sizeof(VectoredObject),
+    0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    vectored_slots,
+};
+
+/* What `PyType_GetSlot` reads back off the type built from that spec. */
+static PyObject *m_vectored_slot(PyObject *self, PyObject *type)
+{
+    (void)self;
+    void *slot = PyType_GetSlot((PyTypeObject *)type, Py_tp_vectorcall);
+    return PyBool_FromLong(slot == (void *)vectored_vectorcall);
+}
+
 /* ── Extra: a spec declaring storage relative to its base's ─────────── */
 
 typedef struct {
@@ -2183,6 +2261,7 @@ static PyMethodDef methods[] = {
     {"type_token", m_type_token, METH_O, "PyType_GetBaseByToken three ways"},
     {"type_token_null", m_type_token_null, METH_O, "a NULL token is an error"},
     {"type_data_size", m_type_data_size, METH_O, "PyType_GetTypeDataSize"},
+    {"vectored_slot", m_vectored_slot, METH_O, "PyType_GetSlot for Py_tp_vectorcall"},
     {"freeze", m_freeze, METH_O, "PyType_Freeze a class"},
     {"capsule_read", m_capsule_read, METH_O, "read the capsule payload"},
     {"capsule_facts", m_capsule_facts, METH_O, "name, validity and context"},
@@ -2275,6 +2354,15 @@ static int types_exec(PyObject *module)
     }
     added = PyModule_AddObjectRef(module, "Spec", spec_type);
     Py_DECREF(spec_type);
+    if (added < 0) {
+        return -1;
+    }
+    PyObject *vectored_type = PyType_FromModuleAndSpec(module, &vectored_spec, NULL);
+    if (vectored_type == NULL) {
+        return -1;
+    }
+    added = PyModule_AddObjectRef(module, "Vectored", vectored_type);
+    Py_DECREF(vectored_type);
     if (added < 0) {
         return -1;
     }
