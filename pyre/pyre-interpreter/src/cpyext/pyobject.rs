@@ -193,7 +193,9 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         return mirror as *mut CPyObject;
     }
     let ob_type = type_mirror(w_obj);
-    let size = mirror_size(ob_type);
+    // `allocate`'s `size += itemcount * itemsize`: a tuple's items are part of
+    // its block, which is what lets `PyTuple_GET_ITEM` read one as a field.
+    let size = mirror_size(ob_type) + super::tupleobject::item_bytes(w_obj, ob_type);
     let raw = attach(w_obj, REFCNT_FROM_PYPY, ob_type, size);
     // Each fill allocates, so the object is read back through the mirror
     // before the next one rather than kept in a local: the block's address
@@ -526,6 +528,7 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     super::modsupport::forget_module_fields(address);
     super::unicodeobject::forget_block(address);
     super::bytesobject::forget_pending(address);
+    super::tupleobject::forget_block(raw);
     super::frameobject::forget_block(raw);
     super::sliceobject::forget_block(raw);
     super::pyerrors::forget_block(raw);
