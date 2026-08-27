@@ -2160,7 +2160,16 @@ impl Converter<'_> {
         }
         if let Some((start, end)) = range {
             let (lineno, col_offset) = self.location(start as usize);
-            let (end_lineno, end_col_offset) = self.location(end as usize);
+            let (mut end_lineno, mut end_col_offset) = self.location(end as usize);
+            // [3.14-spec] CPython `remove_docstring` replaces a sole optimized
+            // docstring with a four-column synthetic Pass on its start line.
+            // RustPython `remove_docstring_from_body` has to encode that in a
+            // byte TextRange, which crosses a newline for a short multiline
+            // literal; PyPy has no optimized-AST parse path to preserve here.
+            if name == "Pass" && end == start.saturating_add(4) && end_lineno != lineno {
+                end_lineno = lineno;
+                end_col_offset = col_offset.saturating_add(4);
+            }
             for (field, value) in [
                 ("lineno", lineno),
                 ("col_offset", col_offset),
