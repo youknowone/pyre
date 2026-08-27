@@ -62,17 +62,24 @@ for _ in range(30):
 for _ in range(30):
     assert data.decode("iso-8859-15", "pyre.charmap.decode.churn") is not None
 
-# A handler position too large for the machine integer keeps the -1 the
-# conversion failure produced: `call_errorhandler` folds a negative position
-# against the length only on the branch where the conversion succeeded, so the
-# bounds test below it rejects this one.  Folding it would reach 0 for a
-# one-byte input and hand the same span back to the handler without end.
+# A handler position too large for the machine integer is refused rather than
+# folded.  `call_errorhandler` folds a negative position against the length
+# only on the branch where the conversion succeeded, so the -1 the failure
+# produces reaches the bounds test unfolded and is rejected there; folding it
+# would reach 0 for a one-byte input and hand the same span back to the handler
+# without end, which is the loop this gate exists for.  The two runners refuse
+# in different words -- the conversion's own `OverflowError` is what a
+# `PyArg_ParseTuple` reading the tuple lets out, and the sentinel's
+# `IndexError` is what carrying it to the bounds test produces -- and the
+# assertion each side has to meet is that it refuses at all.
 def overflowing(exc):
     return ("?", 10**100)
 
 codecs.register_error("pyre.charmap.decode.overflow", overflowing)
 try:
     codecs.charmap_decode(b"\xdd", "pyre.charmap.decode.overflow", TABLE)
+except OverflowError:
+    pass
 except IndexError as error:
     assert "position -1" in str(error), str(error)
 else:
