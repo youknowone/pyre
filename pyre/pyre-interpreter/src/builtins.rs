@@ -11808,7 +11808,7 @@ pub fn is_builtin_super_type(obj: PyObjectRef) -> bool {
 /// property answers it with arbitrary Python.  A caller that must not run
 /// Python asks for this half alone; `super_check` itself keeps the full
 /// sequence by starting here.
-pub(crate) fn super_check_python_free(
+pub fn super_check_python_free(
     start_type: PyObjectRef,
     obj_or_type: PyObjectRef,
 ) -> Option<PyObjectRef> {

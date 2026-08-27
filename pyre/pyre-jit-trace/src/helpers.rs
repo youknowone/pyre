@@ -718,6 +718,43 @@ pub fn emit_bound_method_inline(
     new_op
 }
 
+/// Emit inline `W_Super` creation (`NewWithVtable` + `SetfieldGc` for
+/// `super_type` / `obj_type` / `obj` and the inherited header
+/// `PyObject.w_class`), mirroring `descriptor.rs w_super_new`.
+///
+/// This is the traced form of the proxy `super(C, self)` builds.  Upstream
+/// gets it by tracing straight through `W_Super.__init__`, where the proxy
+/// virtualizes and disappears when the following attribute load consumes it;
+/// pyre reaches `builtin_super` through an opaque `bh_call_fn`, so the proxy
+/// is allocated for real once per iteration AND the call's may-force flavour
+/// makes the walk publish a vref for the frame first.  Emitting New+SetField
+/// removes both.
+pub fn emit_super_inline(
+    ctx: &mut TraceCtx,
+    super_type: OpRef,
+    obj_type: OpRef,
+    obj: OpRef,
+    header_w_class: OpRef,
+) -> OpRef {
+    let new_op = ctx.record_op_with_descr(
+        OpCode::NewWithVtable,
+        &[],
+        crate::descr::w_super_size_descr(),
+    );
+    ctx.heap_cache_mut().new_object(new_op);
+    for (descr, value) in [
+        (crate::descr::super_start_type_descr(), super_type),
+        (crate::descr::super_obj_type_descr(), obj_type),
+        (crate::descr::super_obj_descr(), obj),
+        (crate::descr::super_header_w_class_descr(), header_w_class),
+    ] {
+        let index = descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
+        ctx.heapcache_setfield_cached(new_op, index, value);
+    }
+    new_op
+}
+
 /// Emit inline `Function` creation for `MAKE_FUNCTION` — `NewWithVtable` plus
 /// the `SetfieldGc` set `function.py Function.__init__` performs — instead
 /// of the opaque `jit_make_function_from_globals` residual.

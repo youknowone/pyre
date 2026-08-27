@@ -1,6 +1,6 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=main
-# pyre-check: spec-folds=bare_super_call
+# pyre-check: spec-folds=bare_super_call,bare_super_virtual
 # Self-checking guard for zero-argument `super()` bound to a name, which is the
 # spelling that reaches the frame-escape path.
 #
@@ -45,6 +45,17 @@
 #      did (20000 iterations, 1662 distinct).  E also pins that the `__class__`
 #      property runs exactly once per iteration, which a fold that executed the
 #      call and then declined would double.
+#   F  the loop INSIDE the super-bearing method, so the frame the proxy is
+#      built from is the portal's own rather than an inlined callee's.  The
+#      two frames reach `walker_bare_super_frame_slots` on different channels
+#      -- A/B/C through the callee slot shadow, F through the standard
+#      virtualizable -- and a fold that read only one of them would answer for
+#      the wrong frame on the other.
+#   G  a method whose own `self` is also a cellvar, because a nested function
+#      closes over it.  Slot zero then holds a `Cell` rather than the receiver,
+#      which the virtual fold does not model, so G is the site that keeps the
+#      re-routed residual live: both labels in the `spec-folds` header above
+#      have one.
 N = 20000
 
 
@@ -87,6 +98,38 @@ class Tricky:
         raise ValueError(str(Tricky.hits))
 
 
+class Portal(Base):
+    """Site F's own class: the loop is inside the method that calls `super()`.
+
+    A method whose own body carries the loop is the frame the portal traces,
+    not a callee the trace inlines, so the slot shadow the virtual fold reads
+    does not exist here and the re-routed residual owns the call.
+    """
+
+    def run_own_loop(self, n):
+        acc = 0
+        for _ in range(n):
+            s = super()
+            acc += s.val()
+        return acc
+
+
+class Captured(Base):
+    """Site G's own class: `self` is a cellvar, shared with slot zero.
+
+    `_get_self_location`'s cellvar branch reads the receiver out of that cell.
+    The virtual fold does not model the second dereference and declines, so
+    this is the shape the re-routed residual still owns.
+    """
+
+    def val(self):
+        def again():
+            return self.tag()
+
+        s = super()
+        return s.val() + len(again())
+
+
 class ETrap(Base):
     """Site E's own method, reached only with a `Tricky` receiver.
 
@@ -108,17 +151,24 @@ def main():
     site_c = set()
     site_d = set()
     site_e = set()
+    site_g = set()
     tricky = Tricky()
+    captured = Captured()
     total = 0
     for _ in range(N):
         site_a.add(middle.val())
         site_b.add(leaf.val())
         site_c.add(leaf.tag())
+        site_g.add(captured.val())
         try:
             Leaf.val(42)
         except TypeError as exc:
             site_d.add(str(exc))
         total += 1
+
+    # Site F owns the loop itself, which is what puts `super()` in the portal
+    # frame rather than in an inlined callee.
+    site_f = Portal().run_own_loop(N)
 
     # Site E gets its own loop on purpose.  Sharing the loop above leaves this
     # call on a path the backend never compiles, and an uncompiled site cannot
@@ -133,6 +183,7 @@ def main():
         ("A", site_a, 11),
         ("B", site_b, 111),
         ("C", site_c, "leaf-middle-base"),
+        ("G", site_g, 1 + len("base")),
         (
             "D",
             site_d,
@@ -149,6 +200,14 @@ def main():
             return 1
     if total != N:
         print(f"FAIL dropped iteration: total={total}")
+        return 1
+    # `Base.val` answers 1, so the sum is the iteration count.  A proxy built
+    # from the wrong frame reaches `Portal.val` — which does not exist, so the
+    # MRO walk would find `Base.val` anyway; what it would get wrong is the
+    # class the walk starts after, and a `super()` resolved against the CALLER
+    # of `run_own_loop` raises instead of answering.
+    if site_f != N:
+        print(f"FAIL site F {site_f} != {N}")
         return 1
     # Site E's message is the raise count, so one distinct message per
     # iteration is the only answer that has the property running every

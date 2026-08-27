@@ -2117,6 +2117,81 @@ static W_OBJECT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyL
     )
 });
 
+/// `nestedscope.py Cell` field layout — `contents`, `family`.
+///
+/// `contents` is MUTABLE: `w_cell_set` rewrites it in place on every rebinding
+/// of the closure variable, and `w_cell_delete` nulls it.
+/// `CellFamily.ever_mutated` is the quasi-immutable that says whether any such
+/// write has EVER happened; it says nothing about a given read, so this field
+/// carries no immutability of its own.
+///
+/// `family` is `nestedscope.py Cell._immutable_fields_ = ['family']`, and it is
+/// declared `Int` rather than `Ref` because the families are leaked rather than
+/// GC-managed — the word is absent from this layout's traced pointer offsets.
+/// Nothing reads it through this group; the census is COMPLETE because a field
+/// the struct declares but a group omits has no `index_in_parent` to rederive,
+/// and the two sides that mint its descr then disagree on the number.
+static W_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::nestedscope::{Cell, W_CELL_GC_TYPE_ID, W_CELL_OBJECT_SIZE};
+    build_object_descr_group_with_def_path(
+        W_CELL_OBJECT_SIZE,
+        W_CELL_GC_TYPE_ID,
+        &pyre_object::nestedscope::CELL_TYPE as *const _ as usize,
+        &[
+            (
+                "contents",
+                core::mem::offset_of!(Cell, contents),
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "family",
+                core::mem::offset_of!(Cell, family),
+                8,
+                Type::Int,
+                false,
+                true,
+                false,
+            ),
+        ],
+        "Cell",
+        "nestedscope::Cell",
+    )
+});
+
+/// `descriptor.py W_Super` field layout — `w_starttype`, `w_objtype`,
+/// `w_self`, plus the inherited header `PyObject.w_class`.
+///
+/// All three are plain mutable Ref slots: `descriptor.py` declares no
+/// `_immutable_fields_` for the proxy, and nothing here needs one — the
+/// emitted proxy ([`crate::helpers::emit_super_inline`]) is read back through
+/// the same trace that wrote it, where the optimizer answers from the
+/// `SetfieldGc` it already has.
+///
+/// The header entry is there for the same reason the `Method` group carries
+/// one: the inline emit can escape a guard and be materialized, so the
+/// inherited Python class has to be a proper virtual field of this group.
+static W_SUPER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::descriptor::{W_SUPER_GC_TYPE_ID, W_SUPER_OBJECT_SIZE, W_Super};
+    let field = |key, offset| (key, offset, 8, Type::Ref, false, false, false);
+    build_object_descr_group_with_def_path(
+        W_SUPER_OBJECT_SIZE,
+        W_SUPER_GC_TYPE_ID,
+        &pyre_object::descriptor::SUPER_TYPE as *const _ as usize,
+        &[
+            field("super_type", core::mem::offset_of!(W_Super, super_type)),
+            field("obj_type", core::mem::offset_of!(W_Super, obj_type)),
+            field("obj", core::mem::offset_of!(W_Super, obj)),
+            field("PyObject.w_class", pyre_object::pyobject::W_CLASS_OFFSET),
+        ],
+        "W_Super",
+        "descriptor::W_Super",
+    )
+});
+
 static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // Upstream `rpython/rtyper/lltypesystem/rlist.py:116`
     //     GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))
@@ -3586,6 +3661,44 @@ pub fn w_method_size_descr() -> DescrRef {
 /// payload.
 pub fn object_mutable_cell_value_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
+}
+
+/// `nestedscope.py Cell.contents` — what `w_cell_get` reads.  The modelled
+/// `fast2locals` expansion reads it once per cell slot, in place of the
+/// residual `bh_call_fn(locals)` whose frame force loses the enclosing loop.
+pub fn cell_contents_descr() -> DescrRef {
+    field_descr_from_group(&W_CELL_DESCR_GROUP, 0)
+}
+
+/// `descriptor.py W_Super.w_starttype` — the class `super()` was given, whose
+/// MRO position the attribute walk starts AFTER.
+pub fn super_start_type_descr() -> DescrRef {
+    field_descr_from_group(&W_SUPER_DESCR_GROUP, 0)
+}
+
+/// `descriptor.py W_Super.w_objtype` — `_super_check`'s answer, the type whose
+/// MRO is walked.
+pub fn super_obj_type_descr() -> DescrRef {
+    field_descr_from_group(&W_SUPER_DESCR_GROUP, 1)
+}
+
+/// `descriptor.py W_Super.w_self` — the receiver a found descriptor binds to.
+pub fn super_obj_descr() -> DescrRef {
+    field_descr_from_group(&W_SUPER_DESCR_GROUP, 2)
+}
+
+/// Inherited `PyObject.w_class` on a `W_Super` — the Python-level `super`
+/// class stamped by `w_super_new`'s header, kept in this group for the same
+/// reason [`method_header_w_class_descr`] is kept in the `Method` one.
+pub fn super_header_w_class_descr() -> DescrRef {
+    field_descr_from_group(&W_SUPER_DESCR_GROUP, 3)
+}
+
+/// Size descriptor for `W_Super` allocation via `NewWithVtable`
+/// (vtable = `&SUPER_TYPE`); the three proxy fields and the inherited header
+/// `w_class` are `SetfieldGc`'d after.
+pub fn w_super_size_descr() -> DescrRef {
+    W_SUPER_DESCR_GROUP.size_descr.clone()
 }
 
 /// `typeobject.py IntMutableCell.intvalue` — the unboxed `Signed`
@@ -6890,6 +7003,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("celldict::ObjectMutableCell", || {
         LazyLock::force(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP);
+    }),
+    ("nestedscope::Cell", || {
+        LazyLock::force(&W_CELL_DESCR_GROUP);
+    }),
+    ("descriptor::W_Super", || {
+        LazyLock::force(&W_SUPER_DESCR_GROUP);
     }),
     ("listobject::W_ListObject", || {
         LazyLock::force(&W_LIST_DESCR_GROUP);

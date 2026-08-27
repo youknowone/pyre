@@ -5102,10 +5102,52 @@ impl PyFrame {
     /// namespace rather than the independent copy
     /// [`PyFrame::frame_locals_snapshot`] builds for a function frame.
     pub fn code_locals_are_plain_fastlocals(code: &CodeObject) -> bool {
-        code.flags.contains(CodeFlags::OPTIMIZED)
+        Self::code_locals_are_modelled_fastlocals(code)
             && code.cellvars.is_empty()
             && code.freevars.is_empty()
+    }
+
+    /// [`PyFrame::code_locals_are_plain_fastlocals`] widened to the code
+    /// objects whose cell and freevar slots a modelled `fast2locals` can also
+    /// reproduce.
+    ///
+    /// The cell half of [`PyFrame::fast2locals`] is one extra read per slot —
+    /// `w_cell_get`, i.e. `Cell.contents` — over a slot the caller already
+    /// holds, so a model that can read that field can reproduce it.  What
+    /// stays refused is what the plain predicate refuses for its own reasons:
+    /// a non-OPTIMIZED (module / class / exec) frame, which hands back its
+    /// LIVE namespace rather than an independent copy, and `CO_FAST_HIDDEN`
+    /// slots, which `fast2locals` skips only on non-OPTIMIZED frames and whose
+    /// comprehension names must not leak into one.
+    ///
+    /// Kept beside the plain predicate rather than replacing it: the portal
+    /// arm of the `locals()` fold reads slots out of the virtualizable array
+    /// and models no cell read, so it still needs the narrow question.
+    pub fn code_locals_are_modelled_fastlocals(code: &CodeObject) -> bool {
+        code.flags.contains(CodeFlags::OPTIMIZED)
             && !(0..code.varnames.len()).any(|i| hidden_local(code, i))
+    }
+
+    /// The `fast2locals` names for the slots at and above
+    /// `code.varnames.len()`, in slot order: the PURE cellvars (those not
+    /// sharing a varname slot) followed by the freevars, exactly as
+    /// [`PyFrame::fast2locals`] walks them.
+    ///
+    /// A cellvar that also appears in `varnames` shares that slot in the
+    /// 3.11+ unified layout, so it is named by `varnames` and must not appear
+    /// here a second time.
+    ///
+    /// An iterator rather than a list because the callers want opposite ends
+    /// of it: the walker takes the count once while modelling the frame, and
+    /// [`jit_locals_dict_setitem_cell`] takes one name per bound slot, on a
+    /// compiled path.
+    pub fn cell_slot_names(code: &CodeObject) -> impl Iterator<Item = &str> {
+        let varnames = &code.varnames;
+        code.cellvars
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(move |cs: &&str| !varnames.iter().any(|v| <_ as AsRef<str>>::as_ref(v) == *cs))
+            .chain(code.freevars.iter().map(AsRef::as_ref))
     }
 
     /// pyframe.py `make_arguments` — build Arguments from the value
@@ -5849,6 +5891,46 @@ pub extern "C" fn jit_locals_dict_setitem_local(
     let _ = pyre_object::gc_roots::pin_root(value as PyObjectRef);
     let code = unsafe { &*(code as usize as *const CodeObject) };
     let name: &str = &code.varnames[index as usize];
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
+    }
+    pyre_object::gc_roots::shadow_stack_get(dict_slot) as i64
+}
+
+/// `pyframe.py fast2locals` for ONE cell or freevar slot: bind
+/// `PyFrame::cell_slot_names(code)[index]` to `value` in `dict`.
+///
+/// `index` counts from the first slot ABOVE `code.varnames.len()`, which is
+/// where the pure cellvars and the freevars live; `value` is the cell's
+/// CONTENTS, already read by the caller, not the cell.  Splitting the read out
+/// is what keeps this helper off the frame: same reason
+/// [`jit_locals_dict_setitem_local`] takes a value rather than a slot.
+///
+/// Returns `dict` for the same threading reason as
+/// [`jit_locals_dict_setitem_local`].
+///
+/// # Safety
+/// `dict` must be a live dict, `code` a live `CodeObject` with `index` inside
+/// [`PyFrame::cell_slot_names`], and `value` a live non-null `W_Root`.
+pub extern "C" fn jit_locals_dict_setitem_cell(
+    dict: i64,
+    code: i64,
+    index: i64,
+    value: i64,
+) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dict as PyObjectRef);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value as PyObjectRef);
+    let code = unsafe { &*(code as usize as *const CodeObject) };
+    let name = PyFrame::cell_slot_names(code)
+        .nth(index as usize)
+        .expect("cell slot index is inside cell_slot_names");
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),

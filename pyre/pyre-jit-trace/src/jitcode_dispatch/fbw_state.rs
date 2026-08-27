@@ -3137,28 +3137,43 @@ pub(crate) fn fbw_callee_body_replay_scan(
             // `load_deref` reads the same shape once more —
             // `bh_load_deref_value_fn` dereferences a cell and returns its
             // contents, writing nothing, and its unbound `NameError` is the
-            // same shape as `load_global`'s.  It reached this scan untagged
-            // until `load_deref_value` started carrying
-            // `RuntimeHelperKind::LoadDeref` for the `Cell.get` fold, so the tag
-            // it wanted is now here — and it is still not listed.
+            // same shape as `load_global`'s.  Its `CallFlavor::Plain` lowering
+            // is the same one `load_global` takes, so the two differ in
+            // nothing this scan can read.
             //
-            // Admitting it classifies every freevar-reading body
-            // `DeferredCall` rather than `Dirty`, and a body admitted that way
-            // reaches the vable escape at its OWN residual, which no later
-            // attempt can avoid because the escape is a property of the body.
-            // Measured on `locals_in_inlined_callee`: the escape at the
-            // callee's `locals()` recurs until `MAX_TRACE_ABORT_COUNT` retires
-            // the enclosing green key, 2 loops against 10 aborts where the
-            // same tree without the admission reads 3 against 5.  Denying the
-            // callee from the first escape recovers 3 against 6, but it also
-            // lets loops compile that were previously retired, and one of
-            // them — `bench/synth/frame_lasti_fold_callee_and_bridge` — then
-            // answers `f_lasti` for a caller read from inside the residual
-            // callee with the resume coordinate instead of the CALL it is
-            // suspended at.  That wrong answer is not this line's (see
-            // `bench/synth/_pending/caller_f_lasti_across_residual_call.py`),
-            // but reaching it is, so the admission stays out until it is
-            // fixed.
+            // It was nevertheless kept OUT of this list for a long time, and
+            // the reason was never replay safety.  Admitting it classifies
+            // every freevar-reading body `DeferredCall` rather than `Dirty`,
+            // and one such body — `locals_in_inlined_callee`'s, which calls
+            // `locals()` while holding a freevar — then reached the vable
+            // escape at its own residual.  That escape is a property of the
+            // body, so no later attempt avoided it: the fixture read 2 loops
+            // against 10 aborts where the same tree without the admission read
+            // 3 against 5, the escape recurring until `MAX_TRACE_ABORT_COUNT`
+            // retired the enclosing green key.
+            //
+            // It is answered where it happens rather than here.  That
+            // `locals()` is now modelled per cell slot
+            // (`try_walker_specialize_builtin_locals_in_callee` reads
+            // `Cell.contents` for the cell and freevar slots instead of
+            // handing the frame to a residual), so the callee inlines with
+            // nothing left to force its frame; and where the expansion still
+            // declines, its caller refuses the callee AT the op rather than
+            // letting the residual escape.  The fixture reads 3 loops against
+            // 0 aborts with both in place, against 3 and 5 before either.
+            //
+            // Refusing the callee from the escape ITSELF was tried and is not
+            // the answer: it lets loops compile that were previously retired,
+            // and `bench/synth/frame_lasti_fold_callee_and_bridge` then
+            // compiles a second root and stops compiling the one its header
+            // declares.
+            //
+            // What the admission buys is not `super()`-specific: a body
+            // holding ANY freevar was declined inline, so
+            // `def m(self, x): return x + CAP` over a closed-over `CAP` ran
+            // ~780 ns/iteration against ~1 for the same body reading a global.
+            // Zero-argument `super()` always carries the read (`__class__`
+            // comes out of the closure), so it always paid.
             // `load_import` is `load_global`'s narrower half: both resolve a
             // name through `finditem_str`, but that one reads the frame's
             // globals first -- which may be an arbitrary mapping, so it can
@@ -3187,6 +3202,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     | majit_ir::RuntimeHelperKind::NewtupleFromArray
                     | majit_ir::RuntimeHelperKind::NewlistFromArray
                     | majit_ir::RuntimeHelperKind::GetCurrentException
+                    | majit_ir::RuntimeHelperKind::LoadDeref
                     // `super_attr_unwrap` is a total function of its argument —
                     // an `is_method` class test and one of two field reads — so
                     // re-running one reads the same two words again and commits
