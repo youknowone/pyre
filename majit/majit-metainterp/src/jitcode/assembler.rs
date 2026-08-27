@@ -5836,14 +5836,24 @@ impl JitCodeBuilder {
     /// Whether this opcode makes the body something other than the function it
     /// was lowered from, so a native entry for it would answer differently.
     ///
-    /// The list is exactly the opcodes whose operand is read out of the
-    /// blackhole rather than out of the heap:
+    /// The list is exactly the opcodes a native entry would get WRONG — either
+    /// because the operand lives in the blackhole rather than in the heap, or
+    /// because the opcode carries an obligation beyond the value it returns:
     ///
     /// * the `#[jit_interp]` state fields, which live in the interpreter's
     ///   register banks between merge points and reach memory only at a
     ///   writeback, so a native call would read the pre-writeback value;
-    /// * the virtualizable getters/setters, which `blackhole.py:1189-1246`
-    ///   serves out of `virtualizable_boxes` for the same reason;
+    /// * the virtualizable getters/setters, which carry an obligation the
+    ///   function they were lowered from does not: every one of them begins
+    ///   `fielddescr.get_vinfo().clear_vable_token(vable)`
+    ///   (`blackhole.py:1374-1386 bhimpl_getarrayitem_vable_*`, mirrored by
+    ///   `vable_clear_token_and_get_vinfo`), and `clear_vable_token`
+    ///   (`virtualizable.py:218-222`) FORCES a virtualizable that still holds
+    ///   a token. Both blackholes then read the heap, so the field value would
+    ///   agree — it is the forcing that a native entry would skip, leaving the
+    ///   token standing. (Serving them out of `virtualizable_boxes` is the
+    ///   METAINTERP's behaviour, `pyjitpl.py:1167-1245
+    ///   opimpl_getfield_vable_*`, not the blackhole's.);
     /// * `jit_merge_point` and `call_assembler`/`recursive_call`, which do not
     ///   return to the caller but raise a JitException the C-level call in
     ///   `bhimpl_inline_call_*` propagates and a Rust return value cannot; and
