@@ -5082,15 +5082,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             CalleeReplaySafety::Dirty => {
                 // The generated resume chain is sound for a constant callable
-                // with one paused caller when the callee owns an exception
-                // table and `try_multiframe` gives it a seeded frame.  That
-                // frame makes each in-callee guard carry the callee's own
-                // resume coordinate, so deopt does not replay the whole body
-                // from the caller's CALL boundary.  A stored bound method
-                // reaches the path on `bound_method` alone; one that also meets
-                // these terms takes the same screen exemption below.
-                let seeded_callee_resume = body_facts.has_exception_table
-                    && callable_guard_op.is_constant()
+                // with one paused caller when `try_multiframe` gives the callee
+                // a seeded frame.  That frame makes each in-callee guard carry
+                // the callee's own resume coordinate, so deopt does not replay
+                // the whole body from the caller's CALL boundary.  A stored
+                // bound method reaches the path on `bound_method` alone; one
+                // that also meets these terms takes the same screen exemption
+                // below.
+                //
+                // The callee's own exception table is NOT a term here.  It was
+                // one because the route was written for handler-bearing bodies,
+                // not because the resume coordinate needs a handler: what the
+                // seeded frame answers is where a deopt lands, which is the same
+                // question for a body with no `try` at all.  Requiring it
+                // refused 17 sites in 14 `bench/synth` fixtures that met every
+                // other term — `entry_is_call_boundary`, a constant callable,
+                // depth 0, and `try_multiframe` — for having no handler, while
+                // the same body carrying one was admitted.  `pyjitpl.py:1415`
+                // `perform_call` pushes a real `MIFrame` for every callee
+                // `can_inline_callable` admits and tests no exception table
+                // anywhere.  The screen exemption below is unaffected: it is
+                // reached only when `branchy_handler_scan` is `Some`, which
+                // itself requires `has_exception_table`.
+                let seeded_callee_resume = callable_guard_op.is_constant()
                     && inline_depth < 2
                     && try_multiframe;
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
