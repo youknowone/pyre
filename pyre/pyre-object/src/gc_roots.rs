@@ -288,6 +288,82 @@ fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
 /// free-threaded synchronization path.
 #[inline]
 fn normalize_published_slot(stack: &RootStack, index: usize) -> PyObjectRef {
+    if let Some((start, end, tagged)) = majit_gc::published_nursery_window()
+        && !majit_gc::gc_sync::foreign_mutator_seen()
+    {
+        // SAFETY: `slot` bounds-checks `index`, which the caller claimed.
+        return unsafe { normalize_slot_in_window(stack.slot(index), start, end, tagged) };
+    }
+    normalize_published_slot_hooked(stack, index)
+}
+
+/// Follow same-thread nursery forwarding for one published slot against a
+/// window the caller already read.
+///
+/// # Safety
+/// `slot` must name a live, writable shadow-stack slot.
+#[inline(always)]
+unsafe fn normalize_slot_in_window(
+    slot: *mut PyObjectRef,
+    start: usize,
+    end: usize,
+    tagged: bool,
+) -> PyObjectRef {
+    // SAFETY: the caller owns the slot for the duration of this call.
+    let root = unsafe { *slot };
+    let current = majit_gc::gc_current_object_address_in_window(root as usize, start, end, tagged)
+        as PyObjectRef;
+    if current != root {
+        // SAFETY: same live slot.
+        unsafe { *slot = current };
+    }
+    current
+}
+
+/// Normalize a contiguous run of already-published roots.
+///
+/// `publish` writes the whole livevar set before any query runs, so one window
+/// read describes every slot in the run; the disarmed and free-threaded paths
+/// stay per-slot because each of their queries is its own safepoint.
+///
+/// Answers whether any slot in the run named a forwarding stub, so a caller
+/// holding a native copy of the same words knows whether it owes a reload.
+#[inline]
+fn normalize_published_run(stack: &RootStack, base: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let Some((start, end, tagged)) =
+        majit_gc::published_nursery_window().filter(|_| !majit_gc::gc_sync::foreign_mutator_seen())
+    else {
+        let mut moved = false;
+        for index in base..base + len {
+            // SAFETY: `publish` claimed every index in this range.
+            let before = unsafe { *stack.slot(index) };
+            moved |= normalize_published_slot_hooked(stack, index) != before;
+        }
+        return moved;
+    };
+    assert!(base + len <= stack.len(), "shadow-stack run out of range");
+    // SAFETY: bounds-checked against the live length just above, so every
+    // offset below names a slot inside the one live allocation.
+    let first = unsafe { stack.base.get().add(base) };
+    let mut moved = false;
+    for offset in 0..len {
+        // SAFETY: `offset` is below `len`, which the assertion covers.
+        unsafe {
+            let slot = first.add(offset);
+            let before = *slot;
+            moved |= normalize_slot_in_window(slot, start, end, tagged) != before;
+        }
+    }
+    moved
+}
+
+/// [`normalize_published_slot`] through the hook chain — the shape that has to
+/// answer when no nursery window is published, or when a foreign mutator makes
+/// the query a safepoint.
+fn normalize_published_slot_hooked(stack: &RootStack, index: usize) -> PyObjectRef {
     // SAFETY: callers claimed `index` before entering this helper and keep the
     // surrounding RootScope alive throughout it.
     let mut root = unsafe { *stack.slot(index) };
@@ -424,10 +500,23 @@ impl RootScope {
     pub fn normalize(&self, base: usize, len: usize) {
         #[cfg(debug_assertions)]
         assert_shadow_stack_not_walking();
-        for index in base..base + len {
-            // SAFETY: `publish` claimed every index in this range.
-            normalize_published_slot(unsafe { &*self.stack_slot }, index);
-        }
+        // SAFETY: `publish` claimed every index in this range, and
+        // `stack_slot` is this thread's live root-stack cell.
+        let _ = normalize_published_run(unsafe { &*self.stack_slot }, base, len);
+    }
+
+    /// [`normalize`](Self::normalize), reporting whether any slot in the run
+    /// named a forwarding stub.
+    ///
+    /// A caller that has to rebuild a native view of the run from the slots
+    /// only owes that rebuild when the run actually moved; `false` says the
+    /// words it already holds are the live ones.
+    #[majit_macros::dont_look_inside]
+    pub fn normalize_moved(&self, base: usize, len: usize) -> bool {
+        #[cfg(debug_assertions)]
+        assert_shadow_stack_not_walking();
+        // SAFETY: this thread's live cell; `publish` claimed the range.
+        normalize_published_run(unsafe { &*self.stack_slot }, base, len)
     }
 
     /// Scope-local [`shadow_stack_set`] using the cached cell — the write a

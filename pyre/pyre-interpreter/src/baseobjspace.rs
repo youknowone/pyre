@@ -113,11 +113,9 @@ pub(crate) unsafe fn walk_pending_hash_error_area(
 #[majit_macros::dont_look_inside]
 pub fn clear_method_cache() {
     let mut cache = METHOD_CACHE.lock();
-    cache.versions.fill(0);
-    cache.names.fill(None);
-    cache
-        .lookup_where
-        .fill((std::ptr::null_mut(), std::ptr::null_mut()));
+    for entry in cache.entries.iter_mut() {
+        *entry = MethodCacheEntry::EMPTY;
+    }
 }
 
 /// CPython 3.14 `dict_unhashable_type` (`Objects/dictobject.c`) parity.
@@ -1379,20 +1377,17 @@ pub(crate) unsafe fn get_and_call_function(
     // argument list from the shadow stack.  Both slices are published before the
     // first `normalize_roots` so nothing is still invisible to a foreign
     // collector once this mutator starts entering safepoints.
+    // Every slot access goes through the scope's cached root-stack cell: the
+    // free `gc_roots` functions re-resolve the thread local per call, which on
+    // Darwin is an out-of-line `_tlv_get_addr`, and this arm touches a slot
+    // once per operand and once per argument.  The two slices are adjacent on
+    // the stack, so the whole published set normalizes as one run.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::publish_roots(&[w_descr, w_obj, w_type]);
-    let args_base = pyre_object::gc_roots::publish_roots(args_w);
-    pyre_object::gc_roots::normalize_roots(base, 3);
-    pyre_object::gc_roots::normalize_roots(args_base, args_w.len());
-    use pyre_object::gc_roots::shadow_stack_get;
-    let w_impl = unsafe {
-        get(
-            shadow_stack_get(base),
-            shadow_stack_get(base + 1),
-            shadow_stack_get(base + 2),
-        )
-    }?
-    .unwrap_or_else(|| shadow_stack_get(base));
+    let base = _roots.publish(&[w_descr, w_obj, w_type]);
+    let args_base = _roots.publish(args_w);
+    _roots.normalize(base, 3 + args_w.len());
+    let w_impl = unsafe { get(_roots.get(base), _roots.get(base + 1), _roots.get(base + 2)) }?
+        .unwrap_or_else(|| _roots.get(base));
     // One `Vec` at every arity, the shape the fast path above already builds:
     // `with_capacity`/`push` lower to `newlist`/`append`.  The fixed
     // `[PY_NULL; N]` leg this replaced ended in `<[T; N]>::index(&array,
@@ -1403,7 +1398,7 @@ pub(crate) unsafe fn get_and_call_function(
     // length, so no push reallocates between the shadow-stack reads.
     let mut reloaded = Vec::with_capacity(args_w.len());
     for i in 0..args_w.len() {
-        reloaded.push(shadow_stack_get(args_base + i));
+        reloaded.push(_roots.get(args_base + i));
     }
     crate::call::call_function_impl_result(w_impl, reloaded.as_slice())
 }
@@ -9691,10 +9686,28 @@ unsafe fn lookup_where_pair_wtf8(
 /// (`typeobject.py:541` `cache.names[method_hash] == name`). A fill owns one
 /// copy; a hit compares the incoming borrowed name without allocating or
 /// entering the Python-string intern table. `None` is an empty slot.
+///
+/// The three arrays upstream keeps are one array of one entry here.  A probe
+/// reads all three of a slot's words and nothing else in the row, so three
+/// parallel `Vec`s make it touch three cache lines to answer one question;
+/// packed, the version test, the name test and the answer share a line.
+#[derive(Clone)]
+struct MethodCacheEntry {
+    version: u64,
+    lookup_where: (PyObjectRef, PyObjectRef),
+    name: Option<Wtf8Buf>,
+}
+
+impl MethodCacheEntry {
+    const EMPTY: Self = Self {
+        version: 0,
+        lookup_where: (std::ptr::null_mut(), std::ptr::null_mut()),
+        name: None,
+    };
+}
+
 struct MethodCache {
-    versions: Vec<u64>,
-    names: Vec<Option<Wtf8Buf>>,
-    lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
+    entries: Vec<MethodCacheEntry>,
 }
 
 // PyPy stores this cache on the shared object space. The mutex below protects
@@ -9709,9 +9722,7 @@ const METHOD_CACHE_SIZE: usize = 1 << METHOD_CACHE_SIZE_EXP;
 static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
     std::sync::LazyLock::new(|| {
         parking_lot::Mutex::new(MethodCache {
-            versions: vec![0u64; METHOD_CACHE_SIZE],
-            names: vec![None; METHOD_CACHE_SIZE],
-            lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
+            entries: vec![MethodCacheEntry::EMPTY; METHOD_CACHE_SIZE],
         })
     });
 
@@ -9723,16 +9734,74 @@ static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
 /// is a content hash; use the same FNV-1a content digest over the WTF-8 byte
 /// view.
 fn method_hash(version_tag: u64, name: &Wtf8) -> usize {
-    let mut name_hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in name.as_bytes() {
-        name_hash ^= b as u64;
-        name_hash = name_hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
     const SHIFT2: u32 = 64 - METHOD_CACHE_SIZE_EXP;
     const SHIFT1: u32 = SHIFT2 - 5;
-    let product = version_tag.wrapping_mul(name_hash);
+    let product = version_tag.wrapping_mul(name_content_hash(name));
     let h = (product ^ (product << SHIFT1)) >> SHIFT2;
     (h as usize) & (METHOD_CACHE_SIZE - 1)
+}
+
+/// The `compute_hash(name)` half of [`method_hash`].
+///
+/// RPython reads a string's hash off the string object, where it is computed
+/// once and cached (`rstr.ll_strhash`), so upstream's probe pays no per-lookup
+/// digest at all.  A borrowed `&Wtf8` carries no such slot, so the digest is
+/// recomputed here — a byte-at-a-time FNV chain over a name that is almost
+/// always a dunder was the single most expensive step of the probe.  This is
+/// the same FNV-1a mixing applied to whole 8-byte words, so a `__init__`-sized
+/// name costs one round instead of eight.  Only the slot the pair lands in
+/// depends on it; the entry's validity is still the exact `(version, name)`
+/// match below.
+#[inline]
+fn name_content_hash(name: &Wtf8) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let bytes = name.as_bytes();
+    let mut hash = OFFSET ^ (bytes.len() as u64);
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        hash ^= u64::from_le_bytes(chunk.try_into().unwrap());
+        hash = hash.wrapping_mul(PRIME);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rest.len()].copy_from_slice(rest);
+        hash ^= u64::from_le_bytes(tail);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// `typeobject.py:541` `cache.names[method_hash] == name`, and the same
+/// comparison in `mapdict.py`'s `_find_map_attr_cache`.
+///
+/// Upstream compares two interned RPython strings by identity; the cache here
+/// owns a copy of the name, so the comparison is by content.  Slice equality
+/// bottoms out in a `memcmp` call, which for the dunder-sized names that
+/// dominate this probe costs more than the comparison itself — compare whole
+/// words inline instead.
+#[inline]
+pub(crate) fn cache_name_eq(cached: &Wtf8, name: &Wtf8) -> bool {
+    let (a, b) = (cached.as_bytes(), name.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        let (x, y) = (&a[i..i + 8], &b[i..i + 8]);
+        if u64::from_ne_bytes(x.try_into().unwrap()) != u64::from_ne_bytes(y.try_into().unwrap()) {
+            return false;
+        }
+        i += 8;
+    }
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// typeobject.py `_pure_version_tag` — the `@elidable_promote`
@@ -9867,9 +9936,15 @@ unsafe fn _cached_lookup_where_name(
     // Probe without holding the borrow across the MRO walk below.
     let hit = {
         let cache = METHOD_CACHE.lock();
-        if cache.versions[h] == version_tag && cache.names[h].as_deref() == Some(name) {
+        let entry = &cache.entries[h];
+        if entry.version == version_tag
+            && entry
+                .name
+                .as_deref()
+                .is_some_and(|cached| cache_name_eq(cached, name))
+        {
             // A valid entry with null pointers is the cached negative result.
-            Some(cache.lookup_where[h])
+            Some(entry.lookup_where)
         } else {
             None
         }
@@ -9883,9 +9958,11 @@ unsafe fn _cached_lookup_where_name(
     // `walk_method_cache_gc`, skipped on clean minor collections.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     let mut cache = METHOD_CACHE.lock();
-    cache.versions[h] = version_tag;
-    cache.names[h] = Some(name.to_owned());
-    cache.lookup_where[h] = tup;
+    cache.entries[h] = MethodCacheEntry {
+        version: version_tag,
+        lookup_where: tup,
+        name: Some(name.to_owned()),
+    };
     tup
 }
 
@@ -9905,7 +9982,11 @@ unsafe fn _cached_lookup_where_name(
 /// must be forwarded here or a later hit would read a stale address.
 pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut cache = METHOD_CACHE.lock();
-    for (w_class, w_value) in cache.lookup_where.iter_mut() {
+    for MethodCacheEntry {
+        lookup_where: (w_class, w_value),
+        ..
+    } in cache.entries.iter_mut()
+    {
         // Empty / negative-cache slots hold nulls: nothing to forward.
         if !w_class.is_null() {
             forward(w_class);
@@ -13499,19 +13580,121 @@ pub fn call_args_and_c_profile_args(
     pyre_object::gc_roots::shadow_stack_get(result_slot)
 }
 
-/// PyPy: baseobjspace.py `call_method`.
+/// `callmethod.py call_method_opt` — the std objspace's `space.call_method`.
+///
+/// `objspace.py:790` overrides `baseobjspace.py call_method` with this one, so
+/// the plain `getattr` + `call_function` pair below is the FALLBACK arm, not
+/// the whole method.  The fast arm reaches the descriptor on the type and
+/// passes the receiver as its first argument, which is the same call
+/// `object.__getattribute__` would have made after materialising a bound
+/// method — the materialisation is what it skips.
 ///
 /// Returns `PY_NULL` and stashes the error in `PENDING_CALL_ERROR` when
 /// either the attribute lookup or the call itself raises — same bare-
 /// PyObjectRef contract as `call_function_impl_raw`.
 pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> PyObjectRef {
-    match getattr_str(obj, methname) {
-        Ok(method) => call_function(method, args),
+    match method_descriptor_shortcut(obj, methname) {
+        Ok(Some(w_descr)) => {
+            // `callmethod.py:142` — `space.call_function(w_descr, w_obj, *arg_w)`.
+            // `Arguments.prepend` builds the receiver-first list upstream; the
+            // vector below is that list, filled from the published slots so a
+            // collection inside the fill cannot leave a pre-move address in it.
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.publish(&[w_descr, obj]);
+            let arg_base = roots.publish(args);
+            // `publish` writes the raw words; the set is only complete once
+            // both slices are on the stack, which is why the forwarding query
+            // runs here rather than per slice.
+            roots.normalize(base, 2 + args.len());
+            let mut call_args = Vec::with_capacity(1 + args.len());
+            call_args.push(roots.get(base + 1));
+            for i in 0..args.len() {
+                call_args.push(roots.get(arg_base + i));
+            }
+            call_function(roots.get(base), &call_args)
+        }
+        Ok(None) => match getattr_str(obj, methname) {
+            // `callmethod.py:143-145` — `w_meth = space.getattr(w_obj, w_name)`.
+            Ok(method) => call_function(method, args),
+            Err(e) => {
+                crate::call::set_call_error(e);
+                pyre_object::PY_NULL
+            }
+        },
         Err(e) => {
             crate::call::set_call_error(e);
             pyre_object::PY_NULL
         }
     }
+}
+
+/// `callmethod.py call_method_opt`, for the callers that propagate a
+/// `PyError` rather than reading it back out of `PENDING_CALL_ERROR`.
+pub fn call_method_result(
+    obj: PyObjectRef,
+    methname: &str,
+    args: &[PyObjectRef],
+) -> Result<PyObjectRef, PyError> {
+    if let Some(w_descr) = method_descriptor_shortcut(obj, methname)? {
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.publish(&[w_descr, obj]);
+        let arg_base = roots.publish(args);
+        // See `call_method`: one query for the whole published set.
+        roots.normalize(base, 2 + args.len());
+        let mut call_args = Vec::with_capacity(1 + args.len());
+        call_args.push(roots.get(base + 1));
+        for i in 0..args.len() {
+            call_args.push(roots.get(arg_base + i));
+        }
+        return crate::call::call_function_impl_result(roots.get(base), &call_args);
+    }
+    let method = getattr_str(obj, methname)?;
+    crate::call::call_function_impl_result(method, args)
+}
+
+/// `callmethod.py call_method_opt:134-142` — the descriptor a method call may
+/// reach without building a bound method, or `None` when the receiver's shape
+/// sends the call through `space.getattr`.
+///
+/// The three conditions are upstream's, in upstream's order: the type answers
+/// attributes through the default `__getattribute__`, the name resolves on the
+/// type to a method descriptor, and the instance carries no entry that would
+/// shadow it.  `getdictvalue` is the one of the three that can run app-level
+/// code (a mapping proxy's `__eq__` on a colliding key), so its error is
+/// surfaced rather than swallowed into a decline.
+fn method_descriptor_shortcut(
+    obj: PyObjectRef,
+    methname: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    if obj.is_null() {
+        return Ok(None);
+    }
+    // `callmethod.py:134` — `w_type = space.type(w_obj)`.
+    let Some(w_type) = crate::typedef::r#type(obj) else {
+        return Ok(None);
+    };
+    // `callmethod.py:135` — `if w_type.has_object_getattribute():`.
+    if !unsafe { has_object_getattribute(w_type.as_ptr()) } {
+        return Ok(None);
+    }
+    // `callmethod.py:136` — `w_descr = space.lookup(w_obj, methname)`.
+    let Some(w_descr) = (unsafe { lookup_in_type(w_type.as_ptr(), methname) }) else {
+        return Ok(None);
+    };
+    // `callmethod.py:137` — `space.type(w_descr).flag_method_descriptor`.
+    let Some(w_descr_type) = crate::typedef::r#type(w_descr) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::typeobject::w_type_get_flag_method_descriptor(w_descr_type.as_ptr()) }
+    {
+        return Ok(None);
+    }
+    // `callmethod.py:138-139` — `w_value = w_obj.getdictvalue(space, methname)`;
+    // an instance entry of that name is the bound-method path's answer.
+    if getdictvalue(obj, methname)?.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(w_descr))
 }
 
 /// PyPy: baseobjspace.py `call_function`.

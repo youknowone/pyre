@@ -2971,6 +2971,53 @@ pub fn gc_current_object_address(addr: usize) -> usize {
     }
 }
 
+/// The published nursery window `[start, end)` and the tagged-pointer setting,
+/// or `None` when the published fast path is disarmed and the hook chain has
+/// to answer per address.
+///
+/// [`gc_is_nursery_object`] reloads all four published words for every address
+/// it is handed, and [`gc_sync::foreign_mutator_seen`] is a second ordered
+/// load next to it.  A caller normalizing a *run* of shadow-stack slots asks
+/// the identical question once per slot, so `n` livevars pay `2n` ordered
+/// loads to consult operands that are the same for the whole run.  Reading the
+/// window once and testing the range inline turns the per-slot cost into a
+/// compare pair.
+#[inline]
+pub fn published_nursery_window() -> Option<(usize, usize, bool)> {
+    if !PUBLISHED_NURSERY_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    Some((
+        PUBLISHED_NURSERY_START.load(std::sync::atomic::Ordering::Relaxed),
+        PUBLISHED_NURSERY_END.load(std::sync::atomic::Ordering::Relaxed),
+        PUBLISHED_NURSERY_TAGGED.load(std::sync::atomic::Ordering::Relaxed),
+    ))
+}
+
+/// [`gc_current_object_address`] against a window a caller already read with
+/// [`published_nursery_window`].
+///
+/// The range test is the whole of `is_nursery_object_start` for the armed
+/// path: `start` is a live mapping, so a null address is below it and needs no
+/// separate test, and the tagged case only has to reject an odd word.
+#[inline]
+pub fn gc_current_object_address_in_window(
+    addr: usize,
+    start: usize,
+    end: usize,
+    tagged: bool,
+) -> usize {
+    if addr < start || addr >= end || (tagged && addr & 1 == 1) {
+        return addr;
+    }
+    let hdr = unsafe { header::header_of(addr) };
+    if unsafe { (*hdr).is_forwarded() } {
+        unsafe { header::GcHeader::forwarding_address(hdr) }
+    } else {
+        addr
+    }
+}
+
 /// Process-global callbacks for registering/removing a Rust-stack slot
 /// as a GC root with the currently active backend. Used by host-side
 /// allocators whose callers need to keep a

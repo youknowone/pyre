@@ -1310,14 +1310,18 @@ impl MapAttrCache {
 /// object space.  Pyre's free-threaded execution contexts share that space, so
 /// the cache remains process/interpreter-owned and is synchronized rather than
 /// duplicated through TLS.
-static MAP_ATTR_CACHE: LazyLock<Mutex<MapAttrCache>> =
-    LazyLock::new(|| Mutex::new(MapAttrCache::new()));
+// `parking_lot::Mutex` rather than `std::sync::Mutex`: upstream's cache is
+// `space.fromcache(MapAttrCache)`, reached with nothing but the GIL, so every
+// cycle this lock costs is pyre's own.  The std lock adds a poison flag this
+// cache has no use for — the probe below cannot panic while holding it.
+static MAP_ATTR_CACHE: LazyLock<parking_lot::Mutex<MapAttrCache>> =
+    LazyLock::new(|| parking_lot::Mutex::new(MapAttrCache::new()));
 
 /// interp_gc.py — clear `space.fromcache(MapAttrCache)` before an
 /// explicit full collection so cached map nodes do not retain stale entries.
 #[majit_macros::dont_look_inside]
 pub fn clear_map_attr_cache() {
-    MAP_ATTR_CACHE.lock().unwrap().clear();
+    MAP_ATTR_CACHE.lock().clear();
 }
 
 /// `objectmodel.compute_hash(name)` for a (utf8-encoded) str (mapdict.py).
@@ -1367,12 +1371,14 @@ pub unsafe fn find_map_attr(self_node: MapRef, name: &Wtf8, attrkind: u16) -> Op
     let product = attrs_as_int.wrapping_mul(hash_selector) as u64;
     let attr_hash = ((product ^ (product << SHIFT1)) >> SHIFT2) as usize;
 
-    let mut cache = MAP_ATTR_CACHE.lock().unwrap();
+    let mut cache = MAP_ATTR_CACHE.lock();
     // mapdict.py:104 keeps the name by reference; pyre's slot owns its bytes,
     // so a fill that lands on a bucket already naming this attribute keeps the
     // buffer rather than reallocating it.  Which name a bucket holds is fixed
     // by the hash, so this is the ordinary case for a re-filled bucket.
-    let name_matches = cache.names[attr_hash].as_deref() == Some(name);
+    let name_matches = cache.names[attr_hash]
+        .as_deref()
+        .is_some_and(|cached| crate::baseobjspace::cache_name_eq(cached, name));
     if name_matches && cache.attrs[attr_hash] == self_node && cache.indexes[attr_hash] == attrkind {
         let cached = cache.cached_attrs[attr_hash];
         return if cached.is_null() { None } else { Some(cached) };
@@ -6206,7 +6212,7 @@ mod tests {
     #[test]
     fn find_map_attr_cached_matches_uncached_on_hit_and_miss() {
         unsafe {
-            MAP_ATTR_CACHE.lock().unwrap().clear();
+            MAP_ATTR_CACHE.lock().clear();
             let (_term, a, b) = build_chain();
             // first call populates the cache, second hits it
             assert_eq!(find_map_attr(b, wn("a"), DICT), Some(a));

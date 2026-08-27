@@ -454,15 +454,35 @@ pub fn _wrapkey(key: &str) -> PyObjectRef {
 ///
 /// PyPy erases a real Python `{}` dict — insertion-ordered (since
 /// Python 3.7) and O(1) hashed.  Pyre's port wraps
-/// `indexmap::IndexMap<String, PyObjectRef>`, which provides the same
+/// [`ModuleDictEntries`], which provides the same
 /// insertion-ordered + hashed semantics directly so the strategy
 /// contract on `:188-198 getiter{keys,values,items,reversed}`
 /// continues to honour insertion order while `get` / `set` / `remove`
 /// stay O(1) amortised.
 #[derive(Default)]
 pub struct ModuleDictStorage {
-    pub entries: indexmap::IndexMap<String, PyObjectRef>,
+    pub entries: ModuleDictEntries,
 }
+
+/// The entry table `ModuleDictStorage` holds.
+///
+/// Keyed by the owned name and hashed with
+/// [`crate::dictmultiobject::StrKeyBuildHasher`] rather than Rust's default
+/// `RandomState`: upstream's storage is a plain `{}` over RPython strings,
+/// whose hash is a cheap chain cached on the string object, so a probe on a
+/// global's name costs one load there.
+pub type ModuleDictEntries =
+    indexmap::IndexMap<String, PyObjectRef, crate::dictmultiobject::StrKeyBuildHasher>;
+
+/// The per-name `GlobalCache` registry (`celldict.py self.caches`).
+///
+/// Keyed by global name, so it takes the same hasher
+/// [`ModuleDictEntries`] does.
+pub type GlobalCacheRegistry = std::collections::HashMap<
+    String,
+    std::sync::Arc<std::sync::Mutex<GlobalCache>>,
+    crate::dictmultiobject::StrKeyBuildHasher,
+>;
 
 /// Runtime-assigned GC type id for the [`ModuleDictStorage`] box.
 static MODULE_DICT_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
@@ -490,10 +510,7 @@ pub fn module_dict_storage_gc_type_id() -> u32 {
 /// virtual dict).  The keys are owned `String`s, so no user `__eq__` or
 /// `__hash__` can run inside the boundary at all.
 #[majit_macros::dont_look_inside]
-pub fn module_dict_entries_get(
-    entries: &indexmap::IndexMap<String, PyObjectRef>,
-    key: &str,
-) -> Option<PyObjectRef> {
+pub fn module_dict_entries_get(entries: &ModuleDictEntries, key: &str) -> Option<PyObjectRef> {
     entries.get(key).copied()
 }
 
@@ -510,7 +527,7 @@ pub fn module_dict_entries_get(
 /// copied to the owned `String` the entry table stores inside the boundary.
 #[majit_macros::dont_look_inside]
 pub fn module_dict_entries_insert(
-    entries: &mut indexmap::IndexMap<String, PyObjectRef>,
+    entries: &mut ModuleDictEntries,
     key: &str,
     w_value: PyObjectRef,
 ) -> Option<PyObjectRef> {
@@ -520,7 +537,7 @@ pub fn module_dict_entries_insert(
 impl ModuleDictStorage {
     pub fn new() -> Self {
         Self {
-            entries: indexmap::IndexMap::new(),
+            entries: ModuleDictEntries::default(),
         }
     }
 
@@ -699,9 +716,7 @@ unsafe fn walk_one_global_cache(
 /// strategy-owned registry when multiple Python threads share a module.
 pub struct ModuleDictStrategy {
     pub version: VersionTag,
-    pub caches: std::sync::Mutex<
-        Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<GlobalCache>>>>,
-    >,
+    pub caches: std::sync::Mutex<Option<GlobalCacheRegistry>>,
     /// The hidden `mutate_version` field for `celldict.py:34
     /// _immutable_fields_ = ["version?"]`.  Each compiled loop whose trace
     /// promoted `self.version` (and folded a module-global lookup keyed on it)
@@ -828,15 +843,25 @@ impl ModuleDictStrategy {
         key: &str,
     ) -> std::sync::Arc<std::sync::Mutex<GlobalCache>> {
         let mut cache_registry = self.caches.lock().unwrap();
-        if cache_registry.is_none() {
-            *cache_registry = Some(std::collections::HashMap::new());
-        }
-        let already_present = match cache_registry.as_ref() {
-            Some(c) => c.contains_key(key),
-            None => false,
+        // `celldict.py`:
+        //     if self.caches is None:
+        //         cache = None
+        //         self.caches = {}
+        //     else:
+        //         cache = self.caches.get(key, None)
+        //
+        // One probe, not a `contains_key` followed by a `get`: `key` is the
+        // global's name and this runs whenever a code object's slot for it is
+        // empty, so the second hash was paid on every hit.
+        let cached = match cache_registry.as_mut() {
+            None => {
+                *cache_registry = Some(GlobalCacheRegistry::default());
+                None
+            }
+            Some(caches) => caches.get(key).cloned(),
         };
-        if already_present {
-            return cache_registry.as_ref().unwrap().get(key).unwrap().clone();
+        if let Some(cache) = cached {
+            return cache;
         }
         let cell = self.getdictvalue_no_unwrapping(storage, key);
         let caches = cache_registry.as_mut().unwrap();

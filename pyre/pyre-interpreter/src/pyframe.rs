@@ -1092,8 +1092,12 @@ impl FrameBox {
         // them one at a time would query for forwarding after the first write
         // and let a foreign collection run before the later values were
         // visible.
+        //
+        // Publish and normalize through the bracket's own cell: the free
+        // `pin_roots` resolves the thread-local once per phase, which on
+        // Darwin is an out-of-line `_tlv_get_addr` each time.
         let frame_root = pyre_object::gc_roots::push_roots();
-        let inputs = pyre_object::gc_roots::pin_roots(&[
+        let live = [
             frame.ob_header.w_class,
             frame.pycode as pyre_object::PyObjectRef,
             frame.locals_cells_stack_w as pyre_object::PyObjectRef,
@@ -1104,7 +1108,9 @@ impl FrameBox {
             frame.f_backref as pyre_object::PyObjectRef,
             frame.w_builtin,
             frame.w_globals,
-        ]);
+        ];
+        let inputs = frame_root.publish(&live);
+        frame_root.normalize(inputs, live.len());
         let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
             PYFRAME_GC_TYPE_ID,
             std::mem::size_of::<PyFrame>(),
@@ -1116,7 +1122,7 @@ impl FrameBox {
             // GC operation: a contended barrier is an entry safepoint, so an
             // unrooted fresh frame could otherwise be swept by another
             // collector between this allocation and the barrier below.
-            let _ = pyre_object::gc_roots::pin_root(raw as pyre_object::PyObjectRef);
+            let _ = frame_root.pin_root(raw as pyre_object::PyObjectRef);
             // Read back through the bracket's own cell rather than
             // `shadow_stack_get`, which resolves the thread-local per slot.
             frame.ob_header.w_class = frame_root.get(inputs);
@@ -5283,14 +5289,12 @@ impl PyFrame {
         // written before either is queried: a forwarding query is a safepoint,
         // and `args` would still be off the root stack while the scalars ran
         // theirs.
-        let root_base = pyre_object::gc_roots::publish_roots(&[
-            code as PyObjectRef,
-            w_globals,
-            closure,
-            w_builtin,
-        ]);
-        let args_base = pyre_object::gc_roots::publish_roots(args);
-        pyre_object::gc_roots::normalize_roots(root_base, 4 + args.len());
+        //
+        // Through the bracket's own cell rather than the free functions, which
+        // re-resolve the thread local on every call.
+        let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, w_builtin]);
+        let args_base = _roots.publish(args);
+        _roots.normalize(root_base, 4 + args.len());
         let code_ref =
             unsafe { &*(crate::w_code_get_ptr(_roots.get(root_base)) as *const CodeObject) };
         let num_locals = code_ref.varnames.len();

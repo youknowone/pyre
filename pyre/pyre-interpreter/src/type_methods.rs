@@ -6354,16 +6354,7 @@ pub fn str_method_translate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 // ── Dict methods ─────────────────────────────────────────────────────
 
-/// Layout-slot name reserved for a dict subclass's mapping payload, pyre's
-/// object-resident stand-in for the intrinsic `W_DictMultiObject` field a
-/// PyPy dict subclass carries.
-///
-/// The name holds a space so no class can declare it: `__slots__` entries are
-/// rejected unless they are identifiers. A spellable name would collide — the
-/// user's member is installed first and the reserved name appended after it,
-/// so `dict_data_slot` would answer with the user's index and the mapping
-/// payload would overwrite their slot.
-pub const DICT_DATA_SLOT: &str = "dict subclass w_dict_data";
+pub use pyre_object::typeobject::DICT_DATA_SLOT;
 
 /// Whether a type built on `w_base` owes its instances a reserved
 /// [`DICT_DATA_SLOT`] of their own: the base's instances are dicts, and no
@@ -6383,22 +6374,14 @@ pub unsafe fn base_owes_dict_backing(w_base: PyObjectRef) -> bool {
         if w_base.is_null() {
             return false;
         }
-        let mut layout = pyre_object::w_type_get_layout_ptr(w_base);
+        let layout = pyre_object::w_type_get_layout_ptr(w_base);
         let dict_typedef = &pyre_object::pyobject::DICT_TYPE as *const pyre_object::PyType;
         if layout.is_null() || !std::ptr::eq((*layout).typedef, dict_typedef) {
             return false;
         }
-        while !layout.is_null() {
-            if (*layout)
-                .newslotnames
-                .iter()
-                .any(|name| name == DICT_DATA_SLOT)
-            {
-                return false;
-            }
-            layout = (*layout).base_layout;
-        }
-        true
+        // `Layout::dict_data_slot` already answers for the whole chain — it
+        // is sealed with the base's index when a layout reserves none itself.
+        (*layout).dict_data_slot == pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED
     }
 }
 
@@ -6425,22 +6408,19 @@ unsafe fn dict_data_slot(obj: PyObjectRef) -> Option<u32> {
         if w_type.is_null() {
             return None;
         }
-        let mut layout = pyre_object::w_type_get_layout_ptr(w_type);
-        while !layout.is_null() {
-            let current = &*layout;
-            let first_slot = current
-                .nslots
-                .saturating_sub(current.newslotnames.len() as u32);
-            if let Some(offset) = current
-                .newslotnames
-                .iter()
-                .position(|name| name == DICT_DATA_SLOT)
-            {
-                return Some(first_slot + offset as u32);
-            }
-            layout = current.base_layout;
+        let layout = pyre_object::w_type_get_layout_ptr(w_type);
+        if layout.is_null() {
+            return None;
         }
-        None
+        // `typeobject.py create_all_slots` hands each `Member` the index it
+        // resolved while building the layout; the index is never re-derived
+        // from the slot's name afterwards.  `leak_layout` seals this one the
+        // same way, walking `base_layout` once instead of on every read.
+        let slot = (*layout).dict_data_slot;
+        if slot == pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED {
+            return None;
+        }
+        Some(slot as u32)
     }
 }
 
