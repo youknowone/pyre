@@ -2919,10 +2919,23 @@ impl WarmEnterState {
     /// key filed under a different bucket, so the token read has to go through
     /// [`Self::get_procedure_token`], which maps it. On an ambiguous bucket the
     /// greens are what settle it, exactly as [`Self::resolve_cell_key`] says.
+    /// `gate` runs on the resolved key, BEFORE the token is read.
+    ///
+    /// Reading a token is a `Weak::upgrade` and the `Arc` drop that answers it
+    /// — one atomic each. A caller whose real question is a conjunction of that
+    /// read and something cheaper about the same key wants the cheap half
+    /// first, and cannot have it while the resolve and the read are one step:
+    /// the cheap half needs the resolved key, which only the walk produces.
+    ///
+    /// The resolve is unaffected — the key comes back whatever `gate` answers,
+    /// and a refused gate reports no token, which is what the conjunction was
+    /// going to conclude anyway. A caller with no second conjunct passes a gate
+    /// that always accepts.
     pub fn resolved_cell_procedure_token(
         &self,
         hash: u64,
         make_key: impl FnOnce() -> GreenKey,
+        gate: impl FnOnce(u64) -> bool,
     ) -> (u64, Option<Arc<JitCellToken>>) {
         let mut count = 0usize;
         let mut found: Option<(&BaseJitCell, u64)> = None;
@@ -2939,11 +2952,22 @@ impl WarmEnterState {
             cell = c.next.as_deref();
         }
         match (count, found) {
-            (1, Some((cell, cell_key))) => (cell_key, cell.get_procedure_token()),
-            (0, _) => (hash, self.get_procedure_token(hash)),
+            (1, Some((cell, cell_key))) => (
+                cell_key,
+                gate(cell_key).then(|| cell.get_procedure_token()).flatten(),
+            ),
+            (0, _) => (
+                hash,
+                gate(hash).then(|| self.get_procedure_token(hash)).flatten(),
+            ),
             _ => {
                 let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
-                (cell_key, self.get_procedure_token(cell_key))
+                (
+                    cell_key,
+                    gate(cell_key)
+                        .then(|| self.get_procedure_token(cell_key))
+                        .flatten(),
+                )
             }
         }
     }

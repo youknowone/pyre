@@ -7622,19 +7622,23 @@ impl<S: JitState> JitDriver<S> {
     /// The resolved key travels back with the token because a caller that goes
     /// on to run needs it, and because the `compiled_loops` half of the
     /// predicate is keyed by it.
+    ///
+    /// The `compiled_loops` half is asked FIRST, as the gate the token read
+    /// sits behind. Both conjuncts are pure reads of the same key, so the order
+    /// does not change the answer, but their costs are not alike: the frontend
+    /// half is one hash probe, and the token read is a `Weak::upgrade` and the
+    /// `Arc` drop that answers it, one atomic each. A key with no compiled
+    /// entry — which is every key a door declines on — now stops at the probe.
     #[inline]
     pub fn resolved_runnable_procedure_token(
         &self,
         green_key_hash: u64,
         make_green_key: impl FnOnce() -> GreenKey,
     ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
-        let (cell_key, token) = self
-            .meta
-            .resolved_entry_procedure_token(green_key_hash, make_green_key);
-        (
-            cell_key,
-            token.filter(|_| self.meta.get_compiled_meta(cell_key).is_some()),
-        )
+        self.meta
+            .resolved_entry_procedure_token(green_key_hash, make_green_key, |cell_key| {
+                self.meta.get_compiled_meta(cell_key).is_some()
+            })
     }
 
     /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed

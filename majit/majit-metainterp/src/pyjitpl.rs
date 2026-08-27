@@ -12248,14 +12248,18 @@ impl<M: Clone> MetaInterp<M> {
     /// The key comes back because the second conjunct of the runnable predicate
     /// reads `compiled_loops`, which is indexed by that key and is not a cell
     /// walk, so the caller still needs it.
+    /// `gate` runs on the resolved key before the token is read — see
+    /// [`WarmState::resolved_cell_procedure_token`] for why a caller would
+    /// want that.
     pub fn resolved_entry_procedure_token(
         &self,
         green_key_hash: u64,
         make_green_key: impl FnOnce() -> majit_ir::GreenKey,
+        gate: impl FnOnce(u64) -> bool,
     ) -> (u64, Option<std::sync::Arc<JitCellToken>>) {
-        let (cell_key, token) = self
-            .warm_state
-            .resolved_cell_procedure_token(green_key_hash, make_green_key);
+        let (cell_key, token) =
+            self.warm_state
+                .resolved_cell_procedure_token(green_key_hash, make_green_key, gate);
         (cell_key, token.filter(|token| token.has_compiled_code()))
     }
 
