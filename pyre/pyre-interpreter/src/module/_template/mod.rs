@@ -9,7 +9,7 @@ crate::py_module! {
     appleveldefs: {
         "_template_app.py" => [
             "Template", "Interpolation",
-            "_build_template", "_build_interpolation", "_reconstruct",
+            "_build_template", "_build_interpolation",
         ],
     },
     extra_init: |ns| {

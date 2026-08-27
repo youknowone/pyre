@@ -64,6 +64,12 @@ class Interpolation:
         return (f'Interpolation({self._value!r}, {self._expression!r}, '
                 f'{self._conversion!r}, {self._format_spec!r})')
 
+    def __reduce__(self):
+        # CPython 3.14 `interpolation_reduce`: reconstruct through the exact
+        # public type and the four constructor fields, in their storage order.
+        return (type(self), (self._value, self._expression,
+                             self._conversion, self._format_spec))
+
 
 class Template:
     # CPython 3.14 Objects/templateobject.c: template_methods —
@@ -145,17 +151,16 @@ class Template:
                 f'interpolations={self._interpolations!r})')
 
     def __reduce__(self):
-        return (_reconstruct, (self._strings, self._interpolations))
+        # CPython 3.14 `template_reduce` resolves the public app-level helper
+        # instead of making the private runtime module part of the pickle.
+        from string.templatelib import _template_unpickle
+        return (_template_unpickle, (self._strings, self._interpolations))
 
 
 def _concat_boundary(left, right):
     # Merge the touching boundary strings of two templates: the last static
     # string of `left` joins the first of `right`.
     return left[:-1] + (left[-1] + right[0],) + right[1:]
-
-
-def _reconstruct(strings, interpolations):
-    return Template._make(strings, interpolations)
 
 
 def _build_template(strings, interpolations):
