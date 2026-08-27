@@ -8593,30 +8593,51 @@ fn may_force_vable_escape_surfaces_typed_abort() {
     );
 }
 
-#[test]
-fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
-    // RPython parity: `pyjitpl.py` routes
-    // `OS_NOT_IN_TRACE` residual calls through `do_not_in_trace_call`
-    // which executes the callee concretely and aborts to blackhole
-    // only if it raises (`pyjitpl.py`). The walker has no
-    // concrete executor, so it must surface a typed error rather
-    // than recording either the normal-return or
-    // SwitchToBlackhole shape.
-    let residual_byte = *insns_opname_to_byte()
-        .get("residual_call_r_r/iRd>r")
-        .expect("`residual_call_r_r/iRd>r` must be in insns table");
-    let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+/// A `jit.not_in_trace` callee that returns normally.
+///
+/// `execute_residual_call` reads the raise out of `BH_LAST_EXC_VALUE`, so
+/// leaving that cell alone is what "returned normally" means at this seam.
+extern "C" fn not_in_trace_returns_for_walker_test() -> i64 {
+    NOT_IN_TRACE_CALLS.with(|c| c.set(c.get() + 1));
+    0
+}
+
+/// The same callee, raising: publishes a non-zero exception pointer on
+/// `BH_LAST_EXC_VALUE` (the blackhole `bh_call_*` convention).
+extern "C" fn not_in_trace_raises_for_walker_test() -> i64 {
+    NOT_IN_TRACE_CALLS.with(|c| c.set(c.get() + 1));
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xDEAD));
+    0
+}
+
+thread_local! {
+    /// Counts entries into the two callees above, so a test can tell
+    /// "executed concretely" from "recorded symbolically and never run".
+    static NOT_IN_TRACE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Drive [`do_not_in_trace_call_result`] against a real callee address.
+///
+/// Returns the outcome, how many ops the trace grew by, and how many times
+/// the callee actually ran.
+fn run_not_in_trace(
+    callee: extern "C" fn() -> i64,
+    dst_bank: char,
+) -> (Result<Option<DispatchOutcome>, DispatchError>, usize, u32) {
     let mut tc = fresh_trace_ctx();
-    let mut regs_i = distinct_const_refs(&mut tc, 1);
-    let mut regs_r = distinct_const_refs(&mut tc, 4);
-    let not_in_trace_descr = call_descr_with_oopspec(
-        43,
-        majit_ir::ExtraEffect::CannotRaise,
+    let funcbox = tc.const_int(callee as *const () as i64);
+    let allboxes = [funcbox];
+    let descr = call_descr_with_oopspec(
+        44,
+        majit_ir::ExtraEffect::CanRaise,
         majit_ir::OopSpecIndex::NotInTrace,
     );
-    let descr_pool = vec![not_in_trace_descr];
-    let frame_done_descr = done_descr_ref_for_tests();
+    let call_descr = descr.as_call_descr().expect("CallDescr");
+    let mut regs_i: Vec<OpRef> = Vec::new();
+    let mut regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
+    NOT_IN_TRACE_CALLS.with(|c| c.set(0));
+    let ops_before = tc.ops().len();
     let mut wc = WalkContext {
         callee_shadow: None,
         inline_callee_consts: None,
@@ -8628,9 +8649,9 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
         registers_f: &mut [],
         concrete_registers_r: &mut [],
         concrete_registers_i: &mut [],
-        descr_refs: &descr_pool,
+        descr_refs: &[],
         raw_descrs: RawDescrPool::Global,
-        is_authoritative_executor: false,
+        is_authoritative_executor: true,
         trace_ctx: &mut tc,
         is_top_level: true,
         sub_jitcode_lookup: &no_sub_jitcodes,
@@ -8650,10 +8671,76 @@ fn residual_call_r_r_with_not_in_trace_oopspec_returns_typed_error() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
+    let ei = call_descr.get_extra_info();
+    let outcome = do_not_in_trace_call_result(&mut wc, ei, &allboxes, call_descr, dst_bank, 0);
+    drop(wc);
+    let grew = tc.ops().len() - ops_before;
+    (outcome, grew, NOT_IN_TRACE_CALLS.with(|c| c.get()))
+}
+
+#[test]
+fn not_in_trace_normal_return_executes_concretely_and_records_no_ir() {
+    // `do_not_in_trace_call` (pyjitpl.py) runs the callee through
+    // `execute_varargs` and returns `None`, so `do_residual_call` hands its
+    // caller no result box and the history never grows: "the trace doesn't
+    // contain the call at all".
+    let (outcome, ops_recorded, calls) =
+        run_not_in_trace(not_in_trace_returns_for_walker_test, 'v');
     assert_eq!(
-        err,
-        DispatchError::NotInTraceRequiresConcreteExecution { pc: 0 },
+        outcome,
+        Ok(Some(DispatchOutcome::Continue)),
+        "a normally-returning OS_NOT_IN_TRACE callee must let the walk continue",
+    );
+    assert_eq!(
+        calls, 1,
+        "the callee must be executed concretely, exactly once"
+    );
+    assert_eq!(
+        ops_recorded, 0,
+        "OS_NOT_IN_TRACE records no IR — upstream returns None from \
+         do_not_in_trace_call, so no ResOperation joins the history",
+    );
+}
+
+#[test]
+fn not_in_trace_raise_switches_to_blackhole_and_records_no_ir() {
+    // pyjitpl.py: "cannot trace this!  it raises, so we have to follow the
+    // exception-catching path, but the trace doesn't contain the call at
+    // all" — `SwitchToBlackhole(Counters.ABORT_ESCAPE,
+    // raising_exception=True)`.
+    let (outcome, ops_recorded, calls) = run_not_in_trace(not_in_trace_raises_for_walker_test, 'v');
+    assert_eq!(
+        outcome,
+        Ok(Some(DispatchOutcome::SwitchToBlackhole {
+            reason: majit_metainterp::counters::ABORT_ESCAPE,
+            raising_exception: true,
+        })),
+        "a raising OS_NOT_IN_TRACE callee must abort to blackhole",
+    );
+    assert_eq!(
+        calls, 1,
+        "the raise is observed by running the callee, not by guessing"
+    );
+    assert_eq!(
+        ops_recorded, 0,
+        "the aborting case records no IR either — the call is absent from the trace",
+    );
+}
+
+#[test]
+fn not_in_trace_with_a_destination_bank_stays_fail_loud() {
+    // `jtransform.py` refuses to emit a `jit.not_in_trace` call whose result
+    // is not `lltype.Void`, so only the `residual_call_*_v` spellings can
+    // carry this oopspec. A destination bank here is a codewriter invariant
+    // violation; the walker must not invent a value for it.
+    let (outcome, _ops, calls) = run_not_in_trace(not_in_trace_returns_for_walker_test, 'r');
+    assert_eq!(
+        outcome,
+        Err(DispatchError::NotInTraceRequiresConcreteExecution { pc: 0 }),
+    );
+    assert_eq!(
+        calls, 0,
+        "the guard must fail before running anything, so the refusal has no side effect",
     );
 }
 

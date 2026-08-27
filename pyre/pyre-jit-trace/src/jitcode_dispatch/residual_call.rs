@@ -4546,38 +4546,77 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
 ///     return self.metainterp.do_not_in_trace_call(allboxes, descr)
 /// ```
 ///
-/// Upstream's `do_not_in_trace_call` (pyjitpl.py) executes the
-/// callee concretely and raises `SwitchToBlackhole(ABORT_ESCAPE,
-/// raising_exception=True)` if it raised, otherwise returns `None` so
-/// no IR op is recorded.
+/// ```python
+/// def do_not_in_trace_call(self, allboxes, descr):
+///     self.clear_exception()
+///     executor.execute_varargs(self.cpu, self, rop.CALL_N, allboxes, descr)
+///     if self.last_exc_value:
+///         raise SwitchToBlackhole(Counters.ABORT_ESCAPE,
+///                                 raising_exception=True)
+///     return None
+/// ```
 ///
-/// The pyre trace-walker has no concrete-execution callback for
-/// jitcode-walked residual_call bytecodes yet — concrete execution
-/// happens in the metainterp layer (`pyjitpl.rs
-/// do_not_in_trace_call`) which dispatches `BC_CALL_*` not
-/// `BC_RESIDUAL_CALL_*`. Therefore an `OS_NOT_IN_TRACE` callee that
-/// reached this dispatcher cannot be safely treated as a regular
-/// residual call: upstream records no IR for the normal case, and
-/// aborts to blackhole only when the concrete call raises. Until that
-/// concrete callback is threaded into `WalkContext`, the walker reports
-/// a typed error instead of inventing either outcome.
+/// The check sits at the TOP of `do_residual_call`, ahead of the
+/// forces-virtual branch, so `vable_and_vrefs_before_residual_call` and
+/// the vref bracket never run for this callee: the trace does not contain
+/// the call at all, and there is nothing for a force to have escaped
+/// through.  `rop.CALL_N` is a void call and the `return None` gives the
+/// caller no result box, so no destination register is written either.
 ///
-/// `effect_info_for_call_flavor` (`flatten.rs` audit table) never
-/// sets `oopspecindex`, so this branch is unreachable from production
-/// today. A future producer that begins populating `oopspecindex`
-/// should replace this guard with a real `do_not_in_trace_call`
-/// callback returning `Ok(None)` on normal completion and
-/// `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)` only on
-/// raise.
+/// Concrete execution is [`walker_execute_may_force_boxed_outcome`],
+/// which resolves each argbox to its recorded concrete and calls through
+/// `majit_metainterp::executor::execute_residual_call` without recording
+/// IR — `execute_varargs` off the history, exactly what this arm needs.
+/// It answers `None` when some argbox has no concrete to resolve (the
+/// funcbox is not a constant, or a Ref argbox carries `NO_CONCRETE`);
+/// there is no faithful outcome to invent there, so the typed
+/// [`DispatchError::NotInTraceRequiresConcreteExecution`] still surfaces.
+/// The same error covers a `>X` destination bank. That is upstream's own
+/// invariant, not a pyre restriction: `jtransform.py`'s
+/// `jit.not_in_trace` arm refuses to emit the call at all unless
+/// `op.result.concretetype is lltype.Void` -- *"jit.not_in_trace()
+/// function must return None"* -- so only the `residual_call_*_v`
+/// spellings can carry this oopspec, and a destination reaching here
+/// names a codewriter invariant violation rather than a shape to guess
+/// at.
+///
+/// `effect_info_for_call_flavor` (`flatten.rs` audit table) still never
+/// sets `oopspecindex`, so no production residual call reaches this arm
+/// today; the tests drive it directly.
 #[inline]
-pub(crate) fn do_not_in_trace_call_result(
+pub(crate) fn do_not_in_trace_call_result<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
     ei: &majit_ir::EffectInfo,
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
     pc: usize,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if ei.oopspecindex == OopSpecIndex::NotInTrace {
+    if ei.oopspecindex != OopSpecIndex::NotInTrace {
+        return Ok(None);
+    }
+    if dst_bank != 'v' {
         return Err(DispatchError::NotInTraceRequiresConcreteExecution { pc });
     }
-    Ok(None)
+    // `do_not_in_trace_call`: `self.clear_exception()` before the call, so a
+    // raise the callee leaves behind is unambiguously its own.
+    ctx.clear_last_exc_value();
+    let Some(outcome) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr) else {
+        return Err(DispatchError::NotInTraceRequiresConcreteExecution { pc });
+    };
+    match outcome {
+        // Normal completion records nothing: upstream returns `None` from
+        // `do_not_in_trace_call` and `do_residual_call` passes that straight
+        // out, so no ResOperation joins the history.
+        Ok(_) => Ok(Some(DispatchOutcome::Continue)),
+        // "cannot trace this! it raises, so we have to follow the
+        // exception-catching path, but the trace doesn't contain the call at
+        // all."
+        Err(_) => Ok(Some(DispatchOutcome::SwitchToBlackhole {
+            reason: majit_metainterp::counters::ABORT_ESCAPE,
+            raising_exception: true,
+        })),
+    }
 }
 
 /// IR-recording portion of `pyjitpl.py
@@ -6239,7 +6278,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // pyjitpl.py OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
-    if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
+    if let Some(outcome) =
+        do_not_in_trace_call_result(ctx, ei, &allboxes, call_descr, dst_bank, op.pc)?
+    {
         return Ok((outcome, op.next_pc));
     }
     // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — walker
@@ -7517,7 +7558,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     let ei = call_descr.get_extra_info();
     // pyjitpl.py OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
-    if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
+    if let Some(outcome) =
+        do_not_in_trace_call_result(ctx, ei, &allboxes, call_descr, dst_bank, op.pc)?
+    {
         return Ok((outcome, op.next_pc));
     }
     // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — see
@@ -8592,7 +8635,9 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
 
     let ei = call_descr.get_extra_info();
     clear_walk_exception(ctx);
-    if let Some(outcome) = do_not_in_trace_call_result(ei, op.pc)? {
+    if let Some(outcome) =
+        do_not_in_trace_call_result(ctx, ei, &allboxes, call_descr, dst_bank, op.pc)?
+    {
         return Ok((outcome, op.next_pc));
     }
     // pyjitpl.py OS_JIT_FORCE_VIRTUAL fail-loud — see
