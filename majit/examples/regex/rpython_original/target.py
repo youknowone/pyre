@@ -53,6 +53,12 @@ def entry_point(argv):
     if len(argv) > 3:
         repeats = int(argv[3])
 
+    # The cross-port input pin, run before anything is timed: a number
+    # printed below only compares to the Rust side if both scan the same
+    # bytes.
+    if not fixture.check_digest():
+        return 1
+
     re = fixture.bench_regex(n)
     s = fixture.nonmatching(length, n, 42)
     print "nodes=%d chars=%d repeats=%d" % (fixture.count(re), len(s), repeats)

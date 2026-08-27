@@ -54,7 +54,7 @@ def nonmatching(length, n, seed):
 
     Pinned against the Rust side by `NONMATCHING_4096_FNV1A` -- see
     `test_nonmatching_digest_pins_the_cross_port_input` in `regex.rs`, and
-    `check_digest` below.
+    `check_digest` below, which is what runs that pin on THIS side.
     """
     chars = ['a'] * length
     sd = r_uint(seed)
@@ -83,3 +83,25 @@ def digest(s):
     for i in range(len(s)):
         h = (h ^ r_uint(ord(s[i]))) * FNV_PRIME
     return h
+
+
+def check_digest():
+    """Run the RPython half of the cross-port input pin. `False` = mismatch.
+
+    `regex.rs test_nonmatching_digest_pins_the_cross_port_input` asserts this
+    digest over `nonmatching(4096, 20, 42)`. Until this function existed the
+    docstring above named it but nothing computed it, so the pin held on one
+    side only: the Rust side could move its generator and this port would
+    still print a number, on a different string, and the trace-shape
+    comparison beside it would read as agreement.
+
+    Called from `runner.py` and from both translation targets, so no path that
+    reports a number skips it.
+    """
+    if digest(nonmatching(4096, 20, 42)) == NONMATCHING_4096_FNV1A:
+        return True
+    print "FIXTURE DIGEST MISMATCH: nonmatching(4096, 20, 42) is not the"
+    print "string `regex.rs NONMATCHING_4096_FNV1A` pins. The two ports are"
+    print "no longer scanning the same bytes, so nothing measured here"
+    print "compares to anything measured there."
+    return False

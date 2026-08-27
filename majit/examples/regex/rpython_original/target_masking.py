@@ -8,8 +8,8 @@ metainterpreter in process and answers what the *trace* looks like; it cannot
 answer how fast the trace runs, because `meta_interp` executes traces in an
 interpreter. Only a translated binary can, which is what the post built:
 
-    pypy ../../../../rpython/bin/rpython --opt=jit  target.py   # RPython + JIT
-    pypy ../../../../rpython/bin/rpython --opt=2    target.py   # translated to C
+    pypy ../../../../rpython/bin/rpython --opt=jit  target_masking.py
+    pypy ../../../../rpython/bin/rpython --opt=2    target_masking.py
 
 Those are the post's two rows -- 16,500,000 and 720,000 chars/s on its 2010
 hardware -- and dividing one by the other on ONE machine is the only quantity
@@ -55,6 +55,12 @@ def entry_point(argv):
         length = int(argv[2])
     if len(argv) > 3:
         repeats = int(argv[3])
+
+    # The cross-port input pin, run before anything is timed: a number
+    # printed below only compares to the Rust side if both scan the same
+    # bytes.
+    if not fixture.check_digest():
+        return 1
 
     re = fixture.bench_regex(n)
     s = fixture.nonmatching(length, n, 42)

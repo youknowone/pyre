@@ -18,6 +18,17 @@ pub const KIND_REPETITION: u8 = 4;
 /// `left` and `right` are all fixed once lowered; `marked` is the single
 /// mutable bit the algorithm shifts around.
 ///
+/// `empty` and `marked` are `u8` where `marked.py` writes Python bools, and
+/// the traced `shift` carries the mark as `i64`.  That is not a deviation at
+/// the layer this experiment measures: RPython's `lltype.Bool` is an
+/// int-typed field to the JIT — a read of one is `getfield_gc_i` against a
+/// size-1 fielddescr, and it travels in the int box channel — so the
+/// translated original's trace carries the same quantity in the same bank.
+/// The `u8` is what makes that visible in Rust, which has no bank narrower
+/// than the int one either.  The masking A/B is unaffected in both
+/// directions: Rust's `&`/`|` on `bool` are already non-short-circuiting, so
+/// the operators, not the width, are what `shortcircuit.rs` varies.
+///
 /// The declaration names every fixed field and stops there.  `marked` is the
 /// one omission and the whole experiment turns on it: with the others declared,
 /// a walk from a constant root folds away entirely and the marks are all that

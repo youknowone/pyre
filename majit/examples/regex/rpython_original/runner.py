@@ -114,6 +114,13 @@ def main():
     n = int(args[0]) if len(args) > 0 else 20
     length = int(args[1]) if len(args) > 1 else 4096
 
+    # The cross-port input pin, on this side. `regex.rs`
+    # `test_nonmatching_digest_pins_the_cross_port_input` asserts the same
+    # digest; a trace census that agrees with the Rust one only means anything
+    # if both ran over the same bytes.
+    if not fixture.check_digest():
+        return 1
+
     harness = RegexJit()
     res = harness.meta_interp(build_and_match, [n, length, 42],
                               listops=True, backendopt=True)
@@ -135,7 +142,8 @@ def main():
             print('  --- ops in order ---')
             for j, op in enumerate(body):
                 print('  %4d  %s' % (j, op.getopname()))
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

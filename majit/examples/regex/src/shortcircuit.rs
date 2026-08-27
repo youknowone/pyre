@@ -317,7 +317,7 @@
 //! 42,548,721 / 4,514,372 = 9.4x against RPython's own 9.5x.
 //!
 //! **On the unadapted spelling both JITs lose to their own C, and this module
-//! loses harder.** RPython's `and`/`or` JIT is 8.2x slower than RPython
+//! loses harder.** RPython's `and`/`or` JIT is 8.1x slower than RPython
 //! translated to C. "Not particularly fast" is a property of the spelling, not
 //! of majit — upstream pays it in the same direction and the same order of
 //! magnitude. This module pays it 4.1x harder than upstream does, and that
@@ -861,6 +861,15 @@ mod tests {
         /// branching to masking (guards 26 -> 28) straight through.
         branching_total: usize,
         branching_guards: usize,
+        /// majit's masking body, recorded, for the same reason the branching
+        /// column is. This column is the other half of the A/B and it is
+        /// quoted in five places -- this module's doc, `jit_interp.rs`,
+        /// `regex.rs`, and `rpython_original/README.md` -- and until it was
+        /// pinned here the only thing asserted about it was `mk_guards * 4 <
+        /// sc_guards`, a band wide enough to hold any drift that kept the
+        /// guard count near 1.
+        masking_total: usize,
+        masking_guards: usize,
     }
 
     /// The post's own benchmark regex, `(a|b)*a(a|b){20}a(a|b)*`.
@@ -877,6 +886,12 @@ mod tests {
         // RPython's one extra guard and its two `debug_merge_point`s.
         branching_total: 176,
         branching_guards: 26,
+        // masking: one guard -- the loop-exit `IntLt` -- and the 18 ops the
+        // branching column spends on its other 25 guards reappear as
+        // straight-line `IntAnd`/`IntOr`, so the body is LONGER than the
+        // branching one while guarding 26x less. That inversion is the A/B.
+        masking_total: 194,
+        masking_guards: 1,
     };
 
     /// The node-count control: `{2}` instead of `{20}`, so 21 nodes.
@@ -893,6 +908,12 @@ mod tests {
         int_eq: 2,
         branching_total: 51,
         branching_guards: 9,
+        // At 21 nodes the masking body is one op SHORTER than the branching
+        // one (50 against 51) and still carries the single loop-exit guard:
+        // eight of the branching column's nine guards cost more than the
+        // masking arithmetic that replaces them at this size.
+        masking_total: 50,
+        masking_guards: 1,
     };
 
     fn guards(body: &[OpCode]) -> usize {
@@ -1221,13 +1242,40 @@ mod tests {
                 want.rpython_total,
             );
 
-            // The masking portal stays the other side of the A/B.
+            // The masking portal stays the other side of the A/B. The
+            // relationship first, because it is the claim the post's remark is
+            // about and it survives both columns moving together.
             let (sc_guards, mk_guards) = (guards(&sc.body), guards(&mk.body));
             assert!(
                 mk_guards * 4 < sc_guards,
                 "{nodes} nodes: the masking body has {mk_guards} guards \
                  against the branching body's {sc_guards}; the two portals no \
                  longer differ in the thing the post's remark is about",
+            );
+            // Then the column itself, exactly, the same way the branching one
+            // is pinned. The relationship above holds for any masking guard
+            // count under a quarter of the branching one, so on its own it
+            // would let this column drift while four documents keep quoting
+            // the numbers it used to have.
+            assert_eq!(
+                mk_guards,
+                want.masking_guards,
+                "{nodes} nodes: the masking body has {mk_guards} guards \
+                 against the {} recorded. This column is quoted in this \
+                 module's doc, `jit_interp.rs`, `regex.rs` and \
+                 `rpython_original/README.md`; if the change is deliberate, \
+                 re-record it in all of them",
+                want.masking_guards,
+            );
+            assert_eq!(
+                mk.body.len(),
+                want.masking_total,
+                "{nodes} nodes: the masking body is {} ops against the {} \
+                 recorded (RPython's is {}, the branching body's is {})",
+                mk.body.len(),
+                want.masking_total,
+                want.rpython_total,
+                want.branching_total,
             );
         }
     }

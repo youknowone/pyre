@@ -293,7 +293,7 @@ the same too: 42,548,721 / 4,514,372 = **9.4x** against RPython's own
 = 22.9x on 2010 hardware.
 
 **On the unadapted spelling both JITs lose to their own C, and majit loses
-harder.** RPython's `and`/`or` JIT is **8.2x slower than RPython translated to
+harder.** RPython's `and`/`or` JIT is **8.1x slower than RPython translated to
 C** (555,383 against 4,514,372). So "if you don't change the `and` and `or`
 ... it's not particularly fast" is not a majit artifact and not a Rust
 artifact — it is a property of the spelling, and upstream pays it in the same
@@ -335,13 +335,15 @@ cargo test -p regex --release --no-default-features --features dynasm \
 [perf] majit JIT / no JIT = 5.5x   (the post's own: 16,500,000 / 720,000 = 22.9x)
 ```
 
-That ratio is smaller than the table's 9.4x because its denominator is
-`interp.rs` rather than RPython's C — and the table says those two are within
-10% of each other (majit's no-JIT row reads 4,175,067 against `target.py`'s
-4,514,372), so the two denominators are comparable and the two ratios are
-measuring the same thing at different lengths and loads. `--release` matters: a
-debug run reads about 9.0x because the denominator is unoptimized, and the test
-prints a banner saying so rather than letting that number be quoted.
+That ratio is smaller than the table's 9.4x, and the whole difference is in
+the denominators: this one is `interp.rs` at 6,700,337 chars/s in the block
+above, the table's is `target.py` — RPython translated to C — at 4,514,372, so
+`interp.rs` is the FASTER denominator by 1.48x. The numerators are the same
+quantity measured under different load (36,530,817 here against the table's
+42,548,721), and 1.16 x 1.48 = 1.72 is exactly the 9.4 / 5.5 between the two
+ratios. `--release` matters: a debug run reads about 9.0x because the
+denominator is unoptimized, and the test prints a banner saying so rather than
+letting that number be quoted.
 
 Cranelift reads 2.6x in the same conditions. The two backends agree op for op
 on every census above and differ only here — this row includes the one
