@@ -1019,6 +1019,10 @@ pub struct FrameBox {
 /// `pyre/scripts/vable-projection-census.py` is the corpus-level check.
 const _: fn(PyFrame) -> FrameBox = FrameBox::new;
 
+/// First published-root index [`FrameBox::new`] gives to the interior of a
+/// `std::alloc` `FrameDebugData`, after the frame's own nine GCREF fields.
+const FRAME_BOX_DEBUG_INPUT: usize = 9;
+
 impl FrameBox {
     /// Move `frame` onto the heap behind a GC header.
     ///
@@ -1084,8 +1088,19 @@ impl FrameBox {
         // Publish and normalize through the bracket's own cell: the free
         // `pin_roots` resolves the thread-local once per phase, which on
         // Darwin is an out-of-line `_tlv_get_addr` each time.
+        //
+        // A `FrameDebugData` the collector owns needs nothing beyond the
+        // pointer: `FRAME_DEBUG_DATA_GC_TYPE_ID` declares every `PyObjectRef`
+        // offset in it, so the ordinary walker forwards the interior.  A
+        // `std::alloc` block does not — `finish_for_call_with_globals_obj`
+        // creates the debug block on a stack `PyFrame`, where `aux_allocation`
+        // answers `StdAlloc`, and the globals override a shared code object
+        // stores there is then named by nothing the collector scans.  Publish
+        // that block's own fields alongside the frame's and write them back.
         let frame_root = pyre_object::gc_roots::push_roots();
-        let live = [
+        let unscanned_debugdata = !frame.debugdata.is_null()
+            && !pyre_object::gc_hook::try_gc_owns_object(frame.debugdata as *mut u8);
+        let mut published = [
             frame.ob_header.w_class,
             frame.pycode as pyre_object::PyObjectRef,
             frame.locals_cells_stack_w as pyre_object::PyObjectRef,
@@ -1095,9 +1110,29 @@ impl FrameBox {
             frame.w_yielding_from,
             frame.f_backref as pyre_object::PyObjectRef,
             frame.w_builtin,
+            PY_NULL,
+            PY_NULL,
+            PY_NULL,
+            PY_NULL,
+            PY_NULL,
         ];
-        let inputs = frame_root.publish(&live);
-        frame_root.normalize(inputs, live.len());
+        if unscanned_debugdata {
+            let debug = unsafe { &*frame.debugdata };
+            published[FRAME_BOX_DEBUG_INPUT..].copy_from_slice(&[
+                debug.w_globals,
+                debug.w_locals,
+                debug.w_extra_locals,
+                debug.w_f_trace,
+                debug.hidden_operationerr,
+            ]);
+        }
+        let published: &[pyre_object::PyObjectRef] = if unscanned_debugdata {
+            &published
+        } else {
+            &published[..FRAME_BOX_DEBUG_INPUT]
+        };
+        let inputs = frame_root.publish(published);
+        frame_root.normalize(inputs, published.len());
         let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
             PYFRAME_GC_TYPE_ID,
             std::mem::size_of::<PyFrame>(),
@@ -1122,6 +1157,14 @@ impl FrameBox {
             frame.w_yielding_from = frame_root.get(inputs + 6);
             frame.f_backref = frame_root.get(inputs + 7) as *mut PyFrame;
             frame.w_builtin = frame_root.get(inputs + 8);
+            if unscanned_debugdata {
+                let debug = unsafe { &mut *frame.debugdata };
+                debug.w_globals = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT);
+                debug.w_locals = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT + 1);
+                debug.w_extra_locals = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT + 2);
+                debug.w_f_trace = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT + 3);
+                debug.hidden_operationerr = frame_root.get(inputs + FRAME_BOX_DEBUG_INPUT + 4);
+            }
             debug_assert!(pyre_object::gc_hook::try_gc_owns_object(
                 frame.locals_cells_stack_w as *mut u8
             ));
@@ -2975,22 +3018,29 @@ impl PyFrame {
             // debugdata pointer, mirroring the translated RPython shadow-stack
             // reload around `getorcreatedebug`.
             let frame_anchor = crate::eval::FrameAnchor::new(self);
-            let current = unsafe { &*frame_anchor.live() };
-            let allocation = current.aux_allocation();
-            let value = FrameDebugData::new(current.pycode, init_lineno);
-            let debugdata = if allocation == FrameLocalsArrayAllocation::OldGenGc {
-                let raw = pyre_object::gc_hook::try_gc_alloc_stable_raw(
+            let allocation = unsafe { (*frame_anchor.live()).aux_allocation() };
+            let raw = if allocation == FrameLocalsArrayAllocation::OldGenGc {
+                pyre_object::gc_hook::try_gc_alloc_stable_raw(
                     FRAME_DEBUG_DATA_GC_TYPE_ID,
                     std::mem::size_of::<FrameDebugData>(),
-                );
-                if !raw.is_null() {
-                    unsafe { std::ptr::write(raw as *mut FrameDebugData, value) };
-                    raw as *mut FrameDebugData
-                } else {
-                    pyre_object::lltype::malloc_raw(value)
-                }
+                ) as *mut FrameDebugData
             } else {
+                std::ptr::null_mut()
+            };
+            // Build the payload only after that allocation.  `FrameDebugData::new`
+            // copies the code object's first-seen globals into this stack
+            // temporary; a collection inside the allocation forwards the
+            // anchored frame and the `PyCode` slot the copy came from, but
+            // nothing names the temporary, so constructing it first would
+            // publish a pre-collection address into the new block.  Only an
+            // atomic field read separates the allocation from the write below,
+            // so the fresh block crosses no safepoint unrooted.
+            let value = FrameDebugData::new(unsafe { (*frame_anchor.live()).pycode }, init_lineno);
+            let debugdata = if raw.is_null() {
                 pyre_object::lltype::malloc_raw(value)
+            } else {
+                unsafe { std::ptr::write(raw, value) };
+                raw
             };
             unsafe { (*frame_anchor.live()).debugdata = debugdata };
             let debugdata = unsafe { (*frame_anchor.live()).debugdata };
