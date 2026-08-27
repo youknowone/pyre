@@ -446,14 +446,20 @@ fn terminal_size_seq_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
-/// `os.uname_result` structseq — `(sysname, nodename, release, version,
-/// machine)`; repr renders "posix.uname_result(...)".
-#[cfg(unix)]
+/// `uname_result` structseq — `(sysname, nodename, release, version,
+/// machine)`.  `uname_result_desc` names the type after the module it is
+/// registered in, which is what pickle imports to resolve it: `posix` where
+/// this module is `posix`, `nt` on Windows, which has the type even though it
+/// has no `uname` to build one with.
 fn uname_result_seq_type() -> PyObjectRef {
     static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         crate::_structseq::make_struct_seq(
-            "posix.uname_result",
+            if cfg!(windows) {
+                "nt.uname_result"
+            } else {
+                "posix.uname_result"
+            },
             &["sysname", "nodename", "release", "version", "machine"],
         ) as usize
     }) as PyObjectRef
@@ -4400,10 +4406,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
     crate::module_ns_store(ns, "statvfs_result", statvfs_result_seq_type());
     crate::module_ns_store(ns, "times_result", times_result_seq_type());
-    // `uname_result` names `posix` as its module, which is what pickle imports
-    // to resolve it; only the POSIX hosts have that module, and only they
-    // register `uname` below.
-    #[cfg(unix)]
     crate::module_ns_store(ns, "uname_result", uname_result_seq_type());
 
     // ── posix.get_terminal_size(fd=1) → os.terminal_size(columns, lines) ──

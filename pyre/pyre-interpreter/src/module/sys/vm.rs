@@ -1464,7 +1464,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // directory and the PythonCore registry keys. site.getusersitepackages
     // reads it to build USER_SITE.  A build without a global interpreter lock
     // carries the `t` here, which is how Windows spells what `sys.abiflags`
-    // spells elsewhere.
+    // spells elsewhere: the tag follows the ABI the build publishes
+    // (`Py_GIL_DISABLED` is 1 and `abi_thread` is `t`), not
+    // `sys._is_gil_enabled()`, which reports whether the lock is on right now.
+    // `venv.EnvBuilder.setup_python` reads the same config var to name
+    // `python3.14t.exe`.
     #[cfg(windows)]
     module_ns_store(ns, "winver", w_str_new("3.14t"));
     // sys.dllhandle — the handle of the DLL exporting the Python C API,
@@ -2348,9 +2352,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         store_fn(mon, "restart_events", |_| Ok(w_none()), 0);
         module_ns_store(ns, "monitoring", mon);
     }
-    // sys.platlibdir — typically "lib" on POSIX; used by sysconfig to
-    // construct install paths.
-    module_ns_store(ns, "platlibdir", w_str_new("lib"));
+    // sys.platlibdir — the platform-specific library directory sysconfig and
+    // `site.addsitepackages` build install paths from: "lib" on POSIX, and
+    // "DLLs" on Windows, where the extension modules sit beside the interpreter
+    // instead of under a versioned lib directory.
+    module_ns_store(
+        ns,
+        "platlibdir",
+        w_str_new(if cfg!(windows) { "DLLs" } else { "lib" }),
+    );
     // `sys/app.py exit(exitcode=None)` — raise SystemExit(exitcode),
     // de-tupelizing a tuple argument so `exit((a, b))` becomes
     // `SystemExit(a, b)` (the extra de-tupelizing normalize_exception does

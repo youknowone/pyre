@@ -117,7 +117,13 @@ const SF_DATALESS: u32 = 0x40000000;
 
 /// The Apple headers reserve the top two flag bits for the synthetic flags,
 /// so the super-user mask stops short of them.
-const SF_SETTABLE: u32 = libc_const!(target_vendor = "apple", SF_SETTABLE, 0xffff0000);
+///
+/// `_stat.c` publishes each flag with `PyModule_AddIntMacro`, whose value
+/// parameter is a C `long`.  `0xffff0000` does not fit the 32-bit `long` of an
+/// LLP64 target, so Windows publishes these bits as `-65536` while an LP64
+/// target publishes `4294901760`.
+const SF_SETTABLE: std::ffi::c_long =
+    libc_const!(target_vendor = "apple", SF_SETTABLE, 0xffff_0000u32) as std::ffi::c_long;
 
 #[cfg(target_vendor = "apple")]
 const SF_SUPPORTED: u32 = 0x009f0000;

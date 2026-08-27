@@ -228,11 +228,15 @@ impl FrameRoot {
 
     /// Inlinable, unlike its two siblings, and `eval_loop_jit` is the reason:
     /// it re-seeds the frame pointer after every collection point, four times
-    /// per opcode on the no-tracer fast path. `#[dont_look_inside]` implies
-    /// `#[inline(never)]`, so each of those was a call to a body that reads one
-    /// slot -- measured at ~17 ns per opcode against
+    /// per opcode on the no-tracer fast path, and each of those was a call to a
+    /// body that reads one slot -- measured at ~17 ns per opcode against
     /// `PyFrame::execute_frame_plain`, i.e. the whole `PYRE_NO_JIT=1` versus
-    /// `PYRE_JIT=0` gap, before any JIT decision is taken.
+    /// `PYRE_JIT=0` gap, before any JIT decision is taken.  The `#[inline]` is
+    /// what collapses the seeds into the loop body; `@dont_look_inside` does not
+    /// carry `#[inline(never)]` (its expansion says so), and for a `&mut self`
+    /// receiver it emits no call-target wrapper either, so what its removal
+    /// drops here is the `_jit_look_inside_` marker and the policy/prebuild fns
+    /// beside it.
     ///
     /// Dropping the marker costs no tracing policy: `@dont_look_inside` names
     /// what the tracer must call as a black box, and nothing the walker records
@@ -11223,6 +11227,18 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
 
+    // `maybe_compile_and_run` tests `cell.flags & JC_TRACING` on the cell the
+    // chain walk found and returns there, BEFORE `cell.get_procedure_token()`.
+    // Asking the door first read the token and its compiled meta for a cell
+    // this then declines anyway, and ticked the counter for a call upstream
+    // never counts.
+    if driver.meta_interp().is_tracing_key((
+        frame_root.frame().pycode as usize,
+        frame_root.frame().next_instr(),
+    )) {
+        return None;
+    }
+
     // RPython warmstate.py maybe_compile_and_run: read the cell's procedure
     // token, and only when it is absent ask the counter. A bare
     // `compile_tmp_callback` token (a token, but no `compiled_loops` meta) is
@@ -11237,13 +11253,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         return None;
     }
 
-    // RPython warmstate.py: per-cell JC_TRACING.
-    if driver.meta_interp().is_tracing_key((
-        frame_root.frame().pycode as usize,
-        frame_root.frame().next_instr(),
-    )) {
-        return None;
-    }
     // `warmstate.py maybe_compile_and_run` carries the token the cell read
     // produced out through `EnterJitAssembler(procedure_token, *execute_args)`;
     // holding it here is what keeps it alive across the run the way upstream's

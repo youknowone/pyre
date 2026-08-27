@@ -850,6 +850,24 @@ impl RefHomes {
                 }
             }
         }
+        // `store_force_descr` publishes the bracketing guard's fail arguments
+        // into the frame and leaves the bracket armed past the op, so a force
+        // arriving later is what reads them; x86 keeps that guard's gcmap as
+        // `finish_gcmap` for the same reason.  Ordinary liveness stops at the
+        // guard — nothing consumes them after it — so a Ref that crosses no
+        // collecting call would take no home and `emit_force_arm` would publish
+        // its raw pointer into the untraced exit slots.  Give every one of them
+        // a traced home to name instead.
+        for op in ops
+            .iter()
+            .filter(|op| matches!(op.opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2))
+        {
+            for arg in exit_fail_args(op) {
+                if ref_values.contains(arg) {
+                    Self::assign(&mut by_id, &mut next, arg.raw());
+                }
+            }
+        }
         // Resume-at-LABEL Ref captures must also have an ordinary home.  The
         // high capture slot preserves the value while another bridge executes
         // on this frame; the ordinary home participates in the existing
@@ -4489,7 +4507,7 @@ fn build_function(
                 }
                 guard_idx += 1;
             }
-            OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+            OpCode::GuardNotForced => {
                 // x86/assembler.py genop_guard_guard_not_forced:
                 // `CMP [rbp + jf_descr], 0`, fail when nonzero. `Backend::force`
                 // stamps that mark on its way out, so this guard is what turns a
@@ -4511,6 +4529,25 @@ fn build_function(
                     op,
                     block_exit_depth,
                     guard_dispatch,
+                );
+                guard_idx += 1;
+            }
+            OpCode::GuardNotForced2 => {
+                // x86/regalloc.py consider_guard_not_forced_2 answers with
+                // `assembler.store_force_descr`, not with a branch: unlike
+                // GUARD_NOT_FORCED this one is not paired with a preceding call
+                // to test, it is what `store_token_in_vable` emits before a
+                // FINISH so a force arriving while the virtualizable is still
+                // armed can still rebuild a deadframe. Arm, do not test.
+                emit_force_arm(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    ref_homes,
+                    frame,
+                    op,
+                    exit_index(op, guard_idx),
+                    None,
                 );
                 guard_idx += 1;
             }
@@ -5515,6 +5552,8 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
+                    ref_homes,
+                    frame,
                     ops,
                     op_idx,
                     guard_idx,
@@ -5892,6 +5931,8 @@ fn build_function(
                     &mut sink,
                     constants,
                     value_types,
+                    ref_homes,
+                    frame,
                     ops,
                     op_idx,
                     guard_idx,
@@ -7788,18 +7829,14 @@ fn emit_guard_bridge_dispatch(
 }
 
 /// x86 `_store_force_index_if_next_guard`: a call that may force is bracketed
-/// by the `GUARD_NOT_FORCED` immediately after it, and a force that lands
-/// INSIDE the call reads the frame that guard describes -- upstream stores the
-/// guard's descr into `jf_force_descr` before the call for exactly that reason.
-/// Publish the same coordinate here: the guard's exit index in `frame[0]` and
-/// its fail arguments in the exit slots, written BEFORE the call rather than on
-/// a failure branch, because the reader runs while the call is still on the
-/// stack. Without it `Backend::force` reads whatever exit last wrote the frame,
-/// which is a different iteration's values.
+/// by the `GUARD_NOT_FORCED` immediately after it, so publish that guard's
+/// coordinate before the call runs.
 fn emit_force_bracket_before_call(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
     ops: &[Op],
     op_idx: usize,
     guard_idx: u32,
@@ -7815,25 +7852,65 @@ fn emit_force_bracket_before_call(
     }
     // Everything the guard names is defined by an op at or before the call --
     // except the call's own result, whose local still holds the PREVIOUS
-    // iteration's value here. `build_callee_gcmap` marks the exit slots of a
-    // CALL_ASSEMBLER callee frame as traced, so parking a stale word there
-    // hands the collector a Ref that nothing keeps alive; store a null instead
-    // and let the guard's own failure branch fill in the real result.
-    //
+    // iteration's value here.
+    emit_force_arm(
+        sink,
+        constants,
+        value_types,
+        ref_homes,
+        frame,
+        next_op,
+        exit_index(next_op, guard_idx),
+        Some(ops[op_idx].pos.get().raw()),
+    );
+}
+
+/// x86 `store_force_descr` / `_store_force_index`: publish where a force that
+/// lands while this frame is still reachable reads its state from — upstream
+/// writes the guard's descr into `jf_force_descr` and its fail arguments into
+/// the frame. Publish the same coordinate here: the guard's exit index plus
+/// [`FORCE_ARMED_BIT`] in `frame[0]`, and its fail arguments in the exit slots.
+/// This is written unconditionally, not on a failure branch, because the reader
+/// runs while the bracketed call is still on the stack.
+///
+/// A Ref argument is published as its **home slot offset**, tagged
+/// `offset * 2 + 1`, rather than as its value. The exit slots are not in
+/// `build_home_gcmap`'s traced set — that set is type-precise, and blanket
+/// marking a slot that holds a scalar would offer the collector an integer to
+/// mistake for a nursery address — so a Ref value copied here would not be
+/// forwarded by a collection the bracketed call performs, and
+/// `dead_frame_from_forced_frame` would read a from-space address. The home
+/// slot IS traced and holds the same value, so naming it survives the
+/// collection. Ref pointers are 8-aligned, which is what makes the low tag bit
+/// free to tell an offset from a value; `undefined` and any Ref without a home
+/// (a constant) still publish a literal, which is even.
+#[allow(clippy::too_many_arguments)]
+fn emit_force_arm(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    ref_homes: &RefHomes,
+    frame: FrameGeometry,
+    guard_op: &Op,
+    exit_idx: u32,
+    undefined: Option<u32>,
+) {
     // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
     // the counter slot has nothing to contribute to a force bracket.
-    let undefined = ops[op_idx].pos.get().raw();
-    for (i, &arg_ref) in exit_fail_args(next_op).iter().enumerate() {
+    for (i, &arg_ref) in exit_fail_args(guard_op).iter().enumerate() {
         sink.local_get(0);
-        if arg_ref.raw() == undefined {
+        if undefined == Some(arg_ref.raw()) {
             sink.i64_const(0);
+        } else if let Some(home) = ref_homes.home(arg_ref) {
+            let ofs = frame.home_slot_base + home as u64 * SLOT_SIZE;
+            sink.i64_const((ofs as i64) * 2 + 1);
         } else {
             emit_resolve(sink, constants, value_types, arg_ref);
         }
         sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
     }
     sink.local_get(0);
-    sink.i64_const(exit_index(next_op, guard_idx) as i64 | FORCE_ARMED_BIT);
+    sink.i64_const(exit_idx as i64 | FORCE_ARMED_BIT);
     sink.i64_store(mem64(0));
 }
 

@@ -2292,7 +2292,8 @@ impl WarmEnterState {
                 if cell.has_seen_a_procedure_token() {
                     // A live TEMPORARY token still declines; a token that was
                     // once seen but has since been invalidated falls through to
-                    // the cleanup gate below (warmstate.py:483-491) rather than
+                    // the cleanup gate below (`WarmEnterState.maybe_compile_and_run`)
+                    // rather than
                     // re-entering the never-traced retry.
                     if cell.get_procedure_token().is_some() {
                         return FunctionEntryStep::NotHot;
@@ -2311,8 +2312,9 @@ impl WarmEnterState {
             return FunctionEntryStep::Proceed;
         }
         if cleanup_dead_token_cell {
-            // warmstate.py:483-500 — function-entry warmup must see an
-            // invalidated token as a removed cell and re-count from cold.
+            // `WarmEnterState.maybe_compile_and_run` — function-entry warmup
+            // must see an invalidated token as a removed cell and re-count from
+            // cold.
             crate::mc_diag_bump(24);
             self.cleanup_chain(self.bucket_of(cell_key));
             return FunctionEntryStep::NotHot;

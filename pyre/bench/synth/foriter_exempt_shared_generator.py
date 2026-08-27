@@ -1,11 +1,9 @@
-# pyre-check: max-pypy-ratio=10
-# Measured ~7.0x on dynasm once the function-entry door resolved its
-# bucket hash to a cell key: before that the door read another cell's answer,
-# asked to trace at every call and never entered the compiled loop, and the
-# ceiling here was 63.  pypy's execution time is clamped to the runner's
-# floor for this fixture, so check.py marks the ratio `~` and applies no gate
-# to it; the ceiling records the level rather than enforcing it, and becomes
-# enforceable if the fixture is ever sized past that floor.
+# pyre-check: max-pypy-ratio=20
+# The function-entry door reading its own cell took this off the 63 it needed
+# while the door read another cell's answer, asked to trace at every call and
+# never entered the compiled loop.  Its pypy baseline straddles
+# EXEC_TIME_FLOOR_S the same way its nested-foriter sibling's does, so the
+# ceiling is sized the same way -- see the header there.
 # gh#495 guard: fbw_abort_nested_unjournaled_residual prevents the ForIterNext exemption double-advance.
 # SHARED long generator consumed incrementally. step consumes ONE item (for..break),
 # FOR_ITER advance mutates shared counter (exempt). Then a declining nested-residual CALL.

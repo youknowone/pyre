@@ -157,6 +157,26 @@ PLATFORM_GATED = {
         lambda p: p != "wasi",
         "cannot create socket on WASI",
     ),
+    # `if not support.has_fork_support: raise unittest.SkipTest(...)`
+    "test.test_fork1": (
+        lambda p: p not in ("win32", "emscripten", "wasi"),
+        "os.fork() not available",
+    ),
+    # `if not hasattr(os, "openpty"): raise unittest.SkipTest(...)`
+    "test.test_openpty": (
+        lambda p: p not in ("win32", "emscripten", "wasi"),
+        "os.openpty() not available",
+    ),
+    # `syslog = import_helper.import_module("syslog")`
+    "test.test_syslog": (
+        lambda p: p not in ("win32", "emscripten", "wasi"),
+        "no syslog module",
+    ),
+    # `termios = import_module('termios')`
+    "test.test_tty": (
+        lambda p: p not in ("win32", "emscripten", "wasi"),
+        "no termios module",
+    ),
 }
 
 

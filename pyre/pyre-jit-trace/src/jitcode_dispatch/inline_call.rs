@@ -2237,6 +2237,29 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     let Some(portal_view) = portal_descr.as_call_descr() else {
         return resolved_inline_decline(op.pc, line!());
     };
+    // The live frame this resume runs, resolved under the same rule as the
+    // portal target above: a callee_frame with no concrete shadow declines
+    // before the `last_instr` pin and the vable/vref bookkeeping are recorded,
+    // so the generic residual path that then re-enters the callee at its entry
+    // does not run against a trace already carrying this fold's ops.
+    let concrete_callee_frame = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
+        Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => {
+            gcref.0 as *mut pyre_interpreter::PyFrame
+        }
+        _ => return resolved_inline_decline(op.pc, line!()),
+    };
+    // A resume coordinate is `(last_instr, valuestackdepth)`, not `last_instr`
+    // alone: a header entered with operands on the stack — a `for` header holds
+    // its iterator there — executes against a height the frame has to
+    // advertise, and the portal runner hands that frame to the interpreter
+    // whenever its entry gate declines.  The sub-walk's own `setfield_vable_i`
+    // writes keep the frame in step, so this is a check and not a publish;
+    // decline rather than resume at a coordinate the frame does not carry.
+    if let Some(depth_vsd) = crate::state::depth_based_vsd_for_wcode(w_code as usize, target_pc)
+        && depth_vsd != unsafe { (*concrete_callee_frame).valuestackdepth }
+    {
+        return resolved_inline_decline(op.pc, line!());
+    }
 
     // Pin the loop-entry resume position on the (still-virtual) callee frame:
     // override `last_instr` from -1 (the fresh-frame entry value
@@ -2249,19 +2272,17 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // `FieldDescr` (the same field-set the builder uses), so
     // `optimize_setfield_gc` records it into the virtual's `vinfo.fields`.
     //
-    // MEASURED INCONSISTENCY, no failing case known.  That seeded depth is the
-    // right one only for a header whose static operand-stack depth is zero,
-    // which is what "empty stack at the while-header" above assumes.  A `for`
-    // header is entered with the iterator on the stack.  Census over the 447
-    // `pyre/bench/synth` fixtures (a `stack_depth_at(target_pc)` probe on this
-    // arm, dynasm, 84131dc4da8): 36 emits reach here, 25 at depth 0 and 11 at
-    // depth 1 — all 11 in `str_search_index_bounds.py`, all with `ForIter` at
-    // `target_pc`, pinning `last_instr` beside an operand height one slot short
-    // of what that header executes against.  That fixture still passes its own
-    // asserts and its output comparison, and pinning the analysis depth here
-    // instead changed nothing on it, so no wrong answer is attributable to this
-    // and no gate is warranted yet.  Written down because a measured inconsistency nobody
-    // recorded is one somebody re-derives: see
+    // The seeded depth reads as the whole answer only for a header whose static
+    // operand-stack depth is zero, which is what "empty stack at the
+    // while-header" above assumes; a `for` header is entered with the iterator
+    // on the stack.  Census over the 447 `pyre/bench/synth` fixtures (dynasm,
+    // 84131dc4da8): 36 emits reach here, 25 at static depth 0 and 11 at depth 1
+    // — all 11 in `str_search_index_bounds.py`, all with `ForIter` at
+    // `target_pc`.  Measured on those 11, the frame this resume runs reads
+    // `valuestackdepth` 4 against a `depth_at_py_pc` of 4: the sub-walk's own
+    // `setfield_vable_i` writes carried the push, so the seed is not what the
+    // frame still holds by the time the header is reached.  The gate above is
+    // what keeps that true rather than assumed.  See
     // `pyre/bench/synth/_pending/loop_callee_for_header_resume.py` for the same
     // "resume pc pinned without its operand height" shape that DOES produce a
     // wrong answer, through a different writer.
@@ -2329,12 +2350,6 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // own-frame write into it as the sub-walk records them — but the walk
     // stopped AT the merge point, before the opcode that would have spilled
     // `last_instr` for it.
-    let concrete_callee_frame = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
-        Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => {
-            gcref.0 as *mut pyre_interpreter::PyFrame
-        }
-        _ => return resolved_inline_decline(op.pc, line!()),
-    };
     unsafe { (*concrete_callee_frame).last_instr = target_pc as isize - 1 };
     let funcbox = ctx.trace_ctx.const_int(portal_runner_adr);
     let next_instr_box = ctx.trace_ctx.const_int(target_pc as i64);
@@ -6629,6 +6644,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // position: the sub-walk block above is an expression that always
     // completes, so every callee exit — return, exception, or decline —
     // arrives here before any of the early returns below.
+    //
+    // A callee that stopped at its OWN loop header has not returned, so this
+    // `leave` is recorded before the `CALL_ASSEMBLER` that runs the rest of it,
+    // and a loop body reading the live frame (`sys._getframe()`, a traceback)
+    // names the caller rather than its own frame.  MEASURED 2026-08-27: moving
+    // the `leave` past that op — the obvious fix — hangs
+    // `synth/exception_traceback_frame_lineno` (dynasm, 6/6; the deferral
+    // switched off in the same binary is 3/3 clean).  The guards between the
+    // two, and `GUARD_NO_EXCEPTION` above all in a callee that raises every
+    // iteration, leave the trace before the deferred `leave` is reached, so
+    // `ec.topframeref` keeps the callee and the frame chain never unwinds.
+    // Converging needs the `leave` reachable from those guard exits — a
+    // resume-side leave, or the exception path recording its own — not a
+    // reorder.
     if entered_ec {
         let concrete_ec = unsafe { (*ca_concrete_frame).execution_context }
             as *mut pyre_interpreter::PyExecutionContext;
