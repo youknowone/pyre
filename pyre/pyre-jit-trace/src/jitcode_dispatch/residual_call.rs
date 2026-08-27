@@ -2112,7 +2112,18 @@ pub(crate) fn flush_with_latched_stack(
     py_pc: usize,
     oprefs: &[OpRef],
 ) -> bool {
-    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None)
+    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None, ConsumedOperands::TosOnly)
+}
+
+/// How much of the latch may disagree with the vable shadow because the
+/// in-progress opcode has already popped it into registers — see
+/// [`flush_with_latched_stack_inner`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConsumedOperands {
+    /// One slot, the opcode's TOS.
+    TosOnly,
+    /// The whole operand run, however deep.
+    WholeRun,
 }
 
 /// Resume a FOR_ITER body from the complete header stack plus the item the
@@ -2127,7 +2138,14 @@ pub(crate) fn flush_with_latched_stack_and_item(
     oprefs: &[OpRef],
     push: (pyre_object::PyObjectRef, usize),
 ) -> bool {
-    flush_with_latched_stack_inner(ctx, frame, header_py_pc, oprefs, Some(push))
+    flush_with_latched_stack_inner(
+        ctx,
+        frame,
+        header_py_pc,
+        oprefs,
+        Some(push),
+        ConsumedOperands::TosOnly,
+    )
 }
 
 fn flush_with_latched_stack_inner(
@@ -2136,6 +2154,7 @@ fn flush_with_latched_stack_inner(
     py_pc: usize,
     oprefs: &[OpRef],
     push: Option<(pyre_object::PyObjectRef, usize)>,
+    consumed_operands: ConsumedOperands,
 ) -> bool {
     {
         let mut stack = Vec::with_capacity(oprefs.len() + usize::from(push.is_some()));
@@ -2170,11 +2189,10 @@ fn flush_with_latched_stack_inner(
         } else {
             py_pc
         };
-        // Why this latch exists, checkable at runtime.  Measured over
-        // pyre/bench/synth, the only slot that ever disagrees with the vable
-        // shadow is the in-progress opcode's TOS, and it holds a compile-time
-        // NULL *constant* rather than a stale or absent value: exactly what
-        // `popvalue_maybe_none` writes (`pyframe.py` →
+        // Why this latch exists, checkable at runtime.  A slot that disagrees
+        // with the vable shadow holds a compile-time NULL *constant* rather
+        // than a stale or absent value: exactly what `popvalue_maybe_none`
+        // writes (`pyframe.py` →
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
         // via `jtransform.py:1898`).  The opcode had already popped the slot
         // before its residual forced.
@@ -2187,16 +2205,48 @@ fn flush_with_latched_stack_inner(
         // remove the need for it: `LOAD_ATTR` already emits the push mirror
         // via `emit_pushvalue_ref!` and its slot still reads NULL, because the
         // pop follows the push.
+        //
+        // How much of that run may disagree is [`ConsumedOperands`], and the
+        // two answers are about WHEN the leg's resume pc runs, not about the
+        // latch.
+        //
+        // `WholeRun` is the qmut abort's: it fires BEFORE its residual
+        // executes, so the opcode is entirely ahead of the walk and resuming
+        // at it re-runs nothing.  A `CALL` pops its whole callable/self/args
+        // run into registers before that residual — for a class statement the
+        // jitcode nulls four operand slots between the `LOAD_CONST` of the
+        // class name and the `CallFn` the abort fires at — so every one of
+        // them reads NULL here and a one-slot exemption declines on the first.
+        //
+        // `TosOnly` is the escape leg's, and it is a restriction rather than a
+        // measurement: that leg's opcode is IN PROGRESS (its residual is what
+        // forced), so its `last_instr = pc - 1` says "about to run the CALL"
+        // while the callee doing the forcing is already inside it.  Admitting
+        // the deeper run there turned `caller_f_lasti_across_residual_call`
+        // red — 2 of 20000 reads answered 42, the `LOAD_GLOBAL` ahead of the
+        // call, instead of the `CALL` at 52.  Widening it is part of that
+        // fixture's own epic, not of this check.
+        //
+        // Pops run top-down, so the consumed operands are a SUFFIX of the
+        // latch.  What stays refused either way is a disagreement against a
+        // non-NULL shadow, and a live operand sitting ABOVE a consumed one.
+        // Both say the latch is not this frame's continuation.
         let base = ctx
             .virtualizable_info()
             .map_or(usize::MAX, |info| info.num_static_extra_boxes);
         let nlocals = crate::state::concrete_nlocals(frame).unwrap_or(usize::MAX);
+        // Lowest slot the in-progress opcode has already popped, once one is
+        // seen: everything from here up is its own operand run.
+        let mut consumed_from: Option<usize> = None;
         for (rel, &obj) in stack.iter().enumerate() {
             let entry =
                 ctx.virtualizable_entry_at(base.saturating_add(nlocals).saturating_add(rel));
             let shadow = entry.map(|(_opref, value)| value);
-            let agrees =
-                matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == obj as usize);
+            let shadow_ptr = match shadow {
+                Some(majit_ir::Value::Ref(r)) => Some(r.as_usize()),
+                _ => None,
+            };
+            let agrees = shadow_ptr == Some(obj as usize);
             if !agrees && fbw_debug_abort_enabled() {
                 // Report the OpRef too: a live box with a NULL value means
                 // the symbolic write landed and only the concrete mirror is
@@ -2208,18 +2258,28 @@ fn flush_with_latched_stack_inner(
                     entry.map(|(opref, _)| opref),
                 );
             }
-            // The only orthodox disagreement is the operand the in-progress
-            // opcode popped from TOS: the vable slot is NULL while the MIFrame
-            // register image still carries the consumed object.  A mismatch
-            // below TOS means the latch is not this frame's continuation.
-            let consumed_tos = rel + 1 == stack.len()
+            // The orthodox disagreement: the vable slot is NULL while the
+            // MIFrame register image still carries the object this opcode
+            // consumed out of it.
+            let consumed = !agrees
                 && obj as usize != 0
-                && matches!(shadow, Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0);
-            if !agrees && !consumed_tos {
+                && shadow_ptr == Some(0)
+                && (consumed_operands == ConsumedOperands::WholeRun
+                    || rel + 1 == stack.len());
+            let refusal = if consumed {
+                consumed_from.get_or_insert(rel);
+                None
+            } else if !agrees {
+                Some("disagrees against a shadow that is not a consumed NULL")
+            } else if consumed_from.is_some() && shadow_ptr != Some(0) {
+                Some("is a live operand above the consumed run")
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
                 if fbw_debug_abort_enabled() {
                     eprintln!(
-                        "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {rel}/{} \
-                         is not the consumed TOS",
+                        "[fbw-latched-flush] DECLINE at py_pc={py_pc}: slot {rel}/{} {refusal}",
                         stack.len(),
                     );
                 }
@@ -2256,7 +2316,7 @@ pub(crate) fn flush_qmut_abort_state(
     py_pc: usize,
     oprefs: &[OpRef],
 ) -> bool {
-    flush_with_latched_stack(ctx, frame, py_pc, oprefs)
+    flush_with_latched_stack_inner(ctx, frame, py_pc, oprefs, None, ConsumedOperands::WholeRun)
 }
 
 /// Take the committed escape resume pc and which flush produced it (the
@@ -5502,7 +5562,25 @@ fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
         };
         args.push(value);
     }
-    pyre_interpreter::call::build_class_body_namespace_is_module_dict(&args)
+    if !pyre_interpreter::call::build_class_body_namespace_is_module_dict(&args) {
+        return false;
+    }
+    // Offer the flush leg the operand stack this opcode began with, the way the
+    // two sibling qmut sites do, under the same three preconditions: a
+    // sub-walk's mirror describes the CALLEE frame, and a bridge walk's abort
+    // path never reaches the epilogue that would adopt the flush.
+    //
+    // Without the offer the leg declines and the legacy replay stands, which
+    // re-runs the walked region from its start on top of the residuals the walk
+    // already executed concretely.  The FOR_ITER item consumed at the loop
+    // header is then refused delivery by the R1 never-double guard
+    // ([`fbw_foriter_inflight_take`]) and the whole iteration is LOST: a
+    // `self.x = v` ahead of a class statement in a loop body dropped one
+    // iteration per abort on both native backends.
+    if ctx.vstack_valid && !ctx.fbw_mode.inline_subwalk && !ctx.trace_ctx.is_bridge_trace {
+        fbw_qmut_abort_stack_latch(ctx.vstack_cur_pypc as usize, ctx.vstack_boxes.clone());
+    }
+    true
 }
 
 /// Opt-in until the `ForceQuasiImmutable` flush leg in `trace.rs` re-delivers
