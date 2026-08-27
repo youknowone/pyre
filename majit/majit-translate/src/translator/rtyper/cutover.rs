@@ -2287,7 +2287,12 @@ pub(crate) fn lift_callee_to_pygraph(
         func,
         signature: RefCell::new(signature),
         defaults: RefCell::new(Some(Vec::new())),
-        access_directly: Cell::new(false),
+        // Carried for the same reason `hints` is, three lines up: this is
+        // one graph reached through two representations, so a flag set on
+        // the legacy side has to survive the lift. The sibling stub
+        // synthesizer below keeps `false` because it has no source graph to
+        // read.
+        access_directly: Cell::new(callee_graph.access_directly),
     });
     Ok(pygraph)
 }

@@ -654,6 +654,13 @@ impl GraphStore {
         match self.graphs.get_mut(&key) {
             Some(existing) => {
                 existing.graph.func.merge_from(&graph.func);
+                // Monotonic, like `func`: upstream's aliases are the same
+                // Python graph object, so `graph.access_directly = True`
+                // written through one of them is visible through all. Here
+                // the aliases are separate `FunctionGraph` values folded onto
+                // one `GraphSlot`, so "any alias said true" has to survive
+                // the fold or the flag depends on registration order.
+                existing.graph.access_directly |= graph.access_directly;
                 if !graph.hints.is_empty() {
                     existing.graph.hints = graph.hints;
                 }
@@ -9259,6 +9266,36 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+
+    /// Two aliases of one source funcobj fold onto a single `GraphSlot`.
+    /// Upstream never faces this — its aliases are the same Python graph
+    /// object — so a flag written through either spelling has to survive the
+    /// fold in both registration orders.
+    #[test]
+    fn access_directly_survives_the_alias_fold_in_either_order() {
+        for flagged_first in [true, false] {
+            let mut store = GraphStore::new();
+            let mut flagged = FunctionGraph::new("dispatch");
+            flagged.access_directly = true;
+            let plain = FunctionGraph::new("dispatch");
+            let (a, b) = if flagged_first {
+                (flagged, plain)
+            } else {
+                (plain, flagged)
+            };
+            store.insert(CallPath::from_segments(["m", "dispatch"]), a);
+            store.insert(CallPath::from_segments(["alias", "dispatch"]), b);
+            for spelling in [["m", "dispatch"], ["alias", "dispatch"]] {
+                assert!(
+                    store
+                        .get(&CallPath::from_segments(spelling))
+                        .expect("registered")
+                        .access_directly,
+                    "flagged_first={flagged_first} lost the flag at {spelling:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn serialized_descr_set_keys_ignore_descriptor_address_order() {
