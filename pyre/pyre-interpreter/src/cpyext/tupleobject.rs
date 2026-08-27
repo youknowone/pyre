@@ -2,8 +2,127 @@
 
 use super::object::argument;
 use super::pyobject::{self, CPyObject};
+use super::typeobject::{CPyTypeObject, CPyVarObject};
 use pyre_object::PyObjectRef;
 use std::ffi::c_int;
+
+/// `PyTupleObject` -- the header, and the items that follow it.
+///
+/// `tupleobject.py:31-35 PyTupleObjectFields` gives the mirror an array of
+/// `ob_size` `PyObject *`, filled when the mirror is built, so that
+/// `PyTuple_GET_ITEM` reads a slot the way CPython's macro does.  The array is
+/// the mirror's own rather than a view on the tuple, and has to be: the
+/// arity-2 specialisations of `specialisedtupleobject.py` build a fresh item
+/// on every read, so a borrowed reference into one would name something
+/// nothing keeps alive.
+///
+/// `ob_item` is declared at one slot, which is what `tupleobject.h` spells;
+/// [`item_bytes`] is what decides how many the block really has.
+#[repr(C)]
+pub struct CPyTupleObject {
+    pub ob_base: CPyVarObject,
+    pub ob_item: [*mut CPyObject; 1],
+}
+
+/// The array follows the header with nothing between, which is what lets a
+/// block hold it and a reader find it.
+const _: () = assert!(
+    std::mem::offset_of!(CPyTupleObject, ob_item) == size_of::<CPyVarObject>(),
+    "a tuple mirror's items start where its header ends"
+);
+
+/// Whether a mirror of `ob_type` carries its items in its own block.
+///
+/// The array starts where the header ends, so only a tuple whose type declared
+/// nothing past it has the room; one that added fields of its own keeps the
+/// array beside the block instead, which is what
+/// [`pyobject::items_or_build`] answers with.  The flag is what makes the
+/// layout a tuple's rather than that of any other type sized like one.
+fn carries_items(ob_type: *mut CPyTypeObject) -> bool {
+    if ob_type.is_null() {
+        return false;
+    }
+    let flags = unsafe { (*ob_type).tp_flags };
+    flags & super::typeobject::PY_TPFLAGS_TUPLE_SUBCLASS != 0
+        && unsafe { (*ob_type).tp_basicsize } == size_of::<CPyVarObject>() as isize
+}
+
+/// `pyobject.py:96-100 allocate`'s `size += itemcount * itemsize`, for the one
+/// type whose items live in its block.
+pub(super) fn item_bytes(w_obj: PyObjectRef, ob_type: *mut CPyTypeObject) -> usize {
+    if !carries_items(ob_type) || unsafe { !pyre_object::is_tuple(w_obj) } {
+        return 0;
+    }
+    unsafe { pyre_object::tupleobject::w_tuple_len(w_obj) }
+        .saturating_mul(size_of::<*mut CPyObject>())
+}
+
+/// Where `raw`'s items sit, for a block that carries them.
+///
+/// The count is `ob_size`, which [`super::typeobject::stamp_ob_size`] filled
+/// from the same length [`item_bytes`] sized the block by.
+fn items_in_block(raw: *mut CPyObject) -> Option<(*mut *mut CPyObject, usize)> {
+    if raw.is_null() || !carries_items(unsafe { (*raw).ob_type }) {
+        return None;
+    }
+    let length = unsafe { (*(raw as *mut CPyVarObject)).ob_size }.max(0) as usize;
+    // Reached from the block's base rather than through the declared slot: an
+    // empty tuple's block ends where its array starts, and that address is
+    // still the one a reader is handed.
+    let items = unsafe { raw.byte_add(size_of::<CPyVarObject>()) } as *mut *mut CPyObject;
+    Some((items, length))
+}
+
+/// Give the block the items it does not yet hold --
+/// `tupleobject.py:70-96 tuple_attach`, run on the first read rather than when
+/// the mirror is built.
+///
+/// Upstream fills the array before `track_reference` publishes the mirror, so
+/// nothing can reach a half-filled one.  Here the link is created first, and
+/// `make_ref` below reaches `ensure_mirror` again -- for a type, all the way
+/// into `finish_interpreter_type`, which walks the very MRO tuple being filled.
+/// Filling on demand keeps that recursion out of mirror creation, and a NUL
+/// slot is what marks one still owed: a slot holding a genuine NUL resolves to
+/// NUL again, so a repeated pass is the same answer rather than a second
+/// reference.
+fn fill_missing(raw: *mut CPyObject, items: *mut *mut CPyObject, length: usize) {
+    for index in 0..length {
+        if !unsafe { items.add(index).read() }.is_null() {
+            continue;
+        }
+        // Read the tuple back through the mirror before each `make_ref`: that
+        // call allocates, and the tuple moves under a collection where the
+        // block does not.
+        let w_tuple = unsafe { pyobject::from_ref(raw) };
+        if w_tuple.is_null() || unsafe { !pyre_object::is_tuple(w_tuple) } {
+            return;
+        }
+        let item = unsafe { pyre_object::tupleobject::w_tuple_getitem(w_tuple, index as i64) };
+        let Some(item) = item else { continue };
+        let entry = pyobject::make_ref(item);
+        // Written only if the slot is still owed: the `make_ref` above can
+        // reach a reader that filled it, and two references would be one more
+        // than the block gives back.
+        match unsafe { items.add(index).read() }.is_null() {
+            true => unsafe { items.add(index).write(entry) },
+            false => unsafe { pyobject::decref(entry) },
+        }
+    }
+}
+
+/// Give back the references a dying tuple mirror's items owned --
+/// `tupleobject.py tuple_dealloc`.
+pub(super) fn forget_block(raw: *mut CPyObject) {
+    let Some((items, length)) = items_in_block(raw) else {
+        return;
+    };
+    for index in 0..length {
+        // Cleared before the release: a deallocator this runs can reach the
+        // same block, and has to find a slot it will not release twice.
+        let entry = unsafe { items.add(index).replace(std::ptr::null_mut()) };
+        unsafe { pyobject::decref(entry) };
+    }
+}
 
 /// A tuple of NULL slots for the caller to fill through `PyTuple_SetItem`.
 ///
@@ -114,6 +233,10 @@ pub unsafe extern "C" fn _PyTuple_ITEMS(object: *mut CPyObject) -> *mut *mut CPy
     let Some(value) = tuple_value(object) else {
         return std::ptr::null_mut();
     };
+    if let Some((items, length)) = items_in_block(object) {
+        fill_missing(object, items, length);
+        return items;
+    }
     pyobject::items_or_build(object, || {
         let length = unsafe { pyre_object::tupleobject::w_tuple_len(value) };
         (0..length)
@@ -131,6 +254,25 @@ pub unsafe extern "C" fn _PyTuple_ITEMS(object: *mut CPyObject) -> *mut *mut CPy
             })
             .collect()
     })
+}
+
+/// Put `item` in slot `index` of whichever array `object` hands out, answering
+/// with what it displaced.
+///
+/// A caller holding the address `PyTuple_GET_ITEM` gave it reads the new value
+/// through it, so the slot is written wherever the array lives.
+fn replace_item(
+    object: *mut CPyObject,
+    index: usize,
+    item: *mut CPyObject,
+) -> Option<*mut CPyObject> {
+    let Some((items, length)) = items_in_block(object) else {
+        return pyobject::replace_cached_item(object, index, item);
+    };
+    if index >= length {
+        return None;
+    }
+    Some(unsafe { items.add(index).replace(item) })
 }
 
 /// `PyTuple_SET_ITEM(op, i, v)` -- slot `i` is given `v`, whatever it held
@@ -166,7 +308,7 @@ pub unsafe extern "C" fn _PyTuple_SET_ITEM(
     };
     if written.is_some() {
         // What comes back is dropped rather than released: see above.
-        pyobject::replace_cached_item(object, index as usize, item);
+        replace_item(object, index as usize, item);
     }
 }
 
@@ -211,7 +353,7 @@ pub unsafe extern "C" fn PyTuple_SetItem(
     // value through it, so the slot is written rather than the array rebuilt,
     // and the stolen reference is what the array is given.  Where there is no
     // array to take it, it is released here instead.
-    match pyobject::replace_cached_item(object, index as usize, item) {
+    match replace_item(object, index as usize, item) {
         Some(previous) => unsafe { pyobject::decref(previous) },
         None => unsafe { pyobject::decref(item) },
     }

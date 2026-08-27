@@ -28,10 +28,11 @@ use std::ffi::{c_int, c_void};
 /// question here is only ever "is this block one of them", so a set of
 /// addresses is enough. An address is stable for a block's life, and
 /// [`forget`] is called from `dealloc` before the block is released.
-type TrackedSet =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
-static TRACKED: super::ForkMutex<TrackedSet> =
-    super::ForkMutex::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
+type TrackedSet = super::address_table::HeldSet;
+use super::address_table::{AddressTable, hold};
+
+static TRACKED: AddressTable<TrackedSet> =
+    AddressTable::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// The blocks whose `tp_finalize` has already run.
 ///
@@ -42,8 +43,8 @@ static TRACKED: super::ForkMutex<TrackedSet> =
 /// rather than in `dealloc`, which runs before `tp_dealloc` -- that is the
 /// moment a second deallocation still has to read it -- and clearing at
 /// release is also what keeps a recycled address from inheriting a stale one.
-static FINALIZED: super::ForkMutex<TrackedSet> =
-    super::ForkMutex::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
+static FINALIZED: AddressTable<TrackedSet> =
+    AddressTable::new(TrackedSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { TRACKED.reinit_after_fork() };
@@ -57,12 +58,12 @@ pub(super) fn is_finalized(raw: usize) -> bool {
 
 /// Record that `tp_finalize` has run for the block at `raw`.
 pub(super) fn mark_finalized(raw: usize) {
-    FINALIZED.lock().insert(raw);
+    FINALIZED.lock().insert(hold(raw));
 }
 
 /// Drop the finalized flag for a block that is being released.
 pub(super) fn forget_finalized(raw: usize) {
-    FINALIZED.lock().remove(&raw);
+    FINALIZED.discard(raw);
 }
 
 /// Claim the finalizer of a block whose linked object the collector has just
@@ -83,7 +84,7 @@ pub(super) fn claim_finalizer(raw: usize) -> bool {
     if !has_gc(tp) || unsafe { (*tp).tp_finalize }.is_null() {
         return false;
     }
-    FINALIZED.lock().insert(raw)
+    FINALIZED.lock().insert(hold(raw))
 }
 
 /// Run the finalizer [`claim_finalizer`] promised.
@@ -133,13 +134,13 @@ pub(super) fn track(raw: *mut CPyObject) {
     if unsafe { (*raw).ob_pyre_link }.is_null() {
         return;
     }
-    TRACKED.lock().insert(raw as usize);
+    TRACKED.lock().insert(hold(raw as usize));
 }
 
 /// Drop a block from the tracked set -- `PyObject_GC_UnTrack`, and the release
 /// `dealloc` performs for a block that never untracked itself.
 pub(super) fn forget(raw: usize) {
-    TRACKED.lock().remove(&raw);
+    TRACKED.discard(raw);
 }
 
 /// Every tracked block, as addresses.
@@ -147,7 +148,7 @@ pub(super) fn forget(raw: usize) {
 /// A copy rather than a guard: the collector calls `tp_traverse` while walking
 /// this, and an extension's traverse may reach code that tracks or untracks.
 pub(super) fn tracked_blocks() -> Vec<usize> {
-    TRACKED.lock().iter().copied().collect()
+    TRACKED.lock().iter().map(|held| held.address()).collect()
 }
 
 /// `tp_traverse`, read straight off the block's type.

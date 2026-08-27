@@ -120,8 +120,7 @@ const _: () = {
     assert!(size_of::<CPyStopIterationObject>() == 4 * size_of::<usize>());
 };
 
-type BlockSet =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockSet = super::address_table::HeldSet;
 
 /// The mirrors [`attach`] filled, which is what says whose `value` is a
 /// reference to release.
@@ -130,8 +129,10 @@ type BlockSet =
 /// class derived from `StopIteration` has a type mirror of its own, and asking
 /// the size instead is what turns an unrelated C type's storage into a
 /// reference to decrement.
-static ATTACHED: super::ForkMutex<BlockSet> =
-    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+use super::address_table::{AddressTable, hold};
+
+static ATTACHED: AddressTable<BlockSet> =
+    AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { ATTACHED.reinit_after_fork() };
@@ -185,13 +186,13 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
     );
     let value = pyobject::make_ref(unsafe { crate::baseobjspace::stopiteration_value(w_obj) });
     unsafe { (*(raw as *mut CPyStopIterationObject)).value = value };
-    ATTACHED.lock().insert(raw as usize);
+    ATTACHED.lock().insert(hold(raw as usize));
 }
 
 /// Release the reference a `StopIteration` mirror owns — `pyerrors.py:45-50
 /// stopiteration_dealloc`.
 pub(super) fn forget_block(raw: *mut CPyObject) {
-    if !ATTACHED.lock().remove(&(raw as usize)) {
+    if !ATTACHED.discard(raw as usize) {
         return;
     }
     let py_stopiteration = raw as *mut CPyStopIterationObject;

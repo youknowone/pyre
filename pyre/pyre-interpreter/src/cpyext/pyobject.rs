@@ -98,7 +98,7 @@ struct Block {
 /// about a link is now asked; this survives only because a mirror block's size
 /// is not something the collector has any reason to know.  Its keys are mirror
 /// addresses, which never move, so it needs no collection-time maintenance.
-type BlockSizes = HashMap<usize, Block, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockSizes = super::address_table::AddressMap<Block>;
 static BLOCK_SIZES: ForkMutex<BlockSizes> =
     ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
@@ -193,7 +193,9 @@ pub(super) fn ensure_mirror(w_obj: PyObjectRef) -> *mut CPyObject {
         return mirror as *mut CPyObject;
     }
     let ob_type = type_mirror(w_obj);
-    let size = mirror_size(ob_type);
+    // `allocate`'s `size += itemcount * itemsize`: a tuple's items are part of
+    // its block, which is what lets `PyTuple_GET_ITEM` read one as a field.
+    let size = mirror_size(ob_type) + super::tupleobject::item_bytes(w_obj, ob_type);
     let raw = attach(w_obj, REFCNT_FROM_PYPY, ob_type, size);
     // Each fill allocates, so the object is read back through the mirror
     // before the next one rather than kept in a local: the block's address
@@ -519,21 +521,33 @@ unsafe fn dealloc(raw: *mut CPyObject) {
     // Everything this layer holds on the mirror's behalf goes before
     // `tp_dealloc` can free the block out from under it.  A borrow it owns may
     // be the last reference to its own container, so that recursion runs here.
-    release_borrowed(raw);
-    BYTE_CACHE.lock().remove(&address);
-    forget_items(address);
-    super::dictobject::forget_iteration(address);
-    super::modsupport::forget_module_fields(address);
-    super::unicodeobject::forget_block(address);
-    super::bytesobject::forget_pending(address);
+    // Only a block some table keyed an entry under is walked.  `release_hold`
+    // answers for all fourteen at once, which the tables cannot do for
+    // themselves: five of them are never empty for a program that imported
+    // anything -- a module's fields, a type's name, the tracked set -- so
+    // `AddressTable::is_empty` never fires for those and each costs a lock and
+    // a probe that finds nothing.
+    if super::address_table::release_hold(address) {
+        release_borrowed(raw);
+        BYTE_CACHE.take(address);
+        forget_items(address);
+        super::dictobject::forget_iteration(address);
+        super::modsupport::forget_module_fields(address);
+        super::unicodeobject::forget_block(address);
+        super::bytesobject::forget_pending(address);
+        super::frameobject::forget_pending(raw);
+        super::pyerrors::forget_block(raw);
+        super::cdatetime::forget_block(raw);
+        super::typeobject::forget_descriptor_block(raw);
+        unsafe { super::typeobject::forget_type_mirror(raw) };
+        super::gc::forget(address);
+    }
+    // What a block carries in its own fields is there whether or not a table
+    // keyed anything under its address.
+    super::tupleobject::forget_block(raw);
     super::frameobject::forget_block(raw);
     super::sliceobject::forget_block(raw);
-    super::pyerrors::forget_block(raw);
-    super::cdatetime::forget_block(raw);
     super::methodobject::forget_block(raw);
-    super::typeobject::forget_descriptor_block(raw);
-    unsafe { super::typeobject::forget_type_mirror(raw) };
-    super::gc::forget(address);
     let block = block_at(address);
     let returned = if let Some(tp_dealloc) = unsafe { super::typeobject::tp_dealloc_of(raw) } {
         let call: unsafe extern "C" fn(*mut CPyObject) = unsafe { std::mem::transmute(tp_dealloc) };
@@ -728,10 +742,12 @@ pub fn drain_dead() {
 /// that root belongs to -- [`borrowed_edges`].  Without that the retention above
 /// is unbounded rather than merely wide: an item referring back to its container
 /// keeps the container, which is what would release the entry.
-type BorrowSet = std::collections::HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
-type BorrowMap = HashMap<usize, BorrowSet, BuildHasherDefault<std::hash::DefaultHasher>>;
-static BORROWED: ForkMutex<BorrowMap> =
-    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+type BorrowSet = super::address_table::AddressSet;
+type BorrowMap = super::address_table::HeldMap<BorrowSet>;
+use super::address_table::{AddressTable, hold};
+
+static BORROWED: AddressTable<BorrowMap> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 /// A borrowed reference to `w_item`, owned by `container`'s mirror.
 ///
@@ -749,7 +765,7 @@ pub(super) fn borrow_from(container: *mut CPyObject, w_item: PyObjectRef) -> *mu
     }
     let mut borrowed = BORROWED.lock();
     let fresh = borrowed
-        .entry(container as usize)
+        .entry(hold(container as usize))
         .or_default()
         .insert(item as usize);
     if !fresh {
@@ -761,7 +777,7 @@ pub(super) fn borrow_from(container: *mut CPyObject, w_item: PyObjectRef) -> *mu
 
 /// Release everything a dying container mirror borrowed on C's behalf.
 fn release_borrowed(container: *mut CPyObject) {
-    let owned = BORROWED.lock().remove(&(container as usize));
+    let owned = BORROWED.take(container as usize);
     for item in owned.into_iter().flatten() {
         unsafe { decref(item as *mut CPyObject) };
     }
@@ -786,7 +802,7 @@ pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
         if items.is_empty() {
             continue;
         }
-        edges.push((container, items.iter().copied().collect()));
+        edges.push((container.address(), items.iter().copied().collect()));
     }
 }
 
@@ -803,9 +819,9 @@ pub(super) fn borrowed_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
 /// through `PyTuple_GET_ITEM` is borrowed from the container, and it stays
 /// good for as long as the container does because the array holds it.
 /// Held as addresses, which a mirror pointer is and a `Send` bound accepts.
-type ItemCache = HashMap<usize, Box<[usize]>, BuildHasherDefault<std::hash::DefaultHasher>>;
-static ITEM_ARRAYS: ForkMutex<ItemCache> =
-    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+type ItemCache = super::address_table::HeldMap<Box<[usize]>>;
+static ITEM_ARRAYS: AddressTable<ItemCache> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 /// Give `raw`'s array `items` and answer where they sit.
 ///
@@ -823,7 +839,7 @@ pub(super) fn publish_items(raw: *mut CPyObject, items: Vec<usize>) -> *mut *mut
             .is_some_and(|array| array[..] == items[..]);
         let spare = match unchanged {
             true => Some(items.into_boxed_slice()),
-            false => cache.insert(raw as usize, items.into_boxed_slice()),
+            false => cache.insert(hold(raw as usize), items.into_boxed_slice()),
         };
         (
             cache[&(raw as usize)].as_ptr() as *mut *mut CPyObject,
@@ -888,7 +904,7 @@ pub(super) fn replace_cached_item(
 /// Drop the array a dying container mirror handed out, and the references it
 /// owned with it.
 fn forget_items(raw: usize) {
-    let array = ITEM_ARRAYS.lock().remove(&raw);
+    let array = ITEM_ARRAYS.take(raw);
     release_item_array(array);
 }
 
@@ -899,9 +915,9 @@ fn forget_items(raw: usize) {
 /// hand out a stable, NUL-terminated address, and the interpreter's own storage
 /// is neither NUL-terminated nor at a fixed address.  It is a side table rather
 /// than a field so that a mirror block is exactly what its type declares.
-type ByteCache = HashMap<usize, Box<[u8]>, BuildHasherDefault<std::hash::DefaultHasher>>;
-static BYTE_CACHE: ForkMutex<ByteCache> =
-    ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+type ByteCache = super::address_table::HeldMap<Box<[u8]>>;
+static BYTE_CACHE: AddressTable<ByteCache> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 /// The mirror's cached bytes and their length, without the terminator.
 ///
@@ -917,7 +933,7 @@ pub(super) unsafe fn cached_bytes(
     produce: impl FnOnce() -> Vec<u8>,
 ) -> (*const c_char, usize) {
     let mut cache = BYTE_CACHE.lock();
-    let entry = cache.entry(raw as usize).or_insert_with(|| {
+    let entry = cache.entry(hold(raw as usize)).or_insert_with(|| {
         let mut bytes = produce();
         bytes.push(0);
         bytes.into_boxed_slice()

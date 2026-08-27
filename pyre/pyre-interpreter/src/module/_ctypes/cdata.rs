@@ -11,6 +11,7 @@
 //! than cached in a per-type `StgInfo`.  Reading `_type_` off the class also
 //! transparently handles user subclasses (`class MyInt(c_int)`).
 
+use super::stginfo::ParamFunc;
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
@@ -812,7 +813,7 @@ pub(crate) fn cdata_buffer_view(
     let info = super::stginfo::stginfo_of(cls);
     let kind = info
         .map(super::stginfo::stginfo_paramfunc)
-        .unwrap_or_default();
+        .unwrap_or(ParamFunc::Other);
     let shape = ctype_shape(cls);
     let leaf = ctype_leaf(cls);
     let is_funcptr =
@@ -824,7 +825,7 @@ pub(crate) fn cdata_buffer_view(
     };
     let format = if is_funcptr {
         "X{}".to_string()
-    } else if kind == "union" {
+    } else if kind == ParamFunc::Union {
         "B".to_string()
     } else {
         ctype_pep3118_format(cls, None)
@@ -835,7 +836,7 @@ pub(crate) fn cdata_buffer_view(
 fn ctype_shape(mut cls: PyObjectRef) -> Vec<usize> {
     let mut shape = Vec::new();
     while let Some(info) = super::stginfo::stginfo_of(cls) {
-        if super::stginfo::stginfo_paramfunc(info) != "array" {
+        if super::stginfo::stginfo_paramfunc(info) != ParamFunc::Array {
             break;
         }
         shape.push(super::stginfo::stginfo_length(info));
@@ -849,7 +850,7 @@ fn ctype_shape(mut cls: PyObjectRef) -> Vec<usize> {
 
 fn ctype_leaf(mut cls: PyObjectRef) -> PyObjectRef {
     while let Some(info) = super::stginfo::stginfo_of(cls) {
-        if super::stginfo::stginfo_paramfunc(info) != "array" {
+        if super::stginfo::stginfo_paramfunc(info) != ParamFunc::Array {
             break;
         }
         let Some(proto) = super::stginfo::stginfo_proto(info) else {
@@ -864,13 +865,13 @@ pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -
     let info = super::stginfo::stginfo_of(cls);
     let kind = info
         .map(super::stginfo::stginfo_paramfunc)
-        .unwrap_or_default();
-    match kind.as_str() {
-        "array" => info
+        .unwrap_or(ParamFunc::Other);
+    match kind {
+        ParamFunc::Array => info
             .and_then(super::stginfo::stginfo_proto)
             .map(|proto| ctype_pep3118_format(proto, forced_big))
             .unwrap_or_else(|| "B".to_string()),
-        "pointer" => {
+        ParamFunc::Pointer => {
             if let Some(snapshot) = info.and_then(super::stginfo::stginfo_format) {
                 return snapshot;
             }
@@ -895,8 +896,8 @@ pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -
                 .unwrap_or_else(|| "B".to_string());
             format!("&{inner}")
         }
-        "struct" => struct_pep3118_format(cls),
-        "union" => "B".to_string(),
+        ParamFunc::Struct => struct_pep3118_format(cls),
+        ParamFunc::Union => "B".to_string(),
         _ => {
             let Some(code) = type_code_of(cls).and_then(|s| s.chars().next()) else {
                 return "B".to_string();
@@ -1392,9 +1393,113 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
 
 // ── type-code metadata (StgInfo equivalent, derived from `_type_`) ─────
 
+/// A ctypes type code: the single character `_type_` names, or the `"void"`
+/// [`super::funcptr::build_layout`] gives a zero-sized member.
+///
+/// It carries its own bytes rather than a `String` because a foreign call
+/// reads one per argument and one for the return value, and a heap allocation
+/// per read is most of what such a call does.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct TypeCode {
+    bytes: [u8; Self::CAPACITY],
+    len: u8,
+}
+
+impl TypeCode {
+    /// Wide enough for `"void"`; every other code is one character.
+    pub(super) const CAPACITY: usize = 4;
+
+    /// The code `text` spells, or `None` when it is longer than any code is.
+    pub(super) fn new(text: &str) -> Option<Self> {
+        let src = text.as_bytes();
+        if src.len() > Self::CAPACITY {
+            return None;
+        }
+        let mut bytes = [0u8; Self::CAPACITY];
+        bytes[..src.len()].copy_from_slice(src);
+        Some(TypeCode {
+            bytes,
+            len: src.len() as u8,
+        })
+    }
+
+    /// The code one character spells.  `const` so a caller naming a fixed code
+    /// spends nothing on it.
+    pub(super) const fn from_char(code: char) -> Self {
+        assert!(code.is_ascii(), "a ctypes type code is ASCII");
+        TypeCode {
+            bytes: [code as u8, 0, 0, 0],
+            len: 1,
+        }
+    }
+
+    /// The code's bytes, nul-padded to a fixed width.  No code contains a nul,
+    /// so this round trips through [`TypeCode::from_padded`].
+    pub(super) fn padded(self) -> [u8; Self::CAPACITY] {
+        self.bytes
+    }
+
+    /// The code [`TypeCode::padded`] wrote.
+    pub(super) fn from_padded(bytes: [u8; Self::CAPACITY]) -> Self {
+        let len = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(Self::CAPACITY);
+        TypeCode {
+            bytes,
+            len: len as u8,
+        }
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        // The bytes came from a `&str` and were copied whole, so the prefix is
+        // itself a code point boundary.
+        core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+
+    /// The one character a simple-type code is, or `None` for `"void"` and the
+    /// empty code.
+    pub(super) fn as_char(&self) -> Option<char> {
+        let mut chars = self.as_str().chars();
+        chars.next().filter(|_| chars.next().is_none())
+    }
+}
+
+impl core::ops::Deref for TypeCode {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl core::fmt::Display for TypeCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl core::fmt::Debug for TypeCode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq<str> for TypeCode {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for TypeCode {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 /// The single-char ctypes `_type_` of `cls` (a type), read off the MRO.
 /// Returns `None` when the attribute is absent or not a string.
-pub(super) fn type_code_of(cls: PyObjectRef) -> Option<String> {
+pub(super) fn type_code_of(cls: PyObjectRef) -> Option<TypeCode> {
     if cls.is_null() || !unsafe { pyre_object::is_type(cls) } {
         return None;
     }
@@ -1402,7 +1507,7 @@ pub(super) fn type_code_of(cls: PyObjectRef) -> Option<String> {
     if !unsafe { pyre_object::is_str(v) } {
         return None;
     }
-    Some(unsafe { pyre_object::w_str_get_value(v) }.to_string())
+    TypeCode::new(unsafe { pyre_object::w_str_get_value_opt(v) }?)
 }
 
 /// Whether `obj` is a (subclass) type of `_SimpleCData`.

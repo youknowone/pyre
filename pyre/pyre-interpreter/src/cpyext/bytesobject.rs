@@ -26,9 +26,11 @@ pub unsafe extern "C" fn PyBytes_FromString(text: *const c_char) -> *mut CPyObje
 /// — so `PyBytes_AS_STRING` hands out one address before and after the `bytes`
 /// exists.  This set only records which mirrors have not been read as a value
 /// yet.
-type PendingSet = HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
-static PENDING: super::ForkMutex<PendingSet> =
-    super::ForkMutex::new(HashSet::with_hasher(BuildHasherDefault::new()));
+type PendingSet = super::address_table::HeldSet;
+use super::address_table::{AddressTable, hold};
+
+static PENDING: AddressTable<PendingSet> =
+    AddressTable::new(HashSet::with_hasher(BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { PENDING.reinit_after_fork() };
@@ -36,7 +38,7 @@ pub(super) unsafe fn after_fork_child() {
 
 /// Drop what a dying mirror recorded here.
 pub(super) fn forget_pending(mirror: usize) {
-    PENDING.lock().remove(&mirror);
+    PENDING.discard(mirror);
 }
 
 /// Whether `raw` is a mirror [`PyBytes_FromStringAndSize`] handed out and
@@ -108,7 +110,7 @@ pub unsafe extern "C" fn PyBytes_FromStringAndSize(
         // answers the requested length while C is still writing the buffer.
         (*(raw as *mut CPyVarObject)).ob_size = size;
     }
-    PENDING.lock().insert(raw as usize);
+    PENDING.lock().insert(hold(raw as usize));
     // The terminator `cached_bytes` appends is the NUL upstream's `ob_sval`
     // carries past `ob_size`.
     unsafe { pyobject::cached_bytes(raw, || data) };

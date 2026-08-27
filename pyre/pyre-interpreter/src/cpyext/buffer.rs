@@ -79,8 +79,8 @@ fn releasebuffer_of(tp: *mut CPyTypeObject) -> *const c_void {
 /// Keyed by an address this layer handed out, so the hasher is never fed a key
 /// C chose; the default one is spelled out because it is the const-
 /// constructible form a `static` needs.
-type BufferTable = HashMap<usize, usize, BuildHasherDefault<std::hash::DefaultHasher>>;
-type BufferSet = HashSet<usize, BuildHasherDefault<std::hash::DefaultHasher>>;
+type BufferTable = super::address_table::AddressMap<usize>;
+type BufferSet = super::address_table::AddressSet;
 
 /// The `Py_buffer` behind each live `memoryview` this layer built, keyed by the
 /// `BufferView` that memoryview carries.

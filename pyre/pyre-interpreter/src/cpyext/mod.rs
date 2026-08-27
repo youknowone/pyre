@@ -15,6 +15,7 @@
     any(target_os = "macos", target_os = "linux")
 ))]
 
+mod address_table;
 pub mod buffer;
 pub mod bytearrayobject;
 pub mod bytesobject;
@@ -209,6 +210,7 @@ pub fn after_fork_child() {
     unsafe {
         EXTENSIONS.reinit_after_fork();
         PACKAGE_CONTEXT.reinit_after_fork();
+        address_table::after_fork_child();
         pyobject::after_fork_child();
         typeobject::after_fork_child();
         modsupport::after_fork_child();
@@ -993,6 +995,9 @@ mod tests {
     /// The `BoundFamily.taken` locks are a field of a table rather than a
     /// static of their own; `typeobject::after_fork_child` walks
     /// `BOUND_FAMILIES` to reach them.
+    ///
+    /// An [`address_table::AddressTable`] holds one of these locks, so its
+    /// statics are checked under the same rule.
     #[test]
     fn every_fork_lock_is_reset_in_the_child() {
         let sources = sources();
@@ -1004,6 +1009,7 @@ mod tests {
                     continue;
                 };
                 if !declaration.contains("ForkMutex<")
+                    && !declaration.contains("AddressTable<")
                     && !declaration.contains("ForkExtensionLoadLock")
                 {
                     continue;

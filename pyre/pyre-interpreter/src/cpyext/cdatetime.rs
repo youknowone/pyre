@@ -721,16 +721,17 @@ pub unsafe extern "C" fn PyDateTime_TIME_GET_TZINFO(object: *mut c_void) -> *mut
 
 // ── the fields a block carries ──────────────────────────────────────────
 
-type BlockSet =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+type BlockSet = super::address_table::HeldSet;
 
 /// The blocks [`attach`] filled a `tzinfo` reference into.
 ///
 /// A set of addresses rather than a size test, for the reason
 /// `pyerrors::ATTACHED` states: what decides whether the word at that offset
 /// is a reference is whether this module wrote it.
-static ATTACHED: super::ForkMutex<BlockSet> =
-    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+use super::address_table::{AddressTable, hold};
+
+static ATTACHED: AddressTable<BlockSet> =
+    AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// Which of the two blocks with fields a class of the `datetime` module takes
 /// — `cdatetime.py:143-160 init_datetime`'s three `basestruct`s, of which
@@ -857,14 +858,14 @@ pub(super) fn attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
         };
     }
     if has {
-        ATTACHED.lock().insert(raw as usize);
+        ATTACHED.lock().insert(hold(raw as usize));
     }
 }
 
 /// Release the reference a `time` or `datetime` mirror owns —
 /// `cdatetime.py:191-204 type_dealloc`.
 pub(super) fn forget_block(raw: *mut CPyObject) {
-    if !ATTACHED.lock().remove(&(raw as usize)) {
+    if !ATTACHED.discard(raw as usize) {
         return;
     }
     let block = raw as *mut CPyDateTimeWithTZInfo;

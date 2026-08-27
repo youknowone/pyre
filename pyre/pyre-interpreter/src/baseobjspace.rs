@@ -5449,6 +5449,17 @@ pub(crate) fn setdictvalue_native(obj: PyObjectRef, name: &str, value: PyObjectR
     setdictvalue(obj, name, value).unwrap_or(false)
 }
 
+/// [`getdictvalue`] under the same restriction as [`getdict_native`]: the
+/// receiver's dictionary is a plain field or mapdict slot, so resolving it
+/// cannot run Python and the read is infallible.
+///
+/// The probe that can raise needs a stored non-string key whose hash collides
+/// with `name`, which a reserved internal key never has, so the `unwrap_or`
+/// here reports no attribute rather than hiding one.
+pub(crate) fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    getdictvalue(obj, name).unwrap_or(None)
+}
+
 /// `baseobjspace.py W_Root.getdictvalue`.
 ///
 /// ```python

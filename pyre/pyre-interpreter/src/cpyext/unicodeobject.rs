@@ -168,9 +168,11 @@ struct Block {
     pending: bool,
 }
 
-type BlockTable = HashMap<usize, Block, BuildHasherDefault<std::hash::DefaultHasher>>;
-static BLOCKS: super::ForkMutex<BlockTable> =
-    super::ForkMutex::new(HashMap::with_hasher(BuildHasherDefault::new()));
+type BlockTable = super::address_table::HeldMap<Block>;
+use super::address_table::{AddressTable, hold};
+
+static BLOCKS: AddressTable<BlockTable> =
+    AddressTable::new(HashMap::with_hasher(BuildHasherDefault::new()));
 
 pub(super) unsafe fn after_fork_child() {
     unsafe { BLOCKS.reinit_after_fork() };
@@ -178,7 +180,7 @@ pub(super) unsafe fn after_fork_child() {
 
 /// Drop what a dying mirror's canonical form occupied.
 pub(super) fn forget_block(mirror: usize) {
-    BLOCKS.lock().remove(&mirror);
+    BLOCKS.take(mirror);
 }
 
 /// Whether `raw` is a string [`PyUnicode_New`] handed out and nothing has read
@@ -254,7 +256,7 @@ fn canonical(raw: *mut CPyObject) -> Option<(c_int, usize, bool, *mut u8)> {
             return None;
         }
         let block = encode(w_obj);
-        BLOCKS.lock().entry(raw as usize).or_insert(block);
+        BLOCKS.lock().entry(hold(raw as usize)).or_insert(block);
     }
     let mut table = BLOCKS.lock();
     let block = table.get_mut(&(raw as usize))?;
@@ -307,7 +309,7 @@ pub unsafe extern "C" fn PyUnicode_New(size: isize, maxchar: Py_UCS4) -> *mut CP
         (*raw).ob_type = ob_type;
     }
     BLOCKS.lock().insert(
-        raw as usize,
+        hold(raw as usize),
         Block {
             kind,
             length: size as usize,

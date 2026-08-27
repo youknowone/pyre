@@ -14,8 +14,8 @@
 //! to `CallArg::Aggregate` / `CallRet::Aggregate`; a pointer-typed `restype`
 //! wraps the returned address in a fresh instance.
 
-use super::cdata;
-use super::stginfo;
+use super::cdata::{self, TypeCode};
+use super::stginfo::{self, ParamFunc};
 use super::type_ns_store;
 use pyre_object::PyObjectRef;
 use rustpython_host_env::ctypes as host_ctypes;
@@ -29,6 +29,9 @@ pub(super) const FUNCFLAG_USE_ERRNO: i64 = 0x8;
 /// and no call made since can have overwritten it.
 pub(super) const FUNCFLAG_USE_LASTERROR: i64 = 0x10;
 
+/// The `restype` a CDLL function has when none is declared: `c_int`.
+const DEFAULT_RESTYPE_CODE: TypeCode = TypeCode::from_char('i');
+
 /// Reserved instance-dict keys.
 const PTR_KEY: &str = "_ptr";
 const RESTYPE_KEY: &str = "_restype";
@@ -36,6 +39,9 @@ const ARGTYPES_KEY: &str = "_argtypes";
 pub(super) const CALLABLE_KEY: &str = "_callable";
 const ERRCHECK_KEY: &str = "_errcheck";
 const PARAMFLAGS_KEY: &str = "_paramflags";
+/// Reserved instance-dict key holding what the declarations have settled about
+/// this function's calls — see [`Settled`].
+const PLAN_KEY: &str = "_plan";
 #[cfg(windows)]
 const INDEX_KEY: &str = "_index";
 #[cfg(windows)]
@@ -381,18 +387,269 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, crate::PyError> {
 // ── restype / argtypes descriptors ────────────────────────────────────
 
 pub(super) fn instance_get(obj: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-    let d = crate::baseobjspace::getdict_native(obj);
-    if d.is_null() {
-        return None;
-    }
-    unsafe { pyre_object::w_dict_getitem_str(d, key) }
+    // The dictionary `getdict` would answer is a view onto the instance's own
+    // mapdict storage and the read goes through to it either way, so this asks
+    // the storage directly and leaves the view unbuilt.
+    crate::baseobjspace::getdictvalue_native(obj, key)
 }
 
 fn instance_set(obj: PyObjectRef, key: &str, value: PyObjectRef) {
     let d = crate::baseobjspace::getdict_native(obj);
-    if !d.is_null() {
-        unsafe { pyre_object::w_dict_setitem_str(d, key, value) };
+    if d.is_null() {
+        return;
     }
+    // Every key here is one a [`CallPlan`] was settled from, so the write goes
+    // with the plan dropped — `_setargtypes` / `_setrestype` drop `self._ptr`
+    // for the same reason.  Either store can grow the dict and so move it, and
+    // the value is live across the first, so both go through root slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(d);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value);
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+            pyre_object::gc_roots::shadow_stack_get(value_slot),
+        );
+        drop_settled(pyre_object::gc_roots::shadow_stack_get(dict_slot));
+    }
+}
+
+// ── settled call plan ─────────────────────────────────────────────────
+
+/// Arguments a call hands over without a heap allocation of its own.  A wider
+/// signature is rare enough that the allocation does not matter.
+const INLINE_CALL_ARGS: usize = 8;
+
+/// The most declared arguments a [`CallPlan`] carries.  A signature wider than
+/// this settles nothing and re-derives per call, which costs only the functions
+/// nobody calls in a loop.
+const PLAN_MAX_ARGS: usize = 8;
+
+/// What the declarations have settled about a function's calls.
+#[derive(Clone, Copy)]
+enum Settled {
+    /// The plan a repeat call runs from.
+    Plan(CallPlan),
+    /// There is nothing to settle: a paramflag, an `errcheck`, a
+    /// `_check_retval_`, a COM index or an aggregate in the signature puts the
+    /// call past what a plan describes.  Recorded so that the finding is made
+    /// once rather than at every call.
+    Unplannable,
+}
+
+/// Everything about a call that the declarations fix, derived once.
+///
+/// `_ctypes/function.py` keeps the prepared call in `self._ptr` and drops it in
+/// `_setargtypes` / `_setrestype`; this is the same cache under the same
+/// invalidation — [`instance_set`] and [`store_funcptr_addr`] are every write
+/// that can change an answer in it.  A class-level `_restype_` / `_argtypes_` /
+/// `_flags_` write goes through neither, so the record also carries the type's
+/// version tag and is re-derived once that moves.
+///
+/// The carrier is an opaque `bytes` in the instance dict rather than a Rust
+/// side table so that it holds no object reference across a collection and dies
+/// with the instance it describes.
+#[derive(Clone, Copy)]
+struct CallPlan {
+    addr: usize,
+    flags: i64,
+    /// `Ret::Void` or `Ret::Code` only: the other two name a type, and a plan
+    /// carries no object references.
+    ret: Ret,
+    args: [ArgKind; PLAN_MAX_ARGS],
+    arg_count: usize,
+}
+
+impl CallPlan {
+    /// The declared argument shapes, in order.
+    fn kinds(&self) -> &[ArgKind] {
+        &self.args[..self.arg_count]
+    }
+}
+
+/// Byte layout of the stored record: a kind byte, the type version tag it was
+/// settled under, then — for a plan — the call's fixed values and one record
+/// per declared argument.
+mod plan_bytes {
+    /// Leading byte: this instance settles into no plan.
+    pub(super) const UNPLANNABLE: u8 = 0;
+    /// Leading byte: a plan follows.
+    pub(super) const PLAN: u8 = 1;
+    /// Argument record byte: a pointer-kind argtype.
+    pub(super) const ARG_POINTER: u8 = 0;
+    /// Argument record byte: a simple argtype, followed by its code.
+    pub(super) const ARG_SIMPLE: u8 = 1;
+    /// Return record byte: the call returns nothing.
+    pub(super) const RET_VOID: u8 = 0;
+    /// Return record byte: a simple return, followed by its code.
+    pub(super) const RET_CODE: u8 = 1;
+}
+
+/// The plan `obj` has settled into, or `None` when it has settled nothing yet.
+fn settled(obj: PyObjectRef) -> Option<Settled> {
+    let stored = instance_get(obj, PLAN_KEY)?;
+    if !unsafe { pyre_object::bytesobject::is_bytes(stored) } {
+        return None;
+    }
+    let record = unsafe { pyre_object::bytesobject::w_bytes_data(stored) };
+    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    decode_settled(record, unsafe {
+        crate::baseobjspace::w_type_version_tag(cls)
+    })
+}
+
+/// Read a stored record back, refusing one settled under a different version of
+/// the type.
+fn decode_settled(record: &[u8], version_tag: u64) -> Option<Settled> {
+    let mut cursor = Cursor::new(record);
+    let kind = cursor.byte()?;
+    if cursor.u64()? != version_tag || version_tag == 0 {
+        return None;
+    }
+    if kind == plan_bytes::UNPLANNABLE {
+        return Some(Settled::Unplannable);
+    }
+    if kind != plan_bytes::PLAN {
+        return None;
+    }
+    let addr = cursor.u64()? as usize;
+    let flags = cursor.u64()? as i64;
+    let ret = match cursor.byte()? {
+        plan_bytes::RET_VOID => Ret::Void,
+        plan_bytes::RET_CODE => Ret::Code(TypeCode::from_padded(cursor.code()?)),
+        _ => return None,
+    };
+    let arg_count = cursor.byte()? as usize;
+    if arg_count > PLAN_MAX_ARGS {
+        return None;
+    }
+    let mut args = [ArgKind::Pointer; PLAN_MAX_ARGS];
+    for slot in args.iter_mut().take(arg_count) {
+        *slot = match cursor.byte()? {
+            plan_bytes::ARG_POINTER => ArgKind::Pointer,
+            plan_bytes::ARG_SIMPLE => ArgKind::Simple(TypeCode::from_padded(cursor.code()?)),
+            _ => return None,
+        };
+    }
+    Some(Settled::Plan(CallPlan {
+        addr,
+        flags,
+        ret,
+        args,
+        arg_count,
+    }))
+}
+
+/// A reader over a stored record that answers `None` rather than panicking on a
+/// record shorter than it claims to be.
+struct Cursor<'a> {
+    record: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(record: &'a [u8]) -> Self {
+        Cursor { record, at: 0 }
+    }
+
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let bytes = self.record.get(self.at..self.at + N)?.try_into().ok()?;
+        self.at += N;
+        Some(bytes)
+    }
+
+    fn byte(&mut self) -> Option<u8> {
+        self.take::<1>().map(|bytes| bytes[0])
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        self.take().map(u64::from_ne_bytes)
+    }
+
+    fn code(&mut self) -> Option<[u8; TypeCode::CAPACITY]> {
+        self.take()
+    }
+}
+
+/// The record [`decode_settled`] reads.
+fn encode_settled(settled: Settled, version_tag: u64) -> Vec<u8> {
+    let mut record = Vec::new();
+    let plan = match settled {
+        Settled::Unplannable => {
+            record.push(plan_bytes::UNPLANNABLE);
+            record.extend_from_slice(&version_tag.to_ne_bytes());
+            return record;
+        }
+        Settled::Plan(plan) => plan,
+    };
+    record.push(plan_bytes::PLAN);
+    record.extend_from_slice(&version_tag.to_ne_bytes());
+    record.extend_from_slice(&(plan.addr as u64).to_ne_bytes());
+    record.extend_from_slice(&(plan.flags as u64).to_ne_bytes());
+    match plan.ret {
+        Ret::Code(code) => {
+            record.push(plan_bytes::RET_CODE);
+            record.extend_from_slice(&code.padded());
+        }
+        // `Ret::Pointer` / `Ret::Aggregate` never reach a plan; both name a
+        // type, and `store_settled` refuses them.
+        _ => record.push(plan_bytes::RET_VOID),
+    }
+    record.push(plan.arg_count as u8);
+    for kind in plan.kinds() {
+        match kind {
+            ArgKind::Simple(code) => {
+                record.push(plan_bytes::ARG_SIMPLE);
+                record.extend_from_slice(&code.padded());
+            }
+            // Same: `store_settled` refuses an aggregate argtype.
+            _ => record.push(plan_bytes::ARG_POINTER),
+        }
+    }
+    record
+}
+
+/// Drop whatever `dict` had settled, so the next call derives it again.
+///
+/// # Safety
+/// `dict` must be a live instance dictionary.
+unsafe fn drop_settled(dict: PyObjectRef) {
+    // Dropping one that was never settled is not an error.
+    unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(dict, PLAN_KEY) };
+}
+
+/// Record what this call settled, so the next one runs from it.
+fn store_settled(obj: PyObjectRef, settled: Settled) {
+    let cls = unsafe { pyre_object::w_instance_get_type(obj) };
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(cls) };
+    // A type with no version tag cannot be told apart from one that has since
+    // changed, so nothing is settled against it.
+    if version_tag == 0 {
+        return;
+    }
+    let record = encode_settled(settled, version_tag);
+    // The `bytes` allocation moves the instance, so the dict is read off the
+    // instance only after it, out of a root slot.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let stored = pyre_object::bytesobject::w_bytes_from_bytes(&record);
+    let stored_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(stored);
+    let d = crate::baseobjspace::getdict_native(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+    if d.is_null() {
+        return;
+    }
+    unsafe {
+        pyre_object::w_dict_setitem_str(
+            d,
+            PLAN_KEY,
+            pyre_object::gc_roots::shadow_stack_get(stored_slot),
+        )
+    };
 }
 
 fn restype_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -464,7 +721,10 @@ fn errcheck_deleter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     let d = crate::baseobjspace::getdict_native(args[1]);
     if !d.is_null() {
         // Deleting one that was never set is not an error.
-        unsafe { pyre_object::dictmultiobject::w_dict_delitem_str(d, ERRCHECK_KEY) };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_delitem_str(d, ERRCHECK_KEY);
+            drop_settled(d);
+        }
     }
     Ok(pyre_object::w_none())
 }
@@ -490,9 +750,10 @@ fn reject_kwargs(kwargs: Option<PyObjectRef>) -> Result<(), crate::PyError> {
 // ── call ──────────────────────────────────────────────────────────────
 
 /// Resolved return-type selector.
+#[derive(Clone, Copy)]
 pub(super) enum Ret {
     Void,
-    Code(String),
+    Code(TypeCode),
     /// A pointer metaclass type (`POINTER(T)`): the result address is wrapped
     /// in a fresh instance of this type.
     Pointer(PyObjectRef),
@@ -507,15 +768,15 @@ pub(super) fn resolve_restype(obj: PyObjectRef) -> Result<Ret, crate::PyError> {
         .or_else(|| unsafe { crate::baseobjspace::lookup_in_type(cls, "_restype_") });
     match rt {
         // CDLL functions default to c_int when no restype is set.
-        None => Ok(Ret::Code("i".to_string())),
+        None => Ok(Ret::Code(DEFAULT_RESTYPE_CODE)),
         Some(o) if unsafe { pyre_object::is_none(o) } => Ok(Ret::Void),
         Some(o) => {
             // A `_Pointer` subtype returns a live pointer instance; a
             // struct/union subtype returns a by-value aggregate instance.
             if let Some(info) = stginfo::stginfo_of(o) {
-                match stginfo::stginfo_paramfunc(info).as_str() {
-                    "pointer" => return Ok(Ret::Pointer(o)),
-                    "struct" | "union" => return Ok(Ret::Aggregate(o)),
+                match stginfo::stginfo_paramfunc(info) {
+                    ParamFunc::Pointer => return Ok(Ret::Pointer(o)),
+                    ParamFunc::Struct | ParamFunc::Union => return Ok(Ret::Aggregate(o)),
                     _ => {}
                 }
             }
@@ -647,8 +908,8 @@ fn type_display_name(obj: PyObjectRef) -> String {
 fn check_outarg_type(at: PyObjectRef, index: usize) -> Result<(), crate::PyError> {
     if let Some(info) = stginfo::stginfo_of(at)
         && matches!(
-            stginfo::stginfo_paramfunc(info).as_str(),
-            "pointer" | "array"
+            stginfo::stginfo_paramfunc(info),
+            ParamFunc::Pointer | ParamFunc::Array
         )
     {
         return Ok(());
@@ -786,7 +1047,9 @@ pub(super) fn store_funcptr_addr(obj: PyObjectRef, addr: usize) -> Result<(), cr
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
             PTR_KEY,
             pyre_object::gc_roots::shadow_stack_get(addr_slot),
-        )
+        );
+        // The address a plan calls through is the one being replaced here.
+        drop_settled(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     };
     let bytes = host_ctypes::simple_storage_value_to_bytes_endian(
         "P",
@@ -800,7 +1063,7 @@ pub(super) fn store_funcptr_addr(obj: PyObjectRef, addr: usize) -> Result<(), cr
 /// Owned argument data whose buffers must outlive the borrowed `CallArg`s
 /// handed to `call`.
 enum OwnedArg {
-    Typed(String, Vec<u8>),
+    Typed(TypeCode, Vec<u8>),
     Int(i32),
     Double(f64),
     Pointer(usize),
@@ -892,10 +1155,21 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // A keyword argument only ever names a paramflag, and one that names
     // nothing is not an error — it simply goes unread.
     let (inargs, kwargs) = crate::builtins::split_builtin_kwargs(&args[1..]);
-    if funcptr_addr(self_obj) == 0 && instance_get(self_obj, CALLABLE_KEY).is_some() {
+    let settled_already = settled(self_obj);
+    // A plan that turns out not to describe this call after all leaves the
+    // general path to derive it again and record what it finds.
+    let mut settled_stands = settled_already.is_some();
+    if let Some(Settled::Plan(plan)) = settled_already {
+        match call_settled(self_obj, &plan, inargs)? {
+            Some(value) => return Ok(value),
+            None => settled_stands = false,
+        }
+    }
+    let addr = funcptr_addr(self_obj);
+    if addr == 0 && instance_get(self_obj, CALLABLE_KEY).is_some() {
         return call_python_callback(self_obj, inargs);
     }
-    match funcptr_addr(self_obj) {
+    match addr {
         INTERNAL_CAST_ADDR => return internal_cast(inargs),
         INTERNAL_STRING_AT_ADDR => return internal_string_at(inargs),
         INTERNAL_WSTRING_AT_ADDR => return internal_wstring_at(inargs),
@@ -921,6 +1195,7 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let com: Option<(usize, usize)> = None;
 
     let argtypes = resolve_argtypes(self_obj);
+    let paramflags = instance_get(self_obj, PARAMFLAGS_KEY);
     let callargs = build_callargs(self_obj, argtypes.as_deref(), inargs, kwargs, com.is_some())?;
     let call_args = callargs.args.as_slice();
 
@@ -933,16 +1208,22 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         owned.push(OwnedArg::Pointer(this_ptr));
     }
 
-    match argtypes {
+    // What each declared argtype lowers to, kept so that a repeat call can run
+    // from it instead of asking the types again.
+    let mut kinds: Vec<ArgKind> = Vec::new();
+    match &argtypes {
         Some(argtypes) => {
-            for (i, at) in argtypes.iter().enumerate() {
+            for (i, &at) in argtypes.iter().enumerate() {
                 let arg = *call_args.get(i).ok_or_else(|| {
                     crate::PyError::type_error(format!(
                         "this function takes at least {} argument(s)",
                         argtypes.len()
                     ))
                 })?;
-                owned.push(marshal_typed_arg(arg, *at, &mut keepalive)?);
+                let kind = classify_argtype(at)
+                    .ok_or_else(|| crate::PyError::type_error("argtype has no valid '_type_'"))?;
+                kinds.push(kind);
+                owned.push(marshal_typed_arg(arg, at, kind, &mut keepalive)?);
             }
             // Variadic tail (printf-style): arguments past the declared
             // argtypes are marshalled by the default conversion rules.
@@ -958,6 +1239,92 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
 
     let ret = resolve_restype(self_obj)?;
+    let flags = funcptr_flags(self_obj);
+    let result = invoke(call_address(addr, com), &owned, ret, flags)?;
+    // `owned` / `keepalive` must outlive the call above.
+    drop(keepalive);
+    // A COM method constructed with an interface id answers the plain status,
+    // and asks the callee what went wrong when that status is a failure; the
+    // restype never gets a look in.
+    let checker = resolve_checker(self_obj);
+    let value = match com_status(self_obj, com, &result) {
+        Some(status) => status?,
+        None => {
+            let value = build_return_value(ret, result)?;
+            match checker {
+                Some(checker) => crate::call::call_function_impl_result(checker, &[value])?,
+                None => value,
+            }
+        }
+    };
+    let errcheck = instance_get(self_obj, ERRCHECK_KEY);
+    let value = match apply_errcheck(self_obj, value, call_args)? {
+        Some(forced) => forced,
+        None => build_result(value, &callargs)?,
+    };
+    if !settled_stands {
+        store_settled(
+            self_obj,
+            plan_of_call(
+                addr,
+                flags,
+                ret,
+                &kinds,
+                com.is_some() || checker.is_some() || errcheck.is_some() || paramflags.is_some(),
+            ),
+        );
+    }
+    Ok(value)
+}
+
+/// The address a call is made through: a COM method's comes out of the
+/// interface vtable, everything else calls the stored `_ptr`.
+fn call_address(addr: usize, com: Option<(usize, usize)>) -> usize {
+    match com {
+        Some((_, method)) => method,
+        None => addr,
+    }
+}
+
+/// What this call settles, for the next one to run from.
+///
+/// `past_a_plan` is the caller's finding that something outside the argument
+/// and return shapes — a COM index, a `_check_retval_`, an `errcheck`, a
+/// paramflag — has a say in the answer or in which arguments the call is made
+/// with.
+fn plan_of_call(
+    addr: usize,
+    flags: i64,
+    ret: Ret,
+    kinds: &[ArgKind],
+    past_a_plan: bool,
+) -> Settled {
+    let describable = !past_a_plan
+        && kinds.len() <= PLAN_MAX_ARGS
+        && matches!(ret, Ret::Void | Ret::Code(_))
+        && !kinds.iter().any(|kind| *kind == ArgKind::Aggregate);
+    if !describable {
+        return Settled::Unplannable;
+    }
+    let mut args = [ArgKind::Pointer; PLAN_MAX_ARGS];
+    args[..kinds.len()].copy_from_slice(kinds);
+    Settled::Plan(CallPlan {
+        addr,
+        flags,
+        ret,
+        args,
+        arg_count: kinds.len(),
+    })
+}
+
+/// Hand the marshalled arguments to the foreign function and answer its raw
+/// result.
+fn invoke(
+    addr: usize,
+    owned: &[OwnedArg],
+    ret: Ret,
+    flags: i64,
+) -> Result<host_ctypes::CallValue, crate::PyError> {
     // Build the aggregate return layout (if any) up front so it outlives the
     // borrowed `CallRet` handed to the call.
     let ret_layout = match &ret {
@@ -974,47 +1341,84 @@ fn cfuncptr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
 
     // Borrow the owned data as `CallArg`s; these borrows end with the call.
-    let host_args: Vec<host_ctypes::CallArg> = owned.iter().map(owned_arg_as_call_arg).collect();
-
-    let addr = match com {
-        Some((_, method)) => method,
-        None => funcptr_addr(self_obj),
+    // A signature no wider than the inline row is handed over without a heap
+    // allocation of its own, which is otherwise a whole allocation per call.
+    let mut inline = [host_ctypes::CallArg::Int(0); INLINE_CALL_ARGS];
+    let mut spilled: Vec<host_ctypes::CallArg> = Vec::new();
+    let host_args: &[host_ctypes::CallArg] = if owned.len() <= INLINE_CALL_ARGS {
+        for (slot, arg) in inline.iter_mut().zip(owned) {
+            *slot = owned_arg_as_call_arg(arg);
+        }
+        &inline[..owned.len()]
+    } else {
+        spilled.extend(owned.iter().map(owned_arg_as_call_arg));
+        &spilled
     };
-    let flags = funcptr_flags(self_obj);
+
     let options = host_ctypes::CallOptions {
         use_errno: flags & FUNCFLAG_USE_ERRNO != 0,
         use_last_error: flags & FUNCFLAG_USE_LASTERROR != 0,
     };
     // `clibffi.py:350-352` declares `ffi_call` with the default
     // `releasegil='auto'`, i.e. released: the callee is arbitrary foreign code
-    // and may block on another Python thread's progress.  `owned` / `keepalive`
-    // hold the marshalled buffers across the released window.  Being arbitrary
-    // foreign code is also why the call goes inside `seh::guard`, which is what
-    // stands between a faulting callee and the process.
+    // and may block on another Python thread's progress.  The caller's `owned`
+    // / `keepalive` hold the marshalled buffers across the released window.
+    // Being arbitrary foreign code is also why the call goes inside
+    // `seh::guard`, which is what stands between a faulting callee and the
+    // process.
     let result = {
         let _blocked = crate::module::thread::before_external_block();
-        super::seh::guard(|| host_ctypes::call(addr, &host_args, restype, options))
+        super::seh::guard(|| host_ctypes::call(addr, host_args, restype, options))
     };
+    result?.map_err(call_error)
+}
+
+/// `__call__` for a function whose declarations have already settled into a
+/// [`CallPlan`] — `_getfuncptr` answering out of `self._ptr`.
+///
+/// Answers `None` when the plan turns out not to describe this call after all,
+/// which leaves the general path to derive it again.
+fn call_settled(
+    self_obj: PyObjectRef,
+    plan: &CallPlan,
+    inargs: &[PyObjectRef],
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    let kinds = plan.kinds();
+    if inargs.len() < kinds.len() {
+        return Err(crate::PyError::type_error(format!(
+            "this function takes at least {} argument(s)",
+            kinds.len()
+        )));
+    }
+    // Only a pointer argtype is still wanted as an object; a simple one is
+    // fully described by the code the plan carries.
+    let argtypes = if kinds.iter().any(|kind| *kind == ArgKind::Pointer) {
+        let argtypes = resolve_argtypes(self_obj);
+        if argtypes.as_ref().is_none_or(|at| at.len() < kinds.len()) {
+            return Ok(None);
+        }
+        argtypes
+    } else {
+        None
+    };
+    let mut owned: Vec<OwnedArg> = Vec::with_capacity(inargs.len());
+    let mut keepalive: Vec<Vec<u8>> = Vec::new();
+    for (i, &arg) in inargs.iter().enumerate() {
+        owned.push(match kinds.get(i) {
+            Some(ArgKind::Simple(tc)) => marshal_simple_arg(arg, *tc)?,
+            Some(_) => {
+                let at = argtypes.as_ref().expect("a pointer argtype was resolved")[i];
+                OwnedArg::Pointer(pointer_argument_addr(arg, at, &mut keepalive)?)
+            }
+            // Variadic tail (printf-style): arguments past the declared
+            // argtypes are marshalled by the default conversion rules.
+            None => marshal_default_arg(arg, &mut keepalive)?,
+        });
+    }
+    let result = invoke(plan.addr, &owned, plan.ret, plan.flags)?;
     // `owned` / `keepalive` must outlive the call above.
     drop(keepalive);
-    let result = result?.map_err(call_error)?;
-    // A COM method constructed with an interface id answers the plain status,
-    // and asks the callee what went wrong when that status is a failure; the
-    // restype never gets a look in.
-    let value = match com_status(self_obj, com, &result) {
-        Some(status) => status?,
-        None => {
-            let value = build_return_value(ret, result)?;
-            match resolve_checker(self_obj) {
-                Some(checker) => crate::call::call_function_impl_result(checker, &[value])?,
-                None => value,
-            }
-        }
-    };
-    match apply_errcheck(self_obj, value, call_args)? {
-        Some(forced) => Ok(forced),
-        None => build_result(value, &callargs),
-    }
+    build_return_value(plan.ret, result).map(Some)
 }
 
 /// The status word a returned scalar carries.  A COM method answers an
@@ -1210,7 +1614,7 @@ fn get_arg(
 /// type being its own such thing.
 fn out_parameter(at: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     let info = stginfo::stginfo_of(at);
-    if info.is_some_and(|info| stginfo::stginfo_paramfunc(info) == "array") {
+    if info.is_some_and(|info| stginfo::stginfo_paramfunc(info) == ParamFunc::Array) {
         return crate::call::type_call_instantiate(at, &[]);
     }
     match info.and_then(stginfo::stginfo_proto) {
@@ -1324,7 +1728,7 @@ fn argument_address(obj: PyObjectRef) -> Result<usize, crate::PyError> {
     if cdata::is_cdata_instance(obj) {
         let cls = unsafe { pyre_object::w_instance_get_type(obj) };
         if let Some(info) = stginfo::stginfo_of(cls)
-            && stginfo::stginfo_paramfunc(info) == "pointer"
+            && stginfo::stginfo_paramfunc(info) == ParamFunc::Pointer
         {
             return Ok(host_ctypes::read_pointer_from_buffer(
                 cdata::cdata_bytes(obj).unwrap_or(&[]),
@@ -1356,7 +1760,7 @@ fn internal_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // `_ctypes.c cast_check_pointertype`: a pointer type, a function-pointer
     // type, or a simple type whose code is one of the pointer-shaped ones.
     let is_pointer = stginfo::stginfo_of(target)
-        .is_some_and(|i| stginfo::stginfo_paramfunc(i) == "pointer")
+        .is_some_and(|i| stginfo::stginfo_paramfunc(i) == ParamFunc::Pointer)
         || is_funcptr_type(target)
         || cdata::type_code_of(target)
             .is_some_and(|tc| matches!(tc.as_str(), "s" | "P" | "z" | "U" | "Z" | "X" | "O"));
@@ -1598,28 +2002,54 @@ fn internal_pyos_snprintf(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     Ok(pyre_object::w_int_new(rendered.len() as i64))
 }
 
-/// The `StgInfo.paramfunc` of a cdata instance's type ("simple"/"array"/
-/// "pointer"/"struct"/"union"), or empty when it carries no `StgInfo`.
-fn cdata_paramfunc(obj: PyObjectRef) -> String {
+/// The `StgInfo.paramfunc` of a cdata instance's type, or
+/// [`ParamFunc::Other`] when it carries no `StgInfo`.
+fn cdata_paramfunc(obj: PyObjectRef) -> ParamFunc {
     let cls = unsafe { pyre_object::w_instance_get_type(obj) };
     stginfo::stginfo_of(cls)
         .map(stginfo::stginfo_paramfunc)
-        .unwrap_or_default()
+        .unwrap_or(ParamFunc::Other)
+}
+
+/// What a declared argument type lowers to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ArgKind {
+    /// A pointer metaclass type, an array type — which decays — or a simple
+    /// pointer code like `P`/`z`/`Z`.
+    Pointer,
+    /// A struct or union, passed by value.
+    Aggregate,
+    /// A simple type, passed as the bytes its code describes.
+    Simple(TypeCode),
+}
+
+/// Settle what argument type `at` lowers to.
+///
+/// The three questions a marshalled argument asks — pointer? aggregate? which
+/// code? — all read the same `StgInfo` and the same `_type_`, so they are
+/// asked together and the reads happen once.
+pub(super) fn classify_argtype(at: PyObjectRef) -> Option<ArgKind> {
+    let info = stginfo::stginfo_of(at);
+    let paramfunc = info.map_or(ParamFunc::Other, stginfo::stginfo_paramfunc);
+    if info.is_some_and(|i| stginfo::stginfo_flags(i) & stginfo::TYPEFLAG_ISPOINTER != 0)
+        || paramfunc == ParamFunc::Array
+    {
+        return Some(ArgKind::Pointer);
+    }
+    let code = cdata::type_code_of(at);
+    if code.is_some_and(|c| cdata::is_pointer_code(&c)) || is_funcptr_type(at) {
+        return Some(ArgKind::Pointer);
+    }
+    if matches!(paramfunc, ParamFunc::Struct | ParamFunc::Union) {
+        return Some(ArgKind::Aggregate);
+    }
+    code.map(ArgKind::Simple)
 }
 
 /// Whether argument type `at` lowers to a pointer (a pointer metaclass type,
 /// an array type — which decays — or a simple pointer code like `P`/`z`/`Z`).
 pub(super) fn argtype_is_pointer_kind(at: PyObjectRef) -> bool {
-    if let Some(info) = stginfo::stginfo_of(at) {
-        if stginfo::stginfo_flags(info) & stginfo::TYPEFLAG_ISPOINTER != 0 {
-            return true;
-        }
-        if stginfo::stginfo_paramfunc(info) == "array" {
-            return true;
-        }
-    }
-    matches!(cdata::type_code_of(at).as_deref(), Some(c) if cdata::is_pointer_code(c))
-        || is_funcptr_type(at)
+    classify_argtype(at) == Some(ArgKind::Pointer)
 }
 
 /// Whether `t` is a concrete foreign-function type (`CFUNCTYPE`/`WINFUNCTYPE`).
@@ -1632,13 +2062,6 @@ pub(super) fn is_funcptr_type(t: PyObjectRef) -> bool {
 
 fn is_funcptr_instance(obj: PyObjectRef) -> bool {
     !obj.is_null() && unsafe { crate::baseobjspace::isinstance_w(obj, cfuncptr_type()) }
-}
-
-/// Whether type `t` is a by-value aggregate (struct or union).
-fn is_aggregate_type(t: PyObjectRef) -> bool {
-    stginfo::stginfo_of(t)
-        .map(stginfo::stginfo_paramfunc)
-        .is_some_and(|pf| pf == "struct" || pf == "union")
 }
 
 /// Append the field types declared in one `_fields_` sequence to `out`
@@ -1701,18 +2124,17 @@ pub(super) fn build_layout(t: PyObjectRef) -> Result<host_ctypes::CTypeLayout, c
         .ok_or_else(|| crate::PyError::type_error("type has no ctypes layout info"))?;
     let size = stginfo::stginfo_size(info);
     let paramfunc = stginfo::stginfo_paramfunc(info);
-    match paramfunc.as_str() {
-        "simple" => {
+    match paramfunc {
+        ParamFunc::Simple => {
             let tc = cdata::type_code_of(t)
                 .ok_or_else(|| crate::PyError::type_error("simple type has no '_type_'"))?;
             let ch = tc
-                .chars()
-                .next()
+                .as_char()
                 .ok_or_else(|| crate::PyError::type_error("empty '_type_' code"))?;
             Ok(CTypeLayout::Simple(ch))
         }
-        "pointer" => Ok(CTypeLayout::Pointer),
-        "array" => {
+        ParamFunc::Pointer => Ok(CTypeLayout::Pointer),
+        ParamFunc::Array => {
             let element = stginfo::stginfo_proto(info)
                 .ok_or_else(|| crate::PyError::type_error("array type has no element type"))?;
             Ok(CTypeLayout::Array {
@@ -1721,12 +2143,12 @@ pub(super) fn build_layout(t: PyObjectRef) -> Result<host_ctypes::CTypeLayout, c
                 size,
             })
         }
-        "struct" | "union" => {
+        ParamFunc::Struct | ParamFunc::Union => {
             let mut fields = Vec::new();
             for ft in struct_field_types(t)? {
                 fields.push(build_layout(ft)?);
             }
-            if paramfunc == "union" {
+            if paramfunc == ParamFunc::Union {
                 Ok(CTypeLayout::Union { fields, size })
             } else {
                 Ok(CTypeLayout::Struct { fields, size })
@@ -1769,26 +2191,29 @@ fn make_aggregate_instance(ty: PyObjectRef, bytes: &[u8]) -> Result<PyObjectRef,
     Ok(obj)
 }
 
-/// Marshal one argument that has an explicit `argtype` `at`.
+/// Marshal one argument that has an explicit `argtype` `at`, already settled
+/// into the shape `kind` names.
 fn marshal_typed_arg(
     arg: PyObjectRef,
     at: PyObjectRef,
+    kind: ArgKind,
     keepalive: &mut Vec<Vec<u8>>,
 ) -> Result<OwnedArg, crate::PyError> {
-    if argtype_is_pointer_kind(at) {
-        return Ok(OwnedArg::Pointer(pointer_argument_addr(
+    match kind {
+        ArgKind::Pointer => Ok(OwnedArg::Pointer(pointer_argument_addr(
             arg, at, keepalive,
-        )?));
+        )?)),
+        ArgKind::Aggregate => marshal_aggregate_arg(arg, at),
+        ArgKind::Simple(tc) => marshal_simple_arg(arg, tc),
     }
-    // A by-value struct/union argtype.
-    if is_aggregate_type(at) {
-        return marshal_aggregate_arg(arg, at);
-    }
-    let tc = cdata::type_code_of(at)
-        .ok_or_else(|| crate::PyError::type_error("argtype has no valid '_type_'"))?;
-    // `PyCSimpleType.from_param` hands an instance of the argtype itself
-    // straight through and converts anything else, so a mismatched cdata
-    // cannot be reinterpreted through the wrong argtype.
+}
+
+/// Marshal one argument against the simple type code `tc`.
+///
+/// `PyCSimpleType.from_param` hands an instance of the argtype itself straight
+/// through and converts anything else, so a mismatched cdata cannot be
+/// reinterpreted through the wrong argtype.
+fn marshal_simple_arg(arg: PyObjectRef, tc: TypeCode) -> Result<OwnedArg, crate::PyError> {
     if let Some(bytes) = cdata::same_type_bytes(&tc, arg) {
         return Ok(OwnedArg::Typed(tc, bytes));
     }
@@ -1819,16 +2244,16 @@ fn marshal_default_arg(
     // Aggregate / pointer cdata: arrays and pointers decay to a pointer; a
     // struct/union with no `byref()` is passed by value.
     if cdata::is_cdata_instance(arg) {
-        match cdata_paramfunc(arg).as_str() {
-            "pointer" => {
+        match cdata_paramfunc(arg) {
+            ParamFunc::Pointer => {
                 return Ok(OwnedArg::Pointer(host_ctypes::read_pointer_from_buffer(
                     cdata::cdata_bytes(arg).unwrap_or(&[]),
                 )));
             }
-            "array" => {
+            ParamFunc::Array => {
                 return Ok(OwnedArg::Pointer(cdata::cdata_addr(arg).unwrap_or(0)));
             }
-            "struct" | "union" => {
+            ParamFunc::Struct | ParamFunc::Union => {
                 let cls = unsafe { pyre_object::w_instance_get_type(arg) };
                 return marshal_aggregate_arg(arg, cls);
             }
@@ -1863,7 +2288,7 @@ fn pointer_argument_addr(
     keepalive: &mut Vec<Vec<u8>>,
 ) -> Result<usize, crate::PyError> {
     if let Some(info) = stginfo::stginfo_of(at)
-        && stginfo::stginfo_paramfunc(info) == "pointer"
+        && stginfo::stginfo_paramfunc(info) == ParamFunc::Pointer
         && let Some(proto) = stginfo::stginfo_proto(info)
         && unsafe { pyre_object::is_type(proto) }
         && unsafe { crate::baseobjspace::isinstance_w(arg, proto) }
@@ -1895,8 +2320,8 @@ pub(super) fn resolve_pointer_addr(
     }
     if cdata::is_cdata_instance(arg) {
         // `_Pointer` → stored address; `Array`/`Structure` → buffer address.
-        return Ok(match cdata_paramfunc(arg).as_str() {
-            "pointer" => {
+        return Ok(match cdata_paramfunc(arg) {
+            ParamFunc::Pointer => {
                 host_ctypes::read_pointer_from_buffer(cdata::cdata_bytes(arg).unwrap_or(&[]))
             }
             _ => cdata::cdata_addr(arg).unwrap_or(0),

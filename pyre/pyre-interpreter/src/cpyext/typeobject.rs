@@ -543,13 +543,11 @@ fn builtin_type(layout: &'static pyre_object::pyobject::PyType) -> PyObjectRef {
 /// the type, so the string has to outlive every read of the field and die with
 /// the mirror rather than with this call.  Keyed by the mirror's address, which
 /// is fixed for its life; [`forget_type_name`] is what releases it.
-type NameTable = std::collections::HashMap<
-    usize,
-    CString,
-    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
->;
-static TYPE_NAMES: super::ForkMutex<NameTable> =
-    super::ForkMutex::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
+type NameTable = super::address_table::HeldMap<CString>;
+use super::address_table::{AddressTable, hold};
+
+static TYPE_NAMES: AddressTable<NameTable> =
+    AddressTable::new(NameTable::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// `typeobject.py:708-722 type_dealloc` — release what a synthesized mirror's
 /// own fields hold, and the string behind `tp_name`.
@@ -563,7 +561,7 @@ static TYPE_NAMES: super::ForkMutex<NameTable> =
 /// # Safety
 /// `raw` must be a live block whose count has fallen to zero.
 pub(super) unsafe fn forget_type_mirror(raw: *mut CPyObject) {
-    if TYPE_NAMES.lock().remove(&(raw as usize)).is_none() {
+    if TYPE_NAMES.take(raw as usize).is_none() {
         return;
     }
     let mirror = raw as *mut CPyTypeObject;
@@ -602,7 +600,7 @@ pub(super) fn type_mirror_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
     let names = TYPE_NAMES.lock();
     edges.reserve(names.len());
     for &block in names.keys() {
-        let mirror = block as *mut CPyTypeObject;
+        let mirror = block.address() as *mut CPyTypeObject;
         let base = unsafe { (*mirror).tp_base };
         let base = match is_heap_type(mirror) && !base.is_null() {
             true => unsafe { &raw mut (*base).ob_base.ob_base },
@@ -621,7 +619,7 @@ pub(super) fn type_mirror_edges(edges: &mut Vec<(usize, Vec<usize>)>) {
         .map(|raw| raw as usize)
         .collect();
         if !referents.is_empty() {
-            edges.push((block, referents));
+            edges.push((block.address(), referents));
         }
     }
 }
@@ -883,7 +881,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
             (*mirror).tp_weaklistoffset = (*base).tp_weaklistoffset;
         }
     }
-    TYPE_NAMES.lock().insert(mirror as usize, name);
+    TYPE_NAMES.lock().insert(hold(mirror as usize), name);
 }
 
 /// The mirror of the base whose instance layout `w_type` extends —
@@ -1555,8 +1553,7 @@ static BOUND_MINTED: super::ForkMutex<BoundAddresses> = super::ForkMutex::new(
     BoundAddresses::with_hasher(std::hash::BuildHasherDefault::new()),
 );
 
-type BoundAddresses =
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>;
+type BoundAddresses = super::address_table::AddressSet;
 
 type BoundNames = std::collections::HashMap<
     (usize, &'static str),
@@ -4334,16 +4331,12 @@ fn install_protocols(ns: PyObjectRef, tp: *mut CPyTypeObject) {
 /// A filled block, against the address of the [`CPyWrapperBase`] allocated for
 /// it -- 0 for every family that has none.  An address rather than a pointer
 /// because the table is shared across threads and a raw pointer is not.
-type BlockSet = std::collections::HashMap<
-    usize,
-    usize,
-    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
->;
+type BlockSet = super::address_table::HeldMap<usize>;
 
 /// The blocks [`descriptor_attach`] filled, and so the ones whose references
 /// are this module's to release.
-static DESCRIPTOR_BLOCKS: super::ForkMutex<BlockSet> =
-    super::ForkMutex::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
+static DESCRIPTOR_BLOCKS: AddressTable<BlockSet> =
+    AddressTable::new(BlockSet::with_hasher(std::hash::BuildHasherDefault::new()));
 
 /// Whether `w_type` is one of this module's descriptor carriers.
 ///
@@ -4453,13 +4446,13 @@ pub(super) fn descriptor_attach(raw: *mut CPyObject, w_obj: PyObjectRef) {
         }
         0
     };
-    DESCRIPTOR_BLOCKS.lock().insert(raw as usize, base);
+    DESCRIPTOR_BLOCKS.lock().insert(hold(raw as usize), base);
 }
 
 /// Release what a descriptor block owns — `typeobject.py descr_dealloc` and
 /// `wrapper_dealloc`, which frees the wrapper block on top of it.
 pub(super) fn forget_descriptor_block(raw: *mut CPyObject) {
-    let Some(base) = DESCRIPTOR_BLOCKS.lock().remove(&(raw as usize)) else {
+    let Some(base) = DESCRIPTOR_BLOCKS.take(raw as usize) else {
         return;
     };
     let descr = raw as *mut CPyDescrObject;
@@ -5313,11 +5306,9 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
 /// checked the field answers "does this type have a `tp_new`", which is yes for
 /// every readied type.  What the check asks is the narrower question this
 /// records: did the extension declare one.
-static DECLARED_TP_NEW: super::ForkMutex<
-    std::collections::HashSet<usize, std::hash::BuildHasherDefault<std::hash::DefaultHasher>>,
-> = super::ForkMutex::new(std::collections::HashSet::with_hasher(
-    std::hash::BuildHasherDefault::new(),
-));
+static DECLARED_TP_NEW: super::ForkMutex<super::address_table::AddressSet> = super::ForkMutex::new(
+    super::address_table::AddressSet::with_hasher(std::hash::BuildHasherDefault::new()),
+);
 
 fn record_declared_tp_new(tp: *mut CPyTypeObject) {
     if unsafe { (*tp).tp_new.is_null() } {
@@ -5862,11 +5853,7 @@ fn single_base(bases: PyObjectRef) -> Result<*mut CPyTypeObject, crate::PyError>
 /// leaked deliberately, so the key is stable for the life of the process.  The
 /// module is held as an owned mirror reference, and it is that reference — not
 /// the table — that roots it.
-type TypeSideTable = std::collections::HashMap<
-    usize,
-    usize,
-    std::hash::BuildHasherDefault<std::hash::DefaultHasher>,
->;
+type TypeSideTable = super::address_table::AddressMap<usize>;
 static TYPE_MODULES: super::ForkMutex<TypeSideTable> = super::ForkMutex::new(
     TypeSideTable::with_hasher(std::hash::BuildHasherDefault::new()),
 );

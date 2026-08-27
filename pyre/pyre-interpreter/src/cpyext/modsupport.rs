@@ -39,9 +39,10 @@ struct ModuleFields {
     md_state: usize,
 }
 
-type ModuleTable =
-    std::collections::HashMap<usize, ModuleFields, BuildHasherDefault<std::hash::DefaultHasher>>;
-static MODULE_FIELDS: super::ForkMutex<ModuleTable> = super::ForkMutex::new(
+type ModuleTable = super::address_table::HeldMap<ModuleFields>;
+use super::address_table::{AddressTable, hold};
+
+static MODULE_FIELDS: AddressTable<ModuleTable> = AddressTable::new(
     std::collections::HashMap::with_hasher(BuildHasherDefault::new()),
 );
 
@@ -76,7 +77,7 @@ fn set_field(module: PyObjectRef, update: impl FnOnce(&mut ModuleFields)) {
     if mirror == 0 {
         return;
     }
-    update(MODULE_FIELDS.lock().entry(mirror).or_default());
+    update(MODULE_FIELDS.lock().entry(hold(mirror)).or_default());
 }
 
 /// Drop what a dying module mirror recorded.
@@ -84,7 +85,7 @@ fn set_field(module: PyObjectRef, update: impl FnOnce(&mut ModuleFields)) {
 /// The state block itself is not freed: pyre has no module deallocation path,
 /// and an extension may still hold the address.
 pub(super) fn forget_module_fields(mirror: usize) {
-    MODULE_FIELDS.lock().remove(&mirror);
+    MODULE_FIELDS.take(mirror);
 }
 
 /// The single-phase modules `PyState_AddModule` has filed, one slot per module
