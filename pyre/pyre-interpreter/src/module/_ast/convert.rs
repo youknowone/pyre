@@ -308,9 +308,31 @@ impl ObjectConverter {
             Some(value) => self.obj_to_int(value)?,
             None => column,
         };
+
+        // [3.14-spec] CPython `VALIDATE_POSITIONS` rejects these ranges before
+        // code generation.  PyPy `AstValidator` has no corresponding check,
+        // but the invalid range and ValueError are observable at compile().
+        if line > end_line {
+            return Err(crate::PyError::value_error(format!(
+                "AST node line range ({line}, {end_line}) is not valid"
+            )));
+        }
+        if (line < 0 && end_line != line) || (column < 0 && column != end_column) {
+            return Err(crate::PyError::value_error(format!(
+                "AST node column range ({column}, {end_column}) for line range ({line}, {end_line}) is not valid"
+            )));
+        }
+        if line == end_line && column > end_column {
+            return Err(crate::PyError::value_error(format!(
+                "line {line}, column {column}-{end_column} is not a valid range"
+            )));
+        }
+
         let start = self.offset_of(line, column);
-        // A tree can name an end before its start; the compiler indexes the
-        // range and a reversed one would panic, so it collapses to the start.
+        // Zero and negative line numbers are accepted when the paired end
+        // position satisfies the checks above.  The synthetic source maps all
+        // of them to its first line, so preserve that valid input even when
+        // the mapping makes its byte offsets coincide or reverse.
         let end = self.offset_of(end_line, end_column).max(start);
         Ok(ruff_text_size::TextRange::new(start.into(), end.into()))
     }
