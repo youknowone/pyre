@@ -2,7 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::ItemFn;
+use syn::{Ident, ItemFn};
 
 use super::{JitInterpConfig, StateFieldKind};
 
@@ -40,44 +40,36 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let fresh_free_fn = format_ident!("__majit_recursive_fresh_free_{}", func.sig.ident);
     let sf = config.state_fields.as_ref().unwrap();
 
+    let is_int_or_float = |ty: &Ident| ty == "int" || ty == "float";
+    // Each rejected field is rendered the way it was DECLARED, brackets
+    // included. Rendering the element type alone makes a rejected `[float]`
+    // read as `regs: float`, which is the scalar form the same message lists
+    // as supported — the reader is told the thing they wrote is both.
     let unsupported_fields: Vec<String> = sf
         .fields
         .iter()
-        .filter_map(|f| match &f.kind {
-            StateFieldKind::Scalar { ir_type, .. } => {
-                let ty = ir_type.to_string();
-                if ty == "int" || ty == "float" {
-                    None
-                } else {
-                    Some(format!("{}: {}", f.name, ty))
+        .filter_map(|f| {
+            let (rendered, supported) = match &f.kind {
+                StateFieldKind::Scalar { ir_type, .. } => {
+                    (format!("{}: {}", f.name, ir_type), is_int_or_float(ir_type))
                 }
-            }
-            StateFieldKind::Array(tp) => {
-                let ty = tp.to_string();
-                if ty == "int" {
-                    None
-                } else {
-                    Some(format!("{}: {}", f.name, ty))
+                // A flattened array is int-only: every consumer below reaches
+                // its cells through the int register bank.
+                StateFieldKind::Array(tp) => (format!("{}: [{}]", f.name, tp), tp == "int"),
+                StateFieldKind::VirtArray(tp) => {
+                    (format!("{}: [{}; virt]", f.name, tp), is_int_or_float(tp))
                 }
-            }
-            StateFieldKind::VirtArray(tp) => {
-                let ty = tp.to_string();
-                if ty == "int" || ty == "float" {
-                    None
-                } else {
-                    Some(format!("{}: {}", f.name, ty))
-                }
-            }
-            // RPython parity: opaque(T) fields are pass-through; the JIT
-            // does not enumerate them as inputargs, so any T is allowed.
-            StateFieldKind::Opaque(_) => None,
-            // ref(T) is supported — a ref-typed scalar (usize carrier).
-            StateFieldKind::Ref(_) => None,
+                // opaque(T) fields are pass-through; the JIT does not
+                // enumerate them as inputargs, so any T is allowed. ref(T) is
+                // a ref-typed scalar (usize carrier), also any T.
+                StateFieldKind::Opaque(_) | StateFieldKind::Ref(_) => return None,
+            };
+            (!supported).then_some(rendered)
         })
         .collect();
     if !unsupported_fields.is_empty() {
         let message = format!(
-            "state_fields supports int, float, [int], [int; virt], [float; virt], and opaque(T); unsupported: {}",
+            "state_fields supports int, float, [int], [int; virt], [float; virt], ref(T), and opaque(T); unsupported: {}",
             unsupported_fields.join(", ")
         );
         return quote! {

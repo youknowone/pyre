@@ -3887,6 +3887,69 @@ mod tests {
         .expect("read-only plain [int] array must be accepted");
     }
 
+    /// An unsupported `state_fields` entry is reported the way it was
+    /// declared, brackets included.
+    ///
+    /// `parse_state_fields` accepts `[<ident>]` for any element type and
+    /// `codegen_state` is where the int-only restriction on flattened arrays
+    /// lives, so `[float]` is refused there. Rendering the element type alone
+    /// printed `regs: float` — the scalar spelling the same message lists as
+    /// supported — so the reader was told their declaration was both
+    /// supported and not.
+    #[test]
+    fn an_unsupported_state_field_is_reported_as_declared() {
+        fn expand(fields: proc_macro2::TokenStream) -> String {
+            let config: JitInterpConfig = syn::parse2(quote! {
+                state = S,
+                env = Bytecode,
+                greens = [],
+                state_fields = { #fields },
+            })
+            .expect("fixture attribute must parse");
+            let func: ItemFn = parse_quote! {
+                fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                    let mut driver: majit_metainterp::JitDriver<S> =
+                        majit_metainterp::JitDriver::new(threshold);
+                    let mut pc: usize = 0;
+                    let mut state = S { acc: 0 };
+                    while pc < program.len() {
+                        jit_merge_point!();
+                        let op = program[pc];
+                        pc += 1;
+                        match op {
+                            0 => { state.acc += 1; }
+                            _ => break,
+                        }
+                    }
+                    state.acc
+                }
+            };
+            transform_jit_interp(config, func).to_string()
+        }
+
+        let flat_float = expand(quote! { acc: int, regs: [float] });
+        assert!(
+            flat_float.contains("compile_error"),
+            "a flattened `[float]` array has no lowering and must be refused:\n\
+             {flat_float}"
+        );
+        assert!(
+            flat_float.contains("regs: [float]"),
+            "the refusal must render the declaration, not the element type — \
+             `regs: float` names the supported scalar form instead of the \
+             rejected array one:\n{flat_float}"
+        );
+
+        // The control: the same array over `int` expands cleanly, so the
+        // assertions above are about the element type and not about the
+        // fixture failing for some other reason.
+        let flat_int = expand(quote! { acc: int, regs: [int] });
+        assert!(
+            !flat_int.contains("compile_error"),
+            "`[int]` is the supported flattened array:\n{flat_int}"
+        );
+    }
+
     /// A merge point whose enclosing attribute omits the `greens` key must be
     /// refused at expansion time.
     ///
