@@ -176,16 +176,25 @@ pub trait JitPolicy {
         //   - `res` is False (loops or unsupported types mean
         //     `look_inside_graph` decided not to trace into it),
         //   - `graph.access_directly` is True (annotator set this because
-        //     an argument carried the `access_directly` flag, see
+        //     an ARGUMENT carried the `access_directly` flag, see
         //     `default_specialize` in `rpython/annotator/specialize.py`).
         //
         // Turning the call into a residual call while the function
         // accesses a virtualizable would silently desynchronise the
         // virtualizable from the JIT's view; upstream therefore aborts
         // translation loudly. Pyre carries the same flag on
-        // `SemanticFunction.access_directly` (populated by the
-        // annotator-to-front bridge once it lands) so the gate fires the
-        // moment the same invariant breaks.
+        // `SemanticFunction.access_directly`, which the flowspace
+        // pipeline's `description.rs default_specialize` writes and the
+        // LLBC front end leaves `false` — see that field's own comment for
+        // what a bridge on the LLBC path would have to propagate, and why
+        // reading the hint marker off the containing function is not it.
+        //
+        // This is the first of upstream's two gates on the flag. The
+        // second, `warmspot.py check_access_directly_sanity`, walks
+        // everything reachable from the entry point and asserts that no
+        // graph outside the JIT graph set is `access_directly`; it has no
+        // port here, and would answer vacuously until something sets the
+        // flag on the production path.
         if see_function && !res && func.access_directly {
             panic!(
                 "access_directly on a function which we don't see: {}",
