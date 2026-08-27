@@ -24,11 +24,15 @@ import select
 import sys
 import tempfile
 
-BANNER = re.compile(rb"^(Python 3|pyre )", re.M)
+# The greeting is two lines and they are not interchangeable: the version line
+# names the runtime, the second one names what `site` installed.  Counting only
+# the first would pass a runtime that sent the second to stdout.
+VERSION = re.compile(rb"^(Python 3|pyre )", re.M)
+GREETING = re.compile(rb'^Type "', re.M)
 
 
 def banner_streams(argv):
-    """`(banner lines on stdout, banner lines on stderr)` for an interactive run."""
+    """`(stdout, stderr)` bytes for an interactive run driven through a pty."""
     # stderr is the only stream that can be redirected away from the terminal
     # without making stdin a pipe, which would suppress the banner outright.
     handle = tempfile.NamedTemporaryFile(delete=False, suffix=".err")
@@ -58,17 +62,27 @@ def banner_streams(argv):
     with open(handle.name, "rb") as stream:
         err_text = stream.read()
     os.unlink(handle.name)
-    return len(BANNER.findall(out)), len(BANNER.findall(err_text))
+    return out, err_text
 
 
-stdout_lines, stderr_lines = banner_streams([sys.executable])
+def counts(argv):
+    """`(version line, greeting line)` each as `(stdout hits, stderr hits)`."""
+    out, err = banner_streams(argv)
+    return (
+        (len(VERSION.findall(out)), len(VERSION.findall(err))),
+        (len(GREETING.findall(out)), len(GREETING.findall(err))),
+    )
+
+
+version, greeting = counts([sys.executable])
 # The terminal echoes what was typed into it, so stdout carries the `exit()`
-# that drove the session; what it must not carry is the banner.
-assert stdout_lines == 0, (stdout_lines, stderr_lines)
-assert stderr_lines == 1, (stdout_lines, stderr_lines)
+# that drove the session; what it must not carry is either greeting line.
+assert version == (0, 1), (version, greeting)
+assert greeting == (0, 1), (version, greeting)
 
-# `-q` drops it from stderr too, rather than moving it.
-quiet_out, quiet_err = banner_streams([sys.executable, "-q"])
-assert (quiet_out, quiet_err) == (0, 0), (quiet_out, quiet_err)
+# `-q` drops both lines from stderr too, rather than moving either one.
+quiet_version, quiet_greeting = counts([sys.executable, "-q"])
+assert quiet_version == (0, 0), (quiet_version, quiet_greeting)
+assert quiet_greeting == (0, 0), (quiet_version, quiet_greeting)
 
 print("OK")

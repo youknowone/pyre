@@ -106,11 +106,12 @@ pub mod errno;
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod faulthandler;
 // All four callables inside are gated on `all(unix, feature = "host_env")` with
-// a NotImplementedError on the other arm, so without it the module is its
-// constants and four functions that cannot run.  `mailbox`, `subprocess` and
-// `pathlib._os` each import it inside `try/except ImportError` and take a
-// fallback when it is missing; an import that succeeds takes that fallback away
-// without supplying anything to replace it.
+// a NotImplementedError on the other arm, so a build without it would offer a
+// module of constants and four functions that cannot run.  `mailbox`,
+// `subprocess` and `pathlib._os` each import it inside `try/except ImportError`
+// and take a fallback when it is missing; an import that succeeds would take
+// that fallback away without supplying anything to replace it, so the module is
+// left out instead.
 #[cfg(all(not(feature = "sandbox"), feature = "host_env"))]
 pub mod fcntl;
 pub mod gc;
@@ -133,9 +134,10 @@ pub mod pwd;
 pub mod pyexpat;
 pub mod pypyjit;
 // All three callables are gated on `all(unix, feature = "host_env")` the way
-// `fcntl`'s are.  Its readers are test modules rather than the stdlib proper,
-// and they ask the same question: `test.support`, `test_os`, `test_subprocess`
-// and `test_selectors` all import it inside `try/except ImportError`.
+// `fcntl`'s are, and it is left out for the same reason.  Its readers are test
+// modules rather than the stdlib proper, and they ask the same question:
+// `test.support`, `test_os`, `test_subprocess` and `test_selectors` all import
+// it inside `try/except ImportError`.
 #[cfg(all(not(feature = "sandbox"), feature = "host_env"))]
 pub mod resource;
 #[cfg(not(feature = "sandbox"))]

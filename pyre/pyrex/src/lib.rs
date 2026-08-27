@@ -1926,6 +1926,28 @@ fn finalize_system_exit(
 
 /// Die by SIGINT for an uncaught KeyboardInterrupt after shutdown has run
 /// (`app_main.py:1133-1153`).
+/// Whether a top-level `KeyboardInterrupt` has been reported and not answered
+/// by an explicit exit status yet.
+///
+/// `_PyErr_PrintEx` records one, and `Py_RunMain` consults it after the prompt
+/// and after `Py_FinalizeEx`, so an interrupt raised by the program under `-i`
+/// still ends the process by SIGINT once the prompt is done -- and so does one
+/// raised at the prompt itself.  An explicit `exit(n)` answers it, `exit(0)`
+/// included, because `SystemExit` leaves through `Py_Exit` without passing the
+/// check.
+static UNHANDLED_KEYBOARD_INTERRUPT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn note_unhandled_keyboard_interrupt(error: &pyre_interpreter::PyError) {
+    if is_keyboard_interrupt(error) {
+        UNHANDLED_KEYBOARD_INTERRUPT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn had_unhandled_keyboard_interrupt() -> bool {
+    UNHANDLED_KEYBOARD_INTERRUPT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn terminate_by_sigint() -> ! {
     // A Win32 process has no SIGINT to die of: restoring `SIG_DFL` and calling
     // `raise(SIGINT)` runs the CRT's default action, which returns and ends the
@@ -2224,6 +2246,22 @@ fn finish_main(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionCo
     maybe_print_jit_stats();
 }
 
+/// End a startup failure the way `Py_RunMain` does.
+///
+/// `pymain_run_python` reports the failure and returns a status; `Py_FinalizeEx`
+/// then runs regardless, so the `atexit` callbacks, module teardown and stream
+/// flush a live interpreter owes are delivered before the status is.  Every
+/// caller here is past `import_site`, so `site` and any `sitecustomize` have
+/// already had their chance to register one.
+fn end_after_startup_failure(
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+    status: i32,
+) -> ! {
+    finish_main(canonical, ec_ptr);
+    std::process::exit(status);
+}
+
 /// The interpreter a program leaves running for `-i` to continue in.
 ///
 /// `pymain_run_python` runs the program, then the prompt, and reaches
@@ -2266,6 +2304,7 @@ fn finish_or_inspect(
 /// turns the request to exit into a report, which is why the run ends with the
 /// prompt's status rather than the program's.
 fn report_main_error_for_inspect(mut e: pyre_interpreter::PyError) {
+    note_unhandled_keyboard_interrupt(&e);
     if !pyre_interpreter::error::print_exception_via_excepthook(&mut e) {
         pyre_interpreter::eprint_exception(&e, true);
     }
@@ -2289,7 +2328,7 @@ fn report_or_end_on_main_error(
 }
 
 fn eval_source_in_main(
-    source: &str,
+    read_source: impl FnOnce() -> String,
     mode: Mode,
     filename: &str,
     main_file: Option<&str>,
@@ -2369,11 +2408,14 @@ fn eval_source_in_main(
         }
     }
 
-    // Compiled only once startup is complete, which is the order
+    // Read and compiled only once startup is complete, which is the order
     // `pymain_run_python` runs in: `site` is imported by interpreter
-    // initialisation, ahead of every path that reaches user source.  A
-    // program that will not compile still gets it -- the report below goes
-    // through `sys.excepthook`, which `site` is entitled to have replaced.
+    // initialisation, ahead of every path that reaches user source.  A program
+    // that will not open, or will not compile, still gets it -- the report
+    // below goes through `sys.excepthook`, which `site` is entitled to have
+    // replaced, and the failure still finalizes on its way out.
+    let source = read_source();
+    let source = source.as_str();
     let code = match compile_source_with_filename(source, mode, filename) {
         Ok(code) => code,
         Err(e) => {
@@ -2392,7 +2434,7 @@ fn eval_source_in_main(
             if inspect {
                 return finish_or_inspect(true, session_context, canonical, main_module);
             }
-            std::process::exit(1);
+            end_after_startup_failure(canonical, ec_ptr, 1);
         }
     };
 
@@ -2404,7 +2446,7 @@ fn eval_source_in_main(
             if inspect {
                 return finish_or_inspect(true, session_context, canonical, main_module);
             }
-            std::process::exit(1);
+            end_after_startup_failure(canonical, ec_ptr, 1);
         }
     };
     // The frame is a GC object, and the only root that reaches one is the
@@ -2445,7 +2487,12 @@ fn eval_source_in_main(
     finish_or_inspect(inspect, session_context, canonical, main_module)
 }
 
-fn read_script_source(path: &str, binary_name: &str) -> String {
+fn read_script_source(
+    path: &str,
+    binary_name: &str,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) -> String {
     // The script is read through the import machinery's source provider, so
     // under sandbox the controller VFS mediates it over the same channel
     // module imports use.  The bytes then go through the tokenizer's BOM /
@@ -2459,12 +2506,16 @@ fn read_script_source(path: &str, binary_name: &str) -> String {
             Ok(source) => source,
             Err(error) => {
                 pyre_interpreter::eprint_exception(&error, false);
-                std::process::exit(1);
+                end_after_startup_failure(canonical, ec_ptr, 1);
             }
         },
+        // `pymain_run_file` reports an unopenable script with
+        // `EXIT_STATUS_ERROR`, which is 2 -- the status a shell reads as "the
+        // program was never run", distinct from the 1 a program that ran and
+        // failed exits with.
         Err(e) => {
             eprintln!("{binary_name}: cannot open '{path}': {e}");
-            std::process::exit(1);
+            end_after_startup_failure(canonical, ec_ptr, 2);
         }
     }
 }
@@ -2509,11 +2560,10 @@ fn run_script_path(
             finish_or_inspect(inspect, execution_context, canonical, main_module)
         }
         Ok(false) => {
-            let source = read_script_source(path, binary_name);
             let main_file = absolute_script_path(filename);
             let filename = main_file.as_deref().unwrap_or(filename);
             eval_source_in_main(
-                &source,
+                || read_script_source(path, binary_name, canonical, ec_ptr),
                 Mode::Exec,
                 filename,
                 main_file.as_deref(),
@@ -2562,7 +2612,7 @@ fn run_source(
     }
 
     eval_source_in_main(
-        source,
+        || source.to_string(),
         mode,
         filename,
         main_file.as_deref(),

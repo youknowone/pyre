@@ -232,6 +232,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
                     pending_exit = Some(pyre_interpreter::system_exit_code(&err));
                     break;
                 }
+                crate::note_unhandled_keyboard_interrupt(&err);
                 pyre_interpreter::eprint_exception(&err, true);
                 full_input.clear();
                 continuing_block = false;
@@ -251,8 +252,17 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
     // delivered by the exit below, after the callbacks have run.
     crate::finish_main(canonical, Rc::as_ptr(&execution_context));
 
+    // `exit()` answers an earlier interrupt: `SystemExit` leaves through
+    // `Py_Exit` without reaching the check below, so the status it asked for is
+    // the one delivered, `exit(0)` included.
     if let Some(code) = pending_exit {
         std::process::exit(code);
+    }
+    // A prompt that simply ended still owes the interrupt: `Py_RunMain`
+    // consults the flag after the prompt and after finalization, which is
+    // where this sits.
+    if crate::had_unhandled_keyboard_interrupt() {
+        crate::terminate_by_sigint();
     }
 }
 
