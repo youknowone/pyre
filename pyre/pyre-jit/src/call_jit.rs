@@ -483,7 +483,7 @@ extern "C" fn jit_exc_raise_shim(value: i64) {
 /// (via `store_jit_exception`) — are GC-rooted by `walk_parked_exception_roots`
 /// and by the per-mutator `PyFrameRootArea`, so this writer needs no rooting of
 /// its own.
-fn publish_residual_call_exception(exc_obj: i64) {
+pub(crate) fn publish_residual_call_exception(exc_obj: i64) {
     // Every residual raise enters the two exception channels here, so this is
     // the one place that can hold the line on what they may carry — and the
     // one place where the producer is still on the stack.  Both consumers
@@ -1146,13 +1146,11 @@ fn run_frame_through_portal(frame_ptr: i64) -> i64 {
 /// The call uses the `jd.portal_calldescr` ABI —
 /// `JitDriverStaticData::build_portal_calldescr` lays the args out in `vars`
 /// declaration order: greens `[next_instr, is_being_profiled, pycode]` then
-/// reds `[frame, ec]`. The callee `frame` red already carries `pycode` /
-/// `next_instr` baked in by the caller that built it, so only the frame
-/// pointer is needed to resume; the greens are consumed implicitly through the
-/// reconstructed frame, matching the frame-only `assembler_call_helper` entry.
+/// reds `[frame, ec]`. The red frame owns activation identity, while the green
+/// `next_instr` remains the control coordinate forwarded to the portal.
 #[majit_macros::jit_may_force]
 pub extern "C" fn ll_portal_runner_shim(
-    _next_instr: i64,
+    next_instr: i64,
     _is_being_profiled: i64,
     _pycode: i64,
     frame_ptr: i64,
@@ -1161,8 +1159,15 @@ pub extern "C" fn ll_portal_runner_shim(
     // The callback loop `compile_tmp_callback` builds (compile.py)
     // passes the callee `frame` red that `emit_new_pyframe_inline_with_params`
     // constructed — a proper `PyFrame` with `locals_cells_stack_w` already
-    // populated (NewWithVtable + SetfieldGc).  Run it directly; the greens
-    // (`next_instr` / `pycode`) are redundant because the frame carries them.
+    // populated (NewWithVtable + SetfieldGc). PyPy `ll_portal_runner` forwards
+    // every portal argument to `portal_ptr(*args)`. Preserve that exact
+    // coordinate: a tracing MIFrame may be ahead of the heap frame's stale
+    // `last_instr`, and using the latter resumes the right activation at the
+    // wrong bytecode.
+    if frame_ptr != 0 {
+        let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+        frame.set_last_instr_from_next_instr(next_instr as usize);
+    }
     run_frame_through_portal(frame_ptr)
 }
 

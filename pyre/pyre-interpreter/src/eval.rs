@@ -1908,9 +1908,11 @@ pub fn handle_exception_with_context(
     if err.exc_object.is_null() {
         err.exc_object = exc_obj;
     }
-    // Implicit __context__ chaining: any exception raised while another is being
-    // handled records that active exception as its __context__, not only an
-    // explicit `raise`.
+    // PyPy `PyFrame.handle_bytecode` calls `OperationError.record_context`
+    // only on the ordinary OperationError arm. `RaiseWithExplicitTraceback`
+    // (RERAISE) goes straight to `handle_operation_error(attach_tb=False)`:
+    // the same exception is still propagating and must not acquire the
+    // exception handled by an intervening finally block as a new context.
     //
     // `error.py record_context` records it once and then marks the
     // OperationError, so the frames the SAME error merely unwinds through never
@@ -1918,7 +1920,7 @@ pub fn handle_exception_with_context(
     // error outward because the dispatch loop moves the same value into
     // `Err(err)` on propagation.  The mark is set below whether or not an active
     // exception was found, mirroring the `finally`.
-    if !err.context_recorded {
+    if err.attach_tb && !err.context_recorded {
         let active = match context_source {
             ContextSource::GeneratorChain => get_sys_exception(),
             ContextSource::ResumedFrameOnly => get_current_exception(),
@@ -4525,6 +4527,13 @@ impl OpcodeStepExecutor for PyFrame {
                     frame.last_instr as i64,
                 );
             }
+            // `record_application_traceback` publishes a propagating error in
+            // `IN_FLIGHT_EXCEPTION`. This wrapper is no longer propagating:
+            // CHECK_EG_MATCH has transferred it to the value stack and
+            // `sys_exc_value`, exactly as `push_exc_info` does for an ordinary
+            // caught exception. Leaving the side channel set makes the
+            // temporary group a permanent collector root after POP_EXCEPT.
+            set_in_flight_exception(pyre_object::PY_NULL);
         }
         Ok(())
     }

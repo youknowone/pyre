@@ -5681,10 +5681,11 @@ impl MiniMarkGC {
     /// bit covers internal structs that share a Python-object prefix but have
     /// no app-level typedef.
     ///
-    /// This is the single predicate behind every app-level inspector — the
-    /// `gc.get_objects` filter, the `get_rpy_*` wrap decision, and the walk
-    /// terminator in [`Self::do_get_referents`] — because upstream passes the
-    /// one `try_cast_gcref_to_w_root` to all three.
+    /// This is the predicate behind the `gc.get_objects` filter and the
+    /// `get_rpy_*` wrap decision. The referents walk has one deliberate extra
+    /// boundary: an OBJECT-layout value hidden from enumeration (the
+    /// CPython-compatible execution-frame shape described on
+    /// `TypeInfo::hide_from_app_level_inspector`) still stops traversal.
     fn is_app_level_object_ref(&self, obj: GcRef) -> bool {
         // `referents.py rgc.get_gcflag_dummy(gcref)`: a dummy stands in for
         // an object the collector no longer holds, so it is never an app-level
@@ -5703,6 +5704,30 @@ impl MiniMarkGC {
         }
         let info = self.types.get(type_id);
         info.is_object && !info.hide_from_app_level_inspector
+    }
+
+    /// Whether app-level referents inspection must stop at `obj`.
+    ///
+    /// PyPy `referents._list_w_obj_referents` stops at every valid `W_Root`.
+    /// Pyre additionally omits executing frames from `gc.get_objects()` to
+    /// match CPython, but a frame is still a Python object and
+    /// `traceback.tb_frame` remains a direct referent boundary. Looking
+    /// through it incorrectly attributes all frame locals to the traceback.
+    fn is_app_level_referent_boundary(&self, obj: GcRef) -> bool {
+        // Preserve every ordinary app-level boundary first, including
+        // prebuilt/foreign W_Root objects which are not managed by this heap.
+        if self.is_app_level_object_ref(obj) {
+            return true;
+        }
+        if !self.is_managed_heap_object(obj.0)
+            || unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
+        {
+            return false;
+        }
+        let Some(type_id) = self.get_actual_typeid(obj) else {
+            return false;
+        };
+        (type_id as usize) < self.types.len() && self.types.get(type_id).is_object
     }
 
     /// `pypy/module/gc/referents.py _list_w_obj_referents`: visit the
@@ -5760,7 +5785,7 @@ impl MiniMarkGC {
             while i < pending.len() {
                 parent = pending[i];
                 i += 1;
-                if self.is_app_level_object_ref(parent) {
+                if self.is_app_level_referent_boundary(parent) {
                     result.push(parent);
                 } else {
                     expand = true;
@@ -9550,11 +9575,12 @@ mod tests {
         gc.roots.clear();
     }
 
-    /// `referents.py` terminates a branch on `try_cast_gcref_to_w_root`,
-    /// so the two rejections that helper opens with — the dummy flag and the
-    /// missing typedef — look *through* a node here rather than reporting it.
+    /// A hidden OBJECT is omitted from `get_objects` but remains a direct
+    /// referent boundary (the execution-frame case). A DUMMY is not a live
+    /// Python object and is still looked through, matching
+    /// `referents._list_w_obj_referents`.
     #[test]
-    fn get_referents_looks_through_a_hidden_or_dummy_node() {
+    fn get_referents_stops_at_hidden_object_and_looks_through_dummy() {
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
         let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]));
@@ -9578,7 +9604,9 @@ mod tests {
 
         let mut referents = Vec::new();
         gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
-        assert_eq!(referents, vec![leaf]);
+        assert_eq!(referents, vec![hidden]);
+        assert!(!gc.is_app_level_object_ref(hidden));
+        assert!(gc.is_app_level_referent_boundary(hidden));
 
         unsafe { *(holder.0 as *mut GcRef) = dummy };
         let mut referents = Vec::new();

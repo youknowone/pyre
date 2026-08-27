@@ -2327,14 +2327,12 @@ mod ssl_socket_methods {
                 self.shutdown_started = true;
             }
             flush_transport(self)?;
-            if !unsafe { is_none(self.incoming) } {
+            // PyPy `_stdssl._SSLSocket.shutdown` keeps driving shutdown until
+            // it receives the peer close-notify or the transport reports that
+            // the operation would block. `read()` may already have consumed
+            // the alert, so refill only while peer shutdown is outstanding.
+            while !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
                 receive_transport(self)?;
-                if !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
-                    return Err(tls_error(
-                        pyre_native::ssl::TLS_ERROR_WANT_READ,
-                        "The operation did not complete (read)".to_string(),
-                    ));
-                }
             }
             if unsafe { is_none(self.socket) } {
                 Ok(w_none())

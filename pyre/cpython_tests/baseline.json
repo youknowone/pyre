@@ -60,9 +60,8 @@
       "dynasm": "CRASH"
     },
     "test.test_asyncio": {
-      "cranelift": "TIMEOUT",
-      "dynasm": "TIMEOUT",
-      "reason": "stalls in about one arm in four, at a test that wanders"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_atexit": {
       "dynasm": "PASS"
