@@ -2838,6 +2838,30 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// cannot inline aborts and rewinds to the enclosing CALL, and the FOR_ITER
 /// gate already records why that rewind does not reach a `BINARY_OP` /
 /// `COMPARE_OP` entry: the flush resumes one operand short.
+/// Whether a dunder body at a `BINARY_OP` / `COMPARE_OP` entry is a shape
+/// worth attempting on the strength of the entry's rewind.
+///
+/// This is NOT what makes the rewind sound.  [`BinopRewindInlineGuard`] is:
+/// it refuses the first residual that could commit before it runs, which is
+/// the only form the question has an answer in -- whether a body commits is a
+/// property of the path it walks, and a body that delegates through `+` is
+/// statically indistinguishable from `return self.v + o.v` over ints.
+///
+/// What this filters is a shape that is admissible and still does not survive
+/// being recorded.  A body making a nested Python call inlines into a trace
+/// whose Phase 2 unroll then dies on `phase2 snapshot remap cache miss`
+/// (`unroll.rs`), measured on `synth/inline_freevar_after_mayforce` with a
+/// `Fraction.__gt__`-shaped body -- `return a._richcmp(b, operator.gt)`.  The
+/// same shape was measured once before, dropping five iterations through the
+/// unstaged-reason abort fallback.  Twice is enough to keep the filter and
+/// record what it costs: this entry does not admit a delegating dunder.
+fn dunder_body_admissible_on_rewind(w_code: *const ()) -> bool {
+    let Some(facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return false;
+    };
+    !facts.exc_override_has_nested_call
+}
+
 fn callee_body_commits_nothing(w_code: *const ()) -> bool {
     let Some(body) = crate::state::sub_jitcode_body_for_code(w_code) else {
         return false;
@@ -4048,6 +4072,68 @@ fn walker_guard_function_field<Sym: WalkSym>(
     Ok(())
 }
 
+/// Reconstruct the caller's complete operand stack at an entry opcode from
+/// the same per-frame sources used by multi-frame resume data.
+///
+/// Nothing here reads the entry opcode or a call descr: the inputs are the
+/// jitcode pc and the depth the forward analysis records at it, which is why
+/// this is the source a `BINARY_OP` / `COMPARE_OP` entry can use and
+/// `reconstructed_all_ref_call_stack` is not.  Retired with its only consumer
+/// in #1497 and revived for that entry.
+///
+/// `reconstructed_all_ref_call_stack` is the cheap residual-operand path, but
+/// a CALL under `with` can retain context-manager operands below it after the
+/// simple vstack mirror became unavailable.  RPython copies the complete
+/// caller MIFrame register bank.  `collect_call_stack_overrides` is pyre's
+/// existing equivalent: vstack first, then the CALL-PC color map, then this
+/// frame's virtualizable shadow.  Preserve typed `ConstPtr(NULL)` values and
+/// name an otherwise boxless null-or-self slot from the CALL layout.  Require
+/// a value for every stack slot before publishing the ordered image.
+fn reconstructed_call_stack_from_resume_sources<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_jitcode_pc: usize,
+) -> Option<Vec<pyre_object::PyObjectRef>> {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return None;
+    }
+    let sym = unsafe { &*sym_ptr };
+    let jc = unsafe { sym.jitcode().as_ref()? };
+    let depth = jc.payload.depth_for_jitcode_pc_pred(call_jitcode_pc)? as usize;
+    let nlocals = sym.nlocals();
+    let Some(overrides) = collect_call_stack_overrides(sym, ctx, call_jitcode_pc) else {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[fbw-abort-flush] resume stack source declined: call_jit_pc={call_jitcode_pc} \
+                 depth={depth} vstack_valid={} vstack_depth={} vstack_len={}",
+                ctx.vstack_valid,
+                ctx.vstack_depth,
+                ctx.vstack_boxes.len(),
+            );
+        }
+        return None;
+    };
+    if fbw_debug_abort_enabled() {
+        eprintln!(
+            "[fbw-abort-flush] resume stack source: call_jit_pc={call_jitcode_pc} \
+             nlocals={nlocals} depth={depth} slots={:?} vstack_valid={} vstack_depth={} \
+             vstack_len={}",
+            overrides.iter().map(|&(slot, _)| slot).collect::<Vec<_>>(),
+            ctx.vstack_valid,
+            ctx.vstack_depth,
+            ctx.vstack_boxes.len(),
+        );
+    }
+    let mut ordered = vec![None; depth];
+    for (slot, value) in overrides {
+        let rel = slot.checked_sub(nlocals)?;
+        if rel >= depth || ordered[rel].replace(value).is_some() {
+            return None;
+        }
+    }
+    ordered.into_iter().collect()
+}
+
 /// Shared post-resolution half of the FBW inline lever. Ordinary Python calls
 /// resolve their callee from the CALL operand; builtin-dispatch specializers
 /// resolve an app-level descriptor first and enter here with that function as
@@ -4082,7 +4168,19 @@ fn latch_abort_call_resume<Sym: WalkSym>(
     let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord else {
         return;
     };
-    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr) {
+    // `reconstructed_all_ref_call_stack` declines at its first statement for
+    // any descr that is not `CallFn` / `CallFunctionEx`, because for every
+    // other entry the residual's operand list is a receiver-plus-metadata list
+    // rather than a stack image.  That refusal is right about the SOURCE and
+    // wrong as a verdict: it left a `BINARY_OP` / `COMPARE_OP` entry with no
+    // carrier at all, so its abort fell through to the legacy replay from loop
+    // entry.  Source the image the way the entry-agnostic path does instead --
+    // the frame's own resume sources, keyed on nothing but the jitcode pc,
+    // whose depth `depth_for_jitcode_pc_pred` supplies.  The CALL_ASSEMBLER
+    // leg below already chains the two this way.
+    if let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr)
+        .or_else(|| reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc))
+    {
         fbw_set_abort_call_resume(outer_jitcode_index, call_jitcode_pc, stack);
     }
 }
@@ -8739,14 +8837,45 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             pyre_object::typeobject::w_type_get_name(w_class)
         }));
     }
-    // A `NotImplemented` result below is discarded with a bare `Err`, and this
-    // entry opcode is not a boundary that abort can rewind to, so a body that
-    // commits anything would have its effects replayed by the walk driver.
-    if !callee_body_commits_nothing(w_code) {
-        decline!(format_args!(
-            "{}.{dunder} commits a replayable effect",
-            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
-        ));
+    // A `NotImplemented` result below has to be handed back to the full binary
+    // protocol, and the whole-body `Clean` verdict is what stood in for the
+    // walk being able to do that: with no rewind at this entry the result was
+    // discarded with a bare `Err`, which leaves the walk driver replaying the
+    // loop from entry with the body's effects already applied.
+    //
+    // What the bar has to prevent is a body that COMMITS and then answers
+    // `NotImplemented`, because there is no exit from that: the result has to
+    // go back to the protocol, and every route back re-runs the body.  That is
+    // a property of the path the body walks, and no reading of the code object
+    // has it -- `LoadAttr` and `BinaryOp` are deferred helpers, so the verdict
+    // is `DeferredCall` for `return self.v + o.v` over ints, which commits
+    // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
+    // does.  So the verdict is not asked for the answer.  The descent runs
+    // under [`BinopRewindInlineGuard`], which refuses the first residual that
+    // could commit BEFORE it runs, leaving the cut legal for every path that
+    // reaches the arm below.
+    //
+    // That arm still reads the odometer.  The guard is what makes the reading
+    // come out all-clear; the reading is what proves it for the path walked,
+    // rather than assuming it.
+    let commits_nothing = callee_body_commits_nothing(w_code);
+    // Armed for exactly the bodies admitted on the rewind.  A `Clean` body
+    // commits nothing by the scan that named it, so it keeps the descent it
+    // already had rather than a stricter one.
+    let admitted_on_rewind = !commits_nothing;
+    let refusal = if commits_nothing {
+        None
+    } else if !binop_rewind_enabled() {
+        Some("commits a replayable effect")
+    } else if !dunder_body_admissible_on_rewind(w_code) {
+        Some("delegates through a nested call")
+    } else {
+        None
+    };
+    if let Some(why) = refusal {
+        decline!(format_args!("{}.{dunder} {why}", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
     }
 
     let arg_concretes = vec![
@@ -8755,8 +8884,14 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_lhs),
         ConcreteValue::Ref(concrete_rhs),
     ];
+    // Rewind point for the `NotImplemented` arm below.  Nothing above this
+    // line records IR or touches the heap cache.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let effects_before = fbw_executed_effect_count();
+    let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let rewind_guard = admitted_on_rewind.then(BinopRewindInlineGuard::enter);
+    let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -8781,11 +8916,31 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
-        false,
+        // `entry_is_call_boundary`.  What decides it is whether the abort
+        // rewind can name this entry, not whether the entry is spelled CALL,
+        // and it can once `latch_abort_call_resume` sources the operand image
+        // from the frame's own resume sources instead of from a CALL
+        // residual's operand list -- the latter is what resumed one operand
+        // short here.
+        binop_rewind_enabled(),
         false,
         None,
-    )?
-    else {
+    );
+    // The refusal that sets this happens BEFORE the residual runs, so the
+    // region has applied nothing and the cut is the legal exit.  Asking here
+    // rather than at the `NotImplemented` arm below is the whole point: by the
+    // time a result exists, the commit that had to be prevented has happened.
+    let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
+    drop(rewind_guard);
+    if refused_a_residual {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        decline!(format_args!(
+            "{}.{dunder} may commit before its result is known",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    }
+    let Some(inlined) = descent? else {
         decline!(format_args!(
             "callee inline of {}.{dunder} declined",
             unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
@@ -8805,6 +8960,23 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
                     op.pc,
                     unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
                 );
+            }
+            // Hand the result back to the full binary protocol.  Cutting the
+            // recorded descent away and letting the ordinary residual run
+            // applies the dunder exactly once -- but only while this walk has
+            // applied nothing since `pre_fold_pos`, because the residual
+            // re-executes the body and there is no journal undo for what user
+            // code did.  The same all-clear reading the un-lowered-helper
+            // rollback takes, and for its reason too: a walk already carrying
+            // an unjournaled effect can no longer flush a `CloseLoop` end.
+            if binop_rewind_enabled()
+                && fbw_executed_effect_count() == effects_before
+                && !unjournaled_before
+                && !fbw_has_unjournaled_effect()
+            {
+                ctx.trace_ctx.cut_trace(pre_fold_pos);
+                ctx.trace_ctx.heap_cache_mut().reset();
+                return Ok(None);
             }
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
@@ -8904,10 +9076,33 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     if nparams != 2 {
         return Ok(None);
     }
-    // A `NotImplemented` result below is discarded with a bare `Err`, and this
-    // entry opcode is not a boundary that abort can rewind to, so a body that
-    // commits anything would have its effects replayed by the walk driver.
-    if !callee_body_commits_nothing(w_code) {
+    // A `NotImplemented` result below has to be handed back to the full binary
+    // protocol, and the whole-body `Clean` verdict is what stood in for the
+    // walk being able to do that: with no rewind at this entry the result was
+    // discarded with a bare `Err`, which leaves the walk driver replaying the
+    // loop from entry with the body's effects already applied.
+    //
+    // What the bar has to prevent is a body that COMMITS and then answers
+    // `NotImplemented`, because there is no exit from that: the result has to
+    // go back to the protocol, and every route back re-runs the body.  That is
+    // a property of the path the body walks, and no reading of the code object
+    // has it -- `LoadAttr` and `BinaryOp` are deferred helpers, so the verdict
+    // is `DeferredCall` for `return self.v + o.v` over ints, which commits
+    // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
+    // does.  So the verdict is not asked for the answer.  The descent runs
+    // under [`BinopRewindInlineGuard`], which refuses the first residual that
+    // could commit BEFORE it runs, leaving the cut legal for every path that
+    // reaches the arm below.
+    //
+    // That arm still reads the odometer.  The guard is what makes the reading
+    // come out all-clear; the reading is what proves it for the path walked,
+    // rather than assuming it.
+    let commits_nothing = callee_body_commits_nothing(w_code);
+    // Armed for exactly the bodies admitted on the rewind.  A `Clean` body
+    // commits nothing by the scan that named it, so it keeps the descent it
+    // already had rather than a stricter one.
+    let admitted_on_rewind = !commits_nothing;
+    if !commits_nothing && !(binop_rewind_enabled() && dunder_body_admissible_on_rewind(w_code)) {
         return Ok(None);
     }
 
@@ -8917,8 +9112,14 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         ConcreteValue::Ref(concrete_lhs),
         ConcreteValue::Ref(concrete_rhs),
     ];
+    // Rewind point for the `NotImplemented` arm below.  Nothing above this
+    // line records IR or touches the heap cache.
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let effects_before = fbw_executed_effect_count();
+    let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let rewind_guard = admitted_on_rewind.then(BinopRewindInlineGuard::enter);
+    let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
         code,
@@ -8943,11 +9144,28 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         has_closure,
         Some((lhs, concrete_lhs, w_class, version_tag)),
         Some((rhs, concrete_rhs, w_typ_r.as_ptr())),
-        false,
+        // `entry_is_call_boundary`.  What decides it is whether the abort
+        // rewind can name this entry, not whether the entry is spelled CALL,
+        // and it can once `latch_abort_call_resume` sources the operand image
+        // from the frame's own resume sources instead of from a CALL
+        // residual's operand list -- the latter is what resumed one operand
+        // short here.
+        binop_rewind_enabled(),
         false,
         None,
-    )?
-    else {
+    );
+    // The refusal that sets this happens BEFORE the residual runs, so the
+    // region has applied nothing and the cut is the legal exit.  Asking here
+    // rather than at the `NotImplemented` arm below is the whole point: by the
+    // time a result exists, the commit that had to be prevented has happened.
+    let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
+    drop(rewind_guard);
+    if refused_a_residual {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    let Some(inlined) = descent? else {
         return Ok(None);
     };
 
@@ -8958,6 +9176,23 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
             ConcreteValue::Ref(obj)
                 if std::ptr::eq(obj, pyre_object::special::w_not_implemented())
         ) {
+            // Hand the result back to the full binary protocol.  Cutting the
+            // recorded descent away and letting the ordinary residual run
+            // applies the dunder exactly once -- but only while this walk has
+            // applied nothing since `pre_fold_pos`, because the residual
+            // re-executes the body and there is no journal undo for what user
+            // code did.  The same all-clear reading the un-lowered-helper
+            // rollback takes, and for its reason too: a walk already carrying
+            // an unjournaled effect can no longer flush a `CloseLoop` end.
+            if binop_rewind_enabled()
+                && fbw_executed_effect_count() == effects_before
+                && !unjournaled_before
+                && !fbw_has_unjournaled_effect()
+            {
+                ctx.trace_ctx.cut_trace(pre_fold_pos);
+                ctx.trace_ctx.heap_cache_mut().reset();
+                return Ok(None);
+            }
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         }
         if !result.is_constant() {

@@ -1771,6 +1771,22 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Marks a `BINARY_OP` / `COMPARE_OP` dunder inline admitted on the
+    /// entry's rewind rather than on a whole-body `Clean` verdict.
+    ///
+    /// The two flags above EXEMPT a region from the nested-residual decline.
+    /// This one ARMS it, because the narrowing that decline carries does not
+    /// hold here.  That narrowing rests on aborts resuming FORWARD past the
+    /// inlined frame; a dunder that answers `NotImplemented` has no forward
+    /// resume at all -- the result has to go back to the binary protocol, and
+    /// the only route back re-runs the body.  So this region's single exit is
+    /// the record-time cut, which is legal only while nothing has been
+    /// applied, and the residual that would apply something is refused before
+    /// it runs rather than detected after.
+    pub(crate) static BINOP_REWIND_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set when the arm above refused a residual, so the entry that armed it
+    /// knows the descent stopped for that reason and can take the cut.
+    pub(crate) static BINOP_REWIND_INLINE_TRIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Code keys of the callees [`fbw_inline_callee_hazardous`] named when the
     /// hazard arm of [`fbw_abort_nested_unjournaled_residual`] fired.  The
     /// inline callsite declines them from then on, so the call residualizes
@@ -1913,6 +1929,22 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     // which is what this decline exists to refuse.
     if matches!(cause, Some(ResidualDecline::PureUnfolded)) {
         return Ok(());
+    }
+    // A `BINARY_OP` / `COMPARE_OP` dunder inline admitted on the entry's rewind
+    // has exactly one exit and it is the record-time cut, which is legal only
+    // while the region has applied nothing.  The narrowing the rest of this
+    // function carries does not reach it: that narrowing rests on an abort
+    // resuming FORWARD past the inlined frame, and a dunder answering
+    // `NotImplemented` has no forward resume at all.
+    //
+    // The odometer cannot answer "has anything been applied" in time -- it is
+    // bumped after `exec_result`, and for a Ref-returning dunder residual the
+    // term that moves it is `entered_user_frame`, which is a measurement of
+    // what already ran.  So the refusal is here, where the residual has not run
+    // yet and the cut is still legal.
+    if BINOP_REWIND_INLINE_ACTIVE.with(|c| c.get()) {
+        BINOP_REWIND_INLINE_TRIPPED.with(|c| c.set(true));
+        return Err(DispatchError::callee_inline_unsupported(pc));
     }
     // RPython `do_residual_call` runs the residual executor at any framestack
     // depth (`pyjitpl.py`). Exempt only the self-recursive
@@ -3541,4 +3573,49 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
         pc = op.next_pc;
     }
     false
+}
+
+/// Arms [`BINOP_REWIND_INLINE_ACTIVE`] for the duration of one descent.
+///
+/// While it is armed no residual that is not provably side-effect-free runs at
+/// all, which is the invariant the entry's cut rests on -- not "no residual has
+/// run yet", which only the odometer could answer and only too late.
+pub(crate) struct BinopRewindInlineGuard {
+    prior: bool,
+}
+
+impl BinopRewindInlineGuard {
+    pub(crate) fn enter() -> Self {
+        let prior = BINOP_REWIND_INLINE_ACTIVE.with(|c| c.replace(true));
+        // The outermost arm starts from a clean slate, so a flag left behind by
+        // a descent that unwound for some other reason cannot be read as this
+        // one's refusal.
+        if !prior {
+            BINOP_REWIND_INLINE_TRIPPED.with(|c| c.set(false));
+        }
+        Self { prior }
+    }
+
+    /// Whether the arm refused a residual while this guard was in force.
+    ///
+    /// A guard nested inside another armed region does NOT clear the flag: the
+    /// enclosing entry's rewind is exposed by the same residual, and consuming
+    /// the flag here would leave it looking at a descent that declined for no
+    /// stated reason and continuing past it.  Only the arm that raised the
+    /// region takes it.
+    pub(crate) fn tripped(&self) -> bool {
+        BINOP_REWIND_INLINE_TRIPPED.with(|c| {
+            let tripped = c.get();
+            if tripped && !self.prior {
+                c.set(false);
+            }
+            tripped
+        })
+    }
+}
+
+impl Drop for BinopRewindInlineGuard {
+    fn drop(&mut self) {
+        BINOP_REWIND_INLINE_ACTIVE.with(|c| c.set(self.prior));
+    }
 }
