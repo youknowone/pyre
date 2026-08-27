@@ -2689,34 +2689,6 @@ macro_rules! callback_free_dict_op {
     }};
 }
 
-/// Evaluate `$body` with `$obj` published, then rebind `$obj` to the address
-/// it has afterwards and yield the body's value.
-///
-/// The re-read [`DictOperationGuard::root`] documents, for the helpers that
-/// run below a caller's guard and so cannot reach its slots.
-///
-/// A macro rather than a helper taking `impl FnOnce`, for the reason
-/// `callback_free_dict_op!` gives: a closure has no lifted counterpart, so
-/// every dict graph that reached one would stop there.
-macro_rules! with_dict_rooted {
-    ($obj:ident, $value:ident, $body:expr) => {{
-        let _scope = crate::gc_roots::push_roots();
-        let base = crate::gc_roots::pin_roots(&[$obj, $value]);
-        let result = $body;
-        $obj = crate::gc_roots::shadow_stack_get(base);
-        $value = crate::gc_roots::shadow_stack_get(base + 1);
-        result
-    }};
-    ($obj:ident, $body:expr) => {{
-        let _scope = crate::gc_roots::push_roots();
-        let slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root($obj);
-        let result = $body;
-        $obj = crate::gc_roots::shadow_stack_get(slot);
-        result
-    }};
-}
-
 /// The `ObjectKey`-keyed storage servicing the reentrant scan, for either a
 /// regular `W_DictObject` in object strategy (`dstorage`) or a module dict
 /// switched to object strategy (`object_storage`).  Both hold the same
@@ -3064,7 +3036,7 @@ unsafe fn w_dict_store_checked_inner(
             w_dict_store_bytes_strategy(obj, key, value);
             return Ok(());
         }
-        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::dictmultiobject::UNICODE_DICT_STRATEGY) {
@@ -3078,7 +3050,7 @@ unsafe fn w_dict_store_checked_inner(
             w_dict_store_int_strategy(obj, key, value);
             return Ok(());
         }
-        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::identitydict::IDENTITY_DICT_STRATEGY) {
@@ -3086,7 +3058,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy_is(strategy, &crate::kwargsdict::KWARGS_DICT_STRATEGY) {
@@ -3094,7 +3066,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     if strategy.strategy_kind() == StrategyKind::Map {
@@ -3109,7 +3081,7 @@ unsafe fn w_dict_store_checked_inner(
             strategy.setitem(obj, key, value);
             return Ok(());
         }
-        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
         return w_dict_store_object_strategy_checked_inner(obj, key, value, hash);
     }
     strategy.setitem(obj, key, value);
@@ -4075,9 +4047,9 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 ) -> Result<bool, DictKeyError> {
     if is_module_dict(obj) {
         if !w_module_dict_is_object_strategy(obj) {
-            with_dict_rooted!(obj, value, w_module_dict_switch_to_object_strategy(obj));
+            crate::with_roots!(obj, value => w_module_dict_switch_to_object_strategy(obj));
         }
-        let object_key = with_dict_rooted!(obj, value, object_key_for_checked(key)?);
+        let object_key = crate::with_roots!(obj, value => object_key_for_checked(key)?);
         if let Some(result) = callback_free_dict_op!({
             let entries = w_module_dict_object_storage_mut(obj);
             match entries.get_index_of(&object_key) {
@@ -4123,9 +4095,9 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
 
     let strategy = (*(obj as *const W_DictObject)).dstrategy.imp;
     if strategy.strategy_kind() != StrategyKind::Object {
-        with_dict_rooted!(obj, value, strategy.switch_to_object_strategy(obj));
+        crate::with_roots!(obj, value => strategy.switch_to_object_strategy(obj));
     }
-    let object_key = with_dict_rooted!(obj, value, object_key_for_checked(key)?);
+    let object_key = crate::with_roots!(obj, value => object_key_for_checked(key)?);
     if let Some(result) = callback_free_dict_op!({
         let dict = &mut *(obj as *mut W_DictObject);
         let entries = &mut *(dict.dstorage as *mut ObjectDictStorage);

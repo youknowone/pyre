@@ -1048,6 +1048,67 @@ pub fn clear_prebuilt_roots_dirty() {
     PREBUILT_ROOTS_DIRTY.store(false, Ordering::Relaxed);
 }
 
+/// `shadowstack.py push_roots` / `pop_roots` as a bracket around one
+/// collecting operation.
+///
+/// Upstream never writes this pair by hand: `framework.py` brackets every
+/// operation that can reach the collector, `shadowstack.py` emits the
+/// `gc_push_roots` / `gc_pop_roots` pair, and `expand_pop_roots` turns the pop
+/// into one `gc_restore_root` per variable -- whose whole body is
+/// `setvar(v_value, newvalue)`, writing the forwarded pointer back into the
+/// local the graph will read next. Application code therefore names its
+/// receiver and its argument as plain locals and never sees a root stack.
+///
+/// pyre's interpreter is compiled by rustc, so there is no graph for a
+/// `hop.genop` to write into and the bracket has to be written at the source
+/// level ([`crate::gc_roots`] module docs). This macro is that bracket: it
+/// publishes `$local`s as one livevar set, runs `$body`, and then assigns each
+/// forwarded word back into its own local. What it buys over hand-written
+/// slot arithmetic is `gc_restore_root`'s guarantee -- after the bracket the
+/// local *is* the live word, so there is no stale binding left in scope for a
+/// later read to find, and no slot index to get wrong.
+///
+/// Every `$local` must be a `mut` binding, because the restore assigns to it.
+///
+/// ```ignore
+/// let mut obj = ...;
+/// let mut key = ...;
+/// let found = with_roots!(obj, key => lookup_that_can_collect(obj, key)?);
+/// // `obj` and `key` are the forwarded words here, not the pre-call ones.
+/// ```
+///
+/// The livevar set is published with [`pin_roots`] rather than a `pin_root`
+/// per local: that function's own docs give the reason -- the first
+/// `pin_root`'s forwarding query is a safepoint, so a per-local loop lets a
+/// foreign collection run while the later values are still invisible.
+///
+/// An early exit out of `$body` (a `?`, a `return`) skips the restore and that
+/// is correct: [`push_roots`]'s scope guard pops the slots on the way out, and
+/// the locals it would have restored are going out of scope with it.
+///
+/// A macro rather than a helper taking `impl FnOnce`: a closure has no lifted
+/// counterpart, so every graph that reached one would stop there. Bracketing a
+/// collecting call is exactly what the hot paths do, and they are the graphs
+/// the translator must be able to walk through.
+#[macro_export]
+macro_rules! with_roots {
+    ($($local:ident),+ $(,)? => $body:expr) => {{
+        let _scope = $crate::gc_roots::push_roots();
+        let __roots_base = $crate::gc_roots::pin_roots(&[$($local),+]);
+        let __roots_result = $body;
+        {
+            // One local means the final increment is dead; the arm is shared.
+            #[allow(unused_assignments)]
+            let mut __roots_at = __roots_base;
+            $(
+                $local = $crate::gc_roots::shadow_stack_get(__roots_at);
+                __roots_at += 1;
+            )+
+        }
+        __roots_result
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
