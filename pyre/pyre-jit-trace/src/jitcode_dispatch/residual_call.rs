@@ -7208,6 +7208,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::TwoArgSuperCall, || {
+            try_walker_specialize_two_arg_super_call(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::FloatCall, || {
             try_walker_specialize_float_call(ctx, code, op, &r_args, dst)
         })?
@@ -8162,6 +8172,19 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 if let Some(attr_name) = attr_name.as_deref()
                     && spec_gate(SpecFold::LoadAttr, || {
                         try_walker_specialize_load_attr(
+                            ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
+                        )
+                    })?
+                    .is_some()
+                {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+                // The plain-slot fold declines a `super` proxy: nothing on
+                // it is a mapdict slot, and the MRO suffix `getattribute`
+                // walks starts somewhere else entirely.
+                if let Some(attr_name) = attr_name.as_deref()
+                    && spec_gate(SpecFold::LoadAttrOnSuper, || {
+                        try_walker_specialize_load_attr_on_super(
                             ctx, op.pc, obj_opref, attr_name, dst, dst_bank,
                         )
                     })?
