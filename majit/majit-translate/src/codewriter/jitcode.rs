@@ -213,6 +213,22 @@ pub struct JitCodeBody {
     /// `_startpoints is not None` to gate its non-translated `pc in
     /// self._startpoints` assertion.
     pub startpoints: Option<indexmap::IndexSet<usize>>,
+    /// Offset of the `jit_merge_point` opcode byte, for the one jitcode
+    /// that carries the driver's merge point.
+    ///
+    /// `None` on every other jitcode: `jtransform.py` emits at most one
+    /// marker per portal graph, so at most one assembled body has a merge
+    /// point in it.
+    ///
+    /// Recorded by the assembler at the `code.len()` it reserves for the
+    /// opcode byte, which is the same capture point
+    /// `JitCodeBuilder::jit_merge_point` uses on the proc-macro route. A
+    /// consumer needs the offset and cannot recover it by scanning: an
+    /// operand byte may equal the opcode byte, so only the encoder knows
+    /// where instructions begin. `startpoints` says where *some*
+    /// instruction begins, not which one is the marker.
+    #[serde(default)]
+    pub jit_merge_point_offset: Option<usize>,
     /// RPython `jitcode.py` `self._alllabels = alllabels` — debug-only
     /// set of bytecode offsets that are label targets.
     /// `setup(..., alllabels=None)` (jitcode.py) is the upstream

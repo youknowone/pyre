@@ -5705,6 +5705,11 @@ impl JitCodeBuilder {
             // `BhCallDescr::default()` zero, matching the pre-set state
             // RPython's constructor shows when `calldescr=None`.
             calldescr: self.calldescr,
+            // Recorded on the body as well as on `exec` below, so a body that
+            // makes the round trip through serialization still says where its
+            // marker is. The two routes into `JitCodeBody` now carry the same
+            // field, and `JitCode::from_canonical` reads it back.
+            jit_merge_point_offset: self.jit_merge_point_offset,
             code: self.code,
             constants_i: self.constants_i,
             constants_r: self.constants_r.into_iter().map(Into::into).collect(),

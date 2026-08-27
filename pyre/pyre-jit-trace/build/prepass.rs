@@ -23,7 +23,10 @@ use walkdir::WalkDir;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v16";
+/// Bump whenever the bytes of a cached output change shape. `bincode` is not
+/// self-describing, so a record written by an older generation is not detected
+/// as stale -- it decodes, into the wrong fields.
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v17";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
