@@ -75,40 +75,6 @@ pub struct SemanticFunction {
     /// "elidable" → _elidable_function_
     /// "loopinvariant" → _jit_loop_invariant_
     pub hints: Vec<String>,
-    /// RPython `graph.access_directly`, written at exactly one place:
-    /// `specialize.py default_specialize`, for a graph whose ARGUMENT
-    /// annotation arrived carrying the flag. The flag itself rides on
-    /// `SomeInstance.flags` and is minted by the `compute_result_annotation`
-    /// of the `hint` ExtRegistryEntry in `rlib/jit.py`, so it travels
-    /// callee-ward through the annotator, not through the op stream.
-    ///
-    /// The consequence is easy to get backwards: the function that SPELLS
-    /// `hint(x, access_directly=True)` is not the flagged one. Its own
-    /// arguments arrive unflagged, so `default_specialize` sees nothing on
-    /// them; what gets flagged is every callee the hinted value is then
-    /// passed to. In upstream terms `pyframe.py PyFrame.dispatch` mints the
-    /// flag and `handle_bytecode` carries it.
-    ///
-    /// `annotator/description.rs default_specialize` ports that faithfully
-    /// for the flowspace pipeline. The LLBC front end has no annotator, so
-    /// nothing populates this field along the production path and it is
-    /// always `false` there — `mir.rs` constructs every `SemanticFunction`
-    /// with the literal. The bridge that would populate it has to do the
-    /// propagation itself: seed on the `OpKind::Hint` with
-    /// `HintKind::AccessDirectly`, follow the hinted variable into the
-    /// arguments of each `OpKind::Call`, flag those callees, and iterate to
-    /// a fixpoint. Reading the marker off the body of the function that
-    /// contains it is NOT that bridge — it names the one graph upstream
-    /// leaves alone.
-    ///
-    /// One structural difference survives any such bridge.
-    /// `default_specialize` SPECIALIZES: the flagged callee is a second
-    /// graph, keyed `(AccessDirect, <base key>)`, and the unflagged callers
-    /// keep the original. A front end with one graph per function cannot
-    /// split, and the sole consumer here is a panic
-    /// (`policy::look_inside_graph`), so a function reached both ways must
-    /// be left unflagged rather than flagged.
-    pub access_directly: bool,
     /// Trait name when this function is an `impl Trait for Type {…}`
     /// method, the trait's name when this is a trait default-body
     /// method, otherwise `None` (free function or inherent impl).
@@ -513,7 +479,6 @@ mod tests {
             self_ty_root: None,
             module_path: String::new(),
             hints: Vec::new(),
-            access_directly: false,
             trait_root: None,
             trait_qualified: None,
             returns_objectptr: false,

@@ -4110,7 +4110,6 @@ impl CallControl {
                             self_ty_root: None,
                             hints,
                             module_path: String::new(),
-                            access_directly: false,
                             trait_root: None,
                             trait_qualified: None,
                             returns_objectptr: false,
