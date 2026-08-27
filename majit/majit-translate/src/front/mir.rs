@@ -9342,6 +9342,11 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_word_rotate(
+                    mir_bb, &reg.kind, &segments, &args, dest_local, target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_usize_try_from(
                     mir_bb,
                     &reg.kind,
@@ -14186,6 +14191,119 @@ impl<'a> Lowering<'a> {
             },
         });
         self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Lower a constant `u64`/`usize::rotate_left` to the unsigned
+    /// shift/or expansion used by PyPy's 64-bit tuple hash
+    /// (`tupleobject.py:370-374`, `xxrotate`).  Core integer method bodies are
+    /// opaque in LLBC; leaving this as a call therefore hides a primitive
+    /// RPython operation behind an unregistrable Rust helper.
+    ///
+    /// Keep the gate deliberately narrow: the receiver must be a word-sized
+    /// unsigned integer and the count must be a graph constant.  A signed
+    /// receiver would require an explicit unsigned reinterpretation before
+    /// the right shift, and a variable Rust count needs the full modulo-word
+    /// normalization.  Neither is present in the current RPython-shaped
+    /// source, so those forms remain residual instead of being guessed at.
+    fn try_lower_word_rotate(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "rotate_left"
+        {
+            return Ok(false);
+        }
+        let [value, count] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(receiver_ty) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(
+            self.tyref_literal_uint_atom(receiver_ty),
+            Some("U64" | "Usize")
+        ) {
+            return Ok(false);
+        }
+        let Some(raw_count) = self
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| {
+                (op.result.as_ref() == Some(count))
+                    .then(|| match &op.kind {
+                        OpKind::ConstInt(n) if *n >= 0 => Some(*n as u64),
+                        OpKind::ConstUInt(n) => Some(*n),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+        else {
+            return Ok(false);
+        };
+        let count = (raw_count & 63) as i64;
+        let complement = (64 - count) & 63;
+        let bb_id = self.block_id[mir_bb];
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(result.clone()),
+                kind,
+            });
+            result
+        };
+        let count = push_op(&mut self.graph, OpKind::ConstInt(count));
+        let left = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "lshift".to_string(),
+                lhs: value.clone(),
+                rhs: count,
+                result_ty: ValueType::Unsigned,
+            },
+        );
+        let complement = push_op(&mut self.graph, OpKind::ConstInt(complement));
+        let right = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "rshift".to_string(),
+                lhs: value.clone(),
+                rhs: complement,
+                result_ty: ValueType::Unsigned,
+            },
+        );
+        let result = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "or".to_string(),
+                lhs: left,
+                rhs: right,
+                result_ty: ValueType::Unsigned,
+            },
+        );
+        self.local_var[dest_local] = Some(result);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -31735,6 +31853,113 @@ mod tests {
                     if op == "add")
             }),
             "the formatted overflow message must retain the native string-concat expansion"
+        );
+    }
+
+    /// A by-value fixed array is an RPython list-model iteration source, just
+    /// like the already-covered `&[T]` loop: its `IntoIter::next` must become
+    /// the native `iter`/`next` vertical rather than remain a foreign core
+    /// call.  Loads the real interpreter LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn fixed_array_for_loop_has_no_residual_into_iter_next() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "memoryview_is_native_buffer_descr")
+            .expect("lower memoryview_is_native_buffer_descr");
+        let residual: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("next") => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            residual.is_empty(),
+            "fixed-array for-loop left residual next calls: {residual:?}"
+        );
+    }
+
+    /// RPython evaluates `SHIFT`, `HASH_BITS`, `_HASH_SHIFT`, and
+    /// `HASH_MODULUS` while building `_hash_long`'s flow graph.  The extracted
+    /// Rust graph must likewise contain their integer literals, not synthetic
+    /// zero-argument accessors that the annotator cannot resolve.  Loads the
+    /// real interpreter LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn hash_long_has_no_residual_constant_accessors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "_hash_long").expect("lower _hash_long");
+        let residual: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if matches!(
+                    segments.last().map(String::as_str),
+                    Some("SHIFT" | "HASH_BITS" | "HASH_SHIFT" | "HASH_MODULUS")
+                ) =>
+                {
+                    Some(segments.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            residual.is_empty(),
+            "_hash_long left residual constant accessors: {residual:?}"
+        );
+    }
+
+    /// CPython 3.14's hashable-slice mixer spells PyPy's `xxrotate` expansion
+    /// as Rust `u64::rotate_left`.  The front must recover the same unsigned
+    /// shift/or graph rather than leave the opaque core method behind.
+    #[test]
+    #[ignore]
+    fn slice_hash_has_no_residual_rotate_left() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "slice_hash_value").expect("lower slice_hash_value");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("rotate_left")
+                )
+            })
+            .count();
+        assert_eq!(residual, 0, "slice hash left rotate_left residuals");
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::BinOp { op, result_ty: ValueType::Unsigned, .. }
+                    if op == "or")
+            ),
+            "slice hash must contain PyPy's unsigned shift/or rotate expansion"
         );
     }
 }

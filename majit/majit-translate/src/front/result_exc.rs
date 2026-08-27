@@ -2563,7 +2563,8 @@ pub(crate) fn back_substitute(
         else {
             return Err(format!(
                 "{name}: continue-arm value is defined inside diamond block \
-                 {succ} and cannot be carried across the rewired call edge"
+                 {succ} (variable id {}) and cannot be carried across the rewired call edge",
+                current.id()
             ));
         };
         let [link] = graph.blocks[pred].exits.as_slice() else {

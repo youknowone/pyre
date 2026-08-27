@@ -20002,7 +20002,7 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
 /// IEEE-754 bits are decomposed directly: clearing the stored exponent
 /// to `0x3fe` lands the value in `[0.5, 1)`.  Subnormals are first
 /// scaled into the normal range by `2**54`.
-fn float_frexp(x: f64) -> (f64, i32) {
+pub(crate) fn float_frexp(x: f64) -> (f64, i32) {
     if x == 0.0 {
         return (x, 0);
     }
