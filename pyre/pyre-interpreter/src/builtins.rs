@@ -10281,7 +10281,7 @@ pub fn is_build_class_builtin(obj: PyObjectRef) -> bool {
         return false;
     }
     let func = unsafe { crate::gateway::builtin_code_get(code) };
-    std::ptr::fn_addr_eq(func, builtin_build_class as crate::gateway::BuiltinCodeFn)
+    crate::gateway::builtin_code_fn_eq(func, builtin_build_class as crate::gateway::BuiltinCodeFn)
 }
 
 /// `str(obj)` → convert to string
