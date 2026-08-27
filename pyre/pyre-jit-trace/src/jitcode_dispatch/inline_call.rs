@@ -5098,6 +5098,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     && (bound_method.is_some() || seeded_callee_resume)
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
+                if !foriter_dirty_bound && fbw_inline_diag_enabled() {
+                    eprintln!(
+                        "[inline-foriter-dirty] pc={} boundary={entry_is_call_boundary} \
+                         bound={} exc_table={} const_callable={} depth={inline_depth} \
+                         mf={try_multiframe} strict={strict_inlinable} for_iter={} selfrec={}",
+                        op.pc,
+                        bound_method.is_some(),
+                        body_facts.has_exception_table,
+                        callable_guard_op.is_constant(),
+                        pyre_interpreter::code_has_for_iter(callee_code),
+                        pyre_interpreter::code_is_self_recursive(callee_code),
+                    );
+                }
                 foriter_dirty_bound
             }
         };
