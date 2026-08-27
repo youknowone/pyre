@@ -7024,6 +7024,361 @@ fn jd1_experiment_enabled() -> bool {
     })
 }
 
+fn portal_metatrace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE").as_deref() == Ok("1"))
+}
+
+/// Where the Stage-0 probe enters the portal jitcode.
+///
+/// `merge` (default) starts the walk AT the `jit_merge_point`, seeding only
+/// the registers that op declares. `start` is the faithful shape:
+/// `initialize_state_from_start` is `f = self.newframe(mainjitcode);
+/// f.setup_call(original_boxes)` — entry at pc 0 with the portal's own
+/// arguments, so the prologue runs and the walk reaches the merge point on its
+/// own. `eval_loop_jit`'s `calldescr.arg_classes` is `"r"`: the portal was
+/// never split, so its one argument is the Rust `frame`, not greens+reds.
+fn portal_metatrace_entry_at_start() -> bool {
+    static AT_START: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AT_START
+        .get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE_ENTRY").as_deref() == Ok("start"))
+}
+
+static PORTAL_METATRACE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Back-edges to let pass before the one-shot probe fires. The first
+/// back-edge in the process belongs to interpreter bootstrap (a class body
+/// under `build_class_inner`), not to the user's loop; `PYRE_PORTAL_METATRACE_SKIP`
+/// walks the probe forward to the back-edge worth measuring. Default 0 keeps
+/// the first back-edge.
+fn portal_metatrace_skip() -> u64 {
+    static SKIP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var("PYRE_PORTAL_METATRACE_SKIP")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+static PORTAL_METATRACE_SEEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+struct PortalMetatraceSym {
+    header_pc: usize,
+}
+
+impl majit_metainterp::JitCodeSym for PortalMetatraceSym {
+    fn total_slots(&self) -> usize {
+        0
+    }
+
+    fn loop_header_pc(&self) -> usize {
+        self.header_pc
+    }
+
+    fn fail_args(&self) -> Option<Vec<majit_ir::OpRef>> {
+        None
+    }
+}
+
+/// Stage-0 diagnostic drive of the build-time jd0 portal jitcode. Set
+/// `MAJIT_OPTRACE=1` for `[optrace] depth=… cursor=… pc=… opcode=… jitcode=…`
+/// per step, and `MAJIT_TLDBG=1` for `run_to_end end action=… step_count=…
+/// num_recorded_ops=…` alongside this summary.
+fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize) {
+    pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode() {
+            Some(jitcode) => jitcode,
+            None => {
+                eprintln!("[jd0-mt] portal jitcode unresolved");
+                return;
+            }
+        };
+        let portal_index = canonical
+            .try_index()
+            .map(|index| index.to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        eprintln!(
+            "[jd0-mt] portal jitcode name={} index={} code_len={}",
+            canonical.name,
+            portal_index,
+            canonical.code.len(),
+        );
+        let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+
+        let header_pc = match pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
+            .find(|op| op.opname == "jit_merge_point")
+            .map(|op| op.pc)
+        {
+            Some(pc) => pc,
+            None => {
+                eprintln!("[jd0-mt] jit_merge_point not found");
+                return;
+            }
+        };
+
+        // Decode the six register lists of the `jit_merge_point` op:
+        // opcode(1) + jdindex(1), then `[len:u8][reg:u8 * len]` in green
+        // I/R/F, red I/R/F order, matching `trace_jitcode_from_merge_point`.
+        let mut slot_regs: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+        {
+            let code = &canonical.code;
+            let mut cur = header_pc + 2;
+            for regs in slot_regs.iter_mut() {
+                let len = code[cur] as usize;
+                cur += 1;
+                for _ in 0..len {
+                    regs.push(code[cur] as usize);
+                    cur += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[jd0-mt] header_pc={} merge-point regs greenI={:?} greenR={:?} greenF={:?} redI={:?} redR={:?} redF={:?}",
+            header_pc,
+            slot_regs[0],
+            slot_regs[1],
+            slot_regs[2],
+            slot_regs[3],
+            slot_regs[4],
+            slot_regs[5],
+        );
+
+        let next_instr = loop_header_pc as i64;
+        let is_being_profiled = i64::from(unsafe { &*f }.get_is_being_profiled());
+        let pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
+        let live_frame = f;
+        let ec = unsafe { &*f }.execution_context;
+        eprintln!(
+            "[jd0-mt] greens next_instr={} is_being_profiled={} pycode=0x{:x}",
+            next_instr, is_being_profiled, pycode as usize,
+        );
+        eprintln!(
+            "[jd0-mt] reds frame=0x{:x} ec=0x{:x}",
+            live_frame as usize, ec as usize,
+        );
+
+        let (driver, _) = driver_pair();
+        let meta = driver.meta_interp_mut();
+        if meta.is_tracing() {
+            eprintln!("[jd0-mt] bail: already tracing");
+            return;
+        }
+
+        let live_values = [
+            majit_ir::Value::Ref(majit_ir::GcRef(live_frame as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)),
+        ];
+        let action = meta.force_start_tracing(
+            green_key,
+            (unsafe { &*f }.pycode as usize, loop_header_pc),
+            None,
+            &live_values,
+        );
+        let action_name = match &action {
+            majit_metainterp::BackEdgeAction::Interpret => "Interpret",
+            majit_metainterp::BackEdgeAction::StartedTracing => "StartedTracing",
+            majit_metainterp::BackEdgeAction::AlreadyTracing => "AlreadyTracing",
+            majit_metainterp::BackEdgeAction::RunCompiled => "RunCompiled",
+        };
+        eprintln!("[jd0-mt] force_start_tracing -> {action_name}");
+        if !matches!(action, majit_metainterp::BackEdgeAction::StartedTracing) {
+            return;
+        }
+
+        let mut sym = PortalMetatraceSym { header_pc };
+        let walked = meta.with_trace_ctx_and_token_resolver(
+            |ctx,
+             resolve_token,
+             recursive_target,
+             recursive_decision,
+             recursive_exec,
+             recursive_exec_ref,
+             recursive_exec_float,
+             recursive_exec_void| {
+                let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
+                    |_pc: usize| 0usize,
+                    resolve_token,
+                    recursive_target,
+                    recursive_decision,
+                    recursive_exec,
+                    recursive_exec_ref,
+                    recursive_exec_float,
+                    recursive_exec_void,
+                );
+
+                let jitcode_arc = std::sync::Arc::new(jitcode.clone());
+                let mut frame =
+                    majit_metainterp::MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
+
+                let green_int_values = [next_instr, is_being_profiled];
+                for (&reg, &value) in slot_regs[0].iter().zip(green_int_values.iter()) {
+                    if reg < frame.int_regs.len() && reg < frame.int_values.len() {
+                        let opref = ctx.const_int(value);
+                        frame.int_regs[reg] = Some(opref);
+                        frame.int_values[reg] = Some(value);
+                    } else {
+                        eprintln!(
+                            "[jd0-mt] skipped seed greenI reg={} regs_len={} values_len={}",
+                            reg,
+                            frame.int_regs.len(),
+                            frame.int_values.len(),
+                        );
+                    }
+                }
+                let green_ref_values = [pycode as usize as i64];
+                for (&reg, &value) in slot_regs[1].iter().zip(green_ref_values.iter()) {
+                    if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
+                        let opref = ctx.const_ref(value);
+                        frame.ref_regs[reg] = Some(opref);
+                        frame.ref_values[reg] = Some(value);
+                    } else {
+                        eprintln!(
+                            "[jd0-mt] skipped seed greenR reg={} regs_len={} values_len={}",
+                            reg,
+                            frame.ref_regs.len(),
+                            frame.ref_values.len(),
+                        );
+                    }
+                }
+                let red_ref_values = [live_frame as usize as i64, ec as usize as i64];
+                for (input_index, (&reg, &value)) in slot_regs[4]
+                    .iter()
+                    .zip(red_ref_values.iter())
+                    .enumerate()
+                {
+                    if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
+                        let input_index = input_index as u32;
+                        let opref = majit_ir::OpRef::input_arg_typed(
+                            input_index,
+                            majit_ir::Type::Ref,
+                        );
+                        frame.ref_regs[reg] = Some(opref);
+                        frame.ref_values[reg] = Some(value);
+                    } else {
+                        eprintln!(
+                            "[jd0-mt] skipped seed redR reg={} regs_len={} values_len={}",
+                            reg,
+                            frame.ref_regs.len(),
+                            frame.ref_values.len(),
+                        );
+                    }
+                }
+                frame.code_cursor = header_pc;
+                frame.pc = header_pc;
+
+                // `pyjitpl.py initialize_state_from_start`:
+                //   f = self.newframe(self.jitdriver_sd.mainjitcode)
+                //   f.setup_call(original_boxes)
+                // `setup_call` packs argboxes into the typed banks in
+                // declaration order, so a `calldescr.arg_classes == "r"`
+                // jitcode takes exactly one ref, at r0. Here that is the live
+                // `PyFrame`: pc=3 calls `FrameRoot::new` on r0 to produce r1,
+                // and r1 is what the loop body's first op reads — the register
+                // merge-point entry cannot supply.
+                //
+                // The merge-point seeds above are left standing: every
+                // register they write is re-written by the prologue before the
+                // marker, and `setup_call` overwrites r0 at entry.
+                let entry_pc = if portal_metatrace_entry_at_start() {
+                    frame.setup_call(&[(
+                        majit_metainterp::JitArgKind::Ref,
+                        majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
+                        live_frame as usize as i64,
+                    )]);
+                    // `setup_call` sets `pc = 0`; the walker reads
+                    // `code_cursor`, which it does not touch.
+                    frame.code_cursor = 0;
+                    eprintln!(
+                        "[jd0-mt] entry=start pc=0 setup_call arg_classes=\"r\" r0=0x{:x}",
+                        live_frame as usize,
+                    );
+                    0
+                } else {
+                    header_pc
+                };
+
+                let mut standalone = majit_metainterp::StandaloneFrameStack::new();
+                standalone.frames.push(frame);
+                let before = ctx.num_recorded_ops();
+                let mut machine = majit_metainterp::JitCodeMachine::<PortalMetatraceSym, _>::with_framestack(
+                    &mut standalone.frames,
+                    &[],
+                    &[],
+                );
+                machine.set_outer_program_pc(entry_pc);
+                let action = machine.run_to_end(ctx, &mut sym, &runtime);
+                drop(machine);
+                let after = ctx.num_recorded_ops();
+                let depth = standalone.frames.len();
+                let (stop_jitcode, stop_cursor, stop_pc) = if standalone.frames.is_empty() {
+                    ("<empty>".to_owned(), 0, 0)
+                } else {
+                    let stopped = standalone.frames.current_mut();
+                    (
+                        stopped.jitcode.name().to_owned(),
+                        stopped.code_cursor,
+                        stopped.pc,
+                    )
+                };
+                (
+                    action,
+                    before,
+                    after,
+                    depth,
+                    stop_jitcode,
+                    stop_cursor,
+                    stop_pc,
+                )
+            },
+        );
+
+        if meta.is_tracing() {
+            meta.abort_trace(false);
+        }
+
+        match walked {
+            Some((action, before, after, depth, stop_jitcode, stop_cursor, stop_pc)) => {
+                eprintln!(
+                    "[jd0-mt] walk action={:?} recorded_ops={} depth={} stop_jitcode={} stop_cursor={} stop_pc={}",
+                    action,
+                    after.saturating_sub(before),
+                    depth,
+                    stop_jitcode,
+                    stop_cursor,
+                    stop_pc,
+                );
+            }
+            None => {
+                eprintln!(
+                    "[jd0-mt] walk action=unavailable recorded_ops=0 depth=0 stop_jitcode=<none> stop_cursor=0 stop_pc=0"
+                );
+            }
+        }
+    }));
+
+    if let Err(payload) = result {
+        let (driver, _) = driver_pair();
+        let meta = driver.meta_interp_mut();
+        if meta.is_tracing() {
+            meta.abort_trace(false);
+        }
+        let message = if let Some(message) = payload.downcast_ref::<&str>() {
+            (*message).to_owned()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "<non-string panic payload>".to_owned()
+        };
+        eprintln!("[jd0-mt] walk panicked: {message}");
+    }
+}
+
 /// Whether jd1 enters the compiled drain loop live on `RunCompiled` (the JIT
 /// speedup) versus only compiling and registering it (the cooperative-drain
 /// fallback, where the interpreter caller keeps draining). ON by default;
@@ -9543,7 +9898,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // breaker load; the compiled back-edge mask deliberately excludes it.
         majit_ir::eval_breaker_word::set_gc_interp();
     }
-    let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
+    // The code object is NOT read here. `interp_jit.py` `PyFrame.dispatch`
+    // takes `pycode` as a parameter and reads `co_code = pycode.co_code`
+    // inside the loop, *after* `jit_merge_point` — so the value the dispatch
+    // consumes is the very value the marker declares green. A read hoisted
+    // above the loop is a second, independent read: the marker's green is then
+    // promoted by `ref_guard_value` and never used, while the dispatch runs on
+    // an unpromoted copy that no guard makes constant. See the loop body.
     // `semantic_loop_headers` is consumed only on the `CloseLoop` arm below (a
     // back-edge event).  Loopless frames — the overwhelming majority during
     // cold startup, where every called helper / class body / module top level
@@ -9631,10 +9992,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
             return LoopResult::Done(Err(err));
         }
 
-        if unsafe { &*f }.next_instr() >= code.instructions.len() {
-            return LoopResult::Done(Ok(w_none()));
-        }
-
         let pc = unsafe { &*f }.next_instr();
 
         // interp_jit.py:85-87 — source-level marker declaration.  Its
@@ -9654,6 +10011,25 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // jit_merge_point is a lowered no-op / merge point and does not itself
         // collect, but is treated as a collection boundary conservatively.
         let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+
+        // `interp_jit.py` `PyFrame.dispatch`: `co_code = pycode.co_code`,
+        // read from the green the marker just declared and nowhere else. One
+        // value reaches both the marker and the dispatch, so the
+        // `ref_guard_value` the marker emits promotes the operand the dispatch
+        // actually consumes.
+        let code = unsafe {
+            &*pyre_interpreter::w_code_get_ptr(marker_pycode)
+                .cast::<pyre_interpreter::CodeObject>()
+        };
+
+        // Bounds net for a frame resumed past its last instruction. Upstream
+        // has no counterpart — its loop leaves through `Return` / `Yield` —
+        // and it sits *after* the marker here because any pre-marker read of
+        // the code object is precisely the second, unpromoted read this
+        // ordering exists to remove.
+        if pc >= code.instructions.len() {
+            return LoopResult::Done(Ok(w_none()));
+        }
 
         let (opcode_pc, instruction, op_arg) = match decode_instruction_forward(code, pc) {
             Ok(decoded) => decoded,
@@ -9870,6 +10246,20 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                         loop_profiled,
                     )
                 });
+                if portal_metatrace_enabled()
+                    && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        >= portal_metatrace_skip()
+                    && !PORTAL_METATRACE_FIRED
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    drive_portal_metatrace(f, green_key_hash, loop_header_pc);
+                }
+                // The Stage-0 drive records IR and executes residuals
+                // concretely, so it is a collection point; re-seed before the
+                // compile path reads the frame. A plain reload of the same
+                // shadow-stack slot, so the knob-off path reads the value it
+                // already held.
+                let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
                 if let Some(loop_result) = maybe_compile_and_run(
                     unsafe { &mut *f },
                     green_key,
