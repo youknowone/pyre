@@ -1379,6 +1379,18 @@ fn init_faulthandler(
     if !importing::faulthandler_flag() {
         return;
     }
+    // `run_command_line` installs once, ahead of the program it goes on to
+    // dispatch, so whatever that program does to the handlers is what the
+    // prompt inherits when `-i` follows it.  pyre reaches `import site` from
+    // each entry point instead of from one linear startup, and `-c`/`-m`/a
+    // script followed by `-i` reaches it twice; installing on the second pass
+    // would undo a `faulthandler.disable()` the program had just made.
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    INSTALLED.call_once(|| first = true);
+    if !first {
+        return;
+    }
     let attempt = (|| -> Result<(), pyre_interpreter::PyError> {
         use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
@@ -2223,41 +2235,7 @@ fn eval_source_in_main(
     main_module: pyre_object::PyObjectRef,
     no_site: bool,
 ) {
-    let code = match compile_source_with_filename(source, mode, filename) {
-        Ok(code) => code,
-        Err(e) => {
-            // Render the `File "…", line N` + source + caret + `SyntaxError:`
-            // banner for the malformed source, matching an interactive run.
-            // A main file that will not compile is reported by the same
-            // `PyErr_Print` every other top-level failure is, so the hook sees
-            // it too and the stdlib renderer is what offers the keyword the
-            // author meant.
-            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source, mode);
-            if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
-                pyre_interpreter::eprint_syntax_error(&err);
-            }
-            std::process::exit(1);
-        }
-    };
-
     let ec_ptr = Rc::as_ptr(&execution_context);
-    let mut frame = match PyFrame::new_with_context_and_globals(code, execution_context, canonical)
-    {
-        Ok(frame) => frame,
-        Err(e) => {
-            pyre_interpreter::eprint_exception(&e, true);
-            std::process::exit(1);
-        }
-    };
-    // The frame is a GC object, and the only root that reaches one is the
-    // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
-    // joins when `eval_with_jit` below installs it.  Everything between here
-    // and that call runs Python (`site`) and can therefore drive a collection
-    // that would reclaim the frame and hand its storage to the next frame
-    // allocation.  RPython keeps a local holding a GC object alive through the
-    // translated shadow stack; publish it explicitly for the same span.
-    let _main_frame_root = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
 
     // Seed the module-identity attributes every `__main__` namespace carries
     // (pythonrun.c seeds these; `runpy` does the `-m` case). Without them a
@@ -2307,22 +2285,64 @@ fn eval_source_in_main(
     seed_main_loader(canonical, script_file, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
 
-    // `run_command_line` reaches its stdin branch with `site`, the warnings
-    // bootstrap and the signal handlers already installed, and prints the
-    // banner there rather than on the way in: what it labels is the import
-    // trace `-v` produced for all of that, so it follows the trace instead of
-    // heading it.  `<stdin>` names that branch -- a tty takes the prompt, and
-    // the prompt prints its own.  On stderr, where the trace goes; a piped
-    // program's stdout is its own.
-    if filename == "<stdin>" && importing::verbose_flag() != 0 {
+    // `main.c pymain_header`, which runs once startup is complete -- after
+    // `site` and the warnings bootstrap, so it follows the import trace `-v`
+    // produced for all of that rather than heading it, which is what makes the
+    // banner label that trace.  Its three tests are the three here: `-q`
+    // suppresses outright, a program that is not a tty needs `verbose` to get a
+    // banner at all, and `site_import` decides the second line.  `<stdin>`
+    // names the branch -- a tty takes the prompt, which prints its own.
+    if filename == "<stdin>" && !importing::quiet_flag() && importing::verbose_flag() != 0 {
+        // `fprintf(stderr, ...)`, the process descriptor rather than the
+        // `sys.stderr` a `sitecustomize` may have replaced by now.
         eprintln!("{}", repl::BANNER);
-        // `print_banner(not no_site)` -- the second line names the four
-        // builtins `site` installs, so `-S` leaves it nothing to offer and the
-        // notice is dropped with them.
+        // The `site_import` half: the second line names the four builtins
+        // `site` installs, so `-S` leaves it nothing to offer.
         if !no_site {
             eprintln!("{}", repl::BANNER_COPYRIGHT);
         }
     }
+
+    // Compiled only once startup is complete, which is the order
+    // `pymain_run_python` runs in: `site` is imported by interpreter
+    // initialisation, ahead of every path that reaches user source.  A
+    // program that will not compile still gets it -- the report below goes
+    // through `sys.excepthook`, which `site` is entitled to have replaced.
+    let code = match compile_source_with_filename(source, mode, filename) {
+        Ok(code) => code,
+        Err(e) => {
+            // Render the `File "…", line N` + source + caret + `SyntaxError:`
+            // banner for the malformed source, matching an interactive run.
+            // A main file that will not compile is reported by the same
+            // `PyErr_Print` every other top-level failure is, so the hook sees
+            // it too and the stdlib renderer is what offers the keyword the
+            // author meant.
+            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source);
+            if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
+                pyre_interpreter::eprint_syntax_error(&err);
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let mut frame = match PyFrame::new_with_context_and_globals(code, execution_context, canonical)
+    {
+        Ok(frame) => frame,
+        Err(e) => {
+            pyre_interpreter::eprint_exception(&e, true);
+            std::process::exit(1);
+        }
+    };
+    // The frame is a GC object, and the only root that reaches one is the
+    // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
+    // joins when `eval_with_jit` below installs it.  What runs between here
+    // and that call is Python -- the `linecache` registration below -- and can
+    // therefore drive a collection that would reclaim the frame and hand its
+    // storage to the next frame allocation.  RPython keeps a local holding a GC
+    // object alive through the translated shadow stack; publish it explicitly
+    // for the same span.
+    let _main_frame_root = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
 
     // `<string>` names no file, so `linecache._interactive_cache` is the only
     // place a traceback frame or `inspect.getsource` can reach the command's
