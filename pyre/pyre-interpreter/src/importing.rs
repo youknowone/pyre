@@ -2879,7 +2879,15 @@ pub fn get_builtin_module(name: &str) -> Option<PyObjectRef> {
     if let Some(module) = check_sys_modules(name) {
         return Some(module);
     }
-    create_builtin_module(name, std::ptr::null()).ok().flatten()
+    // Minting runs the module's `startup` hook, which is handed the execution
+    // context and may import through it — `array`'s registers the type with
+    // `_collections_abc.MutableSequence`.  The live context is what
+    // `getbuiltinmodule` would have run under anyway, so it is what this
+    // reader hands over rather than a null nothing on that path may
+    // dereference.
+    create_builtin_module(name, crate::call::getexecutioncontext())
+        .ok()
+        .flatten()
 }
 
 /// Return the interpreter-owned `sys` module, bypassing the Python-visible
