@@ -784,9 +784,12 @@ pub fn install_builtin_modules() {
         pyre_install_module!(pwd);
         #[cfg(unix)]
         pyre_install_module!(grp);
-        #[cfg(unix)]
+        // `host_env` as well as `unix`: both are wholly gated on that pair, so
+        // without it `sys.builtin_module_names` would advertise a module whose
+        // every call raises.
+        #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(resource);
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(fcntl);
         #[cfg(unix)]
         pyre_install_module!(syslog);
