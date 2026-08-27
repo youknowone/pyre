@@ -332,11 +332,13 @@ fn w_tuple_new_array_backed_impl(
     } else {
         (W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE)
     };
-    let raw = crate::gc_hook::try_gc_alloc_stable_raw(type_id, object_size);
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(type_id, object_size);
     // The freshly allocated tuple header is itself a translated livevar across
-    // the items-block allocation and the write barrier below. Publish it
-    // immediately; in a free-threaded run either operation may park behind a
-    // foreign collector even though the address is old-gen and non-moving.
+    // the items-block allocation and the write barrier below, and the nursery
+    // allocator's block moves, so publishing it is what keeps the address this
+    // frame later writes through correct: every read of it below comes back out
+    // of the shadow-stack slot. In a free-threaded run either operation may
+    // also park behind a foreign collector.
     //
     // The allocator hands back UNINITIALIZED payload, and once the root is
     // published `tuple_object_custom_trace` may read `ob_header.w_class` and
@@ -388,14 +390,16 @@ fn w_tuple_new_array_backed_impl(
         .unwrap_or(std::ptr::null_mut()) as *mut u8;
 
     if !raw.is_null() {
-        // The tuple lives in old-gen (`try_gc_alloc_stable`); its items
-        // may still be in the nursery. The element pointers are stored in
-        // the off-GC `items_block`, so the implicit write barrier on the
-        // tuple struct never fires — register the tuple explicitly so the
-        // next minor collection scans it (via the `wrappeditems`
-        // custom-trace hook) and relocates any young element. Mirrors the
-        // `write_barrier_from_array` an old list/tuple store would emit
-        // (incminimark.py:1495).
+        // The element pointers are stored in the off-GC `items_block`, so
+        // the implicit write barrier on the tuple struct never fires —
+        // register the tuple explicitly so the next minor collection scans it
+        // (via the `wrappeditems` custom-trace hook) and relocates any young
+        // element. Mirrors the `write_barrier_from_array` an old list/tuple
+        // store would emit (incminimark.py:1495). A tuple that spilled to the
+        // old generation because the nursery was full is the case that needs
+        // it; one still in the nursery carries no `GCFLAG_TRACK_YOUNG_PTRS`,
+        // which is the flag `do_write_barrier_managed` tests, so the call
+        // costs it a load and nothing else.
         //
         // This runs BEFORE the store, against the null-items image published
         // above: remembering an old object that holds no young pointer yet is
