@@ -314,11 +314,13 @@ pub struct BlackholeInterpreter {
     /// (blackhole.py `self.metainterp_sd = metainterp_sd`), so it is
     /// builder-shared and every interpreter in a chain sees it by
     /// construction.  A pool-owned Rust interpreter cannot hold a `&builder`
-    /// back-reference, so this is the builder's snapshot, copied in by
+    /// back-reference, so this is the builder's snapshot, shared in by
     /// `acquire_interp` the same way `descrs` is (blackhole.py).  Set it
     /// via [`BlackholeInterpBuilder::setup_jitdrivers_sd`] before acquiring,
-    /// not on individual frames.
-    pub jitdrivers_sd: Vec<BhJitDriverSd>,
+    /// not on individual frames.  `Arc<[_]>` rather than `Vec`: upstream's
+    /// back-reference costs nothing to hand on, and every `acquire_interp`
+    /// and `for_inline_callee` hands it on.
+    pub jitdrivers_sd: std::sync::Arc<[BhJitDriverSd]>,
     /// Pyre: absolute start index of the operand stack in
     /// PyFrame.locals_cells_stack_w. RPython does not need this because
     /// its JitCode already operates in register space.
@@ -333,6 +335,18 @@ pub struct BlackholeInterpreter {
     /// table; the builder owns the wired table and propagates an `Arc`
     /// clone via `acquire_interp`.
     pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
+    /// Callee interpreter kept for the next `BC_INLINE_CALL` made from this
+    /// frame, so a recursive descent pays for its frames once instead of once
+    /// per call.  Upstream has no counterpart because `bhimpl_inline_call_*`
+    /// (`blackhole.py`) allocates no callee interpreter at all — it reaches
+    /// the callee through `cpu.bh_call_*(jitcode.fnaddr, ...)`.  pyre
+    /// byte-interprets sub-jitcodes, so it needs a frame; this makes that
+    /// frame as close to free as upstream's absence of one.  Handed back by
+    /// `handler_inline_call_nested_ext` through
+    /// [`Self::reset_for_inline_reuse`], which restores it to exactly the
+    /// state `Default::default()` would have produced, so a reused frame and
+    /// a fresh one are indistinguishable to the sub-jitcode.
+    pub(crate) inline_callee_scratch: Option<Box<BlackholeInterpreter>>,
     /// State-field JIT register layout (`StateFieldLayout`).  Set on the
     /// root resume frame from `JitState::state_field_layout` so the
     /// `state_field` handlers can map a logical field/array index to the
@@ -404,6 +418,18 @@ impl Drop for GuardExcRoot {
 // invoked without any hook-registry indirection visible to dispatch code.
 use majit_translate::rlib::rvmprof::cintf::jit_rvmprof_code;
 
+thread_local! {
+    /// The placeholder `jitcode` every `BlackholeInterpreter::default()`
+    /// starts with, shared instead of rebuilt.  It carries an empty
+    /// `JitCodeBody` and is only ever read — `cleanup_registers` asks it for
+    /// `num_regs_r()` before the first `setposition`, which then replaces it
+    /// — so one instance per thread answers for every interpreter.  Building
+    /// a fresh one per default cost a `JitCode` allocation, a `JitCodeBody`
+    /// commit and, on drop, an `EffectInfo` teardown, once per
+    /// `BC_INLINE_CALL`.
+    static EMPTY_JITCODE: std::sync::Arc<JitCode> = std::sync::Arc::new(JitCode::default());
+}
+
 impl Default for BlackholeInterpreter {
     /// Sentinel-value interpreter used by
     /// `BlackholeInterpBuilder::acquire_interp`'s `unwrap_or_default()`
@@ -429,7 +455,7 @@ impl Default for BlackholeInterpreter {
             tmpreg_i: 0,
             tmpreg_r: 0,
             tmpreg_f: 0,
-            jitcode: std::sync::Arc::new(JitCode::default()),
+            jitcode: EMPTY_JITCODE.with(std::sync::Arc::clone),
             position: 0,
             nextblackholeinterp: None,
             return_type: BhReturnType::Void,
@@ -443,9 +469,10 @@ impl Default for BlackholeInterpreter {
             record_caught_exception: None,
             virtualizable_ptr: 0,
             virtualizable_info: std::ptr::null(),
-            jitdrivers_sd: Vec::new(),
+            jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
             virtualizable_stack_base: 0,
             dispatch_table: std::sync::Arc::new(Vec::new()),
+            inline_callee_scratch: None,
             state_field_layout: StateFieldLayout::default(),
         }
     }
@@ -560,25 +587,35 @@ impl BlackholeInterpreter {
         self.reset_position_state(position);
     }
 
-    /// Spawn a fresh interpreter that shares `parent`'s builder-context
-    /// fields (cpu, descrs, op_*, dispatch_table).  Used by
-    /// `handler_inline_call_nested_ext` for the callee frame of an
-    /// inline-call: a recursive `BlackholeInterpreter` rather than
-    /// `BlackholeInterpBuilder::acquire_interp` to avoid re-entering the
-    /// thread-local builder pool already lent to the caller.
+    /// Restore an inline callee frame to the state `Default::default()`
+    /// would have produced, so [`Self::inline_callee_scratch`] can hand the
+    /// same frame to the next `BC_INLINE_CALL` without the sub-jitcode being
+    /// able to tell.  Everything `clone_context_from` and `setposition` will
+    /// overwrite is left alone; everything else this run touched is cleared.
     ///
-    /// TODO: RPython `blackhole.py:1279-1320`
-    /// `bhimpl_inline_call_*` does not allocate a callee interpreter at
-    /// all — it calls `cpu.bh_call_*(jitcode.fnaddr, ..., jitcode.calldescr)`
-    /// directly because RPython's inline_call jitcode carries a native
-    /// entry point.  pyre's sub-jitcodes are byte-interpreted, so a
-    /// nested interpreter is the closest equivalent.  Within that
-    /// adaptation, `for_inline_callee` mirrors the builder→interp 6-field
-    /// copy that `acquire_interp` performs.
-    pub fn for_inline_callee(parent: &Self) -> Self {
-        let mut callee = Self::default();
-        callee.clone_context_from(parent);
-        callee
+    /// The three register files are zeroed, not just `registers_r`: a fresh
+    /// frame's files are empty `Vec`s that `init_register_file_from_i64s`
+    /// grows with `resize(_, 0)`, so every slot a sub-jitcode does not seed
+    /// reads 0 there and must read 0 here.  `registers_r` additionally must
+    /// not carry a dead reference into the next run —
+    /// [`Self::cleanup_registers`] documents why, and `run` publishes the
+    /// whole file to the collector through `push_bh_regs`.  The `Vec`
+    /// capacities survive, which is the point.
+    pub(crate) fn reset_for_inline_reuse(&mut self) {
+        self.registers_i.fill(0);
+        self.registers_r.fill(0);
+        self.registers_f.fill(0);
+        self.tmpreg_i = 0;
+        self.tmpreg_r = 0;
+        self.tmpreg_f = 0;
+        self.exception_last_value = 0;
+        self.nextblackholeinterp = None;
+        self.return_type = BhReturnType::Void;
+        self.aborted = false;
+        self.abort_permanent_bail = false;
+        self.got_exception = false;
+        self.called_residual.set(false);
+        self.state_field_layout = StateFieldLayout::default();
     }
 
     /// Copy the builder-shared context fields from `parent` onto `self`.
@@ -615,7 +652,7 @@ impl BlackholeInterpreter {
         // never has its own context" shape.
         self.virtualizable_ptr = parent.virtualizable_ptr;
         self.virtualizable_info = parent.virtualizable_info;
-        self.jitdrivers_sd = parent.jitdrivers_sd.clone();
+        self.jitdrivers_sd = std::sync::Arc::clone(&parent.jitdrivers_sd);
         self.virtualizable_stack_base = parent.virtualizable_stack_base;
         self.record_caught_exception = parent.record_caught_exception;
     }
@@ -1299,10 +1336,6 @@ impl BlackholeInterpreter {
         Err(DispatchError::LeaveFrame)
     }
 
-    fn finished(&self) -> bool {
-        self.position >= self.jitcode.code.len()
-    }
-
     /// blackhole.py bhimpl_rvmprof_code.
     pub fn bhimpl_rvmprof_code(&self, leaving: i64, unique_id: i64) {
         jit_rvmprof_code(leaving, unique_id);
@@ -1664,8 +1697,25 @@ impl BlackholeInterpreter {
         // instead of the writer.  `jit_strict_mode` is the untranslated-build
         // analog: debug builds plus `MAJIT_STRICT`.
         let check_startpoints = crate::jit_strict_mode();
+        // `blackhole.py` `BlackholeInterpreter.run` binds the bytecode ONCE —
+        // `self.dispatch_loop(self, self.jitcode.code, self.position)` — and
+        // `dispatch_loop` carries it as a parameter for the whole loop.  Bind it
+        // the same way here.  The `Arc` clone exists only to detach the slice
+        // borrow from `&mut self` so handlers can still take `&mut self`; per
+        // opcode it was an atomic increment and an atomic decrement, plus a
+        // `OnceLock` acquire load in each of `finished`, `next_u8` and
+        // `dispatch_step`, on a path this benchmark runs 8.7 million times per
+        // 4096 input characters.
+        //
+        // Hoisting is sound because a frame's jitcode is fixed for the life of
+        // its dispatch loop: the only production `setposition` callers seat a
+        // DIFFERENT interpreter — `copy_data_from_miframe` and the resume
+        // reader before `run`, and `handler_inline_call_nested_ext` on the
+        // callee — so no handler re-seats the frame it is dispatching in.
+        let jitcode_arc = std::sync::Arc::clone(&self.jitcode);
+        let code: &[u8] = &jitcode_arc.code;
         loop {
-            if self.finished() {
+            if self.position >= code.len() {
                 if trace {
                     eprintln!(
                         "[bh-trace] finished at pos={} reg0={}",
@@ -1686,7 +1736,8 @@ impl BlackholeInterpreter {
                     self.jitcode.try_index(),
                 );
             }
-            let opcode = self.next_u8();
+            let opcode = code[self.position];
+            self.position += 1;
             if trace {
                 eprintln!(
                     "[bh-trace] pos={} op={} reg0={} reg1={}",
@@ -1696,7 +1747,7 @@ impl BlackholeInterpreter {
                     self.registers_i.get(1).copied().unwrap_or(-1),
                 );
             }
-            match self.dispatch_step(opcode) {
+            match self.dispatch_step(opcode, code) {
                 Ok(()) => {}
                 Err(DispatchError::LeaveFrame) => {
                     if trace {
@@ -1757,7 +1808,7 @@ impl BlackholeInterpreter {
     /// byte (handler signature `(bh, code, position) -> Result<usize>`)
     /// and return the post-operand position; we then store it back into
     /// `self.position`.
-    fn dispatch_step(&mut self, opcode: u8) -> Result<(), DispatchError> {
+    fn dispatch_step(&mut self, opcode: u8, code: &[u8]) -> Result<(), DispatchError> {
         let placeholder_addr = unwired_handler_placeholder as *const () as usize;
         let table_handler = self
             .dispatch_table
@@ -1790,11 +1841,6 @@ impl BlackholeInterpreter {
                 self.jitcode.is_valid_startpoint(self.last_opcode_position),
             );
         };
-        // Clone the Arc to detach the `code` borrow from `self`, so the
-        // handler can take `&mut self` without aliasing the code slice.
-        // `Arc::clone` is a single atomic increment.
-        let jitcode_arc = std::sync::Arc::clone(&self.jitcode);
-        let code: &[u8] = &jitcode_arc.code;
         match handler(self, code, self.position) {
             Ok(new_pos) => {
                 self.position = new_pos;
@@ -2236,7 +2282,7 @@ pub struct BlackholeInterpBuilder {
     /// builder (blackhole.py:1079 `sd = self.builder.metainterp_sd`,
     /// :1096 `self.builder.metainterp_sd.jitdrivers_sd[jdindex]`), so the
     /// table belongs here and `acquire_interp` hands each frame a copy.
-    pub jitdrivers_sd: Vec<BhJitDriverSd>,
+    pub jitdrivers_sd: std::sync::Arc<[BhJitDriverSd]>,
 }
 
 impl Default for BlackholeInterpBuilder {
@@ -2275,7 +2321,7 @@ impl BlackholeInterpBuilder {
             // blackhole.py `EMPTY_LIST_I = [] # shared`.
             descrs: EMPTY_DESCR_TABLE,
             dispatch_table: std::sync::Arc::new(Vec::new()),
-            jitdrivers_sd: Vec::new(),
+            jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
         }
     }
 
@@ -2426,8 +2472,11 @@ impl BlackholeInterpBuilder {
     /// builder whose table is still empty gives every frame an empty table,
     /// and `bhimpl_jit_merge_point`'s recursive-portal branch indexes it
     /// directly.
-    pub fn setup_jitdrivers_sd(&mut self, jitdrivers_sd: Vec<BhJitDriverSd>) {
-        self.jitdrivers_sd = jitdrivers_sd;
+    pub fn setup_jitdrivers_sd(
+        &mut self,
+        jitdrivers_sd: impl Into<std::sync::Arc<[BhJitDriverSd]>>,
+    ) {
+        self.jitdrivers_sd = jitdrivers_sd.into();
     }
 
     /// RPython `blackhole.py` `dispatch_loop(self, code, position)`.
@@ -2597,7 +2646,7 @@ impl BlackholeInterpBuilder {
         // back-reference and reads `self.builder.metainterp_sd.jitdrivers_sd`
         // on demand (:1079, :1096).  The pool owns the interpreters here, so
         // hand each one the builder's snapshot instead.
-        bh.jitdrivers_sd = self.jitdrivers_sd.clone();
+        bh.jitdrivers_sd = std::sync::Arc::clone(&self.jitdrivers_sd);
         bh
     }
 
@@ -11823,16 +11872,6 @@ fn handler_inline_call_nested_ext(
     let mut p = p;
     let sub_idx = jitcode::read_u16(code, &mut p) as usize;
     let num_args = jitcode::read_u16(code, &mut p) as usize;
-    let mut arg_triples = Vec::with_capacity(num_args);
-    for _ in 0..num_args {
-        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
-        let caller_src = jitcode::read_reg(code, &mut p) as usize;
-        let callee_dst = jitcode::read_reg(code, &mut p) as usize;
-        arg_triples.push((kind, caller_src, callee_dst));
-    }
-    let return_i = decode_return_slot_at(code, &mut p);
-    let return_r = decode_return_slot_at(code, &mut p);
-    let return_f = decode_return_slot_at(code, &mut p);
 
     // blackhole.py:150-157 `j` argcode resolves via `descrs[idx]`
     // asserted to be a JitCode entry; pyre's helper-side
@@ -11852,10 +11891,21 @@ fn handler_inline_call_nested_ext(
         })
         .clone();
 
-    let mut callee = BlackholeInterpreter::for_inline_callee(bh);
+    // The callee frame is seated before the argument triples are decoded so
+    // each one can be copied where it is read, with no list in between.  The
+    // frame itself comes from `bh`'s scratch slot when this frame has already
+    // made an inline call, so a recursive descent allocates its frames once.
+    let mut callee = bh
+        .inline_callee_scratch
+        .take()
+        .unwrap_or_else(|| Box::new(BlackholeInterpreter::default()));
+    callee.clone_context_from(bh);
     callee.setposition(sub_jitcode, 0);
 
-    for (kind, caller_src, callee_dst) in arg_triples {
+    for _ in 0..num_args {
+        let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
+        let caller_src = jitcode::read_reg(code, &mut p) as usize;
+        let callee_dst = jitcode::read_reg(code, &mut p) as usize;
         match kind {
             JitArgKind::Int => {
                 callee.registers_i[callee_dst] = bh.registers_i[caller_src];
@@ -11868,6 +11918,10 @@ fn handler_inline_call_nested_ext(
             }
         }
     }
+
+    let return_i = decode_return_slot_at(code, &mut p);
+    let return_r = decode_return_slot_at(code, &mut p);
+    let return_f = decode_return_slot_at(code, &mut p);
 
     // RPython `bhimpl_inline_call_*` calls `cpu.bh_call_*(jitcode.fnaddr,
     // ...)` directly, so any `JitException` (`ContinueRunningNormally`,
@@ -11885,10 +11939,14 @@ fn handler_inline_call_nested_ext(
     // inspectors see the post-op cursor.  Mirror that invariant here:
     // sync `bh.position` to the operand-decoded post-op `p` before
     // propagating the JitException.
-    if let Some(args) = callee.run() {
-        bh.position = p;
-        return Err(DispatchError::ContinueRunningNormally(Box::new(args)));
-    }
+    //
+    // Every exit below leaves through the single `break 'callee`, so the
+    // frame always reaches the scratch slot on its way out.
+    let outcome = 'callee: {
+        if let Some(args) = callee.run() {
+            bh.position = p;
+            break 'callee Err(DispatchError::ContinueRunningNormally(Box::new(args)));
+        }
 
     // RPython `blackhole.py` invariant: after the handler has
     // decoded operands and consumed the result payload, every
@@ -11898,43 +11956,51 @@ fn handler_inline_call_nested_ext(
     // `self.position = new_pos` when the handler returns `Ok`, so any
     // `Err(LeaveFrame)` that skips the assignment leaves the parent's
     // cursor pre-op.
-    if callee.aborted {
-        bh.position = p;
-        bh.aborted = true;
-        bh.abort_permanent_bail = callee.abort_permanent_bail;
-        return Err(DispatchError::LeaveFrame);
-    }
-    if callee.got_exception {
-        let exc_val = callee.exception_last_value;
-        if exc_val != 0 {
-            return Err(DispatchError::RaiseException {
-                exc: exc_val,
-                resume_position: p,
-            });
+        if callee.aborted {
+            bh.position = p;
+            bh.aborted = true;
+            bh.abort_permanent_bail = callee.abort_permanent_bail;
+            break 'callee Err(DispatchError::LeaveFrame);
         }
-        bh.position = p;
-        bh.got_exception = true;
-        return Err(DispatchError::LeaveFrame);
-    }
+        if callee.got_exception {
+            let exc_val = callee.exception_last_value;
+            if exc_val != 0 {
+                break 'callee Err(DispatchError::RaiseException {
+                    exc: exc_val,
+                    resume_position: p,
+                });
+            }
+            bh.position = p;
+            bh.got_exception = true;
+            break 'callee Err(DispatchError::LeaveFrame);
+        }
 
-    if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
-        match return_kind {
-            JitArgKind::Int => {
-                let caller_dst = return_i.expect("inline int return missing caller destination");
-                bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
-            }
-            JitArgKind::Ref => {
-                let caller_dst = return_r.expect("inline ref return missing caller destination");
-                bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
-            }
-            JitArgKind::Float => {
-                let caller_dst = return_f.expect("inline float return missing caller destination");
-                bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
+        if let Some((return_kind, callee_src)) = callee.jitcode.trailing_return_info() {
+            match return_kind {
+                JitArgKind::Int => {
+                    let caller_dst =
+                        return_i.expect("inline int return missing caller destination");
+                    bh.registers_i[caller_dst] = callee.registers_i[callee_src as usize];
+                }
+                JitArgKind::Ref => {
+                    let caller_dst =
+                        return_r.expect("inline ref return missing caller destination");
+                    bh.registers_r[caller_dst] = callee.registers_r[callee_src as usize];
+                }
+                JitArgKind::Float => {
+                    let caller_dst =
+                        return_f.expect("inline float return missing caller destination");
+                    bh.registers_f[caller_dst] = callee.registers_f[callee_src as usize];
+                }
             }
         }
-    }
 
-    Ok(p)
+        Ok(p)
+    };
+
+    callee.reset_for_inline_reuse();
+    bh.inline_callee_scratch = Some(callee);
+    outcome
 }
 
 /// Mirror of `BlackholeInterpreter::decode_return_slot` for handler
