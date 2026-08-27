@@ -1054,7 +1054,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             .and_then(|p| p.rsplit("::").next())
             .map(str::to_string)
             .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
-        let returns_objectptr = output_type_is_objectptr(&fd.signature.output, llbc);
+        let gcref_result = gc_root_gcref_result_path(&fn_path);
+        let returns_objectptr =
+            output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
         // Stamp the FUNC.RESULT token for `dont_look_inside` callees only
         // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
         // codewriter surface stays restricted to opaque stubs; every
@@ -1068,7 +1070,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
             || (trait_root.is_some() && self_ty_root.is_none());
-        let return_type = if stamp_return_token {
+        let return_type = if gcref_result {
+            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
+        } else if stamp_return_token {
             dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
         } else {
             None
@@ -3078,6 +3082,12 @@ impl std::error::Error for LowerError {}
 /// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
 /// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
 const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
+/// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
+/// elements, while `rmodel.externalvsinternal(..., gcref=True)` stores those
+/// GC pointers in `GcArray(GCREF)`.  The logical list identity must therefore
+/// remain `[str]`; the rtyper's ordinary ListRepr recast supplies the
+/// STRPTR↔GCREF conversion at each item boundary.
+const STRING_GCREF_GCARRAY_TYPE_ID: &str = "[str]";
 
 /// The `(base, index)` operands of a devirtualized workspace index call,
 /// recorded for the paired `*p = v` write.  Each operand keeps the
@@ -3091,6 +3101,10 @@ struct IndexElemAlias {
     base_var: Variable,
     index_local: Option<usize>,
     index_var: Variable,
+    /// External item bank the source-level list exposes.  This can differ
+    /// from the Rust pointee spelling: `[str]` is physically `GcArray(GCREF)`
+    /// but its get/set boundary is `StringRepr`.
+    item_ty: ValueType,
     /// Identity the paired write must repeat, so `arr[i] = v` keys the
     /// same ARRAY as the `arr[i]` read that recorded this alias.
     array_type_id: Option<String>,
@@ -3427,44 +3441,56 @@ impl<'a> Lowering<'a> {
             // trait's qualified path instead, which the adapter
             // resolves through the unique-impl map
             // (`trait_unique_impls`, keyed by qualified path).
-            let class_root = match &ty {
-                ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc)
-                    // A `&str` / `str` param strips to the `str` builtin
-                    // (not an ADT), so `tyref_class_root` answers `None`;
-                    // name it `"str"` so `derive_subject_inputcells` seeds
-                    // the byte `SomeString` (`s_str0`) instead of the
-                    // abstract `SomeInstance(None)` a `Ref(None)` projects
-                    // to.  A string param compared against a string literal
-                    // then rtypes as `pair(StringRepr, StringRepr)` rather
-                    // than walling at `pair(InstanceRepr, StringRepr)`.
-                    .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
-                    // A list-typed param (`Vec<T>`, `&[T]`, …) has no
-                    // named-ADT leaf — `tyref_class_root` answers `None`
-                    // because `adt_node_class_root` excludes the
-                    // core/std/alloc container family from classdef
-                    // minting.  Carry its full monomorphic spelling so
-                    // `derive_subject_inputcells` projects it through the
-                    // annotator's list model (`project_struct_field_type`)
-                    // instead of the classdef-less `SomeInstance(None)`
-                    // shell, on which a `len()` / iteration would wall at
-                    // `getattr` over a classdef-less instance.
-                    .or_else(|| {
-                        let spelling = tyref_to_ast_string(&local.ty, llbc);
-                        majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
-                    }),
-                // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
-                // so it takes the non-`Ref` arm and would otherwise carry no
-                // `class_root`.  Its variant-name metadata is a side table
-                // keyed by the enum type (the RPython "names by int" model),
-                // not a field on the value; carry the crate-stripped enum
-                // path so the `Debug`-fmt collapse can recover the enum
-                // identity from the value's origin (`debug_enum_disc_owner`)
-                // now that no `__discriminant` field read remains to scavenge.
-                // `derive_subject_inputcells` only consumes `class_root` on
-                // the `Ref` arm, so the annotation seed stays a plain
-                // `SomeInteger`.
-                _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+            let class_root = if i == 1 && gc_root_pin_path(&graph.name) {
+                // RPython's GC transformer publishes every live GC pointer
+                // through llmemory.GCREF, then casts the restored word back
+                // to its source repr.  Rust's `PyObjectRef` parameter is the
+                // physical carrier for that opaque slot, not a W_Root
+                // instance.  Preserve the GCREF input boundary explicitly so
+                // StringRepr and InstanceRepr callers never meet in one
+                // source-level FunctionDesc cell.
+                Some("GCREF".to_string())
+            } else {
+                match &ty {
+                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc)
+                        // A `&str` / `str` param strips to the `str` builtin
+                        // (not an ADT), so `tyref_class_root` answers `None`;
+                        // name it `"str"` so `derive_subject_inputcells` seeds
+                        // the byte `SomeString` (`s_str0`) instead of the
+                        // abstract `SomeInstance(None)` a `Ref(None)` projects
+                        // to.  A string param compared against a string literal
+                        // then rtypes as `pair(StringRepr, StringRepr)` rather
+                        // than walling at `pair(InstanceRepr, StringRepr)`.
+                        .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
+                        .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
+                        // A list-typed param (`Vec<T>`, `&[T]`, …) has no
+                        // named-ADT leaf — `tyref_class_root` answers `None`
+                        // because `adt_node_class_root` excludes the
+                        // core/std/alloc container family from classdef
+                        // minting.  Carry its full monomorphic spelling so
+                        // `derive_subject_inputcells` projects it through the
+                        // annotator's list model (`project_struct_field_type`)
+                        // instead of the classdef-less `SomeInstance(None)`
+                        // shell, on which a `len()` / iteration would wall at
+                        // `getattr` over a classdef-less instance.
+                        .or_else(|| {
+                            let spelling = tyref_to_ast_string(&local.ty, llbc);
+                            majit_ir::descr::is_list_container_spelling(&spelling)
+                                .then_some(spelling)
+                        }),
+                    // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
+                    // so it takes the non-`Ref` arm and would otherwise carry no
+                    // `class_root`.  Its variant-name metadata is a side table
+                    // keyed by the enum type (the RPython "names by int" model),
+                    // not a field on the value; carry the crate-stripped enum
+                    // path so the `Debug`-fmt collapse can recover the enum
+                    // identity from the value's origin (`debug_enum_disc_owner`)
+                    // now that no `__discriminant` field read remains to scavenge.
+                    // `derive_subject_inputcells` only consumes `class_root` on
+                    // the `Ref` arm, so the annotation seed stays a plain
+                    // `SomeInteger`.
+                    _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+                }
             };
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
@@ -4641,7 +4667,18 @@ impl<'a> Lowering<'a> {
                     // to the recorded Variable for a constant operand.
                     let arr = self.realias_operand(alias.base_local, alias.base_var);
                     let idx = self.realias_operand(alias.index_local, alias.index_var);
-                    let arr = if matches!(alias.array_type_id.as_deref(), Some("[i64]" | "[f64]")) {
+                    if alias.array_type_id.as_deref() == Some(STRING_GCREF_GCARRAY_TYPE_ID) {
+                        // The manual Rust shadow-stack reload is the internal
+                        // GCREF word. At the source graph boundary RPython's
+                        // rlist recasts it to the external StringRepr before
+                        // setitem; the typer lowers this marker back to the
+                        // exact cast_opaque_ptr operation.
+                        value = self.narrow_value_to_instance_root(bb_id, value, "str");
+                    }
+                    let arr = if matches!(
+                        alias.array_type_id.as_deref(),
+                        Some("[i64]" | "[f64]" | STRING_GCREF_GCARRAY_TYPE_ID)
+                    ) {
                         self.narrow_value_to_instance_root(
                             bb_id,
                             LinkArg::Value(arr),
@@ -4657,7 +4694,7 @@ impl<'a> Lowering<'a> {
                         base: arr,
                         index: idx,
                         value: value.clone(),
-                        item_ty: tyref_to_value_type(dest_ty, self.llbc),
+                        item_ty: alias.item_ty,
                         array_type_id: alias.array_type_id.clone(),
                         nolength: false,
                     }
@@ -7607,6 +7644,12 @@ impl<'a> Lowering<'a> {
         on_unwind: usize,
     ) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
+        let callee_pin_gcref_arg = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(gc_root_pin_path),
+            _ => false,
+        };
 
         // Destination must be a plain `Local(i)` — projection-typed
         // destinations are not produced for monomorphized calls in any
@@ -7784,6 +7827,24 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
+                }
+                // Rust exposes RPython's generated shadow-stack publication
+                // as a normal `pin_root(PyObjectRef)` call.  Its parameter is
+                // actually `llmemory.GCREF`, irrespective of the source
+                // pointer's external repr.  Cast every caller to that opaque
+                // slot before FunctionDesc propagation so strings, W_Root
+                // instances, and other GC pointers do not union at the
+                // helper's single input cell.
+                if callee_pin_gcref_arg && args.len() == 1 {
+                    args[0] = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(args[0].clone()),
+                            "GCREF",
+                        )
+                        .as_variable()
+                        .expect("a materialized GC root stays a Variable")
+                        .clone();
                 }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py:355-358); the rtyper folds the surviving
@@ -8100,6 +8161,7 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            item_ty: ValueType::Int,
                             array_type_id: None,
                         },
                     );
@@ -8279,7 +8341,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayRead {
                             base: args[0].clone(),
                             index: args[1].clone(),
-                            item_ty,
+                            item_ty: item_ty.clone(),
                             array_type_id: array_type_id.clone(),
                             nolength: false,
                             pure: false,
@@ -8292,6 +8354,7 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            item_ty,
                             array_type_id,
                         },
                     );
@@ -8369,6 +8432,61 @@ impl<'a> Lowering<'a> {
                 // pointer-walking callers (`object_insert` / `_remove` /
                 // `_splice`) keep their `add` and fall to the legacy
                 // walker.
+                // `BytesArray::base` / `UnicodeArray::base` address the same
+                // physical `ItemsBlock` as the object arm below, but PyPy's
+                // `BytesListStrategy` and `AsciiListStrategy` expose an
+                // RPython `str` item.  `rmodel.externalvsinternal` stores that
+                // GC pointer as GCREF; it does not erase the ListDef's
+                // external SomeString annotation.  Recover `[str]` here so
+                // getitem/setitem use StringRepr at the graph boundary and
+                // GCRefRepr only inside the ARRAY.
+                if let Some((item_ty, array_type_id)) = self.string_items_elem_ptr_add(
+                    &reg,
+                    args.len(),
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                ) {
+                    let base = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(args[0].clone()),
+                            &array_type_id,
+                        )
+                        .as_variable()
+                        .expect("a materialized string-items base stays a Variable")
+                        .clone();
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: args[1].clone(),
+                            item_ty: item_ty.clone(),
+                            array_type_id: Some(array_type_id.clone()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: base,
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            item_ty,
+                            array_type_id: Some(array_type_id),
+                        },
+                    );
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if self.is_list_items_elem_ptr_add(
                     &reg,
                     args.len(),
@@ -8397,6 +8515,7 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                         },
                     );
@@ -8438,7 +8557,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayRead {
                             base: base.clone(),
                             index: args[1].clone(),
-                            item_ty,
+                            item_ty: item_ty.clone(),
                             array_type_id: Some(array_type_id.clone()),
                             nolength: false,
                             pure: false,
@@ -8451,6 +8570,7 @@ impl<'a> Lowering<'a> {
                             base_var: base,
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            item_ty,
                             array_type_id: Some(array_type_id),
                         },
                     );
@@ -11933,6 +12053,34 @@ impl<'a> Lowering<'a> {
             self.body,
             self.llbc,
         )
+    }
+
+    /// PyPy's unwrapped byte / ASCII list storage.  Rust reaches the shared
+    /// `ItemsBlock` through `BytesArray::base` / `UnicodeArray::base`, but the
+    /// source-level element remains `str`: `AbstractUnwrappedStrategy`
+    /// appends the result of `bytes_w` / `utf8_w`, and
+    /// `externalvsinternal(..., gcref=True)` alone changes its physical
+    /// storage to GCREF.  Return the logical `[str]` ARRAY identity so the
+    /// ordinary ListRepr performs that recast.
+    fn string_items_elem_ptr_add(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> Option<(ValueType, String)> {
+        is_string_items_elem_ptr_add_parts(
+            reg,
+            args_len,
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+        )
+        .then(|| (ValueType::Str, STRING_GCREF_GCARRAY_TYPE_ID.to_string()))
     }
 
     /// Scalar `GcArray(Signed|Float)` counterpart of
@@ -17186,6 +17334,33 @@ fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool 
         .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path().as_str()))
 }
 
+fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
+}
+
+/// True for the root-stack publication helper.  Both the free function and
+/// `RootScope` method spell the last two semantic components `gc_roots` and
+/// `pin_root`, with an optional `<Impl>` segment between them.
+fn gc_root_pin_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
+}
+
+/// Root-stack operations whose PyObjectRef return is the physical spelling
+/// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
+/// restores the original external repr after reading this opaque word.
+fn gc_root_gcref_result_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.iter().any(|s| *s == "gc_roots")
+        && matches!(
+            segments.last(),
+            Some(&"pin_root") | Some(&"shadow_stack_get")
+        )
+}
+
 /// The scalar `TypedItemsBlock` accessor, kept separate from the object-array
 /// pair because its consumers must emit `GcArray(Signed|Float)` operations,
 /// never reference-array operations.
@@ -17197,6 +17372,19 @@ fn regular_call_is_typed_items_block_accessor(reg: &RegularCall, llbc: &Llbc) ->
         let name = fd.item_meta.name_path();
         is_typed_items_block_base_accessor(&name) || is_typed_array_base_adapter(&name)
     })
+}
+
+/// The two unwrapped-string adapters whose Rust return type is the physical
+/// `*mut PyObjectRef`, while their RPython list item is externally `str` and
+/// internally GCREF.  Keep these out of the generic object-array predicate:
+/// sharing the machine word does not make `[str]` and `[W_Root]` the same
+/// ListDef / ARRAY identity upstream.
+fn regular_call_is_string_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id)
+        .is_some_and(|fd| is_string_array_base_adapter(&fd.item_meta.name_path()))
 }
 
 /// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
@@ -17255,6 +17443,35 @@ fn is_typed_items_elem_ptr_add_parts(
         && index_local.is_some()
         && base_local
             .is_some_and(|base| base_traces_to_typed_items_block_accessor(body, base, llbc))
+        && add_dest_used_only_as_single_deref(body, dest_local)
+}
+
+/// String-list half of brick 3.  The pointee is physically PyObjectRef/GCREF,
+/// but only the two named adapters prove that it is the internal storage of a
+/// `SomeList(SomeString)` rather than a list of W_Root instances.
+#[allow(clippy::too_many_arguments)]
+fn is_string_items_elem_ptr_add_parts(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> bool {
+    args_len == 2
+        && regular_call_is_ptr_add(reg, llbc)
+        && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
+        && index_local.is_some()
+        && base_local.is_some_and(|base| {
+            base_traces_to_items_block_accessor_matching(
+                body,
+                base,
+                llbc,
+                regular_call_is_string_items_block_accessor,
+            )
+        })
         && add_dest_used_only_as_single_deref(body, dest_local)
 }
 
@@ -19618,8 +19835,9 @@ fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
 
 /// Whether a `TyRef` resolves (behind `Ref` / dedup wrappers) to a
 /// string-family value: the `alloc::string::String` ADT, the
-/// `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, or the `{Builtin: "Str"}`
-/// node (the bare `str` deref destination).  All four project to the
+/// `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, pyre's `BytesBlock`
+/// owner for RPython `STR`, or the `{Builtin: "Str"}` node (the bare `str`
+/// deref destination).  All of them project to the
 /// single immutable `s_unicode0` value, so a `deref` between any two of
 /// them is value-identity.
 fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -19656,13 +19874,20 @@ fn node_is_string_value(node: &serde_json::Value, llbc: &Llbc) -> bool {
     {
         return true;
     }
-    // Named string ADTs: `alloc::string::String` and the WTF-8 wrappers.
+    // Named string ADTs: `alloc::string::String`, the WTF-8 wrappers, and
+    // pyre's variable-sized `BytesBlock` owner for RPython `STR.chars`.
+    // Bookkeeper::project_struct_field_type already makes this exact
+    // projection; keeping the MIR input classifier in sync prevents a
+    // function argument from reintroducing a nominal BytesBlock instance.
     adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
             let np = td.item_meta.name_path();
             np == "alloc::string::String"
-                || matches!(np.rsplit("::").next(), Some("Wtf8" | "Wtf8Buf"))
+                || matches!(
+                    np.rsplit("::").next(),
+                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock")
+                )
         })
 }
 
@@ -22045,6 +22270,11 @@ fn is_typed_array_base_adapter(name: &str) -> bool {
         || path_ends_with_segments(name, "float_array::<Impl>::base")
 }
 
+fn is_string_array_base_adapter(name: &str) -> bool {
+    path_ends_with_segments(name, "bytes_array::<Impl>::base")
+        || path_ends_with_segments(name, "unicode_array::<Impl>::base")
+}
+
 /// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
 /// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
 /// receiver (see [`Lowering::is_items_block_base_ptr_add`]).
@@ -22060,6 +22290,7 @@ fn graph_is_items_block_base_accessor(name: &str) -> bool {
     is_object_items_block_base_accessor(name)
         || is_typed_items_block_base_accessor(name)
         || is_typed_array_base_adapter(name)
+        || is_string_array_base_adapter(name)
 }
 
 /// One path segment, with a raw-identifier prefix removed.  `r#struct` and
@@ -30667,28 +30898,50 @@ mod tests {
             "/../../build/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real object LLBC");
-        for (base, function, expected_array) in [
+        for (base, function, expected_array, expected_item, offset_leaf) in [
             (
                 "pyre_object::int_array::<Impl>::base",
                 "pyre_object::int_array::<Impl>::push",
                 "[i64]",
+                ValueType::Int,
+                "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
             ),
             (
                 "pyre_object::float_array::<Impl>::base",
                 "pyre_object::float_array::<Impl>::push",
                 "[f64]",
+                ValueType::Float,
+                "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
+            ),
+            (
+                "pyre_object::bytes_array::<Impl>::base",
+                "pyre_object::bytes_array::<Impl>::push",
+                super::STRING_GCREF_GCARRAY_TYPE_ID,
+                ValueType::Str,
+                "ITEMS_BLOCK_ITEMS_OFFSET",
+            ),
+            (
+                "pyre_object::unicode_array::<Impl>::base",
+                "pyre_object::unicode_array::<Impl>::push",
+                super::STRING_GCREF_GCARRAY_TYPE_ID,
+                ValueType::Str,
+                "ITEMS_BLOCK_ITEMS_OFFSET",
             ),
         ] {
             let base_graph = super::lower_function(&llbc, base)
                 .unwrap_or_else(|err| panic!("lower {base}: {err}"));
             assert!(
-                !base_graph.blocks.iter().flat_map(|block| &block.operations).any(|op| matches!(
-                    &op.kind,
-                    OpKind::Call {
-                        target: CallTarget::FunctionPath { segments },
-                        ..
-                    } if segments.last().is_some_and(|leaf| leaf == "TYPED_ITEMS_BLOCK_ITEMS_OFFSET")
-                )),
+                !base_graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.last().is_some_and(|leaf| leaf == offset_leaf)
+                    )),
                 "{base} must fold the target-layout items offset"
             );
             let graph = super::lower_function(&llbc, function)
@@ -30702,11 +30955,12 @@ mod tests {
                 operations.iter().any(|op| matches!(
                     &op.kind,
                     OpKind::ArrayWrite {
+                        item_ty,
                         array_type_id: Some(array_type_id),
                         ..
-                    } if array_type_id == expected_array
+                    } if array_type_id == expected_array && item_ty == &expected_item
                 )),
-                "{function} must write {expected_array} through setarrayitem"
+                "{function} must write {expected_array}/{expected_item:?} through setarrayitem"
             );
             assert!(
                 !operations.iter().any(|op| matches!(

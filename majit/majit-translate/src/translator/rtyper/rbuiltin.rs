@@ -3662,11 +3662,39 @@ pub fn rtype_cast_instance_intrinsic(
     let r_arg0 = arg_repr(hop, 0)?;
     let v_ptr = hop.inputarg(&r_arg0, 0)?;
     hop.exception_cannot_occur()?;
-    Ok(hop.genop(
-        "cast_pointer",
-        vec![v_ptr],
-        GenopResult::LLType(result_lltype),
-    ))
+    if r_arg0.lowleveltype() == &result_lltype {
+        return Ok(Some(v_ptr));
+    }
+    // RPython `rmodel.externalvsinternal(..., gcref=True)` converts a
+    // concrete GC pointer to/from llmemory.GCREF with `cast_opaque_ptr`
+    // (`rgcref.py:52-63`).  The same marker also carries ordinary
+    // class-pointer narrows, which remain `cast_pointer` per rclass.py.
+    let gcref = crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
+    if r_result.class_name() == "StringRepr" && r_arg0.lowleveltype() != &gcref {
+        // The MIR call-result narrow has already restored the generic
+        // PyObjectRef carrier to its W_Root-shaped external pointer.  A
+        // string-list store immediately recasts that same root-stack word to
+        // StringRepr.  Upstream performs both edges through GCRefRepr, so
+        // materialize the exact concrete→GCREF→STRPTR pair instead of an
+        // invalid cast_pointer between unrelated GC structs.
+        let Some(v_gcref) = hop.genop("cast_opaque_ptr", vec![v_ptr], GenopResult::LLType(gcref))
+        else {
+            return Err(TyperError::message(
+                "rtype_cast_instance_intrinsic: cast to GCREF produced no value",
+            ));
+        };
+        return Ok(hop.genop(
+            "cast_opaque_ptr",
+            vec![v_gcref],
+            GenopResult::LLType(result_lltype),
+        ));
+    }
+    let opname = if r_arg0.lowleveltype() == &gcref || result_lltype == gcref {
+        "cast_opaque_ptr"
+    } else {
+        "cast_pointer"
+    };
+    Ok(hop.genop(opname, vec![v_ptr], GenopResult::LLType(result_lltype)))
 }
 
 #[cfg(test)]

@@ -81,6 +81,12 @@ use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 /// readable Rust return type.
 pub(crate) const OBJECTPTR_RETURN_TYPE: &str = "*mut PyObject";
 
+/// Residual FUNC.RESULT token for the opaque root-stack word used by
+/// RPython's GC transformer.  It is ref-kind like OBJECTPTR but retains the
+/// `Ptr(GcOpaque("GCREF"))` low-level identity required for
+/// `cast_opaque_ptr` back to StringRepr / InstanceRepr.
+pub(crate) const GCREF_RETURN_TYPE: &str = "gcref";
+
 /// Project a post-`specialize` `LowLevelType` back to the legacy
 /// `ConcreteType` bucket the codewriter consumes (Signed / Float /
 /// GcRef / Void).
@@ -2473,6 +2479,13 @@ pub(crate) fn default_someshell_for_lltype(
 pub(crate) fn residual_return_shell(
     token: Option<&str>,
 ) -> Option<crate::annotator::model::SomeValue> {
+    if token == Some(GCREF_RETURN_TYPE) {
+        return Some(
+            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+            ),
+        );
+    }
     if token == Some("ref") {
         return Some(
             crate::codewriter::annotation_state::valuetype_to_someshell(
@@ -2513,6 +2526,9 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
     match token {
         None | Some("()") => Some(LowLevelType::Void),
         Some("ref") => Some(crate::translator::rtyper::rclass::OBJECTPTR.clone()),
+        Some(s) if s == GCREF_RETURN_TYPE => {
+            Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone())
+        }
         Some("bool") => Some(LowLevelType::Bool),
         Some("i64") => Some(LowLevelType::Signed),
         Some("u64") => Some(LowLevelType::Unsigned),
@@ -2565,17 +2581,24 @@ fn declared_funcptr_type_from_legacy(
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
     use crate::model::OpKind;
     let startblock = legacy.blocks.iter().find(|b| b.id == legacy.startblock)?;
-    let mut input_ty: HashMap<crate::flowspace::model::Variable, &crate::model::ValueType> =
-        HashMap::new();
+    let mut input_ty: HashMap<
+        crate::flowspace::model::Variable,
+        (&crate::model::ValueType, &Option<String>),
+    > = HashMap::new();
     for op in &startblock.operations {
-        if let (Some(result), OpKind::Input { ty, .. }) = (op.result.as_ref(), &op.kind) {
-            input_ty.insert(result.clone(), ty);
+        if let (Some(result), OpKind::Input { ty, class_root, .. }) = (op.result.as_ref(), &op.kind)
+        {
+            input_ty.insert(result.clone(), (ty, class_root));
         }
     }
     let mut args = Vec::with_capacity(startblock.inputargs.len());
     for var in &startblock.inputargs {
-        let ty = input_ty.get(var)?;
-        args.push(valuetype_to_lltype(ty)?);
+        let (ty, class_root) = input_ty.get(var)?;
+        args.push(if class_root.as_deref() == Some("GCREF") {
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+        } else {
+            valuetype_to_lltype(ty)?
+        });
     }
     let result = return_token_to_lltype(legacy.return_type.as_deref())?;
     Some(crate::translator::rtyper::lltypesystem::lltype::FuncType { args, result })

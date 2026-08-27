@@ -3478,6 +3478,20 @@ pub(crate) fn derive_subject_inputcells(
             // classdef-less shell, narrowed by call-propagation as before
             // (`description.py FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
+                // Rust's `gc_roots::pin_root(PyObjectRef)` parameter is the
+                // source spelling of RPython GC-transformer's opaque root
+                // slot.  The front marks that exact input as `GCREF`; seed a
+                // SomePtr(GCREF), not the W_Root-like SomeInstance fallback,
+                // so heterogeneous StringRepr / InstanceRepr livevars meet
+                // only after their ordinary cast_opaque_ptr conversion.
+                if class_root.as_deref() == Some("GCREF") {
+                    cells.push(
+                        crate::translator::rtyper::llannotation::lltype_to_annotation(
+                            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+                        ),
+                    );
+                    continue;
+                }
                 // A list-typed param (`Vec<T>`, `&[T]`, …) carries its
                 // full monomorphic spelling as `class_root` (the named-ADT
                 // root resolver excludes the core/std/alloc container

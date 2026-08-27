@@ -1516,7 +1516,43 @@ fn cast_instance_intrinsic(
         }
     };
     let operand = arg_at(args_s, 0, crate::runtime_names::shims::CAST_INSTANCE);
-    let projected = bk.project_struct_field_type(&root);
+    let projected = if root == "GCREF" {
+        // RPython GC-transform root slots are llmemory.GCREF.  Rust spells
+        // the helper parameter/return as PyObjectRef, but that carrier must
+        // not mint a W_Root instance annotation: every concrete GC pointer
+        // is cast_opaque_ptr'd into this slot and restored afterward.
+        crate::translator::rtyper::llannotation::lltype_to_annotation(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        )
+    } else {
+        bk.project_struct_field_type(&root)
+    };
+    // `GCRefRepr.recast` is the symmetric external-item boundary used by
+    // rlist: a GCREF read from `GcArray(GCREF)` becomes its concrete external
+    // pointer (StringRepr here) through cast_opaque_ptr.  The synthetic marker
+    // carries that target spelling; return the projected string for any GC
+    // pointer source, while an already-string source is the identity.
+    if matches!(&projected, SomeValue::String(_)) {
+        return match operand {
+            SomeValue::String(_) => Ok(operand.clone()),
+            SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::Address(_) => Ok(projected),
+            other => Err(AnnotatorError::new(format!(
+                "__cast_instance_intrinsic: non-pointer operand for string root {root:?}: {other:?}"
+            ))),
+        };
+    }
+    if root == "GCREF" {
+        return match operand {
+            SomeValue::String(_)
+            | SomeValue::Instance(_)
+            | SomeValue::List(_)
+            | SomeValue::Ptr(_)
+            | SomeValue::Address(_) => Ok(projected),
+            other => Err(AnnotatorError::new(format!(
+                "__cast_instance_intrinsic: non-GC-pointer operand for GCREF: {other:?}"
+            ))),
+        };
+    }
     // A physical `TypedItemsBlock` pointer is the Rust owner for RPython's
     // direct `GcArray(Signed|Float)`. The MIR front records that cast as this
     // same pointer-narrow marker with a `[i64]` / `[f64]` target spelling.
