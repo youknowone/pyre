@@ -830,9 +830,9 @@ fn real_main(binary_name: &str) {
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let cmd = dedent_command(&cmd);
-            run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site);
+            let session = run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site, inspect);
             if inspect {
-                repl::run_repl(true, no_site);
+                repl::run_repl(true, no_site, session);
             }
         }
         RunMode::Module(module) => {
@@ -843,9 +843,9 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from(&module)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_module(&module, no_site);
+            let session = run_module(&module, no_site, inspect);
             if inspect {
-                repl::run_repl(true, no_site);
+                repl::run_repl(true, no_site, session);
             }
         }
         RunMode::Script(path) => {
@@ -856,9 +856,9 @@ fn real_main(binary_name: &str) {
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let compile_path = script_compile_path(&path);
-            run_script_path(&path, &compile_path, no_site, binary_name);
+            let session = run_script_path(&path, &compile_path, no_site, binary_name, inspect);
             if inspect {
-                repl::run_repl(true, no_site);
+                repl::run_repl(true, no_site, session);
             }
         }
         RunMode::Stdin { argv0 } => {
@@ -875,7 +875,7 @@ fn real_main(binary_name: &str) {
             if stdin_is_interactive(inspect) {
                 // A tty (or `-i`) prints the banner unless `-q` and drops into
                 // the prompt.
-                repl::run_repl(quiet, no_site);
+                repl::run_repl(quiet, no_site, None);
             } else {
                 // Otherwise stdin is read to EOF and executed as a single
                 // `exec` unit named `<stdin>`.
@@ -886,7 +886,7 @@ fn real_main(binary_name: &str) {
                         std::process::exit(1);
                     }
                 };
-                run_source(&source, Mode::Exec, "<stdin>", no_site);
+                run_source(&source, Mode::Exec, "<stdin>", no_site, false);
             }
         }
         RunMode::Interact {
@@ -1969,7 +1969,7 @@ fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
 
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
-fn run_module(module: &str, no_site: bool) {
+fn run_module(module: &str, no_site: bool, inspect: bool) -> Option<MainSession> {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
 
@@ -1997,13 +1997,11 @@ fn run_module(module: &str, no_site: bool) {
 
     if let Err(e) = result {
         // `_run_module_as_main` ends the same run as a script does, so its
-        // failure takes the same exit: `app_main.py` reports every top-level
-        // exception through `display_exception`, which is what reaches a
-        // `sys.excepthook` the module installed.
-        handle_main_error(e, canonical, ec_ptr);
+        // failure takes the same exit, and `-i` opens the prompt over it the
+        // same way -- `SystemExit` included.
+        report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
     }
-    finalize_runtime(canonical, ec_ptr);
-    maybe_print_jit_stats();
+    finish_or_inspect(inspect, execution_context, canonical, main_module)
 }
 
 /// `os.path.abspath` for the run filename, or `None` for the `-c "<string>"`
@@ -2225,6 +2223,70 @@ fn finish_main(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionCo
     maybe_print_jit_stats();
 }
 
+/// The interpreter a program leaves running for `-i` to continue in.
+///
+/// `pymain_run_python` runs the program, then the prompt, and reaches
+/// `Py_FinalizeEx` only after both, so the two share one interpreter and one
+/// `__main__`.  That sharing is the whole of `-i`: the names the program bound
+/// are the ones the prompt inspects.  A program that failed is inspected the
+/// same way -- an uncaught exception, a source that would not compile, even a
+/// `SystemExit` -- because the point of asking for the prompt is to look at
+/// what went wrong.
+pub(crate) struct MainSession {
+    pub(crate) execution_context: Rc<PyExecutionContext>,
+    pub(crate) canonical: pyre_object::PyObjectRef,
+    pub(crate) main_module: pyre_object::PyObjectRef,
+}
+
+/// Finalize here, or hand the live interpreter to the prompt to finalize once
+/// it is done with it.
+fn finish_or_inspect(
+    inspect: bool,
+    execution_context: Rc<PyExecutionContext>,
+    canonical: pyre_object::PyObjectRef,
+    main_module: pyre_object::PyObjectRef,
+) -> Option<MainSession> {
+    if !inspect {
+        finish_main(canonical, Rc::as_ptr(&execution_context));
+        return None;
+    }
+    Some(MainSession {
+        execution_context,
+        canonical,
+        main_module,
+    })
+}
+
+/// Report a top-level failure the prompt is about to open over.
+///
+/// `handle_main_error` is the arm that ends the process, and it finalizes on
+/// the way out; this one only prints, because the interpreter that failed is
+/// the one the prompt continues in.  `SystemExit` takes this path too: `-i`
+/// turns the request to exit into a report, which is why the run ends with the
+/// prompt's status rather than the program's.
+fn report_main_error_for_inspect(mut e: pyre_interpreter::PyError) {
+    if !pyre_interpreter::error::print_exception_via_excepthook(&mut e) {
+        pyre_interpreter::eprint_exception(&e, true);
+    }
+}
+
+/// Report a top-level failure, and end the process unless `-i` asked for the
+/// prompt to open over it.
+///
+/// `handle_main_error` finalizes on its way out, so it is the arm that must not
+/// be taken while the prompt still has the interpreter ahead of it.
+fn report_or_end_on_main_error(
+    e: pyre_interpreter::PyError,
+    inspect: bool,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) {
+    if !inspect {
+        handle_main_error(e, canonical, ec_ptr);
+    }
+    report_main_error_for_inspect(e);
+}
+
 fn eval_source_in_main(
     source: &str,
     mode: Mode,
@@ -2234,8 +2296,11 @@ fn eval_source_in_main(
     canonical: pyre_object::PyObjectRef,
     main_module: pyre_object::PyObjectRef,
     no_site: bool,
-) {
+    inspect: bool,
+) -> Option<MainSession> {
     let ec_ptr = Rc::as_ptr(&execution_context);
+    // The frame below takes the context by value; the prompt needs it too.
+    let session_context = Rc::clone(&execution_context);
 
     // Seed the module-identity attributes every `__main__` namespace carries
     // (pythonrun.c seeds these; `runpy` does the `-m` case). Without them a
@@ -2321,6 +2386,11 @@ fn eval_source_in_main(
             if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
                 pyre_interpreter::eprint_syntax_error(&err);
             }
+            // The source never ran, but the interpreter it would have run in is
+            // up, and that is what `-i` asked to be left at.
+            if inspect {
+                return finish_or_inspect(true, session_context, canonical, main_module);
+            }
             std::process::exit(1);
         }
     };
@@ -2330,6 +2400,9 @@ fn eval_source_in_main(
         Ok(frame) => frame,
         Err(e) => {
             pyre_interpreter::eprint_exception(&e, true);
+            if inspect {
+                return finish_or_inspect(true, session_context, canonical, main_module);
+            }
             std::process::exit(1);
         }
     };
@@ -2366,9 +2439,9 @@ fn eval_source_in_main(
                 println!("{}", PyDisplay(result));
             }
         }
-        Err(e) => handle_main_error(e, canonical, ec_ptr),
+        Err(e) => report_or_end_on_main_error(e, inspect, canonical, ec_ptr),
     }
-    finish_main(canonical, ec_ptr);
+    finish_or_inspect(inspect, session_context, canonical, main_module)
 }
 
 fn read_script_source(path: &str, binary_name: &str) -> String {
@@ -2395,7 +2468,13 @@ fn read_script_source(path: &str, binary_name: &str) -> String {
     }
 }
 
-fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str) {
+fn run_script_path(
+    path: &str,
+    filename: &str,
+    no_site: bool,
+    binary_name: &str,
+    inspect: bool,
+) -> Option<MainSession> {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
     let (canonical, main_module) = prepare_main_module(&execution_context);
@@ -2424,9 +2503,9 @@ fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str)
             seed_main_loader(canonical, None, ec_ptr);
             import_site(no_site, canonical, ec_ptr);
             if let Err(e) = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false) {
-                handle_main_error(e, canonical, ec_ptr);
+                report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
             }
-            finish_main(canonical, ec_ptr);
+            finish_or_inspect(inspect, execution_context, canonical, main_module)
         }
         Ok(false) => {
             let source = read_script_source(path, binary_name);
@@ -2441,13 +2520,23 @@ fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str)
                 canonical,
                 main_module,
                 no_site,
-            );
+                inspect,
+            )
         }
-        Err(e) => handle_main_error(e, canonical, ec_ptr),
+        Err(e) => {
+            report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
+            finish_or_inspect(inspect, execution_context, canonical, main_module)
+        }
     }
 }
 
-fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
+fn run_source(
+    source: &str,
+    mode: Mode,
+    filename: &str,
+    no_site: bool,
+    inspect: bool,
+) -> Option<MainSession> {
     // `config_run_filename_abspath` absolutizes the run filename before the
     // module is compiled, so `co_filename` — and with it every `File "…"` line
     // a traceback prints — carries the absolute path, not the literal argv
@@ -2480,7 +2569,8 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
         canonical,
         main_module,
         no_site,
-    );
+        inspect,
+    )
 }
 
 #[cfg(test)]

@@ -53,7 +53,13 @@ pub(crate) const BANNER: &str = "pyre 0.0.1 (Rust meta-tracing JIT)";
 pub(crate) const BANNER_COPYRIGHT: &str =
     "Type \"help\", \"copyright\", \"credits\" or \"license\" for more information.";
 
-pub fn run_repl(quiet: bool, no_site: bool) {
+/// `resume` carries the interpreter a program has just finished running in, for
+/// the `-i` that follows it.  `pymain_run_python` reaches the prompt without
+/// starting anything over -- the program's `__main__` is the prompt's, and
+/// startup ran once -- so a resumed prompt skips the whole block below and
+/// takes only the parts that are the prompt's own: `sys.ps1`/`ps2` and the
+/// interactive flags.
+pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) {
     let mut repl = Readline::new();
     let history_path = repl_history_path();
 
@@ -61,31 +67,61 @@ pub fn run_repl(quiet: bool, no_site: bool) {
         eprintln!("pyre: could not load REPL history: {err}");
     }
 
-    let execution_context = Rc::new(PyExecutionContext::default());
-    register_build_class();
-    // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
-    // at the REPL raises KeyboardInterrupt rather than killing the
-    // process, and register the periodic signal-check action.
-    unsafe {
-        let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
-        pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
-        (*ec_ptr).install_user_del_action();
-        pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
-    }
-
-    let w_globals = execution_context.fresh_module_globals();
     let _root = pyre_object::gc_roots::push_roots();
-    let w_globals = pyre_object::gc_roots::pin_root(w_globals);
-    unsafe {
-        pyre_object::w_dict_setitem_str(w_globals, "__name__", pyre_object::w_str_new("__main__"))
-    };
+    let (execution_context, canonical, _main_module) = match resume {
+        Some(session) => {
+            // The root scope the program pinned these in is gone with the
+            // frame that ran it, and the prompt holds them for the rest of the
+            // process, so pin them here and read the pins back.
+            let canonical = pyre_object::gc_roots::pin_root(session.canonical);
+            let main_module = pyre_object::gc_roots::pin_root(session.main_module);
+            (session.execution_context, canonical, main_module)
+        }
+        None => {
+            let execution_context = Rc::new(PyExecutionContext::default());
+            register_build_class();
+            // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
+            // at the REPL raises KeyboardInterrupt rather than killing the
+            // process, and register the periodic signal-check action.
+            unsafe {
+                let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
+                pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
+                (*ec_ptr).install_user_del_action();
+                pyre_interpreter::module::signal::interp_signal::install_signal_handling(
+                    &mut *ec_ptr,
+                );
+            }
 
-    // PyPy `module.py Module.getdict()` parity: use the canonical
-    // W_DictObject so REPL STORE_NAME writes, `globals()`, `f.__globals__`,
-    // and `__main__.__dict__` all share one identity.
-    let canonical = w_globals;
-    let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
-    importing::set_sys_module("__main__", main_module);
+            let w_globals = execution_context.fresh_module_globals();
+            let w_globals = pyre_object::gc_roots::pin_root(w_globals);
+            unsafe {
+                pyre_object::w_dict_setitem_str(
+                    w_globals,
+                    "__name__",
+                    pyre_object::w_str_new("__main__"),
+                )
+            };
+
+            // PyPy `module.py Module.getdict()` parity: use the canonical
+            // W_DictObject so REPL STORE_NAME writes, `globals()`,
+            // `f.__globals__`, and `__main__.__dict__` all share one identity.
+            let canonical = w_globals;
+            let main_module =
+                pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
+            importing::set_sys_module("__main__", main_module);
+
+            // pylifecycle.c init_importlib before site — see run_source.
+            if let Err(e) =
+                crate::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context))
+            {
+                eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
+            }
+
+            crate::seed_main_loader(canonical, None, Rc::as_ptr(&execution_context));
+            crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
+            (execution_context, canonical, main_module)
+        }
+    };
 
     let sys_module = match importing::importhook(
         "sys",
@@ -102,18 +138,9 @@ pub fn run_repl(quiet: bool, no_site: bool) {
     };
     configure_sys_for_repl(sys_module);
 
-    // pylifecycle.c init_importlib before site — see run_source.
-    if let Err(e) = crate::init_importlib_bootstrap(canonical, Rc::as_ptr(&execution_context)) {
-        eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
-    }
-
-    crate::seed_main_loader(canonical, None, Rc::as_ptr(&execution_context));
-
-    crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
-
     let runtime = ReplRuntime {
         ctx_ptr: Rc::into_raw(Rc::clone(&execution_context)),
-        w_globals,
+        w_globals: canonical,
         sys_module,
     };
 
@@ -217,8 +244,14 @@ pub fn run_repl(quiet: bool, no_site: bool) {
         eprintln!("pyre: could not save REPL history: {err}");
     }
 
+    // `Py_FinalizeEx` runs after the prompt, not before it, and it is the same
+    // one the program would have reached had no `-i` followed: `atexit`
+    // callbacks, the module teardown and the stream flush all belong here.
+    // `exit()` at the prompt takes it too -- the status it asked for is
+    // delivered by the exit below, after the callbacks have run.
+    crate::finish_main(canonical, Rc::as_ptr(&execution_context));
+
     if let Some(code) = pending_exit {
-        crate::maybe_print_jit_stats();
         std::process::exit(code);
     }
 }
