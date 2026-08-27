@@ -366,7 +366,6 @@ spec_folds! {
     TruthInt             => ("truth_int",                "residual_call", "-"),
     TruthBool            => ("truth_bool",               "residual_call", "-"),
     UnaryPositiveInt     => ("unary_positive_int",       "residual_call", "-"),
-    UnaryNegativeInt     => ("unary_negative_int",       "residual_call", "-"),
     UnaryInvertDescent   => ("unary_invert_descent",     "residual_call", "-"),
     UnaryNegativeDescent => ("unary_negative_descent",   "residual_call", "-"),
     StoreSubscr          => ("store_subscr",             "residual_call", "-"),

@@ -5494,12 +5494,13 @@ fn walk_body_has_exception_handler<Sym: WalkSym>(
     })
 }
 
-/// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py) port
-/// for the **non-elidable** call shapes — companion to
-/// [`try_fold_pure_call_via_executor`] which handles the elidable case.
+/// PyPy `_opimpl_residual_call{1,2,3}` (pyjitpl.py) port for residual calls
+/// not completed by [`try_fold_pure_call_via_executor`].  That fast path
+/// handles cannot-raise elidable calls; can-raise elidable calls continue here
+/// so their exception state is observable.
 ///
 /// Upstream calls `executor.execute_varargs(opnum, argboxes, descr,
-/// exc=can_raise, pure=False)` which dispatches through
+/// exc=can_raise, pure=is_elidable)` which dispatches through
 /// `cpu.bh_call_*` and clears/records BH exception state via
 /// `metainterp.clear_exception()` + `metainterp.execute_raised(...)`.
 /// This walker-friendly counterpart returns `Result<i64, i64>` directly
@@ -5520,13 +5521,13 @@ fn walk_body_has_exception_handler<Sym: WalkSym>(
 /// call regardless of EI.
 ///
 /// **Caller contract**:
-/// * `call_opcode` must be one of the non-elidable residual call shapes:
+/// * `call_opcode` must be one of the residual call shapes:
 ///   `Call{I,R,F,N}` (the default arm), `CallLoopinvariant{I,R,F,N}`
 ///   (the `EF_LOOPINVARIANT` arm), or `CallMayForce{I,R,F,N}` (the
 ///   `forces_virtual_or_virtualizable` arm — only when no active
 ///   virtualizable is present, see force-virtual gate below).
-///   * `CallPure*` is excluded — that's [`try_fold_pure_call_via_executor`]'s
-///     job.
+///   * can-raise `CallPure*` is included; cannot-raise `CallPure*` has already
+///     been handled by [`try_fold_pure_call_via_executor`].
 ///   * `CallReleaseGil*` / `CallAssembler*` are excluded from THIS
 ///     function's direct opcode set, but for distinct reasons:
 ///     - `CallReleaseGil*` IS concrete-executed — `do_residual_call`

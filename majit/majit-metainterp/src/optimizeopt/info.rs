@@ -68,11 +68,10 @@ pub(crate) fn resolve_gc_tid(
 /// `descr.get_all_fielddescrs()` (info.py:217-225), where `typeptr` is absent,
 /// so upstream never emits this header store from the force path. This is the
 /// same optimizer-layer "value already there" elision as heap.py:88-101.
-fn w_class_store_is_covered_by_alloc(
+pub(crate) fn w_class_value_is_covered_by_alloc(
     size_descr: &DescrRef,
     field_descr: &DescrRef,
-    value: &Operand,
-    ctx: &crate::optimizeopt::OptContext,
+    value: Option<Value>,
 ) -> bool {
     let Some(field) = field_descr.as_field_descr().filter(|fd| fd.is_w_class()) else {
         return false;
@@ -97,9 +96,22 @@ fn w_class_store_is_covered_by_alloc(
         return false;
     }
     matches!(
+        value,
+        Some(Value::Ref(value)) if value == GcRef(w_class as usize)
+    )
+}
+
+fn w_class_store_is_covered_by_alloc(
+    size_descr: &DescrRef,
+    field_descr: &DescrRef,
+    value: &Operand,
+    ctx: &crate::optimizeopt::OptContext,
+) -> bool {
+    w_class_value_is_covered_by_alloc(
+        size_descr,
+        field_descr,
         ctx.resolve_operand_operand_opt(value)
             .and_then(|resolved| resolved.const_value()),
-        Some(Value::Ref(value)) if value == GcRef(w_class as usize)
     )
 }
 

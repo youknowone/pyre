@@ -8289,6 +8289,75 @@ extern "C" fn add2_for_walker_test(a: i64, b: i64) -> i64 {
     a.wrapping_add(b)
 }
 
+#[test]
+fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
+    // `MIFrame.execute_varargs` executes the CALL first and only then patches
+    // it to CALL_PURE / handles the possible exception (`pyjitpl.py`).  The
+    // `EF_ELIDABLE_OR_MEMORYERROR` bigint helpers use this exact shape: they
+    // must not be left recorded-only merely because their opcode is CallPureI.
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
+    let arg0 = tc.const_int(40);
+    let arg1 = tc.const_int(2);
+    let allboxes = [funcbox, arg0, arg1];
+    let descr = make_call_descr(
+        81,
+        vec![Type::Int, Type::Int],
+        Type::Int,
+        majit_ir::ExtraEffect::ElidableOrMemoryError,
+    );
+    let recorded = tc.record_op_with_descr(majit_ir::OpCode::CallPureI, &allboxes, descr.clone());
+    let mut regs_i: Vec<OpRef> = Vec::new();
+    let mut regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut regs_i,
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let result = try_execute_residual_call_via_executor(
+        &mut wc,
+        majit_ir::OpCode::CallPureI,
+        &allboxes,
+        descr.as_call_descr().expect("CallPureI descr"),
+        recorded,
+        0,
+        None,
+    );
+    drop(wc);
+
+    assert_eq!(result, Ok(ResidualExecOutcome::Executed(Ok(42))));
+    assert_eq!(tc.box_value(recorded), Some(majit_ir::Value::Int(42)));
+}
+
 fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef, OpRef) {
     let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
     let arg0 = tc.const_int(40);

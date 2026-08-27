@@ -13,7 +13,7 @@ use majit_ir::{Descr, DescrRef, FieldDescr, OopSpecIndex, Op, OpCode, OpRef, Typ
 
 use crate::optimizeopt::info::{
     ArrayStructInfo, PtrInfo, VirtualArrayInfo, VirtualInfo, VirtualStructInfo,
-    VirtualizableFieldState,
+    VirtualizableFieldState, w_class_value_is_covered_by_alloc,
 };
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
@@ -812,9 +812,9 @@ impl OptVirtualize {
                 if !info.is_virtual() {
                     return None;
                 }
-                if !is_typeptr {
+                if !field_descr.is_header_field() {
                     let parent_descr = field_descr.get_parent_descr().expect(
-                        "optimize_setfield_gc: non-typeptr FieldDescr.get_parent_descr() returned None",
+                        "optimize_setfield_gc: non-header FieldDescr.get_parent_descr() returned None",
                     );
                     info.init_fields(parent_descr.clone(), field_idx as usize);
                 }
@@ -835,6 +835,35 @@ impl OptVirtualize {
                                     vinfo.known_class = Some(class_val as i64);
                                 }
                             return Some(OptimizationResult::Remove);
+                        }
+                        // PyPy's typeptr never enters `_fields`: its class
+                        // identity is metadata on InstancePtrInfo and the GC
+                        // allocation writes the header.  Pyre has a second,
+                        // Python-level class header (`PyObject.w_class`) that
+                        // must obey the same boundary.  Its descriptor carries
+                        // a placeholder positional index because it is absent
+                        // from `SizeDescr::all_fielddescrs`; storing it in
+                        // `fields` aliases the first payload slot.
+                        //
+                        // If NEW_WITH_VTABLE already writes this exact class,
+                        // the store is redundant.  Otherwise leave the op to
+                        // normal emission: `_emit_operation` forces the
+                        // virtual first and then preserves the real header
+                        // write.  A dynamic class takes that conservative arm
+                        // as well.  This mirrors virtualize.py
+                        // `optimize_SETFIELD_GC` while adapting pyre's extra
+                        // header without inventing an RPython-side field slot.
+                        if field_descr.is_w_class() {
+                            let covered = w_class_value_is_covered_by_alloc(
+                                &vinfo.descr,
+                                &setfield_descr_arc,
+                                value_as_constant.map(|value| Value::Ref(majit_ir::GcRef(value))),
+                            );
+                            return Some(if covered {
+                                OptimizationResult::Remove
+                            } else {
+                                OptimizationResult::PassOn
+                            });
                         }
                         set_field(&mut vinfo.fields, field_idx, value_op.clone());
                         if let Some(err) =
@@ -2914,6 +2943,20 @@ mod tests {
         idx: u32,
     }
 
+    #[derive(Debug)]
+    struct TestWClassSizeDescr {
+        w_class: i64,
+        class_word: Arc<dyn FieldDescr>,
+        all_fields: Vec<Arc<dyn FieldDescr>>,
+        gc_fields: Vec<Arc<dyn FieldDescr>>,
+    }
+
+    #[derive(Debug)]
+    struct TestWClassFieldDescr;
+
+    #[derive(Debug)]
+    struct TestPayloadFieldDescr;
+
     impl Descr for TestSizeDescr {
         fn index(&self) -> u32 {
             self.idx
@@ -2933,6 +2976,108 @@ mod tests {
         fn is_immutable(&self) -> bool {
             false
         }
+    }
+
+    impl Descr for TestWClassSizeDescr {
+        fn as_size_descr(&self) -> Option<&dyn majit_ir::SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::SizeDescr for TestWClassSizeDescr {
+        fn size(&self) -> usize {
+            24
+        }
+        fn type_id(&self) -> u32 {
+            77
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+        fn vtable(&self) -> usize {
+            0xDEAD
+        }
+        fn w_class_obj(&self) -> Option<i64> {
+            Some(self.w_class)
+        }
+        fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.all_fields
+        }
+        fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+            &self.gc_fields
+        }
+        fn class_word_field(&self) -> Option<&Arc<dyn FieldDescr>> {
+            Some(&self.class_word)
+        }
+    }
+
+    impl Descr for TestWClassFieldDescr {
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestWClassFieldDescr {
+        fn index_in_parent(&self) -> usize {
+            0
+        }
+        fn offset(&self) -> usize {
+            8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> Type {
+            Type::Ref
+        }
+        fn is_pointer_field(&self) -> bool {
+            true
+        }
+        fn field_name(&self) -> &str {
+            "pyobject::PyObject.w_class"
+        }
+        fn is_w_class(&self) -> bool {
+            true
+        }
+    }
+
+    impl Descr for TestPayloadFieldDescr {
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestPayloadFieldDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            None
+        }
+        fn index_in_parent(&self) -> usize {
+            0
+        }
+        fn offset(&self) -> usize {
+            16
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> Type {
+            Type::Int
+        }
+        fn field_name(&self) -> &str {
+            "W_LongObject.value"
+        }
+    }
+
+    fn w_class_layout(default_w_class: usize) -> (DescrRef, DescrRef, DescrRef) {
+        let w_class: Arc<dyn FieldDescr> = Arc::new(TestWClassFieldDescr);
+        let payload: Arc<dyn FieldDescr> = Arc::new(TestPayloadFieldDescr);
+        let size: DescrRef = Arc::new(TestWClassSizeDescr {
+            w_class: default_w_class as i64,
+            class_word: w_class.clone(),
+            all_fields: vec![payload.clone()],
+            gc_fields: vec![w_class.clone()],
+        });
+        (size, w_class as DescrRef, payload as DescrRef)
     }
 
     #[derive(Debug)]
@@ -4173,6 +4318,59 @@ mod tests {
         assign_positions(&mut ops);
         let result = run_pass(&ops);
         assert!(result.is_empty(), "NEW_WITH_VTABLE should be removed");
+    }
+
+    #[test]
+    fn test_w_class_header_does_not_alias_first_payload_slot() {
+        // Pyre's embedded PyObject header is not part of the positional field
+        // list, just as PyPy's typeptr is excluded by all_fielddescrs().  Its
+        // placeholder index 0 must therefore never address payload slot 0.
+        // A class different from the allocation default forces the virtual and
+        // preserves the real header write.
+        let (sd, w_class_fd, _) = w_class_layout(0xCAFE);
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(Value::Ref(majit_ir::GcRef(0xBEEF))),
+                ],
+                w_class_fd,
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_pass(&ops);
+        assert_eq!(
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>(),
+            vec![OpCode::NewWithVtable, OpCode::SetfieldGc]
+        );
+        assert_eq!(
+            result[1]
+                .getdescr()
+                .and_then(|descr| descr.as_field_descr().map(|fd| fd.offset())),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn test_w_class_header_store_covered_by_allocation_stays_virtual() {
+        let (sd, w_class_fd, _) = w_class_layout(0xCAFE);
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(Value::Ref(majit_ir::GcRef(0xCAFE))),
+                ],
+                w_class_fd,
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        assert!(run_pass(&ops).is_empty());
     }
 
     #[test]

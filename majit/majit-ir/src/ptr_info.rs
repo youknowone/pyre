@@ -152,14 +152,15 @@ pub struct VStringConcatInfo {
 ///
 /// Fields are tracked as OpRefs to the operations that produce their values.
 ///
-/// ## Invariant: `fields` NEVER contains typeptr (offset 0)
+/// ## Invariant: `fields` NEVER contains object-header fields
 ///
 /// Matches RPython upstream: `heaptracker.py all_fielddescrs()` skips
 /// `typeptr`, so `info.py AbstractStructPtrInfo.init_fields` sizes
-/// `_fields` with typeptr excluded from the indexable range. The typeptr
-/// (offset 0) is tracked separately via `known_class` and emitted by the
-/// GC rewriter's `gen_initialize_vtable` path (rewrite.py:479-484), NOT
-/// from the force-path field loop.
+/// `_fields` with it excluded from the indexable range. Pyre's additional
+/// Python-level `w_class` header follows the same rule. The typeptr (offset 0)
+/// is tracked separately via `known_class` and emitted by the GC rewriter's
+/// `gen_initialize_vtable` path (rewrite.py), NOT from the force-path field
+/// loop; a non-default `w_class` store forces the virtual before it is emitted.
 ///
 /// Enforced by:
 /// - `virtualize.rs optimize_setfield_gc` Virtual arm: runtime check that
@@ -182,7 +183,7 @@ pub struct VirtualInfo {
     /// SetfieldGc(ob_type) without polluting `fields` (which feeds rd_virtuals).
     pub ob_type_descr: Option<DescrRef>,
     /// Field values: `(field_descr_index, value_opref)`.
-    /// **Invariant**: never contains typeptr (offset 0) — see struct-level docs.
+    /// **Invariant**: never contains typeptr or `w_class` — see struct-level docs.
     pub fields: Vec<(u32, Operand)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
