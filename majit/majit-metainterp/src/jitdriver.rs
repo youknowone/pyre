@@ -82,19 +82,50 @@ pub struct SingleFrameBlackholeResult {
     pub virtualizable_ptr: i64,
 }
 
+/// The blackhole's view of `metainterp_sd.jitdrivers_sd`, cast once and shared.
+///
+/// `bhimpl_jit_merge_point` indexes the prebuilt `jitdrivers_sd` directly, so
+/// nothing about this table is per-resume; the rows only need re-casting
+/// because the blackhole names the result kind, the portal runner and the
+/// portal calldescr in its own types.  The cast is memoised on the static data
+/// that owns the rows and invalidated by `finish_setup_descrs_for_jitdrivers`,
+/// so a resume pays one `Arc` clone rather than one `BhCallDescr` per driver.
 fn bh_jitdrivers_sd(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
-) -> Vec<crate::blackhole::BhJitDriverSd> {
+) -> std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
+    let table = metainterp_sd.bh_jitdrivers_sd.get_or_init(|| {
+        build_bh_jitdrivers_sd(metainterp_sd)
+    });
+    debug_assert!(
+        table.len() == metainterp_sd.jitdrivers_sd.len()
+            && table.iter().zip(&metainterp_sd.jitdrivers_sd).all(|(bh, jd)| {
+                bh.portal_runner_ptr.map_or(0, |f| f as usize as i64) == jd.portal_runner_adr
+                    && bh.result_type as u8 == bh_return_type(jd.result_type) as u8
+            }),
+        "bh_jitdrivers_sd outlived a `jitdrivers_sd` write that did not run \
+         `finish_setup_descrs_for_jitdrivers`"
+    );
+    std::sync::Arc::clone(table)
+}
+
+/// `warmspot.py:449` `jd.result_type` projected to the blackhole dispatch char.
+fn bh_return_type(result_type: majit_ir::Type) -> crate::blackhole::BhReturnType {
+    match result_type {
+        majit_ir::Type::Int => crate::blackhole::BhReturnType::Int,
+        majit_ir::Type::Ref => crate::blackhole::BhReturnType::Ref,
+        majit_ir::Type::Float => crate::blackhole::BhReturnType::Float,
+        majit_ir::Type::Void => crate::blackhole::BhReturnType::Void,
+    }
+}
+
+fn build_bh_jitdrivers_sd(
+    metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
+) -> std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
     metainterp_sd
         .jitdrivers_sd
         .iter()
         .map(|jd| {
-            let result_type = match jd.result_type {
-                majit_ir::Type::Int => crate::blackhole::BhReturnType::Int,
-                majit_ir::Type::Ref => crate::blackhole::BhReturnType::Ref,
-                majit_ir::Type::Float => crate::blackhole::BhReturnType::Float,
-                majit_ir::Type::Void => crate::blackhole::BhReturnType::Void,
-            };
+            let result_type = bh_return_type(jd.result_type);
             let portal_runner_ptr = (jd.portal_runner_adr != 0).then(|| unsafe {
                 std::mem::transmute::<usize, extern "C" fn(i64, i64, i64, i64, i64) -> i64>(
                     jd.portal_runner_adr as usize,
@@ -6135,7 +6166,13 @@ impl<S: JitState> JitDriver<S> {
                 // resolve every frame statelessly from the flat global
                 // registry by its self-describing absolute index (no root/sub
                 // branch, no parent-relative descrs walk, no last-frame state).
-                let jitcode_registry = self.meta.jitcodes().to_vec();
+                // `resume.py`'s `jitcode = jitcodes[jitcode_pos]` indexes the
+                // prebuilt list in place.  Borrowing it costs nothing; the
+                // `to_vec` that stood here cloned every `Arc` in the registry
+                // — two atomic RMWs per jitcode — on a path this fixture takes
+                // once per input character.
+                let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] =
+                    self.meta.jitcodes();
                 let resolve_jitcode = |jitcode_index: i32,
                                        pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {
