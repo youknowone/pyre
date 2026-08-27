@@ -4516,33 +4516,50 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
 /// using the shared structured renderer keeps exception chains and
 /// tracebacks visible to tests that deliberately call the original hook.
 pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let value = args.get(1).copied().unwrap_or_else(w_none);
-    let traceback = args.get(2).copied().unwrap_or_else(w_none);
     // Route through the live `sys.stderr`, not directly through the host
     // seam: tests and applications are allowed to replace `sys.stderr` and
     // `sys.__excepthook__` must honor that replacement.
     let stderr = crate::importing::get_sys_module("sys")
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
+    // Both renderers below run Python -- the stdlib one imports `traceback`,
+    // the built-in one calls `__str__` on the chain -- so each of the three
+    // objects that outlive them is published and read back from its slot; a
+    // Rust local would still name the address it had before a collection moved
+    // the object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(args.get(1).copied().unwrap_or_else(w_none));
+    let _ = pyre_object::gc_roots::pin_root(args.get(2).copied().unwrap_or_else(w_none));
+    // A stream that is not there is `None` in the slot and `false` beside it;
+    // the two answer different questions and the tests below ask both.
+    let has_stderr = stderr.is_some();
+    let _ = pyre_object::gc_roots::pin_root(match stderr {
+        Some(stream) if !stream.is_null() => stream,
+        _ => w_none(),
+    });
+    let value = || pyre_object::gc_roots::shadow_stack_get(sp);
+    let traceback = || pyre_object::gc_roots::shadow_stack_get(sp + 1);
+    let stderr_slot = || has_stderr.then(|| pyre_object::gc_roots::shadow_stack_get(sp + 2));
     // An application that set `sys.stderr = None` disabled the stream, and
     // `PyErr_Display` returns without printing in that case -- ahead of
     // `_PyErr_Display`, so neither renderer runs, which is why the test sits
     // here rather than beside the write below.  Only a missing `sys` or a
     // failing lookup may fall through to the host seam; treating the two alike
     // leaks the render past the configured sink.
-    if let Some(stderr) = stderr
+    if let Some(stderr) = stderr_slot()
         && (stderr.is_null() || unsafe { pyre_object::is_none(stderr) })
     {
         return Ok(w_none());
     }
     // `_PyErr_Display` offers the exception to the stdlib renderer before
     // reaching its own, and that renderer writes to `sys.stderr` itself.
-    if crate::error::display_through_traceback_module(value, traceback) {
+    if crate::error::display_through_traceback_module(value(), traceback()) {
         return Ok(w_none());
     }
     let mut rendered = Vec::new();
-    crate::error::write_exception_from_parts(&mut rendered, value, traceback)
+    crate::error::write_exception_from_parts(&mut rendered, value(), traceback())
         .map_err(|_| crate::PyError::runtime_error("sys.excepthook: failed to write exception"))?;
-    if let Some(stderr) = stderr {
+    if stderr_slot().is_some() {
         // The render is assembled from text the printer already escaped, so it
         // is well-formed WTF-8; a decode failure would mean a byte no writer
         // put there, and the lossy read is the last resort for it.
@@ -4550,7 +4567,12 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
             Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
             None => pyre_object::w_str_new(&String::from_utf8_lossy(&rendered)),
         };
-        let result = crate::baseobjspace::call_method(stderr, "write", &[w_text]);
+        // Read the stream back after that allocation, not before it.
+        let result = crate::baseobjspace::call_method(
+            pyre_object::gc_roots::shadow_stack_get(sp + 2),
+            "write",
+            &[w_text],
+        );
         if result.is_null() {
             let _ = crate::call::take_call_error();
         } else {
@@ -8205,41 +8227,54 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
             args.len().saturating_sub(1)
         )));
     }
-    let w_self = args[0];
-    let w_object = args[1];
-    let w_start = args[2];
-    let w_end = args[3];
-    let w_reason = args[4];
+    // The two `w_int_new` calls below allocate, and the arguments live in a
+    // native slice the gateway copied off the shadow stack, which a collection
+    // does not rewrite.  Publish the receiver and the arguments first, then
+    // read each one back from its slot, as `exc_syntax_error_init` does.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let slot = |n: usize| pyre_object::gc_roots::shadow_stack_get(base + n);
     unsafe {
-        if !crate::baseobjspace::isinstance_str_w(w_object) {
+        if !crate::baseobjspace::isinstance_str_w(slot(1)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 1 must be str, not {}",
-                crate::error::type_name_of(w_object)
+                crate::error::type_name_of(slot(1))
             )));
         }
-        let start = unicode_error_index_w(w_start)?;
-        let end = unicode_error_index_w(w_end)?;
-        if !crate::baseobjspace::isinstance_str_w(w_reason) {
+        let start = unicode_error_index_w(slot(2))?;
+        let end = unicode_error_index_w(slot(3))?;
+        if !crate::baseobjspace::isinstance_str_w(slot(4)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 4 must be str, not {}",
-                crate::error::type_name_of(w_reason)
+                crate::error::type_name_of(slot(4))
             )));
         }
-        let w_start_value = pyre_object::w_int_new(start);
-        let w_end_value = pyre_object::w_int_new(end);
-        pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
-        pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
+        // The second allocation can move the first one's result.
+        let values = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(start));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end));
+        pyre_object::interp_exceptions::w_exception_set_object(slot(0), slot(1));
+        pyre_object::interp_exceptions::w_exception_set_start(
+            slot(0),
+            pyre_object::gc_roots::shadow_stack_get(values),
+        );
+        pyre_object::interp_exceptions::w_exception_set_end(
+            slot(0),
+            pyre_object::gc_roots::shadow_stack_get(values + 1),
+        );
+        pyre_object::interp_exceptions::w_exception_set_reason(slot(0), slot(4));
         // `W_BaseException.descr_init(self, space, [w_object, w_start,
         // w_end, w_reason])` → `self.args_w = args_w`.  The
         // `W_BaseException.args_w` slot already carries the same
         // tuple shape from `__new__`, so we re-stamp it from the
         // bound init args here for parity with PyPy line 444-445.
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            w_object, w_start, w_end, w_reason,
+            slot(1),
+            slot(2),
+            slot(3),
+            slot(4),
         ]);
-        pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(slot(0), args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -8257,31 +8292,32 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             args.len().saturating_sub(1)
         )));
     }
-    let w_self = args[0];
-    let w_encoding = args[1];
-    let w_object_in = args[2];
-    let w_start = args[3];
-    let w_end = args[4];
-    let w_reason = args[5];
+    // The two `w_int_new` calls below allocate, and the arguments live in a
+    // native slice the gateway copied off the shadow stack, which a collection
+    // does not rewrite.  Publish the receiver and the arguments first, then
+    // read each one back from its slot, as `exc_syntax_error_init` does.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let slot = |n: usize| pyre_object::gc_roots::shadow_stack_get(base + n);
     unsafe {
-        if !crate::baseobjspace::isinstance_str_w(w_encoding) {
+        if !crate::baseobjspace::isinstance_str_w(slot(1)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 1 must be str, not {}",
-                crate::error::type_name_of(w_encoding)
+                crate::error::type_name_of(slot(1))
             )));
         }
-        if !crate::baseobjspace::isinstance_bytes_like_w(w_object_in) {
+        if !crate::baseobjspace::isinstance_bytes_like_w(slot(2)) {
             return Err(crate::PyError::type_error(format!(
                 "a bytes-like object is required, not '{}'",
-                crate::error::type_name_of(w_object_in)
+                crate::error::type_name_of(slot(2))
             )));
         }
-        let start = unicode_error_index_w(w_start)?;
-        let end = unicode_error_index_w(w_end)?;
-        if !crate::baseobjspace::isinstance_str_w(w_reason) {
+        let start = unicode_error_index_w(slot(3))?;
+        let end = unicode_error_index_w(slot(4))?;
+        if !crate::baseobjspace::isinstance_str_w(slot(5)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 5 must be str, not {}",
-                crate::error::type_name_of(w_reason)
+                crate::error::type_name_of(slot(5))
             )));
         }
         // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
@@ -8303,39 +8339,43 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         // bytes subclass → `w_bytes_data` (`W_BytesObject` layout);
         // bytearray (exact or subclass) → `w_bytearray_data`
         // (`W_BytearrayObject` layout).
-        let w_object = if pyre_object::is_bytes(w_object_in) {
-            w_object_in
+        // The coerced bytes and the two integers each outlive an allocation
+        // that follows them, so each is published as it is built.
+        let values = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(if pyre_object::is_bytes(slot(2)) {
+            slot(2)
         } else {
             let bytes_type = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE);
             let inherits_bytes = bytes_type
-                .is_some_and(|bt| crate::baseobjspace::isinstance_w(w_object_in, bt.as_ptr()));
+                .is_some_and(|bt| crate::baseobjspace::isinstance_w(slot(2), bt.as_ptr()));
             let data = if inherits_bytes {
-                pyre_object::bytesobject::w_bytes_data(w_object_in)
+                pyre_object::bytesobject::w_bytes_data(slot(2))
             } else {
-                pyre_object::bytearrayobject::w_bytearray_data(w_object_in)
+                pyre_object::bytearrayobject::w_bytearray_data(slot(2))
             };
             pyre_object::w_bytes_from_bytes(data)
-        };
-        let w_start_value = pyre_object::w_int_new(start);
-        let w_end_value = pyre_object::w_int_new(end);
-        pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
-        pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
-        pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
+        });
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(start));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end));
+        let value = |n: usize| pyre_object::gc_roots::shadow_stack_get(values + n);
+        pyre_object::interp_exceptions::w_exception_set_encoding(slot(0), slot(1));
+        pyre_object::interp_exceptions::w_exception_set_object(slot(0), value(0));
+        pyre_object::interp_exceptions::w_exception_set_start(slot(0), value(1));
+        pyre_object::interp_exceptions::w_exception_set_end(slot(0), value(2));
+        pyre_object::interp_exceptions::w_exception_set_reason(slot(0), slot(5));
         // `interp_exceptions.py:1058-1059` — the args list passed to
         // `W_BaseException.descr_init` is the un-coerced
         // `[w_encoding, w_object, w_start, w_end, w_reason]`, so PyPy
         // preserves the original `bytearray` in `e.args[1]` while
         // storing the coerced `bytes` in `e.object`.
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            w_encoding,
-            w_object_in,
-            w_start,
-            w_end,
-            w_reason,
+            slot(1),
+            slot(2),
+            slot(3),
+            slot(4),
+            slot(5),
         ]);
-        pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(slot(0), args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -8351,44 +8391,57 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
             args.len().saturating_sub(1)
         )));
     }
-    let w_self = args[0];
-    let w_encoding = args[1];
-    let w_object = args[2];
-    let w_start = args[3];
-    let w_end = args[4];
-    let w_reason = args[5];
+    // The two `w_int_new` calls below allocate, and the arguments live in a
+    // native slice the gateway copied off the shadow stack, which a collection
+    // does not rewrite.  Publish the receiver and the arguments first, then
+    // read each one back from its slot, as `exc_syntax_error_init` does.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let slot = |n: usize| pyre_object::gc_roots::shadow_stack_get(base + n);
     unsafe {
-        if !crate::baseobjspace::isinstance_str_w(w_encoding) {
+        if !crate::baseobjspace::isinstance_str_w(slot(1)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 1 must be str, not {}",
-                crate::error::type_name_of(w_encoding)
+                crate::error::type_name_of(slot(1))
             )));
         }
-        if !crate::baseobjspace::isinstance_str_w(w_object) {
+        if !crate::baseobjspace::isinstance_str_w(slot(2)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 2 must be str, not {}",
-                crate::error::type_name_of(w_object)
+                crate::error::type_name_of(slot(2))
             )));
         }
-        let start = unicode_error_index_w(w_start)?;
-        let end = unicode_error_index_w(w_end)?;
-        if !crate::baseobjspace::isinstance_str_w(w_reason) {
+        let start = unicode_error_index_w(slot(3))?;
+        let end = unicode_error_index_w(slot(4))?;
+        if !crate::baseobjspace::isinstance_str_w(slot(5)) {
             return Err(crate::PyError::type_error(format!(
                 "argument 5 must be str, not {}",
-                crate::error::type_name_of(w_reason)
+                crate::error::type_name_of(slot(5))
             )));
         }
-        let w_start_value = pyre_object::w_int_new(start);
-        let w_end_value = pyre_object::w_int_new(end);
-        pyre_object::interp_exceptions::w_exception_set_encoding(w_self, w_encoding);
-        pyre_object::interp_exceptions::w_exception_set_object(w_self, w_object);
-        pyre_object::interp_exceptions::w_exception_set_start(w_self, w_start_value);
-        pyre_object::interp_exceptions::w_exception_set_end(w_self, w_end_value);
-        pyre_object::interp_exceptions::w_exception_set_reason(w_self, w_reason);
+        // The second allocation can move the first one's result.
+        let values = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(start));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end));
+        pyre_object::interp_exceptions::w_exception_set_encoding(slot(0), slot(1));
+        pyre_object::interp_exceptions::w_exception_set_object(slot(0), slot(2));
+        pyre_object::interp_exceptions::w_exception_set_start(
+            slot(0),
+            pyre_object::gc_roots::shadow_stack_get(values),
+        );
+        pyre_object::interp_exceptions::w_exception_set_end(
+            slot(0),
+            pyre_object::gc_roots::shadow_stack_get(values + 1),
+        );
+        pyre_object::interp_exceptions::w_exception_set_reason(slot(0), slot(5));
         let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
-            w_encoding, w_object, w_start, w_end, w_reason,
+            slot(1),
+            slot(2),
+            slot(3),
+            slot(4),
+            slot(5),
         ]);
-        pyre_object::interp_exceptions::w_exception_set_args(w_self, args_list);
+        pyre_object::interp_exceptions::w_exception_set_args(slot(0), args_list);
     }
     Ok(pyre_object::w_none())
 }
@@ -11913,7 +11966,7 @@ pub fn compile_err_to_syntax_error(
     e: crate::compile::CompileError,
     source: &str,
 ) -> crate::PyError {
-    compile_err_to_syntax_error_maybe_incomplete(e, source, false)
+    compile_err_to_syntax_error_maybe_incomplete(e, source, None)
 }
 
 /// Convert Ruff/RustPython's one-based UTF-8 byte column to the one-based
@@ -12777,10 +12830,15 @@ fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
 /// `PyCF_ALLOW_INCOMPLETE_INPUT` is set.  PyPy's compiler has the same
 /// parser-level distinction through its `compile_command` path; pyre consumes
 /// RustPython's parser, so keep its exact error-shape classification here.
+///
+/// `allow_incomplete` carries the mode the flag was passed with, because
+/// `PyPARSE_ALLOW_INCOMPLETE_INPUT` is read by the parser that the mode
+/// selects and the three parsers do not stop at the same place.  `None` is the
+/// flag left off, where every failure is an ordinary `SyntaxError`.
 fn compile_err_to_syntax_error_maybe_incomplete(
     e: crate::compile::CompileError,
     source: &str,
-    allow_incomplete: bool,
+    allow_incomplete: Option<crate::compile::Mode>,
 ) -> crate::PyError {
     // Every location in `e` indexes the source the compiler was handed, which
     // `compile_source_with_opts` had already run through `universal_newline`.
@@ -12847,12 +12905,16 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         })
     }
 
-    let incomplete = if !allow_incomplete {
-        false
-    } else if holds_no_statement(source) {
-        true
-    } else {
-        match &e {
+    let incomplete = match allow_incomplete {
+        None => false,
+        // A source holding no statement is unfinished for whichever parser
+        // wanted one, so the mode does not enter here.
+        Some(_) if holds_no_statement(source) => true,
+        // `eval` parses one expression and reaches its own end-of-input error
+        // ahead of the flag: a source that stops mid-expression is reported as
+        // the syntax error it is, whatever the flag asks for.
+        Some(crate::compile::Mode::Eval) => false,
+        Some(mode) => match &e {
             crate::compile::CompileError::Parse(error) => match &error.error {
                 ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
                 _ if error.is_unclosed_bracket => true,
@@ -12861,7 +12923,15 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                 )) => true,
                 ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
                     let loc = error.raw_location.start().to_usize();
-                    opens_triple_quote(source, loc) || string_continues_to_eof(source, loc)
+                    // A triple-quoted literal left open wants more input under
+                    // either parser.  A single-quoted one still open at the end
+                    // of the source is unfinished only for the interactive
+                    // parser, which has another line to read; a block parser
+                    // holds all the input there is and reports the literal as
+                    // unterminated.
+                    opens_triple_quote(source, loc)
+                        || (matches!(mode, crate::compile::Mode::Single)
+                            && string_continues_to_eof(source, loc))
                 }
                 ParseErrorType::OtherError(message)
                     if message.starts_with("Expected an indented block after")
@@ -12912,7 +12982,15 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                     if message.starts_with("unterminated string literal") =>
                 {
                     let loc = error.raw_location.start().to_usize();
-                    opens_triple_quote(source, loc) || string_continues_to_eof(source, loc)
+                    // A triple-quoted literal left open wants more input under
+                    // either parser.  A single-quoted one still open at the end
+                    // of the source is unfinished only for the interactive
+                    // parser, which has another line to read; a block parser
+                    // holds all the input there is and reports the literal as
+                    // unterminated.
+                    opens_triple_quote(source, loc)
+                        || (matches!(mode, crate::compile::Mode::Single)
+                            && string_continues_to_eof(source, loc))
                 }
                 // A closing bracket with no opener, or one that does not
                 // match the opener, is wrong where it stands rather than short
@@ -12931,7 +13009,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                 _ => false,
             },
             _ => false,
-        }
+        },
     };
 
     // `syntax_error_subclass` can supply a replacement message, so it
@@ -13826,7 +13904,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                     crate::compile::compile_source_with_opts(text, mode, &filename, retry_opts)
             {
                 return replace_compile_syntax_error_filename(
-                    compile_err_to_syntax_error_maybe_incomplete(structured, text, true),
+                    compile_err_to_syntax_error_maybe_incomplete(structured, text, Some(mode)),
                     &filename,
                     filename_bytes.as_deref(),
                 );
@@ -13842,7 +13920,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             compile_err_to_syntax_error_maybe_incomplete(
                 e,
                 source,
-                flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
+                (flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0).then_some(mode),
             )
         })
     } else {

@@ -3150,9 +3150,10 @@ fn render_exc_object_wtf8(exc: PyObjectRef) -> Wtf8Buf {
     render_rooted_exc_object_wtf8(exc_slot)
 }
 
-const MAX_SUGGESTION_CANDIDATES: usize = 750;
+pub(crate) const MAX_SUGGESTION_CANDIDATES: usize = 750;
 const MAX_SUGGESTION_STRING_SIZE: usize = 40;
 const SUGGESTION_MOVE_COST: usize = 2;
+const SUGGESTION_CASE_COST: usize = 1;
 
 fn dict_string_keys(dict: PyObjectRef, names: &mut Vec<String>) {
     if dict.is_null() || !unsafe { pyre_object::is_dict(dict) } {
@@ -3171,18 +3172,24 @@ fn dict_string_keys(dict: PyObjectRef, names: &mut Vec<String>) {
 }
 
 fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
-    let mut a: Vec<char> = a.chars().collect();
-    let mut b: Vec<char> = b.chars().collect();
+    // `levenshtein_distance` reads each name through `PyUnicode_AsUTF8AndSize`
+    // and indexes the buffer it gets, so every length and every position here
+    // is a UTF-8 byte.  Measuring code points instead moves the ratio cutoff
+    // and the distance itself for any name outside ASCII, which is a different
+    // ranking rather than the same one in other units.
+    let mut a: &[u8] = a.as_bytes();
+    let mut b: &[u8] = b.as_bytes();
     if a == b {
         return 0;
     }
+    // Trim away common affixes.
     while a.first() == b.first() && !a.is_empty() {
-        a.remove(0);
-        b.remove(0);
+        a = &a[1..];
+        b = &b[1..];
     }
     while a.last() == b.last() && !a.is_empty() {
-        a.pop();
-        b.pop();
+        a = &a[..a.len() - 1];
+        b = &b[..b.len() - 1];
     }
     if a.is_empty() || b.is_empty() {
         return SUGGESTION_MOVE_COST * (a.len() + b.len());
@@ -3200,17 +3207,19 @@ fn suggestion_distance(a: &str, b: &str, max_cost: usize) -> usize {
         .map(|index| index * SUGGESTION_MOVE_COST)
         .collect();
     let mut result = 0;
-    for (bindex, bchar) in b.iter().enumerate() {
+    for (bindex, bbyte) in b.iter().enumerate() {
         let mut distance = bindex * SUGGESTION_MOVE_COST;
         result = distance;
         let mut minimum = usize::MAX;
-        for (index, achar) in a.iter().enumerate() {
-            let case_equal = achar.to_lowercase().eq(bchar.to_lowercase());
+        for (index, abyte) in a.iter().enumerate() {
+            // `_substitution_cost` folds case over ASCII alone, so a pair that
+            // differs only outside that range costs a full move.
+            let case_equal = abyte.eq_ignore_ascii_case(bbyte);
             let substitute = distance
-                + if achar == bchar {
+                + if abyte == bbyte {
                     0
                 } else if case_equal {
-                    1
+                    SUGGESTION_CASE_COST
                 } else {
                     SUGGESTION_MOVE_COST
                 };
@@ -3230,7 +3239,9 @@ pub(crate) fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option
     if candidates.len() >= MAX_SUGGESTION_CANDIDATES {
         return None;
     }
-    let wrong_len = wrong_name.chars().count();
+    // The ratio cutoff below is `_Py_CalculateSuggestions`', which sizes each
+    // name by the UTF-8 buffer `PyUnicode_AsUTF8AndSize` returned for it.
+    let wrong_len = wrong_name.len();
     // No candidate has been measured yet, so nothing caps the first one but
     // its own ratio test below.  A name longer than `MAX_SUGGESTION_STRING_SIZE`
     // is not rejected here: `suggestion_distance` applies that limit to what is
@@ -3242,7 +3253,7 @@ pub(crate) fn best_suggestion(candidates: &[String], wrong_name: &str) -> Option
         if candidate == wrong_name {
             continue;
         }
-        let candidate_len = candidate.chars().count();
+        let candidate_len = candidate.len();
         // No more than 1/3 of the involved characters should need changed.
         let mut max_distance = (candidate_len + wrong_len + 3) * SUGGESTION_MOVE_COST / 6;
         // Don't take matches we've already beaten.
@@ -3934,6 +3945,84 @@ pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
     }
 }
 
+/// `display_exception`'s `stderr = sys.stderr` — the banner lines its failure
+/// arm prints go to the stream the application configured, not to the host seam
+/// beneath it.  A stream set to `None` disables the report the way
+/// `PyErr_Display` does; only a missing `sys` or a failing lookup falls through
+/// to the seam, because treating the two alike leaks the write past a
+/// configured sink.
+pub(crate) fn emit_report_to_sys_stderr(buf: &[u8]) {
+    let stream = crate::importing::get_sys_module("sys")
+        .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
+    let Some(stream) = stream else {
+        emit_report_to_host_stderr(buf);
+        return;
+    };
+    if stream.is_null() || unsafe { pyre_object::is_none(stream) } {
+        return;
+    }
+    // The write runs Python, so the stream is published and read back from its
+    // slot: a Rust local would still name the address it had before the
+    // allocation below moved the object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(stream);
+    // Every caller passes a literal this file holds, so the bytes are
+    // well-formed WTF-8; the lossy read is the last resort for a byte no writer
+    // put there.
+    let w_text = match rustpython_wtf8::Wtf8::from_bytes(buf) {
+        Some(text) => pyre_object::w_str_from_wtf8(text.to_wtf8_buf()),
+        None => pyre_object::w_str_new(&String::from_utf8_lossy(buf)),
+    };
+    // Read the stream back after that allocation, not before it.
+    let result = crate::baseobjspace::call_method(
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        "write",
+        &[w_text],
+    );
+    if result.is_null() {
+        let _ = crate::call::take_call_error();
+        emit_report_to_host_stderr(buf);
+    }
+}
+
+/// `originalexcepthook` for an exception a Rust caller holds: `sys.excepthook`'s
+/// default is the renderer that reaches the live `sys.stderr`, and
+/// `display_exception` hands it each report its failure arm prints.  A hook that
+/// cannot render leaves the host seam as the last sink, which is where a report
+/// with nowhere else to go belongs.
+fn report_through_default_excepthook(failure: &mut PyError) {
+    let exc = failure.to_exc_object();
+    if exc.is_null() {
+        eprint_exception(failure, true);
+        return;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let w_type = crate::baseobjspace::exception_getclass(exc);
+    let _ = pyre_object::gc_roots::pin_root(if w_type.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_type
+    });
+    let w_tb = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc) };
+    unsafe { crate::pytraceback::mark_traceback_escaped(w_tb) };
+    let _ = pyre_object::gc_roots::pin_root(if w_tb.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_tb
+    });
+    let reported = crate::builtins::sys_excepthook(&[
+        pyre_object::gc_roots::shadow_stack_get(sp + 1),
+        pyre_object::gc_roots::shadow_stack_get(sp),
+        pyre_object::gc_roots::shadow_stack_get(sp + 2),
+    ]);
+    if reported.is_err() {
+        eprint_exception(failure, true);
+    }
+}
+
 /// `pythonrun.c _PyErr_Print` for a caller holding the exception rather than
 /// the thread's indicator: every top-level run reports through `sys.excepthook`,
 /// so an application's own hook is what reports the failure it was installed
@@ -3943,24 +4032,16 @@ pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
 ///
 /// `false` says there was no hook to reach, which is `_PyErr_PrintEx`'s
 /// `sys.excepthook is missing` arm, and the caller prints the exception itself.
-/// A hook that runs and fails has still reported: its own failure is named as
-/// unraisable, exactly as upstream does, and this answers `true` rather than
-/// printing the exception a second time.
+/// A hook that runs and fails is reported here instead: the failure and the
+/// original both go through the default hook, which is `display_exception`'s
+/// `originalexcepthook`, so this answers `true` and the caller prints nothing.
 pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
     let Some(sys) = crate::importing::get_sys_module("sys") else {
         return false;
     };
-    // A missing name is a hook that is not there; `None` is a hook that is,
-    // and calling it is what reports it.
-    let Ok(hook) = crate::baseobjspace::getattr_str(sys, "excepthook") else {
-        return false;
-    };
-    if hook.is_null() {
-        return false;
-    }
     let _roots = pyre_object::gc_roots::push_roots();
-    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(hook);
+    let sys_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(sys);
     // Materialising the instance is what gives the hook something to report;
     // the `PyError`'s own fields are raw and this collector does not scan them,
     // so each of the three arguments is pinned as it is taken.
@@ -3985,6 +4066,41 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
     } else {
         w_tb
     });
+    // `app_main.py display_exception` sets the sys.last_xxx attributes before
+    // it resolves the hook, so a hook that inspects them -- a post-mortem
+    // debugger is the reason they exist -- finds the exception it was handed.
+    // `last_exc` names the exception itself and the three beside it are the
+    // triple that predates it, as `PyErr_PrintEx` stores them.  A store that
+    // fails leaves that one name alone.
+    for (name, slot) in [
+        ("last_exc", exc_slot),
+        ("last_type", type_slot),
+        ("last_value", exc_slot),
+        ("last_traceback", tb_slot),
+    ] {
+        let stored = crate::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(sys_slot),
+            name,
+            pyre_object::gc_roots::shadow_stack_get(slot),
+        );
+        drop(stored);
+    }
+    // `display_exception` resolves the hook only once those stores are in
+    // place, so a `sys` whose attribute lookup runs Python -- a module class
+    // with its own `__getattribute__` -- reads the names already written.
+    // A missing name is a hook that is not there; `None` is a hook that is,
+    // and calling it is what reports it.
+    let Ok(hook) = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sys_slot),
+        "excepthook",
+    ) else {
+        return false;
+    };
+    if hook.is_null() {
+        return false;
+    }
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(hook);
     let arguments = [
         pyre_object::gc_roots::shadow_stack_get(type_slot),
         pyre_object::gc_roots::shadow_stack_get(exc_slot),
@@ -3995,11 +4111,28 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         &arguments,
     );
     if let Err(mut failure) = reported {
-        failure.write_unraisable(
-            pyre_object::w_none(),
-            rustpython_wtf8::Wtf8::new("Exception ignored in sys.excepthook"),
-            pyre_object::gc_roots::shadow_stack_get(hook_slot),
-        );
+        // `display_exception`'s `except BaseException` arm: the hook is named
+        // as the thing that failed and its own report follows, both on the live
+        // `sys.stderr` the arm reads -- an application that replaced the stream
+        // is where its diagnostics belong, and the host seam beneath it would
+        // miss a capture buffer entirely.
+        emit_report_to_sys_stderr(b"Error calling sys.excepthook:\n");
+        report_through_default_excepthook(&mut failure);
+        emit_report_to_sys_stderr(b"\nOriginal exception was:\n");
+        // The arm falls out of the `try` into `originalexcepthook(etype,
+        // evalue, etraceback)`, so the original is reported from here onto that
+        // same stream.  Leaving it to the caller would split one report across
+        // two sinks, because the caller's printer writes to the seam.
+        if crate::builtins::sys_excepthook(&[
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            pyre_object::gc_roots::shadow_stack_get(tb_slot),
+        ])
+        .is_err()
+        {
+            eprint_exception(err, true);
+        }
+        return true;
     }
     true
 }

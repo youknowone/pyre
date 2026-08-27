@@ -939,14 +939,18 @@ fn decode_with_name(
     fname: &str,
     encoding: &str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if !unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
-        return Err(bad_buffer_arg(w_obj));
-    }
+    // `make_decoder_wrapper`: decode a bytes buffer and return
+    // `(unicode, bytes_consumed)`.  The input is unwrapped with `bufferstr`,
+    // which reads any buffer -- a `memoryview` included -- and the decoding
+    // itself then runs on the `newbytes` built from what it read.
+    let data = decode_input_bytes(w_obj)?;
     let errors = codec_errors_arg(fname, 2, errors)?;
-    // PyPy `make_decoder_wrapper`: decode a bytes buffer and return
-    // `(unicode, bytes_consumed)`.
-    let consumed = unsafe { pyre_object::bytesobject::bytes_like_data(w_obj).len() };
-    let decode_method = crate::baseobjspace::getattr_str(w_obj, "decode")?;
+    let consumed = data.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_bytes_from_bytes(&data));
+    let decode_method =
+        crate::baseobjspace::getattr_str(pyre_object::gc_roots::shadow_stack_get(sp), "decode")?;
     let decoded = crate::call::call_function_impl_result(
         decode_method,
         &[w_str_new(encoding), w_str_new(&errors)],
@@ -957,8 +961,19 @@ fn decode_with_name(
 /// Acquire the read-only bytes of a decoder input, reporting a decode-context
 /// TypeError (rather than the file-write helper's own wording) when the object
 /// is not a bytes-like buffer.
+///
+/// Only that one wording is replaced.  A buffer the decoder may not read --
+/// a strided `memoryview`, which `bufferstr` refuses because the bytes it
+/// would decode are not the ones the object exposes -- has already said so
+/// with the error the acquisition raised, and reporting it as a wrong argument
+/// type instead names the wrong thing.
 fn decode_input_bytes(w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    unsafe { crate::builtins::file_write_buffer_bytes(w_obj) }.map_err(|_| bad_buffer_arg(w_obj))
+    unsafe { crate::builtins::file_write_buffer_bytes(w_obj) }.map_err(|e| {
+        match e.kind == crate::PyErrorKind::TypeError {
+            true => bad_buffer_arg(w_obj),
+            false => e,
+        }
+    })
 }
 
 /// PyPy `interp_codecs.utf_{16,32}_ex_decode`: the three-value entry point
@@ -1084,8 +1099,11 @@ fn charmap_output(
         }
         Err(e) => return Err(e),
     };
-    if unsafe { pyre_object::bytesobject::is_bytes_like(w_ch) } {
-        out.extend_from_slice(unsafe { pyre_object::bytesobject::bytes_like_data(w_ch) });
+    // `Charmap_Encode.get` tests the table's value with `w_bytes`, so a
+    // `bytearray` falls through to the type error below with everything else
+    // the table is not allowed to give.
+    if unsafe { pyre_object::is_bytes(w_ch) } {
+        out.extend_from_slice(unsafe { pyre_object::bytesobject::w_bytes_data(w_ch) });
         Ok(true)
     } else if unsafe { pyre_object::is_int(w_ch) } {
         let x = unsafe { pyre_object::w_int_get_value(w_ch) };
@@ -1888,19 +1906,14 @@ fn invalid_escape_warning(prefix: &str, sequence: &str, octal: bool) -> String {
 }
 
 /// Acquire a backslash-escape decoder's input.  A `str` answers with its own
-/// bytes and any buffer producer with the bytes it exposes, which is what lets
-/// a `memoryview` -- including a sliced one, whose bytes are not contiguous
-/// with the object it was taken from -- reach the decoder.
+/// bytes; everything else is unwrapped the way the rest of the decoders in
+/// this module unwrap theirs, so the accepted buffer shapes are the same set
+/// and a strided `memoryview` is refused here as it is there.
 fn escape_decoder_input(w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    if unsafe { pyre_object::bytesobject::is_bytes_like(w_obj) } {
-        Ok(unsafe { pyre_object::bytesobject::bytes_like_data(w_obj) }.to_vec())
-    } else if unsafe { is_str(w_obj) } {
-        Ok(unsafe { w_str_get_wtf8(w_obj) }.as_bytes().to_vec())
-    } else if let Some(src) = crate::typedef::buffer_as_bytes_like(w_obj)? {
-        Ok(unsafe { pyre_object::bytesobject::bytes_like_data(src) }.to_vec())
-    } else {
-        Err(bad_buffer_arg(w_obj))
+    if unsafe { is_str(w_obj) } {
+        return Ok(unsafe { w_str_get_wtf8(w_obj) }.as_bytes().to_vec());
     }
+    decode_input_bytes(w_obj)
 }
 
 fn unicode_escape_decode_impl(

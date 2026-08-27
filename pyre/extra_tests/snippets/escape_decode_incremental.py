@@ -160,4 +160,17 @@ for tail, reason, start, end in SPANS:
     else:
         raise AssertionError("no UnicodeDecodeError for %r" % data)
 
+# The decoders take the same buffer shapes as the rest of the codec entry
+# points: a contiguous view is read, and one whose bytes are strided is not the
+# sequence the object exposes, so acquiring it fails.
+assert codecs.unicode_escape_decode(memoryview(b"ab")) == ("ab", 2)
+assert codecs.raw_unicode_escape_decode(memoryview(b"ab")) == ("ab", 2)
+for decode in (codecs.unicode_escape_decode, codecs.raw_unicode_escape_decode):
+    try:
+        decode(memoryview(b"abcdef")[::2])
+    except BufferError as error:
+        assert "contiguous" in str(error), str(error)
+    else:
+        raise AssertionError("a strided view should not be readable")
+
 print("OK")

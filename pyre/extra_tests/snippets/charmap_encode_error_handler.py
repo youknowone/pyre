@@ -108,3 +108,30 @@ except ValueError as error:
     assert str(error) == "boom", str(error)
 else:
     raise AssertionError("the mapping's own error should have propagated")
+
+# The table's value is read with `bytes`: an integer, a `bytes` and `None` are
+# what a mapping may return, and a `bytearray` is none of the three.
+try:
+    codecs.charmap_encode("a", "strict", {97: bytearray(b"x")})
+except TypeError as error:
+    assert "integer, bytes or None" in str(error), str(error)
+else:
+    raise AssertionError("a bytearray table value should be a TypeError")
+
+assert codecs.charmap_encode("a", "strict", {97: b"x"}) == (b"x", 1)
+assert codecs.charmap_encode("a", "strict", {97: 120}) == (b"x", 1)
+
+# The encode leg reads a handler position the way the decode leg does, and
+# refuses an unrepresentable one in the same two shapes.
+def overflowing(exc):
+    return ("?", 10**100)
+
+codecs.register_error("pyre.charmap.encode.overflow", overflowing)
+try:
+    codecs.charmap_encode("ሴ", "pyre.charmap.encode.overflow", {})
+except OverflowError:
+    pass
+except IndexError as error:
+    assert "position -1" in str(error), str(error)
+else:
+    raise AssertionError("an unrepresentable position should be out of bounds")
