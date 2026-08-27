@@ -5052,7 +5052,11 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
     let len = old.len();
     let mut hashes = Vec::with_capacity(len);
     let pairs_base = dict_slot + 1;
-    for i in 0..len {
+    // A slot is not a position: a deleted entry leaves a tombstone the walk
+    // steps over (`rordereddict.py:1373`).  `len` still counts the live pairs,
+    // which is exactly how many the loop publishes.
+    let mut next = 0;
+    while let Some(i) = old.next_valid_slot(next) {
         let k = *old.get_slot(i).unwrap().0;
         let w_key = crate::w_int_new(k);
         let object_key = object_key_for(w_key);
@@ -5061,6 +5065,7 @@ pub unsafe fn w_dict_switch_int_to_object_strategy(w_dict: PyObjectRef) {
         let v = *old.get_slot(i).unwrap().1;
         hashes.push(object_key.hash);
         roots.publish(&[object_key.obj, v]);
+        next = i + 1;
     }
     // The empty box is allocated before the fill so the last collection point
     // is behind the pairs being copied out of their slots.
@@ -5230,12 +5235,15 @@ pub unsafe fn w_dict_switch_bytes_to_object_strategy(w_dict: PyObjectRef) {
     let len = old.len();
     let mut hashes = Vec::with_capacity(len);
     let pairs_base = dict_slot + 1;
-    for i in 0..len {
+    // A slot is not a position, as in [`w_dict_switch_int_to_object_strategy`].
+    let mut next = 0;
+    while let Some(i) = old.next_valid_slot(next) {
         let w_key = crate::w_bytes_from_bytes(old.get_slot(i).unwrap().0.as_slice());
         let object_key = object_key_for(w_key);
         let v = *old.get_slot(i).unwrap().1;
         hashes.push(object_key.hash);
         roots.publish(&[object_key.obj, v]);
+        next = i + 1;
     }
     let new_storage = crate::gc_storage::gc_alloc_storage_box(
         object_dict_storage_with_capacity(len),

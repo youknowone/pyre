@@ -89,14 +89,20 @@ pub struct RDict<K, V, S = RandomState> {
     /// `d.resize_counter`.  Signed because upstream tests `rc <= 0` after
     /// subtracting (rordereddict.py:684).
     resize_counter: isize,
-    /// Bumped whenever a compaction or a reindex moves entries.
+    /// Bumped whenever the entries buffer is replaced or its contents move: a
+    /// reindex, a compaction, a `clear`, or a growth that reallocates.
     ///
-    /// Not upstream's: `d.paranoia` compares `entries != d.entries`, an
-    /// identity test on a GC pointer that a `Vec` reallocating in place does
-    /// not offer.  It is read by the *caller* — `scan_dict_key_reentrant`,
-    /// which re-derives this dict from the dict object between steps and so
-    /// can trust what it reads — to notice that a slot number it is holding
-    /// went stale.  See [`Self::lookup`] for why the check cannot live here.
+    /// Stands in for the first two clauses of `d.paranoia`, `entries !=
+    /// d.entries or indexes != d.indexes` (rordereddict.py:1058-1060) — an
+    /// identity test on two GC pointers that a `Vec` does not offer directly.
+    /// !! A growth counts: `ll_dict_grow` hands `d.entries` a **new** array
+    /// (`_overallocate_entries_len`, 745), so a probe holding a slot number
+    /// across a comparison that merely *inserted* has to see the change.
+    ///
+    /// It is read by the *caller* — `scan_dict_key_reentrant` and setobject's
+    /// three scans, which re-derive this table from the container object
+    /// between steps and so can trust what they read.  See [`Self::lookup`]
+    /// for why the check cannot live here.
     generation: u32,
     hash_builder: S,
 }
@@ -550,7 +556,20 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
             }
         }
         self.resize_counter = rc;
+        // `ll_dict_grow` replaces `d.entries` outright when the array is full,
+        // so a growth here is the same event `entries != d.entries` reports.
+        //
+        // !! Read the *capacity*, not the data pointer: a `Vec` growth goes
+        // through `realloc`, and an allocator that extends the block in place
+        // hands back the address it already had — measured, this passed on
+        // dynasm and cranelift and left wasm answering a mutating `__eq__`
+        // without its restart.  Capacity changes on every growth whatever the
+        // allocator does.
+        let entries_capacity = self.entries.capacity();
         self.entries.push(Some(Entry { hash, key, value }));
+        if self.entries.capacity() != entries_capacity {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.num_live_items += 1;
     }
 
@@ -690,7 +709,11 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
     }
 
     pub fn reserve(&mut self, additional: usize) {
+        let entries_capacity = self.entries.capacity();
         self.entries.reserve(additional);
+        if self.entries.capacity() != entries_capacity {
+            self.generation = self.generation.wrapping_add(1);
+        }
         let want = (self.num_live_items + additional) * 2;
         let mut new_size = DICT_INITSIZE;
         while new_size <= want {
@@ -1153,6 +1176,26 @@ mod tests {
             *v = 99;
         }
         assert_eq!(d.get(&5), Some(&99));
+    }
+
+    /// `entries != d.entries` (rordereddict.py:1058) fires for a *growth*, not
+    /// only for a compaction: `ll_dict_grow` hands `d.entries` a new array, and
+    /// a probe holding a slot number across a comparison that merely inserted
+    /// has to notice.  Missing this answered a mutating `__eq__` without the
+    /// restart it is owed.
+    #[test]
+    fn a_growth_that_reallocates_bumps_the_generation() {
+        let mut d: RDict<u64, u64> = RDict::new();
+        let mut growths = 0;
+        for i in 0..64u64 {
+            let (capacity, generation) = (d.entries.capacity(), d.generation);
+            d.insert(i, i);
+            if d.entries.capacity() != capacity {
+                growths += 1;
+                assert_ne!(d.generation, generation, "grew at insert {i}");
+            }
+        }
+        assert!(growths >= 2, "the entries buffer never grew");
     }
 
     #[test]
