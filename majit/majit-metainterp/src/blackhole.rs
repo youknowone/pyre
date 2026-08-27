@@ -318,8 +318,9 @@ pub struct BlackholeInterpreter {
     /// `acquire_interp` the same way `descrs` is (blackhole.py).  Set it
     /// via [`BlackholeInterpBuilder::setup_jitdrivers_sd`] before acquiring,
     /// not on individual frames.  `Arc<[_]>` rather than `Vec`: upstream's
-    /// back-reference costs nothing to hand on, and every `acquire_interp`
-    /// and `for_inline_callee` hands it on.
+    /// back-reference costs nothing to hand on, and both routes that give a
+    /// frame its context — `acquire_interp` and [`Self::clone_context_from`]
+    /// — hand it on.
     pub jitdrivers_sd: std::sync::Arc<[BhJitDriverSd]>,
     /// Pyre: absolute start index of the operand stack in
     /// PyFrame.locals_cells_stack_w. RPython does not need this because
@@ -331,9 +332,10 @@ pub struct BlackholeInterpreter {
     /// handler lookup is one indirect call (`self.dispatch_table[opcode]`)
     /// without going back to the builder.
     ///
-    /// `Default::default()` and `for_inline_callee` start with an empty
-    /// table; the builder owns the wired table and propagates an `Arc`
-    /// clone via `acquire_interp`.
+    /// `Default::default()` starts with an empty table; the builder owns the
+    /// wired table and propagates an `Arc` clone via `acquire_interp`, and a
+    /// nested inline callee gets the parent's through
+    /// [`Self::clone_context_from`].
     pub(crate) dispatch_table: std::sync::Arc<Vec<BhOpcodeHandler>>,
     /// Callee interpreter kept for the next `BC_INLINE_CALL` made from this
     /// frame, so a recursive descent pays for its frames once instead of once
@@ -343,16 +345,27 @@ pub struct BlackholeInterpreter {
     /// byte-interprets sub-jitcodes, so it needs a frame; this makes that
     /// frame as close to free as upstream's absence of one.  Handed back by
     /// `handler_inline_call_nested_ext` through
-    /// [`Self::reset_for_inline_reuse`], which restores it to exactly the
-    /// state `Default::default()` would have produced, so a reused frame and
-    /// a fresh one are indistinguishable to the sub-jitcode.
+    /// [`Self::reset_for_inline_reuse`].
+    ///
+    /// That reset does NOT restore `Default::default()`, and reading it as if
+    /// it did is how `state_field_layout` came to be missing from
+    /// [`Self::clone_context_from`].  `position` / `last_opcode_position` /
+    /// `entry_position` / `jitcode` survive it and are overwritten by the
+    /// [`Self::setposition`] the take path always runs; `dispatch_table` and
+    /// the vable fields survive it and are overwritten by
+    /// [`Self::clone_context_from`]; `inline_callee_scratch` survives it on
+    /// purpose, which is what makes a grandchild frame free too.  A reused
+    /// frame is indistinguishable from a fresh one because those THREE steps
+    /// together cover every field, not because any one of them does.
     pub(crate) inline_callee_scratch: Option<Box<BlackholeInterpreter>>,
     /// State-field JIT register layout (`StateFieldLayout`).  Set on the
     /// root resume frame from `JitState::state_field_layout` so the
     /// `state_field` handlers can map a logical field/array index to the
     /// flat register slot the resume reader seeded.  Empty (no scalars /
-    /// arrays) for pyre frames and inline callees, which never dispatch
-    /// `state_field` opcodes.
+    /// arrays) for pyre frames, which never dispatch `state_field` opcodes.
+    /// An inline callee inherits the caller's, because a `split_dispatch`
+    /// sub-jitcode dispatches the SAME machine's state fields — see
+    /// [`Self::clone_context_from`], which used to leave it blanked.
     pub state_field_layout: StateFieldLayout,
 }
 
@@ -433,8 +446,9 @@ thread_local! {
 impl Default for BlackholeInterpreter {
     /// Sentinel-value interpreter used by
     /// `BlackholeInterpBuilder::acquire_interp`'s `unwrap_or_default()`
-    /// and by `for_inline_callee` as the receiver for
-    /// `clone_context_from`.  The 6 builder-shared fields stay at
+    /// and by `handler_inline_call_nested_ext` as the receiver for
+    /// `clone_context_from` when this frame has no
+    /// `inline_callee_scratch` to reuse yet.  The 6 builder-shared fields stay at
     /// `u8::MAX` / empty until either `acquire_interp` populates them
     /// (RPython `blackhole.py:284-289` parity) or
     /// `clone_context_from(parent)` copies them from a parent
@@ -655,6 +669,20 @@ impl BlackholeInterpreter {
         self.jitdrivers_sd = std::sync::Arc::clone(&parent.jitdrivers_sd);
         self.virtualizable_stack_base = parent.virtualizable_stack_base;
         self.record_caught_exception = parent.record_caught_exception;
+        // `state_field_layout` belongs to the same group and was missing from
+        // it. A sub-jitcode's `load_state_field` reads
+        // `state_field_layout.scalar_slot(field_idx)`, and the reused callee
+        // frame arrives with the layout `reset_for_inline_reuse` blanked, so
+        // without this line the slot resolves through an all-zero default:
+        // `int_scalar_base + field_idx` = `0 + field_idx`, which addresses the
+        // sub-jitcode's own ARGUMENT registers. The range check that would
+        // have caught it is on the layout, not here, and it is an `assert!`
+        // only since this line was written.
+        //
+        // The layout describes the machine, not the frame — a sub-jitcode
+        // dispatches the same state fields the portal does — so the parent's
+        // is the right one, exactly as for the vable handles above.
+        self.state_field_layout = parent.state_field_layout.clone();
     }
 
     /// blackhole.py setposition
@@ -4472,7 +4500,8 @@ mod tests {
         /// The chain here is `inner -> caller`.  `inner` carries the
         /// portal `jitdriver_sd` and inline-calls a sub-jitcode whose
         /// `jit_merge_point` is bottommost (the callee interpreter
-        /// `for_inline_callee` builds has no `nextblackholeinterp`), so
+        /// `handler_inline_call_nested_ext` seats has no
+        /// `nextblackholeinterp`), so
         /// the `ContinueRunningNormally` reaches `_run_forever` from a
         /// frame that DOES have a caller — the recursive-portal arm.
         /// Re-entering `inner` instead would run its tail a second time
@@ -5081,9 +5110,9 @@ mod tests {
         /// `if callee.aborted { bh.aborted = true; LeaveFrame }` arm.
         /// `bhimpl_abort_permanent` sets aborted
         /// and returns LeaveFrame when no `BH_LAST_EXC_VALUE` is pending,
-        /// which is the case for a clean callee spawned via
-        /// `BlackholeInterpreter::for_inline_callee(parent)` (TLS reset
-        /// between tests via thread isolation).
+        /// which is the case for a clean callee seated by
+        /// `handler_inline_call_nested_ext` (`clone_context_from` +
+        /// `setposition`) (TLS reset between tests via thread isolation).
         #[test]
         fn test_bh_interp_inline_call_abort_permanent_in_sub_propagates() {
             let mut sub = JitCodeBuilder::default();
@@ -6131,9 +6160,17 @@ impl StateFieldLayout {
     /// Flat slot of scalar `field_idx` (scalars occupy
     /// `[int_scalar_base..int_scalar_base + num_scalars]`).
     pub fn scalar_slot(&self, field_idx: usize) -> usize {
-        debug_assert!(
+        // `assert!`, not `debug_assert!`. With the all-zero default layout
+        // every index is out of range and `int_scalar_base + field_idx` is
+        // `0 + field_idx`, which addresses the dispatch JitCode's own
+        // ARGUMENT registers — a wrong VALUE, in release, with nothing said.
+        // That is how a missing `state_field_layout` in
+        // `clone_context_from` stayed invisible.
+        assert!(
             field_idx < self.num_scalars,
-            "scalar field_idx {field_idx} out of range (num_scalars={})",
+            "scalar field_idx {field_idx} out of range (num_scalars={}); an \
+             empty layout here means the frame was never given the machine's \
+             `state_field_layout`",
             self.num_scalars
         );
         self.int_scalar_base + field_idx
@@ -6145,9 +6182,10 @@ impl StateFieldLayout {
     /// registers) in the same order the resume reader seeds the ref
     /// fail-args.
     pub fn ref_scalar_slot(&self, field_idx: usize) -> usize {
-        debug_assert!(
+        assert!(
             field_idx < self.num_ref_scalars,
-            "ref scalar field_idx {field_idx} out of range (num_ref_scalars={})",
+            "ref scalar field_idx {field_idx} out of range \
+             (num_ref_scalars={}); see `scalar_slot`",
             self.num_ref_scalars
         );
         self.ref_scalar_base + field_idx
@@ -6158,9 +6196,10 @@ impl StateFieldLayout {
     /// `float_scalar_base`, in the same order the resume reader seeds the
     /// float fail-args.
     pub fn float_scalar_slot(&self, field_idx: usize) -> usize {
-        debug_assert!(
+        assert!(
             field_idx < self.num_float_scalars,
-            "float scalar field_idx {field_idx} out of range (num_float_scalars={})",
+            "float scalar field_idx {field_idx} out of range \
+             (num_float_scalars={}); see `scalar_slot`",
             self.num_float_scalars
         );
         self.float_scalar_base + field_idx
@@ -6173,12 +6212,13 @@ impl StateFieldLayout {
 
     /// Flat slot of element `elem` in fixed array `array_idx`.
     pub fn array_elem_slot(&self, array_idx: usize, elem: usize) -> usize {
-        debug_assert!(
+        assert!(
             array_idx < self.array_lens.len(),
-            "array_idx {array_idx} out of range (num_arrays={})",
+            "array_idx {array_idx} out of range (num_arrays={}); see \
+             `scalar_slot`",
             self.array_lens.len()
         );
-        debug_assert!(
+        assert!(
             elem < self.array_lens[array_idx],
             "array elem {elem} out of range (len={})",
             self.array_lens[array_idx]
@@ -12050,6 +12090,13 @@ fn inline_call_native(
     // The callee register each triple names IS that position:
     // `inline_helper_param_layout` hands register k of a bank to the k'th
     // parameter of that kind.  Place by it.
+    // `num_args` for each bank, not the per-kind count, because the counts
+    // are not known until the triples are read.  It is an upper bound on all
+    // three at once: `callee_dst` is `inline_helper_param_layout`'s DENSE
+    // per-kind index, so a bank's largest index is (that kind's parameter
+    // count - 1) and every kind's count is <= `num_args`.  The `truncate`s
+    // below cut each bank back to what was actually placed, which is what
+    // `collect_call_args` walks.
     let mut args_i = vec![0i64; num_args];
     let mut args_r = vec![0i64; num_args];
     let mut args_f = vec![0i64; num_args];
