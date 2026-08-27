@@ -621,7 +621,7 @@ pub(crate) fn str_from_utf8(data: &[u8]) -> Result<PyObjectRef, PyError> {
     // which admits sequences that hold no code point at all, and it is
     // reported at the position that validator stopped at.
     let s = pyre_object::rutf8::wtf8_from_bytes(data, true)
-        .map_err(|error| crate::typedef::utf8_decode_error_from(data, error.pos))?;
+        .map_err(|error| crate::typedef::utf8_decode_error_from(data, error.pos as usize))?;
     Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(
         s.to_owned(),
     ))

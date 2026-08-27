@@ -375,8 +375,8 @@ fn check_digest_name(name_obj: PyObjectRef) -> Result<(), crate::PyError> {
         return Err(crate::typedef::unicode_encode_error(
             "utf-8",
             name_obj,
-            pos,
-            pos + 1,
+            pos as i64,
+            (pos + 1) as i64,
             "surrogates not allowed",
         ));
     }

@@ -3095,12 +3095,12 @@ pub fn immutable_unique_id(obj: PyObjectRef) -> Option<PyObjectRef> {
                 ));
             }
             let base: i64 = if len == 1 {
-                let codepoint = pyre_object::unicodeobject::w_str_get_wtf8(obj)
-                    .code_points()
-                    .next()
-                    .expect("len==1 str has a code point")
-                    .to_u32();
-                !(codepoint as i64)
+                let cp = pyre_object::rutf8::codepoint_at_pos(
+                    pyre_object::unicodeobject::w_str_get_wtf8(obj),
+                    0,
+                );
+                // `(neg << IDTAG_SHIFT) | IDTAG_SPECIAL` == `+` (low 4 bits 0).
+                !cp
             } else {
                 257
             };

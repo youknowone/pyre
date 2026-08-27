@@ -6002,21 +6002,23 @@ fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
 /// view (reading the name as `&str` would fail on the surrogate) and raise
 /// `UnicodeEncodeError('utf8', name, pos, pos + 1, 'surrogates not allowed')`
 /// at the first one, matching `check_utf8(name, allow_surrogates=False)`.
+/// Keep the call itself: upstream marks `_check_utf8` `jit.elidable`, so the
+/// validator is a load-bearing part of the JIT shape rather than an iterator
+/// scan to re-express locally. `CheckError.pos` is the byte position PyPy
+/// forwards unchanged into the exception.
 pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError> {
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    let mut pos = 0usize;
-    for cp in wtf8.code_points() {
-        let c = cp.to_u32();
-        if (0xd800..=0xdfff).contains(&c) {
-            return Err(crate::typedef::unicode_encode_error(
-                "utf8",
-                w_name,
-                pos,
-                pos + 1,
-                "surrogates not allowed",
-            ));
-        }
-        pos += 1;
+    if let Err(e) = pyre_object::rutf8::check_utf8(wtf8.as_bytes(), false) {
+        // RPython's CheckError position, `e.pos + 1`, and the exception's
+        // start/end fields are all Signed; keep that type through the call.
+        let pos = e.pos;
+        return Err(crate::typedef::unicode_encode_error(
+            "utf8",
+            w_name,
+            pos,
+            pos + 1,
+            "surrogates not allowed",
+        ));
     }
     Ok(())
 }
@@ -10942,8 +10944,8 @@ fn unicode_to_decimal_w(
                 return Err(crate::typedef::unicode_encode_error(
                     "utf-8",
                     w_unistr,
-                    pos,
-                    pos + 1,
+                    pos as i64,
+                    (pos + 1) as i64,
                     "surrogates not allowed",
                 ));
             };
@@ -10959,8 +10961,8 @@ fn unicode_to_decimal_w(
             return Err(crate::typedef::unicode_encode_error(
                 "utf-8",
                 w_unistr,
-                pos,
-                pos + 1,
+                pos as i64,
+                (pos + 1) as i64,
                 "surrogates not allowed",
             ));
         };

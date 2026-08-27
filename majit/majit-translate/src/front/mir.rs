@@ -3235,6 +3235,11 @@ struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     multi_assigned_locals: std::collections::HashSet<usize>,
+    /// String variables whose Rust source obtained a `&[u8]` through
+    /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
+    /// where `ord(s[i])` is the scalar byte read; the consumer gate below
+    /// uses this provenance to emit exactly that pair of flowspace ops.
+    string_byte_view_locals: Vec<usize>,
     /// Result `Variable`s of calls to callees whose declared result is
     /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -3545,6 +3550,7 @@ impl<'a> Lowering<'a> {
             atomic_ordering_locals: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
+            string_byte_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
@@ -6166,22 +6172,37 @@ impl<'a> Lowering<'a> {
                     && let Some(index_payload) = v.as_object().and_then(|m| m.get("Index"))
                 {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
+                    let string_byte_view = self
+                        .string_byte_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(&inner, local));
                     let (array_type_id, nolength) = array_projection_metadata(&inner.ty, self.llbc);
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ArrayRead {
+                    let kind = if string_byte_view {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__string_byte_getitem".to_string()],
+                            },
+                            args: vec![base, idx_var],
+                            result_ty: ValueType::Int,
+                        }
+                    } else {
+                        OpKind::ArrayRead {
                             base,
                             index: idx_var,
                             item_ty: tyref_to_value_type(&place_ty, self.llbc),
                             array_type_id,
                             nolength,
                             pure: false,
-                        },
+                        }
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind,
                     });
                     return Ok(res);
                 }
@@ -7943,18 +7964,15 @@ impl<'a> Lowering<'a> {
                 // receiver (the `Cannot find attribute "as_bytes" on String`
                 // wall).
                 //
-                // Sound only for len / equality / iteration consumers.  A
-                // scalar index (`as_bytes()[i]`) lowers to `getitem` on
-                // `StringRepr`, which yields a `Char`, not the `u8` the Rust
-                // source expects; that mismatch currently fails rtype — there
-                // is no `(CharRepr, IntegerRepr)` eq/arithmetic pairtype — so
-                // the subject fail-safe residualizes rather than miscompiling.
-                // Do NOT add a `(CharRepr, IntegerRepr)` eq arm (or otherwise
-                // let a char read byte-compare) without lowering a real
-                // byte-slice view here first, or those indexed uses would
-                // silently gain character semantics.
+                // Scalar consumers are recorded as byte views and lower to
+                // RPython's literal `ord(s[i])` pair below. This is distinct
+                // from unicode code-point indexing: the receiver here is the
+                // UTF-8/WTF-8 storage exposed explicitly by `as_bytes`.
                 if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref())
                 {
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -8026,6 +8044,52 @@ impl<'a> Lowering<'a> {
                 // RangeTo remain real getslice operations.
                 if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
                     self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // RPython's UTF-8 carrier is a byte string. A Rust
+                // `as_bytes()[i]` over the frontend's string identity is
+                // therefore `ord(s[i])`, not a list/array element load and
+                // not unicode code-point indexing. Keep it as a synthetic
+                // marker until the flowspace adapter can create the Char
+                // intermediate required by `ord`.
+                if args.len() == 2
+                    && arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+                    && self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                    && !self.is_slice_scalar_index_mut_call(&reg)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__string_byte_getitem".to_string()],
+                            },
+                            args: vec![args[0].clone(), args[1].clone()],
+                            // `ord` returns RPython Signed. Rust's `u8`
+                            // spelling is representation detail here.
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: args[0].clone(),
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            array_type_id: None,
+                        },
+                    );
+                    self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -31510,31 +31574,27 @@ mod tests {
         }
     }
 
-    /// `basename_start` indexes `path[drive..]` with a runtime `usize`
-    /// RangeFrom. RPython represents this as `getslice(start, None)`, so the
-    /// core SliceIndex shim must be gone before annotation.
+    /// `exception_descr_str_wtf8` indexes the Python unicode carrier through
+    /// `Wtf8::index(RangeFrom)`. The frontend already models Wtf8 as
+    /// RPython's string repr, so this is its ordinary `getslice(start, None)`
+    /// and the Rust trait shim must be gone before annotation.
     #[test]
     #[ignore]
-    fn basename_start_rangefrom_lowers_to_getslice_marker() {
+    fn wtf8_rangefrom_lowers_to_getslice_marker() {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "basename_start").expect("lower basename_start");
+        let graph = super::lower_function(&llbc, "exception_descr_str_wtf8")
+            .expect("lower exception_descr_str_wtf8");
         assert!(
             !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                 matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments == &[
-                        "core".to_string(),
-                        "slice".to_string(),
-                        "index".to_string(),
-                        "<Impl>".to_string(),
-                        "index".to_string(),
-                    ])
+                    if segments == &["Wtf8".to_string(), "index".to_string()])
             }),
-            "RangeFrom SliceIndex call must not survive as an opaque core call"
+            "Wtf8 RangeFrom index must not survive as an opaque foreign call"
         );
         assert!(
             graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
@@ -31542,6 +31602,86 @@ mod tests {
                     if segments == &["__getslice_rangefrom".to_string()])
             }),
             "runtime RangeFrom should use the post-annotation getslice marker"
+        );
+    }
+
+    /// PyPy `typeobject._check_surrogate` delegates to the elidable
+    /// `rutf8.check_utf8`; it does not build a unicode iterator in the caller.
+    /// Keep that exact boundary visible in the real extracted graph.
+    #[test]
+    #[ignore]
+    fn check_surrogate_calls_rutf8_without_wtf8_iterator_next() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "check_surrogate").expect("lower check_surrogate");
+        let call_paths: Vec<&[String]> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            call_paths.iter().any(|segments| {
+                segments.ends_with(&["rutf8".to_string(), "check_utf8".to_string()])
+            }),
+            "PyPy's rutf8.check_utf8 boundary must remain in the caller"
+        );
+        assert!(
+            !call_paths
+                .iter()
+                .any(|segments| matches!(*segments, [owner, method]
+                    if owner == "Wtf8CodePoints" && (method == "next" || method == "nth"))),
+            "the local Wtf8 iterator reimplementation must not return: {call_paths:#?}"
+        );
+    }
+
+    /// RPython `rutf8.codepoint_at_pos` reads each encoded byte as
+    /// `ord(code[pos])`. The Rust byte view must retain that exact string
+    /// getitem + ord shape and never fall back to the crate iterator.
+    #[test]
+    #[ignore]
+    fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "codepoint_at_pos").expect("lower rutf8.codepoint_at_pos");
+        let paths: Vec<&[String]> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|segments| *segments == ["__string_byte_getitem"]),
+            "byte reads must reach the adapter's getitem + ord marker: {paths:#?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|segments| *segments == ["Wtf8CodePoints", "next"]),
+            "RPython's direct decoder must not be replaced by Wtf8 iteration"
         );
     }
 

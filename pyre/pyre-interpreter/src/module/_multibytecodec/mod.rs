@@ -331,8 +331,8 @@ fn encode_impl(
                 return Err(crate::typedef::unicode_encode_error(
                     name,
                     roots.get(input_slot),
-                    start,
-                    end,
+                    start as i64,
+                    end as i64,
                     reason,
                 ));
             }

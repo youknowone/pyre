@@ -1194,8 +1194,8 @@ fn charmap_encode_impl(
                 return Err(crate::typedef::unicode_encode_error(
                     "charmap",
                     pyre_object::gc_roots::shadow_stack_get(sp),
-                    start,
-                    end,
+                    start as i64,
+                    end as i64,
                     "character maps to <undefined>",
                 ));
             }
@@ -1227,8 +1227,8 @@ fn charmap_encode_impl(
                                 return Err(crate::typedef::unicode_encode_error(
                                     "charmap",
                                     pyre_object::gc_roots::shadow_stack_get(sp),
-                                    start,
-                                    end,
+                                    start as i64,
+                                    end as i64,
                                     "character maps to <undefined>",
                                 ));
                             }

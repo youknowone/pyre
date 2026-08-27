@@ -1158,7 +1158,9 @@ pub unsafe fn w_str_codepoint_at(obj: PyObjectRef, index: usize) -> Option<CodeP
                 .and_then(|one| one.code_points().next());
         }
         let storage = w_str_get_index_storage(obj);
-        Some(crate::rutf8::codepoint_at_index(value, &*storage, index))
+        Some(CodePoint::from_u32_unchecked(
+            crate::rutf8::codepoint_at_index(value, &*storage, index) as u32,
+        ))
     }
 }
 

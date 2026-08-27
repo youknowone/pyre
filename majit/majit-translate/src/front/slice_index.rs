@@ -1,4 +1,5 @@
-//! `&s[k..]` / `&s[..k]` sub-slice indexes → orthodox `getslice` copies.
+//! `&s[k..]` / `&s[..k]` sub-slice and WTF-8 string indexes → orthodox
+//! `getslice` copies.
 //!
 //! These recognizers are CAPSTONES, not independently wired primitives.
 //! Range/RangeFrom are carried as synthetic markers until the flowspace
@@ -29,8 +30,9 @@
 //! `<[T] as Index<RangeFrom<usize>>>::index(s, RangeFrom { start: k })`.
 //! Its sibling `&s[..k]` uses `RangeTo { end: k }` and rewrites to
 //! `getslice(s, 0, k)` (`SliceKind::StartStop`).
-//! `lower_call` keeps `core::slice::index::<Impl>::index` as an unregistered
-//! residual (the gh#346 census wall), and the `RangeFrom { start }` operand is
+//! `lower_call` keeps `core::slice::index::<Impl>::index` and
+//! `rustpython_wtf8::Wtf8::index` as unregistered residuals (the gh#346 census
+//! wall), and the `RangeFrom { start }` operand is
 //! built by `front::mir`'s `Rvalue::Aggregate` arm as a
 //! `SyntheticTransparentCtor("RangeFrom")` + `FieldWrite("start")` chain —
 //! i.e. `SomeInstance(classdef='core.ops.range.RangeFrom')`, the same shape
@@ -992,8 +994,9 @@ fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable
     has_len && has_one
 }
 
-/// `true` when `kind` is a residual `core::slice::index::<Impl>::index` call —
-/// the `&s[range]` sub-slice residual whose `range` operand this pass folds.
+/// `true` when `kind` is a residual range-index call over either a Rust slice
+/// or the WTF-8 string view used for Python unicode — the `&s[range]`
+/// residual whose `range` operand this pass folds.
 /// The scalar `Vec`/`Constants` integer index is intercepted earlier in
 /// `lower_call` (`is_vec_index_regular` / `constants_call_leaf`), so only the
 /// range-indexed slice residual reaches here.
@@ -1011,6 +1014,15 @@ fn is_slice_range_index_call(kind: &OpKind) -> bool {
 /// Charon runs `monomorphize:false`, so the callee keeps the inherent-impl
 /// path `core::slice::index::<Impl>::index`.
 fn slice_index_segments_match(segments: &[String]) -> bool {
+    // `Wtf8` is the frontend's RPython `SomeString` spelling (mir.rs maps
+    // Wtf8/Wtf8Buf/String/str to ValueType::Str). Its Index<Range*> impl is
+    // therefore the same `str[start:stop]` operation as the slice spelling,
+    // not a foreign method to residualize. PyPy's unicode paths use ordinary
+    // slicing and RPython lowers both string and list slices through
+    // `rtype_getslice`.
+    if segments == ["Wtf8", "index"] {
+        return true;
+    }
     let n = segments.len();
     if n < 4 || segments.first().map(String::as_str) != Some("core") {
         return false;

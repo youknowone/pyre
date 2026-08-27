@@ -1049,8 +1049,8 @@ pub unsafe extern "C" fn PyUnicode_EncodeLocale(
         super::pyerrors::set_pending_error(crate::typedef::unicode_encode_error(
             LOCALE_CODEC,
             value,
-            position,
-            position + 1,
+            position as i64,
+            (position + 1) as i64,
             "encoding error",
         ));
         return std::ptr::null_mut();

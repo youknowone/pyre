@@ -192,7 +192,7 @@ pub(crate) fn format_wtf8_repr(s: &Wtf8) -> String {
     out.push(quote as char);
     let mut pos = 0;
     while pos < s.len() {
-        let code = pyre_object::rutf8::codepoint_at_pos(s, pos).to_u32();
+        let code = pyre_object::rutf8::codepoint_at_pos(s, pos) as u32;
         if code == quote as u32 || code == b'\\' as u32 {
             out.push('\\');
             out.push(code as u8 as char);
@@ -1807,10 +1807,18 @@ fn nt_drive_len(path: &[u8]) -> usize {
 fn basename_start(path: &[u8]) -> usize {
     let windows = cfg!(windows);
     let drive = if windows { nt_drive_len(path) } else { 0 };
-    path[drive..]
-        .iter()
-        .rposition(|&b| b == b'/' || (windows && b == b'\\'))
-        .map_or(drive, |i| drive + i + 1)
+    // `os.path.basename` bottoms out at the last separator search. Spell the
+    // same reverse index walk directly, as RPython's string `rfind` does,
+    // rather than introducing Rust's closure-bearing `Iter::rposition` graph.
+    let mut i = path.len();
+    while i > drive {
+        i -= 1;
+        let b = path[i];
+        if b == b'/' || (windows && b == b'\\') {
+            return i + 1;
+        }
+    }
+    drive
 }
 
 /// The WTF-8 carrying subset of `W_BaseException.descr_str`: a base
@@ -2316,8 +2324,8 @@ impl fmt::Display for PyDisplay {
 #[cfg(test)]
 mod tests {
     use super::{
-        bytes_repr_string, format_float_repr, format_wtf8_repr, jit_format_float_repr_rstr,
-        nt_drive_len,
+        basename_start, bytes_repr_string, format_float_repr, format_wtf8_repr,
+        jit_format_float_repr_rstr, nt_drive_len,
     };
     use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -2396,5 +2404,15 @@ mod tests {
         assert_eq!(nt_drive_len(br"\dir\enc.py"), 0);
         assert_eq!(nt_drive_len(b"enc.py"), 0);
         assert_eq!(nt_drive_len(b""), 0);
+    }
+
+    #[test]
+    fn basename_start_matches_platform_separator_search() {
+        assert_eq!(basename_start(b"dir/enc.py"), 4);
+        assert_eq!(basename_start(b"enc.py"), 0);
+        assert_eq!(basename_start(b"dir/"), 4);
+        assert_eq!(basename_start(b""), 0);
+        #[cfg(not(windows))]
+        assert_eq!(basename_start(br"dir\enc.py"), 0);
     }
 }

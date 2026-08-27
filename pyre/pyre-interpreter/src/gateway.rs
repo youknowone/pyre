@@ -2080,8 +2080,8 @@ pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError
             return Err(crate::typedef::unicode_encode_error(
                 "utf-8",
                 obj,
-                pos,
-                pos + 1,
+                pos as i64,
+                (pos + 1) as i64,
                 "surrogates not allowed",
             ));
         }

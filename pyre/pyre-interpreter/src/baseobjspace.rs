@@ -9192,8 +9192,8 @@ pub fn str_utf8_w(obj: PyObjectRef) -> Result<&'static str, PyError> {
             Err(crate::typedef::unicode_encode_error(
                 "utf-8",
                 obj,
-                pos,
-                pos + 1,
+                pos as i64,
+                (pos + 1) as i64,
                 "surrogates not allowed",
             ))
         }

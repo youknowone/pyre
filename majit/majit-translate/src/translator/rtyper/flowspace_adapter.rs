@@ -1678,6 +1678,21 @@ pub fn translate_op(
                         // interpreter sites ported from `buffer[start:end]`.
                         return Ok(vec![FlowspaceOp::new("getslice", arg_hls, result)]);
                     }
+                    // Rust `Wtf8::as_bytes()[i]` is the byte-string operation
+                    // PyPy writes as `ord(utf8[i])` throughout rutf8.py. The
+                    // string repr's `getitem` yields SomeChar; preserve that
+                    // intermediate and let the ordinary `ord` rtyper turn it
+                    // into Signed.
+                    if segments.as_slice() == ["__string_byte_getitem"] && arg_hls.len() == 2 {
+                        let mut args = arg_hls.into_iter();
+                        let string = args.next().expect("string byte-view arg");
+                        let index = args.next().expect("string byte index arg");
+                        let byte = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new("getitem", vec![string, index], byte.clone()),
+                            FlowspaceOp::new("ord", vec![byte], result),
+                        ]);
+                    }
                     // `[v; N]` array literal.  `front::mir` lowers
                     // `Rvalue::Repeat` to the `__array_repeat` synthetic
                     // carrying `(fill, count)` whenever the count decodes.

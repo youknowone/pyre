@@ -3852,8 +3852,8 @@ fn utf8_only(value: PyObjectRef) -> AstResult<&'static str> {
     Err(crate::typedef::unicode_encode_error(
         "utf-8",
         value,
-        position,
-        position + 1,
+        position as i64,
+        (position + 1) as i64,
         "surrogates not allowed",
     ))
 }

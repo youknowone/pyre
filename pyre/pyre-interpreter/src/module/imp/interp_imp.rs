@@ -561,8 +561,8 @@ fn ascii_module_name(w_name: pyre_object::PyObjectRef) -> Result<String, crate::
         return Err(crate::typedef::unicode_encode_error(
             "ascii",
             w_name,
-            pos,
-            pos + 1,
+            pos as i64,
+            (pos + 1) as i64,
             "ordinal not in range(128)",
         ));
     }

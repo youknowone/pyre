@@ -23805,42 +23805,6 @@ pub(crate) fn unicode_decode_error(
     }
 }
 
-/// interp_exceptions.py W_UnicodeEncodeError.descr_str format.
-/// `w_object` is the str being encoded; the bad code point is read at
-/// `start` through the surrogate-aware WTF-8 view.
-fn unicode_encode_error_msg(
-    codec: &str,
-    w_object: PyObjectRef,
-    start: usize,
-    end: usize,
-    reason: &str,
-) -> String {
-    if end == start + 1 {
-        let badchar = unsafe {
-            pyre_object::w_str_get_wtf8(w_object)
-                .code_points()
-                .nth(start)
-                .map(|c| c.to_u32())
-                .unwrap_or(0)
-        };
-        let badchar_repr = if badchar <= 0xff {
-            format!("'\\x{badchar:02x}'")
-        } else if badchar <= 0xffff {
-            format!("'\\u{badchar:04x}'")
-        } else {
-            format!("'\\U{badchar:08x}'")
-        };
-        format!(
-            "'{codec}' codec can't encode character {badchar_repr} in position {start}: {reason}"
-        )
-    } else {
-        format!(
-            "'{codec}' codec can't encode characters in position {start}-{}: {reason}",
-            end - 1
-        )
-    }
-}
-
 /// `str.encode('utf-8')` under the default error handler, for a consumer that
 /// can only hold a Rust `str` — the compiler's source text, the tokenizer's
 /// input line.
@@ -23859,8 +23823,8 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
     Err(unicode_encode_error(
         "utf-8",
         pyre_object::w_str_from_wtf8(text),
-        position,
-        position + 1,
+        position as i64,
+        (position + 1) as i64,
         "surrogates not allowed",
     ))
 }
@@ -23875,20 +23839,19 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
 pub(crate) fn unicode_encode_error(
     encoding: &str,
     w_object: PyObjectRef,
-    start: usize,
-    end: usize,
+    start: i64,
+    end: i64,
     reason: &str,
 ) -> crate::PyError {
     let w_encoding = pyre_object::w_str_new(encoding);
-    let w_start = pyre_object::w_int_new(start as i64);
-    let w_end = pyre_object::w_int_new(end as i64);
+    let w_start = pyre_object::w_int_new(start);
+    let w_end = pyre_object::w_int_new(end);
     let w_reason = pyre_object::w_str_new(reason);
-    // Eager message for PyError.message; descr_str recomputes the same text
-    // from the fields (display.rs unicode_encode_error_str).
-    let msg = unicode_encode_error_msg(encoding, w_object, start, end, reason);
-    let exc = pyre_object::interp_exceptions::w_exception_new(
+    // PyPy stores the five fields/args here and formats them only from
+    // `W_UnicodeEncodeError.descr_str`. `PyError::from_exc_object` follows
+    // the same lazy display path, so do not precompute a parallel message.
+    let exc = pyre_object::interp_exceptions::w_exception_new_empty(
         pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
-        &msg,
     );
     unsafe {
         pyre_object::interp_exceptions::w_exception_set_encoding(exc, w_encoding);

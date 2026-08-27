@@ -616,7 +616,10 @@ impl FileReader {
 /// wire reader's own error type.
 fn strict_wtf8(bytes: &[u8], errors: ErrorSink) -> Result<&Wtf8, wire::MarshalError> {
     pyre_object::rutf8::wtf8_from_bytes(bytes, true).map_err(|error| {
-        errors.remember(crate::typedef::utf8_decode_error_from(bytes, error.pos));
+        errors.remember(crate::typedef::utf8_decode_error_from(
+            bytes,
+            error.pos as usize,
+        ));
         wire::MarshalError::InvalidUtf8
     })
 }
