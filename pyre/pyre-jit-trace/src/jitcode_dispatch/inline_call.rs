@@ -9021,10 +9021,18 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // region has applied nothing and the cut is the legal exit.  Asking here
     // rather than at the `NotImplemented` arm below is the whole point: by the
     // time a result exists, the commit that had to be prevented has happened.
+    //
+    // The cut takes the snapshots with it.  The descent attaches guards before
+    // it declines, and a snapshot minted inside it names the discarded
+    // operation namespace — including the `virtual_ref` pair the callee's
+    // `enter` pushed.  `cut_trace` leaves the side table alone, so those
+    // entries survive into the optimizer, which remaps every published
+    // snapshot and resolves the stale `OpRef` against a position the cut has
+    // since handed to another operation.
     let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
     drop(rewind_guard);
     if refused_a_residual {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         decline!(format_args!(
             "{}.{dunder} may commit before its result is known",
@@ -9060,12 +9068,15 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
             // code did.  The same all-clear reading the un-lowered-helper
             // rollback takes, and for its reason too: a walk already carrying
             // an unjournaled effect can no longer flush a `CloseLoop` end.
+            //
+            // The snapshots go with the operations, for the reason the refusal
+            // arm above records.
             if binop_rewind_enabled()
                 && fbw_executed_effect_count() == effects_before
                 && !unjournaled_before
                 && !fbw_has_unjournaled_effect()
             {
-                ctx.trace_ctx.cut_trace(pre_fold_pos);
+                ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
                 ctx.trace_ctx.heap_cache_mut().reset();
                 return Ok(None);
             }
@@ -9249,10 +9260,18 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // region has applied nothing and the cut is the legal exit.  Asking here
     // rather than at the `NotImplemented` arm below is the whole point: by the
     // time a result exists, the commit that had to be prevented has happened.
+    //
+    // The cut takes the snapshots with it.  The descent attaches guards before
+    // it declines, and a snapshot minted inside it names the discarded
+    // operation namespace — including the `virtual_ref` pair the callee's
+    // `enter` pushed.  `cut_trace` leaves the side table alone, so those
+    // entries survive into the optimizer, which remaps every published
+    // snapshot and resolves the stale `OpRef` against a position the cut has
+    // since handed to another operation.
     let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
     drop(rewind_guard);
     if refused_a_residual {
-        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
     }
@@ -9275,12 +9294,15 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
             // code did.  The same all-clear reading the un-lowered-helper
             // rollback takes, and for its reason too: a walk already carrying
             // an unjournaled effect can no longer flush a `CloseLoop` end.
+            //
+            // The snapshots go with the operations, for the reason the refusal
+            // arm above records.
             if binop_rewind_enabled()
                 && fbw_executed_effect_count() == effects_before
                 && !unjournaled_before
                 && !fbw_has_unjournaled_effect()
             {
-                ctx.trace_ctx.cut_trace(pre_fold_pos);
+                ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
                 ctx.trace_ctx.heap_cache_mut().reset();
                 return Ok(None);
             }
