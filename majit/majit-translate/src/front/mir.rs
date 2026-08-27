@@ -2650,6 +2650,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &closure_select_outcome.result_exc_calls,
                 result_exc_callee,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
         }
@@ -13893,19 +13894,22 @@ impl<'a> Lowering<'a> {
             | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
         };
         let call_result_ty = tyref_to_value_type(&call_result_tyref, self.llbc);
-        let call_once_result_exc =
-            crate::front::result_exc::tyref_is_result_of_pyerror(&call_result_tyref, self.llbc)
-                .then(|| {
-                    let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
-                        &call_result_tyref,
-                        self.llbc,
-                    );
-                    let payload_ty =
-                        crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
-                            .map(|ty| tyref_to_value_type(&ty, self.llbc))
-                            .unwrap_or(ValueType::Ref(None));
-                    (suffix, payload_ty)
-                });
+        let call_once_result_exc = crate::front::result_exc::tyref_is_result_of_carrier(
+            &call_result_tyref,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        )
+        .then(|| {
+            let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+                &call_result_tyref,
+                self.llbc,
+            );
+            let payload_ty =
+                crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
+                    .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                    .unwrap_or(ValueType::Ref(None));
+            (suffix, payload_ty)
+        });
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
         // build none.  `U` is the dest payload, not the receiver's `T`, so the
