@@ -1468,15 +1468,15 @@ unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef
     }
     let slots = unsafe { &*code.co_consts_w };
     let count = slots.len().min(pyre_object::w_tuple_len(constants));
-    let mut filled = false;
+    if count == 0 {
+        return;
+    }
+    let published = publish_code_slot_store_rooting(obj, &[constants]);
+    let constants = published.get(0);
     for (index, slot) in slots.iter().take(count).enumerate() {
         if let Some(value) = unsafe { pyre_object::w_tuple_getitem(constants, index as i64) } {
             slot.store(value, std::sync::atomic::Ordering::Release);
-            filled = true;
         }
-    }
-    if filled {
-        publish_code_slot_store(obj);
     }
 }
 
@@ -1492,6 +1492,14 @@ unsafe fn w_code_fill_consts_from_tuple(obj: PyObjectRef, constants: PyObjectRef
 /// a nursery constant needs its remembered-set entry back, which is what the
 /// write barrier restores. Without it the next minor collection never traces
 /// the slot and leaves the wrapper holding a stale pointer.
+///
+/// Call this BEFORE the store, the way `framework.py transform_generic_set`
+/// emits the `write_barrier_ptr` `direct_call` ahead of the `setfield` it
+/// guards. Storing first leaves a window in which a collection sees the new
+/// child through the slot while the slot is still absent from the remembered
+/// set, so the collector neither traces nor rewrites it and the wrapper keeps
+/// a stale pointer. A barrier that turns out to guard no store is merely
+/// conservative, which is the direction upstream errs in too.
 #[inline]
 fn publish_code_slot_store(obj: PyObjectRef) {
     if obj.is_null() {
@@ -1499,6 +1507,41 @@ fn publish_code_slot_store(obj: PyObjectRef) {
     }
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+}
+
+/// The words a code-slot store is about to publish, reloaded after the
+/// barrier that guards it.
+struct RootedSlotStore {
+    scope: pyre_object::gc_roots::RootScope,
+    base: usize,
+}
+
+impl RootedSlotStore {
+    /// The `index`th word handed to [`publish_code_slot_store_rooting`], as it
+    /// stands now.
+    #[inline]
+    fn get(&self, index: usize) -> PyObjectRef {
+        self.scope.get(self.base + index)
+    }
+}
+
+/// [`publish_code_slot_store`] with the words the store is about to publish
+/// held live across it.
+///
+/// The barrier reaches `gc_op_with_root`, which is a collection point: it can
+/// wait behind another thread's collection or drive one itself. That
+/// collection rewrites what it can name — the owner, through the barrier's own
+/// root, and a translated `setfield`'s `newvalue`, which is a shadow-stack
+/// livevar where `framework.py transform_generic_set` emits the call. A
+/// `PyObjectRef` that lives only in a Rust local is named by nothing, so a
+/// caller that stores one after the barrier would publish a pre-collection
+/// address. Publish those words here and read them back.
+fn publish_code_slot_store_rooting(obj: PyObjectRef, children: &[PyObjectRef]) -> RootedSlotStore {
+    let scope = pyre_object::gc_roots::push_roots();
+    let base = scope.publish(children);
+    scope.normalize(base, children.len());
+    publish_code_slot_store(obj);
+    RootedSlotStore { scope, base }
 }
 
 /// `w_code_fill_consts_from_tuple` for the marshal reader, whose `co_consts`
@@ -1512,11 +1555,12 @@ pub(crate) unsafe fn w_code_fill_wrapped_consts(obj: PyObjectRef, constants: &[P
     }
     let slots = unsafe { &*code.co_consts_w };
     let count = slots.len().min(constants.len());
-    for index in 0..count {
-        slots[index].store(constants[index], std::sync::atomic::Ordering::Release);
+    if count == 0 {
+        return;
     }
-    if count != 0 {
-        publish_code_slot_store(obj);
+    let published = publish_code_slot_store_rooting(obj, &constants[..count]);
+    for index in 0..count {
+        slots[index].store(published.get(index), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1531,16 +1575,14 @@ unsafe fn w_code_copy_const_slots(dst: PyObjectRef, src: PyObjectRef) {
     }
     let dst_slots = unsafe { &*dst_code.co_consts_w };
     let src_slots = unsafe { &*src_code.co_consts_w };
-    let mut copied = false;
+    if !dst_slots.is_empty() && !src_slots.is_empty() {
+        publish_code_slot_store(dst);
+    }
     for (dst_slot, src_slot) in dst_slots.iter().zip(src_slots.iter()) {
         let value = src_slot.load(std::sync::atomic::Ordering::Acquire);
         if !value.is_null() {
             dst_slot.store(value, std::sync::atomic::Ordering::Release);
-            copied = true;
         }
-    }
-    if copied {
-        publish_code_slot_store(dst);
     }
 }
 
@@ -2986,16 +3028,14 @@ pub unsafe fn w_code_const(w_code_obj: PyObjectRef, idx: usize) -> PyObjectRef {
     // published it or selected the concurrently-published canonical object.
     let candidate_root = &mut realized as *mut PyObjectRef as *mut *mut u8;
     let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(candidate_root) };
+    publish_code_slot_store(w_code_obj);
     let published = match slot.compare_exchange(
         std::ptr::null_mut(),
         realized,
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
     ) {
-        Ok(_) => {
-            publish_code_slot_store(w_code_obj);
-            realized
-        }
+        Ok(_) => realized,
         Err(winner) => winner,
     };
     if registered {
@@ -3248,15 +3288,16 @@ pub unsafe fn w_code_set_w_globals(obj: PyObjectRef, w_globals: PyObjectRef) {
     if obj.is_null() {
         return;
     }
+    // A bootstrap code slot is reached only by the prebuilt root walk, which
+    // clean minor collections may skip; record the store before making it.
+    let published = publish_code_slot_store_rooting(obj, &[w_globals]);
+    let w_globals = published.get(0);
     unsafe {
         std::sync::atomic::AtomicPtr::from_ptr(std::ptr::addr_of_mut!(
             (*(obj as *mut PyCode)).w_globals
         ))
         .store(w_globals, std::sync::atomic::Ordering::Release);
     }
-    // A bootstrap code slot is reached only by the prebuilt root walk, which
-    // clean minor collections may skip; record the store.
-    publish_code_slot_store(obj);
     if !w_globals.is_null() {
         let code_ptr = unsafe { (*(obj as *const PyCode)).code_ptr };
         register_live_code_wrapper(code_ptr, obj);
@@ -3286,6 +3327,12 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
     };
     let mut published = slot.load(std::sync::atomic::Ordering::Acquire);
     if published.is_null() {
+        // Prebuilt-family store (see `w_code_set_w_globals`): the barrier runs
+        // before the publication, so a collection that observes the new child
+        // through this slot finds the slot already remembered. A lost race
+        // leaves only a conservative barrier behind.
+        let rooted = publish_code_slot_store_rooting(obj, &[w_globals]);
+        let w_globals = rooted.get(0);
         match slot.compare_exchange(
             pyre_object::PY_NULL,
             w_globals,
@@ -3293,8 +3340,6 @@ pub unsafe fn w_code_frame_stores_global(obj: PyObjectRef, w_globals: PyObjectRe
             std::sync::atomic::Ordering::Acquire,
         ) {
             Ok(_) => {
-                // Prebuilt-family store (see `w_code_set_w_globals`).
-                publish_code_slot_store(obj);
                 register_live_code_wrapper(unsafe { (*code).code_ptr }, obj);
                 register_w_globals_stamped_code(obj);
                 return false;
@@ -4002,7 +4047,7 @@ pub unsafe fn w_code_mapdict_caches_get(
 pub unsafe fn w_code_mapdict_caches_set(
     obj: PyObjectRef,
     nameindex: usize,
-    entry: crate::objspace::std::mapdict::MapdictCacheEntry,
+    mut entry: crate::objspace::std::mapdict::MapdictCacheEntry,
 ) {
     if obj.is_null() {
         return;
@@ -4013,7 +4058,6 @@ pub unsafe fn w_code_mapdict_caches_set(
     }
     let vec = unsafe { &mut *code.mapdict_caches };
     if let Some(slot) = vec.get_mut(nameindex) {
-        *slot = Some(entry);
         // The LOAD_METHOD fill (mapdict.py:1474) stores a movable
         // `w_method` reference; register this code object so
         // `walk_mapdict_method_cache_gc` forwards the slot.
@@ -4025,9 +4069,11 @@ pub unsafe fn w_code_mapdict_caches_set(
                     .insert(obj as usize);
             }
             // The slot is reached only by `walk_mapdict_method_cache_gc`,
-            // skipped on clean minors.
-            publish_code_slot_store(obj);
+            // skipped on clean minors; record it before the store.
+            let published = publish_code_slot_store_rooting(obj, &[entry.w_method]);
+            entry.w_method = published.get(0);
         }
+        *slot = Some(entry);
     }
 }
 
