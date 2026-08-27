@@ -28,6 +28,7 @@ use majit_gc::GcAllocator;
 use majit_gc::trace::TypeInfo;
 use majit_ir::{Type, Value};
 use majit_metainterp::blackhole::ExceptionState;
+use majit_metainterp::warmstate::FunctionEntryStep;
 use majit_metainterp::{CompiledExitLayout, DetailedDriverRunOutcome, JitState};
 
 /// Host tracer registered with majit-gc so `walk_jf_roots` can reach
@@ -225,7 +226,27 @@ impl FrameRoot {
         Self { depth, slot }
     }
 
-    #[majit_macros::dont_look_inside]
+    /// Inlinable, unlike its two siblings, and `eval_loop_jit` is the reason:
+    /// it re-seeds the frame pointer after every collection point, four times
+    /// per opcode on the no-tracer fast path. `#[dont_look_inside]` implies
+    /// `#[inline(never)]`, so each of those was a call to a body that reads one
+    /// slot -- measured at ~17 ns per opcode against
+    /// `PyFrame::execute_frame_plain`, i.e. the whole `PYRE_NO_JIT=1` versus
+    /// `PYRE_JIT=0` gap, before any JIT decision is taken.
+    ///
+    /// Dropping the marker costs no tracing policy: `@dont_look_inside` names
+    /// what the tracer must call as a black box, and nothing the walker records
+    /// reaches here. `FrameRoot` is private to this module, its callers are the
+    /// eval loop and the JIT doors, and none of them is walked -- pyre records
+    /// from a per-`CodeObject` JitCode, not from this Rust loop. The rooting
+    /// itself is upstream's translator-inserted shadow stack (`shadowcolor.py`),
+    /// which has no annotation for a caller to inherit either way.
+    ///
+    /// Inlining also lets two adjacent seeds share one read. That is sound for
+    /// the same reason the seeds exist: only a collection can move the frame,
+    /// every collection point here is an opaque call, and a load cannot be
+    /// forwarded across one.
+    #[inline]
     fn frame(&mut self) -> &mut PyFrame {
         // SAFETY: `slot` was resolved on this thread in `new` and the thread is
         // still running; no `&mut` borrow of the cell is held here.
@@ -10849,7 +10870,12 @@ fn bound_reached(
     {
         return None;
     }
-    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
+    // `warmstate.py maybe_compile_and_run` reads `procedure_token =
+    // cell.get_procedure_token()` once and both decides and runs on that one
+    // object. Read it once here too: the decision below and the run further
+    // down used to walk the cell chain separately for the same answer.
+    let procedure_token = driver.runnable_procedure_token(green_key);
+    if procedure_token.is_none() && !driver.is_tracing() {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -10867,7 +10893,10 @@ fn bound_reached(
     // reaches the same traces.
     let _topframeref_guard =
         TopFrameRefGuard::new(frame_root.frame().execution_context as *mut PyExecutionContext);
-    let outcome = if driver.has_runnable_compiled_loop(green_key) {
+    // The token stays bound for the whole run, which is what
+    // `EnterJitAssembler(procedure_token, ...)` does with it upstream; the run
+    // resolves the key itself, so it is only the pin.
+    let outcome = if procedure_token.is_some() {
         let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
@@ -11050,26 +11079,37 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             }
         }
     }
-    let green_key = make_green_key(
-        frame_root.frame().pycode,
-        frame_root.frame().next_instr(),
-        frame_root.frame().get_is_being_profiled(),
-    );
+    let code_ptr = frame_root.frame().pycode;
+    let entry_pc = frame_root.frame().next_instr();
+    let is_being_profiled = frame_root.frame().get_is_being_profiled();
+    let green_key_hash = make_green_key(code_ptr, entry_pc, is_being_profiled);
     let (driver, info) = driver_pair();
 
-    // RPython warmstate.py maybe_compile_and_run fast path:
-    // if no runnable compiled loop and not tracing, just tick the counter.
-    // A bare `compile_tmp_callback` token (has_compiled_loop true, no
-    // `compiled_loops` meta) is treated as not-yet-runnable so the counter
-    // keeps ticking toward compiling the real loop.
-    if !driver.has_runnable_compiled_loop(green_key) && !driver.is_tracing() {
-        let should_trace = driver
-            .meta_interp_mut()
-            .warm_state_mut()
-            .should_trace_function_entry(green_key);
-        if !should_trace {
-            return None;
-        }
+    // `maybe_compile_and_run` matches the greens with `JitCell.comparekey`
+    // before anything is read off a cell, so resolve the bucket hash to the key
+    // that names one cell first. Deciding on the bare hash answers about
+    // whichever cell heads a chained bucket: this entry point read "nothing
+    // compiled" for a function whose own cell held a runnable loop, so it
+    // ticked the counter and asked to trace at every call, while
+    // `force_start_tracing_for_key` -- which does walk the chain -- answered
+    // `RunCompiled` and refused. Neither side moved, the compiled code was
+    // never entered, and every call paid a full trace-start attempt.
+    let green_key = driver.resolve_cell_key(green_key_hash, || {
+        pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
+    });
+
+    // RPython warmstate.py maybe_compile_and_run: read the cell's procedure
+    // token, and only when it is absent ask the counter. A bare
+    // `compile_tmp_callback` token (a token, but no `compiled_loops` meta) is
+    // not runnable, so it keeps ticking toward compiling the real loop.
+    //
+    // One call, one walk of the cell chain. The three questions this replaces --
+    // `has_runnable_compiled_loop`, the counter gate, then
+    // `has_runnable_compiled_loop` again to decide the run -- walked it three
+    // times to learn one thing, on every call that refused.
+    let step = driver.function_entry_step(green_key);
+    if matches!(step, FunctionEntryStep::NotHot) {
+        return None;
     }
 
     // RPython warmstate.py: per-cell JC_TRACING.
@@ -11079,7 +11119,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     )) {
         return None;
     }
-    if driver.has_runnable_compiled_loop(green_key) {
+    // `warmstate.py maybe_compile_and_run` carries the token the cell read
+    // produced out through `EnterJitAssembler(procedure_token, *execute_args)`;
+    // holding it here is what keeps it alive across the run the way upstream's
+    // reference does. The run resolves the key itself, so it is only the pin.
+    if let FunctionEntryStep::RunCompiled(_procedure_token) = step {
         // Same gate as maybe_compile_and_run: only enter compiled code
         // when a runnable compiled loop (frontend meta present, not a bare
         // tmp callback) exists for this green_key.

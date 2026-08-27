@@ -6725,6 +6725,18 @@ pub(crate) struct MidBodyPayload {
     pub live_locals: Vec<Option<ConcreteValue>>,
     pub live_stack: Vec<ConcreteValue>,
     pub return_value: pyre_object::PyObjectRef,
+    /// The instance `__new__` produced when the rebuilt callee is a
+    /// constructor's `__init__`, `PY_NULL` otherwise.
+    ///
+    /// This leg resumes the callee directly on the caller and hands the caller
+    /// whatever the callee returns.  For a constructor that is `__init__`'s
+    /// `None`, and the caller's CALL result has to be the instance:
+    /// `type_descr_call_impl` sits between the two frames and its tail is what
+    /// discards `__init__`'s result and returns `w_newobject`.  The rebuild
+    /// cannot reconstruct that native level, so the flush plays the tail
+    /// itself off this field.  [`crate::ctor_continuation`] plays the same
+    /// tail for the blackhole resume.
+    pub constructor_instance: pyre_object::PyObjectRef,
     /// What [`InlineAbortCarrier::Entry`] would have carried for the same
     /// abort.  The rebuild is preferred, but it can still decline at the flush
     /// (an unsourceable outer local, a handler-bearing body); dropping to the
@@ -7249,6 +7261,12 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 if !payload.return_value.is_null() {
                     visitor(unsafe {
                         &mut *(&mut payload.return_value as *mut pyre_object::PyObjectRef).cast()
+                    });
+                }
+                if !payload.constructor_instance.is_null() {
+                    visitor(unsafe {
+                        &mut *(&mut payload.constructor_instance as *mut pyre_object::PyObjectRef)
+                            .cast()
                     });
                 }
                 for slot in payload.live_locals.iter_mut().flatten() {

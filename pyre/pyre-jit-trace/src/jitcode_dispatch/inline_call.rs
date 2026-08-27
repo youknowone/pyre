@@ -2168,6 +2168,26 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
+/// `do_recursive_call`'s call target (`pyjitpl.py`): the portal runner address
+/// `warmspot.py` stamped on the driver, and the portal ABI
+/// `build_portal_calldescr` derived from its `vars`.
+///
+/// The portal driver is the one with greens; `ensure_default_driver_sd`'s
+/// placeholder has none and carries no runner address.
+fn portal_runner_call_target() -> Option<(i64, majit_ir::DescrRef)> {
+    let (driver, _) = crate::driver::try_driver_pair()?;
+    let jd = driver
+        .meta_interp()
+        .staticdata
+        .jitdrivers_sd
+        .iter()
+        .find(|jd| jd.num_greens() > 0)?;
+    if jd.portal_runner_adr == 0 {
+        return None;
+    }
+    Some((jd.portal_runner_adr, jd.portal_calldescr.clone()?))
+}
+
 /// Walker mirror of `opimpl_recursive_call_assembler`
 /// (`metainterp.rs`): a multi-frame inlined callee sub-walk reached its
 /// OWN loop header (surfaced as `SubLoopCalleeCallAssembler`) and a compiled
@@ -2177,16 +2197,18 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
 /// the frame, then emits `CALL_ASSEMBLER([frame, ec])` into the token —
 /// forcing the virtual frame materializes the locals the compiled loop reads
 /// at entry. The op sequence (vable/vref-before, CALL_ASSEMBLER + KEEPALIVE,
-/// residual executor to run the call concretely and stamp `ca_result`, dst
+/// residual executor to run the callee concretely and stamp `ca_result`, dst
 /// writeback, GUARD_NOT_FORCED + GUARD_NO_EXCEPTION) mirrors
 /// [`try_walker_call_assembler_self_recursive`].
+///
+/// What the executor runs is `do_recursive_call`'s own target: the portal
+/// runner on the callee frame the sub-walk already advanced to this header,
+/// not the caller's original CALL.  Re-entering the callee at its entry would
+/// replay the prologue the sub-walk has already executed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
-    funcptr: OpRef,
-    r_args: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst_bank: char,
     dst: usize,
     callee_frame: OpRef,
@@ -2194,9 +2216,20 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     nlocals: usize,
     token: std::sync::Arc<majit_backend::JitCellToken>,
     target_pc: usize,
+    w_code: *const (),
+    is_being_profiled: bool,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     let _ = nlocals;
+    // `do_recursive_call`'s funcbox and ABI, resolved before the first
+    // recorded op so an unwired driver declines the inline instead of
+    // leaving a half-emitted CALL behind.
+    let Some((portal_runner_adr, portal_descr)) = portal_runner_call_target() else {
+        return resolved_inline_decline(op.pc, line!());
+    };
+    let Some(portal_view) = portal_descr.as_call_descr() else {
+        return resolved_inline_decline(op.pc, line!());
+    };
 
     // Pin the loop-entry resume position on the (still-virtual) callee frame:
     // override `last_instr` from -1 (the fresh-frame entry value
@@ -2252,13 +2285,22 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // is why forcing the still-virtual frame here — allocation plus one
     // SETARRAYITEM_GC per known element — is the upstream op sequence rather
     // than a decline.
-    // Run the call concretely to stamp `ca_result` (same rationale as the
+    // Run the callee concretely to stamp `ca_result` (same rationale as the
     // self-recursive arm: the downstream consumer needs the real concrete to
-    // take its int specialization). The inlined prologue already ran the
-    // callee's pre-loop bytecode concretely during the sub-walk; the executor
-    // re-runs the WHOLE call fresh, so a side-effecting pre-loop body would
-    // execute twice at trace time. The corpus target (`loop_callee_return`)
-    // has a side-effect-free callee; a side-effecting prologue is out of scope.
+    // take its int specialization).
+    //
+    // What is run is the PORTAL RUNNER on the callee frame the sub-walk has
+    // already advanced to this loop header — `do_recursive_call`'s funcbox is
+    // `targetjitdriver_sd.portal_runner_adr` and its arguments are the merge
+    // point's own greens and reds (`opimpl_jit_merge_point`'s recursive arm,
+    // `pyjitpl.py`), not the caller's original CALL operands.  Resuming is the
+    // whole point: the inlined prologue already ran the callee's pre-loop
+    // bytecode concretely during the sub-walk, so re-entering the callee at
+    // its ENTRY would apply every one of those effects a second time at trace
+    // time.  `ll_portal_runner_shim` takes the frame and continues it, which
+    // is also exactly what the `CALL_ASSEMBLER` recorded below does at
+    // runtime, so the trace-time and compiled executions are the same
+    // operation on the same frame.
     //
     // GC-rooting of the materialized callee virtualizable frame is equivalent
     // to the GC-clean self-recursive arm (a four-lens audit found no
@@ -2273,13 +2315,51 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // (r1/r5/r6/r2/r4 × nursery {default,1M,256K,64K,16K,4K} × dynasm+x86, all
     // clean) — a diagnostic-build layout artifact, with content-agnostic
     // rooting ruling out a ref-specific defect here.
-    let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
-    let allboxes = build_allboxes(funcptr, r_args, &argbox_types, call_descr.arg_types());
+    // The recorded `last_instr` pin above describes the frame the compiled
+    // trace builds; the live frame this resume runs has to carry the same
+    // coordinate.  Its locals, stack slots and `valuestackdepth` are already
+    // in step — `setarrayitem_vable_*` and `setfield_vable_i` mirror every
+    // own-frame write into it as the sub-walk records them — but the walk
+    // stopped AT the merge point, before the opcode that would have spilled
+    // `last_instr` for it.
+    let concrete_callee_frame = match ctx.trace_ctx.concrete_of_opref(callee_frame) {
+        Some(majit_ir::Value::Ref(gcref)) if gcref.0 != 0 => {
+            gcref.0 as *mut pyre_interpreter::PyFrame
+        }
+        _ => return resolved_inline_decline(op.pc, line!()),
+    };
+    unsafe { (*concrete_callee_frame).last_instr = target_pc as isize - 1 };
+    let funcbox = ctx.trace_ctx.const_int(portal_runner_adr);
+    let next_instr_box = ctx.trace_ctx.const_int(target_pc as i64);
+    let profiled_box = ctx.trace_ctx.const_int(is_being_profiled as i64);
+    let pycode_box = ctx.trace_ctx.const_ref(w_code as i64);
+    // The `ec` red is seeded with no concrete shadow — nothing in the callee
+    // body reads it, so the seed leaves it `Null` — and the residual executor
+    // refuses to run a call whose argument has no value.  Read the live one
+    // off the frame this resume runs, the same source `walker_ec_enter` /
+    // `walker_ec_leave` take theirs from, and hand THAT to the execution; the
+    // `CALL_ASSEMBLER` recorded below keeps the `callee_ec` red itself, which
+    // is what the compiled entry needs.
+    let ec_box = ctx
+        .trace_ctx
+        .const_ref(unsafe { (*concrete_callee_frame).execution_context } as i64);
+    // `_build_allboxes` order for the portal ABI, which
+    // `build_portal_calldescr` lays out in `vars` declaration order:
+    // `[funcbox] + greens[next_instr, is_being_profiled, pycode] +
+    // reds[frame, ec]`.
+    let allboxes = [
+        funcbox,
+        next_instr_box,
+        profiled_box,
+        pycode_box,
+        callee_frame,
+        ec_box,
+    ];
     let exec = try_execute_residual_call_via_executor(
         ctx,
         OpCode::CallMayForceR,
         &allboxes,
-        call_descr,
+        portal_view,
         OpRef::NONE,
         op.pc,
         None,
@@ -2363,7 +2443,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
 /// `AttributeError: 'code' object has no attribute <name>` for an attribute
 /// their own hook answers.  Decline for those instead; their operand image
 /// comes from the per-slot resume sources
-/// ([`reconstructed_call_stack_from_resume_sources`]).
+/// ([`crate::jitcode_dispatch::collect_call_stack_overrides`]).
 ///
 /// `call_kw` is excluded for the same reason one step subtler: its list is a
 /// PERMUTATION of the stack rather than a different set of values.  The wire
@@ -2439,62 +2519,6 @@ pub(crate) fn reconstructed_all_ref_call_stack<Sym: WalkSym>(
         }
     }
     Some(stack)
-}
-
-/// Reconstruct the caller's complete operand stack at a CALL from the same
-/// per-frame sources used by multi-frame resume data.
-///
-/// `reconstructed_all_ref_call_stack` is the cheap residual-operand path, but
-/// a CALL under `with` can retain context-manager operands below it after the
-/// simple vstack mirror became unavailable.  RPython copies the complete
-/// caller MIFrame register bank.  `collect_call_stack_overrides` is pyre's
-/// existing equivalent: vstack first, then the CALL-PC color map, then this
-/// frame's virtualizable shadow.  Preserve typed `ConstPtr(NULL)` values and
-/// name an otherwise boxless null-or-self slot from the CALL layout.  Require
-/// a value for every stack slot before publishing the ordered image.
-fn reconstructed_call_stack_from_resume_sources<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    call_jitcode_pc: usize,
-) -> Option<Vec<pyre_object::PyObjectRef>> {
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return None;
-    }
-    let sym = unsafe { &*sym_ptr };
-    let jc = unsafe { sym.jitcode().as_ref()? };
-    let depth = jc.payload.depth_for_jitcode_pc_pred(call_jitcode_pc)? as usize;
-    let nlocals = sym.nlocals();
-    let Some(overrides) = collect_call_stack_overrides(sym, ctx, call_jitcode_pc) else {
-        if fbw_debug_abort_enabled() {
-            eprintln!(
-                "[fbw-abort-flush] resume stack source declined: call_jit_pc={call_jitcode_pc} \
-                 depth={depth} vstack_valid={} vstack_depth={} vstack_len={}",
-                ctx.vstack_valid,
-                ctx.vstack_depth,
-                ctx.vstack_boxes.len(),
-            );
-        }
-        return None;
-    };
-    if fbw_debug_abort_enabled() {
-        eprintln!(
-            "[fbw-abort-flush] resume stack source: call_jit_pc={call_jitcode_pc} \
-             nlocals={nlocals} depth={depth} slots={:?} vstack_valid={} vstack_depth={} \
-             vstack_len={}",
-            overrides.iter().map(|&(slot, _)| slot).collect::<Vec<_>>(),
-            ctx.vstack_valid,
-            ctx.vstack_depth,
-            ctx.vstack_boxes.len(),
-        );
-    }
-    let mut ordered = vec![None; depth];
-    for (slot, value) in overrides {
-        let rel = slot.checked_sub(nlocals)?;
-        if rel >= depth || ordered[rel].replace(value).is_some() {
-            return None;
-        }
-    }
-    ordered.into_iter().collect()
 }
 
 /// `r_args` index of the `null_or_self` operand — the one slot of a residual
@@ -6509,6 +6533,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         }
                         *dst = Some(value);
                     }
+                    // A constructor's CALL result is the instance, and the
+                    // rebuild delivers the callee's own return.  Carry the
+                    // instance so the flush can play `type_descr_call_impl`'s
+                    // tail; without a concrete Ref to carry there is nothing to
+                    // substitute and `__init__`'s `None` would reach the
+                    // caller, so refuse the rebuild instead.
+                    let constructor_instance = match constructor_result {
+                        None => pyre_object::PY_NULL,
+                        Some((_, ConcreteValue::Ref(instance))) if !instance.is_null() => instance,
+                        Some(_) => return Err("constructor instance has no concrete Ref"),
+                    };
                     Ok(MidBodyPayload {
                         abort_kind,
                         outer_jitcode_index,
@@ -6522,6 +6557,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         live_locals,
                         live_stack,
                         return_value: pyre_object::PY_NULL,
+                        constructor_instance,
                         // Attached later by `fbw_set_abort_call_resume`, which
                         // runs in the Err arm below under the entry latch's own
                         // zero-delta gate.
@@ -6779,46 +6815,31 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
-            // CODEX1 parity: decline the CA inline when the prologue sub-walk
-            // mutated the heap (any journaled effect the odometer counts — a
-            // store, a list append/pop, a cell store — or an unjournaled
-            // effect newly set during the sub-walk).  Emitting the CA here
-            // would re-run the whole call via the residual executor, applying
-            // those side effects twice at trace time.  A side-effect-free
-            // prologue (the common loop-setup-only case) still inlines.
-            if fbw_executed_effect_count() != prologue_effects_before
-                || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect())
-            {
-                // The mid-body carrier captured above resumes the live callee
-                // at this loop header, matching
-                // `run_blackhole_interp_to_cancel_tracing`.  For an
-                // expression-position CALL it also needs the caller operands
-                // below the call.  The ordinary entry latch cannot attach
-                // them here because the prologue effect delta correctly makes
-                // rewinding to the CALL unsafe; attach the stack with the
-                // pre-subwalk count so it can source the preferred rebuild
-                // while the fallback rewind remains provably disabled.
-                if let Some((outer_jitcode_index, call_jitcode_pc)) = abort_flush_call_jitcode_coord
-                    && let Some(stack) = reconstructed_all_ref_call_stack(code, op, ctx, call_descr)
-                        .or_else(|| {
-                            reconstructed_call_stack_from_resume_sources(ctx, call_jitcode_pc)
-                        })
-                {
-                    fbw_attach_midbody_call_stack(
-                        outer_jitcode_index,
-                        call_jitcode_pc,
-                        stack,
-                        executed_effects_before,
-                    );
-                }
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            // `descr_call`'s tail has no place in this fold.  The emit hands
+            // the caller `ca_result`, the compiled `__init__`'s own return,
+            // and for a constructor the CALL has to evaluate to the instance
+            // instead -- the discard, the None check and the `w_newobject`
+            // answer that `type_descr_call_impl` performs between the two
+            // frames.  The three legs that DO play it each own a resume
+            // coordinate to play it at ([`crate::ctor_continuation`] for the
+            // blackhole, `bridge_subwalk` for a bridge,
+            // `MidBodyPayload::constructor_instance` for the gh#467 rebuild);
+            // `CALL_ASSEMBLER` has none, and its `GUARD_NOT_FORCED` would
+            // resume the forced callee straight into the caller's call-result
+            // slot as well.  Residualize the whole instantiation, which is
+            // what `do_residual_call` (`pyjitpl.py`) does with a callee the
+            // tracer cannot follow: `type_descr_call_impl` then runs the tail
+            // for real, TypeError included.
+            //
+            // CONVERGENCE PATH: give the fold the tail as a paused level, the
+            // way the inline path pushes it on `InlineFrame::parents`, and the
+            // fold can be admitted for a constructor too.
+            if constructor_result.is_some() {
+                return resolved_inline_decline(op.pc, line!());
             }
             emit_walker_loop_callee_call_assembler(
                 ctx,
                 op,
-                funcptr,
-                r_args,
-                call_descr,
                 dst_bank,
                 dst,
                 ca_callee_frame,
@@ -6826,6 +6847,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 ca_nlocals,
                 token,
                 target_pc,
+                w_code,
+                is_being_profiled,
             )
         }
         other => Ok(Some((other, op.next_pc))),

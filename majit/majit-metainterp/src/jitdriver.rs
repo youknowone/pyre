@@ -782,6 +782,7 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
+use crate::warmstate::FunctionEntryStep;
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
@@ -7452,6 +7453,19 @@ impl<S: JitState> JitDriver<S> {
         self.meta
             .entry_procedure_token(green_key)
             .filter(|_| self.meta.get_compiled_meta(green_key).is_some())
+    }
+
+    /// The function-entry door's whole answer, from one walk of the cell chain.
+    ///
+    /// `MetaInterp::function_entry_step` joins the two pieces of state that live
+    /// outside the warm state -- `compiled_loops`, the frontend half of
+    /// [`Self::has_runnable_compiled_loop`], and `is_tracing` -- with the cell
+    /// read [`crate::warmstate::WarmEnterState::function_entry_step`] performs.
+    /// Neither is a chain walk, so that read is the only walk the door pays for.
+    ///
+    /// `green_key` must already name one cell; see [`Self::resolve_cell_key`].
+    pub fn function_entry_step(&mut self, green_key: u64) -> FunctionEntryStep {
+        self.meta.function_entry_step(green_key)
     }
 
     /// Turn the raw green-key hash a door arrives with into the key that names

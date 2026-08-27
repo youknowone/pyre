@@ -1417,7 +1417,7 @@
       "dynasm": "PASS"
     },
     "test.test_zipfile": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_zipfile64": {
       "dynasm": "SKIP",

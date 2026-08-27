@@ -2973,7 +2973,67 @@ pub fn dead_frame_from_ran_frame(_compiled_ptr: usize, frame_ptr: usize) -> Dead
     DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
 }
 
+/// Reconstruct a [`DeadFrame`] for a frame a FORCE interrupted while its call
+/// is still on the stack, from the coordinate `emit_force_bracket_before_call`
+/// published into it: `frame[0]` the bracketing GUARD_NOT_FORCED's exit index,
+/// `frame[1..]` that guard's fail arguments.
+///
+/// Twin of [`dead_frame_from_ran_frame`] with one difference: a force is not an
+/// exit, so it must not consume the pending-exception cell. `jit_exc_take`
+/// clears what it reads, and the frame this force interrupted goes on running
+/// afterwards -- draining the cell here would lose an exception the trace has
+/// not delivered yet.
+/// The data region of the frame a force token names — the address the trace
+/// itself carries in local 0.
+fn forced_frame_items_base(force_token: GcRef) -> usize {
+    force_token.0 + majit_backend::jitframe::FIRST_ITEM_OFFSET
+}
+
+fn dead_frame_from_forced_frame(frame_ptr: usize) -> DeadFrame {
+    let frame = frame_ptr as *const i64;
+    let fail_index = unsafe { *frame } as u32;
+    let fail_descr =
+        global_fail_descr(fail_index).expect("invalid fail_index from a forced wasm frame");
+    let num_outputs = exit_slot_count(&fail_descr);
+    let raw_values: Vec<i64> = (0..num_outputs)
+        .map(|i| unsafe { *frame.add(1 + i) })
+        .collect();
+    DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, 0))
+}
+
 impl majit_backend::Backend for WasmBackend {
+    /// `force(token)` where the token is what `FORCE_TOKEN` parked in the
+    /// virtualizable: the running frame's `JitFrame`, whose data region starts
+    /// `FIRST_ITEM_OFFSET` in.
+    ///
+    /// A zero token means no frame is holding the virtualizable, which is the
+    /// interpreter-only state the default answers `None` for.
+    fn force(&self, force_token: GcRef) -> Option<DeadFrame> {
+        if force_token.0 == 0 {
+            return None;
+        }
+        // runner.rs `force` on the native backends: assert the frame carries the
+        // bracket its call published, then mark it so the GUARD_NOT_FORCED
+        // waiting past that call deopts instead of running on.
+        let items_base = forced_frame_items_base(force_token);
+        let slot = items_base as *mut i64;
+        let word = unsafe { *slot };
+        assert_ne!(
+            word & codegen::FORCE_ARMED_BIT,
+            0,
+            "force: wasm frame 0x{items_base:x} carries no force bracket",
+        );
+        unsafe { *slot = word | codegen::FORCE_TAKEN_BIT };
+        Some(dead_frame_from_forced_frame(items_base))
+    }
+
+    fn is_force_token_armed(&self, force_token: GcRef) -> bool {
+        force_token.0 != 0
+            && unsafe { *(forced_frame_items_base(force_token) as *const i64) }
+                & codegen::FORCE_ARMED_BIT
+                != 0
+    }
+
     fn supports_efficient_uint_mul_high(&self) -> bool {
         // WebAssembly has no high-half integer multiply.  The fallback in
         // codegen is multi-precision software, while i64.div/rem are native

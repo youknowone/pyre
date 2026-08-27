@@ -10598,6 +10598,24 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
+    /// The function-entry door's whole answer, from one walk of the cell chain
+    /// — see [`crate::warmstate::WarmEnterState::function_entry_step`].
+    ///
+    /// Lives here rather than on `JitDriver` because the two pieces of state it
+    /// joins are separate FIELDS of this struct: `compiled_loops`, borrowed
+    /// into the closure, and `warm_state`, borrowed mutably by the step. The
+    /// closure is what keeps the map out of the cold path, where the cell holds
+    /// no token and there is nothing for the map to confirm.
+    pub fn function_entry_step(&mut self, green_key: u64) -> crate::warmstate::FunctionEntryStep {
+        let engine_is_tracing = self.is_tracing();
+        let compiled_loops = &self.compiled_loops;
+        self.warm_state.function_entry_step(
+            green_key,
+            || compiled_loops.contains_key(&green_key),
+            engine_is_tracing,
+        )
+    }
+
     /// Record the loop-header bytecode pc for a compiled-loop green key, so a
     /// later bridge whose guard belongs to this loop knows where its parent
     /// loop header lives (the close target of the bridge JUMP).

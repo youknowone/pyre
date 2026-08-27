@@ -26,6 +26,28 @@ use wasm_encoder::{
 pub const FRAME_SLOT_BASE: u64 = 8;
 const SLOT_SIZE: u64 = 8;
 
+/// `frame[0]` is this backend's `jf_descr`: the u32 exit index a guard failure
+/// stamps on its way out. Two bits above that index carry the force protocol
+/// jitframe.py splits across two fields.
+///
+/// [`FORCE_ARMED_BIT`] stands in for `jf_force_descr`:
+/// `_store_force_index_if_next_guard` publishes the bracketing
+/// GUARD_NOT_FORCED's coordinate before a call that may force, and
+/// `Backend::force` refuses a frame carrying none.
+///
+/// [`FORCE_TAKEN_BIT`] stands in for what `force` then writes into `jf_descr`,
+/// the mark `genop_guard_guard_not_forced` reads with
+/// `CMP [rbp + jf_descr], 0` to turn a force that landed inside the call into a
+/// deopt.
+///
+/// Keeping both in `frame[0]` rather than in the real `JitFrame` header keeps
+/// the protocol inside the local-0-relative data region, which is the one part
+/// of the layout both the orthodox JitFrame path and the legacy host-Vec path
+/// share. The host reads `frame[0] as u32`, so neither bit disturbs the index,
+/// and a guard exit's own store clears both.
+pub(crate) const FORCE_TAKEN_BIT: i64 = 1 << 32;
+pub(crate) const FORCE_ARMED_BIT: i64 = 1 << 33;
+
 /// Scratch i64 locals reserved past the value locals for `emit_umulhi`
 /// (al, ah, bl, bh, mid1).
 const UMULHI_SCRATCH: u32 = 5;
@@ -1767,10 +1789,12 @@ const WASM_DIRECT_RESIDUAL_CALL: bool = true;
 /// trampoline: void / float / release-GIL / cond / assembler calls, a missing
 /// call descr, or an arg-count/descr-shape mismatch (defensive).
 ///
-/// This includes `CallMayForce{I,R}` when their ABI is uniformly i64: the wasm
-/// virtualizable is always materialized, so `GuardNotForced` is a no-op and a
-/// direct call is sound. Float / release-GIL / cond / assembler calls and
-/// non-reflectable descrs remain on the trampoline.
+/// This includes `CallMayForce{I,R}` when their ABI is uniformly i64: the force
+/// protocol rides the frame's own data region
+/// (`emit_force_bracket_before_call` before the call, `GuardNotForced` after),
+/// which neither lowering touches, so a direct call is sound. Float /
+/// release-GIL / cond / assembler calls and non-reflectable descrs remain on
+/// the trampoline.
 fn residual_call_i64_arity(op: &Op) -> Option<usize> {
     use OpCode::*;
     if !matches!(
@@ -1822,8 +1846,9 @@ type TypedResidualSig = (Vec<ValType>, Option<ValType>);
 /// non-float argument or result type, or an arg-count/descr-shape mismatch
 /// (defensive).
 ///
-/// This includes `CallMayForceF`: the wasm virtualizable is always
-/// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
+/// This includes `CallMayForceF`: the force protocol rides the frame's own data
+/// region (`emit_force_bracket_before_call` before the call, `GuardNotForced`
+/// after), which neither lowering touches, so a direct call is sound.
 fn residual_call_typed_sig(
     op: &Op,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -1909,8 +1934,10 @@ fn residual_call_typed_sig(
 /// (`result_size == 8`, minted by `make_call_descr_void_word_abi`) — the
 /// callee is really `(i64×n) -> i64` with the result ignored, so it lowers
 /// through the same i64 type family with a trailing `drop`. This includes
-/// `CallMayForceN` with the word ABI: the wasm virtualizable is always
-/// materialized, so `GuardNotForced` is a no-op and a direct call is sound.
+/// `CallMayForceN` with the word ABI: the force protocol rides the frame's own
+/// data region (`emit_force_bracket_before_call` before the call,
+/// `GuardNotForced` after), which neither lowering touches, so a direct call is
+/// sound.
 /// Float / release-GIL / cond / assembler calls and non-reflectable descrs
 /// remain on the trampoline.
 fn residual_call_void_word_arity(op: &Op) -> Option<usize> {
@@ -4402,8 +4429,29 @@ fn build_function(
                 }
                 guard_idx += 1;
             }
-            // Force-token guards still always pass in the wasm backend.
             OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+                // x86/assembler.py genop_guard_guard_not_forced:
+                // `CMP [rbp + jf_descr], 0`, fail when nonzero. `Backend::force`
+                // stamps that mark on its way out, so this guard is what turns a
+                // force that landed inside the preceding call into a deopt: the
+                // trace must not run on holding virtualized fields the force has
+                // already written back, and the virtuals `handle_async_forcing`
+                // materialized are attached for THIS exit's resume to consume.
+                sink.local_get(0);
+                sink.i64_load(mem64(0));
+                sink.i64_const(FORCE_TAKEN_BIT);
+                sink.i64_and();
+                sink.i64_const(0);
+                sink.i64_ne();
+                emit_guard_if_exit(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    guard_idx,
+                    op,
+                    block_exit_depth,
+                    guard_dispatch,
+                );
                 guard_idx += 1;
             }
             OpCode::GuardNoException => {
@@ -5403,6 +5451,14 @@ fn build_function(
             // Refs still hold pre-call (from-space) addresses on return, so
             // reload them from the (forwarded) homes after the call.
             opcode if opcode.is_call_assembler() && ca.emit_ca => {
+                emit_force_bracket_before_call(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    ops,
+                    op_idx,
+                    guard_idx,
+                );
                 let vi = op.pos.get().raw();
                 let descr = op
                     .getdescr()
@@ -5772,6 +5828,14 @@ fn build_function(
             | OpCode::CallMayForceF
             | OpCode::CallAssemblerF
             | OpCode::CallReleaseGilF => {
+                emit_force_bracket_before_call(
+                    &mut sink,
+                    constants,
+                    value_types,
+                    ops,
+                    op_idx,
+                    guard_idx,
+                );
                 let vi = op.pos.get().raw();
                 let can_collect = call_can_collect(op);
 
@@ -6629,7 +6693,29 @@ fn build_function(
             OpCode::ForceToken => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    sink.i64_const(0); // sentinel force token
+                    // `FORCE_TOKEN/0/r` — "nowadays, returns the jitframe".
+                    // The token is what the SETFIELD_GC that follows parks in
+                    // the virtualizable's `vable_token`, and what
+                    // `Backend::force` is handed to rebuild a deadframe from,
+                    // so it has to NAME this frame. A zero here reads as "no
+                    // JIT frame is holding this virtualizable", which makes
+                    // `force_virtualizable_if_necessary` skip the force and
+                    // leaves an `f_locals` read to answer out of whatever the
+                    // frame's own array last received.
+                    //
+                    // Answer the `JitFrame` BASE, not the items base local 0
+                    // holds: the result of this op is Ref-typed, so it takes a
+                    // Ref home slot, and both `build_home_gcmap` and
+                    // `build_callee_gcmap` mark those slots for the collector.
+                    // An items base is an interior pointer; traced as an object
+                    // it reads its type id out of the frame's `jf_forward` word.
+                    // The object base is a real GCREF, so a CA callee frame that
+                    // moves out of the nursery under the very call this token
+                    // brackets is forwarded here like any other reference.
+                    sink.local_get(0);
+                    sink.i32_const(majit_backend::jitframe::FIRST_ITEM_OFFSET as i32);
+                    sink.i32_sub();
+                    sink.i64_extend_i32_u();
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -7639,6 +7725,56 @@ fn emit_guard_bridge_dispatch(
         + (guard_idx - dispatch.fail_index_base) * std::mem::size_of::<u32>() as u32;
     sink.i32_const(cell_addr as i32);
     sink.local_set(dispatch.bridge_slot_local);
+}
+
+/// x86 `_store_force_index_if_next_guard`: a call that may force is bracketed
+/// by the `GUARD_NOT_FORCED` immediately after it, and a force that lands
+/// INSIDE the call reads the frame that guard describes -- upstream stores the
+/// guard's descr into `jf_force_descr` before the call for exactly that reason.
+/// Publish the same coordinate here: the guard's exit index in `frame[0]` and
+/// its fail arguments in the exit slots, written BEFORE the call rather than on
+/// a failure branch, because the reader runs while the call is still on the
+/// stack. Without it `Backend::force` reads whatever exit last wrote the frame,
+/// which is a different iteration's values.
+fn emit_force_bracket_before_call(
+    sink: &mut PeepSink<'_, '_>,
+    constants: &indexmap::IndexMap<u32, i64>,
+    value_types: &ValueLocals,
+    ops: &[Op],
+    op_idx: usize,
+    guard_idx: u32,
+) {
+    let Some(next_op) = ops.get(op_idx + 1) else {
+        return;
+    };
+    if !matches!(
+        next_op.opcode,
+        OpCode::GuardNotForced | OpCode::GuardNotForced2
+    ) {
+        return;
+    }
+    // Everything the guard names is defined by an op at or before the call --
+    // except the call's own result, whose local still holds the PREVIOUS
+    // iteration's value here. `build_callee_gcmap` marks the exit slots of a
+    // CALL_ASSEMBLER callee frame as traced, so parking a stale word there
+    // hands the collector a Ref that nothing keeps alive; store a null instead
+    // and let the guard's own failure branch fill in the real result.
+    //
+    // `counter_value_spill` answers `None` for anything but a GUARD_VALUE, so
+    // the counter slot has nothing to contribute to a force bracket.
+    let undefined = ops[op_idx].pos.get().raw();
+    for (i, &arg_ref) in exit_fail_args(next_op).iter().enumerate() {
+        sink.local_get(0);
+        if arg_ref.raw() == undefined {
+            sink.i64_const(0);
+        } else {
+            emit_resolve(sink, constants, value_types, arg_ref);
+        }
+        sink.i64_store(mem64(FRAME_SLOT_BASE + i as u64 * SLOT_SIZE));
+    }
+    sink.local_get(0);
+    sink.i64_const(exit_index(next_op, guard_idx) as i64 | FORCE_ARMED_BIT);
+    sink.i64_store(mem64(0));
 }
 
 fn emit_guard_spill(
