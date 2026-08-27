@@ -5758,7 +5758,13 @@ impl<S: JitState> JitDriver<S> {
             // compile.py handle_fail
             let fail_index = result.fail_index;
             let trace_id = result.trace_id;
-            let exit_layout = result.exit_layout.clone();
+            // Taken, not cloned: `result` is dropped a few lines below, and
+            // the finish arm above — the one that carries no layout — has
+            // already returned.
+            let exit_layout = *result
+                .exit_layout
+                .take()
+                .expect("a guard exit carries its exit layout");
             let raw_values = result.values.clone();
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
             let guard_value_operand = result.guard_value_operand;
@@ -7339,7 +7345,9 @@ impl<S: JitState> JitDriver<S> {
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
         let descr_arc = std::sync::Arc::clone(&result.descr_arc);
-        let exit_layout = result.exit_layout.clone();
+        // The pointer travels; the layout behind it is opened past the finish
+        // arm below, which is the one that carries none.
+        let exit_layout = result.exit_layout.take();
         // Taken, not copied: every field this arm needs is read out here and
         // `result` is dropped just below, so neither buffer has a reader left.
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
@@ -7375,6 +7383,7 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // compile.py handle_fail / must_compile: single tick+check.
+        let exit_layout = *exit_layout.expect("a guard exit carries its exit layout");
         let fallback_green_key = if exit_layout.rd_loop_token != 0 {
             exit_layout.rd_loop_token
         } else {

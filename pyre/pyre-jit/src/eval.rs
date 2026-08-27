@@ -7102,13 +7102,25 @@ fn drive_unpack_iterable_trace(
             // Extract owned copies so the `&mut meta` borrow held by the
             // `CompileResult` is released before the blackhole resume (which
             // re-acquires `driver_pair()`).
-            let Some((is_finish, fail_index, has_storage, values, exit_layout, guard_exc)) = meta
+            let Some((
+                is_finish,
+                is_exception_exit,
+                fail_index,
+                has_storage,
+                values,
+                exit_layout,
+                guard_exc,
+            )) = meta
                 .run_compiled_detailed_with_values(green_key, &live_values)
                 .map(|r| {
                     (
                         r.is_finish,
+                        // Off the result, not off the layout: a finish exit
+                        // carries no layout, and the flag one would have held
+                        // is a copy of this word.
+                        r.is_exit_frame_with_exception,
                         r.fail_index,
-                        r.exit_layout.storage.is_some(),
+                        r.exit_layout.as_ref().is_some_and(|l| l.storage.is_some()),
                         r.values.clone(),
                         r.exit_layout.clone(),
                         r.exception.exc_value,
@@ -7124,7 +7136,7 @@ fn drive_unpack_iterable_trace(
                 // `ExitFrameWithExceptionRef` trace as the loop for this green
                 // key, so the next crossing lands here). `compile.py`
                 // takes the value from result slot 0, not from `jf_guard_exc`.
-                if exit_layout.is_exception_exit {
+                if is_exception_exit {
                     pending_err = drain_error_from_exc_ref(values.first().copied().unwrap_or(0));
                 }
                 break;
@@ -7147,7 +7159,9 @@ fn drive_unpack_iterable_trace(
             // `next()`/`append` and run forward to the next merge point.
             let bh = resume_in_blackhole_from_exit_layout(
                 &values,
-                &exit_layout,
+                exit_layout
+                    .as_deref()
+                    .expect("a guard exit carrying resume storage carries its layout"),
                 guard_exc,
                 // jd1 is novable: it has no virtualizable to force.
                 std::ptr::null(),
