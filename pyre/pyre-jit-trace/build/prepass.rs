@@ -29,12 +29,17 @@ const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v16";
 /// switches between (native/wasm × release/dev) inside 300 MB.
 ///
 /// A cache shared between worktrees (`PYRE_JIT_TRACE_CACHE_DIR`) has to hold
-/// every checkout's working set at once. Eight slots divided between ten
-/// worktrees evict each other faster than they serve, which is slower than not
-/// sharing at all, so the shared default is sized for the worktrees rather than
-/// for one of them.
+/// every checkout's working set at once, so its floor is the number of
+/// checkouts times the local figure. Below that floor an active worktree ends
+/// up with fewer entries than it had on its own, which is slower than not
+/// sharing at all -- so the multiplier is spelled out rather than folded into a
+/// literal, and `PYRE_JIT_TRACE_CACHE_ENTRIES` raises it for a machine carrying
+/// more. The cap only evicts, so the disk cost follows the entries a machine
+/// actually produces.
 const CODEGEN_CACHE_MAX_ENTRIES_LOCAL: usize = 8;
-const CODEGEN_CACHE_MAX_ENTRIES_SHARED: usize = 48;
+const CODEGEN_CACHE_SHARED_CHECKOUTS: usize = 12;
+const CODEGEN_CACHE_MAX_ENTRIES_SHARED: usize =
+    CODEGEN_CACHE_SHARED_CHECKOUTS * CODEGEN_CACHE_MAX_ENTRIES_LOCAL;
 /// A cache version nothing has touched for this long belongs to no working
 /// set. Only consulted for a shared cache; see `prune_codegen_cache`.
 const CODEGEN_CACHE_STALE_VERSION: std::time::Duration =
@@ -1979,11 +1984,17 @@ fn llbc_layout_sidecars() -> Vec<String> {
 ///
 /// Sharing is sound because `codegen_cache_key` derives the key from content
 /// alone -- workspace sources, `Cargo.lock`, the rustc version string, the LLBC
-/// inputs -- and never from a path. Two worktrees whose trees agree therefore
-/// agree on the key, and the entry one of them stored answers for the other.
-/// The store is already safe to race on: it stages into a pid-suffixed sibling
-/// and renames, and concedes without error when another process got there
-/// first.
+/// inputs -- and never from a path, so an entry stored by one checkout is
+/// legible to every other. The store is already safe to race on: it stages into
+/// a pid-suffixed sibling and renames, and concedes without error when another
+/// process got there first.
+///
+/// What that buys is capacity, not deduplication. Checkouts on different
+/// branches disagree on the key -- twelve of them held 77 distinct keys with
+/// none in common -- because the extracted LLBC alone differs wherever the
+/// interpreter does. The win is that one LRU pool hands its slots to whichever
+/// checkouts are building, instead of every idle one holding a local quota that
+/// nothing is going to ask for.
 ///
 /// Deliberately absent from `codegen_cache_key`: keying on where the cache
 /// lives would give each worktree its own key again and defeat the point.
