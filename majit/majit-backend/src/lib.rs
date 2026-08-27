@@ -3835,9 +3835,12 @@ pub struct JittedGuard {
 
 impl JittedGuard {
     /// Create a new guard, setting `we_are_jitted()` to `true`.
+    ///
+    /// Read and set in one thread-local access rather than through the two
+    /// public accessors: this runs on every entry into compiled code, and the
+    /// pair resolved the same key twice.
     pub fn enter() -> Self {
-        let prev = we_are_jitted();
-        set_jitted(true);
+        let prev = JIT_MODE_FLAG.with(|f| f.replace(true));
         JittedGuard { prev }
     }
 }

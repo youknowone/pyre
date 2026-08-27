@@ -423,6 +423,7 @@ pub fn bh_debug_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_BH_DEBUG").is_some())
 }
 
+#[inline]
 pub fn callee_rca_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_CALLEE_RCA").is_some())

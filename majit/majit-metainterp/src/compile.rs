@@ -249,7 +249,20 @@ pub struct CompileResult<M> {
     /// `pyjitpl.py compile_exit_frame_with_exception`).
     /// jitdriver routes this to `jitexc.ExitFrameWithExceptionRef`.
     pub is_exit_frame_with_exception: bool,
-    pub exit_layout: CompiledExitLayout,
+    /// The failing guard's exit description, and `None` on a FINISH exit.
+    ///
+    /// Held behind a pointer for the reason
+    /// [`CompiledExitLayout::recovery_layout`] gives one level down, applied to
+    /// the layout as a whole: this result is returned BY VALUE from every
+    /// compiled entry, so an inline layout is bytes moved on each one. Every
+    /// reader (`jitdriver`'s two run loops and pyre's drain loop) opens the
+    /// layout only past its own FINISH and `fail_index == u32::MAX` arms, so a
+    /// call that returns through either was copying a layout nothing read.
+    ///
+    /// The allocation lands where the layout is built, which the FINISH arm now
+    /// returns before reaching. A FINISH exit stores one null word here, so the
+    /// steady entry path's allocation count is unchanged.
+    pub exit_layout: Option<Box<CompiledExitLayout>>,
     pub savedata: Option<GcRef>,
     pub exception: ExceptionState,
     /// compile.py: ResumeGuardDescr.status read at guard failure.

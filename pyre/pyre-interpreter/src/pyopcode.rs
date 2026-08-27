@@ -1794,12 +1794,9 @@ fn u32_as_i64(x: u32) -> i64 {
 /// provide a `From<u32> for usize` impl (u32 → usize is not
 /// universally lossless: 16-bit hosts have `usize` smaller than u32).
 /// On supported pyre targets (64-bit Darwin) the conversion is
-/// always lossless, so the runtime `expect(...)` never trips. Walker
-/// lowers as `simple_call(getattr(<usize>, "try_from"), x).expect(…)`
-/// — `lower_method_call` then chains the `.expect` getattr+simple_call
-/// per `build_flow.rs:lower_method_call`. Drop `const fn` because
-/// neither `usize::try_from` nor `Result::expect` is yet stable as
-/// const.
+/// always lossless, so the runtime `expect(...)` never trips. Drop
+/// `const fn` because neither `usize::try_from` nor `Result::expect` is
+/// yet stable as const.
 #[inline]
 fn u32_as_usize(x: u32) -> usize {
     usize::try_from(x).expect("u32 fits in usize on supported pyre targets (64-bit only)")

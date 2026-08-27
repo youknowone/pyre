@@ -234,11 +234,21 @@ impl<T: Copy> VirtArray<T> {
     /// alone — so a length change is a reallocation. A length that does not
     /// change is not, which is the case a caller reusing one array across calls
     /// is in.
+    ///
+    /// The unchanged case inlines to the length compare and the reallocation
+    /// does not, so a caller that reuses one array across calls pays a load and
+    /// a branch rather than a call frame.
+    #[inline]
     pub fn resize(&mut self, new_len: usize, value: T) {
-        let old_len = self.len();
-        if new_len == old_len {
+        if new_len == self.len() {
             return;
         }
+        self.reallocate(new_len, value);
+    }
+
+    #[inline(never)]
+    fn reallocate(&mut self, new_len: usize, value: T) {
+        let old_len = self.len();
         let mut grown = Self::with_len(new_len);
         let kept = old_len.min(new_len);
         grown[..kept].copy_from_slice(&self[..kept]);

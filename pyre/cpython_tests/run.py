@@ -11,8 +11,8 @@ Each module is launched one of three ways, selectable with `--mode`:
 
   * script (default): `pyre <path>/test_xxx.py` — runs the test file directly
     as `__main__` so its `if __name__ == "__main__": unittest.main()` block
-    fires. Needs only `unittest` plus the module's own imports, so it remains
-    the most robust mode today. A package, and a file carrying no such block,
+    fires. Needs only `unittest` plus the module's own imports, making it the
+    most robust default. A package, and a file carrying no such block,
     go through a synthesized unittest entry instead — running those directly
     exits 0 without testing anything. Runner metadata gives
     resource-heavy or dotted-identity-sensitive modules the corresponding
@@ -837,18 +837,114 @@ def host_baseline_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}.{HOST_TAG}{path.suffix}")
 
 
-def expected_status(baseline: dict, overlay: dict, module: str,
-                    backend: str) -> str | None:
-    """Recorded verdict for `module`, the host overlay winning over the shared
-    file.  Within one file `dynasm` stands in for a backend with no entry."""
-    for source in (overlay, baseline):
+# Metadata keys stored beside per-backend verdicts in a module entry.
+NON_BACKEND_ENTRY_KEYS = ("reason", "provenance")
+
+
+def cell_sources(baseline: dict, overlay: dict) -> tuple[dict, dict]:
+    """The two files a cell can come from, in the order they are consulted.
+
+    One helper rather than the pair spelled at each site: `expected_cell` and
+    `cell_provenance` have to agree about precedence, or a status read from the
+    host overlay is graded against an axis read from the shared file.
+    """
+    return (overlay, baseline)
+
+
+def expected_cell(baseline: dict, overlay: dict, module: str,
+                  backend: str) -> tuple[str | None, str | None]:
+    """Return a status and the backend that recorded it.
+
+    The host overlay is consulted before the shared file, and a cell it holds
+    wins — including when it answers by borrowing `dynasm`. An overlay row that
+    holds no cell for this backend is not an answer, though: `write_baseline`
+    mints a row carrying only the backend whose status diverged on this host,
+    so a row exists for every module any backend ever diverged on. Treating
+    that as an answer would drop the shared file's expectation for every OTHER
+    backend, and a module recorded PASS there would stop being one — no longer
+    selected by the gate, and no longer a regression when it fails.
+
+    Missing backend cells fall back to dynasm; returning the source makes that
+    substitution visible to selection and reporting.
+    """
+    for source in cell_sources(baseline, overlay):
         entry = source.get("modules", {}).get(module)
         if entry is None:
             continue
-        status = entry.get(backend) or entry.get("dynasm")
-        if status is not None:
-            return status
+        own = entry.get(backend)
+        if own:
+            return own, backend
+        borrowed = entry.get("dynasm")
+        if borrowed:
+            return borrowed, "dynasm"
+    return None, None
+
+
+def cell_provenance(baseline: dict, overlay: dict, module: str,
+                    backend: str) -> dict | None:
+    """Return the recorded measurement axis, or None for legacy cells.
+
+    Reads the same source order as `expected_cell`, and falls through the same
+    way, so the axis returned is the one under the status that lookup returned.
+    Reading only the shared file here would pair an overlay host's status with
+    the axis of a cell it overrode; stopping at a row that holds no cell for
+    this backend would pair a shared-file status with no axis at all.
+    """
+    for source in cell_sources(baseline, overlay):
+        entry = source.get("modules", {}).get(module)
+        if entry is None:
+            continue
+        prov = entry.get("provenance", {}).get(backend)
+        if prov is not None:
+            return prov
     return None
+
+
+def run_axis(args: argparse.Namespace, binary: Path) -> dict:
+    """Return the configuration that gives this run's statuses meaning."""
+    return {
+        "backend": args.backend,
+        # Name only, not the resolved path: the absolute path is host state and
+        # would rewrite every cell on a different machine without any of them
+        # having been re-measured.
+        "binary": binary.name,
+        "mode": args.mode,
+        "jit": not args.no_jit,
+        "stdlib_version": stdlib_version(),
+    }
+
+
+def axis_drift_report(baseline: dict, overlay: dict, selected: list[str],
+                      axis: dict) -> list[str]:
+    """Report axis drift for cells recorded by the requested backend.
+
+    Borrowed cells are reported separately. Drift is informational because
+    legacy cells do not carry provenance.
+    """
+    unrecorded = 0
+    differing: dict[str, int] = {}
+    compared = 0
+    for m in selected:
+        _status, src = expected_cell(baseline, overlay, m, axis["backend"])
+        if src != axis["backend"]:
+            continue
+        prov = cell_provenance(baseline, overlay, m, src)
+        if prov is None:
+            unrecorded += 1
+            continue
+        compared += 1
+        for key, value in axis.items():
+            if key == "backend":
+                continue
+            if prov.get(key) != value:
+                differing[key] = differing.get(key, 0) + 1
+    own = compared + unrecorded
+    lines = [f"{compared} of {own} own-backend cells carry a recorded axis, "
+             f"{unrecorded} predate it"]
+    for key in sorted(differing):
+        lines.append(f"  axis drift: {differing[key]} of {compared} recorded "
+                     f"under a different {key} (this run: {axis[key]!r})")
+    return lines
 
 
 # ── main ─────────────────────────────────────────────────────────────
@@ -915,6 +1011,8 @@ def main() -> int:
     overlay_path = host_baseline_path(args.baseline)
     overlay = load_baseline(overlay_path) if overlay_path.exists() else {"modules": {}}
     modules = discover_modules(args.filter)
+    # Derive once for reports, baseline updates, and drift checks.
+    axis = run_axis(args, binary)
 
     if args.list:
         for m in modules:
@@ -953,6 +1051,8 @@ def main() -> int:
     skipped: list[str] = []
     off_platform: list[tuple[str, str]] = []
     deselected = 0
+    # Selected modules whose expected status came from another backend.
+    borrowed_gated: list[str] = []
     for m in modules:
         # Even full/update runs must not overwrite another platform's result.
         gate_reason = platform_gate(m)
@@ -960,7 +1060,7 @@ def main() -> int:
             off_platform.append((m, gate_reason))
             skipped.append(m)
             continue
-        exp = expected_status(baseline, overlay, m, args.backend)
+        exp, exp_src = expected_cell(baseline, overlay, m, args.backend)
         is_skip = (exp == "SKIP") or (m in KNOWN_SKIPS)
         if is_skip and not args.full and not args.update_baseline:
             skipped.append(m)
@@ -969,9 +1069,12 @@ def main() -> int:
             deselected += 1
             continue
         to_run.append(m)
+        if exp_src is not None and exp_src != args.backend:
+            borrowed_gated.append(m)
 
-    print(f"pyre CPython suite — backend={args.backend} mode={args.mode} "
-          f"jit={'off' if args.no_jit else 'on'} jobs={args.jobs}")
+    # Print the same derived axis that baseline updates record.
+    print(f"pyre CPython suite — backend={axis['backend']} mode={axis['mode']} "
+          f"jit={'on' if axis['jit'] else 'off'} jobs={args.jobs}")
     print(f"binary: {binary}")
     overlay_count = len(overlay.get("modules", {}))
     print(f"baseline: {args.baseline.name} + "
@@ -981,7 +1084,13 @@ def main() -> int:
         print(f"  off-platform on {sys.platform}: {m} ({reason})")
     extra = f", {deselected} not gated (non-PASS)" if deselected else ""
     print(f"{len(to_run)} to run, {len(skipped)} skipped{extra}, "
-          f"timeout={args.timeout}s\n")
+          f"timeout={args.timeout}s")
+    # Expose how much of this run was gated against another backend.
+    print(f"{len(borrowed_gated)} of {len(to_run)} gated against another "
+          f"backend's recorded status")
+    for line in axis_drift_report(baseline, overlay, to_run, axis):
+        print(line)
+    print()
 
     results: dict[str, tuple[str, str]] = {}
     done = 0
@@ -1049,11 +1158,16 @@ def main() -> int:
     regressions: list[str] = []
     improvements: list[str] = []
     for m, (status, detail) in sorted(results.items()):
-        exp = expected_status(baseline, overlay, m, args.backend)
+        exp, exp_src = expected_cell(baseline, overlay, m, args.backend)
+        # Name the backend a verdict is measured against whenever it is not the
+        # one under test. Without it a regression line reads as this backend
+        # having gone from PASS to FAIL, when what happened may be that this
+        # backend was never recorded passing.
+        via = "" if exp_src in (None, args.backend) else f" (expected from {exp_src})"
         if exp == "PASS" and status != "PASS":
-            regressions.append(f"{m}: PASS -> {status}  {detail}")
+            regressions.append(f"{m}: PASS -> {status}{via}  {detail}")
         elif exp != "PASS" and status == "PASS":
-            improvements.append(f"{m}: {exp or 'new'} -> PASS")
+            improvements.append(f"{m}: {exp or 'new'} -> PASS{via}")
 
     if improvements:
         print(f"\n── improvements ({len(improvements)}) ──")
@@ -1062,10 +1176,7 @@ def main() -> int:
 
     if args.report:
         report = {
-            "backend": args.backend,
-            "mode": args.mode,
-            "jit": not args.no_jit,
-            "stdlib_version": stdlib_version(),
+            **axis,
             "counts": counts,
             "modules": {m: {"status": s, "detail": d}
                         for m, (s, d) in sorted(results.items())},
@@ -1076,11 +1187,18 @@ def main() -> int:
         print(f"\nreport written: {args.report}")
 
     if args.update_baseline:
-        written = write_baseline(args.baseline, baseline, overlay, results,
-                                 args.backend)
+        # `axis`, not `args.backend`: the cells this writes record the axis
+        # they were measured along, and `run_axis` is the one place that
+        # derives it.
+        written = write_baseline(args.baseline, baseline, overlay, results, axis)
         recorded = sum(1 for s, _ in results.values() if s == "PASS")
         for target in written:
             print(f"\nbaseline written: {target} ({recorded} PASS recorded)")
+        # Read the file as written, not as loaded: this bless repairs some of
+        # what these would otherwise name, and a report naming a cell the same
+        # run just corrected is wrong the moment it prints.
+        for line in phantom_row_report(baseline) + stale_curated_cell_report(baseline):
+            print(line)
         return 0
 
     if regressions:
@@ -1101,8 +1219,41 @@ def main() -> int:
     return 0
 
 
+def phantom_row_report(baseline: dict) -> list[str]:
+    """Lines naming baseline rows that no longer have a discoverable module.
+
+    Rows are reported rather than deleted because the caller may be running a
+    filtered subset. Discovery is repeated without that filter here.
+    """
+    rows = baseline.get("modules", {})
+    phantom = sorted(set(rows) - set(discover_modules(None)))
+    if not phantom:
+        return []
+    return [f"{len(phantom)} of {len(rows)} baseline rows have no discoverable "
+            f"module (carried unchanged, not gated):"] + [f"  ? {m}" for m in phantom]
+
+
+def stale_curated_cell_report(baseline: dict) -> list[str]:
+    """Lines naming cells on a curated-skip row that still record a measurement.
+
+    `KNOWN_SKIPS` already governs selection, so these cells are inert. Preserve
+    their last measured status in case the module leaves the curated skip set.
+    """
+    rows = baseline.get("modules", {})
+    stale = [(m, backend, status)
+             for m, entry in sorted(rows.items()) if m in KNOWN_SKIPS
+             for backend, status in sorted(entry.items())
+             if backend not in NON_BACKEND_ENTRY_KEYS and status != "SKIP"]
+    if not stale:
+        return []
+    return [f"{len(stale)} cell(s) on {len({m for m, _, _ in stale})} curated-skip "
+            f"row(s) still record a measurement (reported, not synced — the "
+            f"curated table governs selection, so these are stale and inert):"] + [
+        f"  * {m} [{backend}] {status}" for m, backend, status in stale]
+
+
 def write_baseline(path: Path, baseline: dict, overlay: dict, results: dict,
-                   backend: str) -> list[Path]:
+                   axis: dict) -> list[Path]:
     """Record `results`, splitting them between the shared baseline and this
     host's overlay.  Returns the files actually written.
 
@@ -1111,11 +1262,20 @@ def write_baseline(path: Path, baseline: dict, overlay: dict, results: dict,
     that a host writes to its own overlay only where it disagrees, and a run
     that comes back into agreement drops the overlay entry again -- so an
     overlay never outlives the divergence that created it.
+
+    A cell's provenance travels with the status into whichever of the two files
+    ends up holding it, so an overlay cell is a measurement with an axis under
+    it rather than a bare status.
     """
+    backend = axis["backend"]
     modules = baseline.setdefault("modules", {})
     overlay_modules = overlay.setdefault("modules", {})
+    # Keep the legacy file-level value; per-cell provenance is authoritative for
+    # a measurement's stdlib version.
     baseline["stdlib_version"] = stdlib_version()
     overlay_dirty = False
+    # The containing cell already identifies the backend.
+    cell_axis = {k: v for k, v in axis.items() if k != "backend"}
     for m, (status, _detail) in results.items():
         # Defensive: never overwrite another platform's recorded result.
         if platform_gate(m) is not None:
@@ -1128,24 +1288,56 @@ def write_baseline(path: Path, baseline: dict, overlay: dict, results: dict,
         if m in KNOWN_SKIPS:
             entry = modules.setdefault(m, {})
             entry[backend] = "SKIP"
-            entry.setdefault("reason", KNOWN_SKIPS[m])
+            # Curated reasons are row-wide and refreshed from their source of
+            # truth. Warn before replacing a different recorded rationale.
+            recorded = entry.get("reason")
+            if recorded is not None and recorded != KNOWN_SKIPS[m]:
+                # Leading blank line: the improvements block prints immediately
+                # above, and an unseparated `  ! ` line reads as one of its rows.
+                print(f"\n  ! {m}: recorded `reason` replaced by the curated text")
+                print(f"      was    : {recorded}")
+                print(f"      curated: {KNOWN_SKIPS[m]}")
+            entry["reason"] = KNOWN_SKIPS[m]
+            # A curated skip is a decision, not a measurement, so it has no
+            # measurement provenance.
+            prov = entry.get("provenance")
+            if prov is not None:
+                prov.pop(backend, None)
+                if not prov:
+                    del entry["provenance"]
+            # The skip is a decision about the module rather than about this
+            # host, so it is shared and any host entry for it is dropped.
             overlay_dirty |= overlay_modules.pop(m, None) is not None
             continue
         shared = modules.get(m, {}).get(backend)
         if shared is None:
-            modules.setdefault(m, {})[backend] = status
+            entry = modules.setdefault(m, {})
+            entry[backend] = status
+            entry.setdefault("provenance", {})[backend] = dict(cell_axis)
             continue
         if status == shared:
             host_entry = overlay_modules.get(m)
             if host_entry is not None and host_entry.pop(backend, None) is not None:
                 overlay_dirty = True
-                # `reason` is prose about the divergence, so it cannot keep the
-                # entry alive once no backend still records one.
-                if not any(k != "reason" for k in host_entry):
+                # The axis goes with the cell it described. Left behind it would
+                # be provenance for a status this file no longer records.
+                host_prov = host_entry.get("provenance")
+                if host_prov is not None:
+                    host_prov.pop(backend, None)
+                    if not host_prov:
+                        del host_entry["provenance"]
+                # Neither `reason` nor a leftover `provenance` is a verdict, so
+                # neither can keep the entry alive once no backend still records
+                # one. Spelled through the constant rather than as a literal:
+                # this is the second site walking an entry generically, and two
+                # spellings of "which keys are not backends" is how they drift.
+                if not any(k not in NON_BACKEND_ENTRY_KEYS for k in host_entry):
                     del overlay_modules[m]
             continue
-        if overlay_modules.setdefault(m, {}).get(backend) != status:
-            overlay_modules[m][backend] = status
+        host_entry = overlay_modules.setdefault(m, {})
+        if host_entry.get(backend) != status:
+            host_entry[backend] = status
+            host_entry.setdefault("provenance", {})[backend] = dict(cell_axis)
             overlay_dirty = True
 
     written = [path]

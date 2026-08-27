@@ -11056,60 +11056,55 @@ impl<M: Clone> MetaInterp<M> {
         // FINISH descrs are singletons (`DONE_WITH_THIS_FRAME_DESCR_*` /
         // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`) with `trace_id == 0`
         // and `fail_index == u32::MAX`; they carry no per-trace exit
-        // metadata. Skip the trace lookup entirely and synthesize the
-        // default layout, mirroring RPython where FINISH descrs are
-        // dispatched on identity rather than trace-keyed lookup.
+        // metadata. Skip the trace lookup entirely and carry no layout,
+        // mirroring RPython where FINISH descrs are dispatched on identity
+        // rather than trace-keyed lookup — every field of one built here
+        // would be a default, and this result's readers open the layout only
+        // on the guard arm.
         let mut exit_layout = if is_finish {
-            CompiledExitLayout {
-                rd_loop_token: green_key,
-                trace_id,
-                fail_index,
-                source_op_index: None,
-                exit_types: ExitTypes::from_slice(exit_types),
-                is_finish,
-                is_exception_exit: is_exit_frame_with_exception,
-                recovery_layout: None,
-                resume_layout: None,
-                storage: None,
-            }
+            None
         } else {
-            // Fresh, fallible lookup — see `run_compiled_raw_detailed_with_values`.
-            self.compiled_loops
-                .get(&green_key)
-                .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
-                .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
-                .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
-                .and_then(|(owning_key, resolved_id, trace)| {
-                    Self::compiled_exit_layout_from_trace(
-                        trace,
-                        owning_key,
-                        resolved_id,
+            Some(
+                // Fresh, fallible lookup — see `run_compiled_raw_detailed_with_values`.
+                self.compiled_loops
+                    .get(&green_key)
+                    .and_then(|compiled| Self::trace_for_exit(compiled, trace_id))
+                    .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+                    .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
+                    .and_then(|(owning_key, resolved_id, trace)| {
+                        Self::compiled_exit_layout_from_trace(
+                            trace,
+                            owning_key,
+                            resolved_id,
+                            fail_index,
+                        )
+                    })
+                    .unwrap_or_else(|| CompiledExitLayout {
+                        rd_loop_token: green_key,
+                        trace_id,
                         fail_index,
-                    )
-                })
-                .unwrap_or_else(|| CompiledExitLayout {
-                    rd_loop_token: green_key,
-                    trace_id,
-                    fail_index,
-                    source_op_index: None,
-                    exit_types: ExitTypes::from_slice(exit_types),
-                    is_finish,
-                    is_exception_exit: is_exit_frame_with_exception,
-                    recovery_layout: None,
-                    resume_layout: None,
-                    // The green-key index no longer holds this trace, but the
-                    // failing descr still carries the resume payload it was
-                    // compiled with (`compile.py get_resumestorage`), so a
-                    // blackhole resume off this layout stays possible.
-                    storage: crate::resume::ResumeStorage::from_fail_descr(descr)
-                        .map(std::sync::Arc::new),
-                })
+                        source_op_index: None,
+                        exit_types: ExitTypes::from_slice(exit_types),
+                        is_finish,
+                        is_exception_exit: is_exit_frame_with_exception,
+                        recovery_layout: None,
+                        resume_layout: None,
+                        // The green-key index no longer holds this trace, but the
+                        // failing descr still carries the resume payload it was
+                        // compiled with (`compile.py get_resumestorage`), so a
+                        // blackhole resume off this layout stays possible.
+                        storage: crate::resume::ResumeStorage::from_fail_descr(descr)
+                            .map(std::sync::Arc::new),
+                    }),
+            )
         };
         // RPython: deadframe has ALL jitframe slots accessible.
         // If the backend's descr covers more slots than the trace layout,
         // extend exit_layout.exit_types to match (conservative Int for extras).
-        if exit_types.len() > exit_layout.exit_types.len() {
-            exit_layout.exit_types.resize(exit_types.len(), Type::Int);
+        if let Some(layout) = exit_layout.as_mut()
+            && exit_types.len() > layout.exit_types.len()
+        {
+            layout.exit_types.resize(exit_types.len(), Type::Int);
         }
         let mut values = ExitRawValues::with_capacity(exit_arity);
         let mut typed_values = ExitValues::with_capacity(exit_arity);
@@ -11160,7 +11155,7 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc,
             is_finish,
             is_exit_frame_with_exception,
-            exit_layout,
+            exit_layout: exit_layout.map(Box::new),
             savedata,
             exception,
             status,
@@ -11196,7 +11191,14 @@ impl<M: Clone> MetaInterp<M> {
         // having decided anything about the cell first. A caller that already
         // gated on the token holds it and calls the run directly.
         let token = self.warm_state.get_procedure_token(green_key)?;
-        self.execute_assembler_at_dispatch_key(&token, green_key, live_values, dispatch_key)
+        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
+        Some(self.execute_assembler_at_dispatch_key(
+            &token,
+            green_key,
+            meta,
+            live_values,
+            dispatch_key,
+        ))
     }
 
     /// `compile.py must_compile` reads the failing GUARD_VALUE's operand off the
@@ -11273,11 +11275,10 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
         green_key: u64,
+        meta: std::sync::Arc<M>,
         live_values: &[Value],
         dispatch_key: u32,
-    ) -> Option<CompileResult<M>> {
-        let meta = self.compiled_loops.get(&green_key)?.meta.clone();
-
+    ) -> CompileResult<M> {
         // Read once per run, ahead of every stage, so no stage's difference
         // carries it. See [`ExecuteStageRepeats`]; a default build has neither
         // this load nor the loops it feeds.
@@ -11382,25 +11383,14 @@ impl<M: Clone> MetaInterp<M> {
         // and never reaches the general case at all.
         if is_finish {
             Self::finish_compiled_run_io();
-            // The same layout the general arm synthesizes when it has no trace
-            // to build one from: a final descr carries none. The two guard-only
-            // slot lists stay empty because nothing past a final descr reads
-            // them — they exist for the blackhole resume and the bridge,
-            // neither of which a returned frame reaches. Built before the
-            // result so the descr borrow behind `exit_types` ends first.
-            let exit_layout = CompiledExitLayout {
-                rd_loop_token: green_key,
-                trace_id,
-                fail_index,
-                source_op_index: None,
-                exit_types: ExitTypes::from_slice(exit_types),
-                is_finish,
-                is_exception_exit: is_exit_frame_with_exception,
-                recovery_layout: None,
-                resume_layout: None,
-                storage: None,
-            };
-            return Some(CompileResult {
+            // No layout. A final descr resumes nothing, so every field of one
+            // built here is a default: the two guard-only slot lists are empty
+            // because they exist for the blackhole resume and the bridge, and
+            // a returned frame reaches neither. Both readers of this field
+            // (`jitdriver`'s two run loops) take their copy after their finish
+            // and JUMP arms have returned, so a layout built here would be
+            // copied out of this result and dropped without a reader.
+            return CompileResult {
                 values,
                 typed_values,
                 meta,
@@ -11409,7 +11399,7 @@ impl<M: Clone> MetaInterp<M> {
                 descr_arc,
                 is_finish,
                 is_exit_frame_with_exception,
-                exit_layout,
+                exit_layout: None,
                 savedata: None,
                 exception: ExceptionState {
                     exc_class: 0,
@@ -11418,7 +11408,7 @@ impl<M: Clone> MetaInterp<M> {
                 },
                 status: 0,
                 guard_value_operand: None,
-            });
+            };
         }
 
         let status = descr.get_status();
@@ -11492,7 +11482,7 @@ impl<M: Clone> MetaInterp<M> {
             ovf_flag: false,
         };
 
-        Some(CompileResult {
+        CompileResult {
             values,
             typed_values,
             meta,
@@ -11501,12 +11491,12 @@ impl<M: Clone> MetaInterp<M> {
             descr_arc,
             is_finish,
             is_exit_frame_with_exception,
-            exit_layout,
+            exit_layout: Some(Box::new(exit_layout)),
             savedata,
             exception,
             status,
             guard_value_operand,
-        })
+        }
     }
 
     /// Attach resume data to a specific guard in a compiled loop.

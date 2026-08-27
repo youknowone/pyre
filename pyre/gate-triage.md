@@ -243,10 +243,11 @@ its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
 is exercised without building a pathological helper chain; it retires when the
 descent stops recursing on the host stack.
 
-### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
+### §6c — Default-OFF diagnostics, censuses and probes (74): keep, cost nothing
 
-Each is inert unless set, so none is a removal target by this file's
-already-ON criterion. They are listed so they cannot be missed again.
+Deleting one of these environment reads does not change behavior when the
+variable is unset. They remain listed so diagnostics are not mistaken for dead
+configuration.
 
 `PYRE_ALLOCSITES`, `PYRE_BH_NULL_ARG`, `PYRE_BRIDGE_LATCH_AUDIT`,
 `MAJIT_CALLEE_RCA`, `PYRE_CATCH_LIVE_CENSUS`,
@@ -264,8 +265,7 @@ already-ON criterion. They are listed so they cannot be missed again.
 `PYRE_GC_DIAG`, `MAJIT_GC_FREELIST_DIAG`, `PYRE_GC_SIZE_AUDIT`,
 `PYRE_GEN_ENTRY_DIAG`,
 `PYRE_JD1_DEBUG`, `PYRE_JD1_DUMP`,
-`PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LLBC_STRICT`,
-`PYRE_LOOP_CENSUS`,
+`PYRE_LB_SITE`, `PYRE_LLBC_SKIP_FINGERPRINT_CHECK`, `PYRE_LOOP_CENSUS`,
 `PYRE_M73_BACKXLAT_TWIN_AUDIT`, `PYRE_M73_EMPTYTWIN_CENSUS`,
 `PYRE_M73_LASTINSTR_AUDIT`, `PYRE_M73_MIDBODY_CARRY_AUDIT`,
 `PYRE_MAJIT_STATS_ANCESTOR`, `PYRE_MAJIT_STATS_ROOT_ONLY`, `PYRE_MC_DIAG`,
@@ -344,6 +344,13 @@ inherited one is startup allocation and moves `guard_failures`; setting the
 gate restores the whole-environment copy, so the size of that effect stays
 measurable on one binary. It goes when the allowlist stops being the thing
 under measurement.
+
+### §6d — Default-ON safety controls
+
+| gate | behavior | retirement condition |
+|---|---|---|
+| `PYRE_LLBC_STRICT` | treats stale frozen LLBC artifacts as an error; setting it to `0` demotes the error to a warning | retain while the build consumes frozen LLBC artifacts |
+
 
 ## §7 — Additional runtime diagnostics
 

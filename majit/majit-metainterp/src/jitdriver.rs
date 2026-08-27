@@ -489,6 +489,7 @@ impl Drop for TraceContinuationSuspendGuard {
 /// reason [`no_bridge_enabled`] is — a frontend that owns state the diagnostic
 /// is about has to report it from its own side, and a variable that only the
 /// metainterp honours reads as broken when a frontend's half stays silent.
+#[inline]
 pub fn spdiag_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_SPDIAG").is_some())
@@ -541,6 +542,7 @@ fn failvals_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_FAILVALS").is_some())
 }
+#[inline]
 fn portal_rca_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("MAJIT_PORTAL_RCA").is_some())
@@ -5495,7 +5497,7 @@ impl<S: JitState> JitDriver<S> {
                         state.state_field_layout().total_live_values(),
                     );
                     let extended = self.extend_compiled_live_values_into(
-                        green_key,
+                        &procedure_token,
                         state,
                         &compiled_meta,
                         vable,
@@ -5536,7 +5538,7 @@ impl<S: JitState> JitDriver<S> {
                 }
 
                 if !self.extend_compiled_live_values_into(
-                    green_key,
+                    &procedure_token,
                     state,
                     &compiled_meta,
                     vable,
@@ -5638,7 +5640,11 @@ impl<S: JitState> JitDriver<S> {
             pre_run();
 
             let selected_dispatch_key = dispatch_key.unwrap_or(0);
-            if portal_rca_enabled() {
+            // One read for the pair below. The flag is fixed at process start,
+            // but the compiled run sits between the two sites and is opaque to
+            // the optimizer, so asking twice is two loads and two calls.
+            let portal_rca = portal_rca_enabled();
+            if portal_rca {
                 let labels = state.debug_state_live_labels(&compiled_meta);
                 eprintln!(
                     "[portal-rca][compiled-entry] green_key={green_key} target_pc={target_pc} \
@@ -5661,6 +5667,12 @@ impl<S: JitState> JitDriver<S> {
             let result = self.meta.execute_assembler_at_dispatch_key(
                 &procedure_token,
                 green_key,
+                // The run is handed the meta the gate above already read out of
+                // `compiled_loops`, rather than probing that map a third time
+                // for the same slot. Nothing between the two can replace the
+                // entry: `pre_run` cannot capture the driver and the
+                // `on_compiled_entry` hook is called through `&self.meta`.
+                std::sync::Arc::clone(&compiled_meta),
                 live_values,
                 selected_dispatch_key,
             );
@@ -5668,8 +5680,8 @@ impl<S: JitState> JitDriver<S> {
             // arguments, so the buffers go back before the first exit past
             // this point.
             self.entry_scratch_out(scratch);
-            let mut result = result?;
-            if portal_rca_enabled() {
+            let mut result = result;
+            if portal_rca {
                 eprintln!(
                     "[portal-rca][compiled-exit] green_key={green_key} \
                      dispatch_key={selected_dispatch_key} is_finish={} fail_index={} \
@@ -5713,7 +5725,10 @@ impl<S: JitState> JitDriver<S> {
                 // Taken, not copied: this arm returns below, so the exit values
                 // in `result` have no reader past this point.
                 self.meta.back_edge_finish = Some(std::mem::take(&mut result.typed_values));
-                let run_meta = result.meta.clone();
+                // The meta the run was handed, not a second handle to it:
+                // cloning `result.meta` here bought a refcount pair for a value
+                // already in scope.
+                let run_meta = &compiled_meta;
                 // The FINISH arguments are NOT the loop-carried state, so they
                 // are not written back into it. `warmstate.py:405-419
                 // execute_assembler` takes the `DoneWithThisFrameDescr*` fast
@@ -5734,7 +5749,7 @@ impl<S: JitState> JitDriver<S> {
                 // `descriptor_cache`), so a second consultation could only
                 // return the same object at the cost of one more refcount pair
                 // per compiled entry.
-                self.sync_after(state, &run_meta, vable);
+                self.sync_after(state, run_meta, vable);
                 // Kept for callers that cannot consume the latch (a portal whose
                 // return type the expansion cannot build from a `Value`). Those
                 // callers see today's behaviour unchanged; a caller that drains
@@ -5744,21 +5759,28 @@ impl<S: JitState> JitDriver<S> {
 
             // Normal loop back-edge JUMP, not a guard failure.
             if result.fail_index == u32::MAX {
-                let run_meta = result.meta.clone();
+                // Same handle as the FINISH arm above, for the same reason.
+                let run_meta = &compiled_meta;
                 if !result.typed_values.is_empty() {
-                    state.restore_values(&run_meta, &result.typed_values);
+                    state.restore_values(run_meta, &result.typed_values);
                 }
                 // Carried from the entry decision above, not re-resolved; see
                 // the FINISH arm for why one resolution serves both ends of a
                 // compiled entry.
-                self.sync_after(state, &run_meta, vable);
+                self.sync_after(state, run_meta, vable);
                 return Some(target_pc);
             }
 
             // compile.py handle_fail
             let fail_index = result.fail_index;
             let trace_id = result.trace_id;
-            let exit_layout = result.exit_layout.clone();
+            // Taken, not cloned: `result` is dropped a few lines below, and
+            // the finish arm above — the one that carries no layout — has
+            // already returned.
+            let exit_layout = *result
+                .exit_layout
+                .take()
+                .expect("a guard exit carries its exit layout");
             let raw_values = result.values.clone();
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
             let guard_value_operand = result.guard_value_operand;
@@ -6718,7 +6740,7 @@ impl<S: JitState> JitDriver<S> {
     /// declining caller sees the buffer it passed.
     fn extend_compiled_live_values_into(
         &self,
-        green_key: u64,
+        procedure_token: &majit_backend::JitCellToken,
         state: &S,
         meta: &S::Meta,
         virtualizable: Option<&JitDriverVar>,
@@ -6727,13 +6749,15 @@ impl<S: JitState> JitDriver<S> {
         arrays: &mut Vec<Vec<i64>>,
     ) -> bool {
         // `warmstate.py:188 cell.loop_token` is the single PyPy source of
-        // truth for the entry-path inputarg shape; route through
-        // `warm_state.get_compiled` so this site never consults pyre's
-        // `compiled_loops` side table (the retirement target).
-        let Some(compiled) = self.meta.warm_state_ref().get_compiled(green_key) else {
-            return false;
-        };
-        let compiled_inputs = compiled.inputarg_types().len();
+        // truth for the entry-path inputarg shape, and this token IS what
+        // `warm_state.get_compiled` returns — so the shape still comes off the
+        // cell and never off pyre's `compiled_loops` side table (the
+        // retirement target). Arrives resolved for the reason `sync_before`
+        // gives: `warmstate.py maybe_compile_and_run` reads the cell's token
+        // once and carries the object into `execute_assembler`, where asking
+        // the celltable again costs a walk, a `Weak::upgrade` and an `Arc`
+        // drop for one length.
+        let compiled_inputs = procedure_token.inputarg_types().len();
         if compiled_inputs <= live_values.len() {
             return true;
         }
@@ -6775,10 +6799,13 @@ impl<S: JitState> JitDriver<S> {
         virtualizable: Option<&JitDriverVar>,
         mut live_values: Vec<Value>,
     ) -> Option<Vec<Value>> {
+        // The cold form keeps the lookup: its callers hold a green key and no
+        // token.
+        let procedure_token = self.meta.warm_state_ref().get_compiled(green_key)?;
         let mut statics = Vec::new();
         let mut arrays = Vec::new();
         self.extend_compiled_live_values_into(
-            green_key,
+            &procedure_token,
             state,
             meta,
             virtualizable,
@@ -7339,7 +7366,9 @@ impl<S: JitState> JitDriver<S> {
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
         let descr_arc = std::sync::Arc::clone(&result.descr_arc);
-        let exit_layout = result.exit_layout.clone();
+        // The pointer travels; the layout behind it is opened past the finish
+        // arm below, which is the one that carries none.
+        let exit_layout = result.exit_layout.take();
         // Taken, not copied: every field this arm needs is read out here and
         // `result` is dropped just below, so neither buffer has a reader left.
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
@@ -7375,6 +7404,7 @@ impl<S: JitState> JitDriver<S> {
         }
 
         // compile.py handle_fail / must_compile: single tick+check.
+        let exit_layout = *exit_layout.expect("a guard exit carries its exit layout");
         let fallback_green_key = if exit_layout.rd_loop_token != 0 {
             exit_layout.rd_loop_token
         } else {
