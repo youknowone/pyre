@@ -8853,7 +8853,7 @@ pub(crate) fn pyre_portal_runner(
         );
     }
     frame.set_last_instr_from_next_instr(next_instr);
-    match portal_runner_result(frame) {
+    match portal_body_result(frame) {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
         Err(mut err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
             err.to_exc_object() as usize,
@@ -8864,11 +8864,12 @@ pub(crate) fn pyre_portal_runner(
 /// warmspot.py handle_jitexception.
 ///
 /// RPython: CRN → portal_ptr(*args) re-invokes the interpreter.
-/// pyre: CRN → re-loop eval_loop_jit(frame). This does NOT call
-/// maybe_compile_and_run (warmspot.py:948); portal_ptr is a plain
-/// interpreter dispatch, and pyre's eval_loop_jit is the equivalent.
-/// TODO: exact portal_ptr(*args) parity (currently `continue`
-/// re-enters without re-extracting CRN args from the exception).
+/// Pyre's portal ABI is frame-backed: each CRN producer applies its carried
+/// `next_instr` and reconstructed red state to that same live frame before it
+/// returns this outcome.  Re-looping `eval_loop_jit(frame)` is therefore the
+/// direct `portal_ptr(*args)` body call; it deliberately does not call
+/// `maybe_compile_and_run` again (`warmspot.py ll_portal_runner` owns that
+/// activation-entry step, while `handle_jitexception` does not).
 #[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
@@ -8902,6 +8903,25 @@ fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
             }
         }
     }
+}
+
+/// Resume the interpreter body of an already-active portal.
+///
+/// `warmspot.py` `handle_jitexception` calls `portal_ptr` for
+/// `ContinueRunningNormally`; it does not call `ll_portal_runner` again.  The
+/// latter is an activation boundary ([`portal_activation_result`] in pyre) and
+/// would charge recursion, reinstall the current frame, and consult
+/// function-entry warmstate a second time.
+pub(crate) fn portal_body_result(frame: &mut PyFrame) -> PyResult {
+    if majit_metainterp::majit_log_enabled() {
+        eprintln!(
+            "[portal-resume] body of {:p} without a second activation bracket",
+            frame as *mut PyFrame,
+        );
+    }
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().fix_array_ptrs();
+    handle_jitexception(frame_root.frame())
 }
 
 /// True when this frame's exception-table entry for the exit PC expects operand
@@ -9034,21 +9054,8 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
     Some(unsafe { pyre_object::intobject::w_int_get_value(value) })
 }
 
-/// warmspot.py ll_portal_runner parity: execute a frame through the
-/// JIT-enabled portal runner. Used by bhimpl_recursive_call
-/// (blackhole.py:1101-1116) for recursive portal depth.
-///
-/// warmspot.py:941-959:
-///   maybe_compile_and_run(state.increment_function_threshold, *args)
-///   return portal_ptr(*args)
-///
-/// warmspot.py:997-1005: ExitFrameWithExceptionRef → re-raise.
-pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
-    enter_portal(frame, portal_runner_dispatch)
-}
-
-/// [`portal_runner_result`] for an entry that BEGINS the activation rather than
-/// continuing one, so it owes `pyframe.py execute_frame`'s hook bracket.
+/// `warmspot.py ll_portal_runner` for an entry that BEGINS the activation, so
+/// it owes `pyframe.py execute_frame`'s hook bracket.
 ///
 /// The two are separated because pyre's portal is re-entered for reasons
 /// upstream's is not.  A `ContinueRunningNormally` handoff and a
@@ -9090,8 +9097,8 @@ fn enter_portal(frame: &mut PyFrame, body: fn(&mut FrameRoot) -> PyResult) -> Py
     body(&mut frame_root)
 }
 
-/// The dispatch half of `portal_runner_result`, taking the caller's
-/// [`FrameRoot`] rather than a raw frame.
+/// The portal activation's dispatch half, taking the caller's [`FrameRoot`]
+/// rather than a raw frame.
 ///
 /// `try_function_entry_jit` runs compiled code, and it roots the frame only for
 /// its own body: the root is gone by the time it hands back `None`.  The frame
@@ -9190,7 +9197,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // detect a body effect that ran through user code.
     pyre_interpreter::call::bump_frame_entry_count();
     // Recursion accounting belongs to the activation seams
-    // (`eval_with_jit_inner` and `portal_runner_result`), not this re-entrant
+    // (`eval_with_jit_inner` and `portal_activation_result`), not this re-entrant
     // dispatch loop.  In particular, `FrameRoot` may have forwarded a moving
     // frame since the seam; keying the same activation again by its new
     // address would spend a second recursion unit.
