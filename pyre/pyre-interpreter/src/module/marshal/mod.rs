@@ -455,10 +455,17 @@ fn write_object(
             });
             let len = setobject::w_set_len(obj);
             write_len(out, len)?;
-            for index in 0..len {
-                let item = setobject::w_set_key_at(obj_root.get(), index)
+            // A slot walk, as the dict arm above: `set_remove_slot` tombstones
+            // the slot it empties, so `len` counts the elements but does not
+            // bound their slot numbers.
+            let mut cursor = 0;
+            for _ in 0..len {
+                let slot = setobject::w_set_next_slot(obj_root.get(), cursor)
+                    .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
+                let item = setobject::w_set_key_at(obj_root.get(), slot)
                     .ok_or_else(|| PyError::value_error("unmarshallable object"))?
                     .obj;
+                cursor = slot + 1;
                 let item_root = Rooted::new(item);
                 write_object(out, item_root.get(), refs, version, depth - 1)?;
             }

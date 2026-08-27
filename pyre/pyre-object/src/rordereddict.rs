@@ -213,10 +213,22 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     pub fn clear(&mut self) {
-        self.indexes.clear();
-        self.entries.clear();
+        if self.entries.is_empty() {
+            return;
+        }
+        // `d.entries = _ll_empty_array(DICT)` — the array is *replaced*, so the
+        // old one becomes garbage.  `Vec::clear` would keep every byte of it,
+        // and nothing downstream shrinks an entries buffer: the compaction
+        // trigger in `setitem_lookup_done` asks `len() == capacity()`, which a
+        // cleared-in-place table answers `0 == old capacity`.
+        self.entries = Vec::new();
+        // "we can't remove the index here, because it is possible that crazy
+        // Python code calls d.clear() from the method __eq__() called from
+        // ll_dict_lookup(d).  Instead, stick to the rule that once a dictionary
+        // has got an index, it will always have one."
+        self.indexes = vec![FREE; DICT_INITSIZE];
         self.num_live_items = 0;
-        self.resize_counter = 0;
+        self.resize_counter = (DICT_INITSIZE * 2) as isize;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -438,9 +450,15 @@ impl<K: Hash + Eq, V, S: BuildHasher> RDict<K, V, S> {
         self.reindex(size);
     }
 
-    /// `_ll_dict_resize_to(d, num_extra=1)` (rordereddict.py:735).
+    /// `ll_dict_resize` into `_ll_dict_resize_to`.
+    ///
+    /// `num_extra` is what makes the table *quadruple* rather than double:
+    /// `(num_live_items + num_live_items + 1) * 2` until the dict is large
+    /// enough for the 30000 cap to bite.  Both call sites reach the table
+    /// through `ll_dict_resize`, and neither passes a `num_extra` of its own.
     fn resize(&mut self) {
-        let new_estimate = (self.num_live_items + 1) * 2;
+        let num_extra = (self.num_live_items + 1).min(30000);
+        let new_estimate = (self.num_live_items + num_extra) * 2;
         let mut new_size = DICT_INITSIZE;
         while new_size <= new_estimate {
             new_size *= 2;
@@ -1176,6 +1194,48 @@ mod tests {
             *v = 99;
         }
         assert_eq!(d.get(&5), Some(&99));
+    }
+
+    /// `ll_dict_resize` quadruples: `num_extra` is `num_live_items + 1`, not 1,
+    /// so `new_estimate` is `(2n + 1) * 2` and each new index table is four
+    /// times the last.  Passing 1 halves the estimate and turns the cadence
+    /// into a doubling — same final size, but every intermediate table is
+    /// rebuilt, which is a full rehash of every live key.
+    #[test]
+    fn resize_quadruples_the_index_table() {
+        let mut d: RDict<u64, u64> = RDict::new();
+        let mut sizes = vec![];
+        for i in 0..20_000u64 {
+            d.insert(i, i);
+            if sizes.last() != Some(&d.indexes.len()) {
+                sizes.push(d.indexes.len());
+            }
+        }
+        assert!(sizes.len() >= 4, "too few resizes to judge: {sizes:?}");
+        for pair in sizes.windows(2) {
+            assert_eq!(pair[1], pair[0] * 4, "not a quadrupling: {sizes:?}");
+        }
+    }
+
+    /// `ll_dict_clear` *replaces* the entry array, so
+    /// the old one is released; and it keeps an index table, because "once a
+    /// dictionary has got an index, it will always have one".
+    #[test]
+    fn clear_releases_the_entries_and_keeps_an_index() {
+        let mut d: RDict<u64, u64> = RDict::new();
+        for i in 0..1000u64 {
+            d.insert(i, i);
+        }
+        assert!(d.entries.capacity() >= 1000);
+        d.clear();
+        assert_eq!(d.entries.capacity(), 0, "the entry buffer was kept");
+        assert_eq!(d.indexes.len(), DICT_INITSIZE);
+        assert_eq!(d.resize_counter, (DICT_INITSIZE * 2) as isize);
+        assert_eq!(d.len(), 0);
+        assert_eq!(d.entry_slots(), 0);
+        d.insert(7, 7);
+        assert_eq!(d.get(&7), Some(&7));
+        assert_eq!(d.len(), 1);
     }
 
     /// `entries != d.entries` (rordereddict.py:1058) fires for a *growth*, not
