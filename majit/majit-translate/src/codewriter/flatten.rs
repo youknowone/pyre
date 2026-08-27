@@ -569,6 +569,142 @@ impl<'a> GraphFlattener<'a> {
             .or_insert_with(|| Register::new(kind, color))
     }
 
+    /// Where a rejected exitswitch value came from.
+    ///
+    /// `flatten.py` has no such reporter because RPython reaches it only from
+    /// its own rtyper, where a non-`Signed` exitswitch is unreachable by
+    /// construction.  Here the graph arrives from Charon MIR, so the bank a
+    /// value ended up in is a lowering decision made hundreds of blocks
+    /// earlier, and the kind letter alone names no code.  Report the
+    /// definition site: the op that wrote the value, or — when it is a block
+    /// input — its argument position and what every predecessor passes there.
+    fn describe_exitswitch_value(&self, bid: BlockId, cond: &Variable) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = write!(
+            out,
+            "  exitswitch value: {} (id {}), concretetype {:?}",
+            cond.name(),
+            cond.id(),
+            cond.concretetype()
+        );
+        // Chase the definition backwards.  A block input is not a definition
+        // — it is a rename of whatever each predecessor passes in that
+        // position — so stopping there names a phi rather than the lowering
+        // that chose the bank.  Follow single-predecessor renames until an op
+        // writes the value, a merge makes the answer ambiguous, or the chain
+        // reaches a parameter.
+        let mut here = bid;
+        let mut want = cond.clone();
+        let mut hops = 0usize;
+        loop {
+            let block = self.graph.block(here);
+            if let Some(pos) = block.inputargs.iter().position(|a| a.id() == want.id()) {
+                let mut preds: Vec<(usize, &crate::model::Link)> = Vec::new();
+                for (other_id, other) in self.graph.blocks.iter().enumerate() {
+                    for link in &other.exits {
+                        if link.target == here {
+                            preds.push((other_id, link));
+                        }
+                    }
+                }
+                let _ = write!(
+                    out,
+                    "\n  [{hops}] inputarg[{pos}] of BlockId({}), {} predecessor(s)",
+                    here.0,
+                    preds.len()
+                );
+                let next = match preds.as_slice() {
+                    [(pred_id, link)] => match link.args.get(pos) {
+                        Some(crate::model::LinkArg::Value(v)) => Some((*pred_id, v.clone())),
+                        other => {
+                            let _ = write!(out, " <- BlockId({pred_id}) passes {other:?}");
+                            None
+                        }
+                    },
+                    _ => {
+                        for (pred_id, link) in &preds {
+                            let _ = write!(
+                                out,
+                                "\n      BlockId({pred_id}) passes {:?}",
+                                link.args.get(pos)
+                            );
+                        }
+                        None
+                    }
+                };
+                match next {
+                    Some((pred_id, v)) => {
+                        here = self.graph.blocks[pred_id].id;
+                        want = v;
+                    }
+                    None => break,
+                }
+            } else {
+                let def = self
+                    .graph
+                    .blocks
+                    .iter()
+                    .flat_map(|blk| blk.operations.iter().map(move |op| (blk.id, op)))
+                    .find(|(_, op)| op.result.as_ref().is_some_and(|r| r.id() == want.id()));
+                match def {
+                    Some((b, op)) => {
+                        let _ = write!(
+                            out,
+                            "\n  [{hops}] {} (id {}) written in BlockId({}) by {:?}",
+                            want.name(),
+                            want.id(),
+                            b.0,
+                            op.kind
+                        );
+                        // A projection is not a producer either.  Reporting
+                        // `FieldRead __pos_0` and stopping names the shape but
+                        // not what built the aggregate, and those are different
+                        // fixes — one is how a payload is banked, the other is
+                        // what a call was lowered to return.  Keep walking
+                        // through the base so the two are never confused for
+                        // each other.
+                        if let crate::model::OpKind::FieldRead { base, .. } = &op.kind {
+                            here = b;
+                            want = base.clone();
+                            hops += 1;
+                            if hops > 12 {
+                                let _ = write!(out, "\n  … chain longer than 12 hops, truncated");
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    None => {
+                        let _ = write!(
+                            out,
+                            "\n  [{hops}] {} (id {}) has no writer and no inputarg — \
+                             a graph parameter or an unbound temporary",
+                            want.name(),
+                            want.id()
+                        );
+                    }
+                }
+                break;
+            }
+            hops += 1;
+            if hops > 12 {
+                let _ = write!(out, "\n  … chain longer than 12 hops, truncated");
+                break;
+            }
+        }
+        let _ = write!(out, "\n  {bid:?} last ops:");
+        for op in self.graph.block(bid).operations.iter().rev().take(4).rev() {
+            let _ = write!(
+                out,
+                "\n    {:?} <- {:?}",
+                op.result.as_ref().map(|r| r.name()),
+                op.kind
+            );
+        }
+        out
+    }
+
     /// `getkind(v.concretetype)` + `regallocs[kind].coloring[v]` —
     /// `flatten.py:386` strict 1:1 lookup.
     ///
@@ -1237,11 +1373,24 @@ impl<'a> GraphFlattener<'a> {
             // here (a `__pos_N` read of a match scrutinee aggregate, an enum
             // `__discriminant` read, …), so a bare kind mismatch gives the
             // reader nothing to search for.
-            assert_eq!(
-                kind, 'i',
-                "switch exitswitch must be int (graph {}, block {:?})",
-                self.graph.name, bid
-            );
+            //
+            // Naming them is still not enough to act on: a graph the size of a
+            // dispatch loop has hundreds of blocks and the offending value is
+            // an SSA temporary with no source name.  Report the variable and
+            // its *definition* — the op that wrote it, or the inputarg
+            // position plus what each predecessor passes there — so the reader
+            // lands on the lowering that chose the register bank rather than
+            // on the flattener, which only observes the choice.
+            if kind != 'i' {
+                panic!(
+                    "switch exitswitch must be int (graph {}, block {:?}) \
+                     left: {:?} right: 'i'\n{}",
+                    self.graph.name,
+                    bid,
+                    kind,
+                    self.describe_exitswitch_value(bid, &cond),
+                );
+            }
             // `switches = [link for link in block.exits if link.exitcase != 'default']`.
             // `switches.sort(key=lambda link: link.llexitcase)`.
             let default_link = exits

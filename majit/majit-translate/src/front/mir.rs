@@ -106,10 +106,22 @@ use crate::model::{
 /// `local_fn` uses. Replace with a fully-qualified-path lookup once
 /// the call graph plumbing makes it useful.
 pub fn lower_function(llbc: &Llbc, function_name: &str) -> Result<FunctionGraph, LowerError> {
+    lower_function_with_static_addrs(llbc, function_name, crate::HostStaticAddrs::default())
+}
+
+/// [`lower_function`] against a caller-supplied host table — the same pairing
+/// [`lower_fun_decl`] and [`lower_fun_decl_with_static_addrs`] already have.
+/// A caller that lowers a fallible-returning graph needs this one, because the
+/// default names no error carrier.
+pub fn lower_function_with_static_addrs(
+    llbc: &Llbc,
+    function_name: &str,
+    static_addrs: crate::HostStaticAddrs<'_>,
+) -> Result<FunctionGraph, LowerError> {
     let fd = llbc
         .local_fn(function_name)
         .ok_or_else(|| LowerError::FunctionNotFound(function_name.to_string()))?;
-    lower_fun_decl(llbc, fd)
+    lower_fun_decl_with_static_addrs(llbc, fd, static_addrs)
 }
 
 /// Merge functions and metadata from a slice of LLBCs into one
@@ -1054,7 +1066,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             || elidable_residual.contains(&fn_path)
             || (trait_root.is_some() && self_ty_root.is_none());
         let return_type = if stamp_return_token {
-            dont_look_inside_return_token(&fd.signature.output, llbc)
+            dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
         } else {
             None
         };
@@ -2258,8 +2270,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // sites the body lowering captured.  Both run before
     // `simplify_lowered_graph` so the freed shell ops feed the same
     // dead-op sweep the Abort → RaiseImplicit fold uses.
-    let result_exc_callee =
-        crate::front::result_exc::tyref_is_result_of_pyerror(&fd.signature.output, llbc);
+    let result_exc_callee = crate::front::result_exc::tyref_is_result_of_carrier(
+        &fd.signature.output,
+        llbc,
+        static_addrs.error_carrier,
+    );
     // A `Result<(), PyError>` scoped callee returns void after the
     // exception-link lowering; widen its returnblock so the call
     // descriptor's `FUNC.RESULT` is `v`, not the `Ref`-typed unit shell.
@@ -2302,6 +2317,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
                 result_exc_callee,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
@@ -2310,6 +2326,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
                 tail_forwarded_returns,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
             // Fold each raise site's `PyError` constructor into its
@@ -7659,13 +7676,9 @@ impl<'a> Lowering<'a> {
                 // itemsize`.  RPython can leave that width implicit — every
                 // non-primitive there IS a one-word GC pointer — but a Rust
                 // `Vec<T>` stores `T` inline, so a `Vec<u8>` strides 1 and a
-                // `Vec<String>` strides 24.  A scalar element carries its
-                // spelling as the array identity and the descr computes the
-                // real width from it; a thin pointer needs no spelling.  An
-                // element that is neither falls through to the residual call,
-                // where Rust computes the address itself.  The workspace arm
-                // asks nothing: its `pyre_` fence admits exactly the three
-                // element banks named below, all of them one word.
+                // `Vec<String>` strides 24.  An element that is neither a
+                // sizable scalar nor a thin pointer falls through to the
+                // residual call, where Rust computes the address itself.
                 let element_node = tyref_index_element_node(&call.dest.ty, self.llbc);
                 let element_scalar =
                     element_node.and_then(|elem| json_ty_scalar_element_spelling(elem, self.llbc));
@@ -9824,7 +9837,11 @@ impl<'a> Lowering<'a> {
         // after the body lowering completes.
         if let OpKind::Call { .. } = &op_kind
             && callee_name_path.is_some()
-            && crate::front::result_exc::tyref_is_result_of_pyerror(&call.dest.ty, self.llbc)
+            && crate::front::result_exc::tyref_is_result_of_carrier(
+                &call.dest.ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
         {
             // The per-instantiation suffix of the callee's `Result<T,
             // PyError>` keys the shells `result_exc` rebuilds at the
@@ -12631,7 +12648,11 @@ impl<'a> Lowering<'a> {
         let (payload_disc, payload_on_disc_true) = if is_option {
             (1, true)
         } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
-            && !crate::front::result_exc::tyref_is_result_of_pyerror(recv_ty, self.llbc)
+            && !crate::front::result_exc::tyref_is_result_of_carrier(
+                recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
         {
             (0, false)
         } else {
@@ -16241,6 +16262,7 @@ fn deref_impl_owner_leaf(llbc: &Llbc, fd: &FunDecl) -> Option<String> {
 /// registered, which is the one direction that hides residue.
 pub fn collect_unsafe_fn_stubs_from_llbc(
     llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
 ) -> Vec<(
     Vec<String>,
     crate::flowspace::argument::Signature,
@@ -16269,7 +16291,7 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
         // `Void`; a return type it cannot model still reaches this arm as
         // a token it declines, and the fn then keeps its original "not
         // registered" Skip.
-        let token = dont_look_inside_return_token(&fd.signature.output, llbc);
+        let token = dont_look_inside_return_token(&fd.signature.output, llbc, error_carrier);
         if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
             continue;
         }
@@ -17167,6 +17189,34 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
+    // The same statement, one type family over: a SHARED borrow of a
+    // primitive carries no representation of its own either.  `lltype.py`
+    // `class Ptr.__new__` raises `TypeError("can only point to a Container
+    // type")`, so `Ptr(Signed)` / `Ptr(Char)` do not exist upstream and a
+    // `&u8` has no lltype to be — the only representable model is the byte.
+    //
+    // `resolve_place` already agrees: it collapses an Atom `Deref` to the
+    // base, so `*p` and `p` are one value there.  Banking the borrow as a GC
+    // ref while collapsing its deref is the inconsistency, and it surfaces as
+    // a ref-kinded `SwitchInt` operand that `codewriter/flatten.rs` rejects
+    // (`switch exitswitch must be int`).  `let tag = *code.get(pc)?; match tag
+    // { .. }` over a `&[u8]` is the shape that hits it: `<[T]>::get` hands the
+    // `&u8` back inside an `Option`, so the byte arrives as an ADT payload
+    // rather than through `Index::index` — which is why the indexed spelling
+    // `code[pc]` was already fine ([`tyref_deref_value_type`] covers it) and
+    // this one was not.
+    //
+    // SHARED ONLY, and not by conservatism.  `&mut P` must stay a reference
+    // because a write through it is a real operation on a real pointer
+    // (`__deref_write` takes the reference as an argument); handing that an
+    // integer would corrupt the store.  `*const P` / `*mut P` stay references
+    // for the reason the fieldless-enum arm above already gives — a raw
+    // pointer is a value other code may compare, offset or null-check.  A
+    // shared borrow of a primitive is none of those: it cannot be written
+    // through, and a primitive has no interior mutability to hide behind one.
+    if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
+        return tyref_to_value_type(&TyRef::Other(pointee), llbc);
+    }
     // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
     // rpy_string in the value model (`tyref_is_string_value`), matching
     // upstream's one string type (`rstr.py`).  A bare string-family value
@@ -17263,6 +17313,85 @@ fn tyref_is_borrowed_fieldless_enum_free(ty: &TyRef, llbc: &Llbc) -> bool {
     }
 }
 
+/// The pointee of `ty` when `ty` is a **shared** borrow of a primitive —
+/// `&u8`, `&i64`, `&bool`, `&char`, `&f64` — and `None` otherwise.
+///
+/// Charon writes a reference as `{"Ref": [region, pointee, kind]}` with `kind`
+/// one of `"Shared"` / `"Mut"`, and a primitive as `{"Literal": ...}`.  Both
+/// are required: this fires only on `Shared`, because [`tyref_to_value_type`]'s
+/// caller documents why a mutable or raw pointer must keep its own
+/// representation.
+///
+/// Peels `Ref` exactly ONCE.  `&&u8` peels to `&u8`, which is itself a
+/// primitive borrow; the caller re-enters [`tyref_to_value_type`] on the
+/// pointee, so the outer layers unwrap one call at a time and terminate.
+/// Peeling greedily here would instead collapse `&&u8` in one step and hide
+/// which layer was answered.
+///
+/// Deliberately NOT written in terms of [`strip_ty_wrappers`], which also
+/// peels owning wrappers (`Box`, `Rc`, …).  Those are real heap references
+/// with representations of their own; only a borrow is the identity.
+fn tyref_shared_borrow_primitive_pointee(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<serde_json::Value> {
+    let mut v: &serde_json::Value = match ty {
+        TyRef::Inline { value: (_, v) } | TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    loop {
+        let obj = v.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            v = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            v = &arr[1];
+            continue;
+        }
+        // `[region, pointee, kind]`.  A `Mut` borrow stops here with `None`.
+        let arr = obj.get("Ref").and_then(serde_json::Value::as_array)?;
+        if arr.get(2).and_then(serde_json::Value::as_str) != Some("Shared") {
+            return None;
+        }
+        let pointee = arr.get(1)?;
+        return tyref_primitive_node(pointee, llbc).cloned();
+    }
+}
+
+/// `node` resolved through indirections when it is a Charon primitive
+/// (`{"Literal": ...}`); `None` for every aggregate, reference or ADT shape.
+///
+/// Split out from [`tyref_shared_borrow_primitive_pointee`] because the
+/// pointee is reached after an arbitrary number of `Deduplicated` /
+/// `HashConsedValue` hops, exactly as the borrow itself was.
+fn tyref_primitive_node<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    let mut v = node;
+    loop {
+        let obj = v.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            v = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            v = &arr[1];
+            continue;
+        }
+        return obj.contains_key("Literal").then_some(v);
+    }
+}
+
 /// The `TypeDecl` behind `ty` when it resolves to a fieldless (C-like)
 /// enum (at least one variant, every variant carrying zero payload
 /// fields); `None` otherwise.  Shared by [`tyref_is_fieldless_enum_free`]
@@ -17330,7 +17459,11 @@ fn tyref_fieldless_enum_class_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
 /// keeps the historic declared-void behaviour for unit returns and for
 /// `Unknown` results (whose legacy concrete is also Unknown — the
 /// dead-var backfill family, not a genuine kind mismatch).
-fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> {
+fn dont_look_inside_return_token(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<String> {
     // A `Result<T, PyError>` callee is reached through the residual-call
     // ABI, which hands back the `Ok` payload and routes the error through
     // `BH_LAST_EXC_VALUE`, so `FUNC.RESULT` is `T`.  Reading the kind off
@@ -17349,7 +17482,7 @@ fn dont_look_inside_return_token(output: &TyRef, llbc: &Llbc) -> Option<String> 
     // The `OBJECTPTR` carve-out below deliberately keeps reading the
     // declared `output`: it decides the pointer's lowering, not its bank,
     // and a `Result`-typed output has never taken it.
-    let payload = if crate::front::result_exc::tyref_is_result_of_pyerror(output, llbc) {
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
         crate::front::result_exc::tyref_result_ok(output, llbc)
     } else {
         None
@@ -20734,13 +20867,30 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
                 "FnDef constant references unknown FunDecl id {inner}"
             ))
         })?;
-        return Ok(DecodedConst::FnPath(
-            fd.item_meta
+        // Spell an impl-owned callee the way the registration side keys it
+        // (`CallPath::for_impl_method(self_ty_root, leaf)`), exactly as the
+        // Call terminator does (`call_target_segments`).  The raw
+        // `name_path()` carries the crate root and an `<Impl>` segment
+        // (`<crate>::<module>::<Impl>::<leaf>`) that no registry entry
+        // ever spells, and `lookup_with_leaf_match` refuses to fuzzy-match a
+        // path of three or more segments — so an address-taken method
+        // (`.map(Dynamic::flatten)`) could only ever miss.  A free function
+        // keeps `name_path()`: that IS its registered spelling
+        // (`free_function_alias_paths`).
+        let segments = match impl_method_owner_for_fundecl(llbc, fd) {
+            Some((owner_qualified, leaf)) => {
+                let mut v: Vec<String> = owner_qualified.split("::").map(str::to_string).collect();
+                v.push(leaf);
+                v
+            }
+            None => fd
+                .item_meta
                 .name_path()
                 .split("::")
                 .map(|s| s.to_string())
                 .collect(),
-        ));
+        };
+        return Ok(DecodedConst::FnPath(segments));
     }
     Err(LowerError::Unsupported(format!(
         "Operand::Const kind not yet handled: {value}"
@@ -26405,7 +26555,6 @@ mod tests {
             "i64"
         );
     }
-
     /// The `Vec` index fold must accept a `usize` index.
     ///
     /// `usize` types as `Unsigned`, not `Int`, so gating on `Int` alone left

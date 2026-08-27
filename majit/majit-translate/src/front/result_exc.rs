@@ -56,7 +56,7 @@
 //! returns `T` and raises, so an untransformed caller-side discriminant
 //! switch would read garbage.  Every `Result<T, PyError>` callee is
 //! transformed uniformly (`exceptiontransform.py` `transform_completely`,
-//! no allowlist); the callee-side type gate [`tyref_is_result_of_pyerror`]
+//! no allowlist); the callee-side type gate [`tyref_is_result_of_carrier`]
 //! is the only filter.  Every call site of such a callee either matches
 //! the `?`-diamond, tail-forwards inside an enclosing transformed graph,
 //! or — for hand-written `match` consumers (`eval_loop`, the
@@ -98,9 +98,18 @@ fn adt_path_of(v: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     Some(llbc.type_by_id(id)?.item_meta.name_path())
 }
 
-/// True when `ty` is `core::result::Result<T, E>` with `E` resolving
-/// to the interpreter's `PyError` exception carrier.
-pub(crate) fn tyref_is_result_of_pyerror(ty: &TyRef, llbc: &Llbc) -> bool {
+/// True when `ty` is `core::result::Result<T, E>` with `E` resolving to the
+/// consumer's exception carrier ([`crate::ErrorCarrierSpec`]).
+///
+/// `E` is compared after peeling the spec's wrapper ADTs, so a carrier the
+/// interpreter always hands around boxed (`Box<InterpError>`) is matched
+/// on the type inside the box.  A wrapper contributes no representation:
+/// `Box` is one owned word, exactly what the raise site stores.
+pub(crate) fn tyref_is_result_of_carrier(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => v,
         TyRef::Other(v) => v,
@@ -120,10 +129,32 @@ pub(crate) fn tyref_is_result_of_pyerror(ty: &TyRef, llbc: &Llbc) -> bool {
     else {
         return false;
     };
-    let Some(err_body) = ty_json_body(err_slot, llbc) else {
+    let Some(mut err_body) = ty_json_body(err_slot, llbc) else {
         return false;
     };
-    adt_path_of(err_body, llbc).is_some_and(|p| p == "pyre_interpreter::error::PyError")
+    // Peel at most one hop per declared wrapper, outermost first.  A bound
+    // rather than a `while` so a self-referential type value cannot spin,
+    // and the empty spec (pyre) runs zero iterations — the compare below is
+    // then the same single compare this predicate has always made.
+    for _ in 0..spec.carrier_wrappers.len() {
+        let Some(path) = adt_path_of(err_body, llbc) else {
+            break;
+        };
+        if !spec.carrier_wrappers.contains(&path.as_str()) {
+            break;
+        }
+        let Some(inner) = err_body
+            .get("Adt")
+            .and_then(|a| a.get("generics"))
+            .and_then(|g| g.get("types"))
+            .and_then(|t| t.get(0))
+            .and_then(|slot| ty_json_body(slot, llbc))
+        else {
+            return false;
+        };
+        err_body = inner;
+    }
+    adt_path_of(err_body, llbc).is_some_and(|p| p == spec.carrier_path)
 }
 
 /// True when `ty` is `core::option::Option<T>` — the return type of an
@@ -197,7 +228,7 @@ pub(crate) fn tyref_is_option_ref(ty: &TyRef, llbc: &Llbc) -> bool {
 /// True when `ty` is any `core::result::Result<T, E>` (error type
 /// unconstrained) — the guard for combinators like `Result::unwrap_or` that
 /// discard the error and so do not care about `E`.  For the `Result<T,
-/// PyError>` exception-transform guard use [`tyref_is_result_of_pyerror`].
+/// PyError>` exception-transform guard use [`tyref_is_result_of_carrier`].
 pub(crate) fn tyref_is_result(ty: &TyRef, llbc: &Llbc) -> bool {
     let body = match ty {
         TyRef::Inline { value: (_, v) } => v,
@@ -364,6 +395,7 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
 pub(crate) fn lower_result_exc_returns(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     // Every `Err` below declines the WHOLE callee to a residual call.  The
     // message says why, but it travels out as `LowerError::Unsupported` and
@@ -377,7 +409,7 @@ pub(crate) fn lower_result_exc_returns(
     // falling through to a residual.  This does not change the decline into
     // an error — the fail-safe residual is deliberate here — it only makes
     // the refusal countable.
-    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns);
+    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
     if let Err(msg) = &outcome {
         crate::decline::record_reason(
             RESULT_EXC_CALLEE_GATE,
@@ -401,6 +433,7 @@ use crate::decline::gate::{
 fn lower_result_exc_returns_inner(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
@@ -619,32 +652,33 @@ fn lower_result_exc_returns_inner(
             // the `W_BaseException` ref (`BH_LAST_EXC_VALUE`'s
             // domain; the trait leg reads `ob_header.ob_type` off it),
             // so `PyError::to_exc_object` runs at the raise site.
-            let v_exc = graph
-                .push_op_var(
-                    block_id,
-                    OpKind::Call {
-                        // The free-function spelling, not the method: it is
-                        // `dont_look_inside` and its address is published, so
-                        // the raise site records one residual call instead of
-                        // inlining the materialisation body — whose GC-root,
-                        // `w_exception_new_empty_impl`, WTF-8 and allocation
-                        // calls would otherwise sit in this JitCode and refuse
-                        // every descent that reaches it.
-                        target: CallTarget::FunctionPath {
-                            segments: [
-                                crate::runtime_names::crates::INTERPRETER,
-                                "error",
-                                "pyerror_to_exc_object",
-                            ]
-                            .map(str::to_string)
-                            .to_vec(),
+            //
+            // A carrier that declares no materialiser is already one such
+            // value — a single owned word — so the payload is forwarded
+            // into the raise unchanged and no call is emitted at all.
+            let v_exc = match spec.to_exc_object {
+                Some(segments) => graph
+                    .push_op_var(
+                        block_id,
+                        OpKind::Call {
+                            // The free-function spelling, not the method: it is
+                            // `dont_look_inside` and its address is published, so
+                            // the raise site records one residual call instead of
+                            // inlining the materialisation body — whose GC-root,
+                            // `w_exception_new_empty_impl`, WTF-8 and allocation
+                            // calls would otherwise sit in this JitCode and refuse
+                            // every descent that reaches it.
+                            target: CallTarget::FunctionPath {
+                                segments: segments.iter().copied().map(str::to_string).collect(),
+                            },
+                            args: vec![payload],
+                            result_ty: ValueType::Ref(None),
                         },
-                        args: vec![payload],
-                        result_ty: ValueType::Ref(None),
-                    },
-                    true,
-                )
-                .expect("to_exc_object call must produce a value");
+                        true,
+                    )
+                    .expect("to_exc_object call must produce a value"),
+                None => payload,
+            };
             // `graph.set_raise_values(block, etype, evalue)`. The `etype`
             // link arg is write-only: `make_return`'s 2-arg arm emits
             // `raise <args[1]>` and never reads `args[0]`
@@ -1136,6 +1170,7 @@ pub(crate) fn rewire_result_exc_call_sites(
     graph: &mut FunctionGraph,
     results: &[(Variable, Option<String>, ValueType)],
     enclosing_scoped: bool,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<RewireOutcome, String> {
     let mut outcome = RewireOutcome {
         diamonds: 0,
@@ -1150,6 +1185,7 @@ pub(crate) fn rewire_result_exc_call_sites(
             suffix.as_deref().unwrap_or(""),
             payload_ty,
             enclosing_scoped,
+            spec,
         );
         let site = match site {
             Ok(site) => site,
@@ -1183,6 +1219,7 @@ fn rewire_one_call_site(
     suffix: &str,
     payload_ty: &ValueType,
     enclosing_scoped: bool,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
@@ -1241,10 +1278,57 @@ fn rewire_one_call_site(
                 );
             }
         }
-        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
         return Ok(SiteOutcome::Rewrapped);
     };
-    assert_single_pred(graph, b, &name)?;
+    // The rewrite bypasses B and C on this call edge, so that chain has to
+    // be private to the edge.  A merged B or C is not a malformed shape: it
+    // is several `?` sites whose desugared handlers rustc shared, i.e. the
+    // very multi-predecessor merge `catch_and_rewrap` documents itself as
+    // the fallback for.  Route it there rather than declining the whole
+    // graph — the site keeps its value-encoded `Result` instead of gaining
+    // an exception edge, which is a weaker rewrite but a legal one.  Both
+    // checks sit above `collapse_pos0_read`, this rule's only fallible
+    // mutation, so the fallback always runs on an unmutated graph.
+    //
+    // Why a fallback and not a decline: THIS RULE IS ALL-OR-NOTHING PER
+    // GRAPH.  An `Err` here becomes `LowerError::Unsupported` in
+    // `front/mir.rs`, which drops the WHOLE graph to residual — so ONE
+    // unrecognised site costs every other site in the same body.  Measured
+    // on an embedding interpreter's bytecode dispatch loop, whose portal
+    // carries ~115 `?` sites with a handful of them merged: declining that
+    // one graph cost all 230 of its `branch`/`from_residual` ops — 18% of
+    // the whole artefact's population, from one shape.  A decline count
+    // therefore reads as N hard problems when it is usually one.
+    //
+    // Reading the residue counts this rule leaves: a DECLINED graph
+    // contributes ZERO pairs to the census because it no longer exists, so
+    // a falling "pairs remaining" can mean absorption OR disappearance and
+    // the two have to be separated by hand against the decline list.  On
+    // that artefact the carrier's eval population is 752 pairs and the
+    // three readings are:
+    //     752 -> 14   (98.1%)  portal DECLINED — 332 pairs vanished with
+    //                          their graphs; the headline is nearly all
+    //                          disappearance
+    //     752 -> 24   (96.8%)  portal alive, but still silently counting
+    //                          92 pairs hidden inside 8 other declines
+    //     636/752      84.6%   HONEST: absorbed = population - (24 still
+    //                          opaque in a lowered graph) - (92 hidden in
+    //                          a declined one).  Quote THIS one.
+    // The rule generalises: never divide by a population that includes
+    // graphs the pass deleted.
+    //
+    // This is NOT a no-op for pyre.  Across pyre's own four-crate artefact
+    // (32,843 lowered graphs, 62 declines) exactly one graph reaches this
+    // fallback — `module::_ast::convert::module_to_object`, whose diamond
+    // block merges 3 predecessors — and it now lowers instead of dropping
+    // to residual, carrying 2 still-opaque pairs and 3 rewrap sites.  It is
+    // AST-import code, off every hot path, but it is a real change to
+    // pyre's compiled surface and any jitstats move traces here first.
+    if assert_single_pred(graph, b, &name).is_err() {
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
+        return Ok(SiteOutcome::Rewrapped);
+    }
     // Block B is bypassed by the rewrite (A exits straight to the
     // continue target); only the `branch` destructuring may carry an
     // effect, so any other side-effecting op here is unsupported.
@@ -1255,7 +1339,10 @@ fn rewire_one_call_site(
         .ok_or_else(|| format!("{name}: branch() without result var"))?;
     let (c, cf_c) =
         follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
-    assert_single_pred(graph, c, &name)?;
+    if assert_single_pred(graph, c, &name).is_err() {
+        catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
+        return Ok(SiteOutcome::Rewrapped);
+    }
     // Block C: `d = cf.__discriminant`; switch d {0 → continue, 1 → break}.
     let (disc_idx, disc_var) = graph.blocks[c]
         .operations
@@ -1405,6 +1492,7 @@ fn catch_and_rewrap(
     r: &Variable,
     suffix: &str,
     payload_ty: &ValueType,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     use crate::model::BlockId;
     let name = graph.name.clone();
@@ -1507,17 +1595,24 @@ fn catch_and_rewrap(
         // resolve to that bare two-segment path, which misses the
         // module-qualified impl-method registration and falls back to a
         // symbolic address.
-        let v_err = graph
-            .push_op_var(
-                e_id,
-                OpKind::Call {
-                    target: CallTarget::method("from_exc_object", Some("PyError".to_string())),
-                    args: vec![e_exc_value_in],
-                    result_ty: ValueType::Ref(None),
-                },
-                true,
-            )
-            .expect("from_exc_object must produce a value");
+        //
+        // A carrier that declares no rebuild pair is its own exception
+        // value (the mirror of the raise site's `None` arm), so the caught
+        // word goes straight into the `Err` shell.
+        let v_err = match spec.from_exc_object {
+            Some((receiver_root, method)) => graph
+                .push_op_var(
+                    e_id,
+                    OpKind::Call {
+                        target: CallTarget::method(method, Some(receiver_root.to_string())),
+                        args: vec![e_exc_value_in],
+                        result_ty: ValueType::Ref(None),
+                    },
+                    true,
+                )
+                .expect("from_exc_object must produce a value"),
+            None => e_exc_value_in,
+        };
         Some(build_shell(
             graph,
             e_id,
@@ -3064,4 +3159,170 @@ fn message_is_str_literal(
         }
     }
     true
+}
+
+#[cfg(test)]
+mod carrier_tests {
+    use super::tyref_is_result_of_carrier;
+    use crate::ErrorCarrierSpec;
+    use majit_charon_reader::Llbc;
+    use majit_charon_reader::ullbc::TyRef;
+
+    /// A boxed carrier — the shape an interpreter that hands its error
+    /// around as `Result<T, Box<InterpError>>` declares. `Box` peels because
+    /// it contributes no representation: it is the one owned word the raise
+    /// site stores, so the `Err` payload already is the trace-level exception
+    /// value and neither hook is needed.
+    ///
+    /// pyre's own carrier is bare, so this is the case the [`Default`] spec
+    /// structurally cannot reach and the reason the field exists.
+    const BOXED: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
+        carrier_path: "guest::types::error::InterpError",
+        carrier_wrappers: &["alloc::boxed::Box"],
+        to_exc_object: None,
+        from_exc_object: None,
+    };
+
+    /// The smallest artefact `tyref_is_result_of_carrier` can read: the
+    /// predicate only projects `Adt.id.Adt` → `type_by_id(..).name_path()`
+    /// and `Adt.generics.types[i]`, so a `type_decls` table indexed by
+    /// `def_id` plus the type values under test is the whole input.
+    fn llbc_with_types(paths: &[&[&str]]) -> Llbc {
+        let decls: Vec<String> = paths
+            .iter()
+            .enumerate()
+            .map(|(id, segs)| {
+                let name = segs
+                    .iter()
+                    .map(|s| format!(r#"{{"Ident":["{s}",0]}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    r#"{{"def_id":{id},"item_meta":{{"name":[{name}],
+                       "span":{{"data":{{"file_id":0,"beg":{{"line":0,"col":0}},
+                       "end":{{"line":0,"col":0}}}}}},"source_text":null,
+                       "attr_info":{{"attributes":[],"inline":null,"rename":null,
+                       "public":true}},"is_local":true}},"kind":"Opaque"}}"#
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"charon_version":"test","has_errors":false,"translated":
+               {{"crate_name":"t","fun_decls":[],"type_decls":[{}]}}}}"#,
+            decls.join(",")
+        );
+        Llbc::from_slice(json.as_bytes()).expect("synthetic llbc parses")
+    }
+
+    /// `Adt` type value naming `def_id` with the given type arguments.
+    fn adt(def_id: usize, args: &[String]) -> String {
+        format!(
+            r#"{{"Adt":{{"id":{{"Adt":{def_id}}},"generics":{{"regions":[],
+               "types":[{}],"const_generics":[],"trait_refs":[]}}}}}}"#,
+            args.join(",")
+        )
+    }
+
+    fn ty(json: &str) -> TyRef {
+        serde_json::from_str(json).expect("type value parses")
+    }
+
+    // def_id 0 = Result, 1 = the carrier, 2 = Box, 3 = an unrelated error.
+    const RESULT: usize = 0;
+    const CARRIER: usize = 1;
+    const BOX: usize = 2;
+    const OTHER: usize = 3;
+
+    fn fixture() -> Llbc {
+        llbc_with_types(&[
+            &["core", "result", "Result"],
+            &["guest", "types", "error", "InterpError"],
+            &["alloc", "boxed", "Box"],
+            &["std", "io", "Error"],
+        ])
+    }
+
+    /// The wrapper peel: `Result<T, Box<InterpError>>` matches a spec that
+    /// declares `Box` as a wrapper — the one shape pyre's own spec cannot
+    /// express, and the shape every `?` site in such an interpreter carries.
+    #[test]
+    fn boxed_carrier_matches_through_the_declared_wrapper() {
+        let llbc = fixture();
+        let boxed = adt(BOX, &[adt(CARRIER, &[])]);
+        let result = ty(&adt(RESULT, &[adt(CARRIER, &[]), boxed]));
+        assert!(tyref_is_result_of_carrier(&result, &llbc, BOXED));
+    }
+
+    /// …and only through a *declared* wrapper.  An empty `carrier_wrappers`
+    /// runs zero peel iterations, so the same type is a non-match — which is
+    /// exactly why pyre's `Default` spec leaves such a `Result` alone and
+    /// this parameterization is additive.
+    #[test]
+    fn an_undeclared_wrapper_does_not_peel() {
+        let llbc = fixture();
+        let boxed = adt(BOX, &[adt(CARRIER, &[])]);
+        let result = ty(&adt(RESULT, &[adt(CARRIER, &[]), boxed]));
+        let unwrapped = ErrorCarrierSpec {
+            carrier_wrappers: &[],
+            ..BOXED
+        };
+        assert!(!tyref_is_result_of_carrier(&result, &llbc, unwrapped));
+    }
+
+    /// A bare (unwrapped) carrier still matches a spec that declares a
+    /// wrapper: the peel stops at the first ADT that is not on the list, so
+    /// one spec covers both `Result<T, E>` and `Result<T, Box<E>>`.
+    #[test]
+    fn a_bare_carrier_matches_a_wrapper_declaring_spec() {
+        let llbc = fixture();
+        let result = ty(&adt(RESULT, &[adt(CARRIER, &[]), adt(CARRIER, &[])]));
+        assert!(tyref_is_result_of_carrier(&result, &llbc, BOXED));
+    }
+
+    /// A different error type inside the same wrapper is refused — the peel
+    /// widens what the predicate looks *through*, never what it accepts.
+    #[test]
+    fn a_wrapped_foreign_error_is_refused() {
+        let llbc = fixture();
+        let boxed = adt(BOX, &[adt(OTHER, &[])]);
+        let result = ty(&adt(RESULT, &[adt(CARRIER, &[]), boxed]));
+        assert!(!tyref_is_result_of_carrier(&result, &llbc, BOXED));
+    }
+
+    /// A non-`Result` ADT is refused whatever its argument, and a `Result`
+    /// with no second type argument cannot be read as a carrier.
+    #[test]
+    fn a_non_result_and_an_arity_one_result_are_refused() {
+        let llbc = fixture();
+        let not_result = ty(&adt(BOX, &[adt(CARRIER, &[])]));
+        assert!(!tyref_is_result_of_carrier(&not_result, &llbc, BOXED));
+        let arity_one = ty(&adt(RESULT, &[adt(CARRIER, &[])]));
+        assert!(!tyref_is_result_of_carrier(&arity_one, &llbc, BOXED));
+    }
+
+    /// The `Default` names no carrier, so the pass is inert until a pipeline
+    /// declares one. An empty `carrier_path` has to be a non-match for every
+    /// shape — otherwise a pipeline that forgot to declare would silently get
+    /// some other interpreter's lowering.
+    #[test]
+    fn the_default_spec_names_no_carrier() {
+        let d = ErrorCarrierSpec::default();
+        assert!(d.carrier_path.is_empty());
+        assert!(d.carrier_wrappers.is_empty());
+        assert_eq!(d.to_exc_object, None);
+        assert_eq!(d.from_exc_object, None);
+        assert!(
+            crate::HostStaticAddrs::default()
+                .error_carrier
+                .carrier_path
+                .is_empty()
+        );
+
+        let llbc = fixture();
+        let result = ty(&adt(RESULT, &[adt(CARRIER, &[]), adt(CARRIER, &[])]));
+        assert!(
+            !tyref_is_result_of_carrier(&result, &llbc, d),
+            "an undeclared carrier lowers nothing",
+        );
+    }
 }

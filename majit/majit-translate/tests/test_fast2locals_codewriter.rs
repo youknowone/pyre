@@ -12,9 +12,11 @@ use majit_charon_reader::Llbc;
 use majit_translate::codewriter::call::CallControl;
 use majit_translate::codewriter::codewriter::CodeWriter;
 use majit_translate::codewriter::jitcode::JitCode;
-use majit_translate::front::mir::lower_fun_decl;
+use majit_translate::front::mir::lower_fun_decl_with_static_addrs;
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind, ValueType};
-use majit_translate::{CallPath, GraphTransformConfig, VirtualizableFieldDescriptor};
+use majit_translate::{
+    CallPath, ErrorCarrierSpec, GraphTransformConfig, HostStaticAddrs, VirtualizableFieldDescriptor,
+};
 
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -33,7 +35,21 @@ fn lower_fast2locals() -> Option<FunctionGraph> {
         .iter_local_fns()
         .find(|fd| fd.item_meta.name_path().ends_with("::fast2locals"))
         .expect("fast2locals present in the shipped LLBC");
-    Some(lower_fun_decl(&llbc, fd).expect("lower fast2locals"))
+    // The graph under test returns `Result<(), PyError>`, so the lowering has
+    // to be told which `Result` is the fallible return before `result_exc` can
+    // turn it into exception edges.  `majit-translate` names no carrier of its
+    // own, and the production driver spells this same one in
+    // `pyre-jit-trace/build/prepass.rs`.
+    let static_addrs = HostStaticAddrs {
+        error_carrier: ErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError",
+            carrier_wrappers: &[],
+            to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+            from_exc_object: Some(("PyError", "from_exc_object")),
+        },
+        ..Default::default()
+    };
+    Some(lower_fun_decl_with_static_addrs(&llbc, fd, static_addrs).expect("lower fast2locals"))
 }
 
 /// The virtualizable configuration the production pipeline passes

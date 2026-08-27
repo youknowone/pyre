@@ -32,10 +32,10 @@ pub(crate) struct GraphBodySource {
 /// Owns the extracted LLBC set and everything else the lowering reads, so
 /// a funcobj's body can be built after the whole-program pass has run.
 ///
-/// The three `HostStaticAddrs` tables are held owned because
-/// [`crate::HostStaticAddrs`] borrows its slices from the caller's frame;
-/// the borrowed view is rebuilt per [`GraphBodyProvider::build`] call,
-/// which only a demanded body pays for.
+/// The three `HostStaticAddrs` tables and the error-carrier spec are held
+/// owned because [`crate::HostStaticAddrs`] borrows all of them from the
+/// caller's frame; the borrowed view is rebuilt per
+/// [`GraphBodyProvider::build`] call, which only a demanded body pays for.
 pub(crate) struct GraphBodyProvider {
     llbcs: Vec<Llbc>,
     /// Per-LLBC struct field-attribute map, the same one the whole-program
@@ -47,6 +47,34 @@ pub(crate) struct GraphBodyProvider {
     pytypes: Vec<(String, i64)>,
     refs: Vec<(String, i64)>,
     int_values: Vec<(String, i64)>,
+    error_carrier: OwnedErrorCarrierSpec,
+}
+
+/// Owned mirror of [`crate::ErrorCarrierSpec`], held for the same reason as
+/// the three tables beside it: the spec borrows from the caller's frame, and
+/// a demanded body has to lower with the one the whole-program pass used.
+#[derive(Debug, Default)]
+struct OwnedErrorCarrierSpec {
+    carrier_path: String,
+    carrier_wrappers: Vec<String>,
+    to_exc_object: Option<Vec<String>>,
+    from_exc_object: Option<(String, String)>,
+}
+
+impl OwnedErrorCarrierSpec {
+    fn own(spec: crate::ErrorCarrierSpec<'_>) -> Self {
+        let own_path = |segments: &[&str]| -> Vec<String> {
+            segments.iter().map(|s| (*s).to_string()).collect()
+        };
+        Self {
+            carrier_path: spec.carrier_path.to_string(),
+            carrier_wrappers: own_path(spec.carrier_wrappers),
+            to_exc_object: spec.to_exc_object.map(own_path),
+            from_exc_object: spec
+                .from_exc_object
+                .map(|(receiver, method)| (receiver.to_string(), method.to_string())),
+        }
+    }
 }
 
 impl GraphBodyProvider {
@@ -61,6 +89,7 @@ impl GraphBodyProvider {
             pytypes: own(static_addrs.pytypes),
             refs: own(static_addrs.refs),
             int_values: own(static_addrs.int_values),
+            error_carrier: OwnedErrorCarrierSpec::own(static_addrs.error_carrier),
         }
     }
 
@@ -112,6 +141,9 @@ impl GraphBodyProvider {
         let pytypes = borrowed(&self.pytypes);
         let refs = borrowed(&self.refs);
         let int_values = borrowed(&self.int_values);
+        let carrier = &self.error_carrier;
+        let carrier_wrappers = borrowed_segments(&carrier.carrier_wrappers);
+        let to_exc_object = carrier.to_exc_object.as_deref().map(borrowed_segments);
         mir::lower_fun_decl_with_static_addrs_and_attrs(
             llbc,
             fd,
@@ -119,6 +151,15 @@ impl GraphBodyProvider {
                 pytypes: &pytypes,
                 refs: &refs,
                 int_values: &int_values,
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: &carrier.carrier_path,
+                    carrier_wrappers: &carrier_wrappers,
+                    to_exc_object: to_exc_object.as_deref(),
+                    from_exc_object: carrier
+                        .from_exc_object
+                        .as_ref()
+                        .map(|(receiver, method)| (receiver.as_str(), method.as_str())),
+                },
             },
             attrs,
         )
@@ -127,6 +168,10 @@ impl GraphBodyProvider {
 
 fn borrowed(rows: &[(String, i64)]) -> Vec<(&str, i64)> {
     rows.iter().map(|(k, v)| (k.as_str(), *v)).collect()
+}
+
+fn borrowed_segments(segments: &[String]) -> Vec<&str> {
+    segments.iter().map(String::as_str).collect()
 }
 
 #[cfg(test)]
