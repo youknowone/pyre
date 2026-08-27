@@ -938,6 +938,13 @@ pub struct MiniMarkGC {
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
     prebuilt_root_objects: Vec<usize>,
+    /// High-water capacity of [`Self::enumerate_labeled_root_walker_values`]'s
+    /// snapshot, so the next one asks the allocator once instead of growing
+    /// through it.  `collect_roots` materializes nothing upstream — it calls
+    /// `_collect_ref_stk` per root — so the reallocation ladder is pyre's own,
+    /// and it runs over every registered root on every major cycle.  A `Cell`
+    /// because the snapshot is a `&self` reader.
+    root_snapshot_capacity: std::cell::Cell<usize>,
     /// incminimark.py: objects with GCFLAG_CARDS_SET bit.
     /// Card bits are stored inline before each object's GcHeader.
     /// This list tracks which objects have at least one card bit set.
@@ -1259,6 +1266,7 @@ impl MiniMarkGC {
             roots: RootSet::new(),
             remembered_set: Vec::new(),
             prebuilt_root_objects: Vec::new(),
+            root_snapshot_capacity: std::cell::Cell::new(0),
             old_objects_with_cards_set: Vec::new(),
             young_objects_with_weakrefs: Vec::new(),
             old_objects_with_weakrefs: Vec::new(),
@@ -5102,7 +5110,7 @@ impl MiniMarkGC {
     fn enumerate_labeled_root_walker_values(&self) -> Vec<(GcRef, &'static str)> {
         // incminimark.py collect_roots: root_walker.walk_roots()
         // walks the same root sets as minor collection.
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(self.root_snapshot_capacity.get());
         // Read the registered roots in place. The minor path copies this list
         // first because `drag_out_root` takes `&mut self` while it walks; here
         // the walk only reads, so the copy would be one allocation and one pass
@@ -5184,6 +5192,10 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots(|gcref| {
             result.push((*gcref, "extra_root"));
         });
+        // Monotone: the hint only ever grows, so a collection that happens to
+        // see fewer roots does not send the next one back through the ladder.
+        self.root_snapshot_capacity
+            .set(self.root_snapshot_capacity.get().max(result.len()));
         result
     }
 

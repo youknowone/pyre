@@ -10004,11 +10004,18 @@ unsafe fn _cached_lookup_where_name(
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     // SAFETY: the GIL is held; the walk above has already finished.
     let cache = unsafe { method_cache_mut() };
-    cache.entries[h] = MethodCacheEntry {
-        version: version_tag,
-        lookup_where: tup,
-        name: Some(name.to_owned()),
-    };
+    let entry = &mut cache.entries[h];
+    entry.version = version_tag;
+    entry.lookup_where = tup;
+    // `W_TypeObject._pure_lookup_where_with_method_cache` stores a reference.
+    // Rust owns the bytes instead, so overwrite the buffer the slot
+    // already holds rather than minting one and dropping the displaced one:
+    // the fill rate is the miss rate, and a lookup on a freshly created type
+    // misses every time, so a fresh `Wtf8Buf` per fill is a malloc and a free
+    // on that path.
+    let cached_name = entry.name.get_or_insert_with(Wtf8Buf::new);
+    cached_name.clear();
+    cached_name.push_wtf8(name);
     tup
 }
 

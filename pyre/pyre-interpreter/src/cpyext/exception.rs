@@ -240,19 +240,19 @@ pub unsafe extern "C" fn PyUnicodeDecodeError_Create(
     let bytes = unsafe { std::slice::from_raw_parts(object as *const u8, length as usize) };
     let roots = pyre_object::gc_roots::push_roots();
     let class_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(class);
+    let _ = roots.pin_root(class);
     // Each argument is pinned as it is made: the next one allocates, and a
     // collection there moves whatever is only held in a local.
     let encoding_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(&encoding));
+    let _ = roots.pin_root(pyre_object::w_str_new(&encoding));
     let object_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(bytes));
+    let _ = roots.pin_root(pyre_object::bytesobject::w_bytes_from_bytes(bytes));
     let start_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_int_new(start as i64));
+    let _ = roots.pin_root(pyre_object::w_int_new(start as i64));
     let end_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_int_new(end as i64));
+    let _ = roots.pin_root(pyre_object::w_int_new(end as i64));
     let reason_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(pyre_object::w_str_new(&reason));
+    let _ = roots.pin_root(pyre_object::w_str_new(&reason));
     let reload = pyre_object::gc_roots::shadow_stack_get;
     let made = crate::call::call_function_impl_result(
         reload(class_slot),
