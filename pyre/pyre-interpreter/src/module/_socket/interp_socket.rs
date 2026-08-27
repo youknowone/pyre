@@ -770,9 +770,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("IP_RECVTTL", 21);
         cst!("IP_RECVTOS", 40);
         cst!("IP_RECVERR", 75);
-        cst!("IP_DEFAULT_MULTICAST_LOOP", 1);
-        cst!("IP_DEFAULT_MULTICAST_TTL", 1);
-        cst!("IP_MAX_MEMBERSHIPS", 20);
+        // `IP_DEFAULT_MULTICAST_LOOP`, `IP_DEFAULT_MULTICAST_TTL` and
+        // `IP_MAX_MEMBERSHIPS` are published under `#ifdef`, and the Winsock
+        // headers define none of them, so the module does not carry them here.
         // ── IPv6 ──
         cst!("IPV6_V6ONLY", ws::IPV6_V6ONLY);
         cst!("IPV6_CHECKSUM", ws::IPV6_CHECKSUM);
@@ -840,7 +840,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         cst!("RCVALL_OFF", ws::RCVALL_OFF);
         cst!("RCVALL_ON", ws::RCVALL_ON);
         cst!("RCVALL_SOCKETLEVELONLY", ws::RCVALL_SOCKETLEVELONLY);
-        cst!("RCVALL_IPLEVEL", ws::RCVALL_IPLEVEL);
+        // `RCVALL_IPLEVEL` is a member of the `RCVALL_VALUE` enum that the
+        // module does not publish; `RCVALL_MAX` is the last name it does.
         cst!("RCVALL_MAX", 3);
         // Hyper-V socket ABI constants (`hvsocket.h`).  GUIDs and Bluetooth
         // addresses are public strings rather than integer enum members.
