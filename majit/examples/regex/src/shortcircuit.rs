@@ -33,23 +33,37 @@
 //! compile. Both sides scan the same 4096 bytes, pinned by an FNV-1a digest
 //! asserted on both (`NONMATCHING_4096_FNV1A`).
 //!
-//! Peeled body, 93 nodes:
+//! Peeled body, at both tree sizes:
 //!
 //! ```text
-//!                    RPython   this module   jit_interp
-//!   getfield_gc_r          0             0            0
-//!   getfield_gc_i         24            24           24
-//!   setfield_gc           93            93           93
-//!   int_eq                 2             2            2
-//!   guard_true             6             6            1
-//!   guard_false           21            20            0
+//!   93 nodes        RPython   this module   jit_interp
+//!   getfield_gc_r         0             0            0
+//!   getfield_gc_i        24            24           24
+//!   setfield_gc          93            93           93
+//!   int_eq                2             2            2
+//!   guards               27            26            1
+//!   total               153           176          194
+//!
+//!   21 nodes        RPython   this module   jit_interp
+//!   getfield_gc_r         0             0            0
+//!   getfield_gc_i         6             6            6
+//!   setfield_gc          21            21           21
+//!   int_eq                2             2            2
+//!   guards                9             9            1
+//!   total                45            51           50
 //! ```
 //!
-//! Every structural count is exact: no pointer read survives on either side,
-//! one mark store per node, and two comparisons for 46 `Char` nodes — the
-//! subset construction, performed by both tracers. The loop tails are the same
-//! ops in the same order (`int_add`, `setfield_gc`, `int_lt`, `guard_true`,
-//! `jump`).
+//! Every structural count is exact, at both sizes and on both portals: no
+//! pointer read survives, one mark store per node, and two comparisons for the
+//! `Char` nodes — the subset construction, performed by every tracer here. The
+//! loop tails are the same ops in the same order (`int_add`, `setfield_gc`,
+//! `int_lt`, `guard_true`, `jump`). At 21 nodes even the guard count agrees
+//! exactly, 9 against 9.
+//!
+//! `the_peeled_body_matches_the_rpython_original` asserts that table and
+//! prints it, so this is a gate rather than a paragraph. RPython's column is a
+//! recorded constant — the Rust suite cannot call a Python 2 — with the
+//! command to re-derive it beside the constant.
 //!
 //! **And the guards say this module, not `jit_interp`, is the post's own
 //! spelling.** The post's source is Python `and`/`or`, which really do
@@ -707,6 +721,54 @@ mod tests {
         body.iter().filter(|o| **o == op).count()
     }
 
+    /// One peeled body's shape, as RPython's own JIT produced it.
+    ///
+    /// A recorded constant, not a computed one: reproducing it needs a Python
+    /// 2 and the `rpython/` checkout, which the Rust test suite has no way to
+    /// call. Recording it is what makes the comparison a gate instead of a
+    /// paragraph — if majit's trace drifts away from RPython's, the assertion
+    /// below fails rather than the module doc quietly going stale.
+    ///
+    /// To re-derive either row:
+    ///
+    /// ```text
+    /// pypy majit/examples/regex/rpython_original/runner.py 20 4096
+    /// pypy majit/examples/regex/rpython_original/runner.py 2 512
+    /// ```
+    struct RpythonBody {
+        nodes: usize,
+        total: usize,
+        getfield_gc_r: usize,
+        getfield_gc_i: usize,
+        setfield_gc: usize,
+        int_eq: usize,
+        guards: usize,
+    }
+
+    /// The post's own benchmark regex, `(a|b)*a(a|b){20}a(a|b)*`.
+    const RPYTHON_93: RpythonBody = RpythonBody {
+        nodes: 93,
+        total: 153,
+        getfield_gc_r: 0,
+        getfield_gc_i: 24,
+        setfield_gc: 93,
+        int_eq: 2,
+        // guard_true 6 + guard_false 21.
+        guards: 27,
+    };
+
+    /// The node-count control: `{2}` instead of `{20}`, so 21 nodes.
+    const RPYTHON_21: RpythonBody = RpythonBody {
+        nodes: 21,
+        total: 45,
+        getfield_gc_r: 0,
+        getfield_gc_i: 6,
+        setfield_gc: 21,
+        int_eq: 2,
+        // guard_true 6 + guard_false 3.
+        guards: 9,
+    };
+
     fn guards(body: &[OpCode]) -> usize {
         n_of(body, OpCode::GuardTrue) + n_of(body, OpCode::GuardFalse)
     }
@@ -902,6 +964,136 @@ mod tests {
             sc.body.len(),
             mk.body.len(),
         );
+    }
+
+    /// The reproduction claim itself: majit's peeled body against the one
+    /// RPython's own JIT produces for the post's own source.
+    ///
+    /// This is the test to read first. Everything else in this module measures
+    /// majit against majit; this measures majit against the original, and it
+    /// prints the two side by side so a reader sees the comparison rather than
+    /// a number to go look up.
+    ///
+    /// What is asserted exactly, and why those four: `getfield_gc_r`,
+    /// `getfield_gc_i`, `setfield_gc` and `int_eq` are the *structural* claims
+    /// of the post — the tree walk folded away, one mark stored per node, and
+    /// 46 `Char` nodes reduced to two comparisons by the subset construction.
+    /// If majit reproduced the post, those must agree with RPython digit for
+    /// digit, at both tree sizes. They do.
+    ///
+    /// The guard counts are asserted as a relationship, not an equality,
+    /// because they are the thing the two portals are *supposed* to differ on:
+    /// RPython's source short-circuits, so it guards; the `&`/`|` variant next
+    /// door does not. The branching portal must land within one guard of
+    /// RPython (it does: 26 against 27 — majit's loop exit is one `IntLt`
+    /// where RPython also re-checks the string length), and the masking portal
+    /// must be far below both, or the A/B is not an A/B.
+    #[test]
+    fn the_peeled_body_matches_the_rpython_original() {
+        for want in [&RPYTHON_93, &RPYTHON_21] {
+            let n = if want.nodes == 93 { 20 } else { 2 };
+            let s = nonmatching(4096, n, 42);
+            let nodes = count(lower(&bench_regex(n)));
+            assert_eq!(nodes, want.nodes, "the tree changed size");
+
+            let sc = measure(lower(&bench_regex(n)), &s);
+            let mk = measure_masking(lower(&bench_regex(n)), &s);
+            assert!(sc.compiles > 0 && mk.compiles > 0, "nothing compiled");
+
+            println!("[rpython-xcheck] {nodes} nodes, peeled body");
+            println!(
+                "[rpython-xcheck]   {:<16}{:>9}{:>13}{:>12}",
+                "", "RPython", "branching", "masking"
+            );
+            for (label, got_sc, got_mk, want_n) in [
+                (
+                    "getfield_gc_r",
+                    n_of(&sc.body, OpCode::GetfieldGcR),
+                    n_of(&mk.body, OpCode::GetfieldGcR),
+                    want.getfield_gc_r,
+                ),
+                (
+                    "getfield_gc_i",
+                    n_of(&sc.body, OpCode::GetfieldGcI),
+                    n_of(&mk.body, OpCode::GetfieldGcI),
+                    want.getfield_gc_i,
+                ),
+                (
+                    "setfield_gc",
+                    n_of(&sc.body, OpCode::SetfieldGc),
+                    n_of(&mk.body, OpCode::SetfieldGc),
+                    want.setfield_gc,
+                ),
+                (
+                    "int_eq",
+                    n_of(&sc.body, OpCode::IntEq),
+                    n_of(&mk.body, OpCode::IntEq),
+                    want.int_eq,
+                ),
+                ("guards", guards(&sc.body), guards(&mk.body), want.guards),
+                ("total", sc.body.len(), mk.body.len(), want.total),
+            ] {
+                println!("[rpython-xcheck]   {label:<16}{want_n:>9}{got_sc:>13}{got_mk:>12}");
+            }
+
+            // The structural four, exactly. Re-derive RPython's column with
+            // `pypy majit/examples/regex/rpython_original/runner.py`.
+            for (label, got, want_n) in [
+                (
+                    "getfield_gc_r",
+                    n_of(&sc.body, OpCode::GetfieldGcR),
+                    want.getfield_gc_r,
+                ),
+                (
+                    "getfield_gc_i",
+                    n_of(&sc.body, OpCode::GetfieldGcI),
+                    want.getfield_gc_i,
+                ),
+                (
+                    "setfield_gc",
+                    n_of(&sc.body, OpCode::SetfieldGc),
+                    want.setfield_gc,
+                ),
+                ("int_eq", n_of(&sc.body, OpCode::IntEq), want.int_eq),
+            ] {
+                assert_eq!(
+                    got, want_n,
+                    "{nodes} nodes: majit's branching body has {got} {label}, \
+                     RPython's has {want_n}. This is a structural claim of the \
+                     post, so the two must agree exactly; re-derive RPython's \
+                     with `pypy majit/examples/regex/rpython_original/runner.py`",
+                );
+                let got_mk = match label {
+                    "getfield_gc_r" => n_of(&mk.body, OpCode::GetfieldGcR),
+                    "getfield_gc_i" => n_of(&mk.body, OpCode::GetfieldGcI),
+                    "setfield_gc" => n_of(&mk.body, OpCode::SetfieldGc),
+                    _ => n_of(&mk.body, OpCode::IntEq),
+                };
+                assert_eq!(
+                    got_mk, want_n,
+                    "{nodes} nodes: the masking portal has {got_mk} {label} \
+                     against RPython's {want_n}; the `&`/`|` rewrite is only \
+                     supposed to move guards, not specialization",
+                );
+            }
+
+            // The guards: the relationship, not the equality.
+            let sc_guards = guards(&sc.body);
+            assert!(
+                sc_guards + 1 >= want.guards && sc_guards <= want.guards + 1,
+                "{nodes} nodes: the branching body has {sc_guards} guards \
+                 against RPython's {}, so it is no longer the same spelling \
+                 of `shift`",
+                want.guards,
+            );
+            let mk_guards = guards(&mk.body);
+            assert!(
+                mk_guards * 4 < sc_guards,
+                "{nodes} nodes: the masking body has {mk_guards} guards \
+                 against the branching body's {sc_guards}; the two portals no \
+                 longer differ in the thing the post's remark is about",
+            );
+        }
     }
 
     /// The mechanism behind the timing row, and the half that is free to

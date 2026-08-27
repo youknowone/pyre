@@ -31,6 +31,51 @@ the in-process harness RPython's own JIT tests use: real metainterpreter, real
 optimizer, LLGraph backend. The loop that comes out is the trace RPython would
 compile, without a multi-hour translation.
 
+## Reading its output
+
+```text
+=== result: 0 (0 == did not match, which is the benchmark) ===
+=== 1 loop(s)/bridge(s) compiled ===
+
+--- trace 0: 306 ops total, 153 in the peeled body ---
+  debug_merge_point            2
+  getfield_gc_i               24
+  guard_false                 21
+  ...
+```
+
+* **`result: 0`** — the matcher's answer, and it is supposed to be 0. The
+  benchmark input is generated *not* to match, because a matcher may stop early
+  on a match and then the per-character cost is hidden. A `1` here would mean
+  the generator drifted, not that something got faster.
+* **`1 loop(s)/bridge(s) compiled`** — the whole scan is one trace. The regex
+  is the JitDriver's green, so every character shares one green key. More than
+  one would mean the tree stopped being constant to the tracer.
+* **`306 ops total, 153 in the peeled body`** — a compiled loop is preamble plus
+  peeled body. The preamble runs once; the **peeled body is what runs per input
+  character**, and it is the only half worth grading. Reading 306 would charge
+  the body for reads the preamble hoisted out.
+* **the census** — the peeled body by op name. Four lines carry the post's
+  claims:
+  * **`getfield_gc_r` absent (0)** — not one pointer read. The tree has 92
+    edges and the trace follows none of them: they folded against the constant
+    regex. This is the headline.
+  * **`setfield_gc 93`** — one mark stored per node, for a 93-node tree. So the
+    whole tree is in the loop; nothing was deleted to get the pointer reads to
+    zero.
+  * **`int_eq 2`** — two comparisons for 46 `Char` nodes. That is the subset
+    construction, performed by the tracer: a node whose incoming mark the
+    optimizer proved constant zero has nothing to compare, so its comparison is
+    not in the loop at all.
+  * **`guard_true` + `guard_false` (27)** — the short-circuit branches. The
+    post's source is `and`/`or`, which really do stop early, so the tracer turns
+    each into a guard. This is the number that identifies which majit portal is
+    the faithful port.
+
+None of that says whether **majit** reproduced it — for that the numbers have
+to sit next to majit's. They do, below, and the comparison is asserted rather
+than eyeballed.
+
 ## What is here
 
 * **`marked.py`** — the post's matcher, in RPython. The class hierarchy
@@ -64,17 +109,26 @@ and `r_uint` is in any case the truer match for Rust's `wrapping_mul`.
 ## The result
 
 Peeled body — everything from the last `label` on, which is what runs per input
-character — at `n = 20`, 93 nodes:
+character. Two tree sizes, because a census that does not move with the tree is
+not measuring the tree:
 
-| op | RPython JIT | majit `shortcircuit` | majit `jit_interp` |
+| `n = 20`, 93 nodes | RPython JIT | majit `shortcircuit` | majit `jit_interp` |
 |---|---:|---:|---:|
 | `getfield_gc_r` | 0 | 0 | 0 |
 | `getfield_gc_i` | 24 | 24 | 24 |
 | `setfield_gc` | 93 | 93 | 93 |
 | `int_eq` | 2 | 2 | 2 |
-| `guard_true` | 6 | 6 | 1 |
-| `guard_false` | 21 | 20 | 0 |
+| guards | 27 | 26 | 1 |
 | total | 153 | 176 | 194 |
+
+| `n = 2`, 21 nodes | RPython JIT | majit `shortcircuit` | majit `jit_interp` |
+|---|---:|---:|---:|
+| `getfield_gc_r` | 0 | 0 | 0 |
+| `getfield_gc_i` | 6 | 6 | 6 |
+| `setfield_gc` | 21 | 21 | 21 |
+| `int_eq` | 2 | 2 | 2 |
+| guards | 9 | **9** | 1 |
+| total | 45 | 51 | 50 |
 
 Every structural count is exact. Not one pointer read survives on either side —
 the 92 edges of the tree walk are gone, folded against the green regex. 93
@@ -88,9 +142,28 @@ The loop tails are the same ops in the same order — `int_add`, `setfield_gc`,
 `int_lt`, `guard_true`, `jump` — with RPython additionally carrying a
 `debug_merge_point`, which costs nothing.
 
-At `n = 2` (21 nodes) RPython gives `setfield_gc 21`, `int_eq 2`,
-`getfield_gc_r 0`: the store count tracks the node count, which is the control
-saying the census is measuring the tree and not a constant.
+The 21-node row is the control: the store count tracks the node count on all
+three, so the census is measuring the tree and not a constant. It also lands
+the guard counts exactly on top of each other, 9 against 9 — at this size the
+branching portal is not merely close to RPython's shape, it *is* it.
+
+## This comparison is a gate, not a paragraph
+
+Both tables are asserted, not just written down:
+
+```sh
+cargo test -p regex --no-default-features --features dynasm \
+    -- --nocapture the_peeled_body_matches_the_rpython_original
+```
+
+It prints the three columns side by side and fails if they part. RPython's
+column is a recorded constant inside the test — a Rust test cannot call a
+Python 2 — with the `runner.py` command to re-derive it written beside it. The
+four structural counts are asserted **exactly**, on both portals and at both
+sizes, because those are the post's structural claims. The guards are asserted
+as a relationship instead: the branching portal within one of RPython's, the
+masking portal far below both. Guards are the one thing the two portals are
+supposed to differ on, so pinning them to equality would gate the wrong thing.
 
 ## What this settled about the crate's two portals
 
