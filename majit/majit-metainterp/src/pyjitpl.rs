@@ -5104,21 +5104,20 @@ impl<M: Clone> MetaInterp<M> {
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
+                // Same resolve as the sibling `force_start_tracing` arm and as
+                // `on_back_edge_typed`: the incoming number is a bucket hash,
+                // and the cell the typed arm just marked owns a minted key
+                // whenever that hash was already claimed. Resolve it ONCE:
+                // `with_typed_decision_key` asserts its first argument buckets
+                // to `make_green_key(green_key_raw)`, which a minted cell key
+                // does not, so feeding a resolved key back in fails that
+                // assertion on exactly the chained-cell case this supports.
                 let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
                     self.warm_state.cell_key_for(key)
                 })
                 .flatten()
                 .unwrap_or(green_key);
                 self.prepare_trace_start_runtime();
-                // Same re-resolve as the sibling `force_start_tracing` arm and
-                // as `on_back_edge_typed`: the incoming number is a bucket
-                // hash, and the cell the typed arm just marked owns a minted
-                // key whenever that hash was already claimed.
-                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                    self.warm_state.cell_key_for(key)
-                })
-                .flatten()
-                .unwrap_or(green_key);
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
