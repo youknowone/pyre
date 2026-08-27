@@ -12151,6 +12151,15 @@ impl<'a> Lowering<'a> {
         {
             return Some(arg.clone());
         }
+        // `rlib/debug.py check_not_access_directly` — upstream's
+        // `specialize_call` is `hop.inputarg(hop.args_r[0], arg=0)`, i.e. the
+        // identity once the annotator's assert has run. The assert half is
+        // registered in `annotator/builtin.rs`; this is the other half, and
+        // without it the marker would sit as a residual call on the caller's
+        // path instead of vanishing the way it does upstream.
+        if fmt_path_ends_with(segments, &["debug", "check_not_access_directly"]) {
+            return Some(arg.clone());
+        }
         let [a, b, c] = segments else {
             return None;
         };

@@ -204,6 +204,14 @@ pub fn r#type(obj: PyObjectRef) -> Option<NonNull<PyObject>> {
     if obj.is_null() {
         return None;
     }
+    // `baseobjspace.py W_Root.getclass` opens with
+    // `check_not_access_directly(self)`, and this function is where that
+    // method's body lives — the doc above records the fusion. Upstream's
+    // reason is written at its call site: annotating the type read with
+    // `access_directly` set specialises it, putting "an extra indirection due
+    // to a much more complicated function set" on every call. This is the one
+    // call, as it is upstream.
+    let obj = majit_rlib::debug::check_not_access_directly(obj);
     // A tagged immediate is an exact builtin `int`; its type object is
     // `gettypefor(&INT_TYPE)`, synthesized before the `w_class`/`ob_type`
     // derefs below (which would fault on the immediate). Gated on

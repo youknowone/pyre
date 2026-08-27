@@ -76,6 +76,27 @@ fn call_leafs(graph: &FunctionGraph) -> Vec<String> {
     leafs
 }
 
+/// `rlib/debug.py check_not_access_directly` is the identity after its
+/// annotator assert has run — upstream's `specialize_call` is
+/// `hop.inputarg(hop.args_r[0], arg=0)`. `identity_passthrough_alias` is the
+/// port of that half, and this is the graph that carries the one call
+/// (`typedef::type`, which fuses `space.type` and `W_Root.getclass`). Left
+/// unfolded the marker would sit as a residual call on the type-lookup path.
+#[test]
+fn the_access_directly_marker_folds_out_of_the_type_lookup() {
+    let Some(llbc) = interpreter_llbc() else {
+        return;
+    };
+    let graph = lower_named(&llbc, "typedef::type");
+    assert!(
+        call_leafs(&graph)
+            .iter()
+            .all(|leaf| leaf != "check_not_access_directly"),
+        "the marker must be aliased to its argument, got {:?}",
+        call_leafs(&graph)
+    );
+}
+
 /// `GetSetProperty(PyFrame.fget_getdictscope)`: the wrapper carries the
 /// residual force; `rewrite_op_jit_force_virtualizable` deletes it; the
 /// method itself matches `pyframe.py fget_getdictscope`.
