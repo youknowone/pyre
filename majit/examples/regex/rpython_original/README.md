@@ -89,6 +89,15 @@ than eyeballed.
   same LCG, the same constants, the same left-to-right fixup as the crate's
   `regex.rs`.
 * **`runner.py`** — `meta_interp` plus the census.
+* **`marked_masking.py`**, **`fixture_masking.py`** — the same two modules with
+  part 2's `&`/`|` in place of part 1's `and`/`or`. GENERATED: `make_masking.py`
+  writes them from `marked.py` / `fixture.py` and refuses if any of its five
+  substitutions no longer matches, so the pair stays an A/B of the operators and
+  of nothing else. `make_masking.py --check` exits non-zero when they are stale;
+  it is plain text processing and runs under Python 2 or 3.
+* **`target.py`**, **`target_masking.py`** — RPython translation targets, one
+  per spelling. These are the only thing on this side that can answer how fast
+  a trace *runs*; see below.
 
 ## The input is pinned on both sides
 
@@ -246,6 +255,22 @@ It is not a speed comparison. `meta_interp` runs the optimizer and the LLGraph
 backend, which executes traces in an interpreter; timing it would measure the
 harness. The RPython comparison is the trace-shape one above, and that one is
 exact.
+
+`target.py` and `target_masking.py` are what would answer it on this side: a
+translated binary runs compiled traces natively, which is the row the post
+reports.
+
+```sh
+pypy <repo root>/rpython/bin/rpython --opt=jit target.py   # RPython + JIT
+pypy <repo root>/rpython/bin/rpython --opt=2   target.py   # translated to C
+```
+
+Four binaries — two spellings times two optimization levels — would give the
+post's `and`/`or` claim its RPython-side reading and the JIT-over-C ratio its
+RPython-side denominator. **No such measurement has been taken here.** Each
+translation is a multi-hour build, and this README does not carry a number
+nothing ran. The targets are checked in so the measurement is a build away
+rather than a rewrite away.
 
 The post's headline *ratio* is measured, on the majit side, in one process:
 
