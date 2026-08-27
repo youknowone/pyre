@@ -868,7 +868,14 @@ pub struct OptContext {
     /// then routes the chain step through `Forwarded::InputArg(_)`
     /// (`optimizer.py:394 op.set_forwarded(newop)`) instead of the
     /// retired orphan-box forwarding fallback.
-    pub(crate) inputarg_refs: Vec<majit_ir::InputArgRc>,
+    /// Keyed by position rather than indexed by it. A bridge's fresh label
+    /// inputargs are allocated at `inputarg_base = parent_high_water`, so the
+    /// positions in use are two small clusters — `[0, num_inputs)` and
+    /// `[base, base + num_inputs)` — with the whole parent trace between them.
+    /// A `Vec` had to be grown across that gap every time one was named, which
+    /// made naming an inputarg cost the parent trace's length, on every bridge
+    /// the optimizer ran including the ones it declined.
+    pub(crate) inputarg_refs: FxHashMap<u32, majit_ir::InputArgRc>,
     /// Synthetic `OpRc` stand-ins for ResOp operand placeholders whose
     /// real producer has not been (and may never be) emitted, indexed
     /// sparsely by `OpRef::raw()`. `materialize_operand_at` falls back to
@@ -1817,7 +1824,7 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
-            inputarg_refs: Vec::new(),
+            inputarg_refs: FxHashMap::default(),
             resop_refs: indexmap::IndexMap::default(),
             live_synthetics: Vec::new(),
             live_synthetics_index: FxHashMap::default(),
@@ -1877,7 +1884,12 @@ impl OptContext {
         ctx.inputarg_refs = inputarg_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32)))
+            .map(|(i, &tp)| {
+                (
+                    i as u32,
+                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, i as u32)),
+                )
+            })
             .collect();
         // Seed `ctx.inputargs` so strict accessors like
         // `inputarg_type_at_strict` return `Some(tp)` matching slot i. Each
@@ -1937,37 +1949,6 @@ impl OptContext {
         }
     }
 
-    /// The value `inputarg_refs` is padded with between the last bound
-    /// inputarg and a newly named position.
-    ///
-    /// `inputarg_refs` is indexed by trace position, and a bridge enters with
-    /// `inputarg_base = parent_high_water` ([`Self::inputarg_base`]), so
-    /// naming one of its inputargs grows the vector past every position the
-    /// parent trace ever reached. Allocating a distinct `Rc` per padding slot
-    /// made that growth cost one MALLOC per position of the parent trace, on
-    /// every bridge the optimizer runs — and the optimizer runs on attempted
-    /// bridges, not only on kept ones. One shared `Rc` makes it a refcount
-    /// bump.
-    ///
-    /// Sharing is sound because a padding slot is never a host: every reader
-    /// tests `ia.index == idx` before taking a slot as the canonical
-    /// `_forwarded` host ([`Self::resolve_to_operand`], `unroll.rs`
-    /// `partial_trace_inputargs`), and the write paths repair a slot before
-    /// binding it. `u32::MAX` is the index rather than `0` so that test cannot
-    /// accept the padding at position 0, which `InputArg::new_int(0)` could.
-    ///
-    /// Upstream has no counterpart: `optimizer.py` forwards on the box object
-    /// (`op.set_forwarded(newop)`) and keeps no positional side table, so
-    /// there is nothing there to pad.
-    fn inputarg_padding() -> majit_ir::InputArgRc {
-        thread_local! {
-            static PADDING: majit_ir::InputArgRc = std::rc::Rc::new(
-                majit_ir::InputArg::from_type(majit_ir::Type::Int, u32::MAX),
-            );
-        }
-        PADDING.with(std::rc::Rc::clone)
-    }
-
     /// Ensure `inputarg_refs[pos]` holds a canonical `InputArgRc` of type
     /// `tp` (the `_forwarded` host that `resolve_to_operand` / `read_forwarded`
     /// / `clear_forwarded` / `materialize_operand_at` route the matching InputArg OpRef
@@ -1976,14 +1957,15 @@ impl OptContext {
     /// (re)allocates when the slot is absent or its type/index mismatch (mirrors
     /// the `materialize_operand_at` InputArg arm).
     fn bind_canonical_inputarg(&mut self, pos: usize, tp: majit_ir::Type) {
-        if pos >= self.inputarg_refs.len() {
-            self.inputarg_refs
-                .resize(pos + 1, Self::inputarg_padding());
-            self.inputarg_refs[pos] =
-                std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
-        } else if self.inputarg_refs[pos].tp != tp || self.inputarg_refs[pos].index != pos as u32 {
-            self.inputarg_refs[pos] =
-                std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos as u32));
+        let pos = pos as u32;
+        match self.inputarg_refs.get(&pos) {
+            Some(ia) if ia.tp == tp && ia.index == pos => {}
+            _ => {
+                self.inputarg_refs.insert(
+                    pos,
+                    std::rc::Rc::new(majit_ir::InputArg::from_type(tp, pos)),
+                );
+            }
         }
     }
 
@@ -2234,9 +2216,8 @@ impl OptContext {
         }
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                let idx = opref.raw() as usize;
                 self.inputarg_refs
-                    .get(idx)
+                    .get(&opref.raw())
                     .map(|ia| ia.forwarded.borrow().clone())
             }
             _ => self
@@ -2273,18 +2254,14 @@ impl OptContext {
         let idx = opref.raw() as usize;
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                // `inputarg_refs` is padded up to a named position (see
-                // `inputarg_padding`), so a slot past the last bound inputarg
-                // holds padding whose `index` is `u32::MAX`, not `idx`.
-                // Returning it hands the caller a box for a DIFFERENT
-                // position — and the padding is an Int, so a Ref position
-                // would resolve to an Int box. The write path already
-                // repairs such a slot before use; the read path must instead
-                // report "no binding", which makes `get_replacement_opref`
-                // return the position itself — `resoperation.py:57-68
+                // An unbound position reports "no binding" rather than a
+                // box, which makes `get_replacement_opref` return the
+                // position itself — `resoperation.py:57-68
                 // get_box_replacement`, where a box with no `_forwarded`
-                // resolves to itself.
-                if let Some(ia) = self.inputarg_refs.get(idx)
+                // resolves to itself. The index test is the invariant the
+                // write paths maintain, not a filter: a key never holds a box
+                // for a different position.
+                if let Some(ia) = self.inputarg_refs.get(&(idx as u32))
                     && ia.index as usize == idx
                 {
                     return Some(Operand::from_bound_inputarg(ia));
@@ -2306,8 +2283,7 @@ impl OptContext {
         }
         match opref {
             OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                let idx = opref.raw() as usize;
-                if let Some(ia) = self.inputarg_refs.get(idx) {
+                if let Some(ia) = self.inputarg_refs.get(&opref.raw()) {
                     *ia.forwarded.borrow_mut() = majit_ir::forwarding::Forwarded::None;
                 }
             }
@@ -2331,12 +2307,7 @@ impl OptContext {
     pub(crate) fn seed_boxes_canonical(&mut self, operands: &[Operand]) {
         for o in operands {
             if let Some(ia) = o.bound_inputarg() {
-                let idx = ia.index as usize;
-                if idx >= self.inputarg_refs.len() {
-                    self.inputarg_refs
-                        .resize(idx + 1, Self::inputarg_padding());
-                }
-                self.inputarg_refs[idx] = ia;
+                self.inputarg_refs.insert(ia.index, ia);
             } else if let Some(op) = o.bound_op() {
                 self.resop_refs.insert(op.pos.get(), op);
             }
@@ -2469,7 +2440,7 @@ impl OptContext {
             snapshot_frame_pcs: Vec::new(),
 
             inputargs: Vec::new(),
-            inputarg_refs: Vec::new(),
+            inputarg_refs: FxHashMap::default(),
             resop_refs: indexmap::IndexMap::default(),
             live_synthetics: Vec::new(),
             live_synthetics_index: FxHashMap::default(),
@@ -2851,7 +2822,6 @@ impl OptContext {
     /// The position-keyed const probe used by `allocate_next_pos_raw`.
     fn position_is_const_forwarded(&self, raw: u32) -> bool {
         use majit_ir::forwarding::Forwarded;
-        let idx = raw as usize;
         // `resop_refs` is keyed by the full type-tagged `OpRef`; a raw `u32`
         // can host more than one entry (typed vs untyped). Any host at this
         // raw carrying `Forwarded::Const` claims the position.
@@ -2876,7 +2846,7 @@ impl OptContext {
         .any(|op| matches!(*op.forwarded.borrow(), Forwarded::Const(_)));
         let inputarg_const = self
             .inputarg_refs
-            .get(idx)
+            .get(&raw)
             .is_some_and(|ia| matches!(*ia.forwarded.borrow(), Forwarded::Const(_)));
         resop_const || inputarg_const
     }
@@ -3171,12 +3141,7 @@ impl OptContext {
             return;
         }
         if let Some(ia) = o.bound_inputarg() {
-            let idx = ia.index as usize;
-            if idx >= self.inputarg_refs.len() {
-                self.inputarg_refs
-                    .resize(idx + 1, Self::inputarg_padding());
-            }
-            self.inputarg_refs[idx] = ia;
+            self.inputarg_refs.insert(ia.index, ia);
         } else if let Some(op) = o.bound_op() {
             self.install_canonical_producer(&op);
         }
@@ -4905,22 +4870,12 @@ impl OptContext {
                 // fallback only when no canonical type is recorded
                 // (`resoperation.py:719/727/739` + `:233` the `_forwarded`
                 // host).
-                let idx = opref.raw() as usize;
+                let idx = opref.raw();
                 let tp = self
                     .inputarg_type(opref)
                     .unwrap_or_else(|| opref.ty().unwrap_or(majit_ir::Type::Void));
-                if idx >= self.inputarg_refs.len() {
-                    self.inputarg_refs
-                        .resize(idx + 1, Self::inputarg_padding());
-                    self.inputarg_refs[idx] =
-                        std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
-                } else if self.inputarg_refs[idx].tp != tp
-                    || self.inputarg_refs[idx].index != idx as u32
-                {
-                    self.inputarg_refs[idx] =
-                        std::rc::Rc::new(majit_ir::InputArg::from_type(tp, idx as u32));
-                }
-                Operand::from_bound_inputarg(&self.inputarg_refs[idx])
+                self.bind_canonical_inputarg(idx as usize, tp);
+                Operand::from_bound_inputarg(&self.inputarg_refs[&idx])
             }
             _ => {
                 // A resop reaching here has no producer in any
@@ -9532,7 +9487,7 @@ mod boxref_forwarding_tests {
         ctx.seed_boxes_canonical(std::slice::from_ref(&b));
         // Register the InputArgRc as the slot's canonical host so the
         // context's readers resolve to it across the test body.
-        ctx.inputarg_refs = vec![ia];
+        ctx.inputarg_refs = std::iter::once((ia.index, ia)).collect();
         (ctx, b)
     }
 
@@ -10064,7 +10019,7 @@ mod boxref_forwarding_tests {
         let mut ctx = OptContext::with_num_inputs_and_start_pos(0, 1, 0, 1);
         let (old_box, ia) = bound_inputarg_operand(Type::Int, 0);
         ctx.seed_boxes_canonical(std::slice::from_ref(&old_box));
-        ctx.inputarg_refs = vec![ia];
+        ctx.inputarg_refs = std::iter::once((ia.index, ia)).collect();
         ctx.setintbound(
             &old_box,
             &crate::optimizeopt::intutils::IntBound::unbounded(),

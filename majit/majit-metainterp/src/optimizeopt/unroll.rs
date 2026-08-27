@@ -3407,17 +3407,15 @@ impl OptUnroll {
         // directly preserves any `_forwarded` state the Phase 1 passes wrote
         // on the original `InputArg` object (resoperation.py:700 `_forwarded`
         // host). Read it only when it actually matches the inputarg's type
-        // and index (the `ensure_inputarg_bindings` resize fills gaps with
-        // `OptContext::inputarg_padding` that would otherwise leak in here);
-        // last-resort fresh allocation when it carries no matching Rc (test
-        // fixtures / type-mismatch edge cases).
+        // and index; last-resort fresh allocation when it carries no matching
+        // Rc (test fixtures / type-mismatch edge cases).
         state.partial_trace_inputargs = ctx
             .inputargs
             .iter()
             .map(|ia_opref| {
                 let idx = ia_opref.raw() as usize;
                 let want_ty = ia_opref.ty().unwrap_or(majit_ir::Type::Void);
-                if let Some(rc) = ctx.inputarg_refs.get(idx).cloned()
+                if let Some(rc) = ctx.inputarg_refs.get(&(idx as u32)).cloned()
                     && rc.tp == want_ty
                     && rc.index == idx as u32
                 {
@@ -3438,7 +3436,7 @@ impl OptUnroll {
                 // future binding regression into a test failure here rather
                 // than letting it lose state silently.
                 debug_assert!(
-                    ctx.inputarg_refs.get(idx).is_some(),
+                    ctx.inputarg_refs.contains_key(&(idx as u32)),
                     "partial_trace_inputargs: inputarg slot {idx} unpopulated at \
                      unroll close; ensure_inputarg_bindings must seed every canonical \
                      inputarg so this fresh allocation is only a type-mismatch repair",
