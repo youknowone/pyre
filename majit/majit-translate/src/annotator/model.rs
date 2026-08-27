@@ -2378,10 +2378,16 @@ impl SomeValue {
             ))),
             SomeValue::List(s) => Ok(SomeValue::List(SomeList::new(s.listdef.clone()))),
             SomeValue::Dict(s) => Ok(SomeValue::Dict(SomeDict::new(s.dictdef.clone()))),
+            // `SomeInstance.noneify` reconstructs as
+            // `SomeInstance(self.classdef, can_be_None=True)`, taking the
+            // `flags={}` default: the flags do NOT survive. Carrying them
+            // over would leave `access_directly` set on an annotation that
+            // reached `None`, and `policy.py:71-83` turns an over-set flag
+            // into an aborted translation, not a missed optimisation.
             SomeValue::Instance(s) => Ok(SomeValue::Instance(SomeInstance::new(
                 s.classdef.clone(),
                 true,
-                s.flags.clone(),
+                std::collections::BTreeMap::new(),
             ))),
             SomeValue::PBC(s) => Ok(SomeValue::PBC(SomePBC::with_subset(
                 s.descriptions.values().cloned(),
@@ -2409,10 +2415,13 @@ impl SomeValue {
                 SomeValue::UnicodeString(SomeUnicodeString::new(false, s.inner.no_nul))
             }
             SomeValue::ByteArray(_) => SomeValue::ByteArray(SomeByteArray::new(false)),
+            // `SomeInstance.nonnoneify` drops the flags for the same
+            // reason `noneify` does — it reconstructs with the `flags={}`
+            // default.
             SomeValue::Instance(s) => SomeValue::Instance(SomeInstance::new(
                 s.classdef.clone(),
                 false,
-                s.flags.clone(),
+                std::collections::BTreeMap::new(),
             )),
             SomeValue::PBC(s) => SomeValue::PBC(SomePBC::with_subset(
                 s.descriptions.values().cloned(),
@@ -4992,6 +5001,32 @@ mod tests {
             panic!("expected SomeInstance");
         };
         assert!(classdef_opt_eq(&inst.classdef, &Some(base)));
+    }
+
+    /// `SomeInstance.noneify` / `nonnoneify` reconstruct with the
+    /// `flags={}` default, so a flag does not cross either of them.
+    /// `intersection_Instance` already does the same. The only flag that
+    /// reaches here in production is `access_directly`, whose consumer
+    /// (`policy.py:71-83`) aborts translation when it is set on a graph the
+    /// codewriter declines — so an over-kept flag is a build failure.
+    #[test]
+    fn noneify_and_nonnoneify_drop_instance_flags() {
+        let mut flags = std::collections::BTreeMap::new();
+        flags.insert("access_directly".to_string(), true);
+        let inst = SomeValue::Instance(SomeInstance::new(None, false, flags));
+
+        let noneified = inst.noneify().expect("instance noneifies");
+        let SomeValue::Instance(n) = &noneified else {
+            panic!("noneify kept the instance shape, got {noneified:?}")
+        };
+        assert!(n.can_be_none);
+        assert!(n.flags.is_empty(), "noneify kept {:?}", n.flags);
+
+        let SomeValue::Instance(nn) = inst.nonnoneify() else {
+            panic!("nonnoneify kept the instance shape")
+        };
+        assert!(!nn.can_be_none);
+        assert!(nn.flags.is_empty(), "nonnoneify kept {:?}", nn.flags);
     }
 
     #[test]
