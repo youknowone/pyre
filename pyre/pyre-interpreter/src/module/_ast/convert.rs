@@ -246,6 +246,24 @@ impl ObjectConverter {
         })
     }
 
+    /// PyPy `asdl_py.py:get_field_extractor` checks a present required field
+    /// for `None` after fetching it and before converting its ASDL value.
+    fn required_field(
+        &self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+    ) -> AstResult<PyObjectRef> {
+        let value = self.field(object, field, node)?;
+        if unsafe { pyre_object::is_none(value) } {
+            return Err(crate::PyError::value_error(format!(
+                "field '{field}' is required for {}",
+                class_name(object)
+            )));
+        }
+        Ok(value)
+    }
+
     fn optional_field(&self, object: PyObjectRef, field: &str) -> AstResult<Option<PyObjectRef>> {
         match crate::baseobjspace::getattr_str(object, field) {
             Ok(value) if unsafe { pyre_object::is_none(value) } => Ok(None),
@@ -387,7 +405,7 @@ impl ObjectConverter {
         } else if self.is_node(object, "Interactive")? {
             "Interactive"
         } else if self.is_node(object, "Expression")? {
-            let body = self.field(object, "body", "Expression")?;
+            let body = self.required_field(object, "body", "Expression")?;
             return Ok(ast::Mod::Expression(ast::ModExpression {
                 node_index: Default::default(),
                 range: Default::default(),
@@ -417,7 +435,7 @@ impl ObjectConverter {
                 "FunctionDef"
             };
             let name = self.identifier(object, "name", node)?;
-            let args = self.field(object, "args", node)?;
+            let args = self.required_field(object, "args", node)?;
             let parameters = Box::new(self.recurse(|this| this.parameters(args))?);
             let body = self.body(object, "body", node)?;
             let decorator_list = self.decorators(object, node)?;
@@ -444,7 +462,7 @@ impl ObjectConverter {
                 range,
             }))
         } else if self.is_node(object, "Expr")? {
-            let value = self.field(object, "value", "Expr")?;
+            let value = self.required_field(object, "value", "Expr")?;
             Ok(ast::Stmt::Expr(ast::StmtExpr {
                 node_index: Default::default(),
                 range,
@@ -468,7 +486,7 @@ impl ObjectConverter {
                     self.recurse(|this| this.expr(value))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let value = self.field(object, "value", "Assign")?;
+            let value = self.required_field(object, "value", "Assign")?;
             Ok(ast::Stmt::Assign(ast::StmtAssign {
                 node_index: Default::default(),
                 range,
@@ -534,7 +552,7 @@ impl ObjectConverter {
             }))
         } else if self.is_node(object, "AugAssign")? {
             let target = self.req_expr(object, "target", "AugAssign")?;
-            let op = self.field(object, "op", "AugAssign")?;
+            let op = self.required_field(object, "op", "AugAssign")?;
             let value = self.req_expr(object, "value", "AugAssign")?;
             Ok(ast::Stmt::AugAssign(ast::StmtAugAssign {
                 node_index: Default::default(),
@@ -1030,7 +1048,7 @@ impl ObjectConverter {
     }
 
     fn match_case(&mut self, object: PyObjectRef) -> AstResult<ast::MatchCase> {
-        let pattern = self.field(object, "pattern", "match_case")?;
+        let pattern = self.required_field(object, "pattern", "match_case")?;
         let pattern = self.recurse(|this| this.pattern(pattern))?;
         Ok(ast::MatchCase {
             range: Default::default(),
@@ -1209,7 +1227,7 @@ impl ObjectConverter {
         field: &str,
         node: &str,
     ) -> AstResult<Box<ast::Expr>> {
-        let value = self.field(object, field, node)?;
+        let value = self.required_field(object, field, node)?;
         Ok(Box::new(self.recurse(|this| this.expr(value))?))
     }
 
@@ -1225,8 +1243,14 @@ impl ObjectConverter {
         field: &str,
         node: &str,
     ) -> AstResult<ast::Identifier> {
+        let value = self.required_field(object, field, node)?;
+        if !unsafe { pyre_object::is_str(value) } {
+            return Err(crate::PyError::type_error(
+                "AST identifier must be of type str",
+            ));
+        }
         Ok(ast::Identifier::new(
-            self.string(object, field, node)?,
+            unsafe { pyre_object::w_str_get_value(value) }.to_string(),
             Default::default(),
         ))
     }
@@ -1296,8 +1320,8 @@ impl ObjectConverter {
     fn expr(&mut self, object: PyObjectRef) -> AstResult<ast::Expr> {
         let range = self.location(object, "expr")?;
         if self.is_node(object, "UnaryOp")? {
-            let operand = self.field(object, "operand", "UnaryOp")?;
-            let op = self.field(object, "op", "UnaryOp")?;
+            let operand = self.required_field(object, "operand", "UnaryOp")?;
+            let op = self.required_field(object, "op", "UnaryOp")?;
             Ok(ast::Expr::UnaryOp(ast::ExprUnaryOp {
                 node_index: Default::default(),
                 range,
@@ -1305,9 +1329,9 @@ impl ObjectConverter {
                 operand: Box::new(self.recurse(|this| this.expr(operand))?),
             }))
         } else if self.is_node(object, "BinOp")? {
-            let left = self.field(object, "left", "BinOp")?;
-            let right = self.field(object, "right", "BinOp")?;
-            let op = self.field(object, "op", "BinOp")?;
+            let left = self.required_field(object, "left", "BinOp")?;
+            let right = self.required_field(object, "right", "BinOp")?;
+            let op = self.required_field(object, "op", "BinOp")?;
             Ok(ast::Expr::BinOp(ast::ExprBinOp {
                 node_index: Default::default(),
                 range,
@@ -1316,7 +1340,7 @@ impl ObjectConverter {
                 right: Box::new(self.recurse(|this| this.expr(right))?),
             }))
         } else if self.is_node(object, "Call")? {
-            let func = self.field(object, "func", "Call")?;
+            let func = self.required_field(object, "func", "Call")?;
             let args = self
                 .list(object, "args", "Call")?
                 .into_iter()
@@ -1344,8 +1368,8 @@ impl ObjectConverter {
                 },
             }))
         } else if self.is_node(object, "Attribute")? {
-            let value = self.field(object, "value", "Attribute")?;
-            let ctx = self.field(object, "ctx", "Attribute")?;
+            let value = self.required_field(object, "value", "Attribute")?;
+            let ctx = self.required_field(object, "ctx", "Attribute")?;
             Ok(ast::Expr::Attribute(ast::ExprAttribute {
                 node_index: Default::default(),
                 range,
@@ -1366,7 +1390,7 @@ impl ObjectConverter {
                     self.recurse(|this| this.expr(element))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let ctx = self.context(self.field(object, "ctx", "sequence")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "sequence")?)?;
             if is_tuple {
                 Ok(ast::Expr::Tuple(ast::ExprTuple {
                     node_index: Default::default(),
@@ -1386,7 +1410,7 @@ impl ObjectConverter {
                 }))
             }
         } else if self.is_node(object, "Name")? {
-            let ctx = self.context(self.field(object, "ctx", "Name")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "Name")?)?;
             Ok(ast::Expr::Name(ast::ExprName {
                 node_index: Default::default(),
                 range,
@@ -1403,7 +1427,7 @@ impl ObjectConverter {
                 invalid_type: None,
             }))
         } else if self.is_node(object, "BoolOp")? {
-            let op = self.field(object, "op", "BoolOp")?;
+            let op = self.required_field(object, "op", "BoolOp")?;
             Ok(ast::Expr::BoolOp(ast::ExprBoolOp {
                 node_index: Default::default(),
                 range,
@@ -1421,7 +1445,7 @@ impl ObjectConverter {
                 value,
             }))
         } else if self.is_node(object, "Lambda")? {
-            let args = self.field(object, "args", "Lambda")?;
+            let args = self.required_field(object, "args", "Lambda")?;
             let parameters = self.recurse(|this| this.parameters(args))?;
             let body = self.req_expr(object, "body", "Lambda")?;
             Ok(ast::Expr::Lambda(ast::ExprLambda {
@@ -1555,7 +1579,7 @@ impl ObjectConverter {
         } else if self.is_node(object, "Subscript")? {
             let value = self.req_expr(object, "value", "Subscript")?;
             let slice = self.req_expr(object, "slice", "Subscript")?;
-            let ctx = self.context(self.field(object, "ctx", "Subscript")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "Subscript")?)?;
             Ok(ast::Expr::Subscript(ast::ExprSubscript {
                 node_index: Default::default(),
                 range,
@@ -1565,7 +1589,7 @@ impl ObjectConverter {
             }))
         } else if self.is_node(object, "Starred")? {
             let value = self.req_expr(object, "value", "Starred")?;
-            let ctx = self.context(self.field(object, "ctx", "Starred")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "Starred")?)?;
             Ok(ast::Expr::Starred(ast::ExprStarred {
                 node_index: Default::default(),
                 range,
@@ -1721,7 +1745,7 @@ impl ObjectConverter {
                 ))
             })
             .transpose()?;
-        let value = self.field(object, "value", "keyword")?;
+        let value = self.required_field(object, "value", "keyword")?;
         Ok(ast::Keyword {
             node_index: Default::default(),
             range,
