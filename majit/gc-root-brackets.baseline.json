@@ -8,8 +8,8 @@
   "tier15_calls_fns": 0,
   "tier1_calls": 9,
   "tier1_calls_fns": 7,
-  "unbracketed_calls": 2068,
-  "unbracketed_calls_fns": 828,
+  "unbracketed_calls": 2057,
+  "unbracketed_calls_fns": 821,
   "unmatched_seeds": [
     "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
     "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
