@@ -7911,6 +7911,254 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     Ok(Some(inlined))
 }
 
+/// Inline an exact `property` getter selected by
+/// `W_Super.getattribute`'s MRO suffix walk.
+///
+/// PyPy traces through `lookup_starting_at` and `W_Property.get`, so the
+/// getter enters the same MIFrame inline path as an ordinary property read.
+/// The fused 3.14 `LOAD_SUPER_ATTR` reaches pyre as one opaque may-force
+/// residual; this reconstructs that upstream shape under the same start-class,
+/// receiver-class and type-version guards as the non-Python `super` folds.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_super_property_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    global_super: OpRef,
+    self_obj: OpRef,
+    cls: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_super) = walker_concrete_ref_object(ctx, global_super) else {
+        return Ok(None);
+    };
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_super) {
+        return Ok(None);
+    }
+    let Some(concrete_self) = walker_concrete_ref_object(ctx, self_obj) else {
+        return Ok(None);
+    };
+    let Some(concrete_cls) = walker_concrete_ref_object(ctx, cls) else {
+        return Ok(None);
+    };
+    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
+        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
+    }) else {
+        return Ok(None);
+    };
+    // Class access asks `property.__get__(None, objtype)` and gets the
+    // descriptor itself; the constant result fold owns that arm.
+    if class_mode || !unsafe { pyre_object::descriptor::is_exact_property(w_descr) } {
+        return Ok(None);
+    }
+    let fget = unsafe { pyre_object::descriptor::w_property_get_fget(w_descr) };
+    if fget.is_null() || unsafe { pyre_object::is_none(fget) } {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(fget) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(fget),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_self),
+    ];
+    let fget_const = ctx.trace_ctx.const_ref(fget as i64);
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+
+    // LOAD_SUPER_ATTR names the global callable explicitly.  Pin it before
+    // baking the builtin implementation, just as the non-Python result fold
+    // does; the rewind below removes this guard if the callee walk declines.
+    if !global_super.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_super as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op.pc,
+            OpCode::GuardValue,
+            &[global_super, expected],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(global_super, expected);
+    }
+    super::specialize::walker_emit_super_attr_lookup_guards(
+        ctx,
+        op.pc,
+        self_obj,
+        cls,
+        concrete_self,
+        concrete_cls,
+        objtype,
+        false,
+    )?;
+    walker_pin_descriptor_slot(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
+
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        fget_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        fget,
+        fget_const,
+        fget,
+        arg_concretes,
+        vec![self_obj],
+        vec![ConcreteValue::Ref(concrete_self)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
+}
+
+/// Inline the same exact `property` getter through an already-built
+/// `super` proxy (`proxy = super(); proxy.name`).  Splitting proxy creation
+/// from the attribute opcode must not turn PyPy's traced
+/// `W_Super.getattribute -> W_Property.get` chain back into an opaque
+/// `getattr_fn` residual.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    proxy: OpRef,
+    name: &str,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(concrete_proxy) = walker_concrete_ref_object(ctx, proxy) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::descriptor::is_super(concrete_proxy) } {
+        return Ok(None);
+    }
+    let Some(proxy_w_class) = (unsafe { walker_exact_builtin_class(concrete_proxy) }) else {
+        return Ok(None);
+    };
+    let concrete_cls = unsafe { pyre_object::descriptor::w_super_get_type(concrete_proxy) };
+    let concrete_self = unsafe { pyre_object::descriptor::w_super_get_obj(concrete_proxy) };
+    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
+        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
+    }) else {
+        return Ok(None);
+    };
+    if class_mode || !unsafe { pyre_object::descriptor::is_exact_property(w_descr) } {
+        return Ok(None);
+    }
+    let fget = unsafe { pyre_object::descriptor::w_property_get_fget(w_descr) };
+    if fget.is_null() || unsafe { pyre_object::is_none(fget) } {
+        return Ok(None);
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(fget) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(fget),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_self),
+    ];
+    let fget_const = ctx.trace_ctx.const_ref(fget as i64);
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let (self_op, cls_op) = super::specialize::walker_guard_and_read_super_proxy(
+        ctx,
+        op.pc,
+        proxy,
+        proxy_w_class,
+        concrete_self,
+        concrete_cls,
+    )?;
+    super::specialize::walker_emit_super_attr_lookup_guards(
+        ctx,
+        op.pc,
+        self_op,
+        cls_op,
+        concrete_self,
+        concrete_cls,
+        objtype,
+        false,
+    )?;
+    walker_pin_descriptor_slot(ctx, op.pc, w_descr, crate::descr::property_fget_descr())?;
+
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        fget_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        fget,
+        fget_const,
+        fget,
+        arg_concretes,
+        vec![self_op],
+        vec![ConcreteValue::Ref(concrete_self)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+    )?;
+    if inlined.is_none() {
+        ctx.trace_ctx.cut_trace(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+    }
+    Ok(inlined)
+}
+
 /// Inline a `property` getter read (`obj.value`) after the plain-attribute
 /// mapdict fold declines because the attribute is a data descriptor.  PyPy
 /// traces *through* `space.getattr` → `property.__get__` →

@@ -5821,18 +5821,15 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
         return getattr_str(origin, name);
     }
 
-    // super proxy — PyPy: pypy/module/__builtin__/descriptor.py W_Super.getattribute
-    // Looks up `name` in cls's MRO starting AFTER super_type.
+    // super proxy — PyPy: pypy/module/__builtin__/descriptor.py
+    // `W_Super.getattribute`.  Only an exact `super` reaches this direct
+    // builtin slot: a subclass must first dispatch through its Python-level
+    // `__getattribute__`, so an override is observable.  The inherited
+    // builtin slot is handled in the generic dispatch below.
     unsafe {
-        if name != "__class__"
-            && let Some(value) = super_getattribute_wtf8(obj, Wtf8::new(name))?
-        {
-            return Ok(value);
+        if pyre_object::is_exact_type(obj, &pyre_object::descriptor::SUPER_TYPE) {
+            return super_getattribute_str(obj, name);
         }
-        // `W_Super.getattribute` falls back to
-        // `object.__getattribute__` when the post-starttype MRO has no
-        // match.  This is how the proxy's own getsets (`__self__`,
-        // `__thisclass__`, ...) remain visible.
     }
 
     // Native itertools fallback methods.  Every concrete iterator TypeDef now
@@ -6265,6 +6262,21 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                         std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
                     });
                 if !owned_by_heap_type {
+                    // descriptor.py `W_Super.getattribute`: a `super`
+                    // subclass which inherits the builtin slot still runs the
+                    // builtin implementation on the subclass instance.  Call
+                    // that implementation directly; re-entering
+                    // `object_getattr_miss` would skip the post-starttype MRO
+                    // walk, while re-entering `getattr` would recurse.
+                    if pyre_object::descriptor::is_super(obj) {
+                        return match super_getattribute_str(obj, name) {
+                            Ok(value) => Ok(value),
+                            Err(err) if call_getattr && err.kind == PyErrorKind::AttributeError => {
+                                instance_getattr_hook_or_err(w_type, obj, name, err)
+                            }
+                            Err(err) => Err(err),
+                        };
+                    }
                     return object_getattr_miss(obj, name, call_getattr);
                 }
                 let name_obj = w_str_new(name);
@@ -6493,6 +6505,52 @@ unsafe fn super_getattribute_wtf8(
     }
 }
 
+/// Direct implementation of PyPy's `W_Super.getattribute` for a UTF-8 name.
+///
+/// This is deliberately separate from `space.getattr`: the latter first
+/// selects the receiver type's `__getattribute__` slot, whereas this function
+/// is what that selected builtin slot executes.  Keeping the two levels apart
+/// lets a `super` subclass override the slot without making an inherited or
+/// explicit `super.__getattribute__(obj, name)` call recurse.
+fn super_getattribute_str(obj: PyObjectRef, name: &str) -> PyResult {
+    unsafe {
+        if name != "__class__"
+            && let Some(value) = super_getattribute_wtf8(obj, Wtf8::new(name))?
+        {
+            return Ok(value);
+        }
+    }
+    object_getattr_miss(obj, name, false)
+}
+
+/// Wrapped-name entry point for the builtin `super.__getattribute__`
+/// descriptor.  PyPy's `W_Super.getattribute` accepts the original wrapped
+/// text object; retain that shape so lone-surrogate names do not require a
+/// lossy `&str` conversion.
+pub(crate) fn super_getattribute(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
+    if !unsafe { pyre_object::is_str(w_name) } {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            crate::type_methods::arg_type_name(w_name)
+        )));
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
+        super_getattribute_str(obj, unsafe {
+            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+        })
+    } else {
+        unsafe {
+            if name.as_str() != Ok("__class__")
+                && let Some(value) = super_getattribute_wtf8(obj, name)?
+            {
+                return Ok(value);
+            }
+            object_getattribute_surrogate(obj, w_name, name)
+        }
+    }
+}
+
 // ─── `w_name`-taking attribute API ───
 //
 // `descroperation.py/247/255 getattr/setattr/delattr(space, w_obj,
@@ -6618,10 +6676,33 @@ pub fn delattr(obj: PyObjectRef, w_name: PyObjectRef) -> PyResult {
 /// `getattr_str`'s builtin-type special-cases, all valid identifiers.)
 unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) -> PyResult {
     unsafe {
-        if name.as_str() != Ok("__class__")
-            && let Some(value) = super_getattribute_wtf8(obj, name)?
+        if pyre_object::is_exact_type(obj, &pyre_object::descriptor::SUPER_TYPE) {
+            return super_getattribute(obj, w_name);
+        }
+        if pyre_object::descriptor::is_super(obj)
+            && let Some(w_type) = crate::typedef::r#type(obj)
+            && let Some(slot) = getattribute_if_not_from_object(w_type.as_ptr())
         {
-            return Ok(value);
+            let owned_by_heap_type =
+                lookup_where(w_type.as_ptr(), "__getattribute__").is_some_and(|(owner, found)| {
+                    std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
+                });
+            if !owned_by_heap_type {
+                return match super_getattribute(obj, w_name) {
+                    Ok(value) => Ok(value),
+                    Err(err) if err.kind == PyErrorKind::AttributeError => {
+                        instance_getattr_hook_or_err_wtf8(w_type.as_ptr(), obj, w_name, err)
+                    }
+                    Err(err) => Err(err),
+                };
+            }
+            match get_and_call_function(slot, obj, w_type.as_ptr(), &[w_name]) {
+                Ok(value) => return Ok(value),
+                Err(err) if err.kind == PyErrorKind::AttributeError => {
+                    return instance_getattr_hook_or_err_wtf8(w_type.as_ptr(), obj, w_name, err);
+                }
+                Err(err) => return Err(err),
+            }
         }
         match object_getattribute_surrogate(obj, w_name, name) {
             Ok(v) => Ok(v),
@@ -6673,6 +6754,22 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, name: &Wtf8) 
             }
         }
     }
+}
+
+/// Lone-surrogate twin of `instance_getattr_hook_or_err`.  The wrapped name is
+/// already available, so a `super` subclass override that raises
+/// `AttributeError` can enter its inherited/app-level `__getattr__` without a
+/// lossy UTF-8 conversion.
+unsafe fn instance_getattr_hook_or_err_wtf8(
+    w_type: PyObjectRef,
+    obj: PyObjectRef,
+    w_name: PyObjectRef,
+    err: PyError,
+) -> PyResult {
+    if let Some(hook) = lookup_in_type_where(w_type, "__getattr__") {
+        return get_and_call_function(hook, obj, w_type, &[w_name]);
+    }
+    Err(err)
 }
 
 /// `object.__getattribute__` terminal for a lone-surrogate name —
@@ -10631,10 +10728,8 @@ pub unsafe fn bound_method_attr_fast_path(
     Some((w_type, version_tag, w_descr))
 }
 
-/// The `super(C, self).name` shape that reduces, purely, to
-/// `w_method_new(w_descr, self_obj, objtype)` — the bound method
-/// `W_Super.getattribute` builds when the MRO walk that starts after `C`
-/// lands on a plain function and binding it runs no Python.
+/// The Python-free prefix of `super(C, self).name`: validate the pair and find
+/// the first descriptor in the MRO suffix after `C`.
 ///
 /// Shared by the interpreter's LOAD_SUPER_ATTR and the tracer's
 /// `try_walker_specialize_load_super_attr`, for the reason
@@ -10650,12 +10745,12 @@ pub unsafe fn bound_method_attr_fast_path(
 /// ([`crate::builtins::super_check_python_free`]): the remaining arm is a
 /// `__class__` getattr, which a property answers with arbitrary code.
 ///
-/// Returns `(objtype, version_tag, w_descr)`.  The caller pins `objtype` on
-/// the receiver's `w_class` slot and `version_tag` on `objtype`, which
-/// together make the walk's answer a constant: the classes it reads are all
-/// ancestors of `objtype`, and `mutated()` recurses into subclasses, so a
-/// dict store or a `__bases__` reassignment on any of them bumps `objtype`'s
-/// own tag.
+/// Returns `(objtype, version_tag, w_descr, class_mode)`.  `class_mode` is
+/// PyPy's `space.is_w(w_obj, w_objtype)` decision in
+/// `W_Super.getattribute`: it selects `__get__(None, objtype)` rather than
+/// `__get__(self, objtype)`.  The caller still classifies the descriptor,
+/// because property and a user `__get__` may run Python while a plain value,
+/// function, staticmethod or classmethod has a reducible binding.
 ///
 /// # Safety
 /// `start_type` and `self_obj` must be valid object pointers (null tolerated).
@@ -10663,7 +10758,7 @@ pub unsafe fn super_attr_fast_path(
     start_type: PyObjectRef,
     self_obj: PyObjectRef,
     name: &str,
-) -> Option<(PyObjectRef, u64, PyObjectRef)> {
+) -> Option<(PyObjectRef, u64, PyObjectRef, bool)> {
     // `getattr_str_impl` reaches its super branch only for a name it has not
     // already answered itself: that branch is guarded `name != "__class__"`,
     // and the terminal `__dict__` read sits above it.
@@ -10673,24 +10768,15 @@ pub unsafe fn super_attr_fast_path(
     if start_type.is_null() || self_obj.is_null() || !is_type(start_type) {
         return None;
     }
-    // descriptor.py `_super_check` first arm: a class receiver makes
-    // `getattribute` bind with `descr_obj = PY_NULL`, so there is no `Method`
-    // to emit, and the `w_class` read below would answer the metaclass rather
-    // than the walked type.
-    if is_type(self_obj) {
-        return None;
-    }
-    // `super_check_python_free`'s second arm — its answer is the type whose
-    // MRO `getattribute` walks.
-    let objtype = crate::typedef::r#type(self_obj)?.as_ptr();
-    if !issubtype_w(objtype, start_type) {
-        return None;
-    }
-    // The tracer pins the class by guarding the receiver's `w_class` slot, so
-    // only a receiver whose class IS that slot can be reproduced.  An
-    // exception instance carrying the generic stub resolves its class through
-    // the kind registry instead.
-    if !std::ptr::eq(objtype, (*self_obj).w_class) {
+    let objtype = crate::builtins::super_check_python_free(start_type, self_obj)?;
+    let class_mode = is_type(self_obj) && std::ptr::eq(objtype, self_obj);
+    // In instance mode the tracer pins the class by guarding the receiver's
+    // `w_class` slot, so only a receiver whose class IS that slot can be
+    // reproduced.  An exception carrying the generic stub resolves its class
+    // through the kind registry instead.  Class mode pins the class object
+    // itself and therefore needs no `w_class` equality (that slot is its
+    // metaclass).
+    if !class_mode && !std::ptr::eq(objtype, (*self_obj).w_class) {
         return None;
     }
     // typeobject.py: an uncacheable type cannot pin the lookup.
@@ -10723,21 +10809,39 @@ pub unsafe fn super_attr_fast_path(
     if w_descr.is_null() {
         return None;
     }
-    // `get(w_descr, self_obj, objtype)` must reduce to `w_method_new`, which
-    // is the EXACT `function` typedef and nothing else.  `get` dispatches
-    // `is_method_descriptor` FIRST and answers a `method_descriptor` with
-    // `builtin_bound_method_new`, whose result has a different `type()` and a
-    // `module` field the caller's `Method` template does not write.  Every
-    // other descriptor shape — property, classmethod, staticmethod, getset,
-    // member, slot wrapper, builtin function, or a user `__get__` — either
-    // runs Python or returns something that is not a `Method`.
-    //
-    // `function` is a static typedef, so its `__get__` cannot be reassigned
-    // and needs no version pin of its own.
-    if !std::ptr::eq((*w_descr).ob_type, &crate::FUNCTION_TYPE as *const _) {
-        return None;
+    Some((objtype, version_tag, w_descr, class_mode))
+}
+
+/// Whether `get(w_descr, descr_obj, objtype)` returns `w_descr` unchanged,
+/// without running Python, for the descriptor shapes not otherwise reduced by
+/// the `super` fold.
+///
+/// This mirrors `get` rather than guessing from the payload layout.  Class
+/// access returns function, method-descriptor, slot-wrapper and property
+/// objects themselves.  A builtin function has no binding in either mode.
+/// For every remaining object the absence of `__get__` on its Python type is
+/// exactly the terminal `get -> None`, after which
+/// `W_Super.getattribute` returns the dictionary value unchanged.
+pub unsafe fn super_attr_returns_descr_unchanged(w_descr: PyObjectRef, class_mode: bool) -> bool {
+    if w_descr.is_null() {
+        return false;
     }
-    Some((objtype, version_tag, w_descr))
+    let descr_ob_type = (*w_descr).ob_type;
+    if class_mode
+        && (std::ptr::eq(descr_ob_type, &crate::FUNCTION_TYPE as *const _)
+            || std::ptr::eq(descr_ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
+            || crate::is_slot_wrapper(w_descr)
+            || pyre_object::descriptor::is_exact_property(w_descr))
+    {
+        return true;
+    }
+    if std::ptr::eq(descr_ob_type, &crate::BUILTIN_FUNCTION_TYPE as *const _) {
+        return true;
+    }
+    let Some(descr_type) = crate::typedef::r#type(w_descr) else {
+        return true;
+    };
+    lookup_in_type_where(descr_type.as_ptr(), "__get__").is_none()
 }
 
 /// descroperation.py `object_getattribute(space)` — the canonical

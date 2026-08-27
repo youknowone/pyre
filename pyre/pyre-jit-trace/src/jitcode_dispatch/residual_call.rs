@@ -5831,7 +5831,7 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
 /// resumes the residual, which raises it from the eval loop.  A cell that is
 /// unbound AT RECORDING keeps the residual instead — the fold would otherwise
 /// have to emit a guard it knows fails.
-fn try_walker_read_deref_cell<Sym: WalkSym>(
+pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     cell_op: OpRef,
@@ -8225,6 +8225,17 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
+                // A name binding splits `super()` from the later LOAD_ATTR,
+                // but PyPy still traces through the selected property's
+                // getter.  Give that Python descriptor its inline path before
+                // the Python-free super binding fold below declines it.
+                if let Some(attr_name) = attr_name.as_deref()
+                    && let Some(inlined) = try_walker_inline_super_proxy_property_get(
+                        ctx, op, code, &r_args, call_descr, obj_opref, attr_name, dst, dst_bank,
+                    )?
+                {
+                    return Ok(inlined);
+                }
                 // The plain-slot fold declines a `super` proxy: nothing on
                 // it is a mapdict slot, and the MRO suffix `getattribute`
                 // walks starts somewhere else entirely.
@@ -8442,6 +8453,23 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 ctx.trace_ctx.box_value(code_opref),
                 ctx.trace_ctx.box_value(namei_opref),
             ) {
+                if let Some(name) = walker_load_name_from_code(w_code_ptr, namei as usize)
+                    && let Some(inlined) = try_walker_inline_super_property_get(
+                        ctx,
+                        op,
+                        code,
+                        &r_args,
+                        call_descr,
+                        global_super_opref,
+                        self_opref,
+                        cls_opref,
+                        &name,
+                        dst,
+                        dst_bank,
+                    )?
+                {
+                    return Ok(inlined);
+                }
                 if spec_gate(SpecFold::LoadSuperAttr, || {
                     try_walker_specialize_load_super_attr(
                         ctx,
