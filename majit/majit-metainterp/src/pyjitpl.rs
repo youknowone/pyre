@@ -10924,9 +10924,9 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new).or_else(|| {
-                        trace_layout_ref.and_then(|layout| layout.recovery_layout.clone())
-                    }),
+                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new).or_else(
+                        || trace_layout_ref.and_then(|layout| layout.recovery_layout.clone()),
+                    ),
                     resume_layout: resume_layout.map(std::sync::Arc::new),
                     storage: trace_layout_ref.and_then(|layout| layout.storage.clone()),
                 }

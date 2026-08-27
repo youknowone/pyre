@@ -93,15 +93,18 @@ pub struct SingleFrameBlackholeResult {
 fn bh_jitdrivers_sd(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
 ) -> std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
-    let table = metainterp_sd.bh_jitdrivers_sd.get_or_init(|| {
-        build_bh_jitdrivers_sd(metainterp_sd)
-    });
+    let table = metainterp_sd
+        .bh_jitdrivers_sd
+        .get_or_init(|| build_bh_jitdrivers_sd(metainterp_sd));
     debug_assert!(
         table.len() == metainterp_sd.jitdrivers_sd.len()
-            && table.iter().zip(&metainterp_sd.jitdrivers_sd).all(|(bh, jd)| {
-                bh.portal_runner_ptr.map_or(0, |f| f as usize as i64) == jd.portal_runner_adr
-                    && bh.result_type as u8 == bh_return_type(jd.result_type) as u8
-            }),
+            && table
+                .iter()
+                .zip(&metainterp_sd.jitdrivers_sd)
+                .all(|(bh, jd)| {
+                    bh.portal_runner_ptr.map_or(0, |f| f as usize as i64) == jd.portal_runner_adr
+                        && bh.result_type as u8 == bh_return_type(jd.result_type) as u8
+                }),
         "bh_jitdrivers_sd outlived a `jitdrivers_sd` write that did not run \
          `finish_setup_descrs_for_jitdrivers`"
     );

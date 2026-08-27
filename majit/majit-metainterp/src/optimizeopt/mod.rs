@@ -2215,11 +2215,10 @@ impl OptContext {
             return Some(majit_ir::forwarding::Forwarded::None);
         }
         match opref {
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                self.inputarg_refs
-                    .get(&opref.raw())
-                    .map(|ia| ia.forwarded.borrow().clone())
-            }
+            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => self
+                .inputarg_refs
+                .get(&opref.raw())
+                .map(|ia| ia.forwarded.borrow().clone()),
             _ => self
                 .find_producer_op(opref)
                 .map(|op| op.forwarded.borrow().clone()),

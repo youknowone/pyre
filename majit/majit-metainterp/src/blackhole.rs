@@ -11970,14 +11970,14 @@ fn handler_inline_call_nested_ext(
             break 'callee Err(DispatchError::ContinueRunningNormally(Box::new(args)));
         }
 
-    // RPython `blackhole.py` invariant: after the handler has
-    // decoded operands and consumed the result payload, every
-    // exceptional exit path must update `self.position` to the
-    // post-op cursor before re-raising.  Mirror that here for the
-    // aborted / got_exception paths — `dispatch_step` only writes
-    // `self.position = new_pos` when the handler returns `Ok`, so any
-    // `Err(LeaveFrame)` that skips the assignment leaves the parent's
-    // cursor pre-op.
+        // RPython `blackhole.py` invariant: after the handler has
+        // decoded operands and consumed the result payload, every
+        // exceptional exit path must update `self.position` to the
+        // post-op cursor before re-raising.  Mirror that here for the
+        // aborted / got_exception paths — `dispatch_step` only writes
+        // `self.position = new_pos` when the handler returns `Ok`, so any
+        // `Err(LeaveFrame)` that skips the assignment leaves the parent's
+        // cursor pre-op.
         if callee.aborted {
             bh.position = p;
             bh.aborted = true;

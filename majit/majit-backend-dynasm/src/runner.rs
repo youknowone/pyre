@@ -2113,11 +2113,7 @@ impl DynasmBackend {
     /// `PropagateExceptionDescr.handle_fail`: read `jf_guard_exc`, clear it,
     /// and stage the value into `jf_frame[0]` before synthesizing the
     /// exit-frame-with-exception descr the toplevel consumer expects.
-    fn find_descr_by_ptr(
-        &self,
-        ptr: usize,
-        frame_ptr: *mut JitFrame,
-    ) -> majit_ir::DescrRef {
+    fn find_descr_by_ptr(&self, ptr: usize, frame_ptr: *mut JitFrame) -> majit_ir::DescrRef {
         let attached = self.attached_descr_ptrs();
         // Check all four `DoneWithThisFrameDescr` variants.
         // Forward through `meta_descr` so the metainterp class hierarchy

@@ -1285,9 +1285,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         // from the backend; backend frames the frontend layout lacks are
         // appended so no recovery frame is dropped.
         if let Some(ref backend_recovery) = layout.recovery_layout {
-            if let Some(existing) =
-                entry.recovery_layout.as_mut().map(std::sync::Arc::make_mut)
-            {
+            if let Some(existing) = entry.recovery_layout.as_mut().map(std::sync::Arc::make_mut) {
                 for (i, source) in backend_recovery.frames.iter().enumerate() {
                     if let Some(target) = existing.frames.get_mut(i) {
                         if target.header_pc.is_none() {
