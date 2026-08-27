@@ -281,7 +281,9 @@ fn build_semantic_program_via_active_frontend(
             // so they residualize through the same annotator-only stub path.
             program.unsafe_fn_stubs = llbcs
                 .iter()
-                .flat_map(front::mir::collect_unsafe_fn_stubs_from_llbc)
+                .flat_map(|llbc| {
+                    front::mir::collect_unsafe_fn_stubs_from_llbc(llbc, static_addrs.error_carrier)
+                })
                 .chain(
                     llbcs
                         .iter()
@@ -396,6 +398,57 @@ pub type FnAddrBindings<'a> = [(&'a str, i64)];
 /// `CallControl::register_macro_impl_helper_trace_fnaddr`.
 pub type ImplFnAddrBindings<'a> = [(&'a str, &'a str, &'a str, i64)];
 
+/// Identity of the interpreter's fallible-return carrier — the `E` of the
+/// `Result<T, E>` that [`front::result_exc`] lowers into exception edges.
+///
+/// That pass is otherwise carrier-agnostic graph surgery; these four fields
+/// are the whole of what names one interpreter's error type.  The consumer
+/// supplies its own the way `PipelineConfig::register_trait_families` takes
+/// a consumer's trait names.  There is no default identity to fall back on:
+/// see the [`Default`] impl.
+#[derive(Debug, Clone, Copy)]
+pub struct ErrorCarrierSpec<'a> {
+    /// Qualified ADT path of `E`, compared after peeling
+    /// [`Self::carrier_wrappers`].
+    pub carrier_path: &'a str,
+    /// ADT paths to peel off `E` before that compare, each read through the
+    /// wrapper's own first type argument.  Applied outermost-first and at
+    /// most once per entry, so `&["alloc::boxed::Box"]` takes
+    /// `Box<InterpError>` to `InterpError`.  Empty for a bare carrier.
+    pub carrier_wrappers: &'a [&'a str],
+    /// Free function materialising the `Err` payload into the trace-level
+    /// exception value the raise site stores (`BH_LAST_EXC_VALUE`'s domain).
+    /// `None` when the payload already *is* one such value — a carrier that
+    /// is itself a single owned word needs no materialisation and the raise
+    /// site forwards it unchanged.
+    pub to_exc_object: Option<&'a [&'a str]>,
+    /// The inverse, emitted at a caught-exception rewrap site as
+    /// `(receiver_root, method)`.  `None` for the same reason and with the
+    /// same effect as on [`Self::to_exc_object`]: the caught value already
+    /// is the `Err` payload, so the rewrap forwards it into the shell.
+    pub from_exc_object: Option<(&'a str, &'a str)>,
+}
+
+/// No carrier declared.
+///
+/// This layer ships none: naming one interpreter's error type here is the
+/// thing the spec exists to undo, and it is also the boundary this subtree
+/// keeps against a consumer's object model. A pipeline that has not named a
+/// carrier has no `Result` to lower, so an empty `carrier_path` matches no
+/// ADT and [`front::result_exc`] leaves every graph alone — the same outcome
+/// as running with the pass switched off, rather than a silently different
+/// interpreter's shape.
+impl Default for ErrorCarrierSpec<'_> {
+    fn default() -> Self {
+        Self {
+            carrier_path: "",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: None,
+        }
+    }
+}
+
 /// Host-supplied addresses of prebuilt object-space singletons that pyre
 /// source carries through the flowgraph as opaque `LOAD_GLOBAL`
 /// constants (the static `PyType` pointers and dict-strategy refs).
@@ -421,6 +474,12 @@ pub struct HostStaticAddrs<'a> {
     /// (`ValueType::Int` `ConstInt`), keyed by crate-stripped
     /// `module::NAME`.  Distinct from `refs`: the value, not the address.
     pub int_values: &'a [(&'a str, i64)],
+    /// Which `Result<T, E>` the exception-link lowering owns.  Carried here
+    /// because this struct already reaches both `front::result_exc`
+    /// consumers — the callee gate in
+    /// `lower_unstructured_with_static_addrs_and_attrs` and the caller
+    /// capture on `Lowering` — so no consumer grows a parameter for it.
+    pub error_carrier: ErrorCarrierSpec<'a>,
 }
 
 /// Multi-file analysis with explicit per-source module paths.

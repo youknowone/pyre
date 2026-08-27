@@ -2,8 +2,9 @@
 //! regression tests for `front::result_exc`.
 
 use majit_charon_reader::Llbc;
-use majit_translate::front::mir::lower_function;
+use majit_translate::front::mir::lower_function_with_static_addrs;
 use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
+use majit_translate::{ErrorCarrierSpec, HostStaticAddrs};
 use std::sync::OnceLock;
 
 const INTERP: &str = concat!(
@@ -23,6 +24,29 @@ const INTERP: &str = concat!(
 /// behind a `OnceLock` is sufficient: `get_or_init` runs the load
 /// exactly once even under the concurrent test threads, and
 /// `lower_function` only borrows it.
+/// The carrier the pass under test lowers, spelled the way the production
+/// driver spells it (`pyre-jit-trace/build/prepass.rs`).  `majit-translate`
+/// names no carrier of its own, so a test that expects `Result<T, PyError>`
+/// to become exception links has to declare it.
+fn lower_function(
+    llbc: &Llbc,
+    function_name: &str,
+) -> Result<majit_translate::model::FunctionGraph, majit_translate::front::mir::LowerError> {
+    lower_function_with_static_addrs(
+        llbc,
+        function_name,
+        HostStaticAddrs {
+            error_carrier: ErrorCarrierSpec {
+                carrier_path: "pyre_interpreter::error::PyError",
+                carrier_wrappers: &[],
+                to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                from_exc_object: Some(("PyError", "from_exc_object")),
+            },
+            ..Default::default()
+        },
+    )
+}
+
 fn interp() -> &'static Llbc {
     static LLBC: OnceLock<Llbc> = OnceLock::new();
     LLBC.get_or_init(|| Llbc::load(INTERP).expect("load pyre-interpreter.ullbc"))

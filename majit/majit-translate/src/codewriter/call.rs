@@ -2494,6 +2494,17 @@ impl CallControl {
         let mut offset: usize = 0;
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);
+            // `heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`
+            // open with `if FIELD is lltype.Void: continue`, so a zero-sized
+            // field is in neither the descr list nor the positional census.
+            // Matching one here is the single way this walk and the walker
+            // `field_pos_in` calls can disagree about what a field is: the
+            // mint would ask for a number the census refuses to assign.
+            // `()` / `PhantomData` reach this arm as a `()`-payload enum
+            // variant's `__pos_<i>` row.
+            if ir_type == majit_ir::value::Type::Void {
+                continue;
+            }
             if fname == "typeptr" {
                 // heaptracker.py:102-103: `if name == 'typeptr': continue`
                 continue;
@@ -2794,6 +2805,13 @@ impl CallControl {
         let mut found: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);
+            // Same skip, same reason as `fielddescrof_concrete`: this walk
+            // hands its match to `field_pos_in`, and `heaptracker.py
+            // all_interiorfielddescrs` / `get_fielddescr_index_in` both drop
+            // `Void` before anything else.
+            if ir_type == majit_ir::value::Type::Void {
+                continue;
+            }
             if fname == "typeptr" {
                 continue;
             }
@@ -11965,6 +11983,97 @@ mod tests {
         // …which is why the mint site answers a header word without walking.
         assert_eq!(field_pos_in(&cc, "PyObject", "w_class"), 0);
         assert_eq!(field_pos_in(&cc, "Method", "w_class"), 2);
+    }
+
+    /// A `()`-payload enum variant is what makes a mint site's own field
+    /// walk and the census `field_pos_in` consults disagree.
+    ///
+    /// `front::mir` registers a variant's payload as `__pos_<i>` rows, so
+    /// `Unit((), Tag, AccessMode)` puts a zero-sized row at `__pos_0`.
+    /// `heaptracker.py get_fielddescr_index_in` opens with `if FIELD is
+    /// lltype.Void: continue`, so that row is in no census — and a mint
+    /// site that matched it by name would then ask for a slot the census
+    /// refuses to assign.  `field_pos_in` reports the refusal instead of
+    /// clamping it, so the only fix is for the mint to skip `Void` on the
+    /// same terms.  pyre's own structs carry no `()` field, which is why
+    /// this arm went unexercised until a non-pyre consumer arrived.
+    #[test]
+    fn void_payload_variant_takes_no_field_slot() {
+        use crate::codewriter::heaptracker::get_fielddescr_index_in;
+        const OWNER: &str = "VoidPayloadUnion::Unit";
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            OWNER.to_string(),
+            vec![
+                ("__pos_0".to_string(), "()".to_string()),
+                ("__pos_1".to_string(), "i32".to_string()),
+                ("__pos_2".to_string(), "u8".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+
+        // The census is the two stored rows; the `()` row shifts nothing.
+        assert_eq!(get_fielddescr_index_in(&cc, OWNER, "__pos_1", 0), 0);
+        assert_eq!(get_fielddescr_index_in(&cc, OWNER, "__pos_2", 0), 1);
+        // …and it answers "no such field" over that census of two.
+        assert_eq!(get_fielddescr_index_in(&cc, OWNER, "__pos_0", 0), -3);
+
+        // So the mint must not match it either: there is no descr for a
+        // field the census does not number.  Before this skip the call
+        // matched by name and `field_pos_in` panicked on the `-3`.
+        assert!(
+            cc.fielddescrof(0, OWNER, None, "__pos_0").is_none(),
+            "a zero-sized field has no descr to mint"
+        );
+
+        // The stored rows still mint, at the census's own numbers, and the
+        // `()` row contributes no bytes to their offsets.
+        // (index_in_parent, offset)
+        let slot_of = |idx: u32, name: &str| {
+            let descr = cc
+                .fielddescrof(idx, OWNER, None, name)
+                .unwrap_or_else(|| panic!("{OWNER}.{name} descr resolves"));
+            let fd = descr
+                .as_field_descr()
+                .unwrap_or_else(|| panic!("{OWNER}.{name} is a field descr"));
+            (fd.index_in_parent(), fd.offset())
+        };
+        assert_eq!(slot_of(1, "__pos_1"), (0, 0));
+        assert_eq!(
+            slot_of(2, "__pos_2"),
+            (1, 4),
+            "the 4-byte i32 is the only field before it"
+        );
+    }
+
+    /// The interior-field namespace numbers through the same census, so a
+    /// zero-sized element field is refused there for the same reason
+    /// (`heaptracker.py all_interiorfielddescrs`).
+    #[test]
+    fn void_element_field_mints_no_interior_descr() {
+        const ELEM: &str = "VoidPayloadElem";
+        let mut cc = CallControl::new();
+        let mut registry = crate::front::StructFieldRegistry::default();
+        registry.fields.insert(
+            ELEM.to_string(),
+            vec![
+                ("marker".to_string(), "()".to_string()),
+                ("value".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.set_struct_fields(registry);
+        cc.set_known_struct_names([ELEM.to_string()].into_iter().collect());
+
+        let array = Some(format!("Vec<{ELEM}>"));
+        assert!(
+            cc.interiorfielddescrof(0, &array, "marker").is_none(),
+            "a zero-sized element field has no interior descr to mint"
+        );
+        assert!(
+            cc.interiorfielddescrof(1, &array, "value").is_some(),
+            "the stored element field still resolves"
+        );
     }
 
     #[test]

@@ -1434,3 +1434,128 @@ fn a_scalar_element_indexes_to_an_int_banked_array_read() {
         got.array_reads,
     );
 }
+
+/// A borrowed primitive banks by its container, not by its own type.
+///
+/// `charon-corpus` §10's three shapes each put a shared borrow of a primitive
+/// in a payload position, and all three serialize that borrow identically, so
+/// no predicate over the payload's own type separates them:
+///
+/// | shape                        | payload         | reached through            |
+/// |------------------------------|-----------------|----------------------------|
+/// | `slice_get_tag_dispatch`     | `Option<&u8>`   | `<[T]>::get` then `?`      |
+/// | `range_start_index`          | `Bound<&usize>` | `RangeBounds::start_bound` |
+/// | `borrowed_byte_fields_alias` | `&u8`           | a struct field             |
+///
+/// The first two are enum-variant payloads, reached by matching on them, so
+/// the borrow belongs to the match rather than to the program — and a sibling
+/// arm supplying the merged value by value (`Bound::Unbounded => 0`) forces
+/// one bank across the merge.  The third is a reference the program declared
+/// and stores, which `ptr::eq` compares by address, so it keeps the ref bank.
+///
+/// Each shape falls to a different wrong answer, which is why all three are
+/// asserted together: never peeling types the first `Ref`; peeling only the
+/// `?`-desugaring shells types the second `Ref`, because `Bound` is not one;
+/// peeling every borrowed primitive types the third `Unsigned`.
+/// `jtransform.py:330-337` deletes every cast between integer primitives —
+/// `rewrite_op_cast_char_to_int`, `cast_int_to_uint`, `cast_uint_to_int` and
+/// the rest are each `pass` — because the two share one register kind. A
+/// numeric `From` reaches the same conversion through a call, and `core`
+/// carries no graph body, so left alone it stays residual.
+///
+/// The float sibling is asserted in the same test because it is the only thing
+/// stopping the rule from being read as "numeric `From` is always identity":
+/// `f64::from(i32)` moves banks and has to keep its call.
+#[test]
+fn an_integer_widening_from_aliases_but_a_float_one_does_not() {
+    use majit_translate::{CallTarget, OpKind};
+    let llbc = load_corpus();
+
+    let numeric_from_calls = |name: &str| -> usize {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => {
+                    segments.iter().any(|s| s == "num")
+                        && segments.last().map(String::as_str) == Some("from")
+                }
+                _ => false,
+            })
+            .count()
+    };
+
+    assert_eq!(
+        numeric_from_calls("widening_int_from"),
+        0,
+        "`u32::from(u16)` is a no-op in the Int bank and keeps no call",
+    );
+    assert_eq!(
+        numeric_from_calls("widening_float_from"),
+        1,
+        "`f64::from(i32)` crosses banks, so it is a conversion and keeps its call",
+    );
+
+    // The alias has to bind the destination to the argument, not drop it: a
+    // lowering that discarded the operand would also report zero calls.
+    let graph = lower_function(llbc, "widening_int_from").expect("lowering");
+    let adds = graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op.contains("add")))
+        .count();
+    assert_eq!(adds, 1, "the widened value still reaches the `+ 1`");
+}
+
+#[test]
+fn a_borrowed_primitive_banks_by_its_container() {
+    use majit_translate::model::{OpKind, ValueType};
+    let llbc = load_corpus();
+
+    // `__discriminant` is the tag read the match itself needs, not a payload.
+    let payloads = |name: &str| -> Vec<(String, ValueType)> {
+        let graph = lower_function(llbc, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, ty, .. } if field.name != "__discriminant" => {
+                    Some((field.owner_root.clone().unwrap_or_default(), ty.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        payloads("slice_get_tag_dispatch"),
+        vec![(
+            "core::option::Option::Some".to_string(),
+            ValueType::Unsigned
+        )],
+        "the `?` payload of an `Option<&u8>` is the byte, not a pointer to it",
+    );
+    assert_eq!(
+        payloads("range_start_index"),
+        vec![
+            ("Bound::Included".to_string(), ValueType::Unsigned),
+            ("Bound::Excluded".to_string(), ValueType::Unsigned),
+        ],
+        "a `Bound` payload is an enum variant's too, though no `?` produces it",
+    );
+    assert_eq!(
+        payloads("borrowed_byte_fields_alias"),
+        vec![
+            ("BorrowedByte".to_string(), ValueType::Ref(None)),
+            ("BorrowedByte".to_string(), ValueType::Ref(None)),
+        ],
+        "a struct's `&u8` field is a pointer the program stores and compares",
+    );
+}

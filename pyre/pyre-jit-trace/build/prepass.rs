@@ -273,6 +273,21 @@ pub fn main() {
 /// two-artefact consumers it requires `pyre-jit` too.
 const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
+/// pyre's fallible-return carrier: a bare `PyError`, materialised through
+/// the published `pyerror_to_exc_object` free function and rebuilt through
+/// the `PyError::from_exc_object` associated fn.
+///
+/// `front::result_exc` lowers a `Result<T, E>`-returning graph into
+/// exception edges; naming `E` is the consumer's job, so the identity of
+/// pyre's own `E` lives here rather than in majit.
+const PYRE_ERROR_CARRIER: majit_translate::ErrorCarrierSpec<'static> =
+    majit_translate::ErrorCarrierSpec {
+        carrier_path: "pyre_interpreter::error::PyError",
+        carrier_wrappers: &[],
+        to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+        from_exc_object: Some(("PyError", "from_exc_object")),
+    };
+
 fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
     if let Some(paths) = std::env::var_os("MAJIT_MIR_FRONTEND_LLBC") {
         let paths: Vec<String> = std::env::split_paths(&paths)
@@ -1084,6 +1099,7 @@ fn real_main() {
         pytypes: &static_pytype_addrs,
         refs: &static_ref_addrs,
         int_values: &static_int_values,
+        error_carrier: PYRE_ERROR_CARRIER,
     };
     // Per-source crate-stripped module paths — the analyzer-side
     // metadata (`front::mir`) records
