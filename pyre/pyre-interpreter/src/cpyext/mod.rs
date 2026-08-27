@@ -222,7 +222,6 @@ pub fn after_fork_child() {
         modsupport::after_fork_child();
         methodobject::after_fork_child();
         unicodeobject::after_fork_child();
-        bytesobject::after_fork_child();
         frameobject::after_fork_child();
         pyerrors::after_fork_child();
         cdatetime::after_fork_child();
