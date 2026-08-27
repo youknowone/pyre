@@ -7304,6 +7304,19 @@ pub(crate) mod wasm_errno {
             _ => return None,
         })
     }
+
+    /// The errno a [`crate::importing::SourceProvider`] error stands for.
+    ///
+    /// A provider built to answer `import`'s probes need not be able to serve
+    /// every question the guest puts to it, and refusing is not the same
+    /// answer as a missing file: only the second is what a caller catching
+    /// `FileNotFoundError` is asking about.
+    pub fn seam_errno(e: &std::io::Error) -> i32 {
+        match e.kind() {
+            std::io::ErrorKind::Unsupported => ENOTSUP,
+            _ => ENOENT,
+        }
+    }
 }
 
 /// On Windows `ETIMEDOUT` above is the Winsock code, and the runtime's own
@@ -19145,6 +19158,18 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         any(not(windows), not(feature = "host_env"))
     ))]
     {
+        // The seam is read-only: `SourceProvider` has no writing half, so a
+        // buffer this builtin marks dirty has nowhere to be flushed to.  A
+        // mode that asks for write access is refused here rather than at the
+        // flush that would discover it, so `open(p, "w")` and `open(p, "r+")`
+        // both fail where the file is named.
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        if writing || mode.contains('+') {
+            return Err(crate::PyError::os_error_syscall(
+                wasm_errno::ENOTSUP,
+                resolved_path.w_path(),
+            ));
+        }
         let data: Vec<u8> = if reading && !mode.contains('w') && !mode.contains('x') {
             #[cfg(not(feature = "host_env"))]
             {
@@ -19171,10 +19196,9 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let seam_path = crate::gateway::os_string_from_fs_bytes(path_bytes);
                 match crate::importing::read_source_bytes(std::path::Path::new(&seam_path)) {
                     Ok(bytes) => bytes,
-                    Err(_e) if writing => Vec::new(),
                     Err(e) => {
                         return Err(crate::PyError::os_error_syscall(
-                            io_error_posix_errno(&e, 2),
+                            io_error_posix_errno(&e, wasm_errno::seam_errno(&e)),
                             resolved_path.w_path(),
                         ));
                     }

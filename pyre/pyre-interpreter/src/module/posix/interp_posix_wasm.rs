@@ -95,14 +95,8 @@ fn seam_path(bytes: &[u8]) -> std::path::PathBuf {
 
 /// The seam's `io::Error` as the OSError it stands for, named by the path
 /// object the caller passed rather than by a re-decoded spelling of it.
-///
-/// A provider that answers `import`'s probes need not be able to enumerate a
-/// directory, and refusing is not the same answer as a missing one.
 fn seam_error(e: &std::io::Error, w_path: PyObjectRef) -> crate::PyError {
-    let errno = match e.kind() {
-        std::io::ErrorKind::Unsupported => crate::builtins::wasm_errno::ENOTSUP,
-        _ => crate::builtins::wasm_errno::ENOENT,
-    };
+    let errno = crate::builtins::wasm_errno::seam_errno(e);
     crate::PyError::os_error_syscall(crate::builtins::io_error_posix_errno(e, errno), w_path)
 }
 
