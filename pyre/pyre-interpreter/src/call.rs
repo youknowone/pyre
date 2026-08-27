@@ -1066,6 +1066,12 @@ fn call_builtin_code_positional(code: PyObjectRef, args: &[PyObjectRef]) -> PyRe
     // indirect Rust function-pointer call updates the outer shadow slots but
     // not the copied native slice, so mirror the gateway's own root frame and
     // reload immediately before invoking the builtin.
+    //
+    // Pinned one at a time rather than published as a run: the batched shape
+    // reorders this graph's pending-callee queue, and `builtin_code_call_positional`
+    // below then reaches `getcalldescr` for the `BuiltinCodeFn` PBC family while
+    // the witness graph it types the indirect call against is still a shell
+    // whose return type reads Void, which panics the codewriter.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = _roots.base();
     let _ = _roots.pin_root(code);
@@ -3641,11 +3647,14 @@ pub fn call_function_impl_result(
     // pointers, so establish the same roots before the first collecting call
     // and dispatch from freshly reloaded values.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = _roots.base();
-    let _ = _roots.pin_root(callable);
-    for &arg in args {
-        let _ = _roots.pin_root(arg);
-    }
+    // One publish for the whole livevar set, then one normalize over the run:
+    // `pin_root` per value would query after the first write, and each query
+    // re-reads the nursery window and the foreign-mutator flag that the whole
+    // set shares.  This is the `publish_roots` + `normalize_roots` shape
+    // `pin_roots` documents for a set that does not sit in one slice.
+    let root_base = _roots.publish(&[callable]);
+    let _ = _roots.publish(args);
+    let roots_moved = _roots.normalize_moved(root_base, 1 + args.len());
 
     // A JIT prologue may have published an overflow before entering this
     // residual dispatcher, so preserve that pending exception.  Do not run a
@@ -3664,11 +3673,20 @@ pub fn call_function_impl_result(
     // `<[T; N]>::index(&array, ..len)` and prevented the whole call dispatcher
     // from entering two-phase translation; the meta-tracer can virtualize
     // this orthodox list on the common fixed-arity paths.
-    let mut rooted_args = Vec::with_capacity(args.len());
-    for i in 0..args.len() {
-        rooted_args.push(_roots.get(root_base + 1 + i));
-    }
-    let args = rooted_args.as_slice();
+    //
+    // Only owed when the publish above actually followed a forwarding stub.
+    // The entry stack check cannot collect on its `Ok` leg -- it reads and
+    // clears a thread-local and builds an error on the other one -- so an
+    // unmoved run means the incoming slice already holds the live words, and
+    // rebuilding it would allocate a list per call to copy them.
+    let rooted_args = roots_moved.then(|| {
+        let mut rooted_args = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            rooted_args.push(_roots.get(root_base + 1 + i));
+        }
+        rooted_args
+    });
+    let args = rooted_args.as_deref().unwrap_or(args);
 
     // Binding an override descriptor below runs `baseobjspace::get`, whose
     // property and general `__get__` arms execute Python.  That updates the
@@ -3678,7 +3696,7 @@ pub fn call_function_impl_result(
     let reloaded_args = || {
         let mut reloaded = Vec::with_capacity(arg_count);
         for i in 0..arg_count {
-            reloaded.push(pyre_object::gc_roots::shadow_stack_get(root_base + 1 + i));
+            reloaded.push(_roots.get(root_base + 1 + i));
         }
         reloaded
     };

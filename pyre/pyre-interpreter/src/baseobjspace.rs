@@ -113,11 +113,9 @@ pub(crate) unsafe fn walk_pending_hash_error_area(
 #[majit_macros::dont_look_inside]
 pub fn clear_method_cache() {
     let mut cache = METHOD_CACHE.lock();
-    cache.versions.fill(0);
-    cache.names.fill(None);
-    cache
-        .lookup_where
-        .fill((std::ptr::null_mut(), std::ptr::null_mut()));
+    for entry in cache.entries.iter_mut() {
+        *entry = MethodCacheEntry::EMPTY;
+    }
 }
 
 /// CPython 3.14 `dict_unhashable_type` (`Objects/dictobject.c`) parity.
@@ -1379,20 +1377,17 @@ pub(crate) unsafe fn get_and_call_function(
     // argument list from the shadow stack.  Both slices are published before the
     // first `normalize_roots` so nothing is still invisible to a foreign
     // collector once this mutator starts entering safepoints.
+    // Every slot access goes through the scope's cached root-stack cell: the
+    // free `gc_roots` functions re-resolve the thread local per call, which on
+    // Darwin is an out-of-line `_tlv_get_addr`, and this arm touches a slot
+    // once per operand and once per argument.  The two slices are adjacent on
+    // the stack, so the whole published set normalizes as one run.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::publish_roots(&[w_descr, w_obj, w_type]);
-    let args_base = pyre_object::gc_roots::publish_roots(args_w);
-    pyre_object::gc_roots::normalize_roots(base, 3);
-    pyre_object::gc_roots::normalize_roots(args_base, args_w.len());
-    use pyre_object::gc_roots::shadow_stack_get;
-    let w_impl = unsafe {
-        get(
-            shadow_stack_get(base),
-            shadow_stack_get(base + 1),
-            shadow_stack_get(base + 2),
-        )
-    }?
-    .unwrap_or_else(|| shadow_stack_get(base));
+    let base = _roots.publish(&[w_descr, w_obj, w_type]);
+    let args_base = _roots.publish(args_w);
+    _roots.normalize(base, 3 + args_w.len());
+    let w_impl = unsafe { get(_roots.get(base), _roots.get(base + 1), _roots.get(base + 2)) }?
+        .unwrap_or_else(|| _roots.get(base));
     // One `Vec` at every arity, the shape the fast path above already builds:
     // `with_capacity`/`push` lower to `newlist`/`append`.  The fixed
     // `[PY_NULL; N]` leg this replaced ended in `<[T; N]>::index(&array,
@@ -1403,7 +1398,7 @@ pub(crate) unsafe fn get_and_call_function(
     // length, so no push reallocates between the shadow-stack reads.
     let mut reloaded = Vec::with_capacity(args_w.len());
     for i in 0..args_w.len() {
-        reloaded.push(shadow_stack_get(args_base + i));
+        reloaded.push(_roots.get(args_base + i));
     }
     crate::call::call_function_impl_result(w_impl, reloaded.as_slice())
 }
@@ -9691,10 +9686,28 @@ unsafe fn lookup_where_pair_wtf8(
 /// (`typeobject.py:541` `cache.names[method_hash] == name`). A fill owns one
 /// copy; a hit compares the incoming borrowed name without allocating or
 /// entering the Python-string intern table. `None` is an empty slot.
+///
+/// The three arrays upstream keeps are one array of one entry here.  A probe
+/// reads all three of a slot's words and nothing else in the row, so three
+/// parallel `Vec`s make it touch three cache lines to answer one question;
+/// packed, the version test, the name test and the answer share a line.
+#[derive(Clone)]
+struct MethodCacheEntry {
+    version: u64,
+    lookup_where: (PyObjectRef, PyObjectRef),
+    name: Option<Wtf8Buf>,
+}
+
+impl MethodCacheEntry {
+    const EMPTY: Self = Self {
+        version: 0,
+        lookup_where: (std::ptr::null_mut(), std::ptr::null_mut()),
+        name: None,
+    };
+}
+
 struct MethodCache {
-    versions: Vec<u64>,
-    names: Vec<Option<Wtf8Buf>>,
-    lookup_where: Vec<(PyObjectRef, PyObjectRef)>,
+    entries: Vec<MethodCacheEntry>,
 }
 
 // PyPy stores this cache on the shared object space. The mutex below protects
@@ -9709,9 +9722,7 @@ const METHOD_CACHE_SIZE: usize = 1 << METHOD_CACHE_SIZE_EXP;
 static METHOD_CACHE: std::sync::LazyLock<parking_lot::Mutex<MethodCache>> =
     std::sync::LazyLock::new(|| {
         parking_lot::Mutex::new(MethodCache {
-            versions: vec![0u64; METHOD_CACHE_SIZE],
-            names: vec![None; METHOD_CACHE_SIZE],
-            lookup_where: vec![(std::ptr::null_mut(), std::ptr::null_mut()); METHOD_CACHE_SIZE],
+            entries: vec![MethodCacheEntry::EMPTY; METHOD_CACHE_SIZE],
         })
     });
 
@@ -9925,13 +9936,15 @@ unsafe fn _cached_lookup_where_name(
     // Probe without holding the borrow across the MRO walk below.
     let hit = {
         let cache = METHOD_CACHE.lock();
-        if cache.versions[h] == version_tag
-            && cache.names[h]
+        let entry = &cache.entries[h];
+        if entry.version == version_tag
+            && entry
+                .name
                 .as_deref()
                 .is_some_and(|cached| cache_name_eq(cached, name))
         {
             // A valid entry with null pointers is the cached negative result.
-            Some(cache.lookup_where[h])
+            Some(entry.lookup_where)
         } else {
             None
         }
@@ -9945,9 +9958,11 @@ unsafe fn _cached_lookup_where_name(
     // `walk_method_cache_gc`, skipped on clean minor collections.
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
     let mut cache = METHOD_CACHE.lock();
-    cache.versions[h] = version_tag;
-    cache.names[h] = Some(name.to_owned());
-    cache.lookup_where[h] = tup;
+    cache.entries[h] = MethodCacheEntry {
+        version: version_tag,
+        lookup_where: tup,
+        name: Some(name.to_owned()),
+    };
     tup
 }
 
@@ -9967,7 +9982,11 @@ unsafe fn _cached_lookup_where_name(
 /// must be forwarded here or a later hit would read a stale address.
 pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     let mut cache = METHOD_CACHE.lock();
-    for (w_class, w_value) in cache.lookup_where.iter_mut() {
+    for MethodCacheEntry {
+        lookup_where: (w_class, w_value),
+        ..
+    } in cache.entries.iter_mut()
+    {
         // Empty / negative-cache slots hold nulls: nothing to forward.
         if !w_class.is_null() {
             forward(w_class);
@@ -13583,6 +13602,10 @@ pub fn call_method(obj: PyObjectRef, methname: &str, args: &[PyObjectRef]) -> Py
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.publish(&[w_descr, obj]);
             let arg_base = roots.publish(args);
+            // `publish` writes the raw words; the set is only complete once
+            // both slices are on the stack, which is why the forwarding query
+            // runs here rather than per slice.
+            roots.normalize(base, 2 + args.len());
             let mut call_args = Vec::with_capacity(1 + args.len());
             call_args.push(roots.get(base + 1));
             for i in 0..args.len() {
@@ -13616,6 +13639,8 @@ pub fn call_method_result(
         let roots = pyre_object::gc_roots::push_roots();
         let base = roots.publish(&[w_descr, obj]);
         let arg_base = roots.publish(args);
+        // See `call_method`: one query for the whole published set.
+        roots.normalize(base, 2 + args.len());
         let mut call_args = Vec::with_capacity(1 + args.len());
         call_args.push(roots.get(base + 1));
         for i in 0..args.len() {
