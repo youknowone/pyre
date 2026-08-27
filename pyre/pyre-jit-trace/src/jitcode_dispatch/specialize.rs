@@ -16405,14 +16405,6 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // The snapshot root represents the caller during an inline sub-walk, so
-    // it cannot supply the callee's FOR_ITER green key for demotion.  Leave
-    // that shape on the generic residual until every inlined frame threads
-    // its own snapshot root.
-    if ctx.fbw_mode.inline_subwalk {
-        return Ok(None);
-    }
-
     // A range class-guard failure at this FOR_ITER green key is a definitive
     // polymorphism witness.  Once the failure path has demoted it, retain the
     // generic residual rather than recreating the range guard on retrace.
@@ -16455,8 +16447,8 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         // preserves an existing ResumeGuardDescr (only refreshing
         // fail_arg_types), so the tag survives optimizer guard-folding and
         // unroll; a copied guard chases `prev` to this donor.  With no green
-        // key available (e.g. inline sub-walk) the guard is untagged and the
-        // site is simply never demoted, matching the prior behavior.
+        // key available the guard is untagged and the site is simply never
+        // demoted.
         match range_green_key {
             Some(green_key) => {
                 let descr = majit_metainterp::make_resume_guard_descr_range_foriter(green_key);

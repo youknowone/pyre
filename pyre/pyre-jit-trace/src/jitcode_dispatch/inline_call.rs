@@ -8450,14 +8450,13 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
-    if !ctx.is_authoritative_executor
-        || dst_bank != 'r'
-        || ctx.fbw_mode.inline_subwalk
-        || r_args.len() != 1
-    {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
         return Ok(None);
     }
 
+    // A sub-walk is admitted: `walker_foriter_green_key` keys the demotion off
+    // the JitCode the walk is executing, so a `for` loop in an inlined callee
+    // gets its own key rather than a caller offset read as a callee one.
     let Some(foriter_green_key) = walker_foriter_green_key(ctx, op.pc) else {
         return Ok(None);
     };
