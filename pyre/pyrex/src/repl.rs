@@ -80,9 +80,10 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
         None => {
             let execution_context = Rc::new(PyExecutionContext::default());
             register_build_class();
-            // app_main.py:926 — install SIGINT → default_int_handler so Ctrl-C
-            // at the REPL raises KeyboardInterrupt rather than killing the
-            // process, and register the periodic signal-check action.
+            // `app_main.py run_command_line` — install SIGINT →
+            // default_int_handler so Ctrl-C at the REPL raises
+            // KeyboardInterrupt rather than killing the process, and register
+            // the periodic signal-check action.
             unsafe {
                 let ec_ptr = Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
                 pyre_interpreter::call::set_last_exec_ctx(ec_ptr);
@@ -123,18 +124,15 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
         }
     };
 
-    let sys_module = match importing::importhook(
-        "sys",
-        pyre_object::PY_NULL,
-        pyre_object::PY_NULL,
-        0,
-        Rc::as_ptr(&execution_context),
-    ) {
-        Ok(module) => module,
-        Err(err) => {
-            pyre_interpreter::eprint_exception(&err, true);
-            return;
-        }
+    // The prompt reads `sys.ps1`/`ps2` off the interpreter's own `sys`, the way
+    // `_PySys_GetOptionalAttr` reads `PyInterpreterState.sysdict`.  Importing
+    // the name instead would follow whatever the program left in
+    // `sys.modules["sys"]`, and a `None` there is the sentinel that makes an
+    // import raise -- so a program that blocked the name for its own downstream
+    // code would take the prompt with it.
+    let Some(sys_module) = importing::get_interpreter_sys_module() else {
+        eprintln!("pyre: the interpreter has no sys module");
+        return;
     };
     configure_sys_for_repl(sys_module);
 
