@@ -1,4 +1,5 @@
 {
+  "base": "479d8b89d4391023972eac0a0eb5b16d0bf9aafb",
   "brackets_reaching_no_collection": 3,
   "frame_tier1_calls": 0,
   "frame_tier1_calls_fns": 0,
@@ -8,8 +9,8 @@
   "tier15_calls_fns": 0,
   "tier1_calls": 9,
   "tier1_calls_fns": 7,
-  "unbracketed_calls": 2057,
-  "unbracketed_calls_fns": 821,
+  "unbracketed_calls": 2065,
+  "unbracketed_calls_fns": 825,
   "unmatched_seeds": [
     "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
     "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"

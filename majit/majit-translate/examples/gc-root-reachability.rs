@@ -218,21 +218,30 @@ fn main() {
             cg.indirect.len()
         );
 
-        // Judge the hand-written brackets: a `push_roots()` scope can only be
-        // protecting against a collection if its own function can reach one.
-        // This is a *necessary* condition, so a function that fails it holds a
-        // bracket that nothing in this crate can justify.
+        // Judge the hand-written brackets: a root scope can only be protecting
+        // against a collection if its own function can reach one.  This is a
+        // *necessary* condition, so a function that fails it holds a bracket
+        // that nothing in this crate can justify.
+        //
+        // Two functions open one.  `push_roots` is the naive per-operation
+        // bracket `shadowstack.py` emits; `enter_roots_frame` is the single
+        // coloured frame `shadowcolor.py`'s passes reduce a graph to, which
+        // `#[gc_roots]` produces.  A scan that knew only the first would read
+        // every transformed function as unbracketed -- and would go quieter,
+        // not louder, as more of the interpreter moved across.
         let pin_ids: Vec<u64> = cg
             .names
             .iter()
-            .filter(|(_, n)| n.ends_with("gc_roots::push_roots"))
+            .filter(|(_, n)| {
+                n.ends_with("gc_roots::push_roots") || n.ends_with("gc_roots::enter_roots_frame")
+            })
             .map(|(&id, _)| id)
             .collect();
         if pin_ids.is_empty() {
             // Not a reason to stop: an artefact that brackets nothing is the
             // one most likely to hold defects, and the liveness scan below is
             // exactly what answers for it.
-            println!("   (no gc_roots::push_roots in this artefact's name table)");
+            println!("   (no gc_roots root-scope opener in this artefact's name table)");
         }
         let mut bracketed: Vec<u64> = cg
             .callees

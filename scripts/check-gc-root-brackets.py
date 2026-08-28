@@ -84,6 +84,23 @@ RATCHET = (
 )
 
 
+def merge_base() -> str:
+    """The upstream commit this branch is measured against.
+
+    The numbers below are a ratchet over a moving base.  A rebase brings
+    interpreter code the baseline never saw, and its unbracketed calls land in
+    this count exactly like a regression would -- so record what the baseline
+    was taken against, and say when that has moved rather than let the reader
+    infer that the rise is theirs.
+    """
+    for base in ("origin/main", "upstream/main"):
+        proc = subprocess.run(["git", "merge-base", base, "HEAD"], cwd=ROOT,
+                              capture_output=True, encoding="utf-8")
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    return ""
+
+
 def run_analysis() -> str:
     if not EXAMPLE.exists():
         sys.exit(
@@ -144,6 +161,7 @@ def main() -> int:
     args = ap.parse_args()
 
     got = parse(run_analysis())
+    got["base"] = merge_base()
 
     if args.update:
         BASELINE.write_text(json.dumps(got, indent=2, sort_keys=True) + "\n")
@@ -165,7 +183,17 @@ def main() -> int:
         mark = "" if got[k] == base else f"   (baseline {base})"
         print(f"  {k:34} {got[k]}{mark}")
 
+    rebased = bool(got["base"]) and got["base"] != want.get("base")
+    if rebased:
+        print(
+            f"\nNOTE: the baseline was taken against {want.get('base', '(unrecorded)')[:12]}"
+            f" and this run sits on {got['base'][:12]}. Interpreter code the"
+            f" baseline never saw is in this count; attribute a rise before"
+            f" paying it down."
+        )
+
     bad = []
+    del got["base"]
     for k in INVARIANT_ZERO:
         if got[k] != 0:
             bad.append(f"{k} is {got[k]}, and this one is held at zero: a live "
