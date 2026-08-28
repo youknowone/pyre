@@ -340,29 +340,36 @@ pub fn reset_call_shot_totals() {
 /// So each batch is AMORTIZED first: `PER_BATCH` pairs are accumulated before
 /// anything is divided, which is what makes a batch mean immune to the
 /// granularity — quantization is unbiased when the start phase is uniform, so
-/// it averages out of a sum while it dominates any single term. The minimum is
-/// then taken over the batch MEANS, which keeps the original intent (the least
-/// scheduler-contaminated reading wins) while making each candidate a real
-/// cost.
+/// it averages out of a sum while it dominates any single term.
+///
+/// The MEDIAN batch is then taken, not the smallest. On a big.LITTLE part the
+/// pair's cost is bimodal — measured at 13.5 ns and 20.4 ns on the two core
+/// classes of one machine, with both modes appearing among the batches of a
+/// single call — and the reading being corrected was taken on whichever core
+/// the run landed on. A minimum answers "the cheapest this pair can be", which
+/// is the wrong question: it pins the correction to the fast class and so
+/// under-corrects every reading taken on the other one.
 ///
 /// What is subtracted is what the pair adds to a READING, not what it costs to
 /// execute — those differ, because the pair's own latency partly overlaps
 /// whatever sits between its two reads. An empty bracket has nothing to overlap
-/// with, so this is the largest the correction can legitimately be.
+/// with, so this remains an upper bound on the correction, and the figure it
+/// corrects a lower bound on the stage.
 #[cfg(feature = "__execute-stage-probe")]
 pub fn execute_stage_clock_floor_ns() -> f64 {
-    const BATCHES: u32 = 32;
+    const BATCHES: usize = 32;
     const PER_BATCH: u32 = 4096;
-    let mut best = f64::INFINITY;
-    for _ in 0..BATCHES {
+    let mut means = [0.0f64; BATCHES];
+    for slot in &mut means {
         let mut acc = 0u128;
         for _ in 0..PER_BATCH {
             let start = std::time::Instant::now();
             acc += start.elapsed().as_nanos();
         }
-        best = best.min(acc as f64 / f64::from(PER_BATCH));
+        *slot = acc as f64 / f64::from(PER_BATCH);
     }
-    best
+    means.sort_by(f64::total_cmp);
+    means[BATCHES / 2]
 }
 
 /// compile.py `forget_optimization_info` — discard optimizer-only
