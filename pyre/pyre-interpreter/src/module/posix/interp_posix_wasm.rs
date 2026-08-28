@@ -802,6 +802,107 @@ fn readlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))
 }
 
+/// The guest's environment.
+///
+/// This is what a C library's `environ` array is: the store `putenv` and
+/// `unsetenv` write to, and the one `posix.environ` is built from once.  `os.py`
+/// wraps that dict rather than copying it, so `os.environ` tracks the dict and
+/// these two track this map -- the same two-place split every platform has, and
+/// the reason a bare `os.putenv` is not visible through `os.environ` there
+/// either.  `_create_environ` is what reads this side back, which is how
+/// `os.reload_environ()` sees what `putenv` wrote.
+///
+/// The guest is started with no environment: the runner forwards the few
+/// variables the launcher options resolve against rather than an environment
+/// block, so this begins empty and holds whatever the program puts in it.
+static ENVIRONMENT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+/// A fresh dict holding what the environment holds now.
+///
+/// Bytes on both sides: `os.py` encodes a key before it stores one and decodes
+/// it on the way back, and `os.environb` hands the same dict out undecoded.
+fn environ_snapshot() -> PyObjectRef {
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = ENVIRONMENT
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    for (name, value) in entries {
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_bytes_from_bytes(&name));
+        let w_value = pyre_object::w_bytes_from_bytes(&value);
+        let _ = crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            w_value,
+        );
+    }
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
+}
+
+/// The name or value argument of `putenv` / `unsetenv`, as the bytes the
+/// environment holds.
+///
+/// `os.environ` hands these down already encoded, and `os.environb` hands down
+/// bytes to begin with, so both spellings arrive here and both are kept as
+/// bytes: a name that came from the embedder is a name the guest can set again,
+/// whatever it spells.
+fn env_bytes_arg(
+    w_arg: PyObjectRef,
+    name: &'static str,
+) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
+    crate::gateway::fsencode_path_w(w_arg).map_err(|_| {
+        crate::PyError::type_error(format!("{name}() argument must be str or bytes"))
+    })
+}
+
+/// `posix.putenv(name, value)` — add or replace one variable.
+fn putenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &[], "putenv")?;
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "putenv expected 2 arguments, got {}",
+            pos.len()
+        )));
+    }
+    let name = env_bytes_arg(pos[0], "putenv")?;
+    // `putenv` is defined over `name=value`, so a name carrying the separator
+    // could not be spelled back out of the environment it went into.
+    if name.as_bytes.contains(&b'=') {
+        return Err(crate::PyError::value_error(
+            "illegal environment variable name",
+        ));
+    }
+    let value = env_bytes_arg(pos[1], "putenv")?;
+    ENVIRONMENT
+        .lock()
+        .unwrap()
+        .insert(name.as_bytes.clone(), value.as_bytes.clone());
+    Ok(pyre_object::w_none())
+}
+
+/// `posix.unsetenv(name)` — remove one variable, or leave an absent one absent.
+fn unsetenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = env_bytes_arg(
+        args.first()
+            .copied()
+            .ok_or_else(|| crate::PyError::type_error("unsetenv expected 1 argument, got 0"))?,
+        "unsetenv",
+    )?;
+    // A name nothing set is a name already unset, which is what the syscall
+    // reports and what `os.environ.__delitem__` relies on so that it can raise
+    // the KeyError itself, against the caller's own spelling of the key.
+    ENVIRONMENT.lock().unwrap().remove(&name.as_bytes);
+    Ok(pyre_object::w_none())
+}
+
 /// `posix.unlink(path, *, dir_fd=None)` / `posix.rmdir(path, *, dir_fd=None)`
 /// — the entry points a read-only mount publishes and refuses.
 fn refuse_write(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef, crate::PyError> {
@@ -813,12 +914,12 @@ fn refuse_write(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef,
 }
 
 pub fn register_module(ns: PyObjectRef) {
-    // `os._createenviron` reads this dict directly and wraps it, so `os.environ`
-    // is a live view of it.  The guest is started with no environment — the
-    // runner hands the interpreter the few variables it forwards, rather than
-    // an environment block — so it starts empty and stays whatever the program
-    // puts in it.
-    crate::module_ns_store(ns, "environ", pyre_object::w_dict_new());
+    // `os._create_environ_mapping` binds this dict itself rather than copying
+    // it, so `os.environ._data` is this object and `os.environ` is a live view
+    // of it.  The guest is started with no environment — the runner hands the
+    // interpreter the few variables it forwards, rather than an environment
+    // block — so this begins empty and holds whatever the program puts in it.
+    crate::module_ns_store(ns, "environ", environ_snapshot());
     // `os.py` builds `supports_dir_fd` and friends only when this exists, and
     // then reads `stat` out of its own namespace to seed `supports_fd`.  Empty:
     // no call here takes a directory or a descriptor argument.
@@ -847,6 +948,25 @@ pub fn register_module(ns: PyObjectRef) {
         crate::make_builtin_function("scandir", scandir),
     );
     crate::module_ns_store(ns, "chdir", crate::make_builtin_function("chdir", chdir));
+    // `os.environ.__setitem__` calls `putenv` by name, so a target without it
+    // cannot set a variable at all.
+    crate::module_ns_store(ns, "putenv", crate::make_builtin_function("putenv", putenv));
+    // `os.reload_environ` exists only where this does, and it is the one reader
+    // that can see what a bare `putenv` wrote.
+    crate::module_ns_store(
+        ns,
+        "_create_environ",
+        crate::make_builtin_function_with_arity(
+            "_create_environ",
+            |_args| Ok(environ_snapshot()),
+            0,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "unsetenv",
+        crate::make_builtin_function_with_arity("unsetenv", unsetenv, 1),
+    );
     // `os.walk` catches `OSError` from the iterator and `shutil` calls
     // `isinstance(entry, os.DirEntry)`, so both the type and the entries it
     // stamps are published.
