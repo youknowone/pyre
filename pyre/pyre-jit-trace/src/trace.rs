@@ -1871,6 +1871,21 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             carrier.recipes.len()
         );
     }
+    // Deeper than the middle-frame drive can compile.  Decided here, before
+    // anything in the callee runs: past this point the sub-walk
+    // concrete-executes the reconstructed frames, and the abort tail's rollback
+    // covers the journals alone -- a residual call's heap writes move the
+    // odometer and push no journal entry, so they stand while the blackhole
+    // replays the region that made them.  `carrier_py_frame_depth` reads only
+    // the carrier, so nothing the sub-walk produces is needed to answer it.
+    //
+    // Transient, unlike `NoRecipes` below: the depth is this carrier's, and the
+    // same guard can fail again carrying a shallower one.
+    if carrier_py_frame_depth(carrier) > crate::jitcode_dispatch::fbw_max_multiframe_depth() {
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        crate::jitcode_dispatch::census_record("P2Drain::OverMultiframeDepth");
+        return p2_drain_abort();
+    }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
         // Churn guard: making this class transient retried the same
@@ -2008,37 +2023,34 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // caller's residual-call return register (make_result_of_lastop) and
         // rebinding `result` to that caller's own return.  Any non-portable
         // middle shape yields `None` and drops to the journal-rollback abort
-        // epilogue below, so a carrier we cannot compile deopts cleanly.
+        // epilogue below, which restores what it journaled and no more; the
+        // declines that can be taken before the callee runs belong above this
+        // point, not here.
         let n = carrier.recipes.len();
-        let want_compile = n >= 1
-            && carrier_py_frame_depth(carrier)
-                <= crate::jitcode_dispatch::fbw_max_multiframe_depth();
         let mut middles_ok = true;
-        if want_compile {
-            for i in (0..n.saturating_sub(1)).rev() {
-                // recipes[i]'s paused parents are the shallower frames
-                // recipes[..i] (the root sits above them all).
-                match drive_middle_frame_and_thread(
-                    ctx,
-                    &session,
-                    sym,
-                    root_pc,
-                    root_ec,
-                    root_ec_box,
-                    root_frame_box,
-                    &carrier.recipes[i],
-                    &carrier.recipes[..i],
-                    result,
-                ) {
-                    Some(mid_result) => result = mid_result,
-                    None => {
-                        middles_ok = false;
-                        break;
-                    }
+        for i in (0..n.saturating_sub(1)).rev() {
+            // recipes[i]'s paused parents are the shallower frames
+            // recipes[..i] (the root sits above them all).
+            match drive_middle_frame_and_thread(
+                ctx,
+                &session,
+                sym,
+                root_pc,
+                root_ec,
+                root_ec_box,
+                root_frame_box,
+                &carrier.recipes[i],
+                &carrier.recipes[..i],
+                result,
+            ) {
+                Some(mid_result) => result = mid_result,
+                None => {
+                    middles_ok = false;
+                    break;
                 }
             }
         }
-        if want_compile && middles_ok {
+        if middles_ok {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
                 let root_py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(
