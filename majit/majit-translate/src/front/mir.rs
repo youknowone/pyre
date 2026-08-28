@@ -1082,6 +1082,10 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             returns_objectptr,
         });
     }
+    // `specialize.py default_specialize` runs while the annotator walks
+    // calls; on this path the whole function set has to exist first, so it
+    // runs here, once, over the finished list.
+    crate::front::semantic::propagate_access_directly(&mut functions);
     register_synthetic_positional_metadata(
         &functions,
         &mut known_struct_names,
@@ -20132,7 +20136,7 @@ fn trait_call_label(v: &serde_json::Value) -> String {
 /// so `register_function_graph_alias` (lib.rs) can walk
 /// `{bare, crate::*, pyre_interpreter::*, pyre_object::*, jit_artifact::*}`
 /// aliases off the same `func.name`.
-fn strip_crate_prefix(path: &str) -> String {
+pub(crate) fn strip_crate_prefix(path: &str) -> String {
     match path.split_once("::") {
         Some((_crate, rest)) => rest.to_string(),
         // single-segment name (rare — top-level item without crate
