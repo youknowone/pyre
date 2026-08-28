@@ -1402,6 +1402,10 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // dicts on first use and marks no prebuilt-roots dirty bit, so it
         // belongs with these two rather than behind the gate below.
         crate::module::_codecs::walk_codec_state_gc(&mut fwd);
+        // `ast.get(space)`'s node types are the same shape: published on the
+        // first `_ast` import without a dirty bit, and the only owner of the
+        // classes between one `_ast` module dict and the next.
+        crate::module::_ast::moduledef::walk_ast_state_gc(&mut fwd);
     }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;

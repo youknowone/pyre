@@ -762,17 +762,20 @@ fn node_field_types(name: &str) -> &'static [&'static str] {
     }
 }
 
-fn asdl_base_type(ns: PyObjectRef, name: &str) -> PyObjectRef {
+fn asdl_base_type(lookup: &dyn Fn(&str) -> Option<PyObjectRef>, name: &str) -> PyObjectRef {
     match name {
         "identifier" | "string" => crate::typedef::gettypeobject(&pyre_object::STR_TYPE),
         "int" => crate::typedef::gettypeobject(&pyre_object::INT_TYPE),
         "constant" => crate::typedef::w_object(),
-        _ => crate::module_ns_get(ns, name)
+        _ => lookup(name)
             .unwrap_or_else(|| panic!("_ast ASDL field type {name} was not registered")),
     }
 }
 
-fn asdl_field_type(ns: PyObjectRef, spelling: &str) -> crate::PyResult {
+fn asdl_field_type(
+    lookup: &dyn Fn(&str) -> Option<PyObjectRef>,
+    spelling: &str,
+) -> crate::PyResult {
     let (base_name, marker) = if let Some(base) = spelling.strip_suffix('*') {
         (base, '*')
     } else if let Some(base) = spelling.strip_suffix('?') {
@@ -782,7 +785,7 @@ fn asdl_field_type(ns: PyObjectRef, spelling: &str) -> crate::PyResult {
     };
     let roots = pyre_object::gc_roots::push_roots();
     let base_slot = roots.base();
-    let _ = roots.pin_root(asdl_base_type(ns, base_name));
+    let _ = roots.pin_root(asdl_base_type(lookup, base_name));
     match marker {
         '*' => crate::_pypy_generic_alias::make_generic_alias(
             crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
@@ -848,21 +851,21 @@ fn node_doc(name: &str, variants: Option<&[&str]>) -> String {
 /// `add_ast_annotations` attaches it after every ASDL type exists and binds the
 /// same dictionary under both names; keep PyPy's generated type owner/order and
 /// add only that observable metadata here.
-fn install_field_types(ns: PyObjectRef, name: &str) {
+fn install_field_types(lookup: &dyn Fn(&str) -> Option<PyObjectRef>, name: &str) {
     let fields = node_fields(name);
     let types = node_field_types(name);
     assert_eq!(fields.len(), types.len(), "ASDL field/type count for {name}");
 
     let roots = pyre_object::gc_roots::push_roots();
     let type_slot = roots.base();
-    let _ = roots.pin_root(crate::module_ns_get(ns, name).expect("_ast node type registered"));
+    let _ = roots.pin_root(lookup(name).expect("_ast node type registered"));
     let dict_slot = type_slot + 1;
     let _ = roots.pin_root(pyre_object::w_dict_new());
     for (&field, &spelling) in fields.iter().zip(types) {
         let value_roots = pyre_object::gc_roots::push_roots();
         let value_slot = value_roots.base();
         let _ = value_roots.pin_root(
-            asdl_field_type(ns, spelling).expect("construct _ast ASDL field type"),
+            asdl_field_type(lookup, spelling).expect("construct _ast ASDL field type"),
         );
         let key = pyre_object::w_str_new(field);
         crate::baseobjspace::setitem(
@@ -895,15 +898,80 @@ fn node_attributes(name: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// _ast stub — PyPy: pypy/module/_ast/
+/// `astcompiler/ast.py State`, reached as `ast.get(space)`:
+/// `space.fromcache(State)` builds the node types once and every `_ast`
+/// module dict is filled from that one set.  A program that drops
+/// `sys.modules['_ast']` and imports the module again is then handed the
+/// classes the trees it has already built are instances of.
+struct AstState {
+    /// Name and class in build order, so a base always precedes the
+    /// subclasses that name it.
+    ///
+    /// A raw run rather than a `Vec`, because a reader and the collector's
+    /// walker reach the same slots: neither may mint a Rust reference the
+    /// other's would alias.
+    entries: *mut (&'static str, PyObjectRef),
+    len: usize,
+}
+
+/// Published once and never replaced, which is what lets the collector read
+/// the table without coordinating with the thread that built it.
+static AST_STATE: std::sync::atomic::AtomicPtr<AstState> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Forward the state's classes.  Upstream reaches them through the space's
+/// object graph; pyre holds them off-heap, so the collector has to be handed
+/// them — between one module dict going away and the next one being filled,
+/// this table is their only owner.
+pub(crate) fn walk_ast_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let ptr = AST_STATE.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        return;
+    }
+    // The run is complete before the slot names it and its length never
+    // changes, so the only word this writes is the class in each entry.
+    unsafe {
+        let (entries, len) = ((*ptr).entries, (*ptr).len);
+        for index in 0..len {
+            visitor(&mut (*entries.add(index)).1);
+        }
+    }
+}
+
+/// The one `AstState`, built on the first `_ast` import.
+fn ast_state() -> *mut AstState {
+    use std::sync::atomic::Ordering;
+    let ptr = AST_STATE.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        return ptr;
+    }
+    let types = build_ast_types().into_boxed_slice();
+    let len = types.len();
+    let entries = Box::into_raw(types) as *mut (&'static str, PyObjectRef);
+    let created = Box::into_raw(Box::new(AstState { entries, len }));
+    match AST_STATE.compare_exchange(
+        std::ptr::null_mut(),
+        created,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => created,
+        Err(existing) => {
+            // A loser's classes are ordinary unreachable objects the collector
+            // takes; the two host allocations are this call's to release.
+            drop(unsafe { Box::from_raw(created) });
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(entries, len)) });
+            existing
+        }
+    }
+}
+
+/// The ASDL hierarchy: `AST`, then each abstract group with its concrete
+/// members, then the leaf types that descend from `AST` directly.
 ///
-/// Exposes the AST node type hierarchy. The node types are created as **heap
-/// types** (via `type(name, bases, {})`) following the ASDL hierarchy
-/// (`AST` → abstract group → concrete node), so `ast.py` can subclass them
-/// (`class Suite(mod)`) and monkeypatch them (`Tuple.dims = property(...)`),
-/// matching CPython where `_ast` types are heap types. Compiler-native Ruff
-/// nodes are converted to instances of these public types by `convert.rs`.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+/// Every class is pinned as it is built, because the next `make` allocates and
+/// until [`ast_state`] publishes the table this bracket is their only owner.
+fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
     // `type(name, (base,), {"__module__": "ast"})` — a fresh heap type. The
     // generated AST types report `__module__ == "ast"` (astcompiler/ast.py;
     // the host `_ast.Module.__module__` is likewise `'ast'`).
@@ -991,31 +1059,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         type_roots.get(type_slot)
     };
 
+    let roots = pyre_object::gc_roots::push_roots();
+    let first = roots.base();
+    let mut names: Vec<&'static str> = Vec::new();
+
     // Root: AST(object).
-    let ast = make("AST", crate::typedef::w_object(), None);
-    register_ast_type(ast);
-    let method_roots = pyre_object::gc_roots::push_roots();
-    let init_slot = method_roots.base();
-    let _ = method_roots.pin_root(ast_slot_wrapper("__init__", ast_init, None));
-    let repr_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = method_roots.pin_root(ast_slot_wrapper("__repr__", ast_repr, Some(1)));
-    crate::baseobjspace::setattr_str(
-        ast_type(),
-        "__init__",
-        method_roots.get(init_slot),
-    )
-    .expect("set AST.__init__");
-    crate::baseobjspace::setattr_str(
-        ast_type(),
-        "__repr__",
-        method_roots.get(repr_slot),
-    )
-    .expect("set AST.__repr__");
-    crate::module_ns_store(ns, "AST", ast_type());
+    register_ast_type(make("AST", crate::typedef::w_object(), None));
+    let ast_slot = first;
+    let _ = roots.pin_root(ast_type());
+    names.push("AST");
+    // Its own bracket, so the classes below take the slots that follow the
+    // root's and `names` stays an index into the run.
+    {
+        let method_roots = pyre_object::gc_roots::push_roots();
+        let init_slot = method_roots.base();
+        let _ = method_roots.pin_root(ast_slot_wrapper("__init__", ast_init, None));
+        let repr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = method_roots.pin_root(ast_slot_wrapper("__repr__", ast_repr, Some(1)));
+        crate::baseobjspace::setattr_str(ast_type(), "__init__", method_roots.get(init_slot))
+            .expect("set AST.__init__");
+        crate::baseobjspace::setattr_str(ast_type(), "__repr__", method_roots.get(repr_slot))
+            .expect("set AST.__repr__");
+    }
 
     // Abstract groups (direct AST subclasses) and their concrete members,
     // per the ASDL grammar.
-    let groups: &[(&str, &[&str])] = &[
+    let groups: &[(&'static str, &[&'static str])] = &[
         ("mod", &["Module", "Interactive", "Expression", "FunctionType"]),
         (
             "stmt",
@@ -1059,45 +1128,76 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         ("type_param", &["TypeVar", "ParamSpec", "TypeVarTuple"]),
     ];
     for (group, members) in groups {
-        let g = make(group, ast_type(), Some(members));
-        let group_roots = pyre_object::gc_roots::push_roots();
-        let group_slot = group_roots.base();
-        let _ = group_roots.pin_root(g);
-        crate::module_ns_store(ns, group, group_roots.get(group_slot));
+        let group_slot = first + names.len();
+        let _ = roots.pin_root(make(group, roots.get(ast_slot), Some(members)));
+        names.push(group);
         for m in *members {
-            let t = make(m, group_roots.get(group_slot), None);
-            crate::module_ns_store(ns, m, t);
+            let _ = roots.pin_root(make(m, roots.get(group_slot), None));
+            names.push(m);
         }
     }
 
     // Leaf node types that are direct AST subclasses (no further subclasses).
-    let standalone = &[
+    let standalone: &[&'static str] = &[
         "comprehension", "arguments", "arg", "keyword", "alias", "withitem", "match_case",
     ];
     for name in standalone {
-        let t = make(name, ast_type(), None);
-        crate::module_ns_store(ns, name, t);
+        let _ = roots.pin_root(make(name, roots.get(ast_slot), None));
+        names.push(name);
     }
 
+    // The classes are not in a module dict yet, so the two passes below reach
+    // one another by name through the run they were pinned into.
+    let lookup = |name: &str| -> Option<PyObjectRef> {
+        names
+            .iter()
+            .position(|built| *built == name)
+            .map(|index| roots.get(first + index))
+    };
     // CPython's generated `add_ast_annotations` runs only after every type has
     // been created because, for example, FunctionDef refers to `arguments`
     // and `type_param` types declared later in the ASDL traversal.
     for (_, members) in groups {
         for name in *members {
-            install_field_types(ns, name);
+            install_field_types(&lookup, name);
         }
     }
     for name in standalone {
-        install_field_types(ns, name);
+        install_field_types(&lookup, name);
     }
 
     // CPython 3.14 `ast_state.Load_singleton`: every omitted expression
     // context receives this same object.  Construct it after the ASDL groups
-    // have published `Load` and keep it outside the public module namespace.
-    let roots = pyre_object::gc_roots::push_roots();
-    let load_type_slot = roots.base();
-    let _ = roots.pin_root(crate::module_ns_get(ns, "Load").expect("_ast.Load registered"));
-    register_load_singleton(pyre_object::w_instance_new(roots.get(load_type_slot)));
+    // have built `Load` and keep it outside the public module namespace.
+    let load_roots = pyre_object::gc_roots::push_roots();
+    let load_type_slot = load_roots.base();
+    let _ = load_roots.pin_root(lookup("Load").expect("_ast.Load built"));
+    register_load_singleton(pyre_object::w_instance_new(load_roots.get(load_type_slot)));
+
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (*name, roots.get(first + index)))
+        .collect()
+}
+
+/// _ast stub — PyPy: pypy/module/_ast/
+///
+/// Exposes the AST node type hierarchy. The node types are created as **heap
+/// types** (via `type(name, bases, {})`) following the ASDL hierarchy
+/// (`AST` → abstract group → concrete node), so `ast.py` can subclass them
+/// (`class Suite(mod)`) and monkeypatch them (`Tuple.dims = property(...)`),
+/// matching CPython where `_ast` types are heap types. Compiler-native Ruff
+/// nodes are converted to instances of these public types by `convert.rs`.
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    let state = ast_state();
+    // `module_ns_store` allocates the key, so the entry is read back out of the
+    // run on each pass rather than held as a view across the stores.
+    let (entries, len) = unsafe { ((*state).entries, (*state).len) };
+    for index in 0..len {
+        let (name, w_type) = unsafe { *entries.add(index) };
+        crate::module_ns_store(ns, name, w_type);
+    }
 
     // `compile()` / `ast.parse()` flag bitmasks, used by `lib-python/3/ast.py`
     // (`flags = PyCF_ONLY_AST; flags |= PyCF_TYPE_COMMENTS`). Values are
