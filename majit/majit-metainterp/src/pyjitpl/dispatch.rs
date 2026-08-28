@@ -1155,13 +1155,22 @@ fn report_symbolic_residual_call_target(func: usize, arg_classes: &str) {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(func);
     if first_report {
-        eprintln!(
-            "residual call target {func:#x} is a symbolic path hash, not a code address \
-             (arg classes {arg_classes:?}). The host did not bind this callee's path — add \
-             it to the fnaddr bindings passed to \
-             `EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`, and look the hash up \
-             in the host's symbolic-path table to see which path it names."
-        );
+        if let Some(path) = super::resolve_symbolic_fnaddr_path(func as i64) {
+            eprintln!(
+                "residual call target {func:#x} is symbolic path {path:?}, not a code address \
+                 (arg classes {arg_classes:?}). The host did not bind this callee's path — add \
+                 it to the fnaddr bindings passed to \
+                 `EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`."
+            );
+        } else {
+            eprintln!(
+                "residual call target {func:#x} is a symbolic path hash, not a code address \
+                 (arg classes {arg_classes:?}). The host did not bind this callee's path — add \
+                 it to the fnaddr bindings passed to \
+                 `EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`, and look the hash up \
+                 in the host's symbolic-path table to see which path it names."
+            );
+        }
     }
 }
 

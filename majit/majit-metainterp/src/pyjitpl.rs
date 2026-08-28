@@ -2233,6 +2233,14 @@ pub type RecordDiscardedLevelTraceback = extern "C" fn(i64, i64, i64);
 /// without the explicit store the optimizer would answer a later `__context__`
 /// read from its pre-call cache.
 pub type ResolveExceptionContext = extern "C" fn(i64) -> i64;
+/// Runtime callback that names a symbolic residual-call target.
+///
+/// The translation host owns the path table that minted symbolic function
+/// addresses.  Keeping the resolver behind a hook lets the crate-neutral
+/// metainterpreter report that path without taking ownership of the host's
+/// table.  The returned string is static because diagnostics may be emitted
+/// from any tracing thread after the hook is installed.
+pub type SymbolicFnaddrPathResolver = fn(i64) -> Option<&'static str>;
 
 static RECORD_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -2241,6 +2249,8 @@ static RECORD_INLINE_APPLICATION_TRACEBACK: std::sync::atomic::AtomicUsize =
 static RECORD_DISCARDED_LEVEL_TRACEBACK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static RESOLVE_EXCEPTION_CONTEXT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static SYMBOLIC_FNADDR_PATH_RESOLVER: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_record_application_traceback_hook(hook: Option<RecordApplicationTraceback>) {
@@ -2271,6 +2281,27 @@ pub fn set_resolve_exception_context_hook(hook: Option<ResolveExceptionContext>)
         hook.map_or(0, |callback| callback as usize),
         std::sync::atomic::Ordering::Release,
     );
+}
+
+/// Install the host-owned lookup for symbolic residual-call addresses.
+///
+/// `None` preserves the standalone metainterpreter's hash-only diagnostic.
+pub fn set_symbolic_fnaddr_path_resolver(hook: Option<SymbolicFnaddrPathResolver>) {
+    SYMBOLIC_FNADDR_PATH_RESOLVER.store(
+        hook.map_or(0, |callback| callback as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+pub(crate) fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
+    let hook = SYMBOLIC_FNADDR_PATH_RESOLVER.load(std::sync::atomic::Ordering::Acquire);
+    if hook == 0 {
+        return None;
+    }
+    // SAFETY: the stored address is a `SymbolicFnaddrPathResolver` published
+    // by `set_symbolic_fnaddr_path_resolver`.
+    let callback: SymbolicFnaddrPathResolver = unsafe { std::mem::transmute(hook) };
+    callback(fnaddr)
 }
 
 pub fn resolve_exception_context_hook_address() -> *const () {
