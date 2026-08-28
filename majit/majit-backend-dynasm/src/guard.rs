@@ -37,7 +37,7 @@ use majit_ir::FailDescr;
 /// cross-backend base-class concern; `compile.py:665-674
 /// make_and_attach_done_descrs` binds them on each `cpu` instance
 /// regardless of backend.
-pub use majit_backend::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle};
+pub use majit_backend::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrCell, CpuDescrHandle};
 
 /// Re-export the slot decoder for the same reason: `_decode_pos` is a method
 /// on `AbstractLLCPU` (`llmodel.py`), not a per-arch entry, so its

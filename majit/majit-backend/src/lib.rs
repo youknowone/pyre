@@ -1890,7 +1890,7 @@ impl AttachedDescrPtrs {
 /// the six descrs the metainterp attaches to each cpu instance at
 /// `MetaInterpStaticData.finish_setup`.
 ///
-/// Stored inside a heap-pinned `Arc<RwLock<CpuDescrAttachments>>` on every
+/// Stored inside a heap-pinned `Arc<CpuDescrCell>` on every
 /// `Backend` impl ([`CpuDescrHandle`] below):
 ///
 ///   * The `Arc` allocation address stays stable when the `Backend`
@@ -1902,14 +1902,14 @@ impl AttachedDescrPtrs {
 ///     so the attachments outlive the owning backend — the JIT-emitted
 ///     CALL_ASSEMBLER slow path dereferences the baked handle pointer
 ///     long after `compile_loop` returns.
-///   * The `RwLock` permits `Backend::set_done_with_this_frame_descr_*`
-///     to mutate through `&Backend` (via the Arc) without requiring
-///     `&mut self` access to the inner; the extern-C trampoline takes a
-///     read lock to snapshot pointers for dispatch.
+///   * `CpuDescrCell::update` lets `Backend::set_done_with_this_frame_descr_*`
+///     publish through `&Backend` (via the Arc) without `&mut self` access to
+///     the inner; the extern-C trampoline reads the current copy through one
+///     pointer load to snapshot pointers for dispatch.
 ///
 /// Field names mirror the RPython attribute names 1:1 for parity with
 /// `compile.make_and_attach_done_descrs` targets.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CpuDescrAttachments {
     pub done_with_this_frame_descr_void: Option<majit_ir::DescrRef>,
     pub done_with_this_frame_descr_int: Option<majit_ir::DescrRef>,
@@ -1939,11 +1939,64 @@ impl CpuDescrAttachments {
 }
 
 /// Heap-pinned handle for the six per-cpu descr attachments.  The
-/// `Arc`'s payload (the `RwLock<CpuDescrAttachments>`) lives at a
+/// `Arc`'s payload (the `CpuDescrCell`) lives at a
 /// stable heap address so `compile_loop` can bake that address as an
 /// immediate in the JIT-emitted CALL_ASSEMBLER helper call site and
 /// the extern-C trampoline can dereference it later.
-pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
+pub type CpuDescrHandle = Arc<CpuDescrCell>;
+
+/// The six attachments behind one pointer load.
+///
+/// Every compiled entry reads the attachments once, and the six setters run
+/// during `MetaInterpStaticData.finish_setup`, before any compiled code, and
+/// never again. A `RwLock` priced that read at two atomic read-modify-writes
+/// per entry — measured 7.8 ns on cel's entry probe, the largest single fixed
+/// cost of the call. A write here publishes a fresh copy and keeps every
+/// earlier one alive, so a reader holds a plain reference and the swap
+/// costs the writer, not the entry.
+pub struct CpuDescrCell {
+    current: std::sync::atomic::AtomicPtr<CpuDescrAttachments>,
+    /// Every copy ever published, the current one last. Held so a reference
+    /// handed out before an update stays valid; there are at most a handful
+    /// of updates per cpu, so nothing is reclaimed early.
+    published: std::sync::Mutex<Vec<Box<CpuDescrAttachments>>>,
+}
+
+impl CpuDescrCell {
+    pub fn new(attachments: CpuDescrAttachments) -> Self {
+        let first = Box::new(attachments);
+        let ptr = &*first as *const CpuDescrAttachments as *mut CpuDescrAttachments;
+        CpuDescrCell {
+            current: std::sync::atomic::AtomicPtr::new(ptr),
+            published: std::sync::Mutex::new(vec![first]),
+        }
+    }
+
+    /// The attachments as last published. One acquire load.
+    #[inline]
+    pub fn read(&self) -> &CpuDescrAttachments {
+        // The pointee is a `Box` in `published`, which only grows and drops
+        // with `self`, so it outlives this borrow.
+        unsafe { &*self.current.load(std::sync::atomic::Ordering::Acquire) }
+    }
+
+    /// Publish a copy with `f` applied. Writers serialize on `published`.
+    pub fn update(&self, f: impl FnOnce(&mut CpuDescrAttachments)) {
+        let mut published = self.published.lock().unwrap();
+        let mut next = Box::new(self.read().clone());
+        f(&mut next);
+        let ptr = &*next as *const CpuDescrAttachments as *mut CpuDescrAttachments;
+        published.push(next);
+        self.current
+            .store(ptr, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Default for CpuDescrCell {
+    fn default() -> Self {
+        Self::new(CpuDescrAttachments::default())
+    }
+}
 
 /// `llsupport/asmmemmgr.py:AsmMemoryManager` accounting owned by one CPU.
 /// `total_memory_allocated` is the mapped capacity and never shrinks

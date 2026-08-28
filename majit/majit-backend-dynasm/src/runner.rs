@@ -1466,7 +1466,7 @@ pub struct DynasmBackend {
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
     /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments,
-    /// held in a heap-pinned `Arc<RwLock<CpuDescrAttachments>>` so the
+    /// held in a heap-pinned `Arc<CpuDescrCell>` so the
     /// pointer baked into the CALL_ASSEMBLER helper call site
     /// (`compile_loop` / `compile_bridge`) stays valid even when
     /// `DynasmBackend` is moved (the metainterp stores it by value; tests
@@ -1572,9 +1572,7 @@ impl DynasmBackend {
             next_header_pc: 0,
             constants: majit_ir::ConstMap::new(),
             vtable_offset: None,
-            descr_attachments: Arc::new(std::sync::RwLock::new(
-                crate::guard::CpuDescrAttachments::default(),
-            )),
+            descr_attachments: Arc::new(crate::guard::CpuDescrCell::default()),
             arch_cpu_ext: ArchCpuExt::new(asm_memory_manager),
         }
     }
@@ -1671,12 +1669,12 @@ impl DynasmBackend {
     /// answer, so backend-only integration tests see distinct, non-zero
     /// pointers per result type without ever consulting per-thread state.
     pub(crate) fn attached_descr_ptrs(&self) -> crate::guard::AttachedDescrPtrs {
-        self.descr_attachments.read().unwrap().descr_ptrs()
+        self.descr_attachments.read().descr_ptrs()
     }
 
     /// `Arc` clone of the attachment handle, for compiled traces to
     /// keep alive alongside their executable buffer.  The `Arc`'s
-    /// payload (the `RwLock<CpuDescrAttachments>`) lives at a heap-
+    /// payload (the `CpuDescrCell`) lives at a heap-
     /// pinned address; `Arc::as_ptr(&clone)` is baked by emission into
     /// the CALL_ASSEMBLER helper call site as a compile-time immediate
     /// (same role as RPython's `self.cpu` closure capture in the
@@ -2130,7 +2128,7 @@ impl DynasmBackend {
             // The `DoneWithThisFrameDescr` class hierarchy answers
             // `is_finish`/`fail_arg_types` via its own FailDescr impl —
             // no backend wrapper is needed.
-            let att = self.descr_attachments.read().unwrap();
+            let att = self.descr_attachments.read();
             let meta = if ptr == attached.done_with_this_frame_descr_void {
                 att.done_with_this_frame_descr_void.clone()
             } else if ptr == attached.done_with_this_frame_descr_float {
@@ -2153,7 +2151,6 @@ impl DynasmBackend {
             return self
                 .descr_attachments
                 .read()
-                .unwrap()
                 .exit_frame_with_exception_descr_ref
                 .clone()
                 .expect("matched exit_frame_with_exception ptr but slot is unattached");
@@ -2206,7 +2203,6 @@ impl DynasmBackend {
             return self
                 .descr_attachments
                 .read()
-                .unwrap()
                 .exit_frame_with_exception_descr_ref
                 .clone()
                 .expect(
@@ -2565,33 +2561,23 @@ impl Backend for DynasmBackend {
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_void = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_void = Some(descr));
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_int = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_int = Some(descr));
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_ref = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_ref = Some(descr));
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_float = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_float = Some(descr));
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .exit_frame_with_exception_descr_ref = Some(descr);
+            .update(|a| a.exit_frame_with_exception_descr_ref = Some(descr));
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
         // x86/assembler.py `_build_propagate_exception_path` parity:
@@ -2620,8 +2606,9 @@ impl Backend for DynasmBackend {
         // never does so), refuse the swap with a clear assert.  The
         // pre-bake path (no trampoline yet) keeps overwriting freely
         // — the next `ensure_*_path` will bake the fresh pointer.
-        let mut attachments = self.descr_attachments.write().unwrap();
-        if attachments
+        if self
+            .descr_attachments
+            .read()
             .propagate_exception_descr
             .as_ref()
             .is_some_and(|existing| std::sync::Arc::ptr_eq(existing, &descr))
@@ -2635,7 +2622,8 @@ impl Backend for DynasmBackend {
              previous descr pointer; bind propagate_exception_descr once \
              before backend.setup_once() (pyjitpl.py:2273-2283 ordering)"
         );
-        attachments.propagate_exception_descr = Some(descr);
+        self.descr_attachments
+            .update(|a| a.propagate_exception_descr = Some(descr));
     }
 
     fn compile_bridge(

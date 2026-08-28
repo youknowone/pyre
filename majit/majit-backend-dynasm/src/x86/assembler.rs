@@ -371,11 +371,7 @@ pub(crate) fn build_propagate_exception_path(
     arena: &Arc<AsmMemoryManager>,
 ) -> (codebuf::ArenaExecutableBuffer, usize) {
     let mut asm = Assembler::new().expect("propagate_exception_path: new Assembler");
-    let propagate_descr = cpu_handle
-        .read()
-        .unwrap()
-        .descr_ptrs()
-        .propagate_exception_descr as i64;
+    let propagate_descr = cpu_handle.read().descr_ptrs().propagate_exception_descr as i64;
     assert!(
         propagate_descr != 0,
         "build_propagate_exception_path: cpu_handle.propagate_exception_descr \
@@ -1148,7 +1144,6 @@ impl<'a> Assembler386<'a> {
     fn done_with_this_frame_descr_ptr_for_type(&self, tp: Type) -> i64 {
         self.cpu_handle
             .read()
-            .unwrap()
             .descr_ptrs()
             .done_with_this_frame_descr_ptr_for_type(tp) as i64
     }
@@ -1160,7 +1155,7 @@ impl<'a> Assembler386<'a> {
     /// `is_finish` / `fail_arg_types` through the metainterp class
     /// hierarchy (`compile.py:624 final_descr=True`).
     fn done_with_this_frame_descr_arc_for_type(&self, tp: Type) -> Option<majit_ir::DescrRef> {
-        let attachments = self.cpu_handle.read().unwrap();
+        let attachments = self.cpu_handle.read();
         match tp {
             Type::Void => attachments.done_with_this_frame_descr_void.clone(),
             Type::Int => attachments.done_with_this_frame_descr_int.clone(),
@@ -1173,7 +1168,6 @@ impl<'a> Assembler386<'a> {
     fn exit_frame_with_exception_descr_ref_ptr(&self) -> i64 {
         self.cpu_handle
             .read()
-            .unwrap()
             .descr_ptrs()
             .exit_frame_with_exception_descr_ref as i64
     }
@@ -1185,7 +1179,6 @@ impl<'a> Assembler386<'a> {
     fn propagate_exception_descr_ptr(&self) -> i64 {
         self.cpu_handle
             .read()
-            .unwrap()
             .descr_ptrs()
             .propagate_exception_descr as i64
     }
@@ -4136,7 +4129,6 @@ impl<'a> Assembler386<'a> {
                 let descr: majit_ir::DescrRef = if is_exit_exc {
                     self.cpu_handle
                         .read()
-                        .unwrap()
                         .exit_frame_with_exception_descr_ref
                         .clone()
                 } else {

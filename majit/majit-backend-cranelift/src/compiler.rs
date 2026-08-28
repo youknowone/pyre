@@ -2958,7 +2958,7 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
     // Must update both code_ptr AND finish_descr_ptr (the new target has
     // different FailDescr pointers for its finish exit).
     let attached_descrs = {
-        let attached = new_target.cpu_attachments.read().unwrap().descr_ptrs();
+        let attached = new_target.cpu_attachments.read().descr_ptrs();
         attached_descr_ptrs_with_fallbacks(attached)
     };
     let new_finish_descr_ptr = new_target
@@ -3280,7 +3280,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     // the read lock is safe: `Backend::set_done_with_this_frame_descr_*`
     // only fires during `MetaInterpStaticData.finish_setup`, long
     // before compiled code runs.
-    let attachments_guard = target.cpu_attachments.read().unwrap();
+    let attachments_guard = target.cpu_attachments.read();
     let attachments: &CpuDescrAttachments = &attachments_guard;
     loop {
         let exec = run_compiled_code(
@@ -3694,7 +3694,7 @@ fn emit_memory_error_check(
 /// fail count, checks bridge (atomic + mutex only when bridge exists),
 /// and defers bridge compilation. Falls back to force_fn.
 ///
-/// `cpu_handle` is the heap-stable `Arc<RwLock<CpuDescrAttachments>>`
+/// `cpu_handle` is the heap-stable `Arc<CpuDescrCell>`
 /// address baked as an immediate at emit time so the runtime
 /// finish-descr classifier can resolve
 /// `DoneWithThisFrame*` identity against the owning cpu's attachments
@@ -3703,7 +3703,7 @@ fn emit_memory_error_check(
 /// alive for the lifetime of the emitted code.
 #[inline(never)]
 extern "C" fn call_assembler_guard_failure(
-    cpu_handle: *const std::sync::RwLock<CpuDescrAttachments>,
+    cpu_handle: *const majit_backend::CpuDescrCell,
     token_number: u64,
     fail_descr_ptr: i64,
     frame_ptr: i64,
@@ -3731,7 +3731,7 @@ extern "C" fn call_assembler_guard_failure(
 }
 
 fn call_assembler_guard_failure_inner(
-    cpu_handle: *const std::sync::RwLock<CpuDescrAttachments>,
+    cpu_handle: *const majit_backend::CpuDescrCell,
     token_number: u64,
     fail_descr_ptr: i64,
     frame_ptr: i64,
@@ -3750,7 +3750,7 @@ fn call_assembler_guard_failure_inner(
         default_attachments = CpuDescrAttachments::default();
         &default_attachments
     } else {
-        attachments_guard = unsafe { (*cpu_handle).read().unwrap() };
+        attachments_guard = unsafe { (*cpu_handle).read() };
         &attachments_guard
     };
     // Handle deadframe sentinel (nested CALL_ASSEMBLER propagation).
@@ -8674,7 +8674,7 @@ pub struct CraneliftBackend {
     /// Each `Backend` instance owns its own copy of the metainterp-side
     /// `DoneWithThisFrameDescr*` / `ExitFrameWithExceptionDescrRef` /
     /// `PropagateExceptionDescr` singletons, held in a heap-pinned
-    /// `Arc<RwLock<CpuDescrAttachments>>` so the address is stable even
+    /// `Arc<CpuDescrCell>` so the address is stable even
     /// when `CraneliftBackend` is moved.  `CompiledLoop` carries an Arc
     /// clone so the attachments outlive this backend for the lifetime of
     /// emitted code that baked the handle as an immediate.
@@ -8928,7 +8928,7 @@ impl CraneliftBackend {
             //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
-            descr_attachments: Arc::new(std::sync::RwLock::new(CpuDescrAttachments::default())),
+            descr_attachments: Arc::new(majit_backend::CpuDescrCell::default()),
         }
     }
 
@@ -8987,11 +8987,11 @@ impl CraneliftBackend {
     /// backend-only integration tests that skip `MetaInterp::new` so
     /// every result-type bucket still has a non-zero pointer.
     pub(crate) fn attached_descr_ptrs(&self) -> majit_backend::AttachedDescrPtrs {
-        let attached = self.descr_attachments.read().unwrap().descr_ptrs();
+        let attached = self.descr_attachments.read().descr_ptrs();
         attached_descr_ptrs_with_fallbacks(attached)
     }
 
-    /// Heap-stable `Arc<RwLock<CpuDescrAttachments>>` address for embedding
+    /// Heap-stable `Arc<CpuDescrCell>` address for embedding
     /// in cranelift-emitted CALL_ASSEMBLER helpers; the extern-C trampoline
     /// dereferences it to snapshot the attached descr pointers at dispatch.
     /// Matches dynasm's `cpu_handle_ptr()` semantics so both backends share
@@ -12486,7 +12486,7 @@ impl CraneliftBackend {
                         let result_jf_data_i64 =
                             ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
                         // `compile.py:665 setattr(cpu, name, descr)` — bake the
-                        // heap-stable `Arc<RwLock<CpuDescrAttachments>>` address
+                        // heap-stable `Arc<CpuDescrCell>` address
                         // so the trampoline's runtime classifier resolves
                         // `DoneWithThisFrame*` identity against the owning cpu.
                         // `CompiledLoop.cpu_attachments` keeps the allocation
@@ -16906,39 +16906,27 @@ impl majit_backend::Backend for CraneliftBackend {
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_void = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_void = Some(descr));
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_int = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_int = Some(descr));
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_ref = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_ref = Some(descr));
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .done_with_this_frame_descr_float = Some(descr);
+            .update(|a| a.done_with_this_frame_descr_float = Some(descr));
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .exit_frame_with_exception_descr_ref = Some(descr);
+            .update(|a| a.exit_frame_with_exception_descr_ref = Some(descr));
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
         self.descr_attachments
-            .write()
-            .unwrap()
-            .propagate_exception_descr = Some(descr);
+            .update(|a| a.propagate_exception_descr = Some(descr));
     }
 
     /// `compile.py do_compile_bridge` — line-by-line:
@@ -17416,7 +17404,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // 0 only for the initial entry — every external-JUMP re-entry,
         // including the first LABEL, selects its loader (label_block_id + 1).
         let mut cur_dispatch_key: u32 = 0;
-        let attachments_guard = compiled.cpu_attachments.read().unwrap();
+        let attachments_guard = compiled.cpu_attachments.read();
         let attachments: &CpuDescrAttachments = &attachments_guard;
 
         loop {
