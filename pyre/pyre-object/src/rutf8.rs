@@ -195,6 +195,7 @@ pub fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
 /// `_check_utf8`'s ones'-complement return and the `CheckError` its caller
 /// raises from it are one `Result` here.  Upstream's `start`/`stop` window is
 /// left out: every pyre caller validates a whole buffer.
+#[majit_macros::elidable]
 pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<i64, CheckError> {
     // RPython's `start`, `stop`, `pos`, and return value are all Signed.
     // Convert only where Rust's slice API requires an unsigned index.
@@ -308,6 +309,7 @@ pub fn wtf8_from_bytes(s: &[u8], allow_surrogates: bool) -> Result<&Wtf8, CheckE
 ///
 /// Counts the bytes that are *not* continuation bytes, which upstream spells as
 /// a signed-char comparison against `-0x40`.
+#[majit_macros::elidable]
 pub fn codepoints_in_utf8(value: &Wtf8, start: usize, end: usize) -> usize {
     let value = value.as_bytes();
     let end = end.min(value.len());
@@ -368,6 +370,7 @@ pub fn create_utf8_index_storage(utf8: &Wtf8, utf8len: usize) -> Utf8IndexStorag
 /// `codepoint_position_at_index` (`rutf8.py`) — the byte offset of code
 /// point `index`, which must not exceed the string's code point count.
 #[inline]
+#[majit_macros::elidable]
 pub fn codepoint_position_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) -> usize {
     let elem = &storage[index >> 6];
     let bytepos = elem.baseindex as usize + elem.ofs[(index >> 2) & 0x0F] as usize;
@@ -386,6 +389,7 @@ pub fn codepoint_position_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: 
 /// elidable call; both spellings walk to the same byte offset, so this is the
 /// composition of the two.
 #[inline]
+#[majit_macros::elidable]
 pub fn codepoint_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) -> i64 {
     codepoint_at_pos(utf8, codepoint_position_at_index(utf8, storage, index))
 }
@@ -397,6 +401,7 @@ pub fn codepoint_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) ->
 /// Upstream's leading `if bytepos < 0: return bytepos` guard carries `str.find`
 /// misses through; pyre's search returns `Option`, so the caller handles a miss
 /// and this takes an offset that is always real.
+#[majit_macros::elidable]
 pub fn codepoint_index_at_byte_position(
     utf8: &Wtf8,
     storage: &[Utf8LocElem],

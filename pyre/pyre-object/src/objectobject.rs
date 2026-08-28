@@ -95,11 +95,21 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     obj
 }
 
-/// Keep construction at the allocation boundary. RPython's
-/// `instantiate(cls)` exposes the exact `GcStruct` to `rtype_malloc`, which
-/// emits `malloc(STRUCT)` and lets `jtransform.rewrite_op_malloc` select
-/// `new_with_vtable`. Passing an already-built aggregate across this helper
-/// boundary hides the struct and its field stores from that lowering.
+/// Keep construction at the allocation boundary, so the struct and its field
+/// stores stay in one graph for `jtransform.rewrite_op_malloc` to reach.
+///
+/// Upstream's `instantiate(cls)` is NOT typed by `rtype_malloc` (that one is
+/// `@typer_for(lltype.malloc)`); it goes `rtype_instantiate` ->
+/// `rclass.rtype_new_instance` -> `RInstance.new_instance`, which emits the
+/// `malloc` op itself and then stores each field one at a time
+/// (`rclass.py`, `new_instance`: `genop('malloc', ...)` followed by
+/// `self.setfield(vptr, '__class__', ...)` and one `setfield` per default).
+/// This function is not that shape: it still builds a whole
+/// `W_ObjectObject` and `ptr::write`s it into raw bytes obtained from
+/// `try_gc_alloc_stable_raw(id, size)`, which carries no `malloc(STRUCT)`
+/// operand for `heaptracker.get_vtable_for_gcstruct` to read. Converging
+/// means allocating zeroed and storing `ob_type`, `w_class`, `map` and
+/// `storage` individually, in `new_instance`'s order.
 ///
 /// Allocate a `W_ObjectObject` through the GC. The header is stamped
 /// with [`W_OBJECT_OBJECT_GC_TYPE_ID`] so `object_object_custom_trace`

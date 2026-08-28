@@ -906,9 +906,14 @@ pub unsafe fn w_str_eq_w(obj: PyObjectRef, w_other: PyObjectRef) -> bool {
     }
 }
 
-/// `rstr.py ll_strhash` — the memoized digest, or zero while it has
-/// not been computed yet ("our malloc initializes the memory to zero, so we
-/// use zero as the value of a string whose hash is not computed yet").
+/// The memoized digest, or zero while it has not been computed yet.
+///
+/// The slot caches the PYTHON-VISIBLE `hash()` — `builtins::hash_value` writes
+/// `_hash_unicode` here and returns it — so this is CPython's `unicode_hash`
+/// cache, not RPython's `STR.hash`. `ll_strhash` (`rstr.py`) is the right
+/// analogue for the SHAPE ("read the memo, compute while it reads zero", and
+/// zero because the allocation is born zeroed), but not for the VALUE: see
+/// [`w_str_set_hash`] for why `_ll_strhash`'s sentinel is deliberately absent.
 ///
 /// # Safety
 /// `obj` must be a `W_UnicodeObject`.
@@ -939,12 +944,23 @@ unsafe fn hash_slot<'a>(obj: PyObjectRef) -> &'a std::sync::atomic::AtomicI64 {
     }
 }
 
-/// Publish a computed digest into the memo slot, `rstr.py:411-412`.  Upstream
-/// performs that write inside `LLHelpers._ll_strhash`, whose decorators are
-/// `@dont_inline` and `@jit.dont_look_inside`; the Rust atomic store is the
-/// corresponding foreign-opaque implementation boundary.  The surrounding
-/// memo read and branch remain visible, while [`hash_slot`] carries why a
-/// racing repeat is harmless here.
+/// Publish a computed digest into the memo slot.  Upstream performs the
+/// corresponding write inside `LLHelpers._ll_strhash` (`rstr.py`), whose
+/// decorators are `@dont_inline` and `@jit.dont_look_inside`; the Rust atomic
+/// store is the corresponding foreign-opaque implementation boundary.  The
+/// surrounding memo read and branch remain visible, while [`hash_slot`]
+/// carries why a racing repeat is harmless here.
+///
+/// `_ll_strhash`'s neighbouring `if x == 0: x = 29872897` is NOT ported, and
+/// must not be.  Upstream substitutes because `STR.hash` is an internal
+/// digest nobody observes, so a real zero can be replaced to keep zero
+/// meaning "not computed". This slot holds the Python-level `hash()`, and
+/// `hash("")` is 0 in CPython 3.14; substituting would make it 29872897.
+/// The cost of keeping CPython's value is that `""` re-hashes on every
+/// lookup — the answer is the same, so this is a missed memo, not a wrong
+/// one. CPython avoids both by sentinelling on `-1` and remapping a computed
+/// `-1` to `-2`; adopting that is the convergence path, and it would move
+/// every reader that currently spells the sentinel `0`.
 ///
 /// # Safety
 /// `obj` must be a `W_UnicodeObject`.
@@ -954,18 +970,23 @@ pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
     unsafe { hash_slot(obj) }.store(hash, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `rstr.py ll_strhash` — read the memo, and compute the digest only
-/// while the slot still reads zero:
+/// Read the memo, and compute the digest only while the slot still reads
+/// zero.  `rstr.py`'s `ll_strhash` is the same shape:
 ///
 /// ```python
 /// def ll_strhash(s):
-///     if not s:
+///     if s:
+///         return jit.conditional_call_elidable(s.hash,
+///                                              LLHelpers._ll_strhash, s)
+///     else:
 ///         return 0
-///     x = s.hash
-///     if x == 0:
-///         x = LLHelpers._ll_strhash(s)
-///     return x
 /// ```
+///
+/// The branch here is an ordinary one; upstream spells it as
+/// `jit.conditional_call_elidable`, which pyre has no equivalent of yet, so
+/// the JIT sees a plain memo read and call rather than the elidable
+/// conditional.  See [`w_str_set_hash`] for why the value written differs
+/// from `_ll_strhash`'s.
 ///
 /// The digest is the one [`crate::dict_eq_hook::try_hash_str`] produces, so a
 /// key hashed here lands in the bucket a borrowed-`&str` probe would have

@@ -454,6 +454,10 @@ impl W_TextIOWrapper {
                 Err(_) => return Err(crate::PyError::value_error("illegal newline value")),
             };
             if !matches!(value, "" | "\n" | "\r" | "\r\n") {
+                // Unquoted on purpose. `interp_textio.py`'s `unwrap_newline`
+                // raises with `%R`, but CPython 3.14 prints the value bare
+                // (`illegal newline value: x`), and the observable text is
+                // CPython's. Do not "restore" the repr quoting.
                 return Err(crate::PyError::value_error(format!(
                     "illegal newline value: {value}"
                 )));

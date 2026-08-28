@@ -265,6 +265,12 @@ fn modified(self_obj: PyObjectRef) {
 }
 
 /// `interp_deque.py getlock`: lazily install and return one identity token.
+///
+/// This STORES into `self.lock` on the first call, exactly as upstream's
+/// `self.lock = Lock()` does, so every method that reaches it owns the deque
+/// mutably — `_find_or_count`, `index`, `iter` and `compare` all call
+/// `self.getlock()` upstream.  A `&self` receiver here would let rustc mark
+/// the parameter `noalias readonly` and then store through it.
 fn getlock(self_obj: PyObjectRef) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_obj = pyre_object::gc_roots::pin_root(self_obj);
@@ -282,8 +288,8 @@ fn getlock(self_obj: PyObjectRef) -> PyObjectRef {
     token
 }
 
-/// `interp_deque.py checklock` — raise `RuntimeError` if the deque
-/// was mutated since `lock` was taken.
+/// `lock is not self.lock` — the identity test inside `interp_deque.py`'s
+/// `checklock`, split out so the raise can stay in the caller.
 // Keep the native interpreter's post-callback read out of the caller's alias
 // scope.  This is not a JIT opacity hint: source translation still sees the
 // ordinary field read below, exactly like PyPy's `lock is self.lock`.
@@ -297,6 +303,8 @@ fn lock_valid(self_obj: PyObjectRef, lock: PyObjectRef) -> bool {
     current == lock
 }
 
+/// `interp_deque.py checklock` — raise `RuntimeError` if the deque was
+/// mutated since `lock` was taken.
 fn checklock(self_obj: PyObjectRef, lock: PyObjectRef) -> Result<(), crate::PyError> {
     if !lock_valid(self_obj, lock) {
         return Err(crate::PyError::runtime_error(
@@ -1023,8 +1031,8 @@ impl W_Deque {
         // the reverse of `iterable`.
         extend_from_iterable(self_obj, iterable, false)
     }
-    fn count(&self, x: PyObjectRef) -> Result<i64, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn count(&mut self, x: PyObjectRef) -> Result<i64, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         let lock = getlock(self_obj);
         let mut n = 0i64;
         for it in snapshot(self_obj) {
@@ -1080,8 +1088,8 @@ impl W_Deque {
             )),
         }
     }
-    fn __contains__(&self, x: PyObjectRef) -> Result<bool, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __contains__(&mut self, x: PyObjectRef) -> Result<bool, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         let lock = getlock(self_obj);
         for it in snapshot(self_obj) {
             let equal = crate::baseobjspace::eq_w(it, x)?;
@@ -1161,12 +1169,12 @@ impl W_Deque {
         Ok(())
     }
     fn index(
-        &self,
+        &mut self,
         x: PyObjectRef,
         start: Option<PyObjectRef>,
         stop: Option<PyObjectRef>,
     ) -> Result<i64, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         let items = snapshot(self_obj);
         let len = items.len() as i64;
         // `space.iter(self)` takes the lock before `unwrap_start_stop`,
@@ -1250,12 +1258,12 @@ impl W_Deque {
         let self_obj = self as *const W_Deque as PyObjectRef;
         deque_len(self_obj)
     }
-    fn __iter__(&self) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __iter__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         Ok(deque_iter::make(self_obj, 0))
     }
-    fn __reversed__(&self) -> PyObjectRef {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __reversed__(&mut self) -> PyObjectRef {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_rev_iter::make(self_obj, 0)
     }
     fn __getitem__(&self, index: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1298,28 +1306,28 @@ impl W_Deque {
         store(self_obj, items);
         Ok(())
     }
-    fn __eq__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __eq__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Eq)
     }
-    fn __ne__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __ne__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Ne)
     }
-    fn __lt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __lt__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Lt)
     }
-    fn __le__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __le__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Le)
     }
-    fn __gt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __gt__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Gt)
     }
-    fn __ge__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __ge__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Ge)
     }
     fn __add__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {

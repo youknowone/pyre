@@ -1387,13 +1387,13 @@ pub unsafe fn getcode(obj: PyObjectRef) -> PyObjectRef {
         let func = obj as *const Function;
         if majit_metainterp::jit::we_are_jitted() {
             if !(*func).can_change_code {
-                // function.py:80-81
+                // function.py `Function.getcode`: the immutable-code arm.
                 return _get_immutable_code(obj);
             }
-            // function.py:82
+            // function.py `Function.getcode`: `jit.promote(self.code)`.
             return majit_metainterp::jit::promote((*func).code as usize) as PyObjectRef;
         }
-        // function.py:83
+        // function.py `Function.getcode`: the untraced `return self.code`.
         (*func).code as PyObjectRef
     }
 }

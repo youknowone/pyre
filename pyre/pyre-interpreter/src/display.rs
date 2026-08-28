@@ -270,6 +270,7 @@ pub(crate) fn bytearray_repr_string(data: &[u8], class_name: &str) -> String {
 /// table.  Keep this loop in interpreter source so translation sees the same
 /// StringBuilder/character operations as PyPy instead of an opaque external
 /// Rust formatting iterator.
+#[majit_macros::elidable]
 pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let quote = if data.contains(&b'\'') && !data.contains(&b'"') {

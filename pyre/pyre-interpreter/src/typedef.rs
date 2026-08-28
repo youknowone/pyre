@@ -18999,15 +18999,32 @@ fn init_int_type(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
-/// `complexobject.py repr_format` — `rfloat.formatd(x, 'r', 0)` without the
-/// `DTSF_ADD_DOT_0` flag used by float repr.  RustPython keeps that spelling
-/// inside its complex formatter; selecting a pure-imaginary value exposes the
-/// same component text to the interpreter path.
+/// `complexobject.py repr_format` — `format_float(x, 'r', 0)`, i.e.
+/// `rfloat.formatd(x, 'r', 0)` without the `DTSF_ADD_DOT_0` flag used by float
+/// repr.
+///
+/// `format_float` names the infinities and NaN itself and only then reaches
+/// `formatd`, so those three arms are spelled here rather than inherited from
+/// the Rust formatter. The finite case still selects a pure-imaginary value
+/// out of the complex formatter, which keeps the `formatd` spelling: `strip`
+/// rather than `pop`, because a `debug_assert` on the `j` compiles out in
+/// release and a bare `pop` would then truncate a real character.
 pub(crate) fn format_complex_component_repr(val: f64) -> String {
-    let mut out = rustpython_literal::complex::to_string(0.0, val);
-    debug_assert!(out.ends_with('j'));
-    out.pop();
-    out
+    if val.is_infinite() {
+        return if val > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    if val.is_nan() {
+        return "nan".to_string();
+    }
+    let out = rustpython_literal::complex::to_string(0.0, val);
+    match out.strip_suffix('j') {
+        Some(component) => component.to_string(),
+        None => out,
+    }
 }
 
 /// RPython `rfloat.formatd` residual ABI for a complex repr component.

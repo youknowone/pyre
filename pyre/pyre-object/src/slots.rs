@@ -2,9 +2,20 @@
 //!
 //! Each host object stores its `__slots__` values in a list held by a
 //! `w_slots: PyObjectRef` field. Reads and deletes take that storage value
-//! directly, like mapdict's `getslotvalue`. Growing writes use a compile-time
-//! expansion so each concrete layout reloads its own field after a GC move;
-//! no runtime function-pointer dispatch exists in the translated graph.
+//! directly, the way `mapdict.py`'s `MapdictStorageMixin._mapdict_read_storage`
+//! does (`return self.storage[storageindex]`) — NOT the way
+//! `BaseUserClassMapdict.getslotvalue` does, which reaches the value through
+//! the promoted map with `attrkind = SLOTS_STARTING_FROM + slotindex`.
+//! Growing writes use a compile-time expansion so each concrete layout
+//! reloads its own field after a GC move; no runtime function-pointer
+//! dispatch exists in the translated graph.
+//!
+//! PRE-EXISTING-ADAPTATION: the storage OWNER differs from upstream. pyre
+//! indexes a `w_slots` list by slot index and [`slot_del`] writes `PY_NULL`
+//! into it; `mapdict.py`'s `delslotvalue` deletes the attribute from the map
+//! and installs a new storage+map pair. Nothing here is the mapdict
+//! attribute machinery, so read the citations above as naming the shape of
+//! one read, not as a claim of mapdict parity.
 
 use crate::pyobject::*;
 
@@ -22,12 +33,16 @@ pub unsafe fn slot_get(slots: PyObjectRef, index: usize) -> Option<PyObjectRef> 
 
 /// Expand mapdict-style slot storage into a concrete host layout.
 ///
-/// PyPy's `BaseUserClassMapdict` implementation accesses one known storage
-/// field directly. Pyre currently has several native host layouts carrying
-/// that field, so a Rust function-pointer accessor would add an indirect call
-/// absent upstream. This macro is the static equivalent of the common base
-/// method: after expansion Charon sees only direct `$field` reads/writes on
-/// `$ty`, including the required reload after each allocating list grow.
+/// Upstream copies the storage accessors INTO each concrete class at
+/// translation time — `mapdict.py` spells it
+/// `objectmodel.import_from_mixin(MapdictStorageMixin)` plus
+/// `_share_methods(BaseUserClassMapdict, Object)` — so every class ends up
+/// with its own direct `self.storage[...]` access and no dispatch. Pyre has
+/// several native host layouts carrying the field, and a Rust
+/// function-pointer accessor would add an indirect call upstream does not
+/// have. This macro is that same translation-time method copy: after
+/// expansion Charon sees only direct `$field` reads/writes on `$ty`,
+/// including the required reload after each allocating list grow.
 #[macro_export]
 macro_rules! slot_set_direct {
     ($obj:expr, $index:expr, $value:expr, $ty:ty, $field:ident) => {{

@@ -1,4 +1,14 @@
 //! `_queue` accelerator module.
+//!
+//! PRE-EXISTING-ADAPTATION: PyPy does NOT ship this module. `pypy/module/`
+//! has no `_queue`, and `lib-python/3/queue.py` falls back to its own
+//! `_PySimpleQueue` when the import fails, so upstream's `SimpleQueue` is
+//! pure Python. The spec here is therefore CPython's
+//! `Modules/_queuemodule.c`, not an RPython module.
+//!
+//! The `rthread` citations below are an ANALOGY for where the JIT boundary
+//! belongs — a native blocking primitive is residual in RPython too — and
+//! not a claim of provenance for this type.
 
 use pyre_object::*;
 use std::collections::VecDeque;

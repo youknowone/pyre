@@ -4688,7 +4688,7 @@ mod tests {
         assert_eq!(bindings["pyre_object::safepoint"], safepoint);
     }
 
-    /// `rgc.py:743-750` keeps `may_ignore_finalizer` opaque.  Both names the
+    /// `rgc.py` keeps `may_ignore_finalizer` opaque with `@jit.dont_look_inside`.  Both names the
     /// LLBC call-path resolver can produce must therefore bind the live helper
     /// address or the residual call would carry an unpatchable symbolic hash.
     #[test]

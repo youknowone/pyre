@@ -5998,20 +5998,31 @@ fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
 }
 
 /// typeobject.py `_check_surrogate` — a type name may not contain a
-/// lone surrogate.  Scan the code points through the surrogate-aware WTF-8
-/// view (reading the name as `&str` would fail on the surrogate) and raise
+/// lone surrogate.  Validate through the surrogate-aware WTF-8 view (reading
+/// the name as `&str` would fail on the surrogate) and raise
 /// `UnicodeEncodeError('utf8', name, pos, pos + 1, 'surrogates not allowed')`
 /// at the first one, matching `check_utf8(name, allow_surrogates=False)`.
 /// Keep the call itself: upstream marks `_check_utf8` `jit.elidable`, so the
 /// validator is a load-bearing part of the JIT shape rather than an iterator
-/// scan to re-express locally. `CheckError.pos` is the byte position PyPy
-/// forwards unchanged into the exception.
+/// scan to re-express locally.
+///
+/// `CheckError.pos` is a BYTE offset — `_check_utf8` walks `s[pos]` — and
+/// `_check_surrogate` forwards it unchanged, but `UnicodeEncodeError` is
+/// consumed as a code-point index: `descr_str` reads `self.object[self.start]`
+/// (`interp_exceptions.py`, `W_UnicodeEncodeError.descr_str`) and `.start` is
+/// user-visible. Upstream is inconsistent between the two, and CPython 3.14
+/// reports the code-point index, so convert here rather than propagate the
+/// byte offset.  Oracle evidence (pinned CPython 3.14.6 versus local PyPy):
+/// `type('\u00e9\ud800', (), {})` reports `.start/.end == (1, 2)` on CPython
+/// and `(2, 3)` on PyPy.  Those exception attributes are observable, so the
+/// CPython 3.14 specification wins while the surrounding PyPy call shape is
+/// retained.
 pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError> {
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if let Err(e) = pyre_object::rutf8::check_utf8(wtf8.as_bytes(), false) {
         // RPython's CheckError position, `e.pos + 1`, and the exception's
         // start/end fields are all Signed; keep that type through the call.
-        let pos = e.pos;
+        let pos = pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, e.pos as usize) as i64;
         return Err(crate::typedef::unicode_encode_error(
             "utf8",
             w_name,
@@ -15799,6 +15810,7 @@ pub(crate) fn _hash_int(a: i64) -> i64 {
 /// Reduce the 63-bit rbigint digits modulo the Mersenne prime
 /// `2**61 - 1`, then apply the sign and the `-1 -> -2` sentinel rule.
 #[inline]
+#[majit_macros::elidable]
 pub(crate) fn _hash_long(v: &BigInt) -> i64 {
     let mut i = v.numdigits();
     let mut x = 0_u64;
@@ -15821,6 +15833,7 @@ pub(crate) fn _hash_long(v: &BigInt) -> i64 {
 /// NaN identity hashing is handled by the wrapped-object caller, as in PyPy;
 /// this helper receives finite values or infinities only.
 #[inline]
+#[majit_macros::elidable]
 pub(crate) fn _hash_float(v: f64) -> i64 {
     if v.is_infinite() {
         return if v > 0.0 { HASH_INF } else { -HASH_INF };
@@ -15876,20 +15889,33 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
     acc as i64
 }
 
-/// `tupleobject.py::_descr_hash_jitdriver`: hash the live wrapped-item
-/// storage with an explicit index loop.  This keeps the dynamic path out of
-/// Rust's generic `Iterator` hierarchy, which has no RPython owner/repr.
+/// Hash the live wrapped-item storage with an explicit index loop, keeping
+/// the dynamic path out of Rust's generic `Iterator` hierarchy, which has no
+/// RPython owner/repr.
+///
+/// This is the BODY of `tupleobject.py`'s `_descr_hash_jitdriver`, not that
+/// method: the port carries neither its `hash_driver.jit_merge_point(w_type=
+/// space.type(self.wrappeditems[0]))` nor the `_unroll_condition()` fork that
+/// chooses between it and the `@jit.unroll_safe` `_descr_hash_unroll` arm.
+/// Restoring the fork needs `jit.loop_unrolling_heuristic` and an
+/// `UNROLL_CUTOFF`, neither of which exists here yet; until then the
+/// jitdriver arm is the only one, so the short-tuple unrolled path upstream
+/// takes is never taken.
 unsafe fn _hash_tuple_xx_storage(obj: PyObjectRef) -> i64 {
     let len = w_tuple_len(obj);
     let mut acc = XXPRIME_5;
     let mut i = 0_usize;
     while i < len {
-        if let Some(item) = w_tuple_getitem(obj, i as i64) {
-            let lane = hash_value(item) as u64;
-            acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
-            acc = (acc << 31) | (acc >> 33);
-            acc = acc.wrapping_mul(XXPRIME_1);
-        }
+        // `i < len` bounds the read, so upstream's `wrappeditems[i]` cannot be
+        // absent.  Skipping the lane instead would fold a shorter sequence
+        // while the `acc += len` tail below still counts it, i.e. answer a
+        // hash for a tuple that does not exist.
+        let item = w_tuple_getitem(obj, i as i64)
+            .expect("tuple index below w_tuple_len is always present");
+        let lane = hash_value(item) as u64;
+        acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
+        acc = (acc << 31) | (acc >> 33);
+        acc = acc.wrapping_mul(XXPRIME_1);
         i += 1;
     }
     acc = acc.wrapping_add((len as u64) ^ (XXPRIME_5 ^ 3_527_539));
@@ -21189,6 +21215,23 @@ static __majit_wrap_builtin_dunder_import_target: crate::gateway::BuiltinWrapper
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_surrogate_reports_codepoint_position_like_cpython_314() {
+        let _ = new_builtin_module_dict();
+        let mut name = rustpython_wtf8::Wtf8Buf::new();
+        name.push(rustpython_wtf8::CodePoint::from_char('\u{e9}'));
+        name.push(rustpython_wtf8::CodePoint::from_u32(0xd800).unwrap());
+        let w_name = pyre_object::w_str_from_wtf8(name);
+
+        let error = check_surrogate(w_name).expect_err("a lone surrogate must be rejected");
+        assert_eq!(error.kind, crate::PyErrorKind::UnicodeEncodeError);
+        let start =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_start(error.exc_object) };
+        let end = unsafe { pyre_object::interp_exceptions::w_exception_get_end(error.exc_object) };
+        assert_eq!(unsafe { pyre_object::w_int_get_value(start) }, 1);
+        assert_eq!(unsafe { pyre_object::w_int_get_value(end) }, 2);
+    }
 
     /// Several threads installing the builtins at once all finish.
     ///

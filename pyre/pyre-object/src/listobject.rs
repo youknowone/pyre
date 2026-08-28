@@ -697,9 +697,16 @@ impl W_ListObject {
         // new reference, so it owes the same barrier as the shifts above.
         let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
         let this = &mut *(obj as *mut W_ListObject);
-        // rlist.py:ll_reverse operates on the logical list directly through
-        // ll_getitem_fast / ll_setitem_fast. Keep that shape here instead of
-        // manufacturing a Rust fat slice over the over-allocated items block.
+        // `rlist.py`'s `ll_reverse` operates on the logical list directly
+        // through ll_getitem_fast / ll_setitem_fast. Keep that shape here
+        // instead of manufacturing a Rust fat slice over the over-allocated
+        // items block.
+        //
+        // Its `@jit.look_inside_iff(lambda l: jit.isvirtual(l) and
+        // jit.isconstant(l.ll_length()))` is not carried: pyre has no
+        // `jit.isvirtual` / `jit.isconstant` intrinsic, so the predicate
+        // cannot be spelled — the same gap the four `look_inside_iff` notes
+        // in `dictmultiobject.rs` record.
         let base = items_block_items_base(this.items);
         let mut i = 0;
         let mut length_1_i = this.length_relaxed() as isize - 1;
@@ -1140,6 +1147,25 @@ unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
     true
 }
 
+/// Wrap an unboxed run into objects, the preallocate-and-index shape
+/// `listobject.py`'s `getitems_copy` uses.
+///
+/// The loop shape matches; the BODY does not. Upstream reuses one wrapper
+/// across a run of consecutive-equal unwrapped values —
+/// `if jit.we_are_jitted() or not self._quick_cmp(item, prevvalue)` guards
+/// the re-wrap, with `_quick_cmp` being `a == b` for `IntegerListStrategy`
+/// and `a is b` for `ObjectListStrategy`. pyre wraps every element, so
+/// `[1000] * 3` promoted out of the integer strategy yields three distinct
+/// objects where upstream's interpreter yields three references to one.
+///
+/// Not ported here because upstream itself gives the reuse up under
+/// `jit.we_are_jitted()`, so the identity is not a stable observable to
+/// match; porting it means carrying `prevvalue`/`_quick_cmp` per strategy.
+/// The two hints on the same function — `getitems_unroll =
+/// jit.unroll_safe(...)` and `getitems_copy = jit.look_inside_iff(lambda
+/// self, w_list: w_list._unrolling_heuristic())(...)` — are likewise absent;
+/// `look_inside_iff` needs `jit.isvirtual`/`isconstant`, which pyre has no
+/// intrinsic for yet.
 fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
