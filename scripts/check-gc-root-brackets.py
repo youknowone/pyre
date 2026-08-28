@@ -15,6 +15,11 @@ Two of the reported numbers are invariants at zero and are held there.  The
 rest are a backlog: they are ratcheted, so a change may pay them down but not
 add to them.
 
+The baseline holds one entry per platform.  The scan reads an artefact built
+from this platform's sources, and the interpreter's `cfg` arms differ across
+them, so the counts do too -- a baseline written from one platform cannot be
+satisfied from another, and `--update` rewrites only the entry it measured.
+
 The ratchet is read against the base the baseline was taken on.  The backlog
 counts every unbracketed call in the artefact, not this branch's share of
 them, so a base that has moved brings code the baseline never saw into the
@@ -91,6 +96,23 @@ RATCHET = (
 )
 
 
+def platform_key() -> str:
+    """The name this run's numbers are recorded under.
+
+    The scan reads an artefact extracted from this platform's build, and the
+    interpreter's `cfg` arms differ across them -- a Linux artefact carries
+    calls a macOS one does not.  The counts are therefore not one number but
+    one per platform, and a baseline written from one of them cannot be
+    satisfied from another: a macOS `--update` would leave the Linux gate
+    permanently red by exactly the difference between the two.
+    """
+    if sys.platform.startswith("linux"):
+        return "linux"
+    if sys.platform == "darwin":
+        return "darwin"
+    return sys.platform
+
+
 def merge_base() -> str:
     """The upstream commit this branch is measured against.
 
@@ -100,6 +122,12 @@ def merge_base() -> str:
     was taken against, and say when that has moved rather than let the reader
     infer that the rise is theirs.
     """
+    # A shallow CI checkout is grafted: it holds no `main` ref, and the
+    # merge commit's parent list is truncated away, so nothing in the
+    # repository can name the base.  The workflow knows it and passes it in.
+    supplied = os.environ.get("PYRE_GC_GATE_BASE", "").strip()
+    if supplied:
+        return supplied
     for base in ("origin/main", "upstream/main"):
         proc = subprocess.run(["git", "merge-base", base, "HEAD"], cwd=ROOT,
                               capture_output=True, encoding="utf-8")
@@ -181,22 +209,32 @@ def main() -> int:
 
     got = parse(run_analysis())
     got["base"] = merge_base()
+    key = platform_key()
+
+    recorded = json.loads(BASELINE.read_text()) if BASELINE.is_file() else {}
 
     if args.update:
-        BASELINE.write_text(json.dumps(got, indent=2, sort_keys=True) + "\n")
-        print(f"wrote {BASELINE.relative_to(ROOT)}")
+        # Only this platform's entry: the others were measured on artefacts
+        # this run never saw and are not ours to rewrite.
+        recorded[key] = got
+        BASELINE.write_text(json.dumps(recorded, indent=2, sort_keys=True) + "\n")
+        print(f"wrote {BASELINE.relative_to(ROOT)} [{key}]")
         for k in sorted(got):
             print(f"  {k}: {got[k]}")
         return 0
 
-    if not BASELINE.is_file():
-        sys.exit(f"error: no baseline at {BASELINE.relative_to(ROOT)}; "
-                 "seed it with --update")
-    want = json.loads(BASELINE.read_text())
+    if key not in recorded:
+        sys.exit(
+            f"error: {BASELINE.relative_to(ROOT)} records no `{key}` entry "
+            f"(it has: {', '.join(sorted(recorded)) or 'nothing'}).\n"
+            "  Seed it from a run on this platform: "
+            "python3 scripts/check-gc-root-brackets.py --update"
+        )
+    want = recorded[key]
 
     # Printed whichever way this ends, so a reader can see what was measured
     # rather than infer it from silence.
-    print("gc root bracket gate — measured:")
+    print(f"gc root bracket gate — measured [{key}]:")
     for k in sorted(got):
         base = want.get(k, "—")
         mark = "" if got[k] == base else f"   (baseline {base})"

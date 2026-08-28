@@ -589,6 +589,10 @@ jobs:
     # disk and the scan is ~25 s. Hanging it off `prepare` instead would put it
     # on every downstream job's critical path.
     - name: Check the GC root brackets
+      env:
+        # The checkout is shallow and holds no `main` ref, so the gate cannot
+        # work out for itself which base its numbers were measured over.
+        PYRE_GC_GATE_BASE: ${{ github.event.pull_request.base.sha }}
       run: |
         cargo build -p majit-translate --release --example gc-root-reachability
         python3 scripts/check-gc-root-brackets.py
