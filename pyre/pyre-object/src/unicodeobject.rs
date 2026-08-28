@@ -219,8 +219,14 @@ pub fn w_str_new_managed(s: &str) -> PyObjectRef {
 /// `AsciiListStrategy.wrap` (`listobject.py`).  The immutable `_utf8` storage
 /// is shared and only the exact `W_UnicodeObject` wrapper is newly allocated,
 /// just as `space.newutf8(stringval, len(stringval))` does upstream.
+///
+/// The return type is spelled `*mut PyObject` rather than the `PyObjectRef`
+/// alias so that `emit_helper_call_target_fn` recognises it: it matches a raw
+/// pointer syntactically, and a path alias falls through to the primitive
+/// table and yields no `__majit_call_target_*` trampoline.  The subscript fold
+/// records this wrap by that trampoline.
 #[majit_macros::dont_look_inside]
-pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> PyObjectRef {
+pub fn w_str_from_storage(value: *mut UnicodeValueStorage) -> *mut PyObject {
     let _roots = crate::gc_roots::push_roots();
     let value_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(value as PyObjectRef);

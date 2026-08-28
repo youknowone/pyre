@@ -3170,6 +3170,14 @@ pub unsafe fn w_list_uses_float_storage(obj: PyObjectRef) -> bool {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_list_uses_ascii_storage(obj: PyObjectRef) -> bool {
+    let list = &*(obj as *const W_ListObject);
+    list.strategy == ListStrategy::Ascii
+}
+
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_list_uses_int_or_float_storage(obj: PyObjectRef) -> bool {
     let list = &*(obj as *const W_ListObject);
     list.strategy == ListStrategy::IntOrFloat

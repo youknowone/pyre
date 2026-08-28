@@ -8823,6 +8823,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                 return Ok((outcome, op.next_pc));
                             }
                         }
+                        if specialized.is_none() {
+                            // `str + str` last: every numeric arm above
+                            // declines a Ref operand, and `descr_add`
+                            // (unicodeobject.py) is the only body left for two
+                            // exact strings.
+                            specialized = spec_gate(SpecFold::BinaryOpStr, || {
+                                try_walker_specialize_binary_op_str(
+                                    ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
+                                    dst_bank,
+                                )
+                            })?;
+                        }
                         specialized
                     }
                 } else if op_tag == 10 && ctx.is_authoritative_executor {
@@ -8879,12 +8891,24 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                                 )
                             })? {
                                 Some(()) => Some(()),
-                                None => spec_gate(SpecFold::CompareOpFloat, || {
+                                None => match spec_gate(SpecFold::CompareOpFloat, || {
                                     try_walker_specialize_compare_op_float(
                                         ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst,
                                         dst_bank,
                                     )
-                                })?,
+                                })? {
+                                    Some(()) => Some(()),
+                                    // Two exact strings: `_compare`
+                                    // (unicodeobject.py) answers from one WTF-8
+                                    // ordering, which no numeric arm above can
+                                    // express.
+                                    None => spec_gate(SpecFold::CompareOpStr, || {
+                                        try_walker_specialize_compare_op_str(
+                                            ctx, op.pc, op_tag, &r_args, &allboxes, call_descr,
+                                            dst, dst_bank,
+                                        )
+                                    })?,
+                                },
                             },
                         },
                     }

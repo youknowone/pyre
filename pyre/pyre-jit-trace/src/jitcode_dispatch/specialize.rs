@@ -7801,13 +7801,16 @@ fn walker_emit_index_bounds_guards<Sym: WalkSym>(
 
 /// #62: walker-native speculative specialization for the `BINARY_SUBSCR`
 /// helper residual_call (oopspec `BinaryOp`, op_tag `Subscr`).  Ports
-/// the former subscription/list-strategy path for the object-, int-, and
-/// float-storage list strategies with a
+/// the former subscription/list-strategy path for the object-, int-,
+/// float- and ascii-storage list strategies with a
 /// non-negative concrete index: `guard_class LIST` + `guard_value(strategy)`
 /// + unbox index + `IntLt` bounds guard, then the strategy-specific element
 /// load — `getarrayitem_gc_r` against the `Ptr(GcArray(OBJECTPTR))` items
 /// block for object storage (the element is a boxed Ref read directly), or a
-/// raw-array getitem + `wrapint` / `wrapfloat` rebox for int/float storage.
+/// raw-array getitem + `wrapint` / `wrapfloat` rebox for int/float storage,
+/// or the same items-block load followed by `AsciiListStrategy.wrap` for
+/// ascii storage (the element there is the shared `_utf8` payload, so the
+/// wrap allocates only the header).
 /// The authentic boxed result is taken from the same `execute_may_force_call`
 /// path the generic leg uses.
 ///
@@ -7816,8 +7819,8 @@ fn walker_emit_index_bounds_guards<Sym: WalkSym>(
 /// guards, a strategy guard, elidable `rstr.ll_strhash`, `dict.lookup`, a
 /// non-negative guard on the returned entry index, then a guarded value read.
 ///
-/// Tuples, dict misses, empty-strategy lists, negative indices, and
-/// non-`list[int]` operands fall through to the generic `CallMayForce` record
+/// Tuples, dict misses, empty-strategy lists, negative indices, and every
+/// other operand shape fall through to the generic `CallMayForce` record
 /// (`Ok(None)`), preserving Python `__getitem__` semantics.
 pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -8067,8 +8070,9 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
-    // Gate: EXACT list[int], non-negative index in bounds, int- or
-    // float-storage.  A bool index (`is_int` accepts `W_BoolObject`) is fine:
+    // Gate: EXACT list, non-negative int index in bounds, object-, int-,
+    // float- or ascii-storage.  A bool index (`is_int` accepts `W_BoolObject`)
+    // is fine:
     // bool shares int's `intval`, so it unboxes through its own &BOOL_TYPE
     // guard below.  A list SUBCLASS instance shares `ob_type == &LIST_TYPE`
     // but retags `w_class` and may override `__getitem__`; `is_exact_list`
@@ -8092,6 +8096,8 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             2i64
         } else if pyre_object::w_list_uses_object_storage(list_obj) {
             0i64
+        } else if pyre_object::listobject::w_list_uses_ascii_storage(list_obj) {
+            pyre_object::listobject::ListStrategy::Ascii as i64
         } else {
             // Empty-strategy list: no concrete element to read.
             return Ok(None);
@@ -8150,12 +8156,13 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(raw_index, majit_ir::Value::Int(index));
 
-    // Object storage keeps the inline `length` field (rlist.py); int/float
-    // storage read the typed items-array length field.
+    // Object storage keeps the inline `length` field (rlist.py); the typed
+    // storages read their own items-array length field.
     let len_descr = match sid {
         0 => crate::descr::list_length_descr(),
         1 => crate::descr::list_int_items_len_descr(),
-        _ => crate::descr::list_float_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
+        _ => crate::descr::list_ascii_items_len_descr(),
     };
     let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, list_op, len_descr);
     walker_emit_index_bounds_guards(ctx, op_pc, raw_index, index, lenbox, concrete_len)?;
@@ -8199,7 +8206,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
                 box_int_concrete(elem, boxed_result_i64),
             )
         }
-        _ => {
+        2 => {
             let block = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
                 list_op,
@@ -8212,6 +8219,42 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
                 .set_opref_concrete(raw, majit_ir::Value::Float(elem));
             (
                 crate::state::wrapfloat(ctx.trace_ctx, raw),
+                default_concrete,
+            )
+        }
+        // `AsciiListStrategy.getitem` (listobject.py).  The erased
+        // `[rpython str]` block is the same `ItemsBlock` the object strategy
+        // uses, so the element load is the same `getarrayitem_gc_r` -- but
+        // what it yields is the shared immutable `_utf8` payload, not a
+        // `W_UnicodeObject`, and `wrap` still has to box it.
+        // `w_str_from_storage` is that `wrap`: it allocates the header and
+        // shares the payload, the way `space.newutf8(stringval,
+        // len(stringval))` does upstream.
+        //
+        // The call is recorded NON-elidable deliberately.  Two `L[i]` reads
+        // of the same pair hand back two distinct wrappers upstream too, so
+        // letting the optimizer share one between two sites would answer `is`
+        // differently from the interpreter that recorded the trace.  Its
+        // effect carries empty write sets: the only memory it writes is the
+        // header it just allocated, which no earlier load can alias, so the
+        // loads above stay cached across it.
+        _ => {
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                list_op,
+                crate::descr::list_ascii_items_block_descr(),
+            );
+            let storage =
+                crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, raw_index);
+            let wrap: extern "C" fn(i64) -> i64 =
+                pyre_object::unicodeobject::__majit_call_target_w_str_from_storage;
+            (
+                ctx.trace_ctx.call_ref_typed_with_effect(
+                    wrap as *const (),
+                    &[storage],
+                    &[majit_ir::Type::Ref],
+                    majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+                ),
                 default_concrete,
             )
         }
@@ -18559,6 +18602,234 @@ pub(crate) fn try_walker_specialize_compare_op_float<Sym: WalkSym>(
         }
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// Both operands of a `str` binary operation, with their concrete objects —
+/// the shared gate of [`try_walker_specialize_compare_op_str`] and
+/// [`try_walker_specialize_binary_op_str`].
+///
+/// Exactness is required on both sides.  A `str` SUBCLASS shares the payload
+/// `ob_type` but retags `w_class` and may override `__eq__` / `__add__`, and
+/// `_compare` / `descr_add` (unicodeobject.py) honour that override, so such
+/// an operand falls through to the generic residual.
+fn walker_str_pair_operands<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    r_args: &[OpRef],
+) -> Option<(
+    OpRef,
+    OpRef,
+    pyre_object::PyObjectRef,
+    pyre_object::PyObjectRef,
+)> {
+    if r_args.len() != 2 {
+        return None;
+    }
+    let (lhs, rhs) = (r_args[0], r_args[1]);
+    let lhs_obj = walker_concrete_ref_object(ctx, lhs)?;
+    let rhs_obj = walker_concrete_ref_object(ctx, rhs)?;
+    let exact = |obj: pyre_object::PyObjectRef| unsafe {
+        pyre_object::is_exact_type(obj, &pyre_object::STR_TYPE)
+            && pyre_object::w_str_get_value_opt(obj).is_some()
+    };
+    if !exact(lhs_obj) || !exact(rhs_obj) {
+        return None;
+    }
+    Some((lhs, rhs, lhs_obj, rhs_obj))
+}
+
+/// `guard_class(&STR_TYPE)` + the exact canonical `w_class` guard, the pair
+/// that keeps a `str` subclass out of a fold written for the builtin body.
+fn walker_guard_exact_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+) -> Result<(), DispatchError> {
+    walker_guard_class(
+        ctx,
+        op_pc,
+        operand,
+        &pyre_object::pyobject::STR_TYPE as *const _ as i64,
+    )?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        operand,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
+    )
+}
+
+/// Walker-native specialization for the `COMPARE_OP` residual on two exact
+/// `str` operands: the `str` analogue of
+/// [`try_walker_specialize_compare_op_int`].
+///
+/// `_compare` (unicodeobject.py) answers all six comparisons from one WTF-8
+/// byte ordering, which `jit_str_compare` is, so the emit is that one
+/// elidable call plus an `int_<cmp>` against zero and `space.newbool`.  The
+/// call is elidable because `str` is immutable and the result is a machine
+/// int: sharing one call between two sites on the same pair is unobservable.
+///
+/// Tried after the int, long and float compares decline, so a numeric operand
+/// never reaches it.  Declines to the generic `CallMayForce` for `is` / `is
+/// not` (which never reach here — the caller folds those separately), for a
+/// subclass operand, and whenever the residual's own answer is not the bool
+/// the ordering implies.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_compare_op_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    let Some(cmp_op) = pyre_interpreter::runtime_ops::compare_op_from_tag(op_tag) else {
+        return Ok(None);
+    };
+    use pyre_interpreter::bytecode::ComparisonOperator;
+    let cmp = match cmp_op {
+        ComparisonOperator::Less => OpCode::IntLt,
+        ComparisonOperator::LessOrEqual => OpCode::IntLe,
+        ComparisonOperator::Greater => OpCode::IntGt,
+        ComparisonOperator::GreaterOrEqual => OpCode::IntGe,
+        ComparisonOperator::Equal => OpCode::IntEq,
+        ComparisonOperator::NotEqual => OpCode::IntNe,
+    };
+    let Some((lhs, rhs, lhs_obj, rhs_obj)) = walker_str_pair_operands(ctx, r_args) else {
+        return Ok(None);
+    };
+    // Read the ordering before the residual runs: both operands are exact
+    // `str`, so nothing here can run Python code or move an object.
+    let ordering = pyre_object::unicodeobject::jit_str_compare(lhs_obj as i64, rhs_obj as i64);
+    let folded = majit_metainterp::eval_binop_i(cmp, ordering, 0);
+
+    // The authentic answer, from the same may-force path the generic leg
+    // uses.  A disagreement means the ordering is not what the comparison
+    // resolved to, and the residual keeps the operation.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result = boxed_result_i64 as pyre_object::PyObjectRef;
+    let agrees = !boxed_result.is_null()
+        && unsafe { pyre_object::is_bool(boxed_result) }
+        && unsafe { pyre_object::w_bool_get_value(boxed_result) } == (folded != 0);
+    if !agrees {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    walker_guard_exact_str(ctx, op_pc, lhs)?;
+    walker_guard_exact_str(ctx, op_pc, rhs)?;
+    let helper = pyre_object::unicodeobject::jit_str_compare as *const ();
+    let ordering_op = ctx.trace_ctx.call_typed_with_effect_pure(
+        OpCode::CallI,
+        helper,
+        &[lhs, rhs],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_ir::Type::Int,
+        majit_metainterp::ELIDABLE_CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+        &[
+            majit_ir::Value::Int(helper as i64),
+            majit_ir::Value::Ref(majit_ir::GcRef(lhs_obj as usize)),
+            majit_ir::Value::Ref(majit_ir::GcRef(rhs_obj as usize)),
+        ],
+        majit_ir::Value::Int(ordering),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(ordering_op, majit_ir::Value::Int(ordering));
+    let zero = ctx.trace_ctx.const_int(0);
+    let truth = ctx.trace_ctx.record_op(cmp, &[ordering_op, zero]);
+    ctx.trace_ctx
+        .set_opref_concrete(truth, majit_ir::Value::Int(folded));
+    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, folded != 0, dst_bank)? {
+        Some(boxed) => boxed,
+        None => {
+            let boxed =
+                crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
+            ctx.trace_ctx.set_opref_concrete(
+                boxed,
+                majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+            );
+            boxed
+        }
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
+    Ok(Some(()))
+}
+
+/// Walker-native specialization for `str + str`, the concatenation arm of the
+/// `BINARY_OP` residual.
+///
+/// `descr_add` (unicodeobject.py) builds one fresh `W_UnicodeObject` over the
+/// joined WTF-8 payload, which `jit_str_concat` is.  Recording that call in
+/// place of the residual drops a `CallMayForce`, so the operand loads around
+/// it keep their heap-cache entries and no virtualizable is forced.
+///
+/// The call is recorded NON-elidable: the result is a `str` of length > 1,
+/// which carries storage identity, so letting the pure pass share one call
+/// between two `a + b` sites would answer `(a + b) is (a + b)` True where
+/// every other implementation answers False — the same reason `jit_int_str`
+/// gives for its own effect class.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_specialize_binary_op_str<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    r_args: &[OpRef],
+    allboxes: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' {
+        return Ok(None);
+    }
+    // `s + t` and `s += t` reach the same `descr_add`: `str` has no
+    // `__iadd__`, so the in-place tag resolves to concatenation too.
+    if !matches!(
+        pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
+        Some(
+            pyre_interpreter::bytecode::BinaryOperator::Add
+                | pyre_interpreter::bytecode::BinaryOperator::InplaceAdd
+        )
+    ) {
+        return Ok(None);
+    }
+    let Some((lhs, rhs, _lhs_obj, _rhs_obj)) = walker_str_pair_operands(ctx, r_args) else {
+        return Ok(None);
+    };
+    // Authentic boxed result from the same may-force path the generic leg
+    // uses; the recorded call reproduces it in compiled code.
+    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
+        return Ok(None);
+    };
+    let boxed_result = boxed_result_i64 as pyre_object::PyObjectRef;
+    if boxed_result.is_null()
+        || !unsafe { pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) }
+    {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    walker_guard_exact_str(ctx, op_pc, lhs)?;
+    walker_guard_exact_str(ctx, op_pc, rhs)?;
+    let helper = pyre_object::unicodeobject::jit_str_concat as *const ();
+    let concat = ctx.trace_ctx.call_ref_typed_with_effect(
+        helper,
+        &[lhs, rhs],
+        &[majit_ir::Type::Ref, majit_ir::Type::Ref],
+        majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        concat,
+        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, concat)?;
     Ok(Some(()))
 }
 

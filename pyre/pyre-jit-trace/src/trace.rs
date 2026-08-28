@@ -3976,9 +3976,29 @@ fn run_perfn_walk<Sym: WalkSym>(
         // to itself, and a genuine trivia carry lands on a LATER py.  Anything
         // else is a body that does not encode `start_pc`, which is exactly the
         // decline below.
+        //
+        // The back-translation names the FIRST Python instruction whose
+        // lowering region owns the offset, and Python trivia -- `Nop`
+        // (a bare `pass`), `Cache`, `ExtendedArg`, `Resume`, `NotTaken` --
+        // lowers to nothing, so a trivia run immediately before a loop header
+        // owns the header's own offset and back-translates to the trivia.
+        // Comparing that raw coordinate rejected every loop preceded by a
+        // `pass`: the whole function then ran interpreted.  Normalize the
+        // landing forward past trivia first; an unported instruction is not
+        // trivia, so the carry-across-truncation case above still fails the
+        // test.
         sidecar_entry.filter(|&off| {
-            crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize
-                >= start_pc
+            let landed =
+                crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, off) as usize;
+            let landed = if pjc.code_ptr.is_null() {
+                landed
+            } else {
+                crate::jitcode_dispatch::skip_python_trivia_forward(
+                    unsafe { &*pjc.code_ptr },
+                    landed,
+                )
+            };
+            landed >= start_pc
         })
     } else {
         // Every non-entry resume carries its own JitCode coordinate. Without
