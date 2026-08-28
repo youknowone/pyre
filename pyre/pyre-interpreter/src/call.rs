@@ -1423,7 +1423,7 @@ fn call_function_ex_impl(
     // type-slot boundary; every ordinary callable continues through PyPy's
     // Arguments merge below, where non-string names are rejected.
     if !kwargs_or_null().is_null()
-        && let Some(result) = crate::module::_ast::moduledef::call_type_with_raw_kwargs(
+        && let Some(result) = crate::module::_ast::moduledef::call_with_raw_kwargs(
             callable(),
             &args(),
             kwargs_or_null(),

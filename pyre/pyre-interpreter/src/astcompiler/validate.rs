@@ -35,6 +35,37 @@ pub fn validate_ast(node: &ast::Mod) -> ValidateResult {
     }
 }
 
+/// CPython 3.14 `validate_arguments` visits vararg/kwarg annotations in the
+/// slots where PyPy `AstValidator.visit_arguments` marks its two missing
+/// checks, and visits every annotation before comparing either defaults list.
+/// Object conversion collapses those parallel lists into Ruff's
+/// `ParameterWithDefault`, so it calls this while that order is representable.
+pub(crate) fn validate_parameter_annotations(
+    posonlyargs: &[ast::Parameter],
+    args: &[ast::Parameter],
+    vararg: Option<&ast::Parameter>,
+    kwonlyargs: &[ast::Parameter],
+    kwarg: Option<&ast::Parameter>,
+) -> ValidateResult {
+    let validator = AstValidator;
+    for parameter in posonlyargs {
+        validator.visit_parameter(parameter)?;
+    }
+    for parameter in args {
+        validator.visit_parameter(parameter)?;
+    }
+    if let Some(parameter) = vararg {
+        validator.visit_parameter(parameter)?;
+    }
+    for parameter in kwonlyargs {
+        validator.visit_parameter(parameter)?;
+    }
+    if let Some(parameter) = kwarg {
+        validator.visit_parameter(parameter)?;
+    }
+    Ok(())
+}
+
 fn expr_context_name(ctx: ast::ExprContext) -> &'static str {
     match ctx {
         ast::ExprContext::Load => "Load",

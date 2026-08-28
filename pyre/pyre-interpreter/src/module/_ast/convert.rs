@@ -37,6 +37,135 @@ fn should_report_unsupported_syntax_error(error: &parser::UnsupportedSyntaxError
     )
 }
 
+/// PyPy's `PythonParser` applies the requested `CompileInfo.feature_version`
+/// while reducing these grammar productions. Ruff's supported-version table
+/// starts after some of those historical boundaries, so its unsupported-
+/// syntax side channel cannot represent them. Recover the 3.5/3.6 gates
+/// from the native tree and numeric tokens before publishing an `_ast` tree.
+/// [3.14-spec] PyPy `BaseParser.check_version` owns this tree-site structure
+/// but says "Python (3, N) and above"; CPython 3.14 `CHECK_VERSION` exposes
+/// "Python 3.N and greater", so the app-visible strings below follow 3.14.
+fn legacy_feature_version_error(
+    module: &ast::Mod,
+    tokens: &ast::token::Tokens,
+    source: &str,
+    feature_version: i64,
+) -> Option<(&'static str, ruff_text_size::TextRange)> {
+    use ast::visitor::Visitor;
+
+    if feature_version < 0 || feature_version >= 6 {
+        return None;
+    }
+
+    #[derive(Default)]
+    struct Finder {
+        minor: i64,
+        error: Option<(&'static str, ruff_text_size::TextRange)>,
+    }
+
+    impl Finder {
+        fn record(&mut self, message: &'static str, range: ruff_text_size::TextRange) {
+            if self
+                .error
+                .is_none_or(|(_, current)| range.start() < current.start())
+            {
+                self.error = Some((message, range));
+            }
+        }
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_stmt(&mut self, statement: &'a ast::Stmt) {
+            if self.minor < 5 {
+                match statement {
+                    ast::Stmt::FunctionDef(node) if node.is_async => self.record(
+                        "Async functions are only supported in Python 3.5 and greater",
+                        ruff_text_size::TextRange::empty(node.range.end()),
+                    ),
+                    ast::Stmt::For(node) if node.is_async => self.record(
+                        "Async for loops are only supported in Python 3.5 and greater",
+                        ruff_text_size::TextRange::empty(node.range.end()),
+                    ),
+                    ast::Stmt::With(node) if node.is_async => self.record(
+                        "Async with statements are only supported in Python 3.5 and greater",
+                        ruff_text_size::TextRange::empty(node.range.end()),
+                    ),
+                    _ => {}
+                }
+            }
+            ast::visitor::walk_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expression: &'a ast::Expr) {
+            if self.minor < 5 {
+                match expression {
+                    ast::Expr::Await(node) => self.record(
+                        "Await expressions are only supported in Python 3.5 and greater",
+                        ruff_text_size::TextRange::empty(node.range.end()),
+                    ),
+                    ast::Expr::BinOp(node) if node.op == ast::Operator::MatMult => self.record(
+                        "The '@' operator is only supported in Python 3.5 and greater",
+                        ruff_text_size::TextRange::empty(node.range.end()),
+                    ),
+                    _ => {}
+                }
+            }
+            if self.minor < 6 {
+                let async_comprehension = match expression {
+                    ast::Expr::ListComp(node) => Some(&node.generators),
+                    ast::Expr::SetComp(node) => Some(&node.generators),
+                    ast::Expr::DictComp(node) => Some(&node.generators),
+                    ast::Expr::Generator(node) => Some(&node.generators),
+                    _ => None,
+                };
+                if let Some(generators) = async_comprehension
+                    && let Some(generator) = generators.iter().find(|generator| generator.is_async)
+                {
+                    self.record(
+                        "Async comprehensions are only supported in Python 3.6 and greater",
+                        ruff_text_size::TextRange::empty(generator.range.end()),
+                    );
+                }
+            }
+            ast::visitor::walk_expr(self, expression);
+        }
+    }
+
+    let mut finder = Finder {
+        minor: feature_version,
+        error: None,
+    };
+    match module {
+        ast::Mod::Module(module) => finder.visit_body(&module.body),
+        ast::Mod::Expression(expression) => finder.visit_expr(&expression.body),
+    }
+
+    if feature_version < 6 {
+        for token in tokens.iter() {
+            let (kind, range) = token.as_tuple();
+            if feature_version < 5 && kind == ast::token::TokenKind::AtEqual {
+                finder.record(
+                    "The '@' operator is only supported in Python 3.5 and greater",
+                    range,
+                );
+            }
+            if matches!(
+                kind,
+                ast::token::TokenKind::Int
+                    | ast::token::TokenKind::Float
+                    | ast::token::TokenKind::Complex
+            ) && source[range.start().to_usize()..range.end().to_usize()].contains('_')
+            {
+                finder.record(
+                    "Underscores in numeric literals are only supported in Python 3.6 and greater",
+                    range,
+                );
+            }
+        }
+    }
+    finder.error
+}
+
 /// CPython `_PyPegen_new_identifier` refuses a lexer name whose NFKC form is
 /// one of the three constant keywords.  Ruff already performs that same NFKC
 /// conversion when it builds the AST, but (unlike CPython) leaves the result
@@ -889,6 +1018,13 @@ impl ObjectConverter {
         let kwonlyargs = self.parameter_list(object, "kwonlyargs")?;
         let vararg = self.opt_parameter(object, "vararg")?;
         let kwarg = self.opt_parameter(object, "kwarg")?;
+        crate::astcompiler::validate::validate_parameter_annotations(
+            &posonlyargs,
+            &args,
+            vararg.as_deref(),
+            &kwonlyargs,
+            kwarg.as_deref(),
+        )?;
         // `defaults` covers the tail of posonlyargs ++ args, while `kw_defaults`
         // runs alongside kwonlyargs with a hole for every parameter that has
         // none.  The compiler AST carries each default on its own parameter, so
@@ -2085,8 +2221,13 @@ pub fn parse_to_object_with_opts(
     };
     let options = parser::ParseOptions::from(parse_mode)
         .with_target_version(ast::PythonVersion { major: 3, minor });
-    let parsed = parser::parse(source, options)
-        .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
+    let source_file = SourceFileBuilder::new("<unknown>", source).finish();
+    let parsed = parser::parse(source, options).map_err(|error| {
+        crate::builtins::compile_err_to_syntax_error(
+            crate::compile::CompileError::from_ruff_parse_error(error, &source_file, mode),
+            source,
+        )
+    })?;
     // [3.14-spec] CPython `_PyPegen_new_identifier` performs this check as it
     // interns each identifier.  PyPy `new_identifier` has the same NFKC
     // spelling, while its parser-owned tree deliberately bypasses
@@ -2098,6 +2239,24 @@ pub fn parse_to_object_with_opts(
         .find(|error| should_report_unsupported_syntax_error(error))
     {
         return Err(crate::PyError::syntax_error(error.to_string()));
+    }
+    if let Some((message, range)) =
+        legacy_feature_version_error(parsed.syntax(), parsed.tokens(), source, feature_version)
+    {
+        return Err(crate::builtins::syntax_error_from_source_range(
+            message, source, range,
+        ));
+    }
+    // PyPy `BaseParser.parse_number` lets the object-space integer conversion
+    // enforce `sys.int_max_str_digits`, then turns that ValueError into the
+    // parser's SyntaxError with the hexadecimal advice appended.  The pinned
+    // RustPython helper performs the same token-level check for Ruff.
+    if let Some(error) = rustpython_compiler::long_decimal_integer_literal_error(
+        &source_file,
+        parsed.tokens(),
+        crate::module::sys::state::int_max_str_digits().max(0) as usize,
+    ) {
+        return Err(crate::builtins::compile_err_to_syntax_error(error, source));
     }
     let mut collected = super::type_comments::TypeComments::default();
     if type_comments {
@@ -2133,6 +2292,328 @@ pub fn parse_to_object_with_opts(
         crate::call::take_last_exec_ctx(),
     )?;
     module_to_object(module, source, mode, ast_module, &collected.ignores, true)
+}
+
+/// PyPy `PythonParser.func_type` / `type_expressions`:
+/// `(' type_expressions? ')' '->' expression`, where leading `*`/`**`
+/// markers classify the last one or two argument expressions but are not
+/// represented in `FunctionType.argtypes`.
+///
+/// Ruff has no func-type start rule.  Validate the inner list through its
+/// ordinary call-argument grammar, then parse a byte-for-byte-length-preserving
+/// expression: top-level `->` becomes `, ` and accepted `*`/`**` markers become
+/// spaces.  Every real expression consequently keeps its original TextRange,
+/// including nested and multi-line nodes.
+pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::PyResult {
+    use ast::token::TokenKind;
+
+    let source = &*crate::compile::universal_newline(source);
+    let minor = if feature_version < 0 {
+        14
+    } else {
+        feature_version.min(14) as u8
+    };
+    let options = parser::ParseOptions::from(parser::Mode::Expression)
+        .with_target_version(ast::PythonVersion { major: 3, minor });
+    let source_file = SourceFileBuilder::new("<unknown>", source).finish();
+    let unchecked = parser::parse_unchecked(source, options.clone());
+
+    let mut significant = Vec::new();
+    for token in unchecked.tokens().iter() {
+        let (kind, range) = token.as_tuple();
+        if matches!(
+            kind,
+            TokenKind::Comment
+                | TokenKind::Newline
+                | TokenKind::NonLogicalNewline
+                | TokenKind::EndOfFile
+        ) {
+            continue;
+        }
+        significant.push((kind, range));
+    }
+
+    let invalid = |range: ruff_text_size::TextRange| {
+        let error = parser::ParseError {
+            error: parser::ParseErrorType::OtherError("invalid syntax".to_owned()),
+            location: range,
+        };
+        crate::builtins::compile_err_to_syntax_error(
+            crate::compile::CompileError::from_ruff_parse_error(
+                error,
+                &source_file,
+                crate::compile::Mode::Eval,
+            ),
+            source,
+        )
+    };
+    let eof = ruff_text_size::TextSize::new(source.len() as u32);
+    let eof_range = ruff_text_size::TextRange::empty(eof);
+    if significant.is_empty() || significant[0].0 != TokenKind::Lpar {
+        return Err(invalid(
+            significant.first().map_or(eof_range, |entry| entry.1),
+        ));
+    }
+
+    let mut depth = 0i64;
+    let mut close_index = None;
+    for index in 0..significant.len() {
+        match significant[index].0 {
+            TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => depth += 1,
+            TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
+                depth -= 1;
+                if depth == 0 {
+                    close_index = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close_index) = close_index else {
+        return Err(invalid(eof_range));
+    };
+    if significant[close_index].0 != TokenKind::Rpar {
+        return Err(invalid(significant[close_index].1));
+    }
+    let arrow_index = close_index + 1;
+    if arrow_index >= significant.len() || significant[arrow_index].0 != TokenKind::Rarrow {
+        let range = if arrow_index < significant.len() {
+            significant[arrow_index].1
+        } else {
+            eof_range
+        };
+        return Err(invalid(range));
+    }
+    if arrow_index + 1 >= significant.len() {
+        return Err(invalid(eof_range));
+    }
+    if close_index > 1 && significant[close_index - 1].0 == TokenKind::Comma {
+        return Err(invalid(significant[close_index - 1].1));
+    }
+    // `PythonParser.type_expressions` consumes ordinary `expression` nodes,
+    // not the call grammar's implicit generator argument. Any `for` at the
+    // outer func-type-parentheses depth therefore needs another delimiter
+    // pair around it; comprehensions inside `()`, `[]`, or `{}` remain valid.
+    let mut inner_depth = 1i64;
+    for &(kind, range) in &significant[1..close_index] {
+        match kind {
+            TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => inner_depth += 1,
+            TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => inner_depth -= 1,
+            TokenKind::For if inner_depth == 1 => return Err(invalid(range)),
+            _ => {}
+        }
+    }
+    let open_range = significant[0].1;
+    let close_range = significant[close_index].1;
+    let inner_start = open_range.end().to_usize();
+    let inner_end = close_range.start().to_usize();
+    let inner = &source[inner_start..inner_end];
+    const WRAPPER: &str = "__pyre_func_type__(";
+    let wrapped = format!("{WRAPPER}{inner})");
+    // Ruff's pre-3.5 token stream classifies `await` as a Name and rejects a
+    // valid await expression before it can publish the node that PyPy
+    // `PythonParser.await_primary` hands to `BaseParser.check_version`. The
+    // wrapper validates only the timeless `type_expressions` list shape, so
+    // use the current grammar for that one old-version corner; the transformed
+    // source below still goes through the requested grammar after its PyPy
+    // tree-site version checks have run.
+    let wrapper_options = if (0..5).contains(&feature_version) {
+        parser::ParseOptions::from(parser::Mode::Expression).with_target_version(
+            ast::PythonVersion {
+                major: 3,
+                minor: 14,
+            },
+        )
+    } else {
+        options.clone()
+    };
+    let wrapped_parsed = parser::parse(&wrapped, wrapper_options).map_err(|error| {
+        let map = |offset: ruff_text_size::TextSize| {
+            let offset = offset.to_usize().saturating_sub(WRAPPER.len());
+            ruff_text_size::TextSize::new((inner_start + offset.min(inner.len())) as u32)
+        };
+        let mapped = parser::ParseError {
+            error: error.error,
+            location: ruff_text_size::TextRange::new(
+                map(error.location.start()),
+                map(error.location.end()),
+            ),
+        };
+        crate::builtins::compile_err_to_syntax_error(
+            crate::compile::CompileError::from_ruff_parse_error(
+                mapped,
+                &source_file,
+                crate::compile::Mode::Eval,
+            ),
+            source,
+        )
+    })?;
+    let ast::Mod::Expression(wrapped_expression) = wrapped_parsed.into_syntax() else {
+        return Err(invalid(eof_range));
+    };
+    let ast::Expr::Call(call) = *wrapped_expression.body else {
+        return Err(invalid(eof_range));
+    };
+
+    let mut marker_ranges = Vec::new();
+    let positional_len = call.arguments.args.len();
+    let mut seen_star = false;
+    for index in 0..positional_len {
+        if let ast::Expr::Starred(starred) = &call.arguments.args[index] {
+            if seen_star || index + 1 != positional_len {
+                return Err(invalid(significant[close_index - 1].1));
+            }
+            seen_star = true;
+            let start = starred
+                .range
+                .start()
+                .to_usize()
+                .saturating_sub(WRAPPER.len());
+            marker_ranges.push((inner_start + start, 1usize));
+        }
+    }
+    let mut seen_double_star = false;
+    for keyword in &call.arguments.keywords {
+        if keyword.arg.is_some() || seen_double_star {
+            let start = keyword
+                .range
+                .start()
+                .to_usize()
+                .saturating_sub(WRAPPER.len());
+            let start = ruff_text_size::TextSize::new((inner_start + start) as u32);
+            return Err(invalid(ruff_text_size::TextRange::empty(start)));
+        }
+        seen_double_star = true;
+        let start = keyword
+            .range
+            .start()
+            .to_usize()
+            .saturating_sub(WRAPPER.len());
+        marker_ranges.push((inner_start + start, 2usize));
+    }
+    let arg_count = positional_len + call.arguments.keywords.len();
+
+    let mut transformed = source.as_bytes().to_vec();
+    for &(start, len) in &marker_ranges {
+        for offset in 0..len {
+            transformed[start + offset] = b' ';
+        }
+    }
+    let arrow = significant[arrow_index].1;
+    transformed[arrow.start().to_usize()] = b',';
+    transformed[arrow.start().to_usize() + 1] = b' ';
+    let transformed = String::from_utf8(transformed).expect("ASCII-only func_type rewrite");
+    if (0..5).contains(&feature_version) {
+        let current_options = parser::ParseOptions::from(parser::Mode::Expression)
+            .with_target_version(ast::PythonVersion {
+                major: 3,
+                minor: 14,
+            });
+        if let Ok(current) = parser::parse(&transformed, current_options)
+            && let Some((message, range)) = legacy_feature_version_error(
+                current.syntax(),
+                current.tokens(),
+                source,
+                feature_version,
+            )
+        {
+            return Err(crate::builtins::syntax_error_from_source_range(
+                message, source, range,
+            ));
+        }
+    }
+    let parsed = parser::parse(&transformed, options).map_err(|error| {
+        crate::builtins::compile_err_to_syntax_error(
+            crate::compile::CompileError::from_ruff_parse_error(
+                error,
+                &source_file,
+                crate::compile::Mode::Eval,
+            ),
+            source,
+        )
+    })?;
+    validate_parser_identifiers(source, parsed.tokens())?;
+    if let Some(error) = parsed
+        .unsupported_syntax_errors()
+        .iter()
+        .find(|error| should_report_unsupported_syntax_error(error))
+    {
+        return Err(crate::PyError::syntax_error(error.to_string()));
+    }
+    if let Some((message, range)) =
+        legacy_feature_version_error(parsed.syntax(), parsed.tokens(), source, feature_version)
+    {
+        return Err(crate::builtins::syntax_error_from_source_range(
+            message, source, range,
+        ));
+    }
+    if let Some(error) = rustpython_compiler::long_decimal_integer_literal_error(
+        &source_file,
+        parsed.tokens(),
+        crate::module::sys::state::int_max_str_digits().max(0) as usize,
+    ) {
+        return Err(crate::builtins::compile_err_to_syntax_error(error, source));
+    }
+    let ast::Mod::Expression(expression) = parsed.into_syntax() else {
+        return Err(invalid(eof_range));
+    };
+    let ast::Expr::Tuple(mut top) = *expression.body else {
+        return Err(invalid(eof_range));
+    };
+    if top.elts.len() != 2 {
+        return Err(invalid(eof_range));
+    }
+    let returns = top.elts.pop().expect("two-element func_type tuple");
+    let left = top.elts.pop().expect("two-element func_type tuple");
+    let argtypes = if arg_count == 0 {
+        let ast::Expr::Tuple(tuple) = left else {
+            return Err(invalid(open_range));
+        };
+        if !tuple.elts.is_empty() {
+            return Err(invalid(open_range));
+        }
+        Vec::new()
+    } else if arg_count == 1 {
+        vec![left]
+    } else {
+        let ast::Expr::Tuple(tuple) = left else {
+            return Err(invalid(open_range));
+        };
+        if tuple.elts.len() != arg_count {
+            return Err(invalid(open_range));
+        }
+        tuple.elts
+    };
+    let ast_module_object = crate::importing::importhook(
+        "_ast",
+        PY_NULL,
+        PY_NULL,
+        0,
+        crate::call::take_last_exec_ctx(),
+    )?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let ast_module = Rooted(roots.base());
+    let _ = roots.pin_root(ast_module_object);
+    let converter = Converter {
+        source,
+        source_file,
+        ast_module,
+        parser_locations: true,
+    };
+    let mut args = Vec::with_capacity(argtypes.len());
+    for arg in &argtypes {
+        args.push(converter.expr(arg)?);
+    }
+    let args = converter.list(args);
+    let returns = converter.expr(&returns)?;
+    Ok(converter
+        .node(
+            "FunctionType",
+            None,
+            &[("argtypes", args), ("returns", returns)],
+        )?
+        .get())
 }
 
 fn module_to_object(

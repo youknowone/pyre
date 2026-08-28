@@ -12176,6 +12176,64 @@ fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
     (lineno, byte_index - line_start + 1)
 }
 
+/// Build the located parser error for a diagnostic whose grammar reduction
+/// has already selected both its message and source range.
+///
+/// This deliberately bypasses RustPython's `CompileError::from_ruff_parse_error`:
+/// that constructor is for raw Ruff failures and runs source-wide recovery
+/// rules.  PyPy `BaseParser.check_version`, like CPython's `CHECK_VERSION`, is
+/// already the final parser reduction and must not be reclassified by them.
+pub(crate) fn syntax_error_from_source_range(
+    message: &str,
+    source: &str,
+    range: ruff_text_size::TextRange,
+) -> crate::PyError {
+    let (lineno, byte_offset) = source_byte_location(source, range.start().to_usize());
+    let (end_lineno, end_byte_offset) = source_byte_location(source, range.end().to_usize());
+    let offset = syntax_error_character_offset(source, lineno, byte_offset);
+    let end_offset = syntax_error_character_offset(source, end_lineno, end_byte_offset);
+    let text = source.split_inclusive('\n').nth(lineno - 1);
+    let mut error = crate::PyError::syntax_error_located(
+        message,
+        Wtf8::new("<unknown>"),
+        lineno as i64,
+        offset as i64,
+        end_lineno as i64,
+        end_offset as i64,
+        text,
+    );
+    stamp_parser_syntax_metadata(&mut error, source);
+    error
+}
+
+/// `pegen.c _PyPegen_set_syntax_error_metadata` for an error emitted by a
+/// parser reduction rather than by later code generation.
+fn stamp_parser_syntax_metadata(error: &mut crate::PyError, source: &str) {
+    // The exception is materialised and pinned before the tuple elements are
+    // built: until it is stamped it lives only in this Rust `PyError`, which
+    // the collector does not scan.  Each element is likewise pinned as it is
+    // made and reloaded at the end.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(error.to_exc_object());
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
+    let zero_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(0));
+    let zero = pyre_object::gc_roots::shadow_stack_get(zero_slot);
+    let metadata = pyre_object::w_tuple_new(vec![
+        zero,
+        zero,
+        pyre_object::gc_roots::shadow_stack_get(source_slot),
+    ]);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_syntax_metadata(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            metadata,
+        );
+    }
+}
+
 /// Byte index of the one-based character column a parser diagnostic reports,
 /// which is what indexes back into the source it was parsed from.  A column
 /// past the end of its line lands on the line's end.
@@ -13787,13 +13845,15 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let escape_span = escape_error
         .filter(|escape| escape.message == msg)
         .map(|escape| escape.span);
+    let leading_indent_span = leading_unexpected_indent_span(source);
     // The overrides above assign `msg` in sequence, so the last one to fire is
-    // the message being reported; this chain is that same precedence read
-    // backwards, so the span and the message always name the same construct.
-    // Both halves of a pair do fire together -- an incompatible string prefix
-    // in an assignment target reaches the prefix scan and the shape test, and
-    // `bu'x' = 1` is why the prefix span has to win.
-    let diagnostic_span = escape_span
+    // the message being reported; after the tokenizer's leading-indentation
+    // correction, this chain reads that precedence backwards so the span and
+    // message name the same construct. Both halves of a pair can fire together:
+    // an incompatible string prefix in an assignment target reaches the prefix
+    // scan and the shape test, and `bu'x' = 1` is why the prefix span wins.
+    let diagnostic_span = leading_indent_span
+        .or(escape_span)
         .or(literal_span)
         .or(prefix_span)
         .or(assignment_span)
@@ -13885,30 +13945,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // suggestion off earlier on a long file, and it keeps the line numbers the
     // helper reports absolute instead of relative to the slice.
     if parser_error {
-        // The exception is materialised and pinned before the tuple elements
-        // are built: until it is stamped it lives only in this Rust `PyError`,
-        // which the collector does not scan, so an allocation below could sweep
-        // it.  Each element is likewise pinned as it is made and reloaded at the
-        // end, the discipline `syntax_error_located` uses for the details tuple.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(error.to_exc_object());
-        let source_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
-        let zero_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(0));
-        let zero = pyre_object::gc_roots::shadow_stack_get(zero_slot);
-        let metadata = pyre_object::w_tuple_new(vec![
-            zero,
-            zero,
-            pyre_object::gc_roots::shadow_stack_get(source_slot),
-        ]);
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_syntax_metadata(
-                pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                metadata,
-            );
-        }
+        stamp_parser_syntax_metadata(&mut error, source);
     }
     error
 }
@@ -13922,6 +13959,45 @@ enum IndentFault {
     TabsAndSpaces,
     /// `IndentationError`: a dedent that lands between two enclosing levels.
     UnmatchedDedent,
+}
+
+/// The first real token starts an indented top-level logical line.
+///
+/// [3.14-spec] CPython's tokenizer rejects this before its parser sees the
+/// expression. Ruff can instead continue to an unclosed bracket or a generic
+/// expression error, so recover the tokenizer's earlier position. PyPy uses
+/// the same token-first shape normally, although after an explicit line
+/// continuation its parser can report the later unclosed delimiter instead.
+/// A continuation-only physical line contributes no token and is skipped, as
+/// in `ASTHelpers_Test.test_literal_eval_syntax_errors`.
+fn leading_unexpected_indent_span(source: &str) -> Option<(usize, usize)> {
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let bytes = line.as_bytes();
+        let mut indent = 0usize;
+        let mut has_effective_indent = false;
+        while indent < bytes.len() && matches!(bytes[indent], b' ' | b'\t' | b'\x0c') {
+            // CPython `tok_get_normal_mode` resets both indentation columns
+            // at a formfeed. Whitespace before it therefore cannot make the
+            // first logical line indented; whitespace after it still can.
+            has_effective_indent = if bytes[indent] == b'\x0c' {
+                false
+            } else {
+                true
+            };
+            indent += 1;
+        }
+        let content = line[indent..].trim_end_matches(['\r', '\n']);
+        if content.is_empty() || content.starts_with('#') || content == "\\" {
+            line_start += line.len();
+            continue;
+        }
+        return has_effective_indent.then(|| {
+            let index = line_start + indent - 1;
+            (index, index)
+        });
+    }
+    None
 }
 
 /// The first indentation the tokenizer would reject, and why.
@@ -14085,6 +14161,9 @@ fn syntax_error_subclass(
         ),
         _ => ("IndentationError", plain.map(str::to_owned)),
     };
+    if leading_unexpected_indent_span(source).is_some() {
+        return Some(indentation(Some("unexpected indent")));
+    }
     match &parse_err.error {
         ParseErrorType::OtherError(msg)
             if (msg.starts_with("Missing parentheses in call to 'print'")
@@ -14388,14 +14467,30 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
     }
 
+    let only_ast = flags & PYCF_ONLY_AST != 0;
+    let func_type_mode = mode == "func_type";
+    if func_type_mode && !only_ast {
+        return Err(crate::PyError::value_error(
+            "compile() mode 'func_type' requires flag PyCF_ONLY_AST",
+        ));
+    }
     let mode = match mode {
         "exec" => crate::compile::Mode::Exec,
         "eval" => crate::compile::Mode::Eval,
         "single" => crate::compile::Mode::Single,
+        // PyPy `compiling.py` admits this start rule only at the public AST
+        // boundary.  Ruff's codegen Mode has no corresponding bytecode mode;
+        // the ONLY_AST branch below dispatches before this placeholder can
+        // reach either parser or code generation.
+        "func_type" => crate::compile::Mode::Eval,
         _ => {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
-                "compile() mode must be 'exec', 'eval' or 'single'",
+                if only_ast {
+                    "compile() mode must be 'exec', 'eval', 'single' or 'func_type'"
+                } else {
+                    "compile() mode must be 'exec', 'eval' or 'single'"
+                },
             ));
         }
     };
@@ -14448,6 +14543,13 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         future_features: crate::CodeFlags::from_bits_truncate((flags & COMPILER_FLAGS) as u32),
         ..Default::default()
     };
+    if let Some(source) = source_str.as_deref() {
+        // PyPy's tokenizer calls `misc.syntax_warning` while it is building
+        // either a compiler tree or an app-visible AST.  Keep that ordering:
+        // ONLY_AST and func_type source parses warn too, and a filter that
+        // escalates the warning prevents the parser result from escaping.
+        crate::syntax_warnings::emit_escape_warnings(source, &filename)?;
+    }
     if flags & PYCF_ONLY_AST != 0 {
         // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
         // plain ONLY_AST runs syntax-only preprocessing; OPTIMIZED_AST
@@ -14456,7 +14558,21 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // Kept for the incomplete-input retry below, which the tree builder's
         // own `opts` has been moved into by then.
         let retry_opts = opts.clone();
-        let result = if source_is_ast {
+        let result = if func_type_mode && source_is_ast {
+            // PyPy `compiling.py` returns an AST input unchanged for
+            // ONLY_AST, including FunctionType.  At the pinned CPython 3.14.6,
+            // `PyAst_CheckMode` asserts because this path supplies func_type's
+            // mode 3 to its 0..=2 table, so there is no successful 3.14
+            // observable that displaces the PyPy owner path.
+            Ok(source)
+        } else if func_type_mode {
+            crate::module::_ast::convert::parse_func_type_to_object(
+                source_str
+                    .as_deref()
+                    .expect("non-AST func_type source has decoded text"),
+                feature_version,
+            )
+        } else if source_is_ast {
             // [3.14-spec] CPython `_PyAST_obj2mod` validates the root for the
             // requested mode and `_PyAST_mod2obj` publishes a fresh tree even
             // for plain ONLY_AST.  PyPy `compile_to_ast` returns its input
@@ -14497,7 +14613,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             // reaches code generation, and it runs only for a source that has
             // already failed under the flag -- which is `codeop` and that
             // helper, nothing else.
-            if flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0
+            if !func_type_mode
+                && flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0
                 && let Some(text) = source_str.as_deref()
                 && let Err(structured) =
                     crate::compile::compile_source_with_opts(text, mode, &filename, retry_opts)
@@ -14512,9 +14629,6 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         });
     }
     let code = if let Some(source) = source_str.as_deref() {
-        // The escape warnings precede code generation, and a filter that
-        // escalates one replaces the compile with that error.
-        crate::syntax_warnings::emit_escape_warnings(source, &filename)?;
         crate::compile::compile_source_with_opts(source, mode, &filename, opts).map_err(|e| {
             compile_err_to_syntax_error_maybe_incomplete(
                 e,

@@ -1484,6 +1484,17 @@ pub fn make_method_descriptor_with_arity(
     crate::function_new_method_descriptor(code as *const (), name.to_string())
 }
 
+/// Build a CPython-compatible variadic method descriptor carrying the
+/// app-visible docstring supplied by PyPy's `interp2app` registration.
+pub fn make_method_descriptor_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
+    crate::function_new_method_descriptor(code as *const (), name.to_string())
+}
+
 /// `make_builtin_function` with `fast_natural_arity = PASSTHROUGHARGS1` —
 /// PyPy `BuiltinCodePassThroughArguments1` registration shape.
 pub fn make_builtin_function_passthrough_args1(
