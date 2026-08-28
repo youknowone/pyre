@@ -1888,6 +1888,12 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // zero through `load_state_field/di`. A slot that already held a constant
     // loses nothing, so it is not counted.
     "inline_frame_trim_blanked_live_int",
+    // A `confirm_enter_jit` hook was installed, but a hash-only compatibility
+    // door had no structured greens to pass it. The door declines rather than
+    // invoking the callback with a hash disguised as its argument; a nonzero
+    // value identifies compatibility callers that still need typed-key
+    // threading.
+    "confirm_enter_jit_missing_key",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

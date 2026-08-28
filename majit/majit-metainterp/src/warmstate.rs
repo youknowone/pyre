@@ -1042,8 +1042,10 @@ impl WarmEnterState {
                 // warmstate.py:501 — the second veto position, between
                 // finding a live procedure token and `raise
                 // EnterJitAssembler`. A hook that refuses leaves the caller
-                // interpreting rather than entering the machine code.
-                if !self.confirm_enter_jit_if_available(None) {
+                // interpreting rather than entering the machine code. The
+                // matched typed cell retains the structured greens, so the
+                // hash compatibility door can still call the hook for real.
+                if !self.confirm_enter_jit_if_available(cell.comparekey.as_ref()) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1364,7 +1366,9 @@ impl WarmEnterState {
     pub fn force_start_tracing(&mut self, cell_key: u64) -> HotResult {
         if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() {
-                if !self.confirm_enter_jit_if_available(None) {
+                // A typed cell retains the structured greens even when this
+                // compatibility entry point was called with its hash.
+                if !self.confirm_enter_jit_if_available(cell.comparekey.as_ref()) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -2644,15 +2648,27 @@ impl WarmEnterState {
     }
 
     /// Hash-only compatibility paths cannot reconstruct the greens a hook is
-    /// entitled to inspect. The absent-hook arm stays the same free `true`
-    /// substitution; with a hook installed, such a path declines instead of
-    /// passing a hash disguised as a green tuple.
+    /// entitled to inspect. Typed cells hand their retained `comparekey` to
+    /// this helper, including the compiled-entry branches in
+    /// [`Self::maybe_compile_decision_with_meta`] and
+    /// [`Self::force_start_tracing`]. A genuinely hash-only cell can still
+    /// reach this helper through those two doors, through
+    /// [`Self::start_tracing_cell`], or through a keyless
+    /// [`Self::function_entry_step`]. Such a path declines instead of passing
+    /// a hash disguised as a green tuple, and bumps
+    /// `confirm_enter_jit_missing_key` so the refusal is observable. Removing
+    /// that compatibility refusal requires moving the structured greens into
+    /// those callers (the production pyre doors already supply raw `(code,
+    /// pc)` and take the typed path whenever a hook is installed).
     #[inline]
     fn confirm_enter_jit_if_available(&self, green_key: Option<&GreenKey>) -> bool {
         match (self.confirm_enter_jit_ptr, green_key) {
             (None, _) => true,
             (Some(hook), Some(key)) => hook(key),
-            (Some(_), None) => false,
+            (Some(_), None) => {
+                crate::mc_diag_bump(95); // confirm_enter_jit_missing_key
+                false
+            }
         }
     }
 
@@ -5902,6 +5918,40 @@ mod tests {
             matches!(ws.force_start_tracing_for_key(&key), HotResult::NotHot),
             "the force-start door must not turn an already-compiled cell into \
              an unchecked compiled entry",
+        );
+    }
+
+    /// A permissive hook must preserve both compiled-entry answers even when
+    /// the compatibility API names the typed cell by hash. This also proves
+    /// those doors recover and pass the cell's structured `comparekey` rather
+    /// than treating an installed hook as an unconditional refusal.
+    #[test]
+    fn a_permissive_confirm_enter_jit_preserves_hash_compiled_entry() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_green_key: &GreenKey) -> bool {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![22, 24]);
+        let hash = key.get_uhash();
+        let _token = attach_alive_for_key(&mut ws, &key, JitCellToken::new(1));
+        ws.set_confirm_enter_jit(Some(allow));
+
+        assert!(matches!(
+            ws.maybe_compile_decision(hash),
+            HotResult::RunCompiled
+        ));
+        assert!(matches!(
+            ws.force_start_tracing(hash),
+            HotResult::RunCompiled
+        ));
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "both compiled-entry doors must call the permissive hook",
         );
     }
 
