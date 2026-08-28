@@ -78,6 +78,7 @@ def other_consumers():
 def identity():
     x = float("0.125")
     y = float("0.25")
+    assert x is not y
     same = (x, x)
     distinct = (x, y)
     assert same[0] is x and same[1] is x and same[0] is same[1]
@@ -87,5 +88,6 @@ def identity():
 produced_pairs()
 index_guards()
 other_consumers()
-identity()
+for _ in range(N):
+    identity()
 print("OK")
