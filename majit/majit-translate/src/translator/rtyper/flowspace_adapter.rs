@@ -844,7 +844,7 @@ fn is_vec_ctor_segments(segments: &[String]) -> bool {
 /// fallible Rust reservation; translated callers take this exact path into
 /// `rtype_newlist_hint` and therefore retain both the capacity hint and the
 /// MemoryError edge.
-fn is_try_pyobject_vec_with_capacity_segments(segments: &[String]) -> bool {
+fn is_runtime_newlist_hint_segments(segments: &[String]) -> bool {
     segments.len() >= 2
         && segments[segments.len() - 2] == "builtins"
         && segments[segments.len() - 1] == "try_pyobject_vec_with_capacity"
@@ -2131,7 +2131,7 @@ pub fn translate_op(
                     // Result-to-exception pass has already made this call's
                     // result the normal-edge Vec payload, so the synthetic op
                     // has precisely the upstream one-argument/result shape.
-                    if is_try_pyobject_vec_with_capacity_segments(segments) {
+                    if is_runtime_newlist_hint_segments(segments) {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(format!(
                                 "try_pyobject_vec_with_capacity requires exactly one size hint, got {}",
@@ -5117,7 +5117,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_try_pyobject_vec_with_capacity_becomes_newlist_hint() {
+    fn translate_runtime_capacity_helper_becomes_newlist_hint() {
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_newlist_hint_fixture");
         let vars = mint_vars(&mut graph, 2);
