@@ -1108,6 +1108,27 @@ fn try_commit_midbody_abort_inner(
 /// rollback the decline falls into is sound.  The test is a superset — a loop
 /// whose header has no compiled token would have walked through — so it costs
 /// bridges rather than answers.
+///
+/// Deciding early rather than repairing the tail is what the tail itself
+/// reports.  On `chunked_read_keeps_its_buffered_tail.py` without this arm,
+/// `PYRE_FBW_DEBUG_ABORT` reads:
+///
+/// ```text
+/// [fbw-effect] pc=1886 helper=StoreAttr extraeffect=RandomEffects writes_live=true
+/// [fbw-effect-bump] site=residual count=1
+/// [fbw-effect] pc=1960 helper=StoreAttr extraeffect=CannotRaise writes_live=true
+/// [fbw-effect-bump] site=residual count=2
+/// [s2-adopt-decline] no latched multi-frame image; single-frame adopt follows
+/// [p2-drain-abort] effects=2 adopted=false
+/// ```
+///
+/// The odometer does see both stores; they bump it as `residual`, not as
+/// `store_journal`, which is the same thing as saying no journal carries them.
+/// So the tail's two exits are the adopt — which declined for want of a latched
+/// multi-frame image — and the rollback, which restores only what a journal
+/// holds and then replays the region over stores that already stand.  Repairing
+/// that means making the adopt succeed for this shape, not making the rollback
+/// reach further; until it does, not entering is the only sound road.
 fn code_has_backward_jump(code: &pyre_interpreter::CodeObject) -> bool {
     use pyre_interpreter::Instruction as I;
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -1893,12 +1914,23 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
         return p2_drain_abort();
     };
+    let raw_callee_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
+    if raw_callee_code.is_null() {
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
+        return p2_drain_abort();
+    }
     // Before anything runs in the callee: a loop-bearing one can stop the
     // sub-walk at an outcome this drain does not keep, and the rollback that
     // follows does not reach what the sub-walk has already executed by then.
     // See `code_has_backward_jump`.
-    let raw_callee_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
-    if raw_callee_code.is_null() || code_has_backward_jump(unsafe { &*raw_callee_code }) {
+    if code_has_backward_jump(unsafe { &*raw_callee_code }) {
+        // The predicate reads the whole code object, so it can never become
+        // false for this callee and the drain can never succeed here.  That
+        // puts it with `NoRecipes` rather than with the arms above: leaving
+        // the guard eligible retries the same setup/scan/abort at every
+        // failure, which is the churn that arm's comment measures.
+        fbw_bridge_decline(ctx);
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
         crate::jitcode_dispatch::census_record("P2Drain::LoopBearingCallee");
         return p2_drain_abort();
