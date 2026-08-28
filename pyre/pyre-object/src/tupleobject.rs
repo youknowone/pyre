@@ -395,7 +395,7 @@ fn w_tuple_new_array_backed_impl(
         // register the tuple explicitly so the next minor collection scans it
         // (via the `wrappeditems` custom-trace hook) and relocates any young
         // element. Mirrors the `write_barrier_from_array` an old list/tuple
-        // store would emit (incminimark.py:1495). A tuple that spilled to the
+        // store would emit (incminimark.py). A tuple that spilled to the
         // old generation because the nursery was full is the case that needs
         // it; one still in the nursery carries no `GCFLAG_TRACK_YOUNG_PTRS`,
         // which is the flag `do_write_barrier_managed` tests, so the call

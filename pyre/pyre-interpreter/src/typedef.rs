@@ -10725,15 +10725,15 @@ pub(crate) fn getset_property_get(
     let none_type =
         crate::typedef::r#type(pyre_object::w_none()).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     let w_cls_is_none_type = !w_cls.is_null() && std::ptr::eq(w_cls, none_type);
-    // typedef.py:352-353 if w_obj is None and w_cls is not type(None):
+    // typedef.py if w_obj is None and w_cls is not type(None):
     if w_obj_is_none && !w_cls_is_none_type {
-        // typedef.py:355 if w_cls is None: raise TypeError
+        // typedef.py if w_cls is None: raise TypeError
         if w_cls.is_null() || unsafe { pyre_object::is_none(w_cls) } {
             return Err(crate::PyError::type_error(
                 "__get__(None, None) is invalid".to_string(),
             ));
         }
-        // typedef.py:357 return self
+        // typedef.py return self
         return Ok(w_self);
     }
     // typedef.py try: return self.fget(self, space, w_obj)

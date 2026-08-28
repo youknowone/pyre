@@ -11799,11 +11799,12 @@ pub(crate) unsafe fn get(
     }
 
     // property: PyPy W_Property.get → call fget(obj).  Exact type only, for
-    // the reason `descroperation.py:169-176` gives its own shortcut: calling
-    // the accessor in place of `type(w_descr).__get__` is licensed only where
-    // the type cannot have overridden `__get__`.  A subclass falls through to
-    // the general MRO lookup at the end of this function, which finds either
-    // its override or `property`'s own typedef entry.
+    // the reason `descroperation.py get_and_call_function` gives its own
+    // shortcut: calling the accessor in place of `type(w_descr).__get__` is
+    // licensed only where the type cannot have overridden `__get__`.  A
+    // subclass falls through to the general MRO lookup at the end of this
+    // function, which finds either its override or `property`'s own typedef
+    // entry.
     if is_exact_property(descr) {
         // W_Property.get receives `space.w_None` for class access.  Internally
         // that state is a null pointer so the actual None singleton can still
@@ -11829,7 +11830,7 @@ pub(crate) unsafe fn get(
     // `getset_descriptor.__get__` entry, which is itself a builtin function
     // object, and so pays a second one on every `x.__class__`, `f.__name__`,
     // `frame.f_lineno`, ... .  Run the body in place of the lookup, the licence
-    // the `property` arm above cites (descroperation.py:169-176).
+    // the `property` arm above cites (`get_and_call_function`'s shortcut).
     //
     // `is_getset_property` compares `ob_type` against the static
     // `GETSET_DESCRIPTOR_TYPE`, which only `w_getset_property_new` installs, and

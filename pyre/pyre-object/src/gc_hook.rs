@@ -203,7 +203,7 @@ pub fn try_gc_alloc_stable_raw(type_id: u32, payload_size: usize) -> *mut u8 {
 }
 
 /// [`try_gc_alloc_stable_raw`]'s nursery twin — `malloc_fixedsize`
-/// (`framework.py:361-382`), the allocation every RPython constructor takes.
+/// (`framework.py`), the allocation every RPython constructor takes.
 ///
 /// The two answer the same `null`-means-no-hook contract and neither collects,
 /// so a caller of either may read its field values before the call and store
