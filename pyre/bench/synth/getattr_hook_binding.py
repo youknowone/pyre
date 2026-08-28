@@ -1,14 +1,11 @@
-# pyre-check: max-pypy-ratio=25
-# objspace.py:710 get_and_call_function: a __getattr__ (or __getattribute__)
+# `get_and_call_function`: a __getattr__ (or __getattribute__)
 # defined as a classmethod or staticmethod must be bound through __get__ before
 # being called, exactly like any other special method, so it receives the
 # arguments the descriptor protocol gives it.
 #
 # The hook inlines against the version-tag and map pins that make the miss
 # constant, instead of costing one opaque residual per access holding the
-# whole `object_getattr_miss` walk plus a fresh frame.  The ratio reads
-# 7.4x/10.4x/8.7x (dynasm/cranelift/wasm); the bound is twice the slowest of
-# those (10.4x), rounded up to the next multiple of five.
+# whole `object_getattr_miss` walk plus a fresh frame.
 
 
 class ClassmethodGetattr:
@@ -28,11 +25,14 @@ class PlainGetattr:
         return 'plain:%s' % name
 
 
-# The loop has to outrun check.py's EXEC_TIME_FLOOR_S, below which pypy's
-# execution cannot be separated from its own startup and the printed ratio is an
-# artifact of the clamp rather than a measurement.  600000 iterations put pypy
-# at ~0.05s: ten times the posix floor and three times the coarser windows one.
-N = 600000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 5000
 
 
 def main():

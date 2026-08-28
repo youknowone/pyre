@@ -24,7 +24,14 @@
 # back 2099965 against 2100000, five aborts, thirty-five short.
 #
 # Deterministic, terminating, prints PASS or a FAIL naming the site.
-N = 200000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 2000
 
 
 class Inner:

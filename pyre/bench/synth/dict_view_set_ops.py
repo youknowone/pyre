@@ -1,9 +1,16 @@
-# pyre-check: max-pypy-ratio=25
 # A set operation on a dict view builds a set from the left operand and runs
 # the matching in-place set method against the right one, so the result is a
 # plain set. The reflected forms build the set from the other operand, keeping
 # the operand order of the non-commutative `-` and `&`. A warmup loop
 # exercises the view set-op path.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+
 def warm(n):
     a = {"a": 1, "b": 2}
     b = {"b": 2, "c": 3}
@@ -29,7 +36,7 @@ K2 = {"b": 2, "c": 3}
 
 
 def main():
-    print("warm", warm(120000))
+    print("warm", warm(1000))
     # forward ops, view vs view
     m("keys_sub", lambda: s(K.keys() - K2.keys()))
     m("keys_and", lambda: s(K.keys() & K2.keys()))

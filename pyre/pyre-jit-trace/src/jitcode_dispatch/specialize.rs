@@ -644,19 +644,22 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
                 }
             }
             OpCode::IntLshift => {
-                // Don't specialize int `<<`: route to the generic (residual
-                // BINARY_OP) leg, which carries the full intobject.py
-                // descr_lshift semantics (promote to bignum on overflow, raise
-                // ValueError on a negative count). A bare walker-native IntLshift
-                // would be wrong — the trace is reused for any operands and x86
-                // SHL masks the count mod 64 — and a *guarded* specialization
-                // (range + round-trip guards, bail to bignum) crashes the
-                // cranelift backend: when the lshift result is the loop variable
-                // its box alternates small-int / bignum across the guard's
-                // bridge boundary, and that trips a cranelift bridge bug (works
-                // on dynasm). The generic leg handles the alternation correctly
-                // on both backends.
-                return Ok(None);
+                // `_lshift` enters its machine-word arm only for
+                // `0 <= count < LONG_BIT`.  A trace recorded outside that arm
+                // retains the generic helper: the negative-count exception and
+                // the large-count/zero special case belong to the other branch.
+                if !(0..i64::BITS as i64).contains(&rb) {
+                    return Ok(None);
+                }
+                let raw_value = la.wrapping_shl(rb as u32);
+                if (raw_value >> rb) != la {
+                    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
+                    if boxed_result_obj == pyre_object::PY_NULL
+                        || !unsafe { pyre_object::is_long(boxed_result_obj) }
+                    {
+                        return Ok(None);
+                    }
+                }
             }
             OpCode::IntRshift => {
                 // A count >= LONG_BIT (or negative) folds to 0/-1 in
@@ -703,6 +706,58 @@ pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
     let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
     let lhs_raw = walker_int_operand_raw(ctx, op_pc, lhs, lhs_obj, lhs_type, lhs_descr)?;
     let rhs_raw = walker_int_operand_raw(ctx, op_pc, rhs, rhs_obj, rhs_type, rhs_descr)?;
+
+    if op_code == OpCode::IntLshift {
+        // `ll_int_lshift_ovf` checks overflow by shifting the machine result
+        // back and comparing it with the input.  Keep that literal shape: the
+        // count-range guard prevents the backend's masked shift semantics,
+        // then the round-trip guard selects either `_lshift`'s small-int result
+        // or `_ovf2long_lshift`'s bigint recovery.  In particular, no backend
+        // overflow flag is invented for an operation that PyPy does not model
+        // with one.
+        let in_range = walker_uint_lt_const(ctx, rhs_raw, i64::BITS as i64, 1);
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_range])?;
+
+        let raw_value = la.wrapping_shl(rb as u32);
+        let raw_result = ctx
+            .trace_ctx
+            .record_op(OpCode::IntLshift, &[lhs_raw, rhs_raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(raw_result, majit_ir::Value::Int(raw_value));
+        let shifted_back = ctx
+            .trace_ctx
+            .record_op(OpCode::IntRshift, &[raw_result, rhs_raw]);
+        ctx.trace_ctx
+            .set_opref_concrete(shifted_back, majit_ir::Value::Int(raw_value >> rb));
+        let round_trips = ctx
+            .trace_ctx
+            .record_op(OpCode::IntEq, &[shifted_back, lhs_raw]);
+        let overflowed = (raw_value >> rb) != la;
+        ctx.trace_ctx
+            .set_opref_concrete(round_trips, majit_ir::Value::Int((!overflowed) as i64));
+
+        let result = if overflowed {
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[round_trips])?;
+            walker_emit_ovf2long_box(
+                ctx,
+                op_pc,
+                pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result
+                    as *const (),
+                (lhs_raw, la),
+                (rhs_raw, rb),
+                boxed_result_i64,
+            )?
+        } else {
+            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[round_trips])?;
+            let boxed = walker_box_int(ctx, op_pc, raw_result, raw_value)?;
+            ctx.trace_ctx
+                .set_opref_concrete(boxed, box_int_concrete(raw_value, boxed_result_i64));
+            boxed
+        };
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+        return Ok(Some(DispatchOutcome::Continue));
+    }
+
     if overflows {
         let concrete_value = match op_code {
             OpCode::IntAddOvf => la.wrapping_add(rb),
@@ -8645,8 +8700,9 @@ pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
 /// The guards emitted here are what let the caller skip the probe: an `int` or
 /// `long` subclass keeps the builtin `ob_type` but retags `w_class` and may
 /// define `__neg__`, so it must side-exit to the residual, which still runs the
-/// whole of `neg`. `bool` is excluded for a second reason as well -- see the
-/// `walker_exact_builtin_class` read below.
+/// whole of `neg`.  `bool` takes the same `neg_inner` integer arm and cannot
+/// be subclassed, so its dedicated class guard is sufficient; unlike an
+/// ordinary int it needs no `w_class` version guard.
 pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8659,23 +8715,29 @@ pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
     };
     // SAFETY: `operand_obj` is a live concrete `PyObjectRef` from the walker
     // shadow.
+    let is_bool = unsafe { pyre_object::is_bool(operand_obj) };
     let is_long = unsafe { pyre_object::is_long(operand_obj) };
     let admitted = unsafe {
-        !pyre_object::is_bool(operand_obj)
-            && (is_long || pyre_object::is_int(operand_obj))
-            && pyre_object::is_exact_builtin_instance(operand_obj)
+        is_bool
+            || ((is_long || pyre_object::is_int(operand_obj))
+                && pyre_object::is_exact_builtin_instance(operand_obj))
     };
     if !admitted {
         return Ok(None);
     }
     // SAFETY: as above.
     //
-    // This cannot decline for an admitted operand, by the argument
-    // [`try_walker_orthodox_unary_invert`] gives: the only exact builtins born
-    // with a null `w_class` are the five read-only singletons, and the
-    // admission above already rejects every one of them.
-    let Some(operand_class) = (unsafe { walker_exact_builtin_class(operand_obj) }) else {
-        return Ok(None);
+    // The bool singletons deliberately carry no user-class stamp.  They also
+    // cannot have subclasses, so the `walker_guard_class` check against
+    // `BOOL_TYPE` proves the complete dispatch decision.  Int and long retain
+    // the exact-class guard because their subclasses can override `__neg__`.
+    let operand_class = if is_bool {
+        None
+    } else {
+        let Some(class) = (unsafe { walker_exact_builtin_class(operand_obj) }) else {
+            return Ok(None);
+        };
+        Some(class)
     };
 
     // Resolve every possible decline before recording a guard.
@@ -8713,13 +8775,17 @@ pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
     let sym = unsafe { &*sym_ptr };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_addr = if is_long {
+    let type_addr = if is_bool {
+        &pyre_object::pyobject::BOOL_TYPE as *const _ as i64
+    } else if is_long {
         &pyre_object::pyobject::LONG_TYPE as *const _ as i64
     } else {
         &pyre_object::pyobject::INT_TYPE as *const _ as i64
     };
     walker_guard_class(ctx, op_pc, operand, type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, operand, operand_class)?;
+    if let Some(operand_class) = operand_class {
+        walker_guard_exact_w_class(ctx, op_pc, operand, operand_class)?;
+    }
     ctx.trace_ctx.set_opref_concrete(
         operand,
         majit_ir::Value::Ref(majit_ir::GcRef(operand_obj as usize)),
@@ -18190,7 +18256,8 @@ fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
         iter_op,
         crate::descr::list_iter_index_descr(),
     );
-    ctx.trace_ctx.set_opref_concrete(index_op, Value::Int(index));
+    ctx.trace_ctx
+        .set_opref_concrete(index_op, Value::Int(index));
 
     // Object storage keeps the inline `length` field; the typed storages read
     // their own items-array length field.

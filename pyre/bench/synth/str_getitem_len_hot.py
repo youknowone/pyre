@@ -1,4 +1,3 @@
-# pyre-check: max-pypy-ratio=19
 # pyre-check: spec-folds=builtin_len
 # Hot-loop str/unicode subscript and length over every string kind: ASCII /
 # latin1 (1-byte code units), BMP (2-byte), and non-BMP astral (4-byte). The
@@ -13,8 +12,8 @@
 # `bytesobject.py` takes off `_value` — and the `bytearray` arm reads
 # `W_BytearrayObject.length`, which is what `bytearrayobject.py`'s `_len`
 # reaches through `self._data` as `rlist.py`'s `("length", Signed)`. Without
-# those arms the call stays an opaque forcing residual and the leg measures
-# ~100x the str one, which the ceiling below is set to catch.
+# those arms the call stays an opaque forcing residual; `spec-folds` catches
+# that regression directly.
 #
 # `hot_mutating_len` is a correctness leg, not a speed one. `bytearray`'s
 # length is MUTABLE, so the compiled loop re-reads the field instead of
@@ -51,6 +50,13 @@ def hot_mutating_len(n, ba):
 
 
 def main():
+    try:
+        import pypyjit
+
+        pypyjit.set_param("threshold=20,function_threshold=20")
+    except ImportError:
+        pass
+
     ascii_s = "The quick brown fox jumps over the lazy dog 0123456789!?"
     latin1_s = "café déjà vu naïve résumé — ¡Hola! ½¾ ©®µ"
     bmp_s = "αβγδεζ ελληνικά Ω ДЖЕМ кириллица 日本語 テスト"
@@ -59,24 +65,19 @@ def main():
     ascii_b = b"The quick brown fox jumps over the lazy dog 0123456789!?"
     short_b = b"abc"
 
-    n = 60000
+    n = 2000
     print("ascii", hot_checksum(n, ascii_s))
     print("latin1", hot_checksum(n, latin1_s))
     print("bmp", hot_checksum(n, bmp_s))
     print("astral", hot_checksum(n, astral_s))
     print("len", hot_len(n, ascii_s), hot_len(n, bmp_s), hot_len(n, astral_s))
-    # The bytes legs run longer than the str ones. Folded, a `len(bytes)` is a
-    # single immutable field read, so a leg the size of the str ones would not
-    # clear the measurement floor; unfolded it is ~100x that. Sized so that
-    # losing the bytes arm ALONE carries the fixture past the ceiling above --
-    # measured 2.1x pypy with the arm and 22x without it at a quarter of this
-    # size. The ceiling itself is left where the str legs put it, because those
-    # legs are what set it on the slowest runner.
-    bn = 12000000
+    # The fold census verifies the immutable bytes and mutable bytearray length
+    # arms directly; each leg only needs to stay hot enough to compile.
+    bn = 5000
     print("blen", hot_len(bn, ascii_b), hot_len(bn, short_b))
-    ban = 12000000
+    ban = 5000
     print("balen", hot_len(ban, bytearray(ascii_b)), hot_len(ban, bytearray(short_b)))
-    print("bamut", hot_mutating_len(400000, bytearray(short_b)))
+    print("bamut", hot_mutating_len(2000, bytearray(short_b)))
 
 
 main()

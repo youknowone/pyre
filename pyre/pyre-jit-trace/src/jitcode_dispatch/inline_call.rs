@@ -9327,6 +9327,11 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // Rewind point for the `NotImplemented` arm below.  Nothing above this
     // line records IR or touches the heap cache.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // `MetaInterp.virtualref_boxes` is state beside the history, not part of
+    // `History.cut`.  This speculative descent can run
+    // `opimpl_virtual_ref` before returning `NotImplemented`, so its rewind
+    // must restore the pair stack together with the recorded operations.
+    let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
@@ -9385,6 +9390,8 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     drop(rewind_guard);
     if refused_a_commit {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx
+            .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
         decline!(format_args!(
             "{}.{dunder} may commit before its result is known",
@@ -9429,6 +9436,7 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
                 && !fbw_has_unjournaled_effect()
             {
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+                ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
                 return Ok(None);
             }
@@ -9569,6 +9577,10 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // Rewind point for the `NotImplemented` arm below.  Nothing above this
     // line records IR or touches the heap cache.
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // Keep the `MetaInterp.virtualref_boxes` side state at the same boundary
+    // as the history: the attempted compare dunder can open a virtual-ref
+    // scope before returning `NotImplemented` and being discarded.
+    let pre_fold_virtualrefs = ctx.trace_ctx.snapshot_virtualref_boxes();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
@@ -9627,6 +9639,8 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     drop(rewind_guard);
     if refused_a_commit {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx
+            .restore_virtualref_boxes(pre_fold_virtualrefs.clone());
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
     }
@@ -9658,6 +9672,7 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
                 && !fbw_has_unjournaled_effect()
             {
                 ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+                ctx.trace_ctx.restore_virtualref_boxes(pre_fold_virtualrefs);
                 ctx.trace_ctx.heap_cache_mut().reset();
                 return Ok(None);
             }

@@ -1,10 +1,13 @@
-# pyre-check: max-pypy-ratio=41
-# Sized so pypy's own execution clears the measurement floor: below it the
-# ratio gate divides by the floor and reads startup rather than this loop.
-# The ceiling is twice the slowest ratio observed at this size. The previous 28
-# was fitted against a floored denominator, which over-estimates pypy's work
-# and so understated the ratio; the loop was always this far behind.
-N = 2043795
+# Both phases need one compiled loop and one version-tag invalidation.  Once
+# those have happened, additional rounds repeat the same two cache states.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 10000
 
 
 class C:

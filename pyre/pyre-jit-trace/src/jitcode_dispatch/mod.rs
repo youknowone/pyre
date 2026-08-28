@@ -10923,10 +10923,11 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// on cpython 3.14.6, on pypy3 7.3.22 and for a callee left residual.
 ///
 /// `w_tracefunc` is an ExecutionContext field rather than a frame one, so the
-/// read goes through the portal's own `ec` red (`interp_jit.py reds =
-/// ['frame', 'ec']`) rather than a frame field.  The read is registered with
-/// the heapcache, so a run of merge points with no intervening call collapses
-/// to one, and it is loop-invariant.
+/// read starts from the portal's own `ec` red (`interp_jit.py reds =
+/// ['frame', 'ec']`) rather than a frame field; only a bridge whose red has
+/// not been seeded needs `walker_ensure_execution_context` to recover it from
+/// the frame.  The read is registered with the heapcache, so a run of merge
+/// points with no intervening call collapses to one loop-invariant read.
 ///
 /// A trace recorded while the slot is ALREADY non-NULL records nothing: there
 /// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`

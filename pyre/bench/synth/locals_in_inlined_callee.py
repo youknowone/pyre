@@ -3,7 +3,7 @@
 # own fastlocals, not the caller's.
 #
 # `builtin_locals` reaches its frame through `gettopframe_nohidden`
-# (`interp_inspect.py:7-11`), and the walker can fold that whole read into
+# (`gettopframe_nohidden`), and the walker can fold that whole read into
 # direct virtualizable reads instead of a residual call.  Inside an inlined
 # callee the walker emits those reads against the CALLEE's own virtualizable --
 # its inline body carries `getarrayitem_vable_r` / `setarrayitem_vable_r` for
@@ -62,7 +62,7 @@ def probe_direct():
     last_locals = None
     last_vars = None
     last_dir = None
-    for i in range(100000):
+    for i in range(5000):
         last_locals = helper_locals(i)
         last_vars = helper_vars(i)
         last_dir = helper_dir(i)
@@ -85,7 +85,7 @@ def outer_helper(a):
 def probe_nested():
     outer = "caller-only"
     last = None
-    for i in range(100000):
+    for i in range(5000):
         last = outer_helper(i)
     return outer, last
 
@@ -105,7 +105,7 @@ closure_helper = make_closure(1)
 def probe_closure():
     outer = "caller-only"
     last = None
-    for i in range(100000):
+    for i in range(5000):
         last = closure_helper(i)
     return outer, last
 

@@ -9,9 +9,15 @@
 # direct call so the fold is the shape that records, not a lambda's
 # megamorphic call site.  Every loop must report the OVERRIDE.
 # Sized for the fold, not for throughput: the declining path runs the whole
-# descriptor protocol per iteration, so this costs far more per `N` than a
-# folded loop.  Every loop still compiles at N=2000, leaving a wide margin.
-N = 100000
+# descriptor protocol per iteration.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 1000
 
 
 class GetOverridingClassMethod(classmethod):

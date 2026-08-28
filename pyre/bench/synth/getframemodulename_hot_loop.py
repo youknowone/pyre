@@ -44,7 +44,14 @@
 # fixture has no reason to depend on it.
 import sys
 
-N = 200000
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 2000
 EXPECTED = "__main__"
 OTHER_MODULE = "pyre_getframemodulename_callee"
 

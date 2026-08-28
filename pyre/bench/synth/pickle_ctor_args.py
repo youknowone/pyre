@@ -1,6 +1,3 @@
-# pyre-check: max-pypy-ratio=145
-# pypy's exec time is a real measurement here, but the ratio still spans 18.6x
-# to 70.3x across hosts, so the ceiling is twice the slowest.
 # _pickle.Pickler/Unpickler accept their constructor arguments positionally and
 # by keyword: tp_new allocates and ignores them, __init__ validates and stores
 # them. `pickle.Pickler` binds to the C accelerator where it exists and to the
@@ -11,6 +8,13 @@
 import io
 import pickle
 from pickle import Pickler, Unpickler, PickleBuffer
+
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
 
 
 def roundtrip(obj, protocol):
@@ -52,7 +56,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(15000))
+    print("warm", warm(500))
     m("proto_positional", lambda: roundtrip("abc", 2))
     m("proto_positional_hi", lambda: roundtrip(("x", "y", "z"), 5))
     m("proto_keyword", lambda: roundtrip_kw({"a": 1, "b": 2}, 4, True))

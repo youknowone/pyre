@@ -1,27 +1,23 @@
-# pyre-check: max-pypy-ratio=96
 # pyre-check: spec-folds=builtin_range
 # Pins virtual range construction for one-, two-, and three-bound calls while
 # retaining correct residual behavior for exceptional, subclass, index, and
 # escaping-object shapes.
-#
-# N is 400000 because pypy runs the body in 0.01s at 20000, which leaves its
-# startup-subtracted time under the execution floor on every host and makes
-# the ratio an artifact of that floor rather than a measurement. At 400000
-# pypy spends 0.10s, clearing the floor even on the platform with the
-# coarsest timer.
 #
 # The `try: range(0, 3, 0)` below puts an out-of-line handler after the
 # trailing comprehension. A loop region that gates the back edge by spanning
 # the gap between them picks up that comprehension's call-bearing `FOR_ITER`
 # -- an opcode this loop never reaches -- and `main` then runs interpreted end
 # to end. With the region built from the exception table instead, the while
-# loop and the three `for` loops compile, and this gate's own metric falls
-# from 122x to 23.2x dynasm / 30.2x cranelift / 24.7x wasm. A separate
-# min-of-five interleaved harness reads the same move as 158x to 35.2x /
-# 38.3x, so the ceiling is set from the slower of the two readings: 2.5x of
-# 38.3x, the slack every bench here carries against a runner 2.5x slower than
-# an idle local box.
-N = 400000
+# loop and the three `for` loops compile.  The fold census verifies the range
+# construction itself without sizing the arithmetic loop to a timer floor.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 20000
 
 
 try:

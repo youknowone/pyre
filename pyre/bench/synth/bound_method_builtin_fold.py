@@ -1,7 +1,4 @@
-# pyre-check: max-pypy-ratio=160
-# The trip count puts pypy above the startup-subtraction floor, so this ratio
-# is a measurement rather than pyre divided by the floor constant. The ceiling
-# is twice the slowest of the three backends observed (78.5x on wasm).
+# pyre-check: spec-folds=load_bound_method_attr
 # `lst.append(x)` on a builtin receiver: the name resolves to a builtin-code
 # function on the type, so LOAD_ATTR's method fast path declines (it only
 # pushes `[descr, self]` for `flag_method_descriptor` types) and `getattr`
@@ -15,7 +12,17 @@
 # call site (class guard), `__`-names that bind through the same shape, and a
 # bound method that outlives its CALL (the virtual must materialize). Output
 # verified against CPython/PyPy.
-N = 730000
+# Every leg compiles independently and the fold census names the optimization
+# directly.  A larger count only accumulated materialized lists, sets and
+# escaping method objects after all guarded shapes had already run.
+try:
+    import pypyjit
+
+    pypyjit.set_param("threshold=20,function_threshold=20")
+except ImportError:
+    pass
+
+N = 5000
 
 
 def build(n):
