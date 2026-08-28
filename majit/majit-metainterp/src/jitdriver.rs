@@ -855,7 +855,7 @@ fn kind_counts(vars: &[JitDriverVar], kind: VarKind) -> (usize, usize, usize) {
 /// start of the dispatch body, and the count check would only
 /// false-pass when the body coincidentally starts with a
 /// well-formed-looking 7-byte sequence at the same offset.  The
-/// check fires in release builds — `warmspot.py:660-666
+/// check fires in release builds — `warmspot.py
 /// make_args_specification` runs at translation time and asserts
 /// the marker op's args match the driver schema; the runtime
 /// version stays active in production for the same reason
