@@ -308,60 +308,6 @@ def _partial_prepare_merger(args):
     return phcount, merger
 
 
-def _partial_new(cls, func, /, *args, **keywords):
-    if not callable(func):
-        raise TypeError("the first argument must be callable")
-    if args and args[-1] is Placeholder:
-        raise TypeError("trailing Placeholders are not allowed")
-    for value in keywords.values():
-        if value is Placeholder:
-            raise TypeError("Placeholder cannot be passed as a keyword argument")
-
-    # `partial_new` unpacks a wrapped partial only while it carries no
-    # instance state (`part->dict == NULL`); placeholder positions and bound
-    # arguments are merged for subclasses too, since subclassing alone does
-    # not block the optimization.  The slots above keep `__dict__` empty until
-    # user code assigns an attribute, so a partial holding its own state stays
-    # wrapped and keeps running its own behaviour.
-    if isinstance(func, partial) and not func.__dict__:
-        pto_phcount = func._phcount
-        tot_args = func.args
-        if args:
-            tot_args += args
-            if pto_phcount:
-                nargs = len(args)
-                if nargs < pto_phcount:
-                    tot_args += (Placeholder,) * (pto_phcount - nargs)
-                tot_args = func._merger(tot_args)
-                if nargs > pto_phcount:
-                    tot_args += args[pto_phcount:]
-            phcount, merger = _partial_prepare_merger(tot_args)
-        else:
-            phcount, merger = pto_phcount, func._merger
-        keywords = {**func.keywords, **keywords}
-        func = func.func
-    else:
-        tot_args = args
-        phcount, merger = _partial_prepare_merger(tot_args)
-
-    self = object.__new__(cls)
-    object.__setattr__(self, "_func", func)
-    object.__setattr__(self, "_args", tot_args)
-    object.__setattr__(self, "_keywords", keywords)
-    object.__setattr__(self, "_phcount", phcount)
-    object.__setattr__(self, "_merger", merger)
-    return self
-
-
-def _partial_repr(self):
-    cls = type(self)
-    func, p_args, keywords = self.func, self.args, self.keywords
-    args = [repr(func)]
-    args.extend(map(repr, p_args))
-    args.extend(f"{key}={value!r}" for key, value in keywords.items())
-    return f"{cls.__module__}.{cls.__qualname__}({', '.join(args)})"
-
-
 class partial:
     """New function with partial application of the given arguments
     and keywords.
@@ -375,8 +321,59 @@ class partial:
         "__dict__", "__weakref__",
     )
 
-    __new__ = _partial_new
-    __repr__ = _partial_recursive_repr()(_partial_repr)
+    def __new__(cls, func, /, *args, **keywords):
+        if not callable(func):
+            raise TypeError("the first argument must be callable")
+        if args and args[-1] is Placeholder:
+            raise TypeError("trailing Placeholders are not allowed")
+        for value in keywords.values():
+            if value is Placeholder:
+                raise TypeError("Placeholder cannot be passed as a keyword argument")
+
+        # `partial_new` unpacks a wrapped partial only while it carries no
+        # instance state (`part->dict == NULL`); placeholder positions and bound
+        # arguments are merged for subclasses too, since subclassing alone does
+        # not block the optimization.  The slots above keep `__dict__` empty until
+        # user code assigns an attribute, so a partial holding its own state stays
+        # wrapped and keeps running its own behaviour.
+        if isinstance(func, partial) and not func.__dict__:
+            pto_phcount = func._phcount
+            tot_args = func.args
+            if args:
+                tot_args += args
+                if pto_phcount:
+                    nargs = len(args)
+                    if nargs < pto_phcount:
+                        tot_args += (Placeholder,) * (pto_phcount - nargs)
+                    tot_args = func._merger(tot_args)
+                    if nargs > pto_phcount:
+                        tot_args += args[pto_phcount:]
+                phcount, merger = _partial_prepare_merger(tot_args)
+            else:
+                phcount, merger = pto_phcount, func._merger
+            keywords = {**func.keywords, **keywords}
+            func = func.func
+        else:
+            tot_args = args
+            phcount, merger = _partial_prepare_merger(tot_args)
+
+        self = object.__new__(cls)
+        object.__setattr__(self, "_func", func)
+        object.__setattr__(self, "_args", tot_args)
+        object.__setattr__(self, "_keywords", keywords)
+        object.__setattr__(self, "_phcount", phcount)
+        object.__setattr__(self, "_merger", merger)
+        return self
+
+    @_partial_recursive_repr()
+    def __repr__(self):
+        cls = type(self)
+        func, p_args, keywords = self.func, self.args, self.keywords
+        args = [repr(func)]
+        args.extend(map(repr, p_args))
+        args.extend(f"{key}={value!r}" for key, value in keywords.items())
+        return f"{cls.__module__}.{cls.__qualname__}({', '.join(args)})"
+
 
     @property
     def func(self):
