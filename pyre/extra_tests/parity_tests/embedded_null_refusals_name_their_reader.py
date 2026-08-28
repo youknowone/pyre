@@ -1,3 +1,10 @@
+# pyre-check: platforms=linux,darwin
+#
+# On win32 `PyUnicode_AsWideCharString` refuses the string ahead of every
+# converter below, with a fourth sentence -- `embedded null character`, naming
+# no reader -- so the split this pins is not expressible there either, and the
+# two-path `symlink` at the end reads POSIX paths.
+#
 # pyre-check: pypy-diverges: pypy3 states `embedded null byte` for the
 # `path_converter` calls too, so the split this pins is not expressible there.
 #
