@@ -33174,6 +33174,11 @@ mod tests {
              word each, so its getitems must not remain Vec::index"
         );
         assert_eq!(
+            residual_vec_indexes("load_const_value"),
+            0,
+            "slice-constant handler values must cross the scalar SliceIndex boundary"
+        );
+        assert_eq!(
             residual_vec_indexes("dict_repr"),
             0,
             "dict_repr must flatten host-width pairs before translated reads"
