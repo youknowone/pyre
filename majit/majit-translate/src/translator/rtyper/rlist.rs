@@ -2802,24 +2802,51 @@ pub(crate) fn build_ll_arraycopy_general_helper_graph(
     ))
 }
 
-/// Synthesise the forward-copy branch of
-/// `rgc.ll_arraymove(array, source_start, dest_start, length)`
-/// (`rpython/rlib/rgc.py:415-456`) with the upstream four-argument shape.
+/// Synthesise the `delta < 0` branch of `rgc.ll_arraymove`
+/// (`rpython/rlib/rgc.py`, `ll_arraymove`) with the upstream four-argument
+/// shape.
 ///
 /// The caller proves `source_start > dest_start`, which is upstream's
 /// `delta < 0` case.  Copying from low to high indices is therefore the
-/// overlap-safe direction used by RPython's slow path:
+/// overlap-safe direction, and upstream spells it:
 ///
 /// ```python
-/// i = 0
-/// while i < length:
-///     array[dest_start + i] = array[source_start + i]
-///     i += 1
+/// delta = dest_start - source_start
+/// if delta < 0:
+///     i = source_start
+///     stop = source_start + length
+///     while i < stop:
+///         copy_item(array, array, i, i + delta)
+///         i += 1
 /// ```
 ///
-/// Lowering each assignment as `setarrayitem` retains pyre's ordinary GC
-/// write barrier.  This is stronger than upstream's bulk-move fast path and
-/// has the same pointer-reachability semantics.
+/// The emitted loop rebases that induction variable to zero — `i` runs
+/// `0..length` and both ends are offset — instead of carrying `delta` and
+/// `stop`.  The two are equal at every index; the rebase exists because the
+/// caller already reconstructed `(source_start, dest_start, length)` from
+/// MIR and never materialised a `delta`.
+///
+/// Three parts of `ll_arraymove` are NOT emitted, and each is a named gap
+/// rather than a simplification:
+///
+/// * The `length <= 1` head.  Upstream's own comment says it is there "to
+///   ensure that we get a proper effectinfo.write_descrs_arrays", not for
+///   speed, and the minted helper carries no `list.ll_arraymove` oopspec
+///   either — the same pairing `ll_arraycopy` is still missing.
+/// * The `delta > 0` arm and the `raw_memmove_no_free` fast path.  Only the
+///   left move exists, which is why the helper is minted as
+///   `ll_arraymove_left`: the rtyper caches low-level helpers on
+///   `(name, args, result)`, and a right-move producer — `insert`'s
+///   `ll_arraymove(l, index, index + 1, length - index)` — would have the
+///   identical key and silently receive this graph.
+/// * The `must_split_gc_address_space()` / `_contains_gcptr` dispatch.  The
+///   body below IS upstream's split-address-space branch, taken
+///   unconditionally; note that this is exactly the branch in which upstream
+///   does not emit `gc_writebarrier_before_move`, since that call is the
+///   `elif`.  Per-item `setarrayitem` marks its own cards, so no card can go
+///   stale here, but the barrier llop does exist
+///   (`lltypesystem::lloperation`) and emitting the dispatch is the
+///   convergence path.
 pub(crate) fn build_ll_arraymove_left_helper_graph(
     name: &str,
     item_lltype: LowLevelType,

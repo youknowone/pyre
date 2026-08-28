@@ -7,17 +7,28 @@
 //! the slice operation out of any graph that drops to the legacy walker,
 //! matching the existing RangeTo marker split.
 //!
-//! The `ll_listslice_startstop` clamp (`rpython/rtyper/rlist.py`)
-//! repairs the oversized result of an unsigned `len - 1` wrap. The MinusOne
-//! shape is admitted because `len - 1 <= len` is proven for this receiver;
-//! a general RangeTo stop has no `end <= len` proof and is declined. A full
-//! `Range { start, end }`, however, is the direct Rust spelling used by the
-//! interpreter where PyPy writes `buffer[start:end]` (`RStringIO.read`,
-//! `W_BufferedWriter._write_buf` and siblings). RPython emits `getslice`
-//! without a translator-side dominator proof. The frontend likewise strips
+//! No arm carries an `end <= len` proof, and upstream asks for none:
+//! `ll_listslice_startstop` (`rpython/rtyper/rlist.py:893-903`) CLAMPS an
+//! oversized stop (`if stop > length: stop = length`) and states the rest as
+//! `ll_assert`s, which translate out.  Non-negativity is proven one layer up,
+//! in the annotator (`check_negative_slice`, `rpython/annotator/unaryop.py:437-443`),
+//! and pyre's port raises there identically.  A `Range { start, end }` is the
+//! direct Rust spelling of what PyPy writes as `buffer[start:end]`
+//! (`RStringIO.read`, `rpython/rlib/rStringIO.py:148`;
+//! `BufferedMixin._raw_write`, `pypy/module/_io/interp_bufferedio.py:456`),
+//! so it is admitted on the same terms.  The frontend likewise strips
 //! Rust's implicit range assertions as `TermKind::Assert`, following
 //! `backendopt/removeassert.py`; retaining an extra proof only for the opaque
 //! `Index::index` shim would be a non-upstream control-flow restriction.
+//!
+//! A bare `RangeTo` still declines, and NOT for a semantic reason — upstream
+//! would clamp it like any other stop.  It declines because the ops it lowers
+//! to are not yet wired downstream: admitting it planted bare `getslice/rii>r`
+//! from `split_builtin_kwargs` and `do_warn_explicit` that nothing consumes.
+//! `MinusOne` and `StaticLength` are the two RangeTo shapes whose stop the
+//! rewrite can name at the callsite, so only they are carved out.  When the
+//! unwired `getslice/rii>r` is handled, the RangeTo decline should go: one
+//! rule for every stop is the upstream shape.
 //!
 //! The earlier failure was an unwired frontend `getslice` planted before a
 //! graph fell through the legacy walker. Every admitted path now uses an
@@ -221,8 +232,13 @@ fn rewire_one_slice_index_rangeto_site(
     } else if rangeto_static_length_bound_matches(graph, &site.end, &slice, range) {
         SliceIndexBounds::StaticLength { end: &site.end }
     } else {
+        // Not a bounds decline — `ll_listslice_startstop` would clamp this
+        // stop.  The two shapes above are the ones whose stop this rewrite can
+        // name at the callsite; a general one lowers to a `getslice/rii>r`
+        // nothing downstream consumes yet (see the module header).
         return Err(format!(
-            "{}: RangeTo stop has no proof that end <= slice length — declining",
+            "{}: RangeTo stop is neither the MinusOne nor the static-length \
+             shape — declining until a general getslice is wired",
             graph.name
         ));
     };
@@ -285,17 +301,16 @@ fn rewire_one_slice_index_site(
     }
 
     // 3. Validate the selected bounds before mutating. `decompose_slice_args`
-    // (rtyper.rs) requires a non-negative start. A RangeFrom slice-index
-    // consumer statically selects `SliceIndex<usize>`, so its bound retains
-    // the unsigned/nonnegative annotation even when computed; the marker is
-    // expanded only after annotation. RangeTo's proof gate is only
-    //     the secondary blocker: activating it admitted bare unwired
-    //     `getslice/rii>r` from `split_builtin_kwargs` and
-    //     `do_warn_explicit`; both measured ends were `args.len() - 1`,
-    //     statically unsigned but not constant, so an unsigned-only gate would
-    //     not decline them. A general RangeTo stop also lacks the primary
-    //     `end <= slice.len()` proof: the StartStop helper clamps an oversized
-    //     stop (`rlist.rs`), whereas Rust indexing panics.
+    // (rtyper.rs) requires a non-negative start.  A slice-index consumer
+    // statically selects `SliceIndex<usize>`, so its bounds retain the
+    // unsigned/nonnegative annotation even when computed; the marker is
+    // expanded only after annotation.  Nothing more is asked, because upstream
+    // asks nothing more: `ll_listslice_startstop`
+    // (`rpython/rtyper/rlist.py:893-903`) clamps an oversized stop and states
+    // `start <= length` / `stop >= start` as `ll_assert`s.  The one extra
+    // check below is `MinusOne`, whose end must really be
+    // `sub(ArrayLen(slice), 1)` — that is the shape recognition itself, not a
+    // bounds proof.
     match bounds {
         SliceIndexBounds::RangeFrom { start } => {
             if !graph_defines(graph, start) {
@@ -1020,7 +1035,12 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
     // not a foreign method to residualize. PyPy's unicode paths use ordinary
     // slicing and RPython lowers both string and list slices through
     // `rtype_getslice`.
-    if segments == ["Wtf8", "index"] {
+    //
+    // `rustpython_wtf8::Wtf8` sits at its crate root, so its impl-owner
+    // spelling carries no module segment and the anchored form IS two
+    // segments; the crate-qualified spelling is accepted alongside it so the
+    // arm is anchored wherever the crate name survives.
+    if segments == ["Wtf8", "index"] || segments == ["rustpython_wtf8", "Wtf8", "index"] {
         return true;
     }
     let n = segments.len();

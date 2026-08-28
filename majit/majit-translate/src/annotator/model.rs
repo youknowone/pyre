@@ -233,16 +233,27 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// walk still runs.  Keep this compare-time fallback for registry-absent or
 /// ambiguous constructor spellings: it fires only where `commonbase` is
 /// already None.
+///
+/// It runs the intern's own key derivation — [`normalize_class_qualname`] then
+/// `canonical_struct_name` — rather than a second rule of its own.  A separate
+/// rule disagreed on exactly the spelling the intern was written for: the local
+/// dotted-only strip answered `false` for
+/// `("pyre_object::m::T", "m::T")` while the intern maps both to `m::T`.
+/// Upstream keys identity on the object in one place
+/// (`bookkeeper.py:361-363`), so one derivation is the shape to hold.
+///
+/// Caution carried forward: collapsing an `ob_header`-bearing `W_*` struct
+/// EARLY — that is, keying `struct_root_classes` on the collapse — starved its
+/// base-chain walk, so it minted base-less under first-mint-wins and lost its
+/// `W_Root` base, a measured +184 phaseA cascade across `_io`/`_pickle`.  The
+/// normalization above is a crate-root strip only; it does not collapse the
+/// module path, so the walk still runs.  Any future widening of it has to
+/// re-measure that number.
 fn same_struct_identity(a: &str, b: &str) -> bool {
     fn identity(name: &str) -> String {
-        if !name.contains("::")
-            && !name.contains('<')
-            && name.contains('.')
-            && let Some((_crate, rest)) = name.split_once('.')
-        {
-            return rest.replace('.', "::");
-        }
-        majit_ir::descr::canonical_struct_name(name)
+        majit_ir::descr::canonical_struct_name(
+            &crate::annotator::bookkeeper::normalize_class_qualname(name),
+        )
     }
     identity(a) == identity(b)
 }

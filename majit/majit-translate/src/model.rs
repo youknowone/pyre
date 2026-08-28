@@ -2842,10 +2842,9 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         let (bool_case, int_case) = match kind {
             Some(OpKind::ConstBool(b)) => (Some(*b), Some(i64::from(*b))),
             Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n)),
-            Some(OpKind::ConstUInt(n)) => (
-                (*n == 0 || *n == 1).then_some(*n != 0),
-                i64::try_from(*n).ok(),
-            ),
+            Some(OpKind::ConstUInt(n)) => {
+                ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n as i64))
+            }
             _ => continue,
         };
         let block = &graph.blocks[block_idx];
@@ -2865,7 +2864,8 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         // one survivor (`assert len(newexits) == 1`), falling back to the
         // `"default"` catch-all only when none match: a constant matching
         // two arms is a malformed switch that checkgraph's exitcase
-        // uniqueness invariant (`flowspace/model.py:686`) forbids.
+        // uniqueness invariant (`flowspace/model.py`, `checkgraph`:
+        // `assert len(allexitcases) == len(block.exits)`) forbids.
         let matching: Vec<usize> = block
             .exits
             .iter()
@@ -3252,6 +3252,17 @@ pub fn lower_struct_ptr_writes(
             if destination_owner.is_none() || destination_owner != aggregate_owner {
                 continue;
             }
+            // KNOWN GAP: this scans EVERY block, and each matched store's
+            // `value` is spliced verbatim into the call's block below. Only
+            // the `base` is proven in scope (`producer_root`); the `value` is
+            // not. `checkgraph` (`flowspace/model.py`) resets its `vars` per
+            // block and errors on a cross-block use, so a store whose value is
+            // defined in a block that does not reach the call builds a graph
+            // the port's own checker rejects — and nothing in `front::mir`
+            // calls `checkgraph`, so it surfaces later in `translator`.
+            // Restricting the scan to the call's own block is the fail-closed
+            // fix, but it also drops the multi-block shape this pass exists
+            // for; the real fix is a dominance test on each `value`.
             let stores: Vec<_> = graph
                 .blocks
                 .iter()

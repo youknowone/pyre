@@ -337,7 +337,7 @@ pub(crate) fn reproduce_exit_args(
 /// payload write for `Some`), the same transparent-ctor + `FieldWrite` chain
 /// a static `Rvalue::Aggregate` emits.  The two arm values union to their
 /// common enum base at the join; each arm itself retains the variant class
-/// that owns its fields (`rclass.py:82-88`).
+/// that owns its fields (`rclass.py:499-518`).
 /// `disc` is the variant tag (`Some` = 1, `None` = 0); `payload` is
 /// `Some((some_owner, value, value_ty))` for `Some`, `None` for `None`.
 pub(crate) fn emit_option_variant(
@@ -373,6 +373,20 @@ pub(crate) fn emit_option_variant(
 /// `0`/`1` integer value (`None` = 0, `Some` = 1).  Same transparent-ctor +
 /// `FieldWrite` chain as [`emit_option_variant`], only the discriminant is a
 /// live value instead of a materialized `ConstInt`.
+///
+/// **And the ctor is the enum ROOT, not the variant subclass** — that is the
+/// one place the two emitters differ, and it is keyed on exactly this
+/// difference.  A runtime `disc` names no variant, so no variant identity can
+/// annotate the destination; the root is the `SomeInstance(enum)` that
+/// multi-assigned locals union against (`<other> ∪ int` UnionError in
+/// `mergeinputargs` otherwise).  The same rule, for the same reason, governs
+/// `front::mir`'s `emit_tagged_pair_aggregate`.  Read together: a
+/// STATICALLY known tag builds the variant subclass that owns the payload
+/// row (`rclass.py:499-518`); a RUNTIME tag builds the root and writes
+/// `__pos_0` under the success variant's key, which `resolve_adt_field`
+/// reads back variant-qualified.  Making this arm variant-selecting instead
+/// would mean branching on `disc` at every such site — the branch these
+/// folds exist to avoid.
 pub(crate) fn emit_option_variant_dynamic(
     graph: &mut FunctionGraph,
     block: BlockId,

@@ -3671,27 +3671,52 @@ pub fn rtype_cast_instance_intrinsic(
     }
     // RPython `rmodel.externalvsinternal(..., gcref=True)` converts a
     // concrete GC pointer to/from llmemory.GCREF with `cast_opaque_ptr`
-    // (`rgcref.py:52-63`).  The same marker also carries ordinary
+    // (`rgcref.py:61-71`).  The same marker also carries ordinary
     // class-pointer narrows, which remain `cast_pointer` per rclass.py.
     let gcref = crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
-    if r_result.class_name() == "StringRepr" && r_arg0.lowleveltype() != &gcref {
-        // The MIR call-result narrow has already restored the generic
-        // PyObjectRef carrier to its W_Root-shaped external pointer.  A
-        // string-list store immediately recasts that same root-stack word to
-        // StringRepr.  Upstream performs both edges through GCRefRepr, so
-        // materialize the exact concrete→GCREF→STRPTR pair instead of an
-        // invalid cast_pointer between unrelated GC structs.
-        let Some(v_gcref) = hop.genop("cast_opaque_ptr", vec![v_ptr], GenopResult::LLType(gcref))
+    // `cast_pointer` is legal only between related structs: upstream decides
+    // that with `castable(PTRTYPE, CURTYPE)` (`lltype.py:944-961`), which
+    // raises `InvalidCast` for an unrelated pair.  An unrelated pair of GC
+    // pointers is exactly the erasure RPython routes through
+    // `llmemory.GCREF` — `pairtype(Repr, GCRefRepr).convert_from_to` casts
+    // the source to GCREF and `pairtype(GCRefRepr, Repr).convert_from_to`
+    // casts GCREF to the destination (`rgcref.py:61-71`).  Call those two
+    // ported functions rather than re-emitting their ops, so a destination
+    // that is not a GC pointer refuses here as it does upstream instead of
+    // producing an invalid `cast_pointer`.
+    if r_arg0.lowleveltype() != &gcref
+        && result_lltype != gcref
+        && let (LowLevelType::Ptr(cur), LowLevelType::Ptr(dest)) =
+            (r_arg0.lowleveltype(), &result_lltype)
+        && crate::translator::rtyper::lltypesystem::lltype::castable(dest, cur).is_err()
+    {
+        use crate::translator::rtyper::lltypesystem::rgcref::{
+            GCRefRepr, pair_gcref_repr_convert_from_to, pair_repr_gcref_convert_from_to,
+        };
+        let r_gcref = GCRefRepr::make(r_arg0.clone(), &hop.rtyper.gcrefreprcache) as Arc<dyn Repr>;
+        let mut llops = hop.llops.borrow_mut();
+        let Some(v_gcref) =
+            pair_repr_gcref_convert_from_to(r_arg0.as_ref(), r_gcref.as_ref(), &v_ptr, &mut llops)?
         else {
             return Err(TyperError::message(
-                "rtype_cast_instance_intrinsic: cast to GCREF produced no value",
+                "rtype_cast_instance_intrinsic: conversion to GCREF produced no value",
             ));
         };
-        return Ok(hop.genop(
-            "cast_opaque_ptr",
-            vec![v_gcref],
-            GenopResult::LLType(result_lltype),
-        ));
+        let Some(v_result) = pair_gcref_repr_convert_from_to(
+            r_gcref.as_ref(),
+            r_result.as_ref(),
+            &v_gcref,
+            &mut llops,
+        )?
+        else {
+            return Err(TyperError::message(format!(
+                "rtype_cast_instance_intrinsic: {:?} is not castable from {:?} and \
+                 pairtype(GCRefRepr, Repr).convert_from_to refuses a non-GC destination",
+                result_lltype,
+                r_arg0.lowleveltype(),
+            )));
+        };
+        return Ok(Some(v_result));
     }
     let opname = if r_arg0.lowleveltype() == &gcref || result_lltype == gcref {
         "cast_opaque_ptr"
@@ -3738,8 +3763,13 @@ pub fn rtype_ll_arraymove_intrinsic(
     let source_start = args.remove(0);
     let dest_start = args.remove(0);
     let length = args.remove(0);
+    // Minted as `ll_arraymove_left`, not `ll_arraymove`: the graph is only
+    // upstream's `delta < 0` arm, and `lowlevel_helper_function_with_builder`
+    // caches on `(name, args, result)`.  A right-move producer would present
+    // the identical key and receive this left-only loop, which smears the
+    // first element across the overlap.
     let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-        "ll_arraymove".to_string(),
+        "ll_arraymove_left".to_string(),
         vec![
             array_lltype,
             LowLevelType::Signed,
@@ -3748,7 +3778,7 @@ pub fn rtype_ll_arraymove_intrinsic(
         ],
         LowLevelType::Void,
         move |_rtyper, _args, _result| {
-            build_ll_arraymove_left_helper_graph("ll_arraymove", item_lltype.clone())
+            build_ll_arraymove_left_helper_graph("ll_arraymove_left", item_lltype.clone())
         },
     )?;
     hop.exception_cannot_occur()?;

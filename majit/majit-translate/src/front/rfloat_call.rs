@@ -1,10 +1,18 @@
-//! RPython `rfloat.formatd` residual-call retargets.
+//! Float/complex `repr` residual-call retargets.
 //!
-//! PyPy's `float_repr` calls `rpython.rlib.rfloat.formatd`, whose translated
-//! result is one `STR` GC pointer. RustPython's formatter instead returns a
-//! three-word Rust `String`, which the residual-call ABI cannot return. The
-//! interpreter publishes an exact one-word `BytesBlock*` wrapper; this module
-//! selects that wrapper without teaching the parity layers a Rust ABI.
+//! The two arms mirror `float2string` / `float_repr`
+//! (`pypy/objspace/std/floatobject.py:36-50`) and `repr_format` /
+//! `format_float` (`pypy/objspace/std/complexobject.py:120-133`).  Neither
+//! ports `rpython.rlib.rfloat.formatd` itself: upstream reaches it only
+//! indirectly (`float_repr` -> `float2string` -> `formatd`, and only on the
+//! `isfinite` branch), while these arms retarget RustPython/pyre formatters.
+//!
+//! What the retarget is for: the translated `formatd` result is one `STR` GC
+//! pointer, but RustPython's formatter returns a three-word Rust `String`,
+//! which the residual-call ABI cannot return.  The interpreter publishes an
+//! exact one-word `BytesBlock*` wrapper; this module selects that wrapper
+//! without teaching the parity layers a Rust ABI.  Structurally this is the
+//! [`crate::front::rbigint_call`] residual-retarget family.
 
 const FLOAT_TO_STRING: &[&str] = &["rustpython_literal", "float", "to_string"];
 const FLOAT_RESIDUAL: &[&str] = &["pyre_interpreter", "display", "jit_format_float_repr_rstr"];

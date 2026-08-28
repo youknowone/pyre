@@ -2342,7 +2342,7 @@ impl HostEnv {
         let lltype_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_LLTYPE);
         lltype_module.module_set(
             "malloc",
-            HostObject::new_builtin_callable("pyre_object.lltype.malloc"),
+            HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC),
         );
         lltype_module.module_set(
             "malloc_typed",

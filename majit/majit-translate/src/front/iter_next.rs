@@ -15,8 +15,11 @@
 //! lowered (in MIR) as a `__discriminant` read on `opt` plus a two-way
 //! `switchInt` (None = 0, Some = 1).  RPython's `next` op returns the
 //! element directly and raises `StopIteration` at exhaustion
-//! (`rpython/flowspace/operation.py` `next`; the annotator's
-//! `op.next.can_only_throw` is `[StopIteration, RuntimeError]`).  This
+//! (`Next.canraise = [StopIteration, RuntimeError]`,
+//! `rpython/flowspace/operation.py:594-599`; the annotator narrows that per
+//! container — `SomeIterator.next.can_only_throw` is the callable
+//! `_can_only_throw`, which appends `RuntimeError` only for a `SomeDict`
+//! container, `rpython/annotator/unaryop.py:811-829`).  This
 //! module rewrites the value-encoded Option diamond into that exception
 //! representation — the mirror of [`crate::front::result_exc`]'s
 //! `Result`/`?` rewrite.  The Option diamond is the same shape minus the
@@ -26,9 +29,9 @@
 //! gates on the iterator tracing back to an `iter` op
 //! (`originates_from_iter_op`), so only a list iterator reaches it, and
 //! `ListIteratorRepr::rtype_next` raises solely `StopIteration` — the
-//! block carries no catch-all propagation edge (the `RuntimeError` half
-//! of `next`'s conservative `can_only_throw` is dict-iterator mutation
-//! detection that never fires here, and `flowin` drops the unhandled
+//! block carries no catch-all propagation edge (the `RuntimeError` half is
+//! `Next.canraise`'s conservative pair, which `_can_only_throw` already
+//! drops for a non-dict container, and `flowin` drops the unhandled
 //! remainder).
 //!
 //! ## The rewrite (`rewire_one_next_site`)

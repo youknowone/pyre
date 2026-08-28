@@ -296,7 +296,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     // Keyed by the qualname the HOST_ENV `pyre_object.lltype` module assigns
     // (`flowspace/model.rs`); recognising it as a builtin keeps its body out
     // of the looked-inside set (the `<T as GcType>::type_id()` accessor wall).
-    analyzer_for(&mut reg, "pyre_object.lltype.malloc", malloc_typed_alloc);
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::modules::MALLOC,
+        malloc_typed_alloc,
+    );
     analyzer_for(
         &mut reg,
         crate::runtime_names::modules::MALLOC_TYPED,
@@ -1468,12 +1472,21 @@ fn cast_address_intrinsic(
     )))
 }
 
-/// Annotation of the Rust-adapter spelling of
-/// `rgc.ll_arraymove(array, source_start, dest_start, length)`.
+/// Annotation of the Rust-adapter spelling of `ll_arraymove`.
 ///
 /// The MIR front has already recovered a logical list-items array from the
-/// raw pointers before emitting this call.  Preserve the exact upstream
-/// surface: one list plus three integer indices, no result value.
+/// raw pointers before emitting this call, so the receiver arrives as the
+/// list, matching the list-taking spelling `rlist.ll_arraymove`
+/// (`rpython/rtyper/rlist.py:561-564`) rather than the ll-items one
+/// (`rgc.ll_arraymove`, `rpython/rlib/rgc.py:415-418`), which takes
+/// `lst.ll_items()`.
+///
+/// The declared signature is the whole surface, and both spellings declare
+/// the same one: `@signature(types.any(), types.int(), types.int(),
+/// types.int(), returns=types.none())` and `@enforceargs(None, int, int,
+/// int)`.  `types.any()` / `None` constrain the receiver not at all, so this
+/// port constrains it not at all either — only the three indices are checked,
+/// and there is no result.
 fn ll_arraymove_intrinsic(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1482,14 +1495,6 @@ fn ll_arraymove_intrinsic(
     if !kwds.is_empty() || args_s.len() != 4 {
         return Err(AnnotatorError::new(
             "__majit_ll_arraymove expects (array, source_start, dest_start, length)",
-        ));
-    }
-    if !matches!(
-        arg_at(args_s, 0, crate::runtime_names::shims::LL_ARRAYMOVE),
-        SomeValue::List(_)
-    ) {
-        return Err(AnnotatorError::new(
-            "__majit_ll_arraymove array argument must be SomeList",
         ));
     }
     for index in 1..4 {
@@ -1524,12 +1529,16 @@ fn ll_arraymove_intrinsic(
 /// A root the bookkeeper deliberately models as a non-instance value —
 /// a `FixedObjectArray` projected to its `_items` element list, a
 /// `Wtf8Buf` to a byte string (`project_struct_field_type`,
-/// in `bookkeeper.rs`) — arrives with a `SomeList`/`SomeString`
-/// operand rather than a pointer.  Its access lowers through
-/// `getitem`/byte reads, not a named-field getattr, so the narrow is a
-/// no-op: the operand passes through unchanged, exactly as the erasure
-/// twin `cast_address_intrinsic` handles a `SomeList` for a `Vec` whose
-/// address was erased.
+/// in `bookkeeper.rs`) — has its access lowered through `getitem`/byte
+/// reads, not a named-field getattr.  An operand that ALREADY carries the
+/// modelled variant (`SomeList` for a list root, `SomeString` for a string
+/// root) passes through unchanged, exactly as the erasure twin
+/// `cast_address_intrinsic` handles a `SomeList` for a `Vec` whose address
+/// was erased.  A pointer-shaped operand (`SomeInstance` / `SomePtr` /
+/// `SomeAddress`), which is what the GCREF and `GcArray` boundaries hand in,
+/// is narrowed to the root's projected annotation instead — carrying the
+/// operand's nullability, since `cast_opaque_ptr` answers
+/// `nullptr(PTRTYPE.TO)` for a null (`lltype.py:1008-1010`).
 fn cast_instance_intrinsic(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1569,15 +1578,40 @@ fn cast_instance_intrinsic(
     } else {
         bk.project_struct_field_type(&root)
     };
-    // `GCRefRepr.recast` is the symmetric external-item boundary used by
-    // rlist: a GCREF read from `GcArray(GCREF)` becomes its concrete external
-    // pointer (StringRepr here) through cast_opaque_ptr.  The synthetic marker
-    // carries that target spelling; return the projected string for any GC
-    // pointer source, while an already-string source is the identity.
+    // Nullability travels with the value, not with the target spelling: a
+    // downcast of a nullable pointer is itself nullable, and a null operand
+    // is a legal one — `cast_opaque_ptr` answers `nullptr(PTRTYPE.TO)` for it
+    // (`lltype.py:1008-1010`).  Computed here so the target-spelling arms
+    // below cannot bypass it the way the block further down already honours
+    // it for the instance case.
+    let operand_can_be_none = match operand {
+        SomeValue::Instance(inst) => inst.can_be_none,
+        SomeValue::String(str_) => str_.inner.can_be_none,
+        SomeValue::None_(_) => true,
+        _ => false,
+    };
+    let with_nullability = |mut projected: SomeValue| {
+        if let SomeValue::String(str_) = &mut projected {
+            str_.inner.can_be_none = operand_can_be_none;
+        }
+        projected
+    };
+    // The symmetric external-item boundary rlist uses: a GCREF read from
+    // `GcArray(GCREF)` becomes its concrete external pointer (StringRepr
+    // here).  `AbstractBaseListRepr.recast` (`rpython/rtyper/rlist.py:67-68`)
+    // is the external/internal convert, and the GCREF half of it is
+    // `pairtype(GCRefRepr, Repr).convert_from_to`
+    // (`rpython/rtyper/lltypesystem/rgcref.py:61-65`), which genops
+    // `cast_opaque_ptr`.  The synthetic marker carries that target spelling;
+    // return the projected string for any GC pointer source, while an
+    // already-string source is the identity.
     if matches!(&projected, SomeValue::String(_)) {
         return match operand {
             SomeValue::String(_) => Ok(operand.clone()),
-            SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::Address(_) => Ok(projected),
+            SomeValue::Instance(_)
+            | SomeValue::Ptr(_)
+            | SomeValue::Address(_)
+            | SomeValue::None_(_) => Ok(with_nullability(projected)),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-pointer operand for string root {root:?}: {other:?}"
             ))),
@@ -1589,7 +1623,8 @@ fn cast_instance_intrinsic(
             | SomeValue::Instance(_)
             | SomeValue::List(_)
             | SomeValue::Ptr(_)
-            | SomeValue::Address(_) => Ok(projected),
+            | SomeValue::Address(_)
+            | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-GC-pointer operand for GCREF: {other:?}"
             ))),
@@ -1603,10 +1638,16 @@ fn cast_instance_intrinsic(
     // GcArray lowleveltype that an RPython erase/unerase boundary produces.
     // Reaching the marker proves the pointer is immediately dereferenced, so
     // a null value is not an observable successful path.
+    // `SomeList` carries no `can_be_None` — upstream's does not either — so
+    // the nullability computed above has nowhere to land on this arm; a null
+    // operand is still admitted rather than hard-errored.
     if matches!(&projected, SomeValue::List(_)) {
         return match operand {
             SomeValue::List(_) => Ok(operand.clone()),
-            SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::Address(_) => Ok(projected),
+            SomeValue::Instance(_)
+            | SomeValue::Ptr(_)
+            | SomeValue::Address(_)
+            | SomeValue::None_(_) => Ok(projected),
             other => Err(AnnotatorError::new(format!(
                 "__cast_instance_intrinsic: non-pointer operand for list root {root:?}: {other:?}"
             ))),
@@ -1614,10 +1655,11 @@ fn cast_instance_intrinsic(
     }
     // Carry the operand's nullability onto the downcast result instead
     // of unconditionally narrowing to non-None: a downcast of a nullable
-    // pointer is itself nullable.
+    // pointer is itself nullable.  Same rule as `operand_can_be_none` above,
+    // spelled out here because this arm also has to classify the operand
+    // variant it does not recognise.
     let can_be_none = match operand {
-        SomeValue::Instance(inst) => inst.can_be_none,
-        SomeValue::None_(_) => true,
+        SomeValue::Instance(_) | SomeValue::None_(_) => operand_can_be_none,
         SomeValue::Ptr(_) | SomeValue::Address(_) => false,
         other => {
             // A root the bookkeeper models as a list or string (a
@@ -2096,9 +2138,13 @@ fn malloc_typed_alloc(
     }
     match arg_at(args_s, 0, "malloc[_typed]") {
         SomeValue::Instance(inst) => {
-            // lltype.py `malloc(T)`: only `isinstance(T, Struct)`
-            // is mallocable; everything else falls to
-            // `raise TypeError("malloc: unmallocable type")`. A classdef-less
+            // lltype.py `malloc(T)` (`:2202-2210`) admits `Struct`, `Array`
+            // and `OpaqueType`; anything else falls to
+            // `raise TypeError("malloc: unmallocable type")`.  Only the
+            // `Struct` arm is reachable through this marker.  (Its result is
+            // modelled as a `SomeInstance` rather than upstream `ann_malloc`'s
+            // `SomePtr(Ptr(s_T.const))` — pyre's instance annotation IS the
+            // struct-pointer annotation.)  A classdef-less
             // `SomeInstance` (object-only; `SomeInstance(classdef=None)`)
             // carries no concrete struct, so it is that `else` arm — reject
             // it here instead of boxing a typeless value the downstream
@@ -2651,7 +2697,7 @@ mod tests {
         assert!(is_registered("zip"));
         assert!(is_registered("min"));
         assert!(is_registered("max"));
-        assert!(is_registered("pyre_object.lltype.malloc"));
+        assert!(is_registered(crate::runtime_names::modules::MALLOC));
     }
 
     #[test]

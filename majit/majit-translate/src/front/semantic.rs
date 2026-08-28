@@ -138,7 +138,7 @@ impl StructFieldRegistry {
     }
 
     /// True when `owner` is registered as an enum base class — its sole
-    /// row is the synthetic `__discriminant` tag (`rclass.py:82-88`: the
+    /// row is the synthetic `__discriminant` tag (`rclass.py:499-518`: the
     /// sum-type base carries only the discriminant, each variant subclass
     /// carries its own payload fields under `{enum}::{variant}` keys).  A
     /// struct or non-enum owner has its own field rows and returns false.

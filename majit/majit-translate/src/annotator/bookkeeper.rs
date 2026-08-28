@@ -1927,6 +1927,10 @@ impl Bookkeeper {
         self.getuniqueclassdef(&host)
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// Resolve the subclass `ClassDef` for one variant of a Rust enum —
     /// a subclass of the enum's discriminant-only base. Composes the canonical
     /// interning primitives rather than minting a parallel enum-class
@@ -1961,7 +1965,7 @@ impl Bookkeeper {
         let variant_host = self.intern_enum_variant_host(enum_root, variant_name);
         // Project the variant's OWN payload rows onto the subclass —
         // the RPython sum-type layout where each subclass carries its
-        // own fields (`rclass.py:82-88`), the base only the discriminant.
+        // own fields (`rclass.py:499-518`), the base only the discriminant.
         // A getattr on a narrowed `SomeInstance(variant)` then resolves
         // the payload on the variant via the MRO (variant → base), with
         // the variant's own field type.  The rows are registered under
@@ -2078,7 +2082,8 @@ impl Bookkeeper {
 
     /// Intern (first-mint-wins) and return the canonical variant-subclass
     /// `HostObject` for `{enum_root}::{variant_name}`, wiring the enum's
-    /// discriminant-only base as its sole `__bases__` (`rclass.py:82-88`).
+    /// discriminant-only base as its sole `__bases__` (`rclass.py:517-518`:
+    /// `self.rbase = getinstancerepr(rtyper, self.classdef.basedef, ...)`).
     ///
     /// Both the discriminant-narrowing path
     /// ([`Self::getuniqueclassdef_for_enum_variant`]) and the variant
@@ -2182,6 +2187,10 @@ impl Bookkeeper {
         Some(ktd)
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// Project one struct's registry rows into its `ClassDef.attrs`
     /// — the pass-2 body of [`Self::getuniqueclassdef_for_struct_root`].
     fn project_struct_rows(self: &Rc<Self>, n: &str) -> Result<(), AnnotatorError> {
@@ -2353,6 +2362,10 @@ impl Bookkeeper {
         Ok(())
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// Resolve a struct type-root name to its canonical host class
     /// `HostObject`, minting it on first sight and caching by name in
     /// [`Self::struct_root_classes`].  Because `HostObject`
@@ -2408,24 +2421,7 @@ impl Bookkeeper {
         let mut chain: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut base_host: Option<HostObject> = None;
-        // A Rust declaration reaches the annotator under three spellings:
-        // crate-included `pyre_object::unicodeobject::W_UnicodeObject`,
-        // crate-relative `unicodeobject::W_UnicodeObject`, and a dotted
-        // constructor qualname.  RPython keys all reads and constructors on
-        // the one live class object (`bookkeeper.py getdesc(cls)`), so strip
-        // exactly one registered local-crate prefix and normalize dots before
-        // the first cache lookup.  Keep the crate-relative module path: the
-        // chain walk below still sees `ob_header`/`base` and preserves the
-        // superclass, unlike collapsing directly to an ambiguous bare leaf.
-        let lookup = name.replace('.', "::");
-        let initial = lookup
-            .split_once("::")
-            .filter(|(root, _)| {
-                name.contains('.') || crate::local_crates::is_local_crate_root(root)
-            })
-            .map(|(_, rest)| rest.to_string())
-            .unwrap_or(lookup);
-        let mut cur = initial;
+        let mut cur = normalize_class_qualname(name);
         loop {
             let key = majit_ir::descr::canonical_struct_name(&cur);
             if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
@@ -2445,7 +2441,7 @@ impl Bookkeeper {
                 let lookup = cur.replace('.', "::");
                 // An enum-variant key `{enum_base}::{variant}` subclasses its
                 // enum base — the discriminant-only sum-type root
-                // (`rclass.py:82-88`).  Checked before the header convention
+                // (`rclass.py:499-518`).  Checked before the header convention
                 // because a variant's first field is its payload, not a
                 // header: without this the session prologue
                 // (`CallRegistry::ensure_session`), which pre-mints every
@@ -2516,6 +2512,10 @@ impl Bookkeeper {
         base_host.expect("chain holds at least `name` itself")
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// [`Self::intern_class_by_qualname`] with explicit `__bases__` for
     /// the first mint.  First-mint wins: a cache hit returns the
     /// existing class regardless of `bases`, so every site minting a
@@ -2527,7 +2527,14 @@ impl Bookkeeper {
         name: &str,
         bases: Vec<HostObject>,
     ) -> HostObject {
-        let key = majit_ir::descr::canonical_struct_name(name);
+        // Same normalization as [`Self::intern_class_by_qualname`]: both
+        // entry points answer one identity question, so they must derive one
+        // key.  Keying only the base through the strip splits every enum
+        // variant in two — `pyre_object::m::E` and `m::E` intern to one base
+        // but to `pyre_object::m::E::Some` and `m::E::Some` — which is the
+        // sibling-classdef split `intern_enum_variant_host`'s contract
+        // forbids.
+        let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(name));
         if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
@@ -2552,11 +2559,17 @@ impl Bookkeeper {
             .is_some_and(|reg| reg.fields.contains_key(name))
     }
 
-    /// True when type-root `root`'s registry rows include a field named
-    /// `name`.  The cutover's class-dict method population consults this
-    /// so a method member never shadows a same-named instance field — a
-    /// function source for a field attribute would union-conflict in
-    /// `generalize_attr`.
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
+    /// True when type-root `root` OWNS a field named `name`, or when any
+    /// variant of it does — the enum sum-type layout puts a payload row on
+    /// the variant, not on the discriminant-only base, so an owner-only test
+    /// would miss it (`owner_or_variant_has_field`, `front/semantic.rs`).
+    /// The cutover's class-dict method population consults this so a method
+    /// member never shadows a same-named instance field — a function source
+    /// for a field attribute would union-conflict in `generalize_attr`.
     pub fn struct_root_has_field(&self, root: &str, name: &str) -> bool {
         self.struct_fields
             .borrow()
@@ -2657,7 +2670,7 @@ impl Bookkeeper {
             // the registered-struct arm below produces `Impossible` and
             // blocks `ConstantData::Str.value`.
             // `BytesBlock` is pyre's concrete storage port of RPython `STR`:
-            // a length header followed by the variable-sized `chars` array.
+            // a `hash` header (`STR.become(GcStruct('rpy_string', ('hash', Signed), ...)`, `rstr.py:1226-1228`) followed by the `chars` array, whose length is the array's own length word.
             // `bytes_block_chars` folds the Rust raw-slice view back to this
             // owner, so the owner must carry the same `SomeString` annotation
             // as the slice it represents, not a nominal Rust-struct class.
@@ -3789,6 +3802,34 @@ impl Default for Bookkeeper {
     }
 }
 
+/// One spelling rule for the class cache key, shared by
+/// [`Bookkeeper::intern_class_by_qualname`] and
+/// [`Bookkeeper::intern_class_by_qualname_with_bases`].
+///
+/// A Rust declaration reaches the annotator under three spellings:
+/// crate-included `pyre_object::unicodeobject::W_UnicodeObject`,
+/// crate-relative `unicodeobject::W_UnicodeObject`, and a dotted constructor
+/// qualname.  RPython keys all reads and constructors on the one live class
+/// object (`bookkeeper.py:361-363` — `obj_key = Constant(pyobj)`), so strip
+/// exactly one registered local-crate prefix and normalize dots.
+///
+/// Strip only while a module path survives.  Collapsing
+/// `pyre_object::PyObject` to the bare `PyObject` is what
+/// `harden_duplicate_leaf_metadata` exists to undo — the chain walk needs
+/// `ob_header` / `base` to reach the superclass, and a bare leaf collides
+/// across modules.
+pub(crate) fn normalize_class_qualname(name: &str) -> String {
+    let lookup = name.replace('.', "::");
+    lookup
+        .split_once("::")
+        .filter(|(root, rest)| {
+            rest.contains("::")
+                && (name.contains('.') || crate::local_crates::is_local_crate_root(root))
+        })
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or(lookup)
+}
+
 /// Walk `field_ty`'s type-string structure and collect every bare-named
 /// type that the `StructFieldRegistry` recognises.  Used by
 /// [`Bookkeeper::getuniqueclassdef_for_struct_root`]'s pass-1 discovery
@@ -4537,7 +4578,7 @@ mod tests {
     }
 
     #[test]
-    fn pyobjectref_field_alias_projects_to_pyobject_class_identity() {
+    fn struct_root_alias_and_registered_root_share_one_classdef() {
         use crate::annotator::model::SomeValue;
         use crate::front::StructFieldRegistry;
 
@@ -4557,11 +4598,11 @@ mod tests {
             panic!("PyObjectRef must project to the PyObject instance annotation")
         };
         let alias_class = alias_item.classdef.expect("typed PyObjectRef classdef");
-        let pyobject_class = bk
+        let root_classdef = bk
             .getuniqueclassdef_for_struct_root("pyobject::PyObject")
             .expect("PyObject classdef");
         assert!(
-            Rc::ptr_eq(&alias_class, &pyobject_class),
+            Rc::ptr_eq(&alias_class, &root_classdef),
             "the source alias and registered PyObject root must share one ClassDef"
         );
 
@@ -4575,7 +4616,7 @@ mod tests {
             array_item
                 .classdef
                 .as_ref()
-                .is_some_and(|classdef| Rc::ptr_eq(classdef, &pyobject_class))
+                .is_some_and(|classdef| Rc::ptr_eq(classdef, &root_classdef))
         );
 
         let SomeValue::List(qualified_array) =
@@ -4590,12 +4631,12 @@ mod tests {
             qualified_item
                 .classdef
                 .as_ref()
-                .is_some_and(|classdef| Rc::ptr_eq(classdef, &pyobject_class))
+                .is_some_and(|classdef| Rc::ptr_eq(classdef, &root_classdef))
         );
     }
 
     #[test]
-    fn qualified_fixed_object_array_projects_typed_pyobject_items() {
+    fn qualified_fixed_object_array_projects_typed_instance_items() {
         use crate::annotator::model::SomeValue;
         use crate::front::StructFieldRegistry;
 
@@ -4633,7 +4674,7 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn real_llbc_pyframe_locals_array_projects_typed_pyobject_items() {
+    fn real_llbc_pyframe_locals_array_projects_typed_instance_items() {
         use crate::annotator::model::SomeValue;
         use majit_charon_reader::Llbc;
 
@@ -4887,7 +4928,8 @@ mod tests {
         // `intern_enum_variant_host`) and the discriminant-NARROWING path
         // (`getuniqueclassdef_for_enum_variant`) must resolve the SAME
         // class object — RPython's single-class-per-variant identity
-        // (`rclass.py:82-88`) — and it must carry the variant's payload
+        // (`ClassDesc.getuniqueclassdef`, `classdesc.py:699-702`) — and it
+        // must carry the variant's payload
         // attr.  Before the unification the ctor minted a dotted-qualname
         // sibling classdef with no payload attrs.
         use crate::front::StructFieldRegistry;

@@ -118,16 +118,30 @@ pub(crate) fn scalar_residual_for_method(
     leaf: &str,
     inside_dont_look_inside: bool,
 ) -> Option<(Vec<String>, ScalarResult)> {
-    // `rbigint.py:_AsDouble` is itself `@jit.dont_look_inside`, but
-    // GraphAnalyzer still walks its untranslated graph to compute effects.
-    // Keep the original `RBigInt.bit_length()` / `bit_count()` calls in such
-    // a graph.  Retargeting them to the interpreter-facing residual wrappers
-    // would add `jit_publish_exception(PyError(...).to_exc_object())` and its
-    // GC write barrier to a source graph where upstream carries only the
-    // ordinary OverflowError control-flow edge.  That false write then makes
-    // an enclosing elidable bigint helper fail `getcalldescr` with
-    // EF_RANDOM_EFFECTS.  Trace-visible callers still need the residual ABI,
-    // so only the effect-analysis body of an opaque caller declines it.
+    // NEW-DEVIATION, with a convergence path.  Upstream reads
+    // `_jit_look_inside_` in exactly one place — `JitPolicy.look_inside_graph`
+    // (`rpython/jit/codewriter/policy.py:48-58`) — to decide trace-vs-call.
+    // It never changes which operations a graph CONTAINS: `_AsDouble`'s
+    // flowgraph holds the same `direct_call(rbigint.bit_length)` whether or
+    // not it is opaque (`rpython/rlib/jit.py:133-140`).  Branching the emitted
+    // callee on the hint, as below, has no upstream counterpart.
+    //
+    // Why it is here: `rbigint.py:_AsDouble` is itself `@jit.dont_look_inside`,
+    // but GraphAnalyzer still walks its untranslated graph to compute effects.
+    // Retargeting its `bit_length` to the interpreter-facing residual wrapper
+    // adds `jit_publish_exception(PyError(...).to_exc_object())` and its GC
+    // write barrier to a source graph where upstream carries only the ordinary
+    // OverflowError control-flow edge.  That false write makes an enclosing
+    // elidable bigint helper fail `getcalldescr` with EF_RANDOM_EFFECTS.
+    //
+    // The defect is therefore the WRAPPER's effect, not the caller's hint.
+    // Converging means one of: (a) give the residual wrapper the uniform
+    // `front::result_exc` exception ABI so an OverflowError travels on the
+    // exception link instead of a heap publish — the shape
+    // `exceptiontransform.py` gives every raising graph; or (b) declare the
+    // publish's `EffectInfo` so it is not EF_RANDOM_EFFECTS.  Either lets one
+    // lowering serve both callers and this parameter goes away.  Until then
+    // the gate stays, because the alternative is a miscompiled effect set.
     if inside_dont_look_inside && matches!(leaf, "bit_length" | "bit_count") {
         return None;
     }

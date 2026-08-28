@@ -805,6 +805,11 @@ fn struct_layout_census_enabled() -> bool {
 /// qualified spelling whose identity is missing remains fail-closed by using
 /// its own path-derived id.  The small per-leaf `Vec` mirrors identity lookup
 /// without introducing an unordered side set.
+///
+/// The caller drops any unique-impl entry whose owner collapses to a leaf
+/// this reports more than once: such an entry could seed the receiver with
+/// the OTHER same-named class.  Multiple lookup aliases of one `StructId`
+/// are one RPython class object and must not make that class ambiguous.
 fn distinct_struct_identities_by_leaf(
     program: &front::SemanticProgram,
 ) -> std::collections::HashMap<String, Vec<majit_ir::descr::StructId>> {
@@ -1693,11 +1698,6 @@ fn analyze_pipeline_from_module_paths(
             .or_default()
             .insert(owner.clone());
     }
-    // Leaf names shared by more than one distinct struct identity: a
-    // unique-impl entry whose owner collapses to such a leaf could seed the
-    // receiver with the OTHER same-named class, so those entries are dropped.
-    // Multiple lookup aliases of one StructId are one RPython class object and
-    // must not make that class ambiguous.
     // Opt-in receiver-driven dispatch families (receiver-dispatch configuration): a consumer
     // names `>=2`-impl trait qualified paths
     // whose `dyn Trait` receivers should annotate to a base ClassDef

@@ -403,12 +403,13 @@ pub(crate) fn lower_result_exc_returns(
     // per-graph reason is not recoverable from any output.  Record it here,
     // where the reason still exists.
     //
-    // Upstream is loud in the equivalent position:
-    // `rpython/jit/codewriter/jtransform.py`'s `_handle_list_call` raises
-    // `NotImplementedError("prebuilt lists cannot be virtual")` rather than
-    // falling through to a residual.  This does not change the decline into
-    // an error — the fail-safe residual is deliberate here — it only makes
-    // the refusal countable.
+    // Upstream carries the reason as a value in the equivalent position:
+    // `_handle_list_call` raises `NotSupported(prefix + oopspec_name)`
+    // (`rpython/jit/codewriter/jtransform.py:1796`), naming the shape it
+    // refused, before `rewrite_op_direct_call` catches it and falls through
+    // to a residual call (`jtransform.py:512-520`).  The fail-safe residual
+    // is the same here — this only records the reason before it is
+    // discarded, so the refusal stays countable.
     let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
     if let Err(msg) = &outcome {
         crate::decline::record_reason(

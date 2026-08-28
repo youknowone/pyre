@@ -1611,7 +1611,7 @@ fn derive_program_metadata(
                 // Register the enum base class in `struct_fields` with
                 // only the synthetic `__discriminant` tag — the sum-type
                 // base carries the discriminant, each variant subclass
-                // carries its OWN payload fields (`rclass.py:82-88`,
+                // carries its OWN payload fields (`rclass.py:499-518`,
                 // registered below under `{enum}::{variant}` keys and
                 // projected onto the variant classdef by
                 // `getuniqueclassdef_for_enum_variant`).
@@ -1673,7 +1673,7 @@ fn derive_program_metadata(
                 // Per-variant field rows + exact offsets under
                 // `{enum}::{variant}` keys — the RPython sum-type subclass
                 // layout where each variant carries its OWN fields, the base
-                // only the discriminant (`rclass.py:82-88`).  These feed the
+                // only the discriminant (`rclass.py:499-518`).  These feed the
                 // variant subclasses (their `getuniqueclassdef_for_enum_variant`
                 // attr projection) and the per-variant runtime offsets.
                 // Dual-published under the qualified and bare-leaf spellings
@@ -3256,10 +3256,19 @@ struct Lowering<'a> {
     /// uses this provenance to emit exactly that pair of flowspace ops.
     string_byte_view_locals: Vec<usize>,
     /// MIR locals holding the `ll_items(l)` view returned by the string-list
-    /// slice adapters.  Rust spells the element as a concrete raw pointer,
-    /// but both byte and unicode strategies expose the same external `str`
-    /// over one internal `GcArray(GCREF)`.
-    string_array_view_locals: Vec<usize>,
+    /// slice adapters, each paired with the list's LOGICAL length.  Rust
+    /// spells the element as a concrete raw pointer, but both byte and
+    /// unicode strategies expose the same external `str` over one internal
+    /// `GcArray(GCREF)`.
+    ///
+    /// The pair exists because the fold drops the fat slice's second word.
+    /// That word is `l.length`, which upstream keeps strictly apart from the
+    /// array header's `ll_fixed_length` / `arraylen_gc`
+    /// (`rlist.py:365-375, 395-397`: `ll_length` reads `l.length` while
+    /// `ll_getitem_fast` asserts against it).  A `Rvalue::Len` over one of
+    /// these locals answers with the recorded length, never with `__len` of
+    /// the header, which is the CAPACITY.
+    string_array_view_locals: Vec<(usize, Variable)>,
     /// Result `Variable`s of calls to callees whose declared result is
     /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -3446,14 +3455,21 @@ impl<'a> Lowering<'a> {
             // trait's qualified path instead, which the adapter
             // resolves through the unique-impl map
             // (`trait_unique_impls`, keyed by qualified path).
-            let class_root = if i == 1 && gc_root_pin_path(&graph.name) {
-                // RPython's GC transformer publishes every live GC pointer
-                // through llmemory.GCREF, then casts the restored word back
-                // to its source repr.  Rust's `PyObjectRef` parameter is the
-                // physical carrier for that opaque slot, not a W_Root
-                // instance.  Preserve the GCREF input boundary explicitly so
-                // StringRepr and InstanceRepr callers never meet in one
-                // source-level FunctionDesc cell.
+            // RPython's GC transformer casts a GC helper's pointer *argument*
+            // to `llmemory.GCREF` before the call — `gct_gc_identityhash`
+            // (`framework.py:1174-1182`) does
+            // `[v_ptr] = hop.spaceop.args; v_ptr = hop.genop("cast_opaque_ptr",
+            // [v_ptr], resulttype=llmemory.GCREF)`.  Rust's `PyObjectRef`
+            // parameter is the physical carrier for that opaque slot, not a
+            // W_Root instance.  Preserve the GCREF input boundary explicitly so
+            // StringRepr and InstanceRepr callers never meet in one
+            // source-level FunctionDesc cell.
+            //
+            // Key it on the LAST parameter, never on index 1: both spellings
+            // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+            // `RootScope` method form puts `&self` first, so stamping index 1
+            // there annotates the receiver and leaves the GC pointer untouched.
+            let class_root = if i == arg_count && gc_root_pin_path(&graph.name) {
                 Some("GCREF".to_string())
             } else {
                 match &ty {
@@ -5132,8 +5148,8 @@ impl<'a> Lowering<'a> {
                     }
                     // Pointer -> unsigned-word cast is two operations in
                     // RPython, not a `cast_ptr_to_int` whose result is merely
-                    // labelled Unsigned.  `rbuiltin.py:528-539`
-                    // (`rtype_cast_primitive`) first emits
+                    // labelled Unsigned.  `rbuiltin.py`'s `gen_cast` (which
+                    // `rtype_cast_primitive` delegates to) first emits
                     // `cast_ptr_to_int(..., resulttype=Signed)` and then
                     // `gen_cast(..., TGT=Unsigned)`.  Rust's `p as usize`
                     // reaches this arm directly, so materialise that same
@@ -5350,6 +5366,18 @@ impl<'a> Lowering<'a> {
             // `Len(place)` — slice / array length. Synthetic 1-arg
             // call; needs no descriptor for now.
             Rvalue::Len(place) => {
+                // A string-list items view is one word — the `GcArray` header
+                // — so `__len` over it is `ll_fixed_length` / `arraylen_gc`,
+                // the CAPACITY.  `ll_length` reads the list's own `l.length`
+                // (`rlist.py:365-366`), which the fold recorded; answer with
+                // that, and keep the two apart exactly as upstream does.
+                if let Some((_, logical_len)) = self
+                    .string_array_view_locals
+                    .iter()
+                    .find(|(local, _)| place_references_local(&place, *local))
+                {
+                    return Ok((None, logical_len.clone()));
+                }
                 let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
@@ -5615,7 +5643,8 @@ impl<'a> Lowering<'a> {
                         .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
                         .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
                     let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
-                    // `_names_without_voids()` / `heaptracker.py:104-105`: a
+                    // `_names_without_voids()` (`lltype.py:333`) /
+                    // `heaptracker.py:100-101`: a
                     // zero-sized field occupies no storage and gets no slot,
                     // so no write is generated for it.
                     if crate::codewriter::call::get_type_flag(&field_ty).1
@@ -6291,7 +6320,7 @@ impl<'a> Lowering<'a> {
                     let string_array_view = self
                         .string_array_view_locals
                         .iter()
-                        .any(|&local| place_references_local(&inner, local));
+                        .any(|(local, _)| place_references_local(&inner, *local));
                     let (mut array_type_id, nolength) =
                         array_projection_metadata(&inner.ty, self.llbc);
                     if string_array_view {
@@ -7849,9 +7878,9 @@ impl<'a> Lowering<'a> {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
-            self.string_array_view_locals.iter().any(|&local| {
+            self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
-                    .get(local)
+                    .get(*local)
                     .and_then(Option::as_ref)
                     .is_some_and(|current| current == arg)
             })
@@ -7910,18 +7939,25 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
-                // Rust exposes RPython's generated shadow-stack publication
-                // as a normal `pin_root(PyObjectRef)` call.  Its parameter is
-                // actually `llmemory.GCREF`, irrespective of the source
-                // pointer's external repr.  Cast every caller to that opaque
-                // slot before FunctionDesc propagation so strings, W_Root
-                // instances, and other GC pointers do not union at the
-                // helper's single input cell.
-                if callee_pin_gcref_arg && args.len() == 1 {
-                    args[0] = self
+                // Rust exposes RPython's generated shadow-stack publication as
+                // a normal `pin_root(PyObjectRef)` call.  Its pointer argument
+                // is actually `llmemory.GCREF`, irrespective of the source
+                // pointer's external repr, so cast it the way
+                // `gct_gc_identityhash` casts a GC helper's pointer argument
+                // (`framework.py:1174-1182`) — before FunctionDesc propagation,
+                // so strings, W_Root instances, and other GC pointers do not
+                // union at the helper's single input cell.
+                //
+                // The pointer is the LAST argument: the `RootScope` method form
+                // `gc_root_pin_path` also admits passes `&self` first, and
+                // gating on `args.len() == 1` skipped it entirely, leaving the
+                // definition-side stamp and the call site disagreeing about the
+                // same callee.
+                if callee_pin_gcref_arg && let Some(last) = args.len().checked_sub(1) {
+                    args[last] = self
                         .narrow_value_to_instance_root(
                             bb_id,
-                            LinkArg::Value(args[0].clone()),
+                            LinkArg::Value(args[last].clone()),
                             "GCREF",
                         )
                         .as_variable()
@@ -8236,17 +8272,16 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.index_elem_alias.insert(
-                        dest_local,
-                        IndexElemAlias {
-                            base_local: arg_locals.first().copied().flatten(),
-                            base_var: args[0].clone(),
-                            index_local: arg_locals.get(1).copied().flatten(),
-                            index_var: args[1].clone(),
-                            item_ty: ValueType::Int,
-                            array_type_id: None,
-                        },
-                    );
+                    // No `index_elem_alias` entry.  That table exists so a
+                    // paired `*p = v` becomes an `ArrayWrite` over the same
+                    // base, and this base is a `StringRepr` value — upstream
+                    // has no `setitem` on one (`rstr.py` offers only
+                    // `ll_str2mutable` / `mutable_str` for writes), so the
+                    // write half cannot exist.  The arm is already guarded by
+                    // `!is_slice_scalar_index_mut_call`, but recording an
+                    // alias whose pairing would mint an op RPython does not
+                    // have is a latent illegal-op source, and it also feeds
+                    // `compute_index_write_extra_live`'s liveness reasoning.
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -8265,17 +8300,23 @@ impl<'a> Lowering<'a> {
                 let element_node = tyref_index_element_node(&call.dest.ty, self.llbc);
                 let element_scalar =
                     element_node.and_then(|elem| json_ty_scalar_element_spelling(elem, self.llbc));
-                // RPython's string list item is one GC pointer
-                // (`lltypesystem/rstr.py:229-230`, `StringRepr.lowleveltype =
-                // Ptr(STR)`).  Rust's `&str` is a fat pointer before source
-                // translation, but the translated value is the same
-                // `SomeString` / `Ptr(STR)` used for `String`, `Wtf8`, and
-                // `Wtf8Buf` everywhere else in this front end.  Name that
-                // translated element `str` so `get_array_descr` computes the
-                // RPython pointer item, never the host Rust width.
-                let element_rpython_ref = element_node
-                    .and_then(|elem| json_ty_rpython_gc_pointer_element_spelling(elem, self.llbc));
-                let element_spelling = element_scalar.or(element_rpython_ref);
+                // A string-family or tuple element gets NO spelling here, even
+                // though `StringRepr.lowleveltype = Ptr(STR)` (`rstr.py`,
+                // `StringRepr`) and `TUPLE_TYPE` (`rtuple.py`) really are one
+                // GC pointer inside an RPython list.  Those describe the repr
+                // of a list the translation BUILDS; the container under this
+                // arm is a host Rust one that no translation replaces, and the
+                // read strides over its real memory.  `&str` is two words
+                // there, `String`/`Wtf8Buf` three, and `(Wtf8Buf,
+                // PyObjectRef)` four, so naming any of them a one-word item
+                // reads the wrong address from the second element on.  The
+                // managed `GcArray(GCREF)` items view — the one container that
+                // IS one word per item — carries its own proof
+                // (`first_arg_is_string_array_view`) and mints
+                // `STRING_GCREF_GCARRAY_TYPE_ID` below without asking here;
+                // routing host containers through the same `[str]` identity
+                // would also alias them into that array's `_cache_array` slot.
+                let element_spelling = element_scalar;
                 let element_is_addressable = element_spelling.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
@@ -8961,6 +9002,15 @@ impl<'a> Lowering<'a> {
                     // append.  Keep the initial value as an append operand;
                     // passing it to `new` would misread it as the optional
                     // integer capacity argument.
+                    //
+                    // So the builder is born at `INIT_SIZE`, not at
+                    // `len(initial)`.  That is the size RPython source with
+                    // this shape gets: `b = StringBuilder(); b.append(s)`
+                    // reaches `rtyper_new` with `len(hop.args_v) == 0`
+                    // (`rtyper/rbuilder.py:8-14`).  `convert_const`'s
+                    // `ll_new(len(s))` (`:57-63`) is the PREBUILT-constant
+                    // path — a builder already built at translation time —
+                    // and is not this callsite.
                     if builder_ctor_leaf == Some("from_string") {
                         let void = self
                             .graph
@@ -9132,7 +9182,7 @@ impl<'a> Lowering<'a> {
                 // the same address; it neither allocates nor changes the
                 // pointer representation.  The translated object model keeps
                 // these slots as their upstream scalar fields (for example
-                // unicode `hash`, `rstr.py:411-412`), so alias the view to the
+                // unicode `hash`, `rstr.py:1238`), so alias the view to the
                 // field pointer exactly like the raw-pointer casts above.
                 if args.len() == 1 && self.is_atomic_from_ptr_identity(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
@@ -9283,8 +9333,15 @@ impl<'a> Lowering<'a> {
                             .expect("a string-items view stays a Variable")
                             .clone(),
                     );
-                    if !self.string_array_view_locals.contains(&dest_local) {
-                        self.string_array_view_locals.push(dest_local);
+                    // The dropped second word IS `l.length`; keep it so a
+                    // `Rvalue::Len` over the view answers with it.
+                    if !self
+                        .string_array_view_locals
+                        .iter()
+                        .any(|(local, _)| *local == dest_local)
+                    {
+                        self.string_array_view_locals
+                            .push((dest_local, args[1].clone()));
                     }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -9663,6 +9720,8 @@ impl<'a> Lowering<'a> {
                     && let Some(owner) = self.string_array_slice_view_owner(&reg)
                 {
                     let block = self.emit_string_array_items_read(bb_id, args[0].clone(), owner);
+                    let logical_len =
+                        self.emit_string_array_len_read(bb_id, args[0].clone(), owner);
                     let view = self.narrow_value_to_instance_root(
                         bb_id,
                         LinkArg::Value(block),
@@ -9673,8 +9732,15 @@ impl<'a> Lowering<'a> {
                             .expect("a string-items view stays a Variable")
                             .clone(),
                     );
-                    if !self.string_array_view_locals.contains(&dest_local) {
-                        self.string_array_view_locals.push(dest_local);
+                    // Same pairing as the `from_raw_parts` fold above: the
+                    // view is the header, `l.length` is its own field.
+                    if !self
+                        .string_array_view_locals
+                        .iter()
+                        .any(|(local, _)| *local == dest_local)
+                    {
+                        self.string_array_view_locals
+                            .push((dest_local, logical_len));
                     }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -11919,9 +11985,11 @@ impl<'a> Lowering<'a> {
     /// ARRAY identity proof for the scalar-index `<[T]>::get` rewrite.
     ///
     /// This is the `get` counterpart of the `Index::index` element gate: a
-    /// scalar or an RPython GC-pointer value carries an element spelling so
-    /// the descr computes its exact stride; a thin pointer is already one
-    /// word and needs no identity. Any other inline Rust aggregate declines.
+    /// scalar carries an element spelling so the descr computes its exact
+    /// stride; a thin pointer is already one word and needs no identity. Any
+    /// other inline Rust aggregate declines — including a string or tuple
+    /// element, which is one GC pointer only inside a list the translation
+    /// builds, never inside the host slice this call reads.
     /// The outer `Option` is the proof, while the inner one is the optional
     /// ARRAY identity (`Some(None)` means the proven thin-pointer case).
     fn slice_get_element(&self, reg: &RegularCall) -> Option<(ValueType, Option<String>)> {
@@ -11937,9 +12005,7 @@ impl<'a> Lowering<'a> {
         // T, not a Rust slot reference.  Read the bank from the call's T
         // generic before looking at the reference-wrapped destination.
         let item_ty = tyref_to_value_type(&element_ty, self.llbc);
-        if let Some(spelling) = json_ty_scalar_element_spelling(element, self.llbc)
-            .or_else(|| json_ty_rpython_gc_pointer_element_spelling(element, self.llbc))
-        {
+        if let Some(spelling) = json_ty_scalar_element_spelling(element, self.llbc) {
             return Some((item_ty, Some(format!("[{spelling}]"))));
         }
         json_ty_is_thin_pointer_element(element, self.llbc).then_some((item_ty, None))
@@ -12973,6 +13039,10 @@ impl<'a> Lowering<'a> {
         result
     }
 
+    /// The logical `l.length` of a string-list storage record — the second
+    /// word the `from_raw_parts` view fold drops.  Upstream reads it as the
+    /// list's own field (`ll_length`, `rlist.py:365-366`), strictly apart
+    /// from the array header's `ll_fixed_length` / `arraylen_gc`.
     fn emit_string_array_len_read(
         &mut self,
         bb_id: BlockId,
@@ -14946,10 +15016,17 @@ impl<'a> Lowering<'a> {
         let Some(receiver_ty) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        if !matches!(
-            self.tyref_literal_uint_atom(receiver_ty),
-            Some("U64" | "Usize")
-        ) {
+        // Upstream picks the rotate constants from the word width
+        // (`tupleobject.py`: `if sys.maxint == 2 ** 31 - 1` chooses
+        // `(x << 13) | (x >> 19)`, the else arm `(x << 31) | (x >> 33)`).
+        // The fold below is that 64-bit arm, so `u64` always qualifies and
+        // `usize` only where the target word IS eight bytes.
+        let width_matches_the_64_bit_arm = match self.tyref_literal_uint_atom(receiver_ty) {
+            Some("U64") => true,
+            Some("Usize") => crate::layout::target_word_size() == 8,
+            _ => false,
+        };
+        if !width_matches_the_64_bit_arm {
             return Ok(false);
         }
         let Some(raw_count) = self
@@ -15679,7 +15756,7 @@ impl<'a> Lowering<'a> {
 
     /// Lower the fallible `i32::try_from(i64)` core shell to the checked
     /// narrowing shape PyPy writes directly in
-    /// `ObjSpace.c_int_w` (`baseobjspace.py:2082-2088`): the value succeeds
+    /// `ObjSpace.c_int_w` (`baseobjspace.py:2062-2068`): the value succeeds
     /// exactly when `INT_MIN <= value <= INT_MAX`. Rust carries the two
     /// branches in a `Result<i32, TryFromIntError>`, so preserve that source
     /// CFG by materializing `Ok=0` / `Err=1` and leaving the caller's match
@@ -15775,12 +15852,15 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         );
-        // The predicates are mutually exclusive, so their sum is exactly the
-        // Result discriminant: 0 in range (Ok), 1 out of range (Err).
+        // `c_int_w` joins the two bound tests with `or`
+        // (`baseobjspace.py:2066`), so join them with the registered `or_`
+        // operator (`operation.py:486`) rather than with arithmetic: the
+        // result is the Result discriminant, 0 in range (Ok), 1 out of range
+        // (Err).
         let disc = push_op(
             &mut self.graph,
             OpKind::BinOp {
-                op: "add".to_string(),
+                op: "or".to_string(),
                 lhs: below,
                 rhs: above,
                 result_ty: ValueType::Int,
@@ -16363,6 +16443,17 @@ impl<'a> Lowering<'a> {
     /// `Result::Ok`) — so its runtime offset matches the
     /// `resolve_adt_field` read, which is variant-qualified
     /// (`{enum_leaf}::{variant}`).
+    ///
+    /// **Precondition on the caller.**  The write is unconditional: the
+    /// payload lands under the success variant on the failure arm too.  The
+    /// tagged pair has one payload slot, so nothing is corrupted, but a
+    /// failure variant whose payload some consumer READS would read this
+    /// value under a variant-qualified key that was never written.  Every
+    /// caller here fails with a payload no consumer reads —
+    /// `Option::None` carries none, and `i32::try_from`'s
+    /// `TryFromIntError(())` is the unit — so the read cannot occur.  A new
+    /// caller whose failure arm carries live data must branch instead of
+    /// reusing this tail.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -17172,9 +17263,19 @@ fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Opt
     append_arg_of_borrow(body, llbc, rt, true)
 }
 
+/// [`append_receiver_of_borrow`]'s twin for the appended PIECE: walk the
+/// reference/coercion shells the lowered string model aliases away
+/// ([`sole_string_alias_successor`]) until one of them is the sole
+/// non-accumulator argument of an append call, and return that temp.
+///
+/// The walk is bounded because it is a walk over MIR temps and nothing
+/// proves the alias chain acyclic; eight hops is far past every chain the
+/// real LLBC produces (`&Wtf8Buf` -> `&Wtf8` -> `&str` is three), and a
+/// chain longer than that simply declines the builder lift and leaves the
+/// residual — the same fail-safe every recognizer in this file takes.
 fn append_piece_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
     let mut current = rt;
-    for _ in 0..8 {
+    for _ in 0..ALIAS_WALK_HOPS {
         if ref_temp_is_sole_append_arg(body, llbc, current, false) {
             return Some(current);
         }
@@ -17182,6 +17283,10 @@ fn append_piece_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option
     }
     None
 }
+
+/// Hop budget for a reference/coercion alias walk over MIR temps.  See
+/// [`append_piece_of_borrow`] for why it is bounded and why eight.
+const ALIAS_WALK_HOPS: usize = 8;
 
 /// Follow one Rust reference/coercion shell which the lowered string value
 /// model aliases away: an immediate reborrow, or `Deref::deref` between two
@@ -17264,6 +17369,10 @@ fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) 
     (other == 0).then_some(successor?)
 }
 
+/// The shared body behind [`append_receiver_of_borrow`] (`accumulator =
+/// true`) and its piece-side caller: return `rt` when it already is the
+/// selected append argument, else the single temp that borrows it and is.
+/// More than one such borrower is ambiguous and declines.
 fn append_arg_of_borrow(
     body: &Unstructured,
     llbc: &Llbc,
@@ -17716,13 +17825,24 @@ fn gc_root_pin_path(name: &str) -> bool {
 
 /// Root-stack operations whose PyObjectRef return is the physical spelling
 /// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
-/// restores the original external repr after reading this opaque word.
+/// gives such a helper call a GCREF result and casts it back to the concrete
+/// repr at the use site — `gct_weakref_create` (`framework.py:1151-1154`)
+/// does `genop("direct_call", ..., resulttype=llmemory.GCREF)` followed by
+/// `genop("cast_opaque_ptr", [v_result], resulttype=WEAKREFPTR)`.
+///
+/// `RootScope::get` is admitted alongside `shadow_stack_get`: its own source
+/// doc calls it "scope-local [`shadow_stack_get`] using the cached cell", and
+/// it is the read half of the `pin_root` write half stamped above.  Leaving
+/// it out publishes a root through the opaque slot and reads it back as a
+/// W_Root instance, re-creating on the read side exactly the StringRepr-meets-
+/// InstanceRepr union the write-side stamp exists to remove.  `get` is the
+/// only such leaf in `gc_roots`, so the match stays unambiguous.
 fn gc_root_gcref_result_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.iter().any(|s| *s == "gc_roots")
         && matches!(
             segments.last(),
-            Some(&"pin_root") | Some(&"shadow_stack_get")
+            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get")
         )
 }
 
@@ -18191,6 +18311,16 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
                 llbc,
             )
             || is_typed_items_elem_ptr_add_parts(
+                reg,
+                call.args.len(),
+                operand_local(call.args.first()),
+                call.args.first().and_then(operand_tyref),
+                operand_local(call.args.get(1)),
+                p as usize,
+                body,
+                llbc,
+            )
+            || is_string_items_elem_ptr_add_parts(
                 reg,
                 call.args.len(),
                 operand_local(call.args.first()),
@@ -19438,7 +19568,7 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
 
 /// Emit RPython's pointer-to-Unsigned primitive cast sequence.
 ///
-/// `rbuiltin.py:528-539` first produces a Signed address integer with
+/// `rbuiltin.py`'s `gen_cast` first produces a Signed address integer with
 /// `cast_ptr_to_int`, then applies `gen_cast(..., Unsigned)`.  The caller
 /// appends the returned `r_uint` operation after the Signed producer pushed
 /// here, preserving that ordering while fitting [`Lowering::build_rvalue`]'s
@@ -20959,34 +21089,6 @@ fn json_ty_is_thin_pointer_element(node: &serde_json::Value, llbc: &Llbc) -> boo
     json_ty_is_statically_sized(pointee, llbc)
 }
 
-/// The element spelling of source values whose RPython repr is a one-word GC
-/// pointer even though their Rust source representation is wider.
-///
-/// RPython strings are `Ptr(STR)` (`lltypesystem/rstr.py:229-230`) and
-/// non-empty tuples are `Ptr(GcStruct(...))` (`rtuple.py:116-126`).  These are
-/// exactly the two non-scalar value families a PyPy list stores by reference;
-/// admitting arbitrary named Rust ADTs here would falsely shrink inline host
-/// structs to one word.
-fn json_ty_rpython_gc_pointer_element_spelling(
-    node: &serde_json::Value,
-    llbc: &Llbc,
-) -> Option<String> {
-    let ty = TyRef::Other(node.clone());
-    if tyref_is_string_value(&ty, llbc) {
-        return Some("str".to_string());
-    }
-    let node = strip_ty_indirections(node, llbc)?;
-    let adt = node.as_object()?.get("Adt")?.as_object()?;
-    if adt.get("id").and_then(serde_json::Value::as_str) != Some("Tuple") {
-        return None;
-    }
-    let types = adt.get("generics")?.as_object()?.get("types")?.as_array()?;
-    if types.is_empty() {
-        return None;
-    }
-    Some(charon_type_value_to_ast_string(node, llbc, 0))
-}
-
 /// `true` when `node` names a type of compile-time-known size, which is what
 /// makes a pointer to it thin.
 ///
@@ -21087,6 +21189,12 @@ fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
 /// target must resolve to the translated string-value family, with the
 /// trait decl's leaf name `Into` (a `From<String>` bound has the same
 /// generics shape but means the *opposite* conversion).
+///
+/// The target test is [`node_is_string_value`], whose family is `str`,
+/// `String`, `Wtf8`, `Wtf8Buf` AND `BytesBlock` — so an `Into<BytesBlock>`
+/// bound would resolve here too.  No such bound exists in the source today;
+/// if one appears, note that `BytesBlock` is the low-level `STR` owner rather
+/// than a source-level message type and may want excluding.
 fn typevar_bounded_by_into_string_value(
     var_index: u64,
     fn_generics: &serde_json::Value,
@@ -22651,6 +22759,14 @@ fn is_string_array_base_adapter(name: &str) -> bool {
 /// invariant above from pulling a scalar block into the `Ref`-typed array ops
 /// — the element side is refused by [`is_object_ref_items_ptr`] as well, so the
 /// two gates agree by construction rather than by coincidence.
+/// The `is_string_array_base_adapter` arm is currently INERT through the sole
+/// consumer [`Lowering::is_items_block_base_ptr_add`], which also requires a
+/// `ptr::add` / `wrapping_add` in the same body: `BytesArray::base` /
+/// `UnicodeArray::base` are `items_block_items_base(self.block)`, a call, and
+/// carry no `.add` to collapse.  It is kept so the predicate answers the
+/// question its name asks for the whole family, and it becomes live the
+/// moment either body spells the offset itself — but do not read a passing
+/// `offset_leaf` assertion over those two graphs as evidence that it fired.
 fn graph_is_items_block_base_accessor(name: &str) -> bool {
     is_object_items_block_base_accessor(name)
         || is_typed_items_block_base_accessor(name)
@@ -22744,18 +22860,28 @@ fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
 
 /// Target-layout value of the scalar GcArray's items offset.  Charon leaves
 /// Rust's `offset_of!(TypedItemsBlock, items)` initializer opaque, but the
-/// translated lltype fixes the same layout structurally: one target-word
-/// length header followed by an 8-byte-aligned Signed/Float item array
-/// (`rlist.py:84,116`).  This is the front-end counterpart of
-/// `CallControl::array_items_base`; it derives the target value instead of
-/// importing a host-runtime constant or registering a fake residual getter.
+/// translated lltype fixes the same layout structurally: a length header
+/// followed inline by the `GcArray(Signed|Float)` items
+/// (`get_itemarray_lowleveltype`, `rlist.py:84`).
+///
+/// The derivation is `align_of::<u64>()` padding of that header, not "one
+/// target word": the Rust body is `#[repr(C)] { capacity: usize, items:
+/// [u64; 0] }` (`majit/majit-rlib/src/lltypesystem/rlist.rs:165-171`), whose
+/// 8-byte item alignment rounds a 4- or 8-byte header up to the same 8.  The
+/// offset is therefore width-independent, which is why reading `word` from
+/// [`crate::layout::target_word_size`] here rather than from Charon's
+/// `target_pointer_size` cannot change the answer.
+///
+/// This is the front-end counterpart of `CallControl::array_items_base`; it
+/// derives the target value instead of importing a host-runtime constant or
+/// registering a fake residual getter.
 fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
     let path = segments.join("::");
     if !path_ends_with_segments(&path, "rlist::TYPED_ITEMS_BLOCK_ITEMS_OFFSET") {
         return None;
     }
-    let word = crate::layout::target_word_size();
-    let items_offset = word.div_ceil(8) * 8;
+    let header = crate::layout::target_word_size();
+    let items_offset = header.next_multiple_of(align_of::<u64>());
     Some(OpKind::ConstInt(items_offset as i64))
 }
 
@@ -23709,14 +23835,17 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 ///   current piece — the encoding a literal of 128+ bytes takes (a single
 ///   length byte tops out at `0x7F`), e.g. the 130-byte deprecation tail
 ///   in `space_int` / `space_index`;
-/// - sequential placeholder: the single byte `0xC0` — closes the current
-///   piece, begins the next, and renders the next argument in order (the
-///   Display-vs-Debug choice lives in the parallel args array, not in this
-///   template, so a placeholder carries no kind);
-/// - explicit / reused placeholder: `0xC8` followed by a little-endian
-///   `u16` argument index — a 3-byte token that renders `args[index]`, so
-///   a `{0}…{0}` template that names one argument twice packs two `0xC8`
-///   tokens pointing at index `0`;
+/// - placeholder: any byte `>= 0xC0`, whose low bits select which optional
+///   fields follow it, each little-endian: `0x01` a `u32` flag word, `0x02`
+///   a `u16` width, `0x04` a `u16` precision, `0x08` a `u16` argument index.
+///   Without `0x08` the placeholder is sequential and takes the next
+///   argument in order.  A bare `0xC0` is therefore the plain `{}` and
+///   `0xC8` + `u16` the explicit `{0}`, but they are two points in one
+///   grammar, not two tokens: every field length is decoded so an embedded
+///   zero byte is never mistaken for the terminator.  Bits `0x10` / `0x20`
+///   mark an indirect width / precision (`{:1$}`), whose encoding this
+///   decoder does not know, so it bails on them.  The Display-vs-Debug
+///   choice lives in the parallel args array, not in this template;
 /// - terminator: a `0x00` byte (only at a segment boundary; `0`/`0xC0`
 ///   bytes inside a literal are consumed by its length prefix).
 ///
@@ -23733,9 +23862,11 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 /// `0xC8` index points back at an already-seen argument, so the distinct
 /// argument count is `max(arg_indices) + 1`, which can be less than the
 /// placeholder count.  Returns `None` (bail, leaving the graph untouched)
-/// on any high-bit control byte other than `0xC0`/`0xC8` — a format spec
-/// with width/precision/fill or a named argument — and on non-UTF-8
-/// literal bytes.
+/// on `0x81..=0xBF` (neither a literal length nor a placeholder), on an
+/// indirect width/precision bit, on a truncated field, on a missing `0x00`
+/// terminator, and on non-UTF-8 literal bytes.  A placeholder that carries
+/// flags/width/precision is decoded rather than refused; refusing it is the
+/// job of `FmtPlaceholder::is_default()`, which every collapse consults.
 fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<FmtPlaceholder>)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -23796,13 +23927,23 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<FmtPlac
                 auto += 1;
                 index
             };
+            // An indirect width/precision (`{:1$}`) names an argument for
+            // the field instead of inlining it, and this decoder does not
+            // know how many bytes that costs.  Guessing would desync the
+            // byte stream, and a desync that happened to land on one default
+            // placeholder would be accepted by the collapses downstream —
+            // so refuse the template outright.  No consumer accepts a
+            // non-default placeholder anyway.
+            if b & 0x30 != 0 {
+                return None;
+            }
             placeholders.push(FmtPlaceholder {
                 arg_index,
                 flags,
                 width,
                 precision,
-                width_indirect: b & 0x10 != 0,
-                precision_indirect: b & 0x20 != 0,
+                width_indirect: false,
+                precision_indirect: false,
             });
         } else if b == 0x80 {
             // long literal segment: `0x80` + little-endian u16 length,
@@ -24306,21 +24447,33 @@ fn emit_fmt_expansion_ops(
     ops
 }
 
-/// Expand the byte-only `{:02x}` in `bytearray_repr_string` to the exact
-/// operations PyPy uses in `bytearrayobject.py::descr_repr`:
+/// Expand a byte-only `{:02x}` placeholder to the nibble lookup PyPy uses in
+/// `bytearrayobject.py::descr_repr` (`bytearrayobject.py:286-290`):
 ///
 /// ```python
-/// digits = "0123456789abcdef"
-/// digits[n >> 4] + digits[n & 0xF]
+///             elif not '\x20' <= c < '\x7f':
+///                 n = ord(c)
+///                 buf.append('\\x')
+///                 buf.append("0123456789abcdef"[n >> 4])
+///                 buf.append("0123456789abcdef"[n & 0xF])
 /// ```
+///
+/// Upstream appends three values into a `StringBuilder`; the Rust shell this
+/// replaces is a `format!` that *returns* a `String`, so the same three values
+/// are folded left through `add` (`ll_strconcat`) into the displaced format
+/// result instead.  `pieces` carries the template's literal halves — for the
+/// `format!("\\x{c:02x}")` shell that is `["\\x", ""]`, and the leading `\x`
+/// is upstream's first `buf.append`, so it must be emitted, not merely
+/// matched.
 ///
 /// The caller proves the formatted value came from a `(u8,)` argument tuple,
 /// so two digits are complete (never truncating a wider integer).  Each
 /// getitem annotates as `SomeChar`; `str(char)` follows
-/// `AbstractCharRepr.ll_str -> ll_chr2str`, and the final `add` is ordinary
-/// `StringRepr` concatenation.  No Rust fmt runtime or new helper survives.
+/// `AbstractCharRepr.ll_str -> ll_chr2str` (`rstr.py:554-555`).  No Rust fmt
+/// runtime or new helper survives.
 fn emit_lower_hex_byte_02_ops(
     graph: &mut FunctionGraph,
+    pieces: &[String],
     value: &Variable,
     result: Variable,
 ) -> Vec<SpaceOperation> {
@@ -24413,15 +24566,60 @@ fn emit_lower_hex_byte_02_ops(
             result_ty: ValueType::Str,
         },
     });
-    ops.push(SpaceOperation {
-        result: Some(result),
-        kind: OpKind::BinOp {
-            op: "add".to_string(),
-            lhs: hi,
-            rhs: lo,
-            result_ty: ValueType::Str,
-        },
-    });
+    // Upstream's `buf.append('\\x')` — the template's leading literal — comes
+    // first, then the two nibble characters.  A non-empty trailing piece is
+    // appended last; the `["\\x", ""]` shell has none.
+    let mut parts: Vec<Variable> = Vec::new();
+    if !pieces[0].is_empty() {
+        let literal = alloc(graph);
+        ops.push(SpaceOperation {
+            result: Some(literal.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), pieces[0].clone()],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        parts.push(literal);
+    }
+    parts.push(hi);
+    parts.push(lo);
+    if pieces.len() > 1 && !pieces[1].is_empty() {
+        let literal = alloc(graph);
+        ops.push(SpaceOperation {
+            result: Some(literal.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), pieces[1].clone()],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        parts.push(literal);
+    }
+    // Left-fold the parts through `add` (`ll_strconcat`).
+    let mut acc = parts[0].clone();
+    for part in &parts[1..] {
+        let sum = alloc(graph);
+        ops.push(SpaceOperation {
+            result: Some(sum.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: acc.clone(),
+                rhs: part.clone(),
+                result_ty: ValueType::Str,
+            },
+        });
+        acc = sum;
+    }
+    // Reuse the displaced format result var on the final op so the downstream
+    // link still forwards the rendered String.
+    if let Some(last) = ops.last_mut() {
+        last.result = Some(result);
+    }
     ops
 }
 
@@ -24771,6 +24969,10 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
 struct LowerHexByteFmtCollapse {
     format_block: BlockId,
     format_result: u64,
+    /// The template's literal halves, carried so the expansion re-emits the
+    /// leading `\x` — upstream's first `buf.append` — instead of consuming it
+    /// as a match condition only.
+    pieces: Vec<String>,
     link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
     dead_results: Vec<u64>,
     dead_bases: Vec<u64>,
@@ -24792,6 +24994,7 @@ fn collect_lower_hex_byte_fmt_collapse(
     Some(LowerHexByteFmtCollapse {
         format_block: bf,
         format_result: nav.format_result.id(),
+        pieces: nav.pieces,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -24877,7 +25080,7 @@ fn collapse_lower_hex_byte_fmt_chains(graph: &mut FunctionGraph) -> usize {
         // The original context value was defined in B0.  After link rewrites,
         // the format op's own argument Variable is Bf's inputarg carrying that
         // value; use it so every emitted operand is defined in this block.
-        let expansion = emit_lower_hex_byte_02_ops(graph, &value, result);
+        let expansion = emit_lower_hex_byte_02_ops(graph, &site.pieces, &value, result);
         graph
             .block_mut(site.format_block)
             .operations
@@ -26121,8 +26324,7 @@ mod tests {
     use super::{
         DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
         charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
-        fn_ptr_family_for, json_ty_is_thin_pointer_element,
-        json_ty_rpython_gc_pointer_element_spelling, json_ty_scalar_element_spelling,
+        fn_ptr_family_for, json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
         push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
         tyref_is_raw_byte_ptr,
     };
@@ -28549,16 +28751,21 @@ mod tests {
             boxed_handlers, 1,
             "real LOAD_CONST bigint handler must use the RBigInt pointer boxing ABI"
         );
-        // Pins the whole ArrayRead population of `load_const_value`, not just
-        // its presence — so an added or removed indexed read reds here.
+        // PyPy walks `co_consts_w`, a list of GC pointers.  This function
+        // walks the compiler's `Vec<ConstantData>` instead, whose enum values
+        // are inline Rust aggregates and are wider than one target word.  No
+        // translation replaces that host container, so manufacturing a
+        // one-word ArrayRead would stride into the middle of an element.  Keep
+        // the Vec read residual until ConstantData is projected into the
+        // PyPy-shaped managed constants list.
         assert_eq!(
             load_ops
                 .iter()
                 .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
                 .count(),
-            3
+            0
         );
-        assert!(!load_ops.iter().any(|op| {
+        assert!(load_ops.iter().any(|op| {
             matches!(
                 &op.kind,
                 OpKind::Call {
@@ -29046,7 +29253,9 @@ mod tests {
                 }),
                 "{fname}: checked narrowing must not remain an opaque core call"
             );
-            for expected in ["lt", "gt", "add"] {
+            // `or`, not a sum: `c_int_w` writes
+            // `value < INT_MIN or value > INT_MAX` (`baseobjspace.py:2066`).
+            for expected in ["lt", "gt", "or"] {
                 assert!(
                     graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
                         matches!(&op.kind, OpKind::BinOp { op, .. } if op == expected)
@@ -29131,43 +29340,6 @@ mod tests {
         ));
         assert!(thin(serde_json::json!({"RawPtr": [named_adt, "Mut"]})));
         assert!(!thin(uint("U8")));
-    }
-
-    /// RPython stores strings and non-empty tuples as GC pointers inside a
-    /// list (`rstr.py:229-230`, `rtuple.py:116-126`).  The MIR source types
-    /// can be wider (`&str`, an inline Rust tuple), but their translated list
-    /// element repr must retain the upstream one-word shape.  An arbitrary
-    /// named ADT remains excluded.
-    #[test]
-    fn rpython_string_and_tuple_list_items_are_gc_pointer_elements() {
-        let llbc = llbc_with_trait_impls(serde_json::json!([]));
-        let spelling =
-            |ty: serde_json::Value| json_ty_rpython_gc_pointer_element_spelling(&ty, &llbc);
-        let str_ty = serde_json::json!({
-            "Adt": {
-                "id": {"Builtin": "Str"},
-                "generics": {"types": []}
-            }
-        });
-        assert_eq!(spelling(str_ty).as_deref(), Some("str"));
-
-        let tuple_ty = serde_json::json!({
-            "Adt": {
-                "id": "Tuple",
-                "generics": {
-                    "types": [
-                        {"Literal": {"UInt": "U8"}},
-                        {"RawPtr": [{"Literal": {"Int": "I64"}}, "Mut"]}
-                    ]
-                }
-            }
-        });
-        assert_eq!(spelling(tuple_ty).as_deref(), Some("(u8,*mut i64)"));
-
-        let named_adt = serde_json::json!({
-            "Adt": {"id": {"Adt": 7}, "generics": {"types": []}}
-        });
-        assert_eq!(spelling(named_adt), None);
     }
 
     /// `[T]`, `str` and `dyn Trait` each have two Charon spellings — a
@@ -30739,7 +30911,7 @@ mod tests {
     /// `FixedObjectArray` item to the erased top reference.
     #[test]
     #[ignore]
-    fn popvalue_py_null_narrows_to_nullable_pyobject() {
+    fn popvalue_py_null_narrows_to_nullable_instance() {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -30751,7 +30923,7 @@ mod tests {
             "pyre_interpreter::pyframe::<Impl>::popvalue_maybe_none",
         )
         .expect("lower PyFrame::popvalue_maybe_none");
-        let has_nullable_pyobject = graph.blocks.iter().any(|block| {
+        let has_nullable_instance = graph.blocks.iter().any(|block| {
             block.operations.windows(2).any(|ops| {
                 matches!(
                     &ops[0].kind,
@@ -30770,7 +30942,7 @@ mod tests {
             })
         });
         assert!(
-            has_nullable_pyobject,
+            has_nullable_instance,
             "PY_NULL stack clear must lower as null_mut followed by a PyObject narrow"
         );
     }
@@ -31049,7 +31221,7 @@ mod tests {
     /// large interpreter snapshot.
     #[test]
     #[ignore]
-    fn load_local_value_arrayread_narrows_pyobject_item() {
+    fn load_local_value_arrayread_narrows_instance_item() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../build/llbc/pyre-interpreter.ullbc"
@@ -31058,7 +31230,7 @@ mod tests {
         let graph =
             super::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::load_local_value")
                 .expect("lower eval::<Impl>::load_local_value");
-        let has_pyobject_narrow = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+        let has_instance_narrow = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
             matches!(
                 &op.kind,
                 OpKind::Call {
@@ -31069,7 +31241,7 @@ mod tests {
             )
         });
         assert!(
-            has_pyobject_narrow,
+            has_instance_narrow,
             "FixedObjectArray getitem must recast its GCREF item to PyObject"
         );
     }
@@ -31263,52 +31435,59 @@ mod tests {
             "/../../build/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real object LLBC");
+        // `offset_leaf` is `None` for the two string rows on purpose: their
+        // `base` is `items_block_items_base(self.block)`, a call with no
+        // offset constant in the body, so a "no surviving offset read"
+        // assertion over them would hold whatever the fold did.  Their real
+        // content is the `push` half below.
         for (base, function, expected_array, expected_item, offset_leaf) in [
             (
                 "pyre_object::int_array::<Impl>::base",
                 "pyre_object::int_array::<Impl>::push",
                 "[i64]",
                 ValueType::Int,
-                "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
+                Some("TYPED_ITEMS_BLOCK_ITEMS_OFFSET"),
             ),
             (
                 "pyre_object::float_array::<Impl>::base",
                 "pyre_object::float_array::<Impl>::push",
                 "[f64]",
                 ValueType::Float,
-                "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
+                Some("TYPED_ITEMS_BLOCK_ITEMS_OFFSET"),
             ),
             (
                 "pyre_object::bytes_array::<Impl>::base",
                 "pyre_object::bytes_array::<Impl>::push",
                 super::STRING_GCREF_GCARRAY_TYPE_ID,
                 ValueType::Str,
-                "ITEMS_BLOCK_ITEMS_OFFSET",
+                None,
             ),
             (
                 "pyre_object::unicode_array::<Impl>::base",
                 "pyre_object::unicode_array::<Impl>::push",
                 super::STRING_GCREF_GCARRAY_TYPE_ID,
                 ValueType::Str,
-                "ITEMS_BLOCK_ITEMS_OFFSET",
+                None,
             ),
         ] {
-            let base_graph = super::lower_function(&llbc, base)
-                .unwrap_or_else(|err| panic!("lower {base}: {err}"));
-            assert!(
-                !base_graph
-                    .blocks
-                    .iter()
-                    .flat_map(|block| &block.operations)
-                    .any(|op| matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments },
-                            ..
-                        } if segments.last().is_some_and(|leaf| leaf == offset_leaf)
-                    )),
-                "{base} must fold the target-layout items offset"
-            );
+            if let Some(offset_leaf) = offset_leaf {
+                let base_graph = super::lower_function(&llbc, base)
+                    .unwrap_or_else(|err| panic!("lower {base}: {err}"));
+                assert!(
+                    !base_graph
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.operations)
+                        .any(|op| matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.last().is_some_and(|leaf| leaf == offset_leaf)
+                        )),
+                    "{base} must fold the target-layout items offset"
+                );
+            }
             let graph = super::lower_function(&llbc, function)
                 .unwrap_or_else(|err| panic!("lower {function}: {err}"));
             let operations: Vec<_> = graph
@@ -31697,9 +31876,13 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
-            .filter(
-                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0"),
-            )
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. }
+                if field.name == "__pos_0"
+                    && field.owner_root.as_deref().is_some_and(|owner| {
+                        owner.contains("Option") && owner.ends_with("::Some")
+                    }))
+            })
             .count();
         assert_eq!(
             pos0_reads, 0,
@@ -32225,7 +32408,7 @@ mod tests {
             "bool::then producing Option<PyObjectRef> must use RPython's nullable-pointer \
              representation (Some(ptr)=ptr, None=null), not an Option aggregate"
         );
-        let is_pyobject_narrow = |op: &crate::model::SpaceOperation| {
+        let is_instance_narrow = |op: &crate::model::SpaceOperation| {
             matches!(
                 &op.kind,
                 OpKind::Call {
@@ -32244,7 +32427,7 @@ mod tests {
                     } if name == "call_once"
                 )
             });
-            (has_call_once && block.operations.iter().any(is_pyobject_narrow))
+            (has_call_once && block.operations.iter().any(is_instance_narrow))
                 .then(|| block.exits.first().map(|link| link.target))
                 .flatten()
         });
@@ -32263,7 +32446,7 @@ mod tests {
                         } if segments == &["core", "ptr", "null_mut"]
                     )
                 })
-                && block.operations.iter().any(is_pyobject_narrow)
+                && block.operations.iter().any(is_instance_narrow)
         });
         assert!(
             narrowed_none,
@@ -32498,6 +32681,48 @@ mod tests {
         );
     }
 
+    /// `bytearrayobject.py:286-290` appends three values for a non-printable
+    /// byte — `'\\x'` and the two nibble characters.  The expansion consumed
+    /// the template's `\x` piece as a match condition only, so a JIT-compiled
+    /// repr rendered `bytearray(b'ff')` where CPython renders
+    /// `bytearray(b'\xff')`.  Assert the literal is emitted and folded first.
+    #[test]
+    fn lower_hex_byte_02_expansion_emits_the_backslash_x_literal() {
+        use crate::model::{CallTarget, ConcreteType, FunctionGraph, OpKind};
+        let mut graph = FunctionGraph::new("t");
+        let value = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let pieces = vec!["\\x".to_string(), String::new()];
+        let ops = super::emit_lower_hex_byte_02_ops(&mut graph, &pieces, &value, result.clone());
+
+        let literal = ops
+            .iter()
+            .find(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().is_some_and(|s| s == "__str_const")
+                        && segments.get(1).is_some_and(|s| s == "\\x"))
+            })
+            .expect("the template's leading `\\x` must be emitted, not only matched");
+        let literal = literal.result.clone().expect("__str_const has a result");
+
+        // `'\\x'` is upstream's FIRST buf.append, so it must be the left
+        // operand of the first concat.
+        let first_add = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
+            .expect("the parts fold through add");
+        let OpKind::BinOp { lhs, .. } = &first_add.kind else {
+            unreachable!("matched an add above")
+        };
+        assert_eq!(lhs.id(), literal.id(), "`\\x` must be concatenated first");
+
+        assert_eq!(
+            ops.last().and_then(|op| op.result.clone()).map(|v| v.id()),
+            Some(result.id()),
+            "the final op must reuse the displaced format result var"
+        );
+    }
+
     /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
     /// whole string and `SomeChar`.  `bytearray_repr_string` mixes
     /// `String::push_str` and `String::push(char)` in one loop, so omitting the
@@ -32527,6 +32752,15 @@ mod tests {
                         || segments.last().is_some_and(|leaf| leaf == "new_lower_hex"))
             }),
             "Rust fmt shell must collapse to PyPy's two-nibble lookup"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().is_some_and(|s| s == "__str_const")
+                        && segments.get(1).is_some_and(|s| s == "\\x"))
+            }),
+            "the collapse must keep upstream's `buf.append('\\\\x')` \
+             (bytearrayobject.py:288), not drop it with the fmt shell"
         );
         for opname in ["rshift", "and"] {
             assert!(
@@ -32757,6 +32991,19 @@ mod tests {
     /// lists with ordinary `getitem`.  The Rust `SliceIndex<usize>` shim must
     /// lower to the same ArrayRead shape instead of remaining an opaque core
     /// call that prevents the whole builtin-call chain from being annotated.
+    ///
+    /// The `arguments_w` side reaches that shape: its elements are object
+    /// pointers, one target word each, so the ArrayRead's stride is the host
+    /// stride.  `Signature.argnames` does NOT, and must keep its residual
+    /// `Vec::index`: PyPy's `Signature.argnames` is an RPython list of
+    /// `Ptr(STR)` (`rstr.py`, `StringRepr`), but pyre spells it
+    /// `Vec<&'static str>` — a two-word fat pointer per element — and no
+    /// translation converts the container.  Admitting it would make
+    /// `getarrayitem` compute `base + i * 8` over 16-byte elements.  The
+    /// convergence path is on the pyre side: give `Signature` a managed
+    /// string list, the one container whose items really are one GCREF each,
+    /// and this call joins the addressable set through the same
+    /// `first_arg_is_string_array_view` proof the items view already uses.
     #[test]
     #[ignore]
     fn bind_kwargs_indexes_lower_to_array_reads() {
@@ -32805,11 +33052,12 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(
-            residual_vec_indexes.len(),
-            0,
-            "PyPy argument.py list getitems must not remain opaque Vec::index calls: \
-             {residual_vec_indexes:#?}"
+        assert!(
+            !residual_vec_indexes.is_empty(),
+            "`Signature.argnames: Vec<&'static str>` must keep its residual \
+             Vec::index until the container becomes a managed string list; \
+             a one-word ArrayRead over two-word elements reads the wrong \
+             address from the second element on"
         );
         assert!(
             graph
@@ -32868,10 +33116,14 @@ mod tests {
         );
     }
 
-    /// Real-LLBC anchors for the three roots that previously left
-    /// `vec::Vec::index` opaque. Their corresponding PyPy operations are
-    /// ordinary list reads: argument-list concatenation, dict-item tuple
-    /// reads, and gateway keyword-name/value matching.
+    /// Real-LLBC anchors for three roots that spell one PyPy operation —
+    /// an ordinary list read — over three different host containers.
+    ///
+    /// Only `combine_starargs_wrapped` may lower: its elements are object
+    /// pointers, one target word each, so the emitted getarrayitem's stride
+    /// is the host stride.  `dict_repr` and `bind_builtin_kwargs` are held
+    /// here as counter-examples on purpose; being the same PyPy shape is not
+    /// what makes a read addressable, the element width is.
     #[test]
     #[ignore]
     fn pypy_list_item_roots_have_no_residual_vec_index() {
@@ -32881,14 +33133,10 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        for fname in [
-            "combine_starargs_wrapped",
-            "dict_repr",
-            "bind_builtin_kwargs",
-        ] {
+        let residual_vec_indexes = |fname: &str| {
             let graph = super::lower_function(&llbc, fname)
                 .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
-            let residual: Vec<_> = graph
+            graph
                 .blocks
                 .iter()
                 .flat_map(|block| &block.operations)
@@ -32901,10 +33149,38 @@ mod tests {
                         } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
                     )
                 })
-                .collect();
+                .count()
+        };
+        assert_eq!(
+            residual_vec_indexes("combine_starargs_wrapped"),
+            0,
+            "argument-list concatenation indexes object pointers, one target \
+             word each, so its getitems must not remain Vec::index"
+        );
+        // The other two are NOT in that set, and must not be added by widening
+        // the element gate.  Both are the same PyPy list read over a host
+        // container whose element is WIDER than one word, and no translation
+        // replaces the container:
+        //
+        // * `dict_repr` indexes `w_dict_items`'s
+        //   `Vec<(PyObjectRef, PyObjectRef)>`.  PyPy's `dictmultiobject.py`
+        //   pair really is one GC pointer per item, but only inside a list the
+        //   translation builds; here it is an INLINE 16-byte tuple, so a
+        //   one-word getarrayitem would read each pair's key twice and never
+        //   its value.
+        // * `bind_builtin_kwargs` indexes `names: &[&str]`.  PyPy's
+        //   `Signature.argnames` is a list of `Ptr(STR)`, but `&str` is a
+        //   two-word fat pointer here, so the same read would land mid-element
+        //   from the second name on.
+        //
+        // Lowering either means giving the pyre side a managed list — the one
+        // container whose items are one GCREF each — not relaxing the width
+        // proof in the element gate.
+        for fname in ["dict_repr", "bind_builtin_kwargs"] {
             assert!(
-                residual.is_empty(),
-                "{fname}: PyPy list getitems must not remain Vec::index: {residual:#?}"
+                residual_vec_indexes(fname) > 0,
+                "{fname}: a wider-than-one-word host element must keep its \
+                 residual Vec::index"
             );
         }
     }
@@ -33026,7 +33302,7 @@ mod tests {
     /// pointer while field reads expect the concrete PyObject repr.
     #[test]
     #[ignore]
-    fn pyerror_exc_object_registry_retains_pyobjectref() {
+    fn pyerror_exc_object_registry_retains_instance_ref() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../build/llbc/pyre-interpreter.ullbc"
@@ -33116,7 +33392,7 @@ mod tests {
     /// the same narrowing as a struct-literal initializer.
     #[test]
     #[ignore]
-    fn pyerror_projection_writes_retain_pyobject_class() {
+    fn pyerror_projection_writes_retain_instance_class() {
         use crate::model::{CallTarget, LinkArg, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -33256,8 +33532,26 @@ mod tests {
             "/../../build/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph =
-            super::lower_function(&llbc, "forwarded_exporter").expect("lower forwarded_exporter");
+        // `lower_function`'s default host table names NO error carrier, and
+        // the carrier is what `tyref_is_result_of_carrier` compares `E`
+        // against — with the default the closure's `Result<*mut PyObject,
+        // PyError>` is not a scoped result, `call_once_result_exc` stays
+        // `None`, and the rewrap this test grades can never be reached.
+        // Pass the same spec `pyre-jit-trace`'s prepass installs.
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "forwarded_exporter",
+            crate::HostStaticAddrs {
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_wrappers: &[],
+                    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                    from_exc_object: Some(("PyError", "from_exc_object")),
+                },
+                ..crate::HostStaticAddrs::default()
+            },
+        )
+        .expect("lower forwarded_exporter");
 
         let call_block = graph
             .blocks
@@ -33409,6 +33703,9 @@ mod tests {
         let llbc = Llbc::load(path).expect("load real LLBC");
         for name in [
             "pyre_interpreter::module::_collections::modified",
+            // `checklock`'s comparison half — the graph that carries the
+            // `self.lock` field read.  `checklock` itself only wraps it in
+            // the `RuntimeError` raise.
             "pyre_interpreter::module::_collections::lock_valid",
         ] {
             let graph = super::lower_function(&llbc, name)

@@ -2631,17 +2631,26 @@ fn field_slot_disagreement(
 
 /// Whether `slot` and `field` name the same field.
 ///
-/// Both halves must agree. `field_key()` is `descr.py:220-233`'s fieldname
-/// cache key, and therefore the structural equivalent of the name on the one
-/// RPython FieldDescr object. `field_name()` is only its display label and may
-/// retain a different LLBC spelling of the same StructId
-/// (`option::Option.__discriminant` vs
-/// `core::option::Option.__discriminant`). The key is not always carried — the
-/// flattened inline aggregates (`ob_header`, an enum's `__pos_0`) reach here
-/// under the documented empty-name fallback — so it is compared only when
-/// both sides have one, and the offset is compared always. Neither alone is
-/// sufficient: a key can be absent, and a flattened layout puts an aggregate
-/// and its first leaf at one address (`heaptracker.py:68-69`).
+/// Both halves must agree. `field_key()` is the FIELDNAME half of
+/// `get_field_descr`'s cache key (`descr.py`, `cache[STRUCT][fieldname]`) —
+/// only the half: upstream keys on the owning STRUCT as well, and carries the
+/// owner on the descr itself as `name = '%s.%s' % (STRUCT._name, fieldname)`
+/// plus `get_parent_descr()`. This comparison deliberately drops the owner,
+/// because `field_name()` may retain a different LLBC spelling of the same
+/// StructId (`option::Option.__discriminant` vs
+/// `core::option::Option.__discriminant`) and comparing those answers "apart"
+/// for one class. The cost is that a field of one struct claiming a slot in
+/// another struct's descr is no longer detected when the two share a leaf
+/// name AND an offset. Converging means resolving the owner to a StructId —
+/// the same move `unique_trait_impl_roots` made — and comparing that
+/// alongside the leaf, not restoring the full-name comparison.
+///
+/// The key is not always carried — the flattened inline aggregates
+/// (`ob_header`, an enum's `__pos_0`) reach here under the documented
+/// empty-name fallback — so it is compared only when both sides have one, and
+/// the offset is compared always. Neither alone is sufficient: a key can be
+/// absent, and a flattened layout puts an aggregate and its first leaf at one
+/// address (`heaptracker.py:68-69`).
 pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) -> bool {
     let named_apart = !field.field_key().is_empty()
         && !slot.field_key().is_empty()
