@@ -1284,7 +1284,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             return entries.next_valid_slot(from);
         }
         self.next_entry_slot(
-            &*crate::dictmultiobject::w_module_dict_get_storage(w_dict),
+            crate::dictmultiobject::w_module_dict_module_storage(w_dict),
             from,
         )
     }
@@ -1294,7 +1294,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             return entries.prev_valid_slot(before);
         }
         self.prev_entry_slot(
-            &*crate::dictmultiobject::w_module_dict_get_storage(w_dict),
+            crate::dictmultiobject::w_module_dict_module_storage(w_dict),
             before,
         )
     }
