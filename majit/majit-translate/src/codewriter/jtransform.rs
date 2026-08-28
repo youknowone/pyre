@@ -2833,7 +2833,9 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         match hint_kind {
-            crate::hints::HintKind::AccessDirectly | crate::hints::HintKind::FreshVirtualizable => {
+            crate::hints::HintKind::AccessDirectly
+            | crate::hints::HintKind::NoAccessDirectly
+            | crate::hints::HintKind::FreshVirtualizable => {
                 // `jtransform.py:655-656 if hints.get('fresh_virtualizable')
                 // or hints.get('access_directly'): return` — both are
                 // consumed without emitting an operation.

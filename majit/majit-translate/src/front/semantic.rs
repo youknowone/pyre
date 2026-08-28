@@ -577,21 +577,32 @@ fn access_directly_seeds(
     index: &std::collections::HashMap<String, usize>,
 ) -> Vec<crate::flowspace::model::Variable> {
     let mut seeds = Vec::new();
+    // `hint(x, access_directly=False)` deletes the flags rather than setting
+    // them, so its RESULT is unflagged even when its operand was. Upstream
+    // gets that from re-binding the name to the stripped annotation; here the
+    // result variable has to be excluded from the seeds by hand.
+    let mut killed = Vec::new();
     for block in &func.graph.blocks {
         for op in &block.operations {
-            // `rlib/jit.py` mints `fresh_virtualizable` only alongside
-            // `access_directly`, so both hint spellings seed here.
-            if let crate::model::OpKind::Hint { value, kind } = &op.kind
-                && matches!(
-                    kind,
-                    crate::hints::HintKind::AccessDirectly
-                        | crate::hints::HintKind::FreshVirtualizable
-                )
-            {
-                seeds.push(value.clone());
-                if let Some(result) = &op.result {
-                    seeds.push(result.clone());
+            let crate::model::OpKind::Hint { value, kind } = &op.kind else {
+                continue;
+            };
+            match kind {
+                // `rlib/jit.py` mints `fresh_virtualizable` only alongside
+                // `access_directly`, so both spellings seed.
+                crate::hints::HintKind::AccessDirectly
+                | crate::hints::HintKind::FreshVirtualizable => {
+                    seeds.push(value.clone());
+                    if let Some(result) = &op.result {
+                        seeds.push(result.clone());
+                    }
                 }
+                crate::hints::HintKind::NoAccessDirectly => {
+                    if let Some(result) = &op.result {
+                        killed.push(result.clone());
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -608,6 +619,7 @@ fn access_directly_seeds(
             }
         }
     }
+    seeds.retain(|seed| !killed.iter().any(|dead| dead == seed));
     seeds
 }
 
@@ -773,6 +785,65 @@ mod tests {
         assert!(
             !fns[2].graph.access_directly,
             "reached with and without the flag must stay unflagged"
+        );
+    }
+
+    /// `executioncontext.py app_profile_call` re-binds the frame through
+    /// `hint(frame, access_directly=False)` before handing it to arbitrary
+    /// Python — "from here on, frame is just a normal w_object". The callees
+    /// below that point must not be flagged, or the gate aborts a build
+    /// upstream completes.
+    #[test]
+    fn the_false_spelling_kills_the_seed_for_everything_below_it() {
+        use crate::flowspace::model::Variable;
+        use crate::model::{BlockId, CallTarget, OpKind, SpaceOperation, ValueType};
+
+        // A callee that receives the flag, which then re-binds it away and
+        // passes the result on.
+        let mut mid = caller_hinting_arg0("app_profile_call", None, &[]);
+        let param = mid.graph.block(BlockId(0)).inputargs[0].clone();
+        let normal = Variable::named("normal_w_object");
+        mid.graph
+            .block_mut(BlockId(0))
+            .operations
+            .push(SpaceOperation {
+                result: Some(normal.clone()),
+                kind: OpKind::Hint {
+                    value: param,
+                    kind: crate::hints::HintKind::NoAccessDirectly,
+                },
+            });
+        mid.graph
+            .block_mut(BlockId(0))
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["call_function".to_string()],
+                    },
+                    args: vec![normal],
+                    result_ty: ValueType::Void,
+                },
+            });
+
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("app_profile_call", 1)],
+            ),
+            mid,
+            free_fn("call_function"),
+        ];
+        propagate_access_directly(&mut fns);
+        assert!(
+            fns[1].graph.access_directly,
+            "app_profile_call itself is reached with the flag"
+        );
+        assert!(
+            !fns[2].graph.access_directly,
+            "the flag must not survive the access_directly=False re-bind"
         );
     }
 

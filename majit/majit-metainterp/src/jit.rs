@@ -67,6 +67,25 @@ pub fn hint_access_directly<T>(x: T) -> T {
     hint(x)
 }
 
+/// Stop treating a virtualizable as one: from here on the value is an
+/// ordinary object.
+///
+/// rlib/jit.py — `hint(x, access_directly=False)`
+///
+/// Upstream's single `hint(x, **kwds)` takes the flag's value as a keyword,
+/// and the `False` spelling is not a no-op: the entry DELETES
+/// `access_directly` and `fresh_virtualizable` from the annotation's flags.
+/// `executioncontext.py` uses it at both points where a frame is handed to
+/// arbitrary Python ("from here on, frame is just a normal w_object"), so
+/// the callee set below is not specialised on the virtualizable protocol.
+///
+/// Pyre dispatches one helper per kwarg, so the `False` value becomes this
+/// separate name rather than an argument.
+#[inline(always)]
+pub fn hint_no_access_directly<T>(x: T) -> T {
+    hint(x)
+}
+
 /// Declare that the virtualizable was just allocated, so storing
 /// directly on it is what is wanted — `Frame.__init__` is the motivating
 /// case (`pypy/interpreter/pyframe.py:99`).  Its redirected fields are
