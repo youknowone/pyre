@@ -2114,15 +2114,6 @@ impl<S: JitState> JitDriver<S> {
     /// RPython parity: `metainterp_sd.jitcodes[portal_jd.index]` global
     /// registry slot assignment, scoped to the per-`#[jit_interp]` driver.
     pub fn register_dispatch_jitcode(&mut self, jitcode: crate::jitcode::JitCode) {
-        // Slice (audit Issue #5) — cross-check the dispatch JitCode
-        // body's `BC_JIT_MERGE_POINT` payload partition against the
-        // declared driver schema (set via `declare_schema` at the
-        // macro-emitted install path).  The check fires only when a
-        // schema is non-empty AND the payload counts disagree, which
-        // indicates a codegen / `make_three_lists` regression.
-        // Production-active — `warmspot.py:660-666
-        // make_args_specification` translation-time assert parity.
-        validate_dispatch_jitcode_payload(self, &jitcode);
         let (registry, dispatch_arc) =
             build_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode);
         self.adopt_dispatch_registry(registry, dispatch_arc);
@@ -2146,7 +2137,6 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         jitcode: &std::sync::Arc<crate::jitcode::JitCode>,
     ) {
-        validate_dispatch_jitcode_payload(self, jitcode);
         let (registry, dispatch_arc) =
             build_seeded_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode)
                 .unwrap_or_else(|| {
@@ -2165,6 +2155,14 @@ impl<S: JitState> JitDriver<S> {
         registry: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
         dispatch_arc: std::sync::Arc<crate::jitcode::JitCode>,
     ) {
+        // Validate after `build_jitcode_registry` has selected the canonical
+        // indexed identity. A seeded caller is only a locator: name, index,
+        // and merge offset do not prove equal bodies, and validating that
+        // disposable shell before adopting `all_jitcodes[index]` would install
+        // unchecked bytecode. `codewriter.py CodeWriter.make_jitcodes` owns
+        // the identity invariant `all_jitcodes[jitcode.index] is jitcode`;
+        // validate that exact object before publishing it as `mainjitcode`.
+        validate_dispatch_jitcode_payload(self, &dispatch_arc);
         // call.py `grab_initial_jitcodes`:
         //
         //     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
@@ -11610,6 +11608,40 @@ mod jitcode_registry_tests {
         ))];
         let dispatch = jitcode_value_with_merge_offset("mainloop", Some(0), Some(7));
         build_jitcode_registry(&seed, dispatch);
+    }
+
+    /// Name, index, and merge offset can all agree while the bodies do not.
+    /// Registration therefore validates the seed entry selected by the
+    /// codewriter's indexed object identity, rather than the locator shell the
+    /// caller hands over and then drops.
+    #[test]
+    #[should_panic(expected = "payload slot 0 count 1 disagrees")]
+    fn adoption_validates_the_seeded_object_that_it_installs() {
+        let seeded_core = majit_translate::jitcode::JitCode::new("mainloop");
+        seeded_core.set_body(majit_translate::jitcode::JitCodeBody {
+            code: vec![
+                majit_translate::codewriter::insns::BC_JIT_MERGE_POINT,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            jit_merge_point_offset: Some(0),
+            ..Default::default()
+        });
+        seeded_core.set_index(0);
+        let seed = vec![Arc::new(JitCode::from_canonical(seeded_core))];
+        let locator = seeded_portal("mainloop", 0, 0);
+        let locator = Arc::try_unwrap(locator).expect("the locator has one owner");
+        let (registry, adopted) = build_jitcode_registry(&seed, locator);
+        let mut driver = JitDriver::<RegistryState>::new(2);
+        driver.declare_schema(Vec::new(), Vec::new());
+
+        driver.adopt_dispatch_registry(registry, adopted);
     }
 
     /// A dispatch numbered past the end of the seed names the method that
