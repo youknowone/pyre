@@ -1127,6 +1127,15 @@ pub struct ClosureRuntime<FLabel> {
     label_at: FLabel,
 }
 
+static SYMBOLIC_RESIDUAL_TRACE_ABORTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of tracing instructions precisely declined because their concrete
+/// residual-call target was still a symbolic path hash.
+pub fn symbolic_residual_trace_aborts() -> u64 {
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
 /// placeholder, once per distinct target.
 ///
@@ -1137,15 +1146,6 @@ pub struct ClosureRuntime<FLabel> {
 /// declines the same shape on its own residual-call handlers; this is the
 /// tracing side of that check. Every caller returns [`TraceAction::Abort`]
 /// before making the call, so discarding the recording needs no rollback.
-static SYMBOLIC_RESIDUAL_TRACE_ABORTS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Number of tracing instructions precisely declined because their concrete
-/// residual-call target was still a symbolic path hash.
-pub fn symbolic_residual_trace_aborts() -> u64 {
-    SYMBOLIC_RESIDUAL_TRACE_ABORTS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 fn report_symbolic_residual_call_target(
     ctx: &mut TraceCtx,
     func: usize,
