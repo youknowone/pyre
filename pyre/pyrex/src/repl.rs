@@ -57,8 +57,9 @@ pub(crate) const BANNER_COPYRIGHT: &str =
 /// the `-i` that follows it.  `pymain_run_python` reaches the prompt without
 /// starting anything over -- the program's `__main__` is the prompt's, and
 /// startup ran once -- so a resumed prompt skips the whole block below and
-/// takes only the parts that are the prompt's own: `sys.ps1`/`ps2` and the
-/// interactive flags.
+/// takes only the parts that are the prompt's own: `sys.ps1`/`ps2`, the
+/// interactive flags, and `sys.__interactivehook__`.  The PYTHONSTARTUP file
+/// is the one step it does not take; that belongs to `pymain_run_stdin`.
 pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) {
     let mut repl = Readline::new();
     let history_path = repl_history_path();
@@ -68,7 +69,10 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
     }
 
     let _root = pyre_object::gc_roots::push_roots();
-    let (execution_context, canonical, _main_module) = match resume {
+    // A resumed prompt is `pymain_repl`, the one that follows a program; a fresh
+    // one is `pymain_run_stdin`.  Only the second runs the startup file.
+    let resumed = resume.is_some();
+    let (execution_context, canonical, main_module) = match resume {
         Some(session) => {
             // The root scope the program pinned these in is gone with the
             // frame that ran it, and the prompt holds them for the rest of the
@@ -124,6 +128,12 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
         }
     };
 
+    // `import_site` and the importlib bootstrap ran Python since the fresh arm
+    // above minted its `__main__`, and the resumed one has a whole program
+    // behind it, so the module is read back off a pin rather than trusted as a
+    // local -- the same reason the resumed arm pins what the session carried.
+    let main_module = pyre_object::gc_roots::pin_root(main_module);
+
     // The prompt reads `sys.ps1`/`ps2` off the interpreter's own `sys`, the way
     // `_PySys_GetOptionalAttr` reads `PyInterpreterState.sysdict`.  Importing
     // the name instead would follow whatever the program left in
@@ -142,6 +152,8 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
         sys_module,
     };
 
+    // `pymain_header` runs before either step below, and `pymain_run_stdin`
+    // takes the startup file first and the hook second.
     if !quiet {
         // `pymain_header` writes both of its lines with `fprintf(stderr, ...)`,
         // and `print_banner` reaches the same descriptor through `sys.stderr`,
@@ -151,6 +163,11 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
         eprintln!("{BANNER}");
         eprintln!("Type \"exit()\" or Ctrl-D to exit.");
     }
+
+    if !resumed {
+        run_startup_file(&runtime, canonical, main_module);
+    }
+    run_interactive_hook(&runtime, canonical);
 
     let mut full_input = String::new();
     let mut continuing_block = false;
@@ -261,6 +278,146 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
     // where this sits.
     if crate::had_unhandled_keyboard_interrupt() {
         crate::terminate_by_sigint();
+    }
+}
+
+/// Report a failure one of the prompt's own startup steps raised.
+///
+/// `pymain_err_print` takes `SystemExit` first, so a startup file or an
+/// interactive hook that raises one ends the process instead of reaching the
+/// prompt; everything else is printed through `sys.excepthook` and the prompt
+/// opens over it.
+fn report_or_exit_before_prompt(
+    error: PyError,
+    canonical: pyre_object::PyObjectRef,
+    ctx_ptr: *const PyExecutionContext,
+) {
+    if error.kind == pyre_interpreter::PyErrorKind::SystemExit {
+        crate::finalize_system_exit(error, canonical, ctx_ptr);
+    }
+    crate::report_main_error_for_inspect(error);
+}
+
+/// Run `source` in the prompt's `__main__` namespace.
+fn exec_in_main(runtime: &ReplRuntime, code: pyre_interpreter::CodeObject) -> Result<(), PyError> {
+    let code_ptr = Box::into_raw(Box::new(code));
+    let w_code = pyre_interpreter::pycode::w_code_new(code_ptr as *const ());
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(w_code);
+    let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let mut frame = pyre_interpreter::pyframe::createframe_obj(
+        pyre_object::gc_roots::shadow_stack_get(code_slot) as *const (),
+        runtime.w_globals,
+        runtime.ctx_ptr,
+        None,
+    )?;
+    eval_with_jit(&mut frame, None).map(|_| ())
+}
+
+/// `pymain_run_startup` — the PYTHONSTARTUP file, run in `__main__` ahead of
+/// the prompt that reads stdin.
+///
+/// Only that prompt runs it.  `pymain_repl`, the prompt that follows `-c`, `-m`
+/// or a script, does not, so a program never has one run after it.
+///
+/// A file that will not open is reported and skipped: the two lines are the
+/// fixed `Could not open PYTHONSTARTUP` and the `OSError` built from the errno,
+/// printed the way every other failure here is.
+fn run_startup_file(
+    runtime: &ReplRuntime,
+    canonical: pyre_object::PyObjectRef,
+    main_module: pyre_object::PyObjectRef,
+) {
+    if importing::ignore_environment_flag() {
+        return;
+    }
+    let Some(path) = std::env::var_os("PYTHONSTARTUP") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let path = std::path::PathBuf::from(path);
+    let display = path.to_string_lossy().into_owned();
+    let bytes = match importing::read_source_bytes(&path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("Could not open PYTHONSTARTUP");
+            let w_filename = pyre_object::w_str_new(&display);
+            report_or_exit_before_prompt(
+                PyError::os_error_syscall(e.raw_os_error().unwrap_or(0), w_filename),
+                canonical,
+                runtime.ctx_ptr,
+            );
+            return;
+        }
+    };
+    let source = match pyre_interpreter::decode_source_bytes(
+        &bytes,
+        rustpython_wtf8::Wtf8::new(display.as_str()),
+        false,
+    ) {
+        Ok(source) => source,
+        Err(error) => {
+            report_or_exit_before_prompt(error, canonical, runtime.ctx_ptr);
+            return;
+        }
+    };
+
+    // `_PyRun_SimpleFileObject` binds the two module-identity attributes only
+    // when `__file__` is not already there, and removes exactly what it bound.
+    // The prompt's `__main__` has neither, so the startup file sees its own
+    // path and the prompt that follows sees no `__file__` at all.
+    let bind_file_name =
+        pyre_interpreter::baseobjspace::getattr_str(main_module, "__file__").is_err();
+    if bind_file_name {
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            main_module,
+            "__file__",
+            pyre_object::w_str_new(&display),
+        );
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            main_module,
+            "__cached__",
+            pyre_object::w_none(),
+        );
+    }
+    let outcome =
+        match pyre_interpreter::compile_source_with_filename(&source, Mode::Exec, &display) {
+            Ok(code) => exec_in_main(runtime, code),
+            Err(e) => Err(pyre_interpreter::compile_err_to_syntax_error(e, &source)),
+        };
+    if bind_file_name {
+        let _ = pyre_interpreter::baseobjspace::delattr_str(main_module, "__file__");
+        let _ = pyre_interpreter::baseobjspace::delattr_str(main_module, "__cached__");
+    }
+    if let Err(error) = outcome {
+        report_or_exit_before_prompt(error, canonical, runtime.ctx_ptr);
+    }
+}
+
+/// `pymain_run_interactive_hook` — `sys.__interactivehook__()`, which
+/// `site.enablerlcompleter` leaves behind for whichever prompt opens.
+///
+/// Every prompt calls it, the one that follows a program included.  The name is
+/// read off the interpreter's own `sys` for the reason `ps1` is; a missing one
+/// is not a failure, which is what an `-S` run relies on.
+fn run_interactive_hook(runtime: &ReplRuntime, canonical: pyre_object::PyObjectRef) {
+    let Ok(hook) =
+        pyre_interpreter::baseobjspace::getattr_str(runtime.sys_module, "__interactivehook__")
+    else {
+        return;
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(hook);
+    let hook_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let called = pyre_interpreter::call::call_function_impl_result(
+        pyre_object::gc_roots::shadow_stack_get(hook_slot),
+        &[],
+    );
+    if let Err(error) = called {
+        eprintln!("Failed calling sys.__interactivehook__");
+        report_or_exit_before_prompt(error, canonical, runtime.ctx_ptr);
     }
 }
 
