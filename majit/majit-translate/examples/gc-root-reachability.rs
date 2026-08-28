@@ -404,6 +404,38 @@ fn main() {
             "       of which hold a NON-ARGUMENT live pointer: {} fn(s)",
             non_arg_fns.len()
         );
+        // The findings as data rather than as a report.  The printed lines
+        // above are shaped for a reader and are parsed positionally by
+        // `scripts/check-gc-root-brackets.py`; a rewriter needs the site
+        // itself -- which file, which line, which callee, and the names to
+        // bracket -- and needs it to survive a change to the prose.
+        if let Ok(path) = std::env::var("GC_FINDINGS_JSON") {
+            let mut out = String::new();
+            for f in &found {
+                let row = serde_json::json!({
+                    "file": f.file,
+                    "line": f.line,
+                    "func": f.func_name,
+                    "callee": f.callee_name,
+                    // The two live columns stay apart: upstream's
+                    // `get_livevars_for_roots` drops the call's own arguments
+                    // for a moving GC, and whether pyre may do the same is the
+                    // divergence this module's header records.
+                    "live_non_arg": f.live_non_arg,
+                    "live_arg": f.live_arg,
+                    "movable_use": f.movable_use,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match std::fs::write(&path, out) {
+                Ok(()) => println!("       wrote {} finding(s) to {path}", found.len()),
+                // A report that says it wrote and did not is worse than one
+                // that fails, so this is loud even though the scan itself
+                // succeeded.
+                Err(e) => println!("       FAILED to write {path}: {e}"),
+            }
+        }
         // Tier 1: the callee is *itself* a dispatch seed, so "this call runs
         // Python" needs no transitive argument.  Tier 2 reaches Python only
         // through further calls and is far likelier to be a false positive.
