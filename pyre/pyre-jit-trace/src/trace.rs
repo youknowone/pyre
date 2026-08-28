@@ -1092,8 +1092,8 @@ fn try_commit_midbody_abort_inner(
     }
 }
 
-/// Whether `code` carries a backward jump — the loop a reconstructed callee
-/// can reach.
+/// Whether a backward jump is reachable from `start_pc` — the loop a
+/// reconstructed frame resumed there can still reach.
 ///
 /// `drive_bridge_carrier_walk` keeps its sub-walk only on a clean
 /// `SubReturn`; every other outcome falls through to the journal-rollback tail,
@@ -1103,11 +1103,23 @@ fn try_commit_midbody_abort_inner(
 /// replayed region reads fields it has already written.  A callee that reaches
 /// its own loop header while a compiled token exists for it surfaces
 /// `SubLoopCalleeCallAssembler`, one such outcome, and that is only decidable
-/// after the prologue has run.  Decide on the code instead and decline before
+/// after the prologue has run.  Walk the code instead and decline before
 /// driving anything: the effect odometer has not moved at that point, so the
-/// rollback the decline falls into is sound.  The test is a superset — a loop
-/// whose header has no compiled token would have walked through — so it costs
-/// bridges rather than answers.
+/// rollback the decline falls into is sound.
+///
+/// The walk starts where the drain resumes the frame, not at the top of the
+/// code, because a frame resumed past its loops cannot re-enter them.  Reading
+/// the whole code object instead declined `inline_subwalk_user_iterator`'s
+/// `step`, resumed at py 37 with only the `return` tail ahead of it and its one
+/// header behind at py 20, and that decline cost 402 -> 5988 guard failures and
+/// a `loops_aborted` of 1.
+///
+/// Successors are the codewriter's: fall-through unless the opcode is an
+/// unconditional jump, the branch operand's target, and the handler any
+/// covering exception-table entry names.  The test remains a superset of the
+/// outcome it stands for — a header whose token is not compiled would have
+/// walked through — so it still costs bridges rather than answers, and a seed
+/// that lands outside the code declines rather than admits.
 ///
 /// Deciding early rather than repairing the tail is what the tail itself
 /// reports.  On `chunked_read_keeps_its_buffered_tail.py` without this arm,
@@ -1129,15 +1141,60 @@ fn try_commit_midbody_abort_inner(
 /// holds and then replays the region over stores that already stand.  Repairing
 /// that means making the adopt succeed for this shape, not making the rollback
 /// reach further; until it does, not entering is the only sound road.
-fn code_has_backward_jump(code: &pyre_interpreter::CodeObject) -> bool {
+fn backward_jump_reachable_from(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
-    let mut arg_state = pyre_interpreter::OpArgState::default();
-    code.instructions.iter().copied().any(|unit| {
-        matches!(
-            arg_state.get(unit).0,
+    let n = code.instructions.len();
+    // An entry the projection cannot place inside this code object leaves the
+    // walk with nothing to explore, and an empty walk answers "no loop" -- the
+    // admitting answer. Refuse instead: not knowing where the frame resumes is
+    // not evidence that it resumes outside every loop.
+    if start_pc >= n {
+        return true;
+    }
+    // On a raise the unwinder transfers to the covering handler, which is a
+    // control-flow successor the branch operand does not carry.
+    let handlers: Vec<(usize, usize, usize)> =
+        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+            .map(|e| {
+                (
+                    e.start as usize / 2,
+                    e.end as usize / 2,
+                    e.target as usize / 2,
+                )
+            })
+            .collect();
+    let mut seen = vec![false; n];
+    let mut work = vec![start_pc];
+    while let Some(pc) = work.pop() {
+        if pc >= n || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            // An opcode this build cannot decode says nothing about where it
+            // goes, so keep walking past it rather than pruning the successor.
+            work.push(pc + 1);
+            continue;
+        };
+        if matches!(
+            instr,
             I::JumpBackward { .. } | I::JumpBackwardNoInterrupt { .. }
-        )
-    })
+        ) {
+            return true;
+        }
+        if !crate::liveness::is_unconditional_jump(&instr) {
+            work.push(pc + 1);
+        }
+        if let Some(target) = crate::liveness::target_pc(code, &instr, pc, op_arg) {
+            work.push(target);
+        }
+        for (start, end, target) in &handlers {
+            if pc >= *start && pc < *end {
+                work.push(*target);
+            }
+        }
+    }
+    false
 }
 
 fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
@@ -1935,20 +1992,54 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
         return p2_drain_abort();
     }
-    // Before anything runs in the callee: a loop-bearing one can stop the
-    // sub-walk at an outcome this drain does not keep, and the rollback that
-    // follows does not reach what the sub-walk has already executed by then.
-    // See `code_has_backward_jump`.
-    if code_has_backward_jump(unsafe { &*raw_callee_code }) {
-        // The predicate reads the whole code object, so it can never become
-        // false for this callee and the drain can never succeed here.  That
-        // puts it with `NoRecipes` rather than with the arms above: leaving
-        // the guard eligible retries the same setup/scan/abort at every
-        // failure, which is the churn that arm's comment measures.
-        fbw_bridge_decline(ctx);
-        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
-        crate::jitcode_dispatch::census_record("P2Drain::LoopBearingCallee");
-        return p2_drain_abort();
+    // Before anything runs in the callee: a frame that can reach a loop header
+    // from where the drain resumes it can stop the sub-walk at an outcome this
+    // drain does not keep, and the rollback that follows does not reach what
+    // the sub-walk has already executed by then.
+    // See `backward_jump_reachable_from`.
+    //
+    // Every recipe is tested, not the deepest alone.  A middle frame is driven
+    // by the same `drive_bridge_frame_subwalk`, so it surfaces the same outcome
+    // from its own header -- and it is driven only after the deepest callee has
+    // executed, which is exactly the position this arm exists to avoid.  For a
+    // self-recursive carrier every recipe shares one code object, so the
+    // whole-code test this replaces covered the middles by accident; reading
+    // each recipe's own resume point is what keeps that cover once the test
+    // stops reading the whole code.
+    for carried in carrier.recipes.iter() {
+        let raw_code = carried.code_ptr as *const pyre_interpreter::CodeObject;
+        let seed = (!raw_code.is_null())
+            .then(|| crate::state::pyjitcode_for_code(carried.code_ptr))
+            .flatten()
+            .and_then(|carried_pjc| {
+                let carried_entry = select_recipe_entry(
+                    carried.jitcode_index,
+                    carried_pjc.jitcode.index() as i32,
+                    carried.jitcode_pc,
+                )?;
+                Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
+                    &carried_pjc.metadata,
+                    carried_entry,
+                ) as usize)
+            });
+        // A recipe the drain cannot project has no resume point to test, and
+        // admitting it would drive a frame this arm never read.
+        let Some(seed) = seed else {
+            fbw_bridge_decline(ctx);
+            discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+            crate::jitcode_dispatch::census_record("P2Drain::RecipeNotProjectable");
+            return p2_drain_abort();
+        };
+        if backward_jump_reachable_from(unsafe { &*raw_code }, seed) {
+            // Kept permanently declined, as the whole-code test was: the churn
+            // the `NoRecipes` arm measures is what a retryable decline of this
+            // class costs, and narrowing which carriers reach here does not
+            // change what happens to the ones that do.
+            fbw_bridge_decline(ctx);
+            discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+            crate::jitcode_dispatch::census_record("P2Drain::LoopBearingCallee");
+            return p2_drain_abort();
+        }
     }
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
