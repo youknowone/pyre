@@ -502,6 +502,25 @@ impl<'a> MirGraphLookup<'a> {
 ///   accessor, a `Vec` — is not followed. `Rvalue::Use` needs no rule: the
 ///   front end reuses the operand's `Variable` rather than emitting a copy.
 ///
+/// `default_specialize` also reads `_jit_look_inside_` off the callee before
+/// it specializes: when that is False it deletes `access_directly` from the
+/// argument annotation rather than keying a second graph, so a
+/// `dont_look_inside` function is never flagged by any caller. The harvested
+/// marker set is passed in and a callee it names is skipped, which is that
+/// deletion — without it the pass would hand `policy::look_inside_graph` a
+/// flag on exactly the graphs it aborts on.
+///
+/// One half of the minter is NOT reproduced here. `rlib/jit.py`'s `hint`
+/// entry only sets the flag when the value is a `SomeInstance` whose
+/// classdesc declares `_virtualizable_`, and deletes it otherwise; this pass
+/// seeds on the `OpKind::Hint` op whatever the value is. Reproducing it needs
+/// the virtualizable class-root set at front-end time, and pyre declares that
+/// set out of band as a data table the BUILD SCRIPT turns into
+/// `GraphTransformConfig::vable_fields` for the codewriter, so the check
+/// cannot be made without threading that config into `front::mir`. Until
+/// then, a hint spelled on a non-virtualizable value would seed where
+/// upstream erases.
+///
 /// A callee that does not resolve to a lowered function is skipped entirely
 /// — it can neither be flagged nor veto a flag, since there is no graph for
 /// the gate to read. A `FunctionPath` resolves by crate-stripped path; a
@@ -520,7 +539,10 @@ impl<'a> MirGraphLookup<'a> {
 /// the suppression the flag would buy (dropping a `jit_force_virtualizable`)
 /// has no injector on this path yet — but it means the gate is quiet by
 /// absence, not by agreement, and a census is the only way to tell which.
-pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
+pub(crate) fn propagate_access_directly(
+    functions: &mut [SemanticFunction],
+    dont_look_inside: &std::collections::HashSet<String>,
+) {
     use std::collections::HashMap;
 
     fn path_of(f: &SemanticFunction) -> String {
@@ -531,11 +553,18 @@ pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
         }
     }
 
-    let index: HashMap<String, usize> = functions
-        .iter()
-        .enumerate()
-        .map(|(i, f)| (path_of(f), i))
-        .collect();
+    // `None` marks a path more than one lowered function answers to.
+    // `cachedgraph(key)` upstream is keyed on the `FunctionDesc`, i.e. the
+    // function object itself; a crate-stripped path is a weaker key, so a
+    // collision has to be refused rather than silently resolved to whichever
+    // function was collected last.
+    let mut index: HashMap<String, Option<usize>> = HashMap::new();
+    for (i, func) in functions.iter().enumerate() {
+        index
+            .entry(path_of(func))
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(i));
+    }
 
     // A method call target names the receiver's type root and the method,
     // not a path, so it cannot be looked up in `index`. `call.rs
@@ -555,6 +584,13 @@ pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
             .and_modify(|slot| *slot = None)
             .or_insert(Some(i));
     }
+
+    // Indexed by the same position as `functions`, so the inner loop tests a
+    // bool instead of rebuilding a path string per call op.
+    let opaque: Vec<bool> = functions
+        .iter()
+        .map(|f| dont_look_inside.contains(&path_of(f)))
+        .collect();
 
     // Per function, the parameter positions that arrive carrying the flag.
     let mut flagged_params: Vec<Vec<usize>> = vec![Vec::new(); functions.len()];
@@ -577,6 +613,16 @@ pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
                     let Some(callee) = resolve_callee(target, &index, &method_index) else {
                         continue;
                     };
+                    // `default_specialize` reads `_jit_look_inside_` off the
+                    // callee and, when it is False, DELETES `access_directly`
+                    // from the argument annotation instead of specializing —
+                    // so a `dont_look_inside` graph is never flagged, no
+                    // matter which caller reaches it. Skipping it here is
+                    // that deletion: the argument neither flags the callee
+                    // nor travels further through it.
+                    if opaque[callee] {
+                        continue;
+                    }
                     for (pos, arg) in args.iter().enumerate() {
                         let slot = reaching.entry((callee, pos)).or_insert((0, 0));
                         if seeds.iter().any(|seed| seed == arg) {
@@ -616,7 +662,7 @@ pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
 fn access_directly_seeds(
     func: &SemanticFunction,
     flagged_params: &[Vec<usize>],
-    index: &std::collections::HashMap<String, usize>,
+    index: &std::collections::HashMap<String, Option<usize>>,
 ) -> Vec<crate::flowspace::model::Variable> {
     let mut seeds = Vec::new();
     // `hint(x, access_directly=False)` deletes the flags rather than setting
@@ -653,7 +699,7 @@ fn access_directly_seeds(
     } else {
         format!("{}::{}", func.module_path, func.name)
     };
-    if let Some(&me) = index.get(&self_path) {
+    if let Some(Some(me)) = index.get(&self_path).copied() {
         let inputargs = &func.graph.block(func.graph.startblock).inputargs;
         for &pos in &flagged_params[me] {
             if let Some(arg) = inputargs.get(pos) {
@@ -691,15 +737,13 @@ fn leaf_of(name: &str) -> String {
 /// resolved through the receiver-root pair instead.
 fn resolve_callee(
     target: &crate::model::CallTarget,
-    index: &std::collections::HashMap<String, usize>,
+    index: &std::collections::HashMap<String, Option<usize>>,
     method_index: &std::collections::HashMap<(String, String), Option<usize>>,
 ) -> Option<usize> {
     match target {
         crate::model::CallTarget::FunctionPath { segments } => {
             let joined = segments.join("::");
-            index
-                .get(crate::front::mir::strip_crate_prefix(&joined).as_str())
-                .copied()
+            *index.get(crate::front::mir::strip_crate_prefix(&joined).as_str())?
         }
         crate::model::CallTarget::Method {
             name,
@@ -710,8 +754,9 @@ fn resolve_callee(
             // the receiver's classdef is known; it is the same key
             // `call.rs target_to_path` hands `function_graphs`, so prefer it.
             if let Some(path) = resolved_path
-                && let Some(&i) =
-                    index.get(crate::front::mir::strip_crate_prefix(&path.to_string()).as_str())
+                && let Some(Some(i)) = index
+                    .get(crate::front::mir::strip_crate_prefix(&path.to_string()).as_str())
+                    .copied()
             {
                 return Some(i);
             }
@@ -951,7 +996,7 @@ mod tests {
             ),
             free_fn("handle_bytecode"),
         ];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert_eq!(
             flags(&fns),
             vec![
@@ -975,7 +1020,7 @@ mod tests {
             caller_hinting_arg0("handle_bytecode", None, &[("execute", 1)]),
             free_fn("execute"),
         ];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert_eq!(
             flags(&fns)
                 .into_iter()
@@ -1000,7 +1045,7 @@ mod tests {
             ),
             impl_method_qualified("PyFrame", "initialize_frame_scopes"),
         ];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert!(!fns[0].graph.access_directly);
         assert!(
             fns[1].graph.access_directly,
@@ -1018,7 +1063,7 @@ mod tests {
             impl_method_qualified("PyFrame", "run"),
             impl_method_qualified("PyFrame", "run"),
         ];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert!(!fns[1].graph.access_directly);
         assert!(!fns[2].graph.access_directly);
     }
@@ -1073,7 +1118,7 @@ mod tests {
         caller.graph.set_goto(start, body, vec![hinted]);
 
         let mut fns = vec![caller, impl_method_qualified("PyFrame", "handle_bytecode")];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert!(
             fns[1].graph.access_directly,
             "a Link must carry the flag into the successor's inputarg"
@@ -1090,11 +1135,53 @@ mod tests {
             caller_hinting_into_method("app_profile_call", true, "PyFrame", "getclass"),
             impl_method_qualified("PyFrame", "getclass"),
         ];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert!(
             fns[1].graph.access_directly,
             "a representation cast must not lose the flag"
         );
+    }
+
+    /// `default_specialize` deletes `access_directly` from the argument
+    /// annotation when the callee's `_jit_look_inside_` is False, so a
+    /// `dont_look_inside` graph is never flagged. Those are exactly the graphs
+    /// `policy::look_inside_graph` refuses, so flagging one turns a working
+    /// build into the safety-net panic.
+    #[test]
+    fn a_dont_look_inside_callee_is_never_flagged() {
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("residual", 1)],
+            ),
+            free_fn("residual"),
+        ];
+        let opaque: std::collections::HashSet<String> = ["residual".to_string()].into();
+        propagate_access_directly(&mut fns, &opaque);
+        assert!(
+            !fns[1].graph.access_directly,
+            "a dont_look_inside callee must never carry the flag"
+        );
+    }
+
+    /// A crate-stripped path is a weaker key than upstream's `FunctionDesc`
+    /// identity, so a collision has to be refused. Resolving it to whichever
+    /// function was collected last would flag a graph the hint never reached.
+    #[test]
+    fn an_ambiguous_path_flags_neither() {
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("handle_bytecode", 1)],
+            ),
+            free_fn("handle_bytecode"),
+            free_fn("handle_bytecode"),
+        ];
+        propagate_access_directly(&mut fns, &Default::default());
+        assert!(!fns[1].graph.access_directly);
+        assert!(!fns[2].graph.access_directly);
     }
 
     /// Upstream SPECIALIZES, so an unflagged caller keeps the original graph.
@@ -1111,7 +1198,7 @@ mod tests {
             caller_hinting_arg0("other_caller", None, &[("handle_bytecode", 1)]),
             free_fn("handle_bytecode"),
         ];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert!(
             !fns[2].graph.access_directly,
             "reached with and without the flag must stay unflagged"
@@ -1166,7 +1253,7 @@ mod tests {
             mid,
             free_fn("call_function"),
         ];
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert!(
             fns[1].graph.access_directly,
             "app_profile_call itself is reached with the flag"
@@ -1198,7 +1285,7 @@ mod tests {
             panic!("expected the second call")
         };
         args[0] = crate::flowspace::model::Variable::named("unrelated");
-        propagate_access_directly(&mut fns);
+        propagate_access_directly(&mut fns, &Default::default());
         assert!(fns[1].graph.access_directly, "handle_bytecode is flagged");
         assert!(!fns[2].graph.access_directly, "log is not");
     }

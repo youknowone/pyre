@@ -1085,7 +1085,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     // `specialize.py default_specialize` runs while the annotator walks
     // calls; on this path the whole function set has to exist first, so it
     // runs here, once, over the finished list.
-    crate::front::semantic::propagate_access_directly(&mut functions);
+    crate::front::semantic::propagate_access_directly(&mut functions, &dont_look_inside);
     register_synthetic_positional_metadata(
         &functions,
         &mut known_struct_names,
