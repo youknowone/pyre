@@ -523,6 +523,19 @@ enum RewriteResult {
     Keep,
 }
 
+/// `jtransform.py:952-954 is_typeptr_getset`: the access names the class
+/// word of the object header.  Upstream keys on the field name `typeptr`
+/// and the struct's `typeptr` hint; pyre's header is `PyObject { ob_type,
+/// w_class }`, and only the `ob_type` word is the class the tracer guards on
+/// — `w_class` is the Python-level class, an ordinary field to a guard.
+fn is_typeptr_field(field: &FieldDescriptor) -> bool {
+    let owner_leaf = field
+        .owner_root
+        .as_deref()
+        .map(|owner| owner.rsplit("::").next().unwrap_or(owner));
+    field.name == "ob_type" && owner_leaf == Some("PyObject")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResolvedCallResult {
     kind: char,
@@ -3706,6 +3719,32 @@ impl<'a> Transformer<'a> {
         ty: &ValueType,
         graph_name: &str,
     ) -> RewriteResult {
+        // `jtransform.py:833-834 if self.is_typeptr_getset(op): return
+        // self.handle_getfield_typeptr(op)` — checked before anything else,
+        // as upstream does.  Upstream also folds a Constant receiver to its
+        // class constant; pyre's receivers here are SSA variables (a prebuilt
+        // constant reaches a field read through `ConstRef`, not as an
+        // operand), so that arm has no input and is not spelled.
+        if let OpKind::FieldRead { base, .. } = &op.kind
+            && is_typeptr_field(field)
+        {
+            self.notes.push(GraphTransformNote {
+                function: graph_name.to_string(),
+                detail: format!("rewrite: getfield({}) → guard_class", field.name),
+            });
+            // `jtransform.py:1008-1010`: `-live-` first, the guard is a
+            // resume point.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                },
+                SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::GuardClass { base: base.clone() },
+                },
+            ]);
+        }
         // `rewrite_op_getsubstruct` applies only to an address-producing
         // projection.  A by-value Rust field can itself have an inline-struct
         // layout (notably a `#[repr(transparent)]` newtype) while the operation
@@ -8601,6 +8640,9 @@ fn remap_op(
         OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
             value: remap_value(value, aliases),
             kind_char: *kind_char,
+        },
+        OpKind::GuardClass { base } => OpKind::GuardClass {
+            base: remap_value(base, aliases),
         },
         OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
             value: remap_value(value, aliases),

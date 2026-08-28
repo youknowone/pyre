@@ -815,6 +815,11 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } | OpKind::VableArrayLen { .. } => {
             RegKind::Int
         }
+        // The class word of the header, in whichever bank the read it
+        // replaced was allocated to (`OpKind::GuardClass`); the formatter
+        // has no regalloc to ask, and the int bank is where the class
+        // pointer hints (`record_exact_class/ri`) already carry it.
+        OpKind::GuardClass { .. } => RegKind::Int,
         // Result-less or pyre-only debug variants — `op_args_repr`
         // only reaches this fall-through when `op.result.is_some()`,
         // so any miss surfaces as a real coverage gap to extend.

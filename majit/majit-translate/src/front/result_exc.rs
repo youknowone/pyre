@@ -1021,6 +1021,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![value.clone()],
+        OpKind::GuardClass { base } => vec![base.clone()],
         OpKind::VtableMethodPtr { receiver, .. } => vec![receiver.clone()],
         OpKind::IsInstance {
             obj, class_carrier, ..

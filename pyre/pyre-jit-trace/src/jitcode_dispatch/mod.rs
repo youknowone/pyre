@@ -12293,6 +12293,8 @@ fn handle<Sym: WalkSym>(
         // exec-generated unary family.
         "ptr_nonzero/r>i" => ptr_nullity_record(code, op, ctx, true),
         "ptr_iszero/r>i" => ptr_nullity_record(code, op, ctx, false),
+        "guard_class/r>i" => guard_class_record(code, op, ctx, 'i'),
+        "guard_class/r>r" => guard_class_record(code, op, ctx, 'r'),
         "int_guard_value/i" => guard_value_record(code, op, ctx, GuardValueBank::Int),
         "ref_guard_value/r" => guard_value_record(code, op, ctx, GuardValueBank::Ref),
         "float_guard_value/f" => guard_value_record(code, op, ctx, GuardValueBank::Float),

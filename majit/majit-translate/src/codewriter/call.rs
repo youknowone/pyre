@@ -9025,6 +9025,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         OpKind::GuardTrue { .. }
         | OpKind::GuardFalse { .. }
         | OpKind::GuardValue { .. }
+        | OpKind::GuardClass { .. }
         | OpKind::JitDebug { .. }
         | OpKind::AssertGreen { .. }
         | OpKind::CurrentTraceLength
