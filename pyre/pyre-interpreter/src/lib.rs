@@ -1426,7 +1426,7 @@ pub fn stdio_line_endings_bytes<'a>(
 /// stream at all — leaves them on the mode `allocate_stdio` builds with.
 pub fn stdio_newline(stream_name: &str) -> Option<&'static str> {
     let platform_default = if cfg!(windows) { Some("\r\n") } else { None };
-    let stated = crate::importing::get_sys_module("sys")
+    let stated = crate::importing::get_interpreter_sys_module()
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, stream_name).ok())
         .and_then(crate::module::_io::W_TextIOWrapper::stdio_write_newline);
     stated.unwrap_or(platform_default)

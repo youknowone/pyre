@@ -279,7 +279,7 @@ pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     }
     let name = unsafe { pyre_object::w_str_get_value(args[2]) };
     if name == "Py_OptimizeFlag" {
-        let optimize = crate::importing::get_sys_module("sys")
+        let optimize = crate::importing::get_interpreter_sys_module()
             .and_then(|sys| crate::baseobjspace::getattr_str(sys, "flags").ok())
             .and_then(|flags| crate::baseobjspace::getattr_str(flags, "optimize").ok())
             .unwrap_or_else(|| pyre_object::w_int_new(0));

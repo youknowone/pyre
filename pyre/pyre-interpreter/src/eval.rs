@@ -4832,7 +4832,7 @@ impl OpcodeStepExecutor for PyFrame {
     // a rebound displayhook (doctest, IDLE) and a redirected sys.stdout take
     // effect instead of writing straight to the native stream.
     fn print_expr(&mut self, val: PyObjectRef) -> Result<(), PyError> {
-        if let Some(sys_mod) = crate::importing::get_sys_module("sys") {
+        if let Some(sys_mod) = crate::importing::get_interpreter_sys_module() {
             match crate::baseobjspace::getattr_str(sys_mod, "displayhook") {
                 Ok(hook) => {
                     let r = crate::call_function(hook, &[val]);

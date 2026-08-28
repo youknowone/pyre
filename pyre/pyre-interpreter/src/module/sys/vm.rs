@@ -3765,7 +3765,7 @@ fn stdio_encoding_and_errors() -> (String, String) {
 
 fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (String, String) {
     let defaults = stdio_encoding_and_errors();
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return (defaults.0, default_errors.to_string());
     };
     let Ok(stream) = crate::baseobjspace::getattr_str(sys, stream_name) else {
@@ -3794,7 +3794,7 @@ fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (Strin
 /// The `__std*__` aliases name the streams this built even after user code
 /// rebinds `sys.stdout`; a rebound one is not this function's to reconfigure.
 pub fn init_stream_codecs() -> Result<(), crate::PyError> {
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Ok(());
     };
     for name in ["__stdout__", "__stderr__", "__stdin__"] {

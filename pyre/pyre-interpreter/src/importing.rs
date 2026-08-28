@@ -2776,7 +2776,7 @@ pub fn add_sys_path(dir: &Path) {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     let entry = crate::gateway::fsdecode_os_str_wtf8(dir.as_os_str());
-    if get_sys_module("sys").is_none() {
+    if get_interpreter_sys_module().is_none() {
         {
             let mut path = SYS_PATH.lock().unwrap();
             let pb = dir.to_path_buf();
@@ -2792,7 +2792,7 @@ pub fn add_sys_path(dir: &Path) {
     let _roots = push_roots();
     let slot = shadow_stack_len();
     let _ = pin_root(pyre_object::w_str_from_wtf8(entry.clone()));
-    let Some(sys_mod) = get_sys_module("sys") else {
+    let Some(sys_mod) = get_interpreter_sys_module() else {
         return;
     };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
@@ -2833,7 +2833,7 @@ pub fn add_sys_path_0() {
     };
     // No `sys` yet (an embedder that never imports `site`): stage at the front
     // of the seed instead, which `create_sys_path_list` flushes in order.
-    if get_sys_module("sys").is_none() {
+    if get_interpreter_sys_module().is_none() {
         SYS_PATH.lock().unwrap().insert(0, PathBuf::from(entry));
         return;
     }
@@ -2842,7 +2842,7 @@ pub fn add_sys_path_0() {
     let _roots = push_roots();
     let slot = shadow_stack_len();
     let _ = pin_root(crate::gateway::fsdecode_os_str(&entry));
-    let Some(sys_mod) = get_sys_module("sys") else {
+    let Some(sys_mod) = get_interpreter_sys_module() else {
         return;
     };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
@@ -2963,6 +2963,20 @@ pub fn get_builtin_module(name: &str) -> Option<PyObjectRef> {
 /// `sys` entry is the corresponding owner.
 pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
     sys_modules_registry_get("sys")
+}
+
+/// Return the interpreter-owned `builtins` module, bypassing the
+/// Python-visible `sys.modules` mapping.
+///
+/// The other half of [`get_interpreter_sys_module`]: `PyInterpreterState`
+/// carries `builtins` beside `sysdict`, and `finalize_modules_delete_special`
+/// reads both from there rather than through a mapping the program owns.
+/// The module this returns is the registry's, not
+/// `ExecutionContext::get_builtin()`'s -- the two are the split described at
+/// `create_builtin_module`, and finalization wants the one whose dict
+/// `sys.modules` published.
+pub fn get_interpreter_builtins_module() -> Option<PyObjectRef> {
+    sys_modules_registry_get("builtins")
 }
 
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
@@ -3694,7 +3708,7 @@ fn python_sys_path_dirs() -> Result<Option<Vec<PathBuf>>, crate::PyError> {
     // Python list is authoritative even when empty: a missing / non-list / empty
     // `sys.path` searches nothing, so `del sys.path` and `sys.path.clear()` break
     // imports exactly as they do under CPython, rather than resurrecting the seed.
-    let Some(sys_mod) = get_sys_module("sys") else {
+    let Some(sys_mod) = get_interpreter_sys_module() else {
         return Ok(None);
     };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
@@ -5680,7 +5694,7 @@ pub(crate) fn module_shadow_info(
     // by user code — only a real set participates, and its membership test
     // (which hashes `__name__`) propagates.
     let mut shadowing_stdlib = false;
-    if let Some(sys_mod) = get_sys_module("sys") {
+    if let Some(sys_mod) = get_interpreter_sys_module() {
         let _scope = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let w_name = pyre_object::gc_roots::pin_root(w_name);

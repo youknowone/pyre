@@ -4123,7 +4123,7 @@ enum DefaultPrintTarget {
 /// and a `b'Â¢'` on the native path. A missing `sys.stdout` attribute
 /// raises `RuntimeError("lost sys.stdout")` as builtin_print does.
 fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> {
-    let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
+    let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
         // No `sys` yet (very early bootstrap) — native path.
         return Ok(DefaultPrintTarget::Native("strict"));
     };
@@ -4181,7 +4181,7 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .first()
         .copied()
         .unwrap_or_else(|| pyre_object::w_str_new(""));
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Err(crate::PyError::runtime_error("lost sys.stdin"));
     };
 
@@ -4557,7 +4557,7 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // Route through the live `sys.stderr`, not directly through the host
     // seam: tests and applications are allowed to replace `sys.stderr` and
     // `sys.__excepthook__` must honor that replacement.
-    let stderr = crate::importing::get_sys_module("sys")
+    let stderr = crate::importing::get_interpreter_sys_module()
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
     // Both renderers below run Python -- the stdlib one imports `traceback`,
     // the built-in one calls `__str__` on the chain -- so each of the three
@@ -20955,7 +20955,7 @@ pub(crate) fn call_forwarding_args(
 /// `app_breakpoint.py breakpoint` — forward to `sys.breakpointhook`, which
 /// must accept whatever arguments are passed.  By default that drops into pdb.
 fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
     };
     let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {

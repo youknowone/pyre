@@ -1321,7 +1321,7 @@ fn init_warnoptions(
             importing::importhook("warnings", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr)?;
             return Ok(());
         };
-        let Some(w_sys) = importing::get_sys_module("sys") else {
+        let Some(w_sys) = importing::get_interpreter_sys_module() else {
             return Ok(());
         };
         // `from warnings import _processoptions` raises `ImportError` when the
@@ -1760,6 +1760,28 @@ fn clear_shutdown_modules(
     collect_and_run_finalizers(ec_ptr);
 }
 
+/// The module dict of one of the two names finalization reaches for, or
+/// `None` when the runtime never minted it.
+///
+/// The reads are from the interpreter's own registry, not from `sys.modules`:
+/// `finalize_modules_delete_special` clears `interp->sysdict` and
+/// `interp->builtins`, and a program can park any value under either name in
+/// the mapping. `w_module_get_w_dict` is a raw field read whose contract is
+/// "points to a valid `Module`", so a value that is not one yields a wild
+/// pointer its caller then stores through -- `sys.modules['sys'] = 42`
+/// segfaulted at exit. `clear_shutdown_modules` already tests the same way
+/// before the same cast.
+fn interpreter_module_dict(
+    module: Option<pyre_object::PyObjectRef>,
+) -> Option<pyre_object::PyObjectRef> {
+    let module = module?;
+    if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+        return None;
+    }
+    let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    (!dict.is_null()).then_some(dict)
+}
+
 /// `pylifecycle.c finalize_modules_delete_special`, the step `finalize_modules`
 /// takes before it releases any module namespace.
 ///
@@ -1795,19 +1817,16 @@ fn finalize_delete_special() {
         ("stdout", "__stdout__"),
         ("stderr", "__stderr__"),
     ];
-    if let Some(builtins) = pyre_interpreter::importing::get_sys_module("builtins") {
-        let dict = unsafe { pyre_object::w_module_get_w_dict(builtins) };
-        if !dict.is_null() {
-            unsafe { pyre_object::w_dict_setitem_str(dict, "_", pyre_object::w_none()) };
-        }
+    if let Some(dict) =
+        interpreter_module_dict(pyre_interpreter::importing::get_interpreter_builtins_module())
+    {
+        unsafe { pyre_object::w_dict_setitem_str(dict, "_", pyre_object::w_none()) };
     }
-    let Some(sys) = pyre_interpreter::importing::get_sys_module("sys") else {
+    let Some(dict) =
+        interpreter_module_dict(pyre_interpreter::importing::get_interpreter_sys_module())
+    else {
         return;
     };
-    let dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
-    if dict.is_null() {
-        return;
-    }
     for name in SYS_CLEARED {
         // `_PySys_ClearAttrString` binds `None` rather than deleting the name,
         // so a late reader finds a value that is not there instead of a name

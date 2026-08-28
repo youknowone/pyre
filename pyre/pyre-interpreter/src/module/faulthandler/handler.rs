@@ -280,7 +280,7 @@ fn faulthandler_get_fileno_and_file(
 ) -> Result<(i32, pyre_object::PyObjectRef), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let resolved = if w_file.is_null() || unsafe { pyre_object::is_none(w_file) } {
-        let sys = crate::importing::get_sys_module("sys")
+        let sys = crate::importing::get_interpreter_sys_module()
             .ok_or_else(|| crate::PyError::runtime_error("sys.stderr is None"))?;
         let w_stderr = crate::baseobjspace::getattr_str(sys, "stderr")?;
         if w_stderr.is_null() || unsafe { pyre_object::is_none(w_stderr) } {
