@@ -8093,6 +8093,81 @@ fn run_compiled_code(
     )
 }
 
+/// `llmodel.py get_latest_descr`: the `(fail_index, descr)` a frame's
+/// `jf_descr` word names. Split out of `run_compiled_code_inner` so the probe
+/// can price it on its own.
+fn resolve_exit_descr(
+    jf_descr_raw: i64,
+    fail_descrs: &[DescrRef],
+    attachments: &CpuDescrAttachments,
+    propagate_descr_ptr: usize,
+) -> (u32, Option<ExitDescr>) {
+    if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
+        (CALL_ASSEMBLER_DEADFRAME_SENTINEL, None)
+    } else if jf_descr_raw == 0 {
+        // Propagate-into-exit fall-through: when the metainterp
+        // didn't attach an `exit_frame_with_exception_descr_ref`
+        // (unit-test setups), the rewrite above leaves jf_descr at 0;
+        // surface the cranelift singleton directly so the consumer
+        // still sees `is_exit_frame_with_exception=true`.
+        if propagate_descr_ptr != 0 {
+            let cl: DescrRef = EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone();
+            (u32::MAX, Some(ExitDescr::owned(cl)))
+        } else {
+            (0u32, None)
+        }
+    } else if let Some(metainterp_finish) = match_metainterp_finish_descr(jf_descr_raw, attachments)
+    {
+        // `history.py:125` `cpu.get_latest_descr(deadframe)` parity:
+        // `jf_descr` carries the metainterp `Arc<DoneWithThisFrameDescr*>`
+        // address (compiler.rs baking).  Return that *exact* Arc
+        // so the consumer sees the same identity `compile.py:618-672`
+        // attached on the cpu — not the process-global fallback static.
+        // Both are `Arc<DoneWithThisFrameDescrInt>` (no wrapper) so the
+        // trait-method dispatch is identical; only
+        // the Arc identity differs, and PyPy parity demands they match.
+        // Borrowed: see `ExitDescr`. `attachments` is the cpu's own set, which
+        // outlives every deadframe decoded against it.
+        (
+            u32::MAX,
+            Some(unsafe { ExitDescr::borrowed(metainterp_finish) }),
+        )
+    } else {
+        // `jf_descr_raw` is the metainterp `AbstractFailDescr` Arc's
+        // data pointer.  Resolve via the `fail_descrs` collection.
+        // Derive `fail_index` from
+        // the resolved Arc via the FailDescr trait — never dereference
+        // the raw pointer as a concrete type, since the meta side can
+        // be either `ResumeGuardDescr` or `DoneWithThisFrameDescr*`.
+        let arc = find_fail_descr_by_ptr(
+            fail_descrs,
+            jf_descr_raw as usize,
+            attachments.propagate_exception_descr.as_ref(),
+        );
+        let fi = arc.as_ref().map(|a| as_fd(a).fail_index()).unwrap_or(0);
+        // compile.py:665-674 parity: done_with_this_frame_descr is a
+        // global singleton — it won't appear in per-trace fail_descrs.
+        let arc = arc.or_else(|| {
+            let ptr = jf_descr_raw as usize;
+            // Singletons are `DescrRef = Arc<dyn Descr>` (fat pointer).
+            // Match on the data-pointer half via
+            // `as *const () as usize`.
+            for global in [
+                &*DONE_WITH_THIS_FRAME_DESCR_INT,
+                &*DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+                &*DONE_WITH_THIS_FRAME_DESCR_REF,
+                &*DONE_WITH_THIS_FRAME_DESCR_VOID,
+            ] {
+                if Arc::as_ptr(global) as *const () as usize == ptr {
+                    return Some(global.clone());
+                }
+            }
+            None
+        });
+        (fi, arc.map(ExitDescr::owned))
+    }
+}
+
 fn run_compiled_code_inner(
     code_ptr: *const u8,
     fail_descrs: &[DescrRef],
@@ -8217,6 +8292,31 @@ fn run_compiled_code_inner(
             std::hint::black_box(&mut scratch);
         }
     }
+    #[cfg(feature = "__execute-stage-probe")]
+    {
+        use majit_backend::deadframe::{ProbeExtraStage, frame_build_repeats, probe_extra_stage};
+        let repeats = frame_build_repeats();
+        match probe_extra_stage() {
+            ProbeExtraStage::Guard => {
+                for _ in 0..repeats {
+                    let g = majit_backend::JittedGuard::enter();
+                    std::hint::black_box(&g);
+                    drop(g);
+                }
+            }
+            ProbeExtraStage::Heap => {
+                for _ in 0..repeats {
+                    std::hint::black_box(cranelift_jitframe_type_id());
+                }
+            }
+            ProbeExtraStage::Flags => {
+                for _ in 0..repeats {
+                    std::hint::black_box(entry_flags());
+                }
+            }
+            _ => {}
+        }
+    }
     if debug_prints {
         let preview: Vec<i64> = (0..inputs.len().min(10)).map(|i| inputs.raw(i)).collect();
         majit_ir::debug::log_one("jit-running", &format!("pre-call-inputs {preview:?}"));
@@ -8331,65 +8431,30 @@ fn run_compiled_code_inner(
     }
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
-    let (fail_index, direct_descr) = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
-        (CALL_ASSEMBLER_DEADFRAME_SENTINEL, None)
-    } else if jf_descr_raw == 0 {
-        // Propagate-into-exit fall-through: when the metainterp
-        // didn't attach an `exit_frame_with_exception_descr_ref`
-        // (unit-test setups), the rewrite above leaves jf_descr at 0;
-        // surface the cranelift singleton directly so the consumer
-        // still sees `is_exit_frame_with_exception=true`.
-        if propagate_descr_ptr != 0 {
-            let cl: DescrRef = EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone();
-            (u32::MAX, Some(cl))
-        } else {
-            (0u32, None)
-        }
-    } else if let Some(metainterp_finish) = match_metainterp_finish_descr(jf_descr_raw, attachments)
+    let (fail_index, direct_descr) =
+        resolve_exit_descr(jf_descr_raw, fail_descrs, attachments, propagate_descr_ptr);
+    #[cfg(feature = "__execute-stage-probe")]
+    if majit_backend::deadframe::probe_extra_stage()
+        == majit_backend::deadframe::ProbeExtraStage::Descr
     {
-        // `history.py:125` `cpu.get_latest_descr(deadframe)` parity:
-        // `jf_descr` carries the metainterp `Arc<DoneWithThisFrameDescr*>`
-        // address (compiler.rs baking).  Return that *exact* Arc
-        // so the consumer sees the same identity `compile.py:618-672`
-        // attached on the cpu — not the process-global fallback static.
-        // Both are `Arc<DoneWithThisFrameDescrInt>` (no wrapper) so the
-        // trait-method dispatch is identical; only
-        // the Arc identity differs, and PyPy parity demands they match.
-        (u32::MAX, Some(metainterp_finish))
-    } else {
-        // `jf_descr_raw` is the metainterp `AbstractFailDescr` Arc's
-        // data pointer.  Resolve via the `fail_descrs` collection.
-        // Derive `fail_index` from
-        // the resolved Arc via the FailDescr trait — never dereference
-        // the raw pointer as a concrete type, since the meta side can
-        // be either `ResumeGuardDescr` or `DoneWithThisFrameDescr*`.
-        let arc = find_fail_descr_by_ptr(
-            fail_descrs,
-            jf_descr_raw as usize,
-            attachments.propagate_exception_descr.as_ref(),
-        );
-        let fi = arc.as_ref().map(|a| as_fd(a).fail_index()).unwrap_or(0);
-        // compile.py:665-674 parity: done_with_this_frame_descr is a
-        // global singleton — it won't appear in per-trace fail_descrs.
-        let arc = arc.or_else(|| {
-            let ptr = jf_descr_raw as usize;
-            // Singletons are `DescrRef = Arc<dyn Descr>` (fat pointer).
-            // Match on the data-pointer half via
-            // `as *const () as usize`.
-            for global in [
-                &*DONE_WITH_THIS_FRAME_DESCR_INT,
-                &*DONE_WITH_THIS_FRAME_DESCR_FLOAT,
-                &*DONE_WITH_THIS_FRAME_DESCR_REF,
-                &*DONE_WITH_THIS_FRAME_DESCR_VOID,
-            ] {
-                if Arc::as_ptr(global) as *const () as usize == ptr {
-                    return Some(global.clone());
-                }
-            }
-            None
-        });
-        (fi, arc)
-    };
+        for _ in 0..majit_backend::deadframe::frame_build_repeats() {
+            std::hint::black_box(resolve_exit_descr(
+                jf_descr_raw,
+                fail_descrs,
+                attachments,
+                propagate_descr_ptr,
+            ));
+        }
+    }
+    #[cfg(feature = "__execute-stage-probe")]
+    if majit_backend::deadframe::probe_extra_stage()
+        == majit_backend::deadframe::ProbeExtraStage::Arc
+        && let Some(d) = direct_descr.as_ref()
+    {
+        for _ in 0..majit_backend::deadframe::frame_build_repeats() {
+            std::hint::black_box(d.clone());
+        }
+    }
     if log_enabled {
         eprintln!(
             "[post-call-descr] raw={:#x} fail_index={} matched_local={}",
@@ -9269,8 +9334,16 @@ impl CraneliftBackend {
         // lock is safe: `Backend::set_done_with_this_frame_descr_*` only
         // fires during `MetaInterpStaticData.finish_setup`, long before
         // compiled code runs.
-        let attachments_guard = compiled.cpu_attachments.read().unwrap();
+        let attachments_guard = compiled.cpu_attachments.read();
         let attachments: &CpuDescrAttachments = &attachments_guard;
+        #[cfg(feature = "__execute-stage-probe")]
+        if majit_backend::deadframe::probe_extra_stage()
+            == majit_backend::deadframe::ProbeExtraStage::Attach
+        {
+            for _ in 0..majit_backend::deadframe::frame_build_repeats() {
+                std::hint::black_box(&*compiled.cpu_attachments.read());
+            }
+        }
 
         loop {
             let mut exec = run_compiled_code(

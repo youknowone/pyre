@@ -737,3 +737,36 @@ mod tests {
         unsafe { free_off_gc_jitframe(frame) };
     }
 }
+
+/// Which fixed cost of a compiled entry the probe repeats beside the frame
+/// build, selected once per process from `MAJIT_PROBE_EXTRA`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeExtraStage {
+    None,
+    /// `JittedGuard::enter` and its drop.
+    Guard,
+    /// The jitframe heap selector's thread-local read.
+    Heap,
+    /// The three `Once`-guarded flag reads.
+    Flags,
+    /// `cpu_attachments.read()`.
+    Attach,
+    /// The `jf_descr` word to `(fail_index, descr)`.
+    Descr,
+    /// One clone and drop of the exit descr's `Arc`.
+    Arc,
+}
+
+/// `MAJIT_PROBE_EXTRA`, read once.
+pub fn probe_extra_stage() -> ProbeExtraStage {
+    static STAGE: std::sync::OnceLock<ProbeExtraStage> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("MAJIT_PROBE_EXTRA").as_deref() {
+        Ok("guard") => ProbeExtraStage::Guard,
+        Ok("heap") => ProbeExtraStage::Heap,
+        Ok("flags") => ProbeExtraStage::Flags,
+        Ok("attach") => ProbeExtraStage::Attach,
+        Ok("descr") => ProbeExtraStage::Descr,
+        Ok("arc") => ProbeExtraStage::Arc,
+        _ => ProbeExtraStage::None,
+    })
+}
