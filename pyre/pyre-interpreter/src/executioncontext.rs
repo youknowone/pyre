@@ -1730,14 +1730,8 @@ pub fn disarm_async_eval_breaker() {
     majit_ir::eval_breaker_word::clear_async();
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn has_pending_signal_action() -> bool {
     crate::module::signal::signalstate::has_pending_signals()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn has_pending_signal_action() -> bool {
-    false
 }
 
 /// `dont_look_inside` so the tracer treats it as an opaque call and never
@@ -2110,24 +2104,17 @@ impl ActionFlag {
     /// single cell compiled-loop back-edges poll. Only that ticker drives the
     /// shared async bit; per-EC flags that are not the registered breaker
     /// source must not touch the shared word, or one context's dispatch clear
-    /// would drop another context's pending async. wasm builds have no signal
-    /// module (no registered ticker), so the mirror is inert there.
+    /// would drop another context's pending async.
     ///
     /// The cell identity is compared as `usize` rather than via
     /// `ptr::eq`: this runs inside the traced eval loop (`decrement_ticker`),
     /// and a raw-pointer equality on `*const isize` can lower to an
     /// `int_eq/ir>i` kind shape that has no blackhole handler; casting both
     /// addresses to `usize` keeps the comparison an int/int equality.
-    #[cfg(not(target_arch = "wasm32"))]
     fn is_registered_ticker(&self) -> bool {
         let here = &self._ticker as *const isize as usize;
         let registered = crate::module::signal::signalstate::registered_ticker_ptr() as usize;
         here == registered
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn is_registered_ticker(&self) -> bool {
-        false
     }
 }
 

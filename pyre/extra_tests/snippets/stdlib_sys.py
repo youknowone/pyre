@@ -12,6 +12,7 @@ assert (
     sys.platform == "linux"
     or sys.platform == "darwin"
     or sys.platform == "win32"
+    or sys.platform == "wasi"
     or sys.platform == "unknown"
 )
 

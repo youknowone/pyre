@@ -769,7 +769,11 @@ pub fn install_builtin_modules() {
     // syscall code is absent.
     #[cfg(not(feature = "sandbox"))]
     {
-        #[cfg(not(target_arch = "wasm32"))]
+        // `_signal` is a bootstrap module upstream: it is built on every
+        // platform, and what a platform lacks it lacks entry point by entry
+        // point.  A target with no kernel to route a number publishes the
+        // handler table and `raise_signal`, and leaves out the itimers, the
+        // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
         // Only a POSIX host has the user/group databases these read; the
         // platforms without them have no `pwd`/`grp` module at all, and the
@@ -789,12 +793,10 @@ pub fn install_builtin_modules() {
         pyre_install_module!(select);
         #[cfg(unix)]
         pyre_install_module!(termios);
-        // `socket.py`'s module body subclasses `_socket.socket`, so a module
-        // that is present without the host layer behind it fails the import
-        // with AttributeError -- and `platform._node`, `uuid` and the rest
-        // reach for `socket` inside `try/except ImportError`, which that is
-        // not.  A target with no socket layer has no `_socket` at all.
-        #[cfg(not(target_arch = "wasm32"))]
+        // `socket.py`'s module body subclasses `_socket.socket`, so the type
+        // has to be there even where nothing can be connected: a target with
+        // no host layer publishes it and the numbers, and leaves out the
+        // entry points that would need a descriptor.
         pyre_install_module!(_socket);
         #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(_ssl);

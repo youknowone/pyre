@@ -1459,6 +1459,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "version",
         w_str_new(&format!("3.14.6 (pyre 0.0.1) [{compiler}]")),
     );
+    // The stdlib branches on this name to decide what a platform can do, and
+    // the two spellings it knows for a WebAssembly guest are `emscripten` and
+    // `wasi`.  A guest reaching its embedder through host imports is the
+    // second of those: `emscripten` promises the JavaScript runtime behind it
+    // — `platform._sys_version` reads `sys._emscripten_info` on that name and
+    // has nothing to fall back to — while `wasi` promises only that there is
+    // no process to fork, no home directory and no signal delivery, which is
+    // what this target is.  Reported for both wasm hosts: what the guest can
+    // do is the same on either side of the browser boundary.
     module_ns_store(
         ns,
         "platform",
@@ -1468,6 +1477,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             "linux"
         } else if cfg!(target_os = "windows") {
             "win32"
+        } else if cfg!(target_arch = "wasm32") {
+            "wasi"
         } else {
             "unknown"
         }),

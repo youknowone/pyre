@@ -983,6 +983,13 @@ fn run_python_impl(source: &str) -> String {
     unsafe {
         let ec_ptr = std::rc::Rc::as_ptr(&execution_context) as *mut PyExecutionContext;
         (*ec_ptr).install_user_del_action();
+        // The same step for the other periodic action: without it the ticker
+        // cell is unregistered and `CheckSignalAction` never runs, so a
+        // handler `signal.signal` recorded has nothing to deliver it -- which
+        // on this target is the only delivery there is.  It also installs the
+        // startup `SIGINT` handler, so `getsignal(SIGINT)` names
+        // `default_int_handler` here as it does natively.
+        pyre_interpreter::module::signal::interp_signal::install_signal_handling(&mut *ec_ptr);
     }
     // Register the __build_class__ callback. Class construction resolves the
     // live frame from the execution-context slot seeded above.

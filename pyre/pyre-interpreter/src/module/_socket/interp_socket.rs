@@ -1547,8 +1547,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "_default_timeout", pyre_object::w_none());
 
     // `_rsocket_rffi.py constants['has_ipv6'] = True` — exposed by
-    // PyPy's moduledef.py constants loop as a module-level boolean.
-    crate::module_ns_store(ns, "has_ipv6", pyre_object::boolobject::w_bool_from(true));
+    // PyPy's moduledef.py constants loop as a module-level boolean.  It
+    // reports the runtime's support for the family, not the header's number
+    // for it, so a target with no socket layer answers false while still
+    // carrying `AF_INET6`.
+    crate::module_ns_store(
+        ns,
+        "has_ipv6",
+        pyre_object::boolobject::w_bool_from(cfg!(any(unix, windows))),
+    );
 
     // ── module-level getdefaulttimeout / setdefaulttimeout ──
     // `interp_func.py:378-397` — None means "blocking", float means
@@ -1919,6 +1926,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::module_ns_store(ns, "socket", socket_tp);
         crate::module_ns_store(ns, "SocketType", socket_tp);
     }
+    // The same two names, and the numbers, where there is no host layer to
+    // build the rest of the module out of.
+    #[cfg(not(any(unix, windows)))]
+    super::interp_socket_wasm::register_names(ns);
 
     // `socket.py` defines `socketpair` only when `_socket` carries one and
     // falls back to `_fallback_socketpair`'s own AF_INET pair otherwise, and
