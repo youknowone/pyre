@@ -4912,45 +4912,80 @@ impl majit_backend::Backend for WasmBackend {
             }
 
             // Host-buffer frame path, for an embedder that registered no
-            // `JitFrame` type id: fail_index at frame[0], inputs/outputs at
-            // frame[1 + i], surviving Ref homes manually rooted across the
-            // trace. A home slot only ever holds null (entry init) or a valid
-            // GcRef (store-on-def), so forwarding is safe. This buffer is not
-            // on the jitframe shadow stack and no collection moves it, which is
-            // what `host_entry_frame_is_jitframe` reports to codegen so the
-            // body emits no frame reload. The path to
-            // `wasm_gc_remove_root` is straight-line and the wasm32 build is
-            // `panic=abort`, so `glue::execute` cannot unwind and leak roots.
-            let mut frame = vec![0i64; frame_size];
+            // `JitFrame` type id: fail_index at item[0], inputs/outputs at
+            // item[1 + i], surviving Ref homes rooted across the trace. A home
+            // slot only ever holds null (entry init) or a valid GcRef
+            // (store-on-def), so forwarding is safe. No collection moves this
+            // buffer, which is what `host_entry_frame_is_jitframe` reports to
+            // codegen so the body emits no frame reload. The release below is
+            // straight-line and the wasm32 build is `panic=abort`, so
+            // `glue::execute` cannot unwind and leak roots.
+            //
+            // The buffer carries a `JitFrame` header all the same, and is
+            // published on the jitframe shadow stack for the span of the call.
+            // Rooting the homes with the active GC reaches only *that*
+            // collector. A frontend keeping a heap of its own reads the shadow
+            // stack instead -- it is the one publication point a collector that
+            // is not this one can consult -- so without the frame on it a home
+            // holding one of that heap's objects is invisible: the collector
+            // moves the object, the home keeps the address it had, and the
+            // trace resumes on a pointer into free space. The two walks forward
+            // the same slots, which a forwarding collector does idempotently:
+            // the second visit reads an address the first already took out of
+            // from-space.
+            let sign = std::mem::size_of::<isize>();
+            let depth = frame_size * 8 / sign;
+            let alloc_size = majit_backend::jitframe::JitFrame::alloc_size(depth);
+            // An `i64` element type for the alignment a `JitFrame` needs and
+            // for the zero fill `JitFrame::init` requires.
+            let mut backing = vec![0i64; alloc_size.div_ceil(8)];
+            let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
+            unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
+            // Held until the outputs are read, which is what `jf_gcmap` points
+            // at for as long as the frame is on the shadow stack.
+            let gcmap = build_home_gcmap(compiled.frame);
+            unsafe { (*jf).jf_gcmap = gcmap.as_ptr() as *const u8 };
+            let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
             for (i, arg) in args.iter().enumerate() {
-                frame[1 + i] = match arg {
+                let v = match arg {
                     Value::Int(v) => *v,
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Ref(r) => r.0 as i64,
                     Value::Void => 0,
                 };
+                unsafe { *items.add(1 + i) = v };
             }
-            let frame_ptr = frame.as_mut_ptr() as usize as u32;
             let home_base = compiled.frame.home_slot_base as usize / 8;
             for h in 0..compiled.frame.home_slots {
-                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 unsafe { wasm_gc_add_root(slot) };
             }
+            majit_gc::shadow_stack::register_libc_jitframe(jf as usize);
+            let saved = majit_gc::shadow_stack::push_jf(GcRef(jf as usize));
             {
                 let _bh_phase = majit_gc::BhProbePhase::enter("compiled");
-                glue::execute(func_handle, frame_ptr);
+                glue::execute(func_handle, items as usize as u32);
             }
+            majit_gc::shadow_stack::pop_jf_to(saved);
+            majit_gc::shadow_stack::unregister_libc_jitframe(jf as usize);
+            // Nothing reads the frame's interior through the gcmap any more,
+            // and the gcmap is about to go out of scope.
+            unsafe { (*jf).jf_gcmap = std::ptr::null() };
             for h in 0..compiled.frame.home_slots {
-                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
             }
             let exc_value = jit_exc_take();
-            let fail_index = frame[0] as u32;
+            let fail_index = unsafe { *items } as u32;
             // Global fail-index space (see the CA-path resolution above).
             let fail_descr =
                 global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
             let num_outputs = exit_slot_count(&fail_descr);
-            let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
+            let raw_values: Vec<i64> = (0..num_outputs)
+                .map(|i| unsafe { *items.add(1 + i) })
+                .collect();
+            drop(gcmap);
+            drop(backing);
             DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
         }
     }
