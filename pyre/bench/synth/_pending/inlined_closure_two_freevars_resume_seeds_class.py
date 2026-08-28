@@ -54,28 +54,47 @@ pyre-only, and it is what turns a mis-seeded register into a wrong answer
 several frames away rather than an immediate failure.  Whatever fixes the
 seeding, that arm is worth making loud.
 
-## Why the shape is exactly this
+## It is a SHIFT, and the condition is the CALLEE's freevar count
 
-Every widening below was measured, and each one stops reproducing, so none of
-it is decoration:
+Give `x` and `y` distinguishable values and the rebuilt array reads out
+directly (`inner` returning `(x, y)` reproduces the same way, so the check can
+name each item):
 
-    2 cellvars, `inner` reads BOTH, `inner` is CALLED     FAIL
-    1 cellvar   (`y` passed as an argument instead)       pass
-    2 cellvars, `inner` reads only one of them            pass
-    3 cellvars, `inner` reads all three                   pass
-    4 cellvars, `inner` reads all four                    pass
-    `inner` defined but never called                      pass
-    the same loop at module level rather than in `outer`  pass
+    outer.x = 1042        outer.y = 1001042
+    inner.x = <class 'cell'>
+    inner.y = 1042                        <- outer.x's VALUE, not outer.y's
+
+So the callee's `locals_cells_stack_w` is rebuilt as
+`[cell_class, x_cell, ...]`: one extra leading element, every freevar shifted
+by one, and the last cell dropped off the end.
+
+The condition is that the INLINED CALLEE closes over exactly two names -- not
+how many cellvars the caller has.  With `outer` holding three or four cellvars
+and `inner` closing over just two of them, it still fails identically
+(`MISMATCH i=1042: <class 'cell'> 1042`):
+
+    callee closes over 2      FAIL      (caller cellvars 2, 3 or 4 alike)
+    callee closes over 1      pass      (`y` passed as an argument instead,
+                                         or `inner` reading only one of two)
+    callee closes over 3      pass      (n swept 1500..40000, all clean)
+    callee closes over 4      pass
+    `inner` never called                 pass
+    the same loop at module level        pass
 
 `while` in place of `for` still fails, `inner` defined before the loop still
-fails, and `str` cellvars fail the same way (`'type' and 'str'`), so it is
-neither the loop form nor the value type.
+fails (and then the closure is loop-invariant, so the trace is much smaller),
+a local inside `inner` still fails, and `str` cellvars fail the same way
+(`'type' and 'str'`).  Reading `y + x` rather than `x + y` still corrupts the
+FIRST freevar, so it is the slot and not the read order.
 
-The count is a real condition, not an inlining artefact: `PYRE_LOOP_CENSUS=1`
-reports `loop outer` for 2, 3 and 4 cellvars alike, `PYRE_FBW_INLINE_DIAG=1`
-reports the identical `[inline-resolved] callee=outer.<locals>.inner
-nparams=0 has_closure=true` admission for 2 and for 3, and both record exactly
-`Guard failures: 1`.  Only the 2-cellvar shape answers wrong.
+The count is not an inlining artefact.  For two and three freevars alike
+`PYRE_LOOP_CENSUS=1` reports `loop outer`, `PYRE_FBW_INLINE_DIAG=1` reports the
+same `[inline-resolved] callee=outer.<locals>.inner nparams=0
+has_closure=true`, both record exactly one guard failure and no bridges, and
+both build the analogous virtuals -- `NewArrayClear(2)` + `NewArrayClear(4)`
+for two, `NewArrayClear(3)` + `NewArrayClear(5)` for three.  The guard that
+fails differs (11 against 25), but sweeping n over 1500..40000 keeps the
+three-freevar shape clean, so it is not merely which guard happened to fail.
 
 n must clear the trace threshold: 1000 passes, 1500 and up fail.
 
