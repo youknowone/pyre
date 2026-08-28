@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # pyre-check: platforms=darwin
 # pyre-check: pypy-diverges: `interp_kqueue.py W_Kevent` registers no
 # `__repr__`, so pypy3 prints the default `<select.kevent object at 0x...>`.

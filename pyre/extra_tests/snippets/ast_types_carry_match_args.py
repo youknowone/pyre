@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # pyre-check: pypy-diverges: pins `__match_args__` on every `_ast` type, the base included; pypy3 binds it on the concrete nodes but `ast.AST` carries none
 # CPython-suite gap: `test_ast` reads `_fields` on every node type but never
 # reads `__match_args__`, and its pattern-matching tests build their own

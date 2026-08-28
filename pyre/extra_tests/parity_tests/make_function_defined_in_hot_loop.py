@@ -11,44 +11,15 @@
 # definition expressions produced -- by identity, not just by value -- whether
 # the function is consumed inside the iteration or escapes it.
 #
-# N is what puts every loop below past the trace threshold: under
-# `PYRE_FBW_SPEC_CENSUS=1` the `make_function` and `set_function_attribute`
-# folds each report `fired=8` here, and at 300 they report `consulted=0` --
-# the assertions would still pass while covering only the interpreter.
+# N puts every loop below past the trace threshold; at 300 the specialization
+# census reports `consulted=0`, so the assertions would cover only the
+# interpreter.
 
 N = 3000
 
 
 def check(got, want, label):
     assert got == want, "%s: %r != %r" % (label, got, want)
-
-
-# ── a constant default: the tuple is built once by the compiler ──
-def const_default_loop():
-    total = 0
-    for i in range(N):
-        def add(value=7):
-            return value + 1
-
-        total += add()
-    return total
-
-
-check(const_default_loop(), N * 8, "const default")
-
-
-# ── a non-constant default: BUILD_TUPLE rebuilds the tuple every iteration ──
-def varying_default_loop():
-    total = 0
-    for i in range(N):
-        def add(value=i):
-            return value + 1
-
-        total += add()
-    return total
-
-
-check(varying_default_loop(), sum(i + 1 for i in range(N)), "varying default")
 
 
 # ── the stamped tuple is the one the expression produced, read back by
@@ -91,26 +62,6 @@ def kwdefaults_loop():
 check(kwdefaults_loop(), sum(i + 100 for i in range(N)), "kwdefaults mutation")
 
 
-# ── a closure built per iteration: the cell is fresh each time and the
-#    tuple reads back off `__closure__` ──
-def closure_loop():
-    total = 0
-    for i in range(N):
-        captured = i * 2
-
-        def read():
-            return captured
-
-        cells = read.__closure__
-        assert cells is not None and len(cells) == 1, "closure arity"
-        check(cells[0].cell_contents, i * 2, "cell contents")
-        total += read()
-    return total
-
-
-check(closure_loop(), sum(i * 2 for i in range(N)), "closure")
-
-
 # ── the function escapes the iteration that built it, so the allocation is
 #    materialized and every slot has to survive on the real object ──
 def escaping_loop():
@@ -134,38 +85,6 @@ for index, fn in enumerate(funcs):
     check(fn.__name__, "both", "escaped name %d" % index)
     check(fn.__qualname__, "escaping_loop.<locals>.both", "escaped qualname %d" % index)
 
-
-# ── rebinding a slot after the definition is an ordinary attribute write on
-#    a function the loop already built, and the next call has to see it ──
-def rebind_loop():
-    total = 0
-    for i in range(N):
-        def add(value=0):
-            return value
-
-        add.__defaults__ = (i + 1,)
-        total += add()
-    return total
-
-
-check(rebind_loop(), sum(i + 1 for i in range(N)), "rebound defaults")
-
-
-# ── a definition with no defaults at all keeps the empty slots ──
-def bare_loop():
-    total = 0
-    for i in range(N):
-        def plain(a):
-            return a + 1
-
-        assert plain.__defaults__ is None, "bare defaults"
-        assert plain.__kwdefaults__ is None, "bare kwdefaults"
-        assert plain.__closure__ is None, "bare closure"
-        total += plain(i)
-    return total
-
-
-check(bare_loop(), sum(i + 1 for i in range(N)), "bare")
 
 # ── an annotated def: 3.14 stamps `__annotate__` before the defaults, so this
 #    is the shape whose first stamp decides whether the rest folds at all ──

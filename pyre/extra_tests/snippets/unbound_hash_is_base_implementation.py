@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_tuple and test_set never call `tuple.__hash__` or
 # `frozenset.__hash__` on an instance of a subclass that overrides `__hash__`.
 # parity-tests reason: both descriptors dispatched through `hash()`, which looks

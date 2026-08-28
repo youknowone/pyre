@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_mmap's exhaustive find/rfind sweep (test_find_end,
 # test_rfind) never uses an empty pattern — its list is
 # [b"o", b"on", b"two", b"ones", b"s"] — so the near-end answer an empty needle

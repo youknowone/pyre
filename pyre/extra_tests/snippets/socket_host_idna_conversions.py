@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_socket does not import, so nothing in the suite runs
 # a host argument through the two converters these entry points split between.
 # parity-tests reason: the three `gethostby*` functions took the address-tuple

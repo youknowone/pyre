@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_sys does not import, so nothing in the suite calls
 # `sys.stdout.write` with an argument that is not a `str`.
 # parity-tests reason: pyre's std streams are native objects that encode

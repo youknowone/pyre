@@ -69,3 +69,4 @@ for hex_arg, position in ((chr(0xDC80), 0), ("41" + chr(0xDC80) + "42", 2), ("41
 assert bytes.fromhex("41 42") == b"AB"
 
 print("OK")
+# pyre-check: gate=1

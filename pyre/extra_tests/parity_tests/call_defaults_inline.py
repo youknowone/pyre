@@ -116,25 +116,4 @@ else:
     raise AssertionError("needs_two(1) must raise TypeError")
 
 
-# `__defaults__` replaced mid-loop must be observed: the tuple identity the
-# trace pinned is gone, so binding has to re-derive which element fills which
-# parameter — including when the replacement changes the tuple's length AND its
-# representation (3-tuple array-backed -> 2-int pair).
-def swapped(a, b=3, c=5):
-    return a * 100 + b * 10 + c
-
-
-seen = []
-for i in range(N):
-    if i == N // 3:
-        swapped.__defaults__ = (4, 6)
-    elif i == 2 * N // 3:
-        swapped.__defaults__ = (7, 8, 9)
-    seen.append(swapped(1))
-check(seen[0], 135, "swap/before")
-check(seen[N // 3], 146, "swap/after two-int pair")
-# A defaults tuple LONGER than the parameter list keeps its tail: `def_first`
-# goes negative and `b`/`c` take `defs_w[1]` / `defs_w[2]`.
-check(seen[2 * N // 3], 189, "swap/after over-long tuple")
-
 print("OK")

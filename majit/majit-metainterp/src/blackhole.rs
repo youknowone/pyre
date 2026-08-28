@@ -1572,8 +1572,34 @@ impl BlackholeInterpreter {
     }
 
     fn find_catch_after_resume_live(&self, resume_live_pos: usize) -> Option<usize> {
+        let (catch_pos, skipped) = self.scan_catch_after_resume_live(resume_live_pos);
+        static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DIAG.get_or_init(|| std::env::var_os("PYRE_CATCH_SCAN_DIAG").is_some()) {
+            eprintln!(
+                "[catch-scan] jitcode={} resume_live={resume_live_pos} \
+                 ops_before_live={skipped} found={}",
+                self.jitcode.name(),
+                catch_pos.is_some(),
+            );
+        }
+        catch_pos
+    }
+
+    /// The forward scan itself, with the number of startpoints it consumed
+    /// before the trailing `-live-`.
+    ///
+    /// That count is the open question in #1151: the loop imposes no bound on
+    /// it, so a raising operation whose own block carries no
+    /// `-live-`/`catch_exception` pair can walk into the next operation's and
+    /// route the exception to a handler that is not its own.  `PYRE_CATCH_SCAN_DIAG`
+    /// prints it for every call, found or not, so a corpus that never exceeds
+    /// one op says the producer-side invariant holds where a count of returned
+    /// catches alone would not.
+    fn scan_catch_after_resume_live(&self, resume_live_pos: usize) -> (Option<usize>, usize) {
         let code = &self.jitcode.code;
-        let startpoints = self.jitcode.startpoints.as_ref()?;
+        let Some(startpoints) = self.jitcode.startpoints.as_ref() else {
+            return (None, 0);
+        };
         let mut points: Vec<usize> = startpoints
             .iter()
             .copied()
@@ -1581,19 +1607,22 @@ impl BlackholeInterpreter {
             .collect();
         points.sort_unstable();
         let mut crossed_trailing_live = false;
+        let mut skipped = 0usize;
         for q in points {
             let op = code[q];
             if op == self.op_catch_exception {
-                return crossed_trailing_live.then_some(q);
+                return (crossed_trailing_live.then_some(q), skipped);
             }
             if crossed_trailing_live {
-                return None;
+                return (None, skipped);
             }
             if op == self.op_live {
                 crossed_trailing_live = true;
+            } else {
+                skipped += 1;
             }
         }
-        None
+        (None, skipped)
     }
 
     /// blackhole.py handle_rvmprof_enter.

@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: `test_extcall` and `test_call` check the `f() argument
 # after * must be an iterable` message, but only ever for callables whose
 # `__qualname__` and `__module__` are ordinary strings.  A runtime that

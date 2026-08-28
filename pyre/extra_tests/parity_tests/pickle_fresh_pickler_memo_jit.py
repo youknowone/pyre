@@ -1,3 +1,5 @@
+# CPython-suite gap: pickle tests do not repeat fresh Picklers at a hot call site.
+# parity-tests reason: this guards pyre JIT abort/resume and memo ownership.
 import io
 import pickle
 
@@ -16,5 +18,3 @@ for proto in range(pickle.HIGHEST_PROTOCOL + 1):
         assert pickle.loads(stream.getvalue()) == payload
 
 print("OK")
-# CPython-suite gap: pickle tests do not repeat fresh Picklers at a hot call site.
-# parity-tests reason: this guards pyre JIT abort/resume and memo ownership.

@@ -592,7 +592,13 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
         crate::compile::Mode::Exec,
         &filename,
     )
-    .map_err(|error| crate::builtins::compile_err_to_syntax_error(error, &source))?;
+    .map_err(|error| {
+        crate::builtins::compile_err_to_syntax_error(
+            error,
+            &source,
+            crate::compile::Mode::Exec,
+        )
+    })?;
     let w_code = crate::w_code_new(Box::into_raw(Box::new(code)) as *const ());
     if let Some(key) = cache_key {
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;

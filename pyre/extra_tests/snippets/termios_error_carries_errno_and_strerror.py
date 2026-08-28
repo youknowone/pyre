@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # pyre-check: platforms=darwin,linux
 # CPython-suite gap: test_termios does not import, so nothing in the suite
 # inspects what a failed termios call raises.

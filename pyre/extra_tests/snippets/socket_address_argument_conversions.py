@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_socket does not import, so nothing in the suite calls
 # these conversions with an argument outside the range the C type holds.
 # parity-tests reason: `htons` / `ntohs` / `htonl` / `ntohl` narrowed with a

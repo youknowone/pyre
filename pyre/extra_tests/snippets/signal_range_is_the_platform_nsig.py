@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # pyre-check: platforms=darwin,linux
 # CPython-suite gap: test_signal never asks for a signal number above the
 # platform's range, so nothing in the suite reads the bound back.

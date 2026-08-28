@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # pyre-check: platforms=darwin
 # CPython-suite gap: the suite reads these constants only through the calls
 # that take them, and every such test skips when the name is absent, so a

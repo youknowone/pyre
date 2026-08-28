@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # pyre-check: platforms=darwin,linux
 # CPython-suite gap: test__locale guards every `nl_langinfo` assertion behind
 # `hasattr(locale, name)`, so a module that publishes none of the item keys

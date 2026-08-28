@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: `test_traceback`'s `TestTracebackType` builds nodes with
 # plain in-range integers, so nothing in the suite reaches either edge of the
 # `int` converter its signature declares -- neither an object that is only

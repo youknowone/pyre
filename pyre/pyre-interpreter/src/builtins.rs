@@ -12054,8 +12054,9 @@ fn builtin_callable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 pub fn compile_err_to_syntax_error(
     e: crate::compile::CompileError,
     source: &str,
+    mode: crate::compile::Mode,
 ) -> crate::PyError {
-    compile_err_to_syntax_error_maybe_incomplete(e, source, None)
+    compile_err_to_syntax_error_maybe_incomplete(e, source, mode, false)
 }
 
 /// Convert Ruff/RustPython's one-based UTF-8 byte column to the one-based
@@ -12398,6 +12399,38 @@ fn parenthesized_expr(source: &str, expr: &rustpython_compiler::ast::Expr) -> bo
         .is_some_and(|before| before.trim_end().ends_with('('))
 }
 
+/// The starred element of a target that `expressions` cannot parse, if it has
+/// one.  A display keeps its own brackets and unpacks inside them, so only an
+/// unparenthesized tuple hands its elements to the expression grammar one by
+/// one.
+fn first_starred_target(
+    target: &rustpython_compiler::ast::Expr,
+) -> Option<&rustpython_compiler::ast::Expr> {
+    use rustpython_compiler::ast::Expr;
+    match target {
+        Expr::Starred(_) => Some(target),
+        Expr::Tuple(tuple) if !tuple.parenthesized => tuple
+            .elts
+            .iter()
+            .find(|element| matches!(element, Expr::Starred(_))),
+        _ => None,
+    }
+}
+
+/// The span of the token a statement opens with.
+///
+/// Every compound statement opens with a keyword, and a decorated one with
+/// `@`, so this is the token the expression grammar rejects outright.
+fn leading_token_span(source: &str, statement: &rustpython_compiler::ast::Stmt) -> (usize, usize) {
+    let start = statement.range().start().to_usize();
+    let rest = source.get(start..).unwrap_or_default();
+    let length = rest
+        .find(|character: char| !character.is_alphanumeric() && character != '_')
+        .unwrap_or(rest.len())
+        .max(1);
+    (start, start + length)
+}
+
 /// Whether the target reaches `python.gram:invalid_named_expression`'s third
 /// alternative, which is what prints the `Maybe you meant '=='` form.
 ///
@@ -12474,16 +12507,29 @@ fn value_followed_by_assignment(source: &str, value_end: usize) -> bool {
     rest.starts_with(":=") || (rest.starts_with('=') && !rest.starts_with("=="))
 }
 
-/// The span of the augmented-assignment operator between a target and a value.
-fn augassign_operator_span(
+/// The span of the assignment operator standing between a target and whatever
+/// follows it -- the value, or the next target of a chain.
+///
+/// A parenthesized target ends inside its own parentheses, so the gap can open
+/// with a run of closing ones: `(a) = 1` hands this `) = `.  Read the operator
+/// out from its `=` rather than by trimming the gap, and the brackets stay out
+/// of the span.
+fn assignment_operator_span(
     source: &str,
     target_end: usize,
-    value_start: usize,
+    next_start: usize,
 ) -> Option<(usize, usize)> {
-    let gap = source.get(target_end..value_start)?;
-    let start = target_end + (gap.len() - gap.trim_start().len());
-    let end = target_end + gap.trim_end().len();
-    (start < end).then_some((start, end))
+    let gap = source.get(target_end..next_start)?;
+    let equals = gap.find('=')?;
+    let start = gap[..equals]
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| {
+            !character.is_whitespace() && !matches!(character, ')' | ']' | '}')
+        })
+        .last()
+        .map_or(equals, |(index, _)| index);
+    Some((target_end + start, target_end + equals + 1))
 }
 
 /// `python.gram:invalid_assignment` / `invalid_named_expression` name the
@@ -12501,6 +12547,7 @@ fn augassign_operator_span(
 fn assignment_target_error(
     error: &crate::compile::CompileError,
     source: &str,
+    mode: crate::compile::Mode,
 ) -> Option<(String, usize, usize)> {
     use rustpython_compiler::ast::{self, Expr, Stmt, visitor::Visitor};
 
@@ -12566,7 +12613,55 @@ fn assignment_target_error(
         )
     };
 
-    match finder.found? {
+    let found = finder.found?;
+
+    // `eval` is `expressions NEWLINE* ENDMARKER`, which has no assignment rule
+    // at all: the parse stops at the operator and reports the plain failure
+    // rather than any of the messages below.  Two target shapes fail before it
+    // and name their own first token instead -- a starred element of an
+    // unparenthesized tuple, at its `*`, and an unparenthesized `yield`, at the
+    // keyword.  A display keeps its own brackets and unpacks inside them, so
+    // `[*a, b] = 1` and `(a, *b) = 1` still report at the operator.
+    if matches!(mode, crate::compile::Mode::Eval) {
+        // `expressions` reaches an assignment operator only when the assignment
+        // is the whole source.  A nested one stands behind the keyword that
+        // opens the statement holding it, which is where the parse stopped, so
+        // report there instead -- `def f(): (yield a) = 1` is named at `def`.
+        let top_level = parsed.syntax().body.iter().find(|statement| {
+            let range = statement.range();
+            range.start().to_usize() <= error_index && error_index <= range.end().to_usize()
+        })?;
+        if !std::ptr::eq(top_level, found) {
+            let (start, end) = leading_token_span(source, top_level);
+            return Some(("invalid syntax".to_owned(), start, end));
+        }
+        let (target, next) = match found {
+            Stmt::AugAssign(node) => (node.target.as_ref(), node.value.as_ref()),
+            Stmt::Assign(node) => (
+                node.targets.first()?,
+                node.targets.get(1).unwrap_or(node.value.as_ref()),
+            ),
+            _ => return None,
+        };
+        if let Some(starred) = first_starred_target(target) {
+            let start = starred.range().start().to_usize();
+            return Some(("invalid syntax".to_owned(), start, start + 1));
+        }
+        if matches!(target, Expr::Yield(_) | Expr::YieldFrom(_))
+            && !parenthesized_expr(source, target)
+        {
+            let start = target.range().start().to_usize();
+            return Some(("invalid syntax".to_owned(), start, start + "yield".len()));
+        }
+        let (start, end) = assignment_operator_span(
+            source,
+            target.range().end().to_usize(),
+            next.range().start().to_usize(),
+        )?;
+        return Some(("invalid syntax".to_owned(), start, end));
+    }
+
+    match found {
         Stmt::AugAssign(node) => {
             let target = node.target.as_ref();
             // `single_target` is the only augmented target the grammar accepts,
@@ -12582,7 +12677,7 @@ fn assignment_target_error(
             if matches!(target, Expr::Yield(_) | Expr::YieldFrom(_))
                 && !parenthesized_expr(source, target)
             {
-                let (start, end) = augassign_operator_span(
+                let (start, end) = assignment_operator_span(
                     source,
                     target.range().end().to_usize(),
                     node.value.range().start().to_usize(),
@@ -13155,7 +13250,8 @@ fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
 fn compile_err_to_syntax_error_maybe_incomplete(
     e: crate::compile::CompileError,
     source: &str,
-    allow_incomplete: Option<crate::compile::Mode>,
+    mode: crate::compile::Mode,
+    allow_incomplete: bool,
 ) -> crate::PyError {
     // Every location in `e` indexes the source the compiler was handed, which
     // `compile_source_with_opts` had already run through `universal_newline`.
@@ -13212,6 +13308,17 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         })
     }
 
+    /// A triple-quoted literal left open wants more input under every parser.  A
+    /// single-quoted one still open at the end of the source is reported as
+    /// unterminated only by the block parser, which holds all the input there
+    /// is; the interactive parser has another line to read and `eval`, wanting
+    /// one expression, stops at the end of the input it was given, so for both
+    /// the literal is unfinished.
+    fn open_literal_wants_more_input(source: &str, loc: usize, mode: crate::compile::Mode) -> bool {
+        opens_triple_quote(source, loc)
+            || (!matches!(mode, crate::compile::Mode::Exec) && string_continues_to_eof(source, loc))
+    }
+
     // A source holding nothing but blank lines and comments has no statement
     // to fail on, so the parser can only have run out of input: `eval` wants
     // an expression and the tokenizer reaches EOF still looking for one.
@@ -13248,12 +13355,10 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         }
     }
 
-    let incomplete = match allow_incomplete {
-        None => false,
-        // A source holding no statement is unfinished for whichever parser
-        // wanted one, so the mode does not enter here.
-        Some(_) if holds_no_statement(source) => true,
-        Some(mode) => {
+    // A source holding no statement is unfinished for whichever parser wanted
+    // one, so the mode does not enter that arm.
+    let incomplete = allow_incomplete
+        && (holds_no_statement(source) || {
             let unfinished = match &e {
                 crate::compile::CompileError::Parse(error) => match &error.error {
                     ParseErrorType::Lexical(LexicalErrorType::Eof) => true,
@@ -13263,16 +13368,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                     )) => true,
                     ParseErrorType::Lexical(LexicalErrorType::UnclosedStringError) => {
                         let loc = error.raw_location.start().to_usize();
-                        // A triple-quoted literal left open wants more input under
-                        // every parser.  A single-quoted one still open at the end
-                        // of the source is reported as unterminated only by the
-                        // block parser, which holds all the input there is; the
-                        // interactive parser has another line to read and `eval`,
-                        // wanting one expression, stops at the end of the input it
-                        // was given, so for both the literal is unfinished.
-                        opens_triple_quote(source, loc)
-                            || (!matches!(mode, crate::compile::Mode::Exec)
-                                && string_continues_to_eof(source, loc))
+                        open_literal_wants_more_input(source, loc, mode)
                     }
                     ParseErrorType::OtherError(message)
                         if message.starts_with("Expected an indented block after")
@@ -13323,16 +13419,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                         if message.starts_with("unterminated string literal") =>
                     {
                         let loc = error.raw_location.start().to_usize();
-                        // A triple-quoted literal left open wants more input under
-                        // every parser.  A single-quoted one still open at the end
-                        // of the source is reported as unterminated only by the
-                        // block parser, which holds all the input there is; the
-                        // interactive parser has another line to read and `eval`,
-                        // wanting one expression, stops at the end of the input it
-                        // was given, so for both the literal is unfinished.
-                        opens_triple_quote(source, loc)
-                            || (!matches!(mode, crate::compile::Mode::Exec)
-                                && string_continues_to_eof(source, loc))
+                        open_literal_wants_more_input(source, loc, mode)
                     }
                     // A closing bracket with no opener, or one that does not
                     // match the opener, is wrong where it stands rather than short
@@ -13371,8 +13458,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             unfinished
                 && (!matches!(mode, crate::compile::Mode::Eval)
                     || parse_reached_end_of_source(&e, source))
-        }
-    };
+        });
 
     // `syntax_error_subclass` can supply a replacement message, so it
     // runs before the located error is built.
@@ -13467,6 +13553,25 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     } else {
         e.to_string()
     };
+    // `eval_input` is `expressions NEWLINE* ENDMARKER`: there is no statement
+    // rule for a keyword to open, and nothing may follow the expression.  The
+    // parser's own account of the token it stopped on -- that a keyword stands
+    // where an identifier belongs, or that the expression had already ended --
+    // describes a grammar `eval` does not have, and the failure it reports is
+    // the plain one.  This runs before the overrides below, so a literal that
+    // named its own failure still keeps that message.
+    if matches!(mode, crate::compile::Mode::Eval)
+        && let crate::compile::CompileError::Parse(parse_error) = &e
+        && match &parse_error.error {
+            ParseErrorType::UnexpectedExpressionToken => true,
+            ParseErrorType::OtherError(message) => {
+                message.starts_with("Expected an identifier, but found a keyword ")
+            }
+            _ => false,
+        }
+    {
+        msg = "invalid syntax".to_owned();
+    }
     let unterminated_fstring = match &e {
         crate::compile::CompileError::Parse(parse_error) => {
             unclosed_error_is_fstring(source, parse_error.raw_location.start().to_usize())
@@ -13564,7 +13669,31 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     if generator_span.is_some() {
         msg = "invalid syntax".to_owned();
     }
-    let assignment_error = assignment_target_error(&e, source);
+    // `invalid_assignment` is a grammar alternative, reached only by a
+    // statement whose tokens lexed and parsed.  A literal whose own content is
+    // wrong -- a bad escape, a byte outside ASCII, a replacement field that
+    // does not parse -- fails before any alternative gets to name the target,
+    // and so does a generator expression the call left unparenthesized.  Each
+    // of those has already claimed `msg` above, wherever in the statement it
+    // sits: `b'\xe4' = 1` reports the byte and `f() = '\N{'` the escape in the
+    // value, not the target either way.
+    let literal_content_error = escape_error.is_some()
+        || delimiter_error.is_some()
+        || literal_span.is_some()
+        || fstring_span.is_some()
+        || msg.starts_with("f-string: ")
+        || msg.starts_with("t-string: ")
+        || matches!(
+            &e,
+            crate::compile::CompileError::Parse(parse_error)
+                if matches!(
+                    parse_error.error,
+                    ParseErrorType::UnparenthesizedGeneratorExpression
+                )
+        );
+    let assignment_error = (!literal_content_error)
+        .then(|| assignment_target_error(&e, source, mode))
+        .flatten();
     if let Some((replacement, _, _)) = &assignment_error {
         msg = replacement.clone();
     }
@@ -13586,18 +13715,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let escape_span = escape_error
         .filter(|escape| escape.message == msg)
         .map(|escape| escape.span);
-    // `assignment_span` precedes the three spans whose messages `msg` has
-    // already overwritten above, so the span and the message name the same
-    // construct: an invalid assignment target inside an f-string replacement
-    // field, or in a `yield`/`await` the recovered tree parenthesized, reaches
-    // both this and the shape test that ran first.
+    // The overrides above assign `msg` in sequence, so the last one to fire is
+    // the message being reported; this chain is that same precedence read
+    // backwards, so the span and the message always name the same construct.
+    // Both halves of a pair do fire together -- an incompatible string prefix
+    // in an assignment target reaches the prefix scan and the shape test, and
+    // `bu'x' = 1` is why the prefix span has to win.
     let diagnostic_span = escape_span
         .or(literal_span)
-        .or(assignment_span)
-        .or(fstring_span)
-        .or(scope_span)
-        .or(generator_span)
         .or(prefix_span)
+        .or(assignment_span)
+        .or(generator_span)
+        .or(scope_span)
+        .or(fstring_span)
         .or(delimiter_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
@@ -14280,7 +14410,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                     crate::compile::compile_source_with_opts(text, mode, &filename, retry_opts)
             {
                 return replace_compile_syntax_error_filename(
-                    compile_err_to_syntax_error_maybe_incomplete(structured, text, Some(mode)),
+                    compile_err_to_syntax_error_maybe_incomplete(structured, text, mode, true),
                     &filename,
                     filename_bytes.as_deref(),
                 );
@@ -14296,7 +14426,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             compile_err_to_syntax_error_maybe_incomplete(
                 e,
                 source,
-                (flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0).then_some(mode),
+                mode,
+                flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
             )
         })
     } else {
@@ -14420,7 +14551,7 @@ fn exec_or_eval(
             };
             crate::syntax_warnings::emit_escape_warnings(&source, "<string>")?;
             let code = crate::compile::compile_source(&source, mode)
-                .map_err(|e| compile_err_to_syntax_error(e, &source))?;
+                .map_err(|e| compile_err_to_syntax_error(e, &source, mode))?;
             let code_ptr = Box::into_raw(Box::new(code)) as *const ();
             (crate::w_code_new(code_ptr), false)
         }

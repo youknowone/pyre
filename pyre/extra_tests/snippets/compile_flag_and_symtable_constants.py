@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_ast and test_symtable use these constants through the
 # module that publishes them, so both sides of a comparison move together and
 # a wrong number is invisible.

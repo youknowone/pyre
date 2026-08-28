@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # pyre-check: pypy-diverges: pins staticmethod.__text_signature__ (3.14); pypy3's staticmethod has no such attribute
 # CPython-suite gap: exact builtin and descriptor text signatures are not asserted.
 # parity-tests reason: guard pyre's CPython 3.14 signature metadata surface.

@@ -48,3 +48,16 @@ for _round in range(30):
 
     buf = bytearray(b"abcdefgh" * 4)
     assert buf.find(b"c", Idx(2)) == 2
+
+
+# list.index also keeps a movable search value alive while converting bounds.
+class Payload:
+    pass
+
+
+for _round in range(20):
+    needle = [Payload()]
+    values = [[Payload()] for _ in range(8)] + [needle]
+    assert values.index(needle, Idx(0), Idx(64)) == 8
+    assert values.index(needle, Idx(-9)) == 8
+    assert values.index(needle, Idx(8), Idx(9)) == 8

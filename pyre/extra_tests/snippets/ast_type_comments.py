@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_type_comments is not in the gated set, and nothing
 # else in the suite passes `type_comments=True`, so a parse that accepts the
 # flag and collects nothing looks exactly like one that works.

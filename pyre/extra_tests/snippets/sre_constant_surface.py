@@ -1,3 +1,4 @@
+# pyre-check: gate=1
 # CPython-suite gap: test_re reads `MAXGROUPS` out of the module under test, so
 # both sides of every comparison move together and a wrong value is invisible;
 # `MAGIC`, `CODESIZE` and `MAXREPEAT` are never checked against a number at all.

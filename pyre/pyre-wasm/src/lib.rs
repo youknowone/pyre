@@ -953,18 +953,19 @@ fn run_python_impl(source: &str) -> String {
 
     let filename = SCRIPT_PATH.with(|p| p.borrow().clone());
     let filename = filename.as_deref().unwrap_or("<string>");
-    let code = match compile_source_with_filename(source, Mode::Exec, filename) {
-        Ok(code) => code,
-        Err(e) => {
-            // `pyrex::run_source` renders the same `File "…", line N` + caret
-            // banner on stderr and exits 1.
-            pyre_interpreter::eprint_syntax_error(&pyre_interpreter::compile_err_to_syntax_error(
-                e, source,
-            ));
-            EXIT_CODE.with(|c| c.set(1));
-            return String::new();
-        }
-    };
+    let code =
+        match compile_source_with_filename(source, Mode::Exec, filename) {
+            Ok(code) => code,
+            Err(e) => {
+                // `pyrex::run_source` renders the same `File "…", line N` + caret
+                // banner on stderr and exits 1.
+                pyre_interpreter::eprint_syntax_error(
+                    &pyre_interpreter::compile_err_to_syntax_error(e, source, Mode::Exec),
+                );
+                EXIT_CODE.with(|c| c.set(1));
+                return String::new();
+            }
+        };
 
     let execution_context = std::rc::Rc::new(PyExecutionContext::default());
     // Seed the TLS execution-context slot (pyrex real_main does the same at
