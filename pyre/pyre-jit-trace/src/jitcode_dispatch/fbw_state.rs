@@ -2022,22 +2022,6 @@ thread_local! {
     /// trace executes that residual once on later iterations, so the generic
     /// nested-replay decline does not apply to this resolved descriptor path.
     pub(crate) static EXCEPTION_STRING_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Marks a `BINARY_OP` / `COMPARE_OP` dunder inline admitted on the
-    /// entry's rewind rather than on a whole-body `Clean` verdict.
-    ///
-    /// The two flags above EXEMPT a region from the nested-residual decline.
-    /// This one ARMS it, because the narrowing that decline carries does not
-    /// hold here.  That narrowing rests on aborts resuming FORWARD past the
-    /// inlined frame; a dunder that answers `NotImplemented` has no forward
-    /// resume at all -- the result has to go back to the binary protocol, and
-    /// the only route back re-runs the body.  So this region's single exit is
-    /// the record-time cut, which is legal only while nothing has been
-    /// applied, and the residual that would apply something is refused before
-    /// it runs rather than detected after.
-    pub(crate) static BINOP_REWIND_INLINE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set when the arm above refused a residual, so the entry that armed it
-    /// knows the descent stopped for that reason and can take the cut.
-    pub(crate) static BINOP_REWIND_INLINE_TRIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Code keys of the callees [`fbw_inline_callee_hazardous`] named when the
     /// hazard arm of [`fbw_abort_nested_unjournaled_residual`] fired.  The
     /// inline callsite declines them from then on, so the call residualizes
@@ -2181,22 +2165,11 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     if matches!(cause, Some(ResidualDecline::PureUnfolded)) {
         return Ok(());
     }
-    // A `BINARY_OP` / `COMPARE_OP` dunder inline admitted on the entry's rewind
-    // has exactly one exit and it is the record-time cut, which is legal only
-    // while the region has applied nothing.  The narrowing the rest of this
-    // function carries does not reach it: that narrowing rests on an abort
-    // resuming FORWARD past the inlined frame, and a dunder answering
-    // `NotImplemented` has no forward resume at all.
-    //
-    // The odometer cannot answer "has anything been applied" in time -- it is
-    // bumped after `exec_result`, and for a Ref-returning dunder residual the
-    // term that moves it is `entered_user_frame`, which is a measurement of
-    // what already ran.  So the refusal is here, where the residual has not run
-    // yet and the cut is still legal.
-    if BINOP_REWIND_INLINE_ACTIVE.with(|c| c.get()) {
-        BINOP_REWIND_INLINE_TRIPPED.with(|c| c.set(true));
-        return Err(DispatchError::callee_inline_unsupported(pc));
-    }
+    // The narrowing the rest of this function carries rests on an abort
+    // resuming FORWARD past the inlined frame, which a `BINARY_OP` /
+    // `COMPARE_OP` dunder answering `NotImplemented` has no form of.  That
+    // region refuses every unjournaled commit instead, this one included.
+    fbw_binop_rewind_refuse_commit(ctx, pc)?;
     // RPython `do_residual_call` runs the residual executor at any framestack
     // depth (`pyjitpl.py`). Exempt only the self-recursive
     // `CALL_ASSEMBLER` fold's concrete-stamp executor from this pyre-local
@@ -3868,47 +3841,77 @@ pub(crate) fn fbw_callee_body_has_binary_op_residual(
     false
 }
 
-/// Arms [`BINOP_REWIND_INLINE_ACTIVE`] for the duration of one descent.
+/// Refuse a commit the enclosing `BINARY_OP` / `COMPARE_OP` rewind cannot undo.
 ///
-/// While it is armed no residual that is not provably side-effect-free runs at
-/// all, which is the invariant the entry's cut rests on -- not "no residual has
-/// run yet", which only the odometer could answer and only too late.
-pub(crate) struct BinopRewindInlineGuard {
-    prior: bool,
+/// A dunder inlined on that entry's rewind has exactly one exit, the
+/// record-time cut, and the cut is legal only while the region has applied
+/// nothing: a `NotImplemented` result has to go back to the binary protocol,
+/// and every route back re-executes the body.  So the answer has to be given
+/// BEFORE the commit, which is what this is; by the time the odometer has
+/// moved, the write that had to be prevented has happened.
+///
+/// The odometer's sites are what this has to cover, and they split in two.
+/// The unjournaled pair is refused here — `residual`, through
+/// [`fbw_abort_nested_unjournaled_residual`], and `store_attr_direct`, whose
+/// specialization performs the write inside the resolver and reaches no other
+/// hook.  The journaled four — `store_journal`, `list_append`,
+/// `list_pop_end`, `cell_store_journal` — need no refusal: they move the
+/// odometer, so the entry's all-clear reading fails and it aborts instead of
+/// cutting, and [`fbw_store_journal_rollback`] undoes them on that exit.
+pub(crate) fn fbw_binop_rewind_refuse_commit<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    let mut session = ctx.session.borrow_mut();
+    if session.binop_rewind_depth == 0 {
+        return Ok(());
+    }
+    session.binop_rewind_refused = true;
+    Err(DispatchError::callee_inline_unsupported(pc))
 }
 
-impl BinopRewindInlineGuard {
-    pub(crate) fn enter() -> Self {
-        let prior = BINOP_REWIND_INLINE_ACTIVE.with(|c| c.replace(true));
-        // The outermost arm starts from a clean slate, so a flag left behind by
-        // a descent that unwound for some other reason cannot be read as this
-        // one's refusal.
-        if !prior {
-            BINOP_REWIND_INLINE_TRIPPED.with(|c| c.set(false));
+/// Raises a [`fbw_binop_rewind_refuse_commit`] region for one descent.
+pub(crate) struct BinopRewindInlineGuard<'s> {
+    session: &'s std::cell::RefCell<WalkSession>,
+    /// Whether this guard is the one that raised the region, as opposed to a
+    /// nested entry inside one already standing.
+    outermost: bool,
+}
+
+impl<'s> BinopRewindInlineGuard<'s> {
+    pub(crate) fn enter(session: &'s std::cell::RefCell<WalkSession>) -> Self {
+        let mut s = session.borrow_mut();
+        let outermost = s.binop_rewind_depth == 0;
+        // The outermost entry starts from a clean slate, so a flag left behind
+        // by a descent that unwound for some other reason cannot be read as
+        // this one's refusal.
+        if outermost {
+            s.binop_rewind_refused = false;
         }
-        Self { prior }
+        s.binop_rewind_depth += 1;
+        drop(s);
+        Self { session, outermost }
     }
 
-    /// Whether the arm refused a residual while this guard was in force.
+    /// Whether a commit was refused while this guard was in force.
     ///
-    /// A guard nested inside another armed region does NOT clear the flag: the
-    /// enclosing entry's rewind is exposed by the same residual, and consuming
+    /// A guard nested inside another region does NOT clear the flag: the
+    /// enclosing entry's rewind is exposed by the same commit, and consuming
     /// the flag here would leave it looking at a descent that declined for no
-    /// stated reason and continuing past it.  Only the arm that raised the
+    /// stated reason and continuing past it.  Only the entry that raised the
     /// region takes it.
-    pub(crate) fn tripped(&self) -> bool {
-        BINOP_REWIND_INLINE_TRIPPED.with(|c| {
-            let tripped = c.get();
-            if tripped && !self.prior {
-                c.set(false);
-            }
-            tripped
-        })
+    pub(crate) fn refused(&self) -> bool {
+        let mut s = self.session.borrow_mut();
+        let refused = s.binop_rewind_refused;
+        if refused && self.outermost {
+            s.binop_rewind_refused = false;
+        }
+        refused
     }
 }
 
-impl Drop for BinopRewindInlineGuard {
+impl Drop for BinopRewindInlineGuard<'_> {
     fn drop(&mut self) {
-        BINOP_REWIND_INLINE_ACTIVE.with(|c| c.set(self.prior));
+        self.session.borrow_mut().binop_rewind_depth -= 1;
     }
 }

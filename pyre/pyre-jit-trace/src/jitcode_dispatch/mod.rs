@@ -592,6 +592,25 @@ pub struct WalkSession {
     /// Bounded by [`fbw_max_subwalk_depth`]; see that function for why the
     /// walker needs a bound RPython's heap-allocated framestack does not.
     pub subwalk_depth: usize,
+    /// How many `BINARY_OP` / `COMPARE_OP` dunder inlines admitted on the
+    /// entry's rewind are currently descending.
+    ///
+    /// Non-zero means the walk is inside a region whose only exit is the
+    /// record-time cut, so no unjournaled commit may run — see
+    /// [`fbw_binop_rewind_refuse_commit`].
+    ///
+    /// It lives on the session for the reason [`WalkSession::last_exc_value`]
+    /// does: the entry that raises the region and the residual dispatch that
+    /// has to refuse sit any number of inline levels apart, and neither owns
+    /// the other's [`WalkContext`]. The session is also the boundary that
+    /// makes the state mean what it says — it is created per walk attempt, so
+    /// a second walk reaching the same dispatch on the same OS thread starts
+    /// outside every region rather than inheriting one.
+    pub binop_rewind_depth: usize,
+    /// Set when a commit was refused inside the region above, so the entry
+    /// that raised it knows the descent stopped for that reason and may take
+    /// the cut.
+    pub binop_rewind_refused: bool,
 }
 
 impl Default for WalkSession {
@@ -611,6 +630,8 @@ impl Default for WalkSession {
             recording_jitcode_index: -1,
             recording_opcode_position: 0,
             subwalk_depth: 0,
+            binop_rewind_depth: 0,
+            binop_rewind_refused: false,
         }
     }
 }

@@ -2838,10 +2838,10 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
 /// worth attempting on the strength of the entry's rewind.
 ///
 /// This is NOT what makes the rewind sound.  [`BinopRewindInlineGuard`] is:
-/// it refuses the first residual that could commit before it runs, which is
-/// the only form the question has an answer in -- whether a body commits is a
-/// property of the path it walks, and a body that delegates through `+` is
-/// statically indistinguishable from `return self.v + o.v` over ints.
+/// it refuses the first commit before it runs, which is the only form the
+/// question has an answer in -- whether a body commits is a property of the
+/// path it walks, and a body that delegates through `+` is statically
+/// indistinguishable from `return self.v + o.v` over ints.
 ///
 /// What this filters is a shape that is admissible and still does not survive
 /// being recorded.  A body making a nested Python call inlines into a trace
@@ -8987,9 +8987,9 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // is `DeferredCall` for `return self.v + o.v` over ints, which commits
     // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
     // does.  So the verdict is not asked for the answer.  The descent runs
-    // under [`BinopRewindInlineGuard`], which refuses the first residual that
-    // could commit BEFORE it runs, leaving the cut legal for every path that
-    // reaches the arm below.
+    // under [`BinopRewindInlineGuard`], which refuses the first commit BEFORE
+    // it runs, leaving the cut legal for every path that reaches the arm
+    // below.
     //
     // That arm still reads the odometer.  The guard is what makes the reading
     // come out all-clear; the reading is what proves it for the path walked,
@@ -9026,7 +9026,10 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
-    let rewind_guard = admitted_on_rewind.then(BinopRewindInlineGuard::enter);
+    // Copied out before the descent takes `ctx` mutably; the region state is
+    // the session's, not this frame's.
+    let session = ctx.session;
+    let rewind_guard = admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session));
     let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -9062,10 +9065,10 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
         false,
         None,
     );
-    // The refusal that sets this happens BEFORE the residual runs, so the
-    // region has applied nothing and the cut is the legal exit.  Asking here
-    // rather than at the `NotImplemented` arm below is the whole point: by the
-    // time a result exists, the commit that had to be prevented has happened.
+    // The refusal that sets this happens BEFORE the commit runs, so the region
+    // has applied nothing and the cut is the legal exit.  Asking here rather
+    // than at the `NotImplemented` arm below is the whole point: by the time a
+    // result exists, the write that had to be prevented has happened.
     //
     // The cut takes the snapshots with it.  The descent attaches guards before
     // it declines, and a snapshot minted inside it names the discarded
@@ -9074,9 +9077,9 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     // entries survive into the optimizer, which remaps every published
     // snapshot and resolves the stale `OpRef` against a position the cut has
     // since handed to another operation.
-    let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
+    let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
-    if refused_a_residual {
+    if refused_a_commit {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         decline!(format_args!(
@@ -9237,9 +9240,9 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // is `DeferredCall` for `return self.v + o.v` over ints, which commits
     // nothing, exactly as it is for `self.x + o` over a mutating dunder, which
     // does.  So the verdict is not asked for the answer.  The descent runs
-    // under [`BinopRewindInlineGuard`], which refuses the first residual that
-    // could commit BEFORE it runs, leaving the cut legal for every path that
-    // reaches the arm below.
+    // under [`BinopRewindInlineGuard`], which refuses the first commit BEFORE
+    // it runs, leaving the cut legal for every path that reaches the arm
+    // below.
     //
     // That arm still reads the odometer.  The guard is what makes the reading
     // come out all-clear; the reading is what proves it for the path walked,
@@ -9265,7 +9268,10 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
     let method_const = ctx.trace_ctx.const_ref(method as i64);
-    let rewind_guard = admitted_on_rewind.then(BinopRewindInlineGuard::enter);
+    // Copied out before the descent takes `ctx` mutably; the region state is
+    // the session's, not this frame's.
+    let session = ctx.session;
+    let rewind_guard = admitted_on_rewind.then(|| BinopRewindInlineGuard::enter(session));
     let descent = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -9301,10 +9307,10 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
         false,
         None,
     );
-    // The refusal that sets this happens BEFORE the residual runs, so the
-    // region has applied nothing and the cut is the legal exit.  Asking here
-    // rather than at the `NotImplemented` arm below is the whole point: by the
-    // time a result exists, the commit that had to be prevented has happened.
+    // The refusal that sets this happens BEFORE the commit runs, so the region
+    // has applied nothing and the cut is the legal exit.  Asking here rather
+    // than at the `NotImplemented` arm below is the whole point: by the time a
+    // result exists, the write that had to be prevented has happened.
     //
     // The cut takes the snapshots with it.  The descent attaches guards before
     // it declines, and a snapshot minted inside it names the discarded
@@ -9313,9 +9319,9 @@ pub(crate) fn try_walker_inline_user_compareop<Sym: WalkSym>(
     // entries survive into the optimizer, which remaps every published
     // snapshot and resolves the stale `OpRef` against a position the cut has
     // since handed to another operation.
-    let refused_a_residual = rewind_guard.as_ref().is_some_and(|g| g.tripped());
+    let refused_a_commit = rewind_guard.as_ref().is_some_and(|g| g.refused());
     drop(rewind_guard);
-    if refused_a_residual {
+    if refused_a_commit {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
         ctx.trace_ctx.heap_cache_mut().reset();
         return Ok(None);
