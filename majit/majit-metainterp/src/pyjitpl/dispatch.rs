@@ -1146,7 +1146,12 @@ pub fn symbolic_residual_trace_aborts() -> u64 {
     SYMBOLIC_RESIDUAL_TRACE_ABORTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn report_symbolic_residual_call_target(func: usize, arg_classes: &str) {
+fn report_symbolic_residual_call_target(
+    ctx: &mut TraceCtx,
+    func: usize,
+    arg_classes: &str,
+) -> TraceAction {
+    ctx.symbolic_residual_abort = true;
     SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static REPORTED: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<usize>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
@@ -1172,6 +1177,7 @@ fn report_symbolic_residual_call_target(func: usize, arg_classes: &str) {
             );
         }
     }
+    TraceAction::Abort
 }
 
 impl<FLabel> ClosureRuntime<FLabel> {
@@ -7308,11 +7314,11 @@ where
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -7407,11 +7413,11 @@ where
                     //    `extern "C" fn(...) -> i64` and reads garbage from
                     //    rax/x0).
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -7630,11 +7636,11 @@ where
                     // int destination register, and abort on exception.
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -7708,11 +7714,11 @@ where
                     // return) — RPython `executor.execute_varargs` →
                     // `cpu.bh_call_i`.
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     let concrete = if concrete_ptr.is_null() {
                         0
@@ -7927,11 +7933,11 @@ where
                     // branch for the full citation.
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -8001,11 +8007,11 @@ where
                         None
                     };
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     let concrete = if concrete_ptr.is_null() {
                         0
@@ -8182,11 +8188,11 @@ where
                     // branch for the full citation.
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -8245,11 +8251,11 @@ where
                         None
                     };
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        report_symbolic_residual_call_target(
+                        return report_symbolic_residual_call_target(
+                            ctx,
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
-                        return TraceAction::Abort;
                     }
                     let concrete = if concrete_ptr.is_null() {
                         0.0f64
@@ -10100,6 +10106,19 @@ fn publish_walk_abort_handoff(
     standalone: &mut StandaloneFrameStack,
 ) {
     if matches!(action, TraceAction::Abort) && !standalone.frames.is_empty() {
+        // `try_generate_dispatch_arm_body` lowers every statement in one
+        // source arm, in order, into the same sub-JitCode.  Each residual-call
+        // instruction executes its concrete target before recording it, so a
+        // symbolic target may be refused after an earlier residual call in the
+        // arm already committed heap effects.  Replaying from
+        // `last_mp_green_pc` would execute that prefix twice; publishing the
+        // post-decode framestack would skip the refused call.  There is no
+        // sound automatic resume position, so publish neither handoff and let
+        // the public `symbolic_residual_trace_aborts` counter tell the embedder
+        // that its fnaddr bindings are incomplete.
+        if std::mem::replace(&mut ctx.symbolic_residual_abort, false) {
+            return;
+        }
         if let Some(pc) = standalone.frames.frames[0]
             .int_values
             .first()
@@ -12242,6 +12261,13 @@ mod tests {
 
     extern "C" fn residual_void_no_args() {}
 
+    static RESIDUAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn residual_count_prefix() {
+        RESIDUAL_PREFIX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     extern "C" fn residual_void_raises() {
         // exc payload must be a valid OBJECTPTR (typeptr at offset 0) so
         // `DefaultCpu::cls_of_box` can dereference per model.py.
@@ -13121,6 +13147,68 @@ mod tests {
                 .iter()
                 .any(|op| op.opcode == OpCode::GuardValue),
             "catch handler must see last_exc_value after residual-call unwind"
+        );
+    }
+
+    /// A dispatch-arm sub-JitCode is a statement sequence, so one residual
+    /// call can commit a side effect before a later residual target is refused.
+    /// No source-pc or blackhole handoff is sound for that abort: the former
+    /// repeats the committed prefix, while the latter skips the refused call.
+    #[test]
+    fn symbolic_residual_after_concrete_residual_publishes_no_resume_handoff() {
+        let before = RESIDUAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 47);
+        let concrete_idx = builder.add_fn_ptr(residual_count_prefix as *const ());
+        builder.residual_call_void_canonical_via_target_with_effect_info(
+            concrete_idx,
+            &[],
+            residual_effect(majit_ir::descr::ExtraEffect::CannotRaise),
+        );
+        let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+            "symbolic_residual_after_concrete_residual",
+        ]);
+        let symbolic_idx = builder.add_fn_ptr(symbolic as usize as *const ());
+        builder.residual_call_void_canonical_via_target_with_effect_info(
+            symbolic_idx,
+            &[],
+            residual_effect(majit_ir::descr::ExtraEffect::CannotRaise),
+        );
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test_types(&[Type::Int]);
+        // The production dispatch walk set this at the source opcode's merge
+        // point before entering its arm sub-JitCode.
+        ctx.last_mp_green_pc = Some(41);
+        let mut sym = DummySym;
+        let action = trace_jitcode_with_args(
+            &mut ctx,
+            &mut sym,
+            &jitcode,
+            41,
+            |_pc| 0,
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), 41)],
+        );
+
+        assert!(matches!(action, TraceAction::Abort));
+        assert_eq!(
+            RESIDUAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the concrete prefix call executes before the symbolic refusal",
+        );
+        assert_eq!(
+            ctx.last_mp_green_pc,
+            Some(41),
+            "the source-opcode replay coordinate exists but is unsafe",
+        );
+        assert_eq!(ctx.walk_final_pc, None, "no source-pc handoff is sound");
+        assert!(
+            ctx.aborted_framestack.is_none(),
+            "no post-decode blackhole handoff is sound",
+        );
+        assert!(
+            !ctx.symbolic_residual_abort,
+            "the one-shot refusal flag must be consumed by the publisher",
         );
     }
 

@@ -556,6 +556,13 @@ pub struct TraceCtx {
     /// instruction boundary).  RPython has no counterpart: it has no panic arm
     /// here.
     pub abort_after_panic: bool,
+    /// Set when the walk refused a residual call whose target was still a
+    /// symbolic path hash.  A dispatch-arm sub-JitCode may contain an earlier
+    /// residual call that already executed concretely, so neither replaying
+    /// the source opcode nor resuming after the refused call is sound.  The
+    /// abort publisher consumes this flag and declines both resume handoffs;
+    /// [`crate::symbolic_residual_trace_aborts`] is the embedder-facing signal.
+    pub symbolic_residual_abort: bool,
     /// `pyjitpl.py run_blackhole_interp_to_cancel_tracing` needs
     /// `metainterp.framestack` to still exist when it calls
     /// `blackhole.py convert_and_run_from_pyjitpl(self, ...)`.  RPython
@@ -1756,6 +1763,7 @@ impl TraceCtx {
             walk_final_pc: None,
             last_mp_green_pc: None,
             abort_after_panic: false,
+            symbolic_residual_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
@@ -1853,6 +1861,7 @@ impl TraceCtx {
             walk_final_pc: None,
             last_mp_green_pc: None,
             abort_after_panic: false,
+            symbolic_residual_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
             pending_guard_not_invalidated_pc: None,
