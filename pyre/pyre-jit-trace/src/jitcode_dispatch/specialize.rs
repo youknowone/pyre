@@ -10919,9 +10919,11 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     // refusal.  Before the width gate came off, `locals_in_wide_inlined_callee`
     // reported the single line `nslots-over-cap nslots=42 name=wide`; that was
     // the only one the corpus produced, and no other gate has ever been
-    // observed to fire.  So the gates left below are unmeasured rather than
-    // known-live, and a widening aimed at one of them needs a fixture that
-    // reaches it first.
+    // observed to fire.  Each gate below now records why it does not: the
+    // non-OPTIMIZED refusal is the answer rather than a gap, its
+    // `CO_FAST_HIDDEN` half is a bit this compiler never sets, and the two
+    // frame-payload gates sit behind writers that need a reference to the
+    // level's own live frame.
     if let Some(callee) = super::fbw_state::fbw_innermost_inline_callee_key(ctx) {
         return Err(super::fbw_state::fbw_decline_inline_callee(
             ctx,
@@ -11038,6 +11040,14 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         decline!("shadow-names-other-code");
     }
     let code_obj = unsafe { &*code_ptr };
+    // Two conditions, and only the first can fire.  A non-OPTIMIZED frame
+    // answers `locals()` from `PyFrame::getdictscope` — its LIVE namespace,
+    // not the independent copy this arm builds — so declining is the answer
+    // rather than a gap.  The `CO_FAST_HIDDEN` half is inert: `pycode.rs`
+    // builds `localspluskinds` out of `CO_FAST_LOCAL` and `CO_FAST_CELL`
+    // alone, so nothing this compiler produces carries the bit, and
+    // `PyFrame::fast2locals` skips such a slot only on a frame this arm has
+    // already refused.
     if !pyre_interpreter::PyFrame::code_locals_are_modelled_fastlocals(code_obj) {
         decline!("not-modelled-fastlocals");
     }
@@ -11063,6 +11073,14 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     // shape, whose rewrite has to reach the frame's own dict across calls;
     // this level's frame is rebuilt from scratch by the compiled trace when it
     // is built at all, so that shape has no counterpart here and declines.
+    //
+    // Never observed to fire, and the reason is structural: this arm has
+    // already required an OPTIMIZED frame, and on one of those `w_locals` has
+    // no writer the answer can follow.  `bind_unoptimized_locals_scope`
+    // returns before binding it, `PyFrame::fget_getdictscope` hands an
+    // optimized frame a `FrameLocalsProxy` rather than calling
+    // `getdictscope`, and the line-tracing call to `fast2locals` is guarded on
+    // `w_locals` being non-null already, so it cannot be the first setter.
     if !frame_ref.get_w_locals().is_null() {
         decline!("frame-has-w-locals");
     }
@@ -11074,6 +11092,14 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     // key.  Read the LIVE callee frame, which is the only holder: this level's
     // frame is built by the compiled trace, so its payload starts empty every
     // iteration and only a residual on the recorded path can have filled it.
+    //
+    // Never observed to fire either, and an earlier gate is why.  The one
+    // writer is `FrameLocalsProxy::setitem_value`, so filling the dict takes a
+    // reference to this level's own live frame, and that write calls
+    // `force_locals` before it stores.  `locals_proxy_extra_key_hot` drives
+    // exactly that shape one frame in and reports no decline at all: the
+    // expansion is not reached there, because the callee is no longer an
+    // un-escaped inline level by the time `locals()` is recorded.
     if !frame_ref.get_extra_locals().is_null() {
         decline!("frame-has-extra-locals");
     }
