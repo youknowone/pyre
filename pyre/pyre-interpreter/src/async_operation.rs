@@ -72,10 +72,10 @@ static HANDLES: std::sync::Mutex<[usize; 2]> = std::sync::Mutex::new([0; 2]);
 /// into its own fresh module globals and stores the `aiter` / `anext`
 /// function objects; both retain that namespace as their `__globals__`,
 /// keeping the `_NOT_PROVIDED` sentinel reachable.
-fn handle(which: usize) -> PyObjectRef {
+fn handle(which: usize) -> PyResult {
     let cached = HANDLES.lock().unwrap()[which];
     if cached != 0 {
-        return cached as PyObjectRef;
+        return Ok(cached as PyObjectRef);
     }
 
     // Do not hold HANDLES while executing Python: applevel installation can
@@ -92,9 +92,11 @@ fn handle(which: usize) -> PyObjectRef {
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
     let _ = pyre_object::gc_roots::pin_root(w_app_globals);
-    // The source imports nothing, so nothing the program does can make this
-    // fail; a failure here is the bundled file's own.
-    if let Err(e) = crate::importing::appleveldef_install(
+    // The source imports nothing, but running it is still running Python: it
+    // builds two functions in a fresh frame, so it answers a recursion limit
+    // the program set and a `builtins` the program emptied. That belongs to
+    // the `aiter`/`anext` call that forced the install.
+    crate::importing::appleveldef_install(
         pyre_object::gc_roots::shadow_stack_get(save_point),
         ASYNC_OP_SRC,
         "app_operation.py",
@@ -102,9 +104,7 @@ fn handle(which: usize) -> PyObjectRef {
         // `get_applevel_name` hands to every appleveldef of that module.
         "builtins",
         &["aiter", "anext"],
-    ) {
-        panic!("async_operation: app_operation.py — {e:?}");
-    }
+    )?;
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
     let get = |name: &str| {
         unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }
@@ -115,7 +115,7 @@ fn handle(which: usize) -> PyObjectRef {
     if handles[which] == 0 {
         *handles = initialized;
     }
-    handles[which] as PyObjectRef
+    Ok(handles[which] as PyObjectRef)
 }
 
 /// RPython's GC transform treats the app-level interphook cache as a normal
@@ -132,10 +132,10 @@ pub(crate) fn walk_handle_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 /// `aiter(obj)` — delegates to the app-level `aiter`, whose `def aiter(obj)`
 /// signature enforces the single-argument arity.
 pub fn builtin_aiter(args: &[PyObjectRef]) -> PyResult {
-    crate::call::call_function_impl_result(handle(AITER), args)
+    crate::call::call_function_impl_result(handle(AITER)?, args)
 }
 
 /// `anext(iterator[, default])` — delegates to the app-level `anext`.
 pub fn builtin_anext(args: &[PyObjectRef]) -> PyResult {
-    crate::call::call_function_impl_result(handle(ANEXT), args)
+    crate::call::call_function_impl_result(handle(ANEXT)?, args)
 }
