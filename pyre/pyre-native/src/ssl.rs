@@ -2731,10 +2731,7 @@ struct ContextKeyLog {
 
 impl ContextKeyLog {
     fn set_path(&self, path: Option<&std::path::Path>) -> std::io::Result<()> {
-        let mut slot = self
-            .file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = self.file.lock();
         // `_SSLContext.keylog_filename` removes the old callback and closes
         // its BIO before it handles either None or the replacement path.
         *slot = None;
@@ -2757,10 +2754,7 @@ impl ContextKeyLog {
     }
 
     fn enabled(&self) -> bool {
-        self.file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
+        self.file.lock().is_some()
     }
 
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
@@ -2780,10 +2774,7 @@ impl ContextKeyLog {
         }
         line.push(b'\n');
 
-        let mut slot = self
-            .file
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = self.file.lock();
         if let Some(file) = slot.as_mut() {
             // Rustls' callback has no error return, just like the OpenSSL
             // callback boundary.  A setter/open error is reported eagerly;
@@ -2813,10 +2804,7 @@ impl CapturingKeyLog {
     }
 
     fn set_sink(&self, sink: Arc<ContextKeyLog>) {
-        *self
-            .sink
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
+        *self.sink.lock() = sink;
     }
 }
 
@@ -2825,21 +2813,12 @@ impl rustls::KeyLog for CapturingKeyLog {
         if label == "CLIENT_RANDOM" {
             *self.tls12_master_secret.lock() = Some(secret.to_vec());
         }
-        let sink = self
-            .sink
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let sink = self.sink.lock().clone();
         sink.log(label, client_random, secret);
     }
 
     fn will_log(&self, label: &str) -> bool {
-        label == "CLIENT_RANDOM"
-            || self
-                .sink
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .enabled()
+        label == "CLIENT_RANDOM" || self.sink.lock().enabled()
     }
 }
 
