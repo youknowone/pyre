@@ -14417,6 +14417,20 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             ParseErrorType::OtherError(message) if message == "Expected a statement" => {
                 "invalid syntax".to_owned()
             }
+            // `parser::parse_missing_identifier` uses this private parser
+            // wording after a trailing attribute dot (`foo.`).  PyPy
+            // `PythonParser._parse` and CPython 3.14's `primary` grammar rule
+            // both expose the ordinary syntax diagnostic for that source, so
+            // keep the normalization attached to the exact structured error
+            // instead of rewriting arbitrary messages.
+            ParseErrorType::OtherError(message) if message == "Expected an identifier" => {
+                "invalid syntax".to_owned()
+            }
+            ParseErrorType::OtherError(message)
+                if message.starts_with("Expected an identifier, but found a keyword ") =>
+            {
+                "invalid syntax".to_owned()
+            }
             // `ast.c` reports these three through `ast_error`, lower-case and
             // with `follows` where ruff writes `cannot follow`.
             ParseErrorType::PositionalAfterKeywordArgument => {
