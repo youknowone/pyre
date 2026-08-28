@@ -11906,6 +11906,7 @@ mod tests {
             false,
             Vec::new(),
             Vec::new(),
+            CallPath::from_segments(["test", "portal"]),
         );
         assert!(
             cc.jitdrivers_sd()[0].green_args_spec.is_empty()
