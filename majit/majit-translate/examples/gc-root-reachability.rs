@@ -350,6 +350,57 @@ fn main() {
             "       and {} body/bodies with a statement this reader could not parse",
             stats.unparsed_statement_bodies
         );
+        // The withheld figure above says a bracket dominates the call.  It does
+        // not say the root the call needed is in that bracket, and nothing has
+        // ever asked: `postprocess_double_check` asserts exactly this upstream,
+        // after `shadowcolor.py` has run, whereas every bracket in this
+        // artefact is hand-written and ungraded.  A bracket read as coverage
+        // while pinning the wrong set is worse than no bracket, because it also
+        // removes the call from the finding count above.
+        println!(
+            "       of those withheld: {} pin every live pointer, {} are SHORT a root, \
+             {} could not be read",
+            stats.withheld_bracket_covers,
+            stats.withheld_bracket_short,
+            stats.withheld_contents_opaque
+        );
+        for sb in stats.short_brackets.iter().take(20) {
+            println!(
+                "           SHORT {}:{} {} -> {}  missing [{}]  pinned [{}]",
+                sb.file,
+                sb.line,
+                sb.func_name,
+                sb.callee_name,
+                sb.missing.join(", "),
+                sb.pinned.join(", ")
+            );
+        }
+        if stats.short_brackets.len() > 20 {
+            println!(
+                "           ... and {} more (set GC_SHORT_BRACKETS_JSON to read them all)",
+                stats.short_brackets.len() - 20
+            );
+        }
+        if let Ok(path) = std::env::var("GC_SHORT_BRACKETS_JSON") {
+            let mut out = String::new();
+            for sb in &stats.short_brackets {
+                let row = serde_json::json!({
+                    "file": sb.file, "line": sb.line, "func": sb.func_name,
+                    "callee": sb.callee_name,
+                    "missing": sb.missing,
+                    "pinned": sb.pinned,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match std::fs::write(&path, out) {
+                Ok(()) => println!(
+                    "       wrote {} short bracket(s) to {path}",
+                    stats.short_brackets.len()
+                ),
+                Err(e) => println!("       FAILED to write {path}: {e}"),
+            }
+        }
         // The resolved graph is an *under*-approximation of what collects: a
         // call whose dispatch edge is unresolved is excluded, so a clean
         // resolved census is not a clean census.  Re-run with the opaque set

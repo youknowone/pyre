@@ -71,6 +71,41 @@ pub struct ScanStats {
     /// question this pass cannot answer, so they are neither reported nor
     /// silently dropped.
     pub withheld_under_a_bracket: usize,
+    /// Of [`Self::withheld_under_a_bracket`], those whose bracket pins every
+    /// GC pointer live across the call.  A call with nothing live counts here:
+    /// any bracket covers an empty set.
+    pub withheld_bracket_covers: usize,
+    /// Those where a pointer live across the call is not in the bracket's
+    /// pinned set.  The bracket exists, so the finding scan withholds the
+    /// call -- and the root it would have needed is not in it.  Listed in
+    /// [`Self::short_brackets`].
+    pub withheld_bracket_short: usize,
+    /// Those whose pinned set could not be read: a body holding a statement or
+    /// terminator this reader could not parse, an `enter_roots_frame` whose
+    /// slots are filled by later stores rather than named in an argument, or a
+    /// pin whose argument does not trace back to a set.  Neither graded nor
+    /// claimed clean -- a set read short would accuse correct code.
+    pub withheld_contents_opaque: usize,
+    /// The [`ScanStats::withheld_bracket_short`] calls, named.
+    pub short_brackets: Vec<ShortBracket>,
+}
+
+/// A bracketed call whose bracket does not pin everything live across it.
+///
+/// The complement of a [`Finding`]: there the bracket is absent, here it is
+/// present and short.  `postprocess_double_check` asserts the same property
+/// upstream after `shadowcolor.py` has run; this reads it off the shipped
+/// hand-written brackets, which no pass has ever checked.
+pub struct ShortBracket {
+    pub func_name: String,
+    pub file: String,
+    pub line: u64,
+    pub callee_name: String,
+    /// Live across the call and not pinned by the bracket that dominates it.
+    pub missing: Vec<String>,
+    /// What the bracket does pin here, so the two columns can be read
+    /// together: an empty one is a scope opened over no roots at all.
+    pub pinned: Vec<String>,
 }
 
 /// Callee names that say the pointer is addressed as a movable object.
@@ -220,6 +255,70 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
     }
 }
 
+/// How a local that a pin call was handed came to hold its value.
+///
+/// Only the shapes `pin_roots(&[a, b])` lowers to are followed; anything else
+/// leaves the pinned set unread rather than guessed at.
+enum PinSrc {
+    /// `_t = [a, b, c]` -- the pinned set itself.
+    Aggregate(Vec<u64>),
+    /// `_t = &_u`, `_t = _u as _`, `_t = _u` -- the same value under a second
+    /// name, so keep walking.
+    Alias(u64),
+}
+
+fn pin_src(r: &Rvalue) -> Option<PinSrc> {
+    let one = |o: &Operand| {
+        let mut s = HashSet::new();
+        use_operand(o, &mut s);
+        s.into_iter().next()
+    };
+    match r {
+        Rvalue::Aggregate(_, ops) => {
+            let mut v = Vec::new();
+            for o in ops {
+                v.extend(one(o));
+            }
+            Some(PinSrc::Aggregate(v))
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            place_local(place).map(PinSrc::Alias)
+        }
+        Rvalue::Use(o) | Rvalue::Cast(_, o, _) => one(o).map(PinSrc::Alias),
+        _ => None,
+    }
+}
+
+/// Every local the value reaching a pin argument is spelled by.
+///
+/// The whole alias chain is kept, not only its end: a pin publishes a *value*,
+/// so every local holding that value at the pin is covered by it, and the
+/// liveness answer names whichever one the body went on to use.
+fn chase_pinned(l: u64, defs: &HashMap<u64, PinSrc>, out: &mut HashSet<u64>, depth: u32) {
+    if !out.insert(l) || depth > 8 {
+        return;
+    }
+    match defs.get(&l) {
+        Some(PinSrc::Aggregate(v)) => {
+            for &m in v {
+                chase_pinned(m, defs, out, depth + 1);
+            }
+        }
+        Some(PinSrc::Alias(next)) => chase_pinned(*next, defs, out, depth + 1),
+        None => {}
+    }
+}
+
+/// The functions that write a livevar onto the root stack.
+///
+/// `push_roots` opens the scope and takes no arguments; the set is named
+/// separately, so the contents are read off these and not off the opener.
+/// `publish_roots` is `pin_roots` without the normalize half, and pins just
+/// the same.
+fn is_pin_fn(name: &str) -> bool {
+    name.ends_with("::pin_root") || name.ends_with("::pin_roots") || name.ends_with("::publish_roots")
+}
+
 fn successors(t: &TermKind) -> Vec<u64> {
     match t {
         TermKind::Goto { target } => vec![*target],
@@ -295,20 +394,21 @@ pub fn scan(
         stats.bodies_scanned += 1;
         let n = body.body.len();
         let terms: Vec<Option<TermKind>> = body.body.iter().map(|b| b.term().ok()).collect();
-        if terms
+        let unparsed_terms = terms
             .iter()
-            .any(|t| t.is_none() || matches!(t, Some(TermKind::Unknown)))
-        {
+            .any(|t| t.is_none() || matches!(t, Some(TermKind::Unknown)));
+        if unparsed_terms {
             // Successors are unknown for that block, so every live set derived
             // from it is a lower bound.  Count the body; do not pretend it is
             // clean.
             stats.unparsed_terminator_bodies += 1;
         }
-        if body.body.iter().any(|blk| {
+        let unparsed_stmts = body.body.iter().any(|blk| {
             blk.statements
                 .iter()
                 .any(|st| matches!(st.stmt_kind(), Err(_) | Ok(StmtKind::Unknown)))
-        }) {
+        });
+        if unparsed_stmts {
             // `transfer_stmt` reads no uses out of either shape, so the live
             // sets below can only be smaller than the truth.
             stats.unparsed_statement_bodies += 1;
@@ -348,6 +448,209 @@ pub fn scan(
             }
             seen
         };
+        // Reachable from entry, brackets and all.  A block no path reaches
+        // has no meet to take, and a must-analysis would hand it the universe
+        // and read every root as pinned; it is also not a block whose bracket
+        // anyone runs.
+        let reachable: HashSet<usize> = {
+            let mut seen: HashSet<usize> = HashSet::new();
+            let mut work = vec![0usize];
+            while let Some(cur) = work.pop() {
+                if !seen.insert(cur) {
+                    continue;
+                }
+                if let Some(t) = &terms[cur] {
+                    for s in successors(t) {
+                        if (s as usize) < n {
+                            work.push(s as usize);
+                        }
+                    }
+                }
+            }
+            seen
+        };
+
+        // What each pin call names.  `bracket_blocks` says a scope is open; it
+        // does not say what is in it, and a scope that pins the wrong set
+        // silences this scan without protecting anything.
+        //
+        // A local assigned twice is not a chain worth following, so the map is
+        // built over single-assignment locals only -- which is every temporary
+        // `pin_roots(&[..])` lowers through.
+        let mut defs: HashMap<u64, PinSrc> = HashMap::new();
+        let mut defined: HashSet<u64> = HashSet::new();
+        for (b, blk) in body.body.iter().enumerate() {
+            for st in &blk.statements {
+                let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
+                    continue;
+                };
+                let Some(d) = bare_local(&place) else { continue };
+                if !defined.insert(d) {
+                    defs.remove(&d);
+                    continue;
+                }
+                if let Some(src) = pin_src(&rv) {
+                    defs.insert(d, src);
+                }
+            }
+            if let Some(TermKind::Call { call, .. }) = &terms[b] {
+                if let Some(d) = bare_local(&call.dest) {
+                    if !defined.insert(d) {
+                        defs.remove(&d);
+                    }
+                }
+            }
+        }
+
+        // A body whose pinned set cannot be read is not a body with an empty
+        // one: grading it would turn "not understood" into "root missing".
+        let mut opaque_contents = unparsed_terms || unparsed_stmts;
+        let mut saw_pin_call = false;
+        let mut term_pins: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+        for b in 0..n {
+            let Some(TermKind::Call { call, .. }) = &terms[b] else {
+                continue;
+            };
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                continue;
+            };
+            let Some(name) = cg.names.get(id) else { continue };
+            if name.ends_with("gc_roots::enter_roots_frame") {
+                // The coloured form reserves slots and stores the roots into
+                // them afterwards, so there is no argument to read a set off.
+                opaque_contents = true;
+                continue;
+            }
+            // Reading a slot back yields the word the slot holds now, which
+            // is rooted by whatever pinned it; the index it takes is not a
+            // root, so only the result is read here.
+            let reads_a_slot_back = name.ends_with("gc_roots::shadow_stack_get");
+            if !is_pin_fn(name) && !reads_a_slot_back {
+                continue;
+            }
+            saw_pin_call = true;
+            let mut pinned: HashSet<u64> = HashSet::new();
+            if !reads_a_slot_back {
+                for a in &call.args {
+                    let mut seed: HashSet<u64> = HashSet::new();
+                    use_operand(a, &mut seed);
+                    for l in seed {
+                        chase_pinned(l, &defs, &mut pinned, 0);
+                    }
+                }
+            }
+            // What a pin hands back is the word now in the slot, so the local
+            // it binds is rooted exactly as the argument was.  `pin_root` is
+            // `#[must_use]` for that reason -- a collection may have forwarded
+            // the value, and the returned word is the one the caller must go
+            // on to use.  `let obj = pin_root(obj)` rebinds, so the local the
+            // body uses afterwards is a *different* one from the local passed
+            // in, and pinning only the argument would read the rebound name as
+            // unrooted.
+            if let Some(d) = bare_local(&call.dest) {
+                pinned.insert(d);
+            }
+            pinned.retain(|l| gc_locals.contains_key(l));
+            if pinned.is_empty() {
+                // A pin that named nothing we could resolve is a pin we do not
+                // understand, not one that pinned nothing.
+                opaque_contents = true;
+            }
+            term_pins[b] = pinned;
+        }
+        if !bracket_blocks.is_empty() && !saw_pin_call {
+            // A scope is open and nothing in this body names what went into
+            // it: the pins run behind a helper that holds the scope itself,
+            // as `RootedItems` does.  An unread set, not an empty one.
+            opaque_contents = true;
+        }
+
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for b in 0..n {
+            if !reachable.contains(&b) {
+                continue;
+            }
+            if let Some(t) = &terms[b] {
+                for s in successors(t) {
+                    if (s as usize) < n {
+                        preds[s as usize].push(b);
+                    }
+                }
+            }
+        }
+        // Locals a block reassigns before its terminator runs: the pin still
+        // holds the word the local used to carry, which is not the one the
+        // call is about to use.
+        let mut stmt_kills: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+        for (b, blk) in body.body.iter().enumerate() {
+            for st in &blk.statements {
+                match st.stmt_kind() {
+                    Ok(StmtKind::Assign(place, _)) => {
+                        if let Some(d) = bare_local(&place) {
+                            stmt_kills[b].insert(d);
+                        }
+                    }
+                    Ok(StmtKind::StorageLive(i)) | Ok(StmtKind::StorageDead(i)) => {
+                        stmt_kills[b].insert(i);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Forward *must*-analysis: a root counts as pinned at a call only when
+        // every path reaching it pinned that local and nothing has reassigned
+        // it since.  Starts at the universe and intersects down, so a block
+        // whose predecessors disagree keeps only what they all hold.
+        let universe: HashSet<u64> = gc_locals.keys().copied().collect();
+        let out_of = |b: usize, pin: &[HashSet<u64>]| -> HashSet<u64> {
+            let mut s: HashSet<u64> = pin[b].difference(&stmt_kills[b]).copied().collect();
+            if let Some(TermKind::Call { call, .. }) = &terms[b] {
+                if let Some(d) = bare_local(&call.dest) {
+                    s.remove(&d);
+                }
+            }
+            s.extend(term_pins[b].iter().copied());
+            s
+        };
+        let mut pinned_in: Vec<HashSet<u64>> = (0..n)
+            .map(|b| {
+                if b == 0 || !reachable.contains(&b) {
+                    HashSet::new()
+                } else {
+                    universe.clone()
+                }
+            })
+            .collect();
+        for _round in 0..n + 8 {
+            let outs: Vec<HashSet<u64>> = (0..n).map(|b| out_of(b, &pinned_in)).collect();
+            let mut changed = false;
+            let mut next: Vec<HashSet<u64>> = Vec::with_capacity(n);
+            for b in 0..n {
+                if b == 0 || !reachable.contains(&b) {
+                    next.push(HashSet::new());
+                    continue;
+                }
+                let mut acc = match preds[b].first() {
+                    Some(&p) => outs[p].clone(),
+                    None => HashSet::new(),
+                };
+                for &p in preds[b].iter().skip(1) {
+                    acc.retain(|l| outs[p].contains(l));
+                }
+                if acc != pinned_in[b] {
+                    changed = true;
+                }
+                next.push(acc);
+            }
+            pinned_in = next;
+            if !changed {
+                break;
+            }
+        }
+
         let mut live_in: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         // Backward liveness to a fixed point.  The bodies are small; a plain
         // worklist over predecessors converges in a handful of rounds.
@@ -420,10 +723,6 @@ pub fn scan(
             if !reach.contains(callee) {
                 continue;
             }
-            if !unbracketed.contains(&b) {
-                stats.withheld_under_a_bracket += 1;
-                continue;
-            }
             let mut after: HashSet<u64> = HashSet::new();
             for s in [*target, *on_unwind] {
                 if let Some(sl) = live_in.get(s as usize) {
@@ -434,6 +733,52 @@ pub fn scan(
                 after.remove(&d);
             }
             after.retain(|l| gc_locals.contains_key(l));
+            // One span answers every column below: a call with no statement to
+            // stand on falls back to the function's own span, and a file taken
+            // from anywhere else would then name a different one.
+            let at = bb
+                .statements
+                .last()
+                .map_or(&fd.item_meta.span.data, |s| &s.span.data);
+            if !unbracketed.contains(&b) {
+                stats.withheld_under_a_bracket += 1;
+                // Withholding the call is right -- a bracket does dominate it
+                // -- but "a bracket is open" and "this root is in it" are two
+                // questions, and only the first was ever asked.  Grade the
+                // second here so a bracket that pins the wrong set stops
+                // reading as coverage.
+                if opaque_contents || !reachable.contains(&b) {
+                    stats.withheld_contents_opaque += 1;
+                    continue;
+                }
+                let held: HashSet<u64> =
+                    pinned_in[b].difference(&stmt_kills[b]).copied().collect();
+                let mut missing: Vec<String> = after
+                    .iter()
+                    .filter(|l| !held.contains(l))
+                    .map(|l| gc_locals[l].clone())
+                    .collect();
+                if missing.is_empty() {
+                    stats.withheld_bracket_covers += 1;
+                    continue;
+                }
+                missing.sort();
+                let mut pinned: Vec<String> = held
+                    .iter()
+                    .filter_map(|l| gc_locals.get(l).cloned())
+                    .collect();
+                pinned.sort();
+                stats.withheld_bracket_short += 1;
+                stats.short_brackets.push(ShortBracket {
+                    func_name: fd.item_meta.name_path(),
+                    file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
+                    line: at.beg.line,
+                    callee_name: cg.names.get(callee).cloned().unwrap_or_default(),
+                    missing,
+                    pinned,
+                });
+                continue;
+            }
             if after.is_empty() {
                 continue;
             }
@@ -523,5 +868,114 @@ fn transfer_term(t: &TermKind, live: &mut HashSet<u64>) {
         TermKind::Switch { discr, .. } => use_operand(discr, live),
         TermKind::Assert { assert, .. } => use_operand(&assert.cond, live),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_charon_reader::ullbc::{Operand, Place, PlaceKind, Rvalue, TyRef};
+
+    fn ty() -> TyRef {
+        TyRef::Dedup { id: 0 }
+    }
+
+    fn local(i: u64) -> Place {
+        Place {
+            kind: PlaceKind::Local(i),
+            ty: ty(),
+        }
+    }
+
+    fn mv(i: u64) -> Operand {
+        Operand::Move(local(i))
+    }
+
+    fn chased(l: u64, defs: &HashMap<u64, PinSrc>) -> Vec<u64> {
+        let mut out = HashSet::new();
+        chase_pinned(l, defs, &mut out, 0);
+        let mut v: Vec<u64> = out.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// The set is named by `pin_roots`, never by the opener.  Reading the
+    /// contents off `push_roots` would find no argument at all and report
+    /// every bracket as empty.
+    #[test]
+    fn the_scope_opener_is_not_where_a_root_set_is_named() {
+        assert!(is_pin_fn("pyre_object::gc_roots::pin_root"));
+        assert!(is_pin_fn("pyre_object::gc_roots::pin_roots"));
+        assert!(is_pin_fn("pyre_object::gc_roots::publish_roots"));
+        assert!(!is_pin_fn("pyre_object::gc_roots::push_roots"));
+        assert!(!is_pin_fn("pyre_object::gc_roots::enter_roots_frame"));
+    }
+
+    /// `pin_roots(&[a, b])` lowers to an array build, a borrow, and the call.
+    #[test]
+    fn a_pin_argument_traces_back_to_the_array_it_was_built_from() {
+        let mut defs = HashMap::new();
+        defs.insert(2, PinSrc::Aggregate(vec![10, 11]));
+        defs.insert(
+            3,
+            pin_src(&Rvalue::Ref {
+                place: local(2),
+                kind: serde_json::Value::Null,
+                ptr_metadata: serde_json::Value::Null,
+            })
+            .expect("a borrow is a followable alias"),
+        );
+        assert_eq!(chased(3, &defs), vec![2, 3, 10, 11]);
+    }
+
+    /// The borrow is `&[T; N]` and the parameter is `&[T]`, so an unsize cast
+    /// sits between them on some lowerings and on others it does not.
+    #[test]
+    fn an_unsize_cast_between_the_array_and_the_slice_is_walked_through() {
+        let mut defs = HashMap::new();
+        defs.insert(2, PinSrc::Aggregate(vec![10]));
+        defs.insert(3, PinSrc::Alias(2));
+        defs.insert(
+            4,
+            pin_src(&Rvalue::Cast(serde_json::Value::Null, mv(3), ty()))
+                .expect("a cast is a followable alias"),
+        );
+        assert_eq!(chased(4, &defs), vec![2, 3, 4, 10]);
+    }
+
+    /// A pin publishes a value, so every local spelling that value at the pin
+    /// is covered by it -- keeping only the end of the chain would read a
+    /// covered root as missing and accuse correct code.
+    #[test]
+    fn a_pin_covers_every_local_the_value_is_spelled_by() {
+        let mut defs = HashMap::new();
+        defs.insert(1, pin_src(&Rvalue::Use(mv(0))).expect("a use is an alias"));
+        assert_eq!(chased(1, &defs), vec![0, 1]);
+    }
+
+    /// A local defined by a call has no followable definition; the pin still
+    /// names that local and nothing more.
+    #[test]
+    fn an_argument_with_no_followable_definition_names_only_itself() {
+        assert_eq!(chased(7, &HashMap::new()), vec![7]);
+    }
+
+    /// Two locals aliasing each other must not walk forever.  A body is read
+    /// from an artefact, so no shape can be ruled out by construction.
+    #[test]
+    fn an_alias_cycle_terminates() {
+        let mut defs = HashMap::new();
+        defs.insert(0, PinSrc::Alias(1));
+        defs.insert(1, PinSrc::Alias(0));
+        assert_eq!(chased(0, &defs), vec![0, 1]);
+    }
+
+    /// A shape this reader does not model leaves the set unread rather than
+    /// guessed at: `RootedItems` fills its slots through a method, and reading
+    /// that as an empty pin would report every root in it as missing.
+    #[test]
+    fn an_unmodelled_rvalue_yields_no_source_at_all() {
+        assert!(pin_src(&Rvalue::Unknown).is_none());
+        assert!(pin_src(&Rvalue::Len(local(1))).is_none());
     }
 }
