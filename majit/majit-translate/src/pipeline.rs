@@ -117,7 +117,15 @@ pub struct CompiledJitDriver {
     /// never declared; `red_args_types` describes them in that case.
     #[serde(default)]
     pub reds: Vec<String>,
-    /// RPython: `jd._green_args_spec` (`warmspot.py:663`), parallel to `greens`.
+    /// RPython: `jd._green_args_spec` (`warmspot.py
+    /// make_args_specification`), parallel to `greens`.
+    ///
+    /// Upstream stores each marker operand's full `concretetype`, including
+    /// `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)`.  Pyre's graph-side
+    /// `ConcreteType` has already projected every GC pointer to `GcRef` before
+    /// `Transformer::marker_operand_kinds` reads it, so this artifact can only
+    /// preserve the IR kind today.  Widening this field to `GreenType` would
+    /// not recover information its producer cannot supply.
     #[serde(default)]
     pub green_args_spec: Vec<majit_ir::Type>,
     /// RPython: `jd.red_args_types` (`warmspot.py:664`).
