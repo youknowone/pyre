@@ -213,7 +213,9 @@ pub const COLLECTING_SEEDS: &[&str] = &[
     "majit_gc::alloc_fast_nursery_collecting_typed_rooted",
     "majit_gc::standalone_alloc_nursery_collecting_typed_rooted",
     "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
-    "majit_gc::collect_full",
+    // The generation-carrying entry every backend trampoline dispatches to;
+    // `collect_full` is its `gen = 2` shim and no extracted crate calls it.
+    "majit_gc::collect_generation",
     "majit_gc::collect_step",
     "majit_gc::collect_oldgen_nonmoving",
     // The host hook the interpreter reaches them through.

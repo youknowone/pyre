@@ -8,12 +8,10 @@
 //! `pypy/objspace/std/listobject.py descr_index` names its receiver and its
 //! needle as plain locals.
 //!
-//! pyre's interpreter is compiled by rustc, so there is no flow graph for a
-//! `hop.genop` to write into and the bracket is written by hand
-//! (`pyre_object::gc_roots`).  What this module ports is therefore the
-//! *analysis* half: the same questions, answered over the ULLBC charon emits
-//! for those crates, so a hand-written bracket can be checked instead of
-//! trusted.
+//! pyre's interpreter is compiled by rustc, so its hand-written bracket is
+//! checked over ULLBC by [`liveness`].  The generated translator graph is a
+//! separate owner: [`shadowcolor`] is the strict flowspace-graph port used
+//! after `gc_push_roots` / `gc_pop_roots` have been emitted there.
 //!
 //! # Why not the insertion half
 //!
@@ -28,9 +26,10 @@
 //! *answer* `framework.py`'s question about that code, but nothing written
 //! back into it would reach the binary.
 //!
-//! So the hand-written brackets stay, and this module exists to stop them
-//! being taken on trust: `liveness::scan` reports the calls that can collect
-//! with a GC pointer live across them and no bracket, and reports what it had
-//! to withhold rather than counting it clean.
+//! So the hand-written brackets stay, and `liveness::scan` reports the calls
+//! that can collect with a GC pointer live across them and no bracket.  This
+//! does not replace the ordinary translator-side transformation: that remains
+//! the flow-graph algorithm in `shadowcolor.py`, ported by [`shadowcolor`].
 pub mod framework;
 pub mod liveness;
+pub mod shadowcolor;
