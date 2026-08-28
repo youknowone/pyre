@@ -14,13 +14,23 @@ use wasm_bindgen::prelude::*;
 // Native-host (`wasm-host`) builds target wasm32-unknown-unknown, which has no OS
 // entropy. To avoid the wasm-bindgen-based `wasm_js` backend (whose imports a
 // non-JS embedder cannot satisfy), getrandom is wired to its `custom` backend
-// via `--cfg getrandom_backend="custom"`, which calls this hook. pyre seeds only
-// non-cryptographic uses (string hash key, the `random` module) from it, and the
-// values never affect check.py's oracle comparison, so a deterministic
-// SplitMix64 stream is sufficient.
+// via `--cfg getrandom_backend="custom"`, which calls this hook.
+//
+// The embedder has entropy, so this asks it for the bytes: `os.urandom` and
+// `secrets` are the same call, and a stream anyone can recompute is not what
+// either of them promises. Only when the host declines does the SplitMix64
+// fall-back below answer, which keeps the string hash key and the `random`
+// module working on an embedder that supplies no entropy at all.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 mod custom_getrandom {
     use core::sync::atomic::{AtomicU64, Ordering};
+
+    #[link(wasm_import_module = "pyre_host")]
+    unsafe extern "C" {
+        /// Fill `[buf, buf+cap)` with entropy; 0 on success, -1 if the host
+        /// has none to give.
+        fn host_random(buf_ptr: *mut u8, buf_cap: u32) -> i32;
+    }
 
     static STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
@@ -29,6 +39,12 @@ mod custom_getrandom {
         dest: *mut u8,
         len: usize,
     ) -> Result<(), getrandom::Error> {
+        if len == 0 {
+            return Ok(());
+        }
+        if unsafe { host_random(dest, len as u32) } == 0 {
+            return Ok(());
+        }
         let mut i = 0;
         while i < len {
             let mut z = STATE
@@ -247,6 +263,51 @@ mod residual_host {
     }
 }
 
+// Host clock for the native-host (`wasm-host`) build.
+//
+// wasm32 has neither a `SystemTime` nor an `Instant`: both panic rather than
+// answer, which kept `time` -- and the nine stdlib modules that import it --
+// out of the guest entirely.  The runner owns a clock, so the guest asks it
+// the same way it asks for module source.
+#[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
+mod host_clock {
+    use pyre_interpreter::module::time::interp_time::ClockProvider;
+
+    #[link(wasm_import_module = "pyre_host")]
+    unsafe extern "C" {
+        /// Nanoseconds since the unix epoch, or -1 if the host has no clock.
+        fn host_time_ns() -> i64;
+        /// Nanoseconds on the host's monotonic clock, counted from an origin
+        /// the host only has to keep fixed for the run.
+        fn host_monotonic_ns() -> i64;
+        /// Block the calling thread for `nanos` nanoseconds.
+        fn host_sleep_ns(nanos: i64);
+    }
+
+    struct HostClock;
+
+    impl ClockProvider for HostClock {
+        fn wall_nanos(&self) -> i128 {
+            unsafe { host_time_ns() as i128 }
+        }
+        fn monotonic_nanos(&self) -> i128 {
+            unsafe { host_monotonic_ns() as i128 }
+        }
+        fn sleep_nanos(&self, nanos: u64) {
+            // An i64 tops out at 292 years, which is longer than any sleep a
+            // caller means, so a wider request is served as the longest one
+            // the call can carry rather than wrapping into a short one.
+            unsafe { host_sleep_ns(nanos.min(i64::MAX as u64) as i64) }
+        }
+    }
+
+    pub fn install() {
+        pyre_interpreter::module::time::interp_time::install_clock_provider(std::sync::Arc::new(
+            HostClock,
+        ));
+    }
+}
+
 // Host-filesystem source provider for the native-host (`wasm-host`) build.
 //
 // wasm32 has no filesystem, but the wasmtime runner does, so module source is
@@ -278,6 +339,10 @@ mod host_fs_provider {
         /// directory.
         fn host_list_dir(path_ptr: *const u8, path_len: u32, buf_ptr: *mut u8, buf_cap: u32)
         -> i64;
+        /// Write the host's working directory into `[buf, buf+cap)`; return
+        /// its byte length (without writing if it exceeds `cap`), or -1 if
+        /// the host has none.
+        fn host_cwd(buf_ptr: *mut u8, buf_cap: u32) -> i64;
     }
 
     struct HostFsProvider;
@@ -344,6 +409,25 @@ mod host_fs_provider {
                 "host_list_dir: {} kept growing",
                 path.display()
             )))
+        }
+        fn cwd(&self) -> Option<Vec<u8>> {
+            // The host reports the length whether or not it fitted and writes
+            // nothing when it did not, so the second round reads a buffer
+            // sized from the first answer.
+            let mut buf = vec![0u8; 256];
+            for _ in 0..4 {
+                let size = unsafe { host_cwd(buf.as_mut_ptr(), buf.len() as u32) };
+                if size < 0 {
+                    return None;
+                }
+                let size = size as usize;
+                if size <= buf.len() {
+                    buf.truncate(size);
+                    return Some(buf);
+                }
+                buf = vec![0u8; size];
+            }
+            None
         }
         fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             let p = path.as_os_str().as_encoded_bytes();
@@ -856,6 +940,7 @@ fn run_python_impl(source: &str) -> String {
             pyre_interpreter::importing::add_sys_path(&dir);
         }
         host_fs_provider::install();
+        host_clock::install();
     }
     install_wasm_print_hook();
     OUTPUT_BUF.with(|buf| buf.borrow_mut().clear());

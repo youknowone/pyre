@@ -574,6 +574,15 @@ impl<'sink, 'buf> PeepSink<'sink, 'buf> {
         f64_load(memarg: MemArg),
         f64_store(memarg: MemArg),
         i32_load(memarg: MemArg),
+        i64_load16_s(memarg: MemArg),
+        i64_load16_u(memarg: MemArg),
+        i64_load32_s(memarg: MemArg),
+        i64_load32_u(memarg: MemArg),
+        i64_load8_s(memarg: MemArg),
+        i64_load8_u(memarg: MemArg),
+        i64_store16(memarg: MemArg),
+        i64_store32(memarg: MemArg),
+        i64_store8(memarg: MemArg),
         i32_load16_s(memarg: MemArg),
         i32_load16_u(memarg: MemArg),
         i32_load8_s(memarg: MemArg),
@@ -621,38 +630,17 @@ fn emit_jit_call(sink: &mut PeepSink<'_, '_>, jit_call_idx: u32) {
 /// 8 bytes on 64-bit; reading a fixed 8 bytes here would fold in the next
 /// field's bytes on wasm32.
 fn emit_sized_int_load(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize, signed: bool) {
+    // The i64 family loads and extends in one instruction, so the widening
+    // never has to be spelled separately.
     match (size, signed) {
-        (8, _) => {
-            sink.i64_load(mem64(offset));
-        }
-        (4, true) => {
-            sink.i32_load(memarg(offset, 2));
-            sink.i64_extend_i32_s();
-        }
-        (4, false) => {
-            sink.i32_load(memarg(offset, 2));
-            sink.i64_extend_i32_u();
-        }
-        (2, true) => {
-            sink.i32_load16_s(memarg(offset, 1));
-            sink.i64_extend_i32_s();
-        }
-        (2, false) => {
-            sink.i32_load16_u(memarg(offset, 1));
-            sink.i64_extend_i32_u();
-        }
-        (1, true) => {
-            sink.i32_load8_s(memarg(offset, 0));
-            sink.i64_extend_i32_s();
-        }
-        (1, false) => {
-            sink.i32_load8_u(memarg(offset, 0));
-            sink.i64_extend_i32_u();
-        }
-        _ => {
-            sink.i64_load(mem64(offset));
-        }
-    }
+        (4, true) => sink.i64_load32_s(memarg(offset, 2)),
+        (4, false) => sink.i64_load32_u(memarg(offset, 2)),
+        (2, true) => sink.i64_load16_s(memarg(offset, 1)),
+        (2, false) => sink.i64_load16_u(memarg(offset, 1)),
+        (1, true) => sink.i64_load8_s(memarg(offset, 0)),
+        (1, false) => sink.i64_load8_u(memarg(offset, 0)),
+        _ => sink.i64_load(mem64(offset)),
+    };
 }
 
 /// Emit a width-correct integer store. The stack must hold
@@ -660,26 +648,14 @@ fn emit_sized_int_load(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize, si
 /// A fixed 8-byte store would clobber the adjacent field/item (or run past
 /// the array end) for word-sized fields and pointer array items on wasm32.
 fn emit_sized_int_store(sink: &mut PeepSink<'_, '_>, offset: u64, size: usize) {
+    // The i64 family truncates as it stores, so the narrowing never has to be
+    // spelled separately.
     match size {
-        8 => {
-            sink.i64_store(mem64(offset));
-        }
-        4 => {
-            sink.i32_wrap_i64();
-            sink.i32_store(memarg(offset, 2));
-        }
-        2 => {
-            sink.i32_wrap_i64();
-            sink.i32_store16(memarg(offset, 1));
-        }
-        1 => {
-            sink.i32_wrap_i64();
-            sink.i32_store8(memarg(offset, 0));
-        }
-        _ => {
-            sink.i64_store(mem64(offset));
-        }
-    }
+        4 => sink.i64_store32(memarg(offset, 2)),
+        2 => sink.i64_store16(memarg(offset, 1)),
+        1 => sink.i64_store8(memarg(offset, 0)),
+        _ => sink.i64_store(mem64(offset)),
+    };
 }
 
 /// `(field_size, is_signed)` from an op's FieldDescr. A field op always carries
@@ -4397,12 +4373,7 @@ fn build_function(
                     // bytes on wasm32. Reading it as i64 would fold in the
                     // following field's bytes and never match the class
                     // immediate. Load 4 bytes and zero-extend.
-                    sink.i32_load(MemArg {
-                        offset: off,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
+                    sink.i64_load32_u(memarg(off, 2));
                     emit_resolve(&mut sink, constants, value_types, op.arg(1).to_opref());
                     sink.i64_ne();
                 } else {
@@ -4488,13 +4459,9 @@ fn build_function(
                 // so its stable pointer is directly addressable by the trace.
                 if invalidated_flag_addr != 0 {
                     sink.i32_const(invalidated_flag_addr as i32);
-                    sink.i32_load8_u(MemArg {
-                        offset: 0,
-                        align: 0,
-                        memory_index: 0,
-                    });
-                    sink.i32_const(0);
-                    sink.i32_ne();
+                    // The flag byte is the test: `emit_guard_if_exit` opens
+                    // with an `if`, which is already `!= 0`.
+                    sink.i32_load8_u(memarg(0, 0));
                     emit_guard_if_exit(
                         &mut sink,
                         constants,
@@ -4515,12 +4482,15 @@ fn build_function(
                 // trace must not run on holding virtualized fields the force has
                 // already written back, and the virtuals `handle_async_forcing`
                 // materialized are attached for THIS exit's resume to consume.
+                // The bit sits in the upper half of `frame[0]`, so on
+                // little-endian wasm32 it is bit 0 of the i32 at frame offset
+                // 4; masking it leaves the `!= 0` the `if` already applies.
+                const FORCE_TAKEN_HALF_OFS: u64 = 4;
+                const _: () = assert!(FORCE_TAKEN_BIT == 1 << 32);
                 sink.local_get(0);
-                sink.i64_load(mem64(0));
-                sink.i64_const(FORCE_TAKEN_BIT);
-                sink.i64_and();
-                sink.i64_const(0);
-                sink.i64_ne();
+                sink.i32_load(memarg(FORCE_TAKEN_HALF_OFS, 2));
+                sink.i32_const(1);
+                sink.i32_and();
                 emit_guard_if_exit(
                     &mut sink,
                     constants,
@@ -4738,14 +4708,14 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    // if val < 0, use 0; else use val
-                    // Wasm: local.tee + i64.const 0 + local.get + i64.lt_s + select
+                    // `select` answers with the FIRST value when its condition
+                    // holds, so the condition is the one that keeps `val`.
                     let tmp_local = value_types.local(vi); // reuse result local as temp
                     sink.local_tee(tmp_local);
                     sink.i64_const(0);
                     sink.local_get(tmp_local);
                     sink.i64_const(0);
-                    sink.i64_lt_s();
+                    sink.i64_ge_s();
                     sink.select();
                     sink.local_set(value_types.local(vi));
                 }
@@ -4862,12 +4832,7 @@ fn build_function(
                     sink.i32_wrap_i64();
                     let field_offset = field_offset_from_descr(op);
                     // Load as i32 (pointer on wasm32) and extend to i64
-                    sink.i32_load(MemArg {
-                        offset: field_offset,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
+                    sink.i64_load32_u(memarg(field_offset, 2));
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -4933,35 +4898,25 @@ fn build_function(
             OpCode::GetarrayitemGcI | OpCode::GetarrayitemGcPureI | OpCode::GetarrayitemRawI => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    // addr = base + base_size + index * item_size
-                    emit_array_addr(&mut sink, constants, value_types, op);
+                    let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                     let (item_size, signed) = array_item_size_sign_from_descr(op);
-                    emit_sized_int_load(&mut sink, 0, item_size, signed);
+                    emit_sized_int_load(&mut sink, base_size, item_size, signed);
                     sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::GetarrayitemGcR | OpCode::GetarrayitemGcPureR | OpCode::GetarrayitemRawR => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_array_addr(&mut sink, constants, value_types, op);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
+                    let base_size = emit_array_addr(&mut sink, constants, value_types, op);
+                    sink.i64_load32_u(memarg(base_size, 2));
                     sink.local_set(value_types.local(vi));
                 }
             }
             OpCode::GetarrayitemGcF | OpCode::GetarrayitemGcPureF | OpCode::GetarrayitemRawF => {
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
-                    emit_array_addr(&mut sink, constants, value_types, op);
-                    sink.f64_load(MemArg {
-                        offset: 0,
-                        align: 3,
-                        memory_index: 0,
-                    });
+                    let base_size = emit_array_addr(&mut sink, constants, value_types, op);
+                    sink.f64_load(mem64(base_size));
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -4977,17 +4932,17 @@ fn build_function(
                     &same_as_forwardings,
                     &mut wb_applied,
                 );
-                emit_array_addr(&mut sink, constants, value_types, op);
+                let base_size = emit_array_addr(&mut sink, constants, value_types, op);
                 if array_item_is_float_from_descr(op) {
                     emit_resolve_f64(&mut sink, constants, value_types, op.arg(2).to_opref());
-                    sink.f64_store(mem64(0));
+                    sink.f64_store(mem64(base_size));
                 } else {
                     emit_resolve(&mut sink, constants, value_types, op.arg(2).to_opref()); // value
                     // A Ref item is pointer-width (4 bytes on wasm32). Storing a
                     // fixed 8 bytes would clobber the next item, or run past the
                     // array end on the last item and corrupt the heap.
                     let (item_size, _signed) = array_item_size_sign_from_descr(op);
-                    emit_sized_int_store(&mut sink, 0, item_size);
+                    emit_sized_int_store(&mut sink, base_size, item_size);
                 }
             }
 
@@ -5228,17 +5183,13 @@ fn build_function(
                 }
                 sink.i64_const(guard_gc_type_info.base_type_info as i64);
                 sink.i64_add();
-                sink.i64_const(guard_gc_type_info.infobits_offset as i64);
-                sink.i64_add();
                 sink.i32_wrap_i64();
-                // Stack: [..., loc_infobits(i32 addr)]
+                // Stack: [..., loc_type_info(i32 addr)]
 
-                // assembler.py:1940 TEST8 [loc_infobits], IS_OBJECT_FLAG
-                sink.i32_load8_u(MemArg {
-                    offset: 0,
-                    align: 0,
-                    memory_index: 0,
-                });
+                // assembler.py:1940 TEST8 [loc_infobits], IS_OBJECT_FLAG. The
+                // `offset=infobits_offset` of the address computation above is
+                // a constant, so it rides in the load's own MemArg.
+                sink.i32_load8_u(memarg(guard_gc_type_info.infobits_offset as u64, 0));
                 sink.i32_const(guard_gc_type_info.is_object_flag as i32);
                 sink.i32_and();
                 // assembler.py:1942 guard_success_cc = Conditions['NZ']:
@@ -5520,12 +5471,7 @@ fn build_function(
                     let slot =
                         base as u64 + index as u64 * std::mem::size_of::<majit_ir::GcRef>() as u64;
                     sink.i32_const(slot as i32);
-                    sink.i32_load(MemArg {
-                        offset: 0,
-                        align: 2,
-                        memory_index: 0,
-                    });
-                    sink.i64_extend_i32_u();
+                    sink.i64_load32_u(memarg(0, 2));
                     sink.local_set(value_types.local(vi));
                 }
             }
@@ -5819,8 +5765,10 @@ fn build_function(
                 sink.local_get(ca_cfp_local);
                 sink.i64_extend_i32_u();
                 sink.i32_const(dispatch_entry);
-                sink.i32_load(mem32(crate::failguard::WASM_CA_DISPATCH_COMPILED_PTR_OFS));
-                sink.i64_extend_i32_u();
+                sink.i64_load32_u(memarg(
+                    crate::failguard::WASM_CA_DISPATCH_COMPILED_PTR_OFS,
+                    2,
+                ));
                 sink.i32_const(ca.deopt_helper_slot as i32);
                 // call_indirect(table_index, type_index): the shared table is 0.
                 sink.call_indirect(0, ca_helper_type_idx);
@@ -6227,6 +6175,9 @@ fn build_function(
                     sink.local_tee(alloc_scratch_local);
                     sink.i32_const(total_size as i32);
                     sink.i32_add();
+                    // The sum is the committed `nursery_free`, so keep it
+                    // rather than adding it again on the arm that takes it.
+                    sink.local_tee(alloc_size_local);
                     // new_free > *nursery_top → slow path
                     sink.i32_const(na.top_addr as i32);
                     sink.i32_load(MemArg {
@@ -6263,9 +6214,7 @@ fn build_function(
                     sink.else_();
                     // Commit: *nursery_free = free + total.
                     sink.i32_const(na.free_addr as i32);
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(total_size as i32);
-                    sink.i32_add();
+                    sink.local_get(alloc_size_local);
                     sink.i32_store(MemArg {
                         offset: 0,
                         align: 2,
@@ -6500,6 +6449,9 @@ fn build_function(
                     sink.local_tee(alloc_scratch_local);
                     sink.i32_const(total_size as i32);
                     sink.i32_add();
+                    // The sum is the committed `nursery_free`, so keep it
+                    // rather than adding it again on the arm that takes it.
+                    sink.local_tee(alloc_size_local);
                     sink.i32_const(na.top_addr as i32);
                     sink.i32_load(MemArg {
                         offset: 0,
@@ -6536,9 +6488,7 @@ fn build_function(
                     sink.else_();
                     // Commit: *nursery_free = free + total.
                     sink.i32_const(na.free_addr as i32);
-                    sink.local_get(alloc_scratch_local);
-                    sink.i32_const(total_size as i32);
-                    sink.i32_add();
+                    sink.local_get(alloc_size_local);
                     sink.i32_store(MemArg {
                         offset: 0,
                         align: 2,
@@ -7440,27 +7390,29 @@ fn array_len_layout_from_descr(op: &Op) -> (u64, usize) {
     .unwrap_or_else(|| missing_layout_descr("array descr (len layout)", op))
 }
 
-/// Compute array element address: base + base_size + index * item_size.
-/// Leaves i32 address on the wasm stack.
+/// Leave `base + index * item_size` on the wasm stack as an i32 address, and
+/// return the `base_size` displacement the access still owes.
+///
+/// The header is a fixed part of the descr, so it rides in the access's own
+/// MemArg offset instead of being added at run time — the same place the
+/// `getfield` arms put `field_offset_from_descr`.
 fn emit_array_addr(
     sink: &mut PeepSink<'_, '_>,
     constants: &indexmap::IndexMap<u32, i64>,
     value_types: &ValueLocals,
     op: &Op,
-) {
+) -> u64 {
     let (base_size, item_size) = op
         .with_array_descr(|ad| (ad.base_size() as u64, ad.item_size() as u64))
         .unwrap_or_else(|| missing_layout_descr("array descr (base/item size)", op));
     emit_resolve(sink, constants, value_types, op.arg(0).to_opref()); // array ptr
     sink.i32_wrap_i64();
-    // base + base_size + index * item_size
     emit_resolve(sink, constants, value_types, op.arg(1).to_opref()); // index
     sink.i32_wrap_i64();
     sink.i32_const(item_size as i32);
     sink.i32_mul();
     sink.i32_add();
-    sink.i32_const(base_size as i32);
-    sink.i32_add();
+    base_size
 }
 
 // ── Guard emission helpers ──

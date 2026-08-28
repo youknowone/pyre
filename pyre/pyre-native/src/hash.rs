@@ -112,13 +112,32 @@ type LockedHashState = Mutex<HashState>;
 /// Size/alignment contract for the opaque, object-owned storage embedded in
 /// pyre's `_HashState` payload.  The digest implementations are fixed-size
 /// state machines; none owns heap memory or needs drop glue.
-pub const HASH_STATE_STORAGE_WORDS: usize = 64;
+///
+/// The capacity is stated in BYTES because that is what has to hold a state
+/// machine whose size does not follow the target's pointer width.  Stating it
+/// as a word count gave wasm32 half the room a 64-bit target got, and the
+/// runtime check below then aborted the guest on the first `hashlib` digest.
+pub const HASH_STATE_STORAGE_BYTES: usize = 512;
+pub const HASH_STATE_STORAGE_WORDS: usize = HASH_STATE_STORAGE_BYTES / std::mem::size_of::<usize>();
 pub const HASH_STATE_STORAGE_ALIGN: usize = 16;
+
+/// Words a caller embeds beyond the capacity so the payload still fits after
+/// being aligned up to [`HASH_STATE_STORAGE_ALIGN`].
+///
+/// The owning Python object carries only the heap's word alignment, so the
+/// array inside it starts anywhere on a word boundary and the round-up eats
+/// up to one alignment less one word.  A slack stated in words rather than in
+/// bytes is right only where a word is eight bytes wide.
+pub const STATE_STORAGE_ALIGN_SLACK_WORDS: usize =
+    (HASH_STATE_STORAGE_ALIGN - std::mem::size_of::<usize>()) / std::mem::size_of::<usize>();
+
+// The state's size is a compile-time fact on every target, so the target that
+// cannot hold it fails to build rather than trapping in the field.
+const _: () = assert!(std::mem::size_of::<LockedHashState>() <= HASH_STATE_STORAGE_BYTES);
+const _: () = assert!(std::mem::align_of::<LockedHashState>() <= HASH_STATE_STORAGE_ALIGN);
 
 fn check_storage(storage: *mut usize, words: usize) {
     assert!(words >= HASH_STATE_STORAGE_WORDS);
-    assert!(std::mem::size_of::<LockedHashState>() <= words * std::mem::size_of::<usize>());
-    assert!(std::mem::align_of::<LockedHashState>() <= HASH_STATE_STORAGE_ALIGN);
     assert!(!storage.is_null());
     assert_eq!((storage as usize) % HASH_STATE_STORAGE_ALIGN, 0);
 }
@@ -398,13 +417,17 @@ pub fn digest_output_size(name: &str) -> Option<usize> {
 }
 
 type LockedHmacState = Mutex<HmacState>;
-pub const HMAC_STATE_STORAGE_WORDS: usize = 128;
+/// [`HASH_STATE_STORAGE_BYTES`]'s counterpart: an HMAC carries two digest
+/// states, so it is sized in bytes for the same reason.
+pub const HMAC_STATE_STORAGE_BYTES: usize = 1024;
+pub const HMAC_STATE_STORAGE_WORDS: usize = HMAC_STATE_STORAGE_BYTES / std::mem::size_of::<usize>();
 pub const HMAC_STATE_STORAGE_ALIGN: usize = 16;
+
+const _: () = assert!(std::mem::size_of::<LockedHmacState>() <= HMAC_STATE_STORAGE_BYTES);
+const _: () = assert!(std::mem::align_of::<LockedHmacState>() <= HMAC_STATE_STORAGE_ALIGN);
 
 fn check_hmac_storage(storage: *mut usize, words: usize) {
     assert!(words >= HMAC_STATE_STORAGE_WORDS);
-    assert!(std::mem::size_of::<LockedHmacState>() <= words * std::mem::size_of::<usize>());
-    assert!(std::mem::align_of::<LockedHmacState>() <= HMAC_STATE_STORAGE_ALIGN);
     assert!(!storage.is_null());
     assert_eq!((storage as usize) % HMAC_STATE_STORAGE_ALIGN, 0);
 }
