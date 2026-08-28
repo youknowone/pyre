@@ -7662,6 +7662,12 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::ContainsOp { .. }
             // string formatting: produces immutable strings
             | I::FormatSimple
+            // `f"{v:spec}"`. `codewriter.rs` lowers it to one
+            // `format_with_spec` MayForce residual over (value, spec) that
+            // pushes a fresh string -- the `FormatSimple` arm with a second
+            // operand. A user `__format__` may run Python, exactly as a user
+            // `__str__` may under the `ConvertValue` below it.
+            | I::FormatWithSpec
             | I::ConvertValue { .. }
             | I::BuildString { .. }
             // misc read-only: len(), iterator cleanup, local delete,
@@ -7702,6 +7708,14 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             // rejecting only the opcode spelling kept otherwise identical
             // `for` loops interpreted while PyPy traces them.
             | I::ImportName { .. }
+            // `IMPORT_FROM` is the second half of that same boundary and
+            // always follows an `IMPORT_NAME`, so admitting only the first
+            // left `from X import Y` rejected and `ImportName`'s admission
+            // inert for that spelling. It peeks the module the previous
+            // opcode pushed and pushes `getattr(module, name)` through one
+            // `import_from` MayForce residual -- the `LoadAttr` shape,
+            // strictly less than the `__import__` call above it.
+            | I::ImportFrom { .. }
             | I::Resume { .. }
             // container builders: produce new heap objects but do not mutate
             // existing ones; walk-abort just drops the incomplete object

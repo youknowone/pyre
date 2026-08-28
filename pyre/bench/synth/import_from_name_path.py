@@ -1,7 +1,11 @@
-# No `max-pypy-ratio`: this fixture compiles no loop -- its jitstats record
-# `loops_compiled=0` -- so a pypy ratio compares two interpreters' startup
-# rather than any generated code, and reads whatever the host's process
-# spawn cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`: the loop runs in 0.01s against pypy's 0.01s, so a ratio
+# reads whatever the host's process spawn cost happens to be that run rather
+# than any generated code. The jitstats baselines gate it.
+#
+# The loop does compile. `IMPORT_FROM` was the opcode that kept it out: the
+# body holds an `IMPORT_NAME`/`IMPORT_FROM` pair and the FOR_ITER body scan
+# admitted only the first, so this spelling stayed interpreted while the
+# `import x` spelling traced.
 # A failed `from X import Y` raises ImportError carrying `.name` (the module)
 # and `.path` (its source file), per error.py new_import_error. The absolute
 # path is install-dependent, so only its basename is checked.  `keyword` is a
