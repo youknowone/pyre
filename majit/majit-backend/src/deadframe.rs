@@ -110,49 +110,74 @@ impl Drop for FrameHeapOwner {
 /// footprint without costing the ordinary one anything.
 const FRAME_POOL_CAPACITY: usize = 8;
 
-/// A buffer parked on the free list: the `Vec<i64>`'s pointer and capacity,
-/// with its length taken to equal its capacity.
+/// A buffer parked on the free list: a `Vec<i64>` taken apart into its three
+/// words, and put back together exactly as it was.
 #[derive(Clone, Copy)]
 struct ParkedBuf {
     ptr: *mut i64,
+    len: usize,
     cap: usize,
 }
 
 impl ParkedBuf {
     const EMPTY: ParkedBuf = ParkedBuf {
         ptr: std::ptr::null_mut(),
+        len: 0,
         cap: 0,
     };
 
     fn park(buf: Vec<i64>) -> Self {
         let mut buf = std::mem::ManuallyDrop::new(buf);
-        // `take_pooled_frame_buf` sizes by `len`, so keep the two equal.
-        let cap = buf.capacity();
-        // Safety: `cap <= capacity`, and the elements are `i64`, so any
-        // word in the allocation is initialised for the purpose of `resize`.
-        unsafe { buf.set_len(cap) };
         ParkedBuf {
             ptr: buf.as_mut_ptr(),
-            cap,
+            len: buf.len(),
+            cap: buf.capacity(),
         }
     }
 
     fn unpark(self) -> Vec<i64> {
-        // Safety: `park` took these from a live `Vec<i64>` and nothing else
-        // has owned them since.
-        unsafe { Vec::from_raw_parts(self.ptr, self.cap, self.cap) }
+        // Safety: `park` took these three from a live `Vec<i64>` and nothing
+        // else has owned them since.
+        unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
     }
+}
+
+/// Frees a thread's parked buffers when the thread exits.
+///
+/// `FRAME_POOL` has no destructor so that its access path stays the direct
+/// one; this key has one, and is touched exactly once per thread, on the
+/// first park, which is what registers it. Thread-local destructors run in
+/// no fixed order, but a key without one stays readable throughout, so the
+/// pool is still there when this runs. A buffer parked after it ran — a
+/// deadframe dropped during thread teardown — is the one case that leaks.
+struct PoolReaper;
+
+impl Drop for PoolReaper {
+    fn drop(&mut self) {
+        let _ = FRAME_POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            for parked in &pool.free[..pool.free_len] {
+                drop(parked.unpark());
+            }
+            pool.free_len = 0;
+        });
+    }
+}
+
+thread_local! {
+    static POOL_REAPER: PoolReaper = const { PoolReaper };
 }
 
 /// `Copy`, and so without a destructor: that is what lets `FRAME_POOL` be a
 /// `const`-initialised thread-local with no lazy state and no registered
-/// destructor, which is the fast access path. The price is that a thread's
-/// parked buffers are not freed when it exits — at most eight frames of a
-/// few hundred bytes each.
+/// destructor, which is the fast access path. `POOL_REAPER` is the destructor,
+/// kept on a key the hot path never touches.
 #[derive(Clone, Copy)]
 struct FramePool {
     free: [ParkedBuf; FRAME_POOL_CAPACITY],
     free_len: usize,
+    /// Whether `POOL_REAPER` has been registered on this thread.
+    reaper_armed: bool,
     /// Buffers the owned arm asked the allocator for.
     owned: u64,
     /// Buffers the pooled arm handed out.
@@ -191,6 +216,7 @@ thread_local! {
         RefCell::new(FramePool {
             free: [ParkedBuf::EMPTY; FRAME_POOL_CAPACITY],
             free_len: 0,
+            reaper_armed: false,
             owned: 0,
             taken: 0,
             misses: 0,
@@ -230,6 +256,11 @@ fn give_back_pooled_frame_buf(buf: Vec<i64>) {
     let _ = FRAME_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
         if pool.free_len < FRAME_POOL_CAPACITY {
+            if !pool.reaper_armed {
+                pool.reaper_armed = true;
+                // First touch registers its destructor for this thread.
+                let _ = POOL_REAPER.try_with(|_| ());
+            }
             let at = pool.free_len;
             pool.free[at] = ParkedBuf::park(buf);
             pool.free_len += 1;
