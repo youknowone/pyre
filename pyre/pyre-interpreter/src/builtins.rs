@@ -14436,8 +14436,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     .map_err(|error| {
         replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
     })?;
-    let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-    let result = crate::w_code_new(code_ptr);
+    let result = crate::box_code_object(code);
     unsafe { crate::pycode::set_compilation_unit_filename_bytes(result, filename_bytes) };
     Ok(result)
 }
@@ -14552,8 +14551,7 @@ fn exec_or_eval(
             crate::syntax_warnings::emit_escape_warnings(&source, "<string>")?;
             let code = crate::compile::compile_source(&source, mode)
                 .map_err(|e| compile_err_to_syntax_error(e, &source, mode))?;
-            let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-            (crate::w_code_new(code_ptr), false)
+            (crate::box_code_object(code), false)
         }
     };
     let raw_code = unsafe {

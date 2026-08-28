@@ -599,7 +599,7 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
             crate::compile::Mode::Exec,
         )
     })?;
-    let w_code = crate::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+    let w_code = crate::box_code_object(code);
     if let Some(key) = cache_key {
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;
         // keep the freshly boxed code reachable across that call.

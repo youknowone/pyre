@@ -1034,6 +1034,15 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 /// Those registries retire when code objects become GC-managed.
 #[majit_macros::dont_look_inside]
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
+    // Zero owner: this entry point's contract is that the body is never
+    // released, so the wrapper takes no part in `CodeUnit` retirement.
+    w_code_new_owned(code_ptr, hidden_applevel, 0)
+}
+
+/// [`w_code_new_with_hidden_applevel`] naming the `box_code_object` allocation
+/// the body belongs to, so the wrapper can be counted against it.
+#[majit_macros::dont_look_inside]
+fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) -> PyObjectRef {
     // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159
     // ll_assert((nsize & (WORD-1)) == 0, "malloc: size is not aligned")`):
     // bitwise AND of `cast_ptr_to_int(p)` against `(power_of_two_align - 1)`
@@ -1213,6 +1222,10 @@ pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: boo
     if !pyre_object::gc_hook::try_gc_owns_object(obj as *mut u8) {
         register_prebuilt_code_root(obj);
     }
+    // Claim the graph before the fill loop: each nested constant publishes its
+    // own wrapper against the same owner, and a wrapper that dies during the
+    // loop must not find the count at zero.
+    attach_code_unit_wrapper(owner, code_ptr);
     if code_ptr_aligned {
         let consts_len = unsafe { &*(code_ptr as *const crate::CodeObject) }
             .constants
@@ -1268,8 +1281,18 @@ pub unsafe fn w_code_yields_inside_try(w_code: PyObjectRef) -> bool {
 /// to the residualised `w_code_new`.
 #[majit_macros::dont_look_inside]
 pub fn box_code_object(code: crate::CodeObject) -> PyObjectRef {
+    box_code_object_with_hidden_applevel(code, false)
+}
+
+/// [`box_code_object`] for the unit `gateway.py`'s `ApplevelClass` compiles,
+/// which carries `hidden_applevel=True` through its whole constants graph.
+#[majit_macros::dont_look_inside]
+pub fn box_code_object_with_hidden_applevel(
+    code: crate::CodeObject,
+    hidden_applevel: bool,
+) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-    w_code_new(code_ptr)
+    w_code_new_owned(code_ptr, hidden_applevel, code_ptr as usize)
 }
 
 /// [`box_code_object`] for a caller that only has a borrow, which has to copy.
@@ -1313,8 +1336,9 @@ pub fn box_code_constant(code: &crate::CodeObject) -> PyObjectRef {
 unsafe fn box_code_constant_in_place(
     code: *const crate::CodeObject,
     hidden_applevel: bool,
+    owner: usize,
 ) -> PyObjectRef {
-    w_code_new_with_hidden_applevel(code as *const (), hidden_applevel)
+    w_code_new_owned(code as *const (), hidden_applevel, owner)
 }
 
 /// Wrap a nested compiler constant and inherit the two things the enclosing
@@ -1331,7 +1355,8 @@ unsafe fn box_code_constant_inheriting_unit(
     code: *const crate::CodeObject,
     parent: &PyCode,
 ) -> PyObjectRef {
-    let obj = unsafe { box_code_constant_in_place(code, parent.hidden_applevel) };
+    let owner = code_unit_owner(parent.code_ptr);
+    let obj = unsafe { box_code_constant_in_place(code, parent.hidden_applevel, owner) };
     if parent.filename_inherits_to_nested
         && unsafe { &*code }.source_path
             == unsafe { &*(parent.code_ptr as *const crate::CodeObject) }.source_path
@@ -3728,6 +3753,226 @@ pub fn live_code_wrapper(code_ptr: *const ()) -> PyObjectRef {
         .map_or(PY_NULL, |&w| w as PyObjectRef)
 }
 
+/// One `box_code_object` allocation graph and what still reads it.
+///
+/// `pycode.py` needs no equivalent.  A nested code object is an ordinary GC
+/// object upstream, so the collector reaches each one through `co_consts_w`
+/// and reclaims it on its own.  Pyre's compiler hands over a single
+/// recursively-owned `CodeObject` graph instead, and
+/// [`box_code_constant_in_place`] publishes wrappers that point *into* it, so
+/// nothing in the graph may be released until every wrapper reached through it
+/// is gone -- a closure outliving the module that defined it keeps its own
+/// `__code__` inside its parent's `constants` table.
+struct CodeUnit {
+    /// Live `PyCode` wrappers whose `code_ptr` lands in this graph: the
+    /// top-level one plus one per realized nested code constant.
+    wrappers: usize,
+    /// A jitcode keeps a raw body address (`PyJitCodePayload::code_ptr`) and
+    /// dereferences it long after the wrappers are gone, so once one is
+    /// written the graph has to stay readable for the process lifetime.
+    pinned: bool,
+    /// Every `code_ptr` registered against this graph, so [`retire_code_unit`]
+    /// can drop their entries in the address-keyed side tables together with
+    /// the bodies those entries describe.
+    members: Vec<usize>,
+}
+
+#[derive(Default)]
+struct CodeUnitRegistry {
+    /// Keyed by the owning `Box::into_raw` address.
+    units: std::collections::HashMap<usize, CodeUnit>,
+    /// Every published `code_ptr` to the graph that owns it.
+    owner_of: std::collections::HashMap<usize, usize>,
+}
+
+/// Both halves live under one lock: [`retire_code_unit`] walks from a unit to
+/// its members, and [`pin_code_unit`] walks the other way, so a lock per map
+/// would be two orders over the same pair.
+static CODE_UNITS: std::sync::OnceLock<std::sync::Mutex<CodeUnitRegistry>> =
+    std::sync::OnceLock::new();
+
+fn code_units() -> &'static std::sync::Mutex<CodeUnitRegistry> {
+    CODE_UNITS.get_or_init(|| std::sync::Mutex::new(CodeUnitRegistry::default()))
+}
+
+/// Record a wrapper published over `code_ptr` inside the graph `owner` owns.
+///
+/// `owner` is zero for the constructors whose contract is that the body is
+/// never released ([`w_code_new`]'s prebuilt and gateway callers), and those
+/// register nothing at all.
+fn attach_code_unit_wrapper(owner: usize, code_ptr: *const ()) {
+    if owner == 0 || code_ptr.is_null() {
+        return;
+    }
+    let mut registry = code_units()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = &mut *registry;
+    let unit = registry.units.entry(owner).or_insert_with(|| CodeUnit {
+        wrappers: 0,
+        pinned: false,
+        members: Vec::new(),
+    });
+    unit.wrappers += 1;
+    if registry.owner_of.insert(code_ptr as usize, owner).is_none() {
+        unit.members.push(code_ptr as usize);
+    }
+}
+
+/// Drop one wrapper's claim on its graph, retiring the graph with the last one.
+fn detach_code_unit_wrapper(code_ptr: *const ()) {
+    if code_ptr.is_null() {
+        return;
+    }
+    let mut registry = code_units()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = &mut *registry;
+    let Some(&owner) = registry.owner_of.get(&(code_ptr as usize)) else {
+        return;
+    };
+    let Some(unit) = registry.units.get_mut(&owner) else {
+        return;
+    };
+    unit.wrappers -= 1;
+    if unit.wrappers > 0 || unit.pinned {
+        return;
+    }
+    let unit = registry
+        .units
+        .remove(&owner)
+        .expect("unit was just borrowed");
+    for member in &unit.members {
+        registry.owner_of.remove(member);
+    }
+    retire_code_unit(owner as *mut crate::CodeObject, &unit.members);
+}
+
+/// The `box_code_object` allocation `code_ptr`'s body belongs to, or zero when
+/// no graph claims it.
+fn code_unit_owner(code_ptr: *const ()) -> usize {
+    if code_ptr.is_null() {
+        return 0;
+    }
+    code_units()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .owner_of
+        .get(&(code_ptr as usize))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Keep the graph `code_ptr` belongs to readable for the process lifetime.
+///
+/// The JIT stores raw body addresses in its jitcode table and dereferences
+/// them from trace-side readers that hold no wrapper, so a code object it has
+/// written a jitcode for cannot take part in the retirement above.  Callers
+/// hold a live wrapper for `code_ptr`, which is what keeps the graph in the
+/// registry for this to find.
+pub fn pin_code_unit(code_ptr: *const ()) {
+    if code_ptr.is_null() {
+        return;
+    }
+    let mut registry = code_units()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = &mut *registry;
+    let Some(&owner) = registry.owner_of.get(&(code_ptr as usize)) else {
+        return;
+    };
+    if let Some(unit) = registry.units.get_mut(&owner) {
+        unit.pinned = true;
+    }
+}
+
+/// Drop everything a retired graph's bodies own, keeping every allocation the
+/// graph is addressed by.
+///
+/// The bodies are what the memory is in -- the instruction units, the constant
+/// payloads, the name tables and the two line/exception tables -- and nothing
+/// can read them once the last wrapper is gone.  The `CodeObject` shells and
+/// the `constants` spines that hold them stay allocated on purpose: a raw
+/// `CodeObject` address is the key of every side table in the tree (the JIT's
+/// jitcode map and its per-code shape cache, [`CODE_LOCATIONS`], the JIT's
+/// green keys), and none of those is reachable from here, so an address handed
+/// back to the allocator would answer another code object's lookups with this
+/// one's record.  Holding the shells is what keeps an address unique for the
+/// process lifetime, which is the property those tables were written against.
+fn retire_code_unit(owner: *mut crate::CodeObject, members: &[usize]) {
+    {
+        let mut cache = code_locations_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for member in members {
+            // A `Decoded` record's rows stay leaked: `code_locations` hands
+            // them out as `&'static`, and this runs from the collector, which
+            // can interrupt a reader still holding one.  Dropping the record
+            // is enough -- a retired body has no instructions, so
+            // `code_locations` answers from the empty array and never consults
+            // the map for it again.
+            cache.remove(member);
+        }
+    }
+    // SAFETY: `owner` is the `Box::into_raw` address `box_code_object`
+    // registered, no wrapper reaches any body in the graph any more, and the
+    // registry entry has been removed under the lock, so this runs once.
+    release_code_object_body(unsafe { &mut *owner });
+}
+
+/// Release one body's payloads and recurse through the code constants nested
+/// in it, which are the graph's other members.
+fn release_code_object_body(code: &mut crate::CodeObject) {
+    for constant in code.constants.iter_mut() {
+        release_constant_payload(constant);
+    }
+    code.instructions = crate::bytecode::CodeUnits::from(Vec::new());
+    code.locations = Vec::new().into_boxed_slice();
+    code.names = Vec::new().into_boxed_slice();
+    code.varnames = Vec::new().into_boxed_slice();
+    code.cellvars = Vec::new().into_boxed_slice();
+    code.freevars = Vec::new().into_boxed_slice();
+    code.localspluskinds = Vec::new().into_boxed_slice();
+    code.linetable = Vec::new().into_boxed_slice();
+    code.exceptiontable = Vec::new().into_boxed_slice();
+    code.source_path = String::new();
+    code.obj_name = String::new();
+    code.qualname = String::new();
+}
+
+/// Free a retired constant's payload, keeping the `Box<CodeObject>` a nested
+/// code constant is addressed by.
+///
+/// A code object can sit inside a container constant as well as directly in
+/// the table (`ConstantData::Tuple`'s elements), so the container variants
+/// recurse rather than being replaced wholesale.
+fn release_constant_payload(constant: &mut crate::bytecode::ConstantData) {
+    use crate::bytecode::ConstantData;
+    match constant {
+        ConstantData::Code { code } => release_code_object_body(code),
+        ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
+            for element in elements.iter_mut() {
+                release_constant_payload(element);
+            }
+        }
+        ConstantData::Slice { elements } => {
+            for element in elements.iter_mut() {
+                release_constant_payload(element);
+            }
+        }
+        // Scalars own no allocation worth the discriminant change; the rest
+        // are the strings, bytes and bignums the table is mostly made of.
+        ConstantData::Integer { .. } | ConstantData::Str { .. } | ConstantData::Bytes { .. } => {
+            *constant = ConstantData::None
+        }
+        ConstantData::Float { .. }
+        | ConstantData::Complex { .. }
+        | ConstantData::Boolean { .. }
+        | ConstantData::None
+        | ConstantData::Ellipsis => {}
+    }
+}
+
 /// Collector destructor for a managed `PyCode` wrapper.
 ///
 /// PyPy lets the GC reclaim the `PyCode` and its list-valued cache fields
@@ -3807,6 +4052,9 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
         drop(unsafe { Box::from_raw(code.co_code_bytes) });
         code.co_code_bytes = std::ptr::null_mut();
     }
+    // Last, so every side table this wrapper owns is already gone when the
+    // graph's own bodies are released.
+    detach_code_unit_wrapper(code.code_ptr);
 }
 
 /// pycode.py `_compute_flatcall`.
@@ -4432,6 +4680,97 @@ mod tests {
 
         assert_eq!(stored.source_path.as_ptr(), source_storage);
         assert_eq!(stored.instructions.as_ptr(), instruction_storage);
+    }
+
+    #[test]
+    fn a_code_graph_is_retired_by_its_last_wrapper_and_never_before() {
+        // Two nested functions, so the graph has members the top-level
+        // wrapper does not speak for.
+        let code = compile_exec(
+            "def outer():\n    def inner():\n        return 'body'\n    return inner\n",
+        )
+        .expect("compile failed");
+        let w_code = box_code_object(code);
+        let owner = unsafe { w_code_get_ptr(w_code) } as usize;
+
+        let nested: Vec<usize> = {
+            let registry = code_units()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let unit = registry.units.get(&owner).expect("owner registered");
+            // One wrapper per member: the top-level plus every nested code
+            // constant `w_code_new_owned`'s fill loop realized.
+            assert_eq!(unit.wrappers, unit.members.len());
+            assert!(unit.members.len() >= 3, "{:?}", unit.members);
+            assert!(!unit.pinned);
+            unit.members
+                .iter()
+                .copied()
+                .filter(|member| *member != owner)
+                .collect()
+        };
+
+        let body = || unsafe { &*(owner as *const crate::CodeObject) };
+        for member in &nested {
+            detach_code_unit_wrapper(*member as *const ());
+            assert!(
+                !body().instructions.is_empty(),
+                "the graph was retired while {member:#x}'s siblings were still live"
+            );
+        }
+        detach_code_unit_wrapper(owner as *const ());
+        assert!(body().instructions.is_empty());
+        assert!(body().names.is_empty());
+        assert!(body().source_path.is_empty());
+        // The shells stay allocated: a raw body address is the key of every
+        // side table in the tree, so none may be handed back to the allocator.
+        for member in &nested {
+            let nested_body = unsafe { &*(*member as *const crate::CodeObject) };
+            assert!(nested_body.instructions.is_empty());
+        }
+        let registry = code_units()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!registry.units.contains_key(&owner));
+        assert!(registry.owner_of.keys().all(|key| !nested.contains(key)));
+    }
+
+    #[test]
+    fn a_pinned_code_graph_survives_its_last_wrapper() {
+        let code = compile_exec("def f():\n    return 'kept'\n").expect("compile failed");
+        let w_code = box_code_object(code);
+        let owner = unsafe { w_code_get_ptr(w_code) } as usize;
+        pin_code_unit(owner as *const ());
+
+        let members: Vec<usize> = code_units()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .units
+            .get(&owner)
+            .expect("owner registered")
+            .members
+            .clone();
+        for member in &members {
+            detach_code_unit_wrapper(*member as *const ());
+        }
+        let body = unsafe { &*(owner as *const crate::CodeObject) };
+        assert!(
+            !body.instructions.is_empty(),
+            "a jitcode's raw body address must stay readable"
+        );
+    }
+
+    #[test]
+    fn an_unowned_wrapper_takes_no_part_in_retirement() {
+        // `w_code_new`'s contract is that the body is never released, so its
+        // wrappers register nothing and detaching one retires nothing.
+        let code = compile_exec("x = 1\n").expect("compile failed");
+        let code_ptr = Box::into_raw(Box::new(code)) as *const ();
+        let _w_code = w_code_new(code_ptr);
+        assert_eq!(code_unit_owner(code_ptr), 0);
+        detach_code_unit_wrapper(code_ptr);
+        let body = unsafe { &*(code_ptr as *const crate::CodeObject) };
+        assert!(!body.instructions.is_empty());
     }
 
     #[test]
