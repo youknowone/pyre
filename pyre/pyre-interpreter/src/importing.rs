@@ -769,7 +769,11 @@ pub fn install_builtin_modules() {
     // syscall code is absent.
     #[cfg(not(feature = "sandbox"))]
     {
-        #[cfg(not(target_arch = "wasm32"))]
+        // `_signal` is a bootstrap module upstream: it is built on every
+        // platform, and what a platform lacks it lacks entry point by entry
+        // point.  A target with no kernel to route a number publishes the
+        // handler table and `raise_signal`, and leaves out the itimers, the
+        // sigset calls and `pause`.
         pyre_install_module!("_signal"(signal));
         // Only a POSIX host has the user/group databases these read; the
         // platforms without them have no `pwd`/`grp` module at all, and the

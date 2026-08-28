@@ -131,7 +131,6 @@ pub mod resource;
 #[cfg(not(feature = "sandbox"))]
 pub mod select;
 #[allow(non_snake_case)]
-#[cfg(not(target_arch = "wasm32"))]
 pub mod signal;
 #[allow(non_snake_case)]
 pub mod r#struct;

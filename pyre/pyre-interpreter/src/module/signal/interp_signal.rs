@@ -12,6 +12,61 @@ use pyre_object::PyObjectRef;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
+/// The signal numbers and names `<signal.h>` supplies elsewhere.
+///
+/// A target with no signals still has to name them: `signal.Signals` is built
+/// from whatever `_signal` publishes, and a handler installed under a number
+/// this module does not know is one `getsignal` could never answer for.  The
+/// numbering is musl's, which is wasi-libc's, matching the `sys.platform` the
+/// guest reports; the descriptions are the ones `strsignal` answers with, kept
+/// beside the numbers so a signal has one entry rather than two.
+#[cfg(not(any(unix, windows)))]
+pub(crate) mod wasm_signals {
+    /// The number the interpreter installs its own handler under at startup.
+    pub const SIGINT: i32 = 2;
+
+    pub const TABLE: &[(&str, i32, &str)] = &[
+        ("SIGHUP", 1, "Hangup"),
+        ("SIGINT", SIGINT, "Interrupt"),
+        ("SIGQUIT", 3, "Quit"),
+        ("SIGILL", 4, "Illegal instruction"),
+        ("SIGTRAP", 5, "Trace/breakpoint trap"),
+        ("SIGABRT", 6, "Aborted"),
+        ("SIGBUS", 7, "Bus error"),
+        ("SIGFPE", 8, "Floating point exception"),
+        ("SIGKILL", 9, "Killed"),
+        ("SIGUSR1", 10, "User defined signal 1"),
+        ("SIGSEGV", 11, "Segmentation fault"),
+        ("SIGUSR2", 12, "User defined signal 2"),
+        ("SIGPIPE", 13, "Broken pipe"),
+        ("SIGALRM", 14, "Alarm clock"),
+        ("SIGTERM", 15, "Terminated"),
+        ("SIGCHLD", 17, "Child exited"),
+        ("SIGCONT", 18, "Continued"),
+        ("SIGSTOP", 19, "Stopped (signal)"),
+        ("SIGTSTP", 20, "Stopped"),
+        ("SIGTTIN", 21, "Stopped (tty input)"),
+        ("SIGTTOU", 22, "Stopped (tty output)"),
+        ("SIGURG", 23, "Urgent I/O condition"),
+        ("SIGXCPU", 24, "CPU time limit exceeded"),
+        ("SIGXFSZ", 25, "File size limit exceeded"),
+        ("SIGVTALRM", 26, "Virtual timer expired"),
+        ("SIGPROF", 27, "Profiling timer expired"),
+        ("SIGWINCH", 28, "Window changed"),
+        ("SIGIO", 29, "I/O possible"),
+        ("SIGSYS", 31, "Bad system call"),
+    ];
+
+    /// The description for `signum`, or nothing for a number no signal in the
+    /// table carries.
+    pub fn strsignal(signum: i32) -> Option<&'static str> {
+        TABLE
+            .iter()
+            .find(|(_, n, _)| *n == signum)
+            .map(|(_, _, text)| *text)
+    }
+}
+
 /// executioncontext.py `space.getexecutioncontext().checksignals()`
 /// — deliver a signal that may have arrived during a syscall.  Resolves
 /// the live EC from the thread-local slot (`getexecutioncontext`).
@@ -31,7 +86,7 @@ pub fn checksignals_now() -> Result<(), crate::PyError> {
 /// interp_signal.py `SignalMask.__enter__` — unpack a list / tuple
 /// / set of signal numbers, the argument shape `sigwait` / `sigpending`
 /// share with `pthread_sigmask`.
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", unix))]
 fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError> {
     unsafe {
         if pyre_object::is_list(arg) {
@@ -58,7 +113,7 @@ fn signal_set_items(arg: PyObjectRef) -> Result<Vec<PyObjectRef>, crate::PyError
 /// of `class_name` (an `OSError` or subclass) carrying the errno and its
 /// strerror, so `.errno` / `str()` behave like any `OSError`.  Falls back
 /// to `OSError` if `class_name` is not registered.
-#[cfg(feature = "host_env")]
+#[cfg(all(feature = "host_env", unix))]
 fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
     let strerror = unsafe {
         std::ffi::CStr::from_ptr(libc::strerror(errno))
@@ -574,11 +629,11 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
 
         // app_main.py:926 — `signal.signal(SIGINT, default_int_handler)`.
         #[cfg(any(unix, windows))]
-        {
-            let sigint = libc::SIGINT;
-            if signalstate::pypysig_setflag(sigint) {
-                set_handler(sigint, default_int_handler_obj());
-            }
+        let sigint = libc::SIGINT;
+        #[cfg(not(any(unix, windows)))]
+        let sigint = wasm_signals::SIGINT;
+        if signalstate::pypysig_setflag(sigint) {
+            set_handler(sigint, default_int_handler_obj());
         }
         action as *mut CheckSignalAction as usize
     });
@@ -793,8 +848,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                             ))
                         }
                     };
-                    #[cfg(not(windows))]
+                    #[cfg(unix)]
                     let raised = rustpython_host_env::signal::raise_signal(signum);
+                    // No kernel to hand the number to.  The delivery this
+                    // target has is the interpreter's own checkpoint, which
+                    // the shared tail below runs, so raising is marking the
+                    // number pending -- the same two steps the unix arm takes,
+                    // with the first one no longer a syscall.
+                    #[cfg(not(any(unix, windows)))]
+                    let raised = {
+                        check_signum_in_range(i64::from(signum))?;
+                        signalstate::signal_pushback(signum);
+                        Ok::<(), std::io::Error>(())
+                    };
                     match raised {
                         Ok(()) => {
                             // interp_signal.py — the signal may
@@ -843,7 +909,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     // `'Unknown signal: 32'` on pypy.
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
-                    Ok(rustpython_host_env::signal::strsignal(signum)
+                    #[cfg(any(unix, windows))]
+                    let text = rustpython_host_env::signal::strsignal(signum);
+                    #[cfg(not(any(unix, windows)))]
+                    let text = wasm_signals::strsignal(signum).map(str::to_owned);
+                    Ok(text
                         .map(|s| pyre_object::w_str_new(&s))
                         .unwrap_or(pyre_object::w_none()))
                 }
@@ -858,6 +928,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             1,
         ),
     );
+    // `valid_signals` reads a `sigfillset`ed `sigset_t`; a target with neither
+    // does not publish it.
+    #[cfg(any(unix, windows))]
     crate::module_ns_store(
         ns,
         "valid_signals",
@@ -1426,6 +1499,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     // Common signal numbers (POSIX subset, sourced from libc so numerics
     // match the host — Linux SIGUSR1=10 / macOS SIGUSR1=30, etc.).
+    #[cfg(not(any(unix, windows)))]
+    for (name, value, _) in wasm_signals::TABLE {
+        crate::module_ns_store(ns, name, pyre_object::w_int_new(i64::from(*value)));
+    }
     #[cfg(unix)]
     {
         crate::module_ns_store(ns, "SIGHUP", pyre_object::w_int_new(libc::SIGHUP as i64));

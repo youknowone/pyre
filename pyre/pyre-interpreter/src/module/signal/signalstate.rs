@@ -21,11 +21,16 @@ pub const NSIG: i32 = 23;
 pub const NSIG: i32 = 32;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub const NSIG: i32 = 65;
+// The wasm guest reports `sys.platform == "wasi"`, and wasi-libc's
+// `<signal.h>` is musl's, so it carries musl's `_NSIG` and musl's numbering.
+#[cfg(target_arch = "wasm32")]
+pub const NSIG: i32 = 65;
 #[cfg(not(any(
     windows,
     target_vendor = "apple",
     target_os = "linux",
-    target_os = "android"
+    target_os = "android",
+    target_arch = "wasm32"
 )))]
 pub const NSIG: i32 = 64;
 
@@ -572,17 +577,24 @@ pub fn pypysig_ignore(signum: i32) -> bool {
 #[cfg(windows)]
 pub fn pypysig_reinstall(_signum: i32) {}
 
+/// The four installers on a target with no OS to install into.
+///
+/// There is no kernel here to route a number to a handler, so recording that
+/// the guest asked for one is the whole of the install: `signal()` keeps the
+/// handler and `raise_signal` is what delivers it.  They report success
+/// because the request is met — by the only deliverer this target has, which
+/// is the interpreter's own checkpoint.
 #[cfg(not(any(unix, windows)))]
 pub fn pypysig_setflag(_signum: i32) -> bool {
-    false
+    true
 }
 #[cfg(not(any(unix, windows)))]
 pub fn pypysig_default(_signum: i32) -> bool {
-    false
+    true
 }
 #[cfg(not(any(unix, windows)))]
 pub fn pypysig_ignore(_signum: i32) -> bool {
-    false
+    true
 }
 #[cfg(not(any(unix, windows)))]
 pub fn pypysig_reinstall(_signum: i32) {}

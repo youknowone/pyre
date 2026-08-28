@@ -4976,7 +4976,6 @@ fn register_thread_root_areas() {
             pyre_interpreter::display::capture_repr_active_area(),
             "repr_active",
         );
-        #[cfg(not(target_arch = "wasm32"))]
         register(
             signal_handler_root_walker_area,
             pyre_interpreter::module::signal::interp_signal::capture_signal_handler_root_area(),
@@ -5859,7 +5858,6 @@ unsafe fn mapdict_root_walker_area(data: *const (), visitor: &mut dyn FnMut(&mut
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 unsafe fn signal_handler_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -5895,7 +5893,6 @@ fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir
     });
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 fn signal_handler_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     pyre_interpreter::module::signal::interp_signal::walk_signal_handler_roots(|slot| {
