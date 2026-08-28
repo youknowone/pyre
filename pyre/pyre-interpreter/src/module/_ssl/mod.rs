@@ -2357,12 +2357,22 @@ mod ssl_socket_methods {
                 self.shutdown_started = true;
             }
             flush_transport(self)?;
-            // `_stdssl._SSLSocket.shutdown` keeps driving shutdown until it
-            // receives the peer close-notify or the transport reports that the
-            // operation would block.  `read()` may already have consumed the
-            // alert, so refill only while peer shutdown is outstanding.
-            while !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
-                receive_transport(self)?;
+            // `_stdssl._SSLSocket.shutdown` drives shutdown toward the peer
+            // close-notify but refuses to wait for it forever -- "Don't loop
+            // endlessly; instead preserve legacy behaviour of trying
+            // SSL_shutdown() only twice" -- and hands the socket back even
+            // when the alert never arrives.  `read()` may already have
+            // consumed it, so the first test can end the phase outright, and a
+            // receive that cannot complete now ends it rather than raising:
+            // unwrap owes its caller the socket either way.
+            const SHUTDOWN_RECEIVE_ATTEMPTS: usize = 2;
+            for _ in 0..SHUTDOWN_RECEIVE_ATTEMPTS {
+                if unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {
+                    break;
+                }
+                if receive_transport(self).is_err() {
+                    break;
+                }
             }
             if unsafe { is_none(self.socket) } {
                 Ok(w_none())
