@@ -385,7 +385,11 @@ fn run_startup_file(
     let outcome =
         match pyre_interpreter::compile_source_with_filename(&source, Mode::Exec, &display) {
             Ok(code) => exec_in_main(runtime, code),
-            Err(e) => Err(pyre_interpreter::compile_err_to_syntax_error(e, &source)),
+            Err(e) => Err(pyre_interpreter::compile_err_to_syntax_error(
+                e,
+                &source,
+                Mode::Exec,
+            )),
         };
     if bind_file_name {
         let _ = pyre_interpreter::baseobjspace::delattr_str(main_module, "__file__");

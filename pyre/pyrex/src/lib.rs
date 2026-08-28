@@ -2486,7 +2486,7 @@ fn eval_source_in_main(
             // `PyErr_Print` every other top-level failure is, so the hook sees
             // it too and the stdlib renderer is what offers the keyword the
             // author meant.
-            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source);
+            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source, mode);
             if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
                 pyre_interpreter::eprint_syntax_error(&err);
             }
