@@ -6634,11 +6634,25 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // #61: UNARY_POSITIVE `+int` identity fold.  The object-space `pos` on an
-    // exact int returns the operand unchanged, so a provably-int operand folds
-    // to the operand box itself behind a `GUARD_CLASS INT`, eliding the
-    // `CALL_MAY_FORCE` (and its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the
-    // generic residual emits.  A bool (`+True` is int `1`) / non-int operand
+    // UNARY_POSITIVE.  Descend `pos_inner` -- `pos` past the override probe --
+    // rather than re-emit its identity arm by hand, the same shape the invert
+    // and neg descents take.  Sits ahead of the `unary_positive_int` fold so
+    // that fold's `consulted` count reads whether the descent took the site.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
+        && spec_gate(SpecFold::UnaryPositiveDescent, || {
+            try_walker_orthodox_unary_positive(ctx, op.pc, r_args[0], dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // #61: UNARY_POSITIVE `+int` identity fold.  Kept behind the descent so a
+    // build whose `pos_inner` jitcode is missing or unlowered still forwards
+    // an exact-int operand.  A bool (`+True` is int `1`) / non-int operand
     // declines to the generic leg so its `__pos__` still runs.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'

@@ -406,6 +406,9 @@ thread_local! {
     /// Cached `ALL_JITCODES` index of `neg_inner` for the current thread.
     /// Resolved by graph key, for the reason given above.
     static NEG_INNER_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
+    /// Cached `ALL_JITCODES` index of `pos_inner` for the current thread.
+    /// Resolved by graph key, for the reason given above.
+    static POS_INNER_JITCODE_INDEX: OnceCell<Option<usize>> = const { OnceCell::new() };
 }
 
 /// Scan the build-time names index for the unique entry equal to `name`.
@@ -542,6 +545,31 @@ pub fn neg_inner_jitcode() -> Option<Arc<JitCode>> {
     let idx = NEG_INNER_JITCODE_INDEX.with(|cell| {
         *cell.get_or_init(|| {
             compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::neg_inner")
+        })
+    })?;
+    get_jitcode_by_index(idx)
+}
+
+/// The charon `pos_inner` body in `ALL_JITCODES`, resolved by the graph key the
+/// codewriter allocated it under and cached per thread. `None` if the helper is
+/// absent from the build-time pipeline.
+///
+/// This is `descroperation.rs` `pos` past its `__pos__` override probe -- the
+/// one arm a descent cannot take. What is left is the exact-int identity, the
+/// bool/int rewrap, the long/float/complex arms, the instance fallback and the
+/// terminal `TypeError`, so a caller that has pinned an exact `int` or `long`
+/// receiver records one of the identity arms and nothing else.
+///
+/// `+x` is `CALL_INTRINSIC_1`, so the only route to this body runs through
+/// `OpcodeStepExecutor::unary_positive`, which is declared without a body for
+/// that reason: a default there is the graph the walker takes, and `PyFrame`'s
+/// implementation -- and with it `pos` and `pos_inner` -- is never reached.
+/// `None` here is the helper's absence from the build-time pipeline, and the
+/// identity fold behind the descent still serves exact-int `+x`.
+pub fn pos_inner_jitcode() -> Option<Arc<JitCode>> {
+    let idx = POS_INNER_JITCODE_INDEX.with(|cell| {
+        *cell.get_or_init(|| {
+            compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::pos_inner")
         })
     })?;
     get_jitcode_by_index(idx)
