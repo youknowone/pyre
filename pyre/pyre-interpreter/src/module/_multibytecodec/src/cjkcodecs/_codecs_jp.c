@@ -188,7 +188,12 @@ ENCODER(euc_jis_2004)
                                 JISX0213_ENCPAIRS);
                             if (code == DBCINV)
                                 return 1;
-                        } else
+                        }
+                        /* [3.14-spec] PyPy ENCODER(euc_jis_2004) consumes a
+                         * trailing NUL as the second half of a JIS X 0213
+                         * pair.  Pinned v3.14.6 keeps that NUL for the next
+                         * iteration (`gh-101828`). */
+                        else if ((*inbuf)[1] != 0)
                             insize = 2;
                     }
                 }
@@ -588,7 +593,10 @@ ENCODER(shift_jis_2004)
                             if (code == DBCINV)
                                 return 1;
                             }
-                            else
+                            /* [3.14-spec] PyPy ENCODER(shift_jis_2004)
+                             * consumes a trailing NUL here; pinned v3.14.6
+                             * keeps it for the next iteration (`gh-101828`). */
+                            else if (IN2 != 0)
                                 insize = 2;
                         }
                     }
