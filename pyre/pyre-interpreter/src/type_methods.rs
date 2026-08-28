@@ -606,8 +606,14 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 // EmptyListStrategy._extend_from_list delegates to the
                 // donor's copy_into; BaseRangeListStrategy shares its
                 // immutable erased tuple rather than appending boxed ints.
-                pyre_object::listobject::w_list_setslice(list, 0, 0, other)
-                    .expect("range copy_into an empty exact list");
+                pyre_object::listobject::w_list_setslice_mode(
+                    list,
+                    0,
+                    0,
+                    other,
+                    majit_metainterp::jit::we_are_jitted(),
+                )
+                .expect("range copy_into an empty exact list");
                 return Ok(w_none());
             }
             pyre_object::listobject::w_list_reserve_for_extend(list, n);

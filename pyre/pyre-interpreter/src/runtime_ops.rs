@@ -1523,7 +1523,10 @@ pub fn unpack_ex_slots(
         if is_tuple(value()) {
             pyre_object::w_tuple_items_copy_as_vec(value())
         } else if is_list(value()) {
-            pyre_object::w_list_items_copy_as_vec(value())
+            pyre_object::w_list_items_copy_as_vec_mode(
+                value(),
+                majit_metainterp::jit::we_are_jitted(),
+            )
         } else {
             // pyopcode.py UNPACK_EX wraps `fixedview` in a
             // TypeError → "cannot unpack non-iterable %T object" remap.

@@ -992,13 +992,92 @@ pub fn _compute_args_as_cellvars(
 #[inline]
 pub fn _code_const_eq(_space: PyObjectRef, w_a: PyObjectRef, w_b: PyObjectRef) -> bool {
     let _ = _space;
-    std::ptr::eq(w_a, w_b)
+    unsafe { code_const_equal(w_a, w_b).unwrap_or(false) }
 }
 
-#[inline]
 pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
     let _ = _space;
-    w_a
+    // PyPy `pycode._convert_const`, including the recursive tuple/frozenset
+    // construction.  Keep the input in a shadow-stack slot because every
+    // converted child and result container may collect.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_a);
+    let current = || pyre_object::gc_roots::shadow_stack_get(root_base);
+    let w_a = current();
+
+    let is_str = unsafe { is_exact_type(w_a, &STR_TYPE) };
+    let is_bytes = unsafe { is_exact_type(w_a, &pyre_object::bytesobject::BYTES_TYPE) };
+    if is_str || is_bytes {
+        // `_convert_const`: `(w_type, w_a)` keeps text and bytes separated
+        // while comparing each payload by value.
+        let w_type = crate::typedef::r#type(current())
+            .map(std::ptr::NonNull::as_ptr)
+            .unwrap_or(std::ptr::null_mut());
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_type);
+        fields.push(current());
+        return w_tuple_new(fields.take());
+    }
+    if unsafe { is_code(w_a) } {
+        return current();
+    }
+    if unsafe { is_exact_type(w_a, &TUPLE_TYPE) } {
+        let len = unsafe { pyre_object::w_tuple_len(w_a) };
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        for index in 0..len {
+            let item = unsafe { pyre_object::w_tuple_getitem(current(), index as i64) }
+                .unwrap_or(pyre_object::w_none());
+            items.push(_convert_const(std::ptr::null_mut(), item));
+        }
+        return w_tuple_new(items.take());
+    }
+    if unsafe { is_exact_type(w_a, &pyre_object::setobject::FROZENSET_TYPE) } {
+        let len = unsafe { pyre_object::setobject::w_set_len(w_a) };
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        for index in 0..len {
+            let item = unsafe { pyre_object::setobject::w_set_key_at(current(), index) }
+                .map(|key| key.obj)
+                .unwrap_or(pyre_object::w_none());
+            items.push(_convert_const(std::ptr::null_mut(), item));
+        }
+        return pyre_object::w_frozenset_from_items(&items.take());
+    }
+    if unsafe { pyre_object::sliceobject::is_slice(w_a) } {
+        // [3.14-spec] PyPy 3.11 has no marshal-v5 slice constant.  Preserve
+        // its recursive-key shape for the new public constant kind.
+        let w_type = crate::typedef::r#type(current())
+            .map(std::ptr::NonNull::as_ptr)
+            .unwrap_or(std::ptr::null_mut());
+        let mut fields = pyre_object::gc_roots::RootedItems::new();
+        fields.push(w_type);
+        for item in [
+            unsafe { pyre_object::sliceobject::w_slice_get_start(current()) },
+            unsafe { pyre_object::sliceobject::w_slice_get_stop(current()) },
+            unsafe { pyre_object::sliceobject::w_slice_get_step(current()) },
+        ] {
+            fields.push(_convert_const(std::ptr::null_mut(), item));
+        }
+        return w_tuple_new(fields.take());
+    }
+    if unsafe { is_exact_type(w_a, &COMPLEX_TYPE) } {
+        let real = unsafe { pyre_object::w_complex_get_real(w_a) };
+        let imag = unsafe { pyre_object::w_complex_get_imag(w_a) };
+        if !real.is_nan() && !imag.is_nan() {
+            // PyPy's complex immutable id carries the component bit patterns.
+            // Public `id(complex)` follows 3.14's address identity in Pyre, so
+            // spell that private strong key here instead of changing `id()`.
+            let w_type = crate::typedef::r#type(current())
+                .map(std::ptr::NonNull::as_ptr)
+                .unwrap_or(std::ptr::null_mut());
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_type);
+            fields.push(w_int_new(real.to_bits() as i64));
+            fields.push(w_int_new(imag.to_bits() as i64));
+            return w_tuple_new(fields.take());
+        }
+    }
+    crate::baseobjspace::id(current())
 }
 
 /// pypy/interpreter/pycode.py `PyCode.__init__`
@@ -1915,48 +1994,64 @@ fn code_data_equal(a: &crate::CodeObject, b: &crate::CodeObject) -> bool {
         && a.names == b.names
         && a.linetable == b.linetable
         && a.exceptiontable == b.exceptiontable
-        && crate::pyframe::code_constants(a)
-            .iter()
-            .zip(crate::pyframe::code_constants(b).iter())
-            .all(|(left, right)| constant_strong_equal(left, right))
 }
 
-fn constant_strong_equal(
-    left: &crate::bytecode::ConstantData,
-    right: &crate::bytecode::ConstantData,
-) -> bool {
-    use crate::bytecode::ConstantData;
-    match (left, right) {
-        (ConstantData::Code { code: a }, ConstantData::Code { code: b }) => code_data_equal(a, b),
-        (ConstantData::Tuple { elements: a }, ConstantData::Tuple { elements: b }) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
-                    .all(|(x, y)| constant_strong_equal(x, y))
-        }
-        (ConstantData::Slice { elements: a }, ConstantData::Slice { elements: b }) => a
-            .iter()
-            .zip(b.iter())
-            .all(|(x, y)| constant_strong_equal(x, y)),
-        (ConstantData::Frozenset { elements: a }, ConstantData::Frozenset { elements: b }) => {
-            if a.len() != b.len() {
-                return false;
-            }
-            let mut matched = vec![false; b.len()];
-            a.iter().all(|item| {
-                b.iter()
-                    .enumerate()
-                    .find(|(index, candidate)| {
-                        !matched[*index] && constant_strong_equal(item, candidate)
-                    })
-                    .map(|(index, _)| {
-                        matched[index] = true;
-                    })
-                    .is_some()
-            })
-        }
-        _ => left == right,
+/// PyPy `pycode._code_const_eq` / `_convert_const`: strong equality for code
+/// constants, operating on the wrapped constants owned by `PyCode.co_consts_w`.
+///
+/// Comparing compiler `ConstantData` here is observably wrong: the marshal
+/// reader deliberately installs its decoded wrappers as the authority while
+/// retaining shape-only compiler placeholders.  PyPy never looks behind
+/// `co_consts_w` for equality either.
+unsafe fn code_const_equal(left: PyObjectRef, right: PyObjectRef) -> Result<bool, crate::PyError> {
+    let mut converted = pyre_object::gc_roots::RootedItems::new();
+    converted.push(_convert_const(std::ptr::null_mut(), left));
+    converted.push(_convert_const(std::ptr::null_mut(), right));
+    let converted = converted.take();
+    crate::baseobjspace::eq_w(converted[0], converted[1])
+}
+
+unsafe fn code_objects_equal(
+    this: PyObjectRef,
+    other: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    // `w_code_const` may realize a nested code wrapper and collect.  PyPy's
+    // `descr_code__eq__` keeps both `PyCode` instances live as ordinary
+    // RPython references throughout the loop; reload the equivalent rooted
+    // slots at every recursive code-object level.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let root_base = pyre_object::gc_roots::pin_roots(&[this, other]);
+    let this = pyre_object::gc_roots::shadow_stack_get(root_base);
+    let other = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+    let a = unsafe { require_code(this, "__eq__")? };
+    let b = unsafe { require_code(other, "__eq__")? };
+    if unsafe { (*(this as *const PyCode)).co_firstlineno_raw }
+        != unsafe { (*(other as *const PyCode)).co_firstlineno_raw }
+        || unsafe { code_bytes(this) } != unsafe { code_bytes(other) }
+        || !code_data_equal(a, b)
+    {
+        return Ok(false);
     }
+    for index in 0..a.constants.len() {
+        let _constant_roots = pyre_object::gc_roots::push_roots();
+        let constant_root_base = pyre_object::gc_roots::shadow_stack_len();
+        let left =
+            unsafe { w_code_const(pyre_object::gc_roots::shadow_stack_get(root_base), index) };
+        let _ = pyre_object::gc_roots::pin_root(left);
+        let right = unsafe {
+            w_code_const(
+                pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+                index,
+            )
+        };
+        let _ = pyre_object::gc_roots::pin_root(right);
+        let left = pyre_object::gc_roots::shadow_stack_get(constant_root_base);
+        let right = pyre_object::gc_roots::shadow_stack_get(constant_root_base + 1);
+        if left.is_null() || right.is_null() || !unsafe { code_const_equal(left, right)? } {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// # Safety
@@ -1969,17 +2064,7 @@ pub unsafe fn code_eq(
     if !unsafe { is_code(other) } {
         return Ok(pyre_object::special::w_not_implemented());
     }
-    let a = unsafe { require_code(this, "__eq__")? };
-    let b = unsafe { require_code(other, "__eq__")? };
-    if (*(this as *const PyCode)).co_firstlineno_raw
-        != (*(other as *const PyCode)).co_firstlineno_raw
-    {
-        return Ok(w_bool_from(false));
-    }
-    if unsafe { code_bytes(this) } != unsafe { code_bytes(other) } {
-        return Ok(w_bool_from(false));
-    }
-    Ok(w_bool_from(code_data_equal(a, b)))
+    Ok(w_bool_from(unsafe { code_objects_equal(this, other)? }))
 }
 
 /// # Safety

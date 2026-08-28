@@ -122,7 +122,7 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
                 eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
             }
 
-            crate::seed_main_loader(canonical, None, Rc::as_ptr(&execution_context));
+            crate::seed_main_loader(canonical, None, false, Rc::as_ptr(&execution_context));
             crate::import_site(no_site, canonical, Rc::as_ptr(&execution_context));
             (execution_context, canonical, main_module)
         }

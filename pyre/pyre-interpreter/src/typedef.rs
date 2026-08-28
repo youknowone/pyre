@@ -3446,6 +3446,15 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(annotations) = crate::baseobjspace::finditem_str(w_dict, "__annotations__")? {
         return Ok(annotations);
     }
+    // [3.14-spec] PyPy has no lazy module-annotation cache to invalidate;
+    // RustPython `PyModule::__annotations__` carries CPython 3.14's PEP 649
+    // adaptation on the ordinary module dict and declines to cache while
+    // `__spec__._initializing` is true.  This is observable in
+    // `test_type_annotations.TypeAnnotationTests.test_partially_executed_module`:
+    // a circular importer sees the partial mapping, while the completed
+    // module's next read must evaluate all annotations afresh.
+    let is_initializing =
+        module_is_initializing(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     let annotations = match crate::baseobjspace::finditem_str(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         "__annotate__",
@@ -3472,13 +3481,36 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     };
     let annotations_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(annotations);
-    let key = pyre_object::w_str_new("__annotations__");
-    crate::baseobjspace::setitem(
-        pyre_object::gc_roots::shadow_stack_get(dict_slot),
-        key,
-        pyre_object::gc_roots::shadow_stack_get(annotations_slot),
-    )?;
+    if !is_initializing {
+        let key = pyre_object::w_str_new("__annotations__");
+        crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+            pyre_object::gc_roots::shadow_stack_get(annotations_slot),
+        )?;
+    }
     Ok(pyre_object::gc_roots::shadow_stack_get(annotations_slot))
+}
+
+/// RustPython `PyModule::is_initializing`: inspect the importlib-owned spec
+/// without making failures in optional metadata observable through an
+/// otherwise valid `module.__annotations__` read.
+fn module_is_initializing(w_dict: PyObjectRef) -> bool {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let _ = roots.pin_root(w_dict);
+    if let Ok(Some(spec)) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__spec__") {
+        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(spec);
+        if let Ok(initializing) =
+            crate::baseobjspace::getattr_str(roots.get(spec_slot), "_initializing")
+        {
+            let initializing_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(initializing);
+            return crate::baseobjspace::is_true(roots.get(initializing_slot)).unwrap_or(false);
+        }
+    }
+    false
 }
 
 fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -6606,15 +6638,17 @@ fn init_str_type(ns: PyObjectRef) {
                 "__add__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
-                    // Self-contained concat: returning NotImplemented for a
-                    // non-str operand lets the `+` operator emit the
-                    // "can only concatenate" message, and avoids the
-                    // recursion that delegating back to `add` would cause
-                    // (descroperation::add re-dispatches to this dunder).
+                    // CPython 3.14 `PyUnicode_Concat` is also the observable
+                    // `str.__add__` slot wrapper: a direct descriptor call
+                    // raises its concat-specific error.  The `+` operator
+                    // preserves PyPy `_call_binop_impl` reflected dispatch in
+                    // `descroperation::add` before reaching the same error.
                     if unsafe { pyre_object::is_str(args[1]) } {
                         unsafe { crate::objspace::descroperation::str_concat(args[0], args[1]) }
                     } else {
-                        Ok(pyre_object::w_not_implemented())
+                        Err(unsafe {
+                            crate::objspace::descroperation::str_concat_type_error(args[1])
+                        })
                     }
                 },
                 2,

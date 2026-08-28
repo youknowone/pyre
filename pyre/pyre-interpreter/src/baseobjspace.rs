@@ -4036,8 +4036,9 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let w_other = if obj == value {
-        pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec(
+        pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec_mode(
             value,
+            majit_metainterp::jit::we_are_jitted(),
         ))
     } else if pyre_object::is_list(value) {
         value
@@ -4061,8 +4062,14 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         let s_hi = stop.max(start).max(0) as usize;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_other = pyre_object::gc_roots::shadow_stack_get(other_slot);
-        pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
-            .expect("w_other is always a valid list");
+        pyre_object::listobject::w_list_setslice_mode(
+            obj,
+            s_lo,
+            s_hi,
+            w_other,
+            majit_metainterp::jit::we_are_jitted(),
+        )
+        .expect("w_other is always a valid list");
         return Ok(w_none());
     }
     // Extended slice: `pypy/objspace/std/listobject.py
@@ -4685,6 +4692,19 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
 /// PyPy-compatible identity check returning a Python bool object.
 pub fn is_(w_one: PyObjectRef, w_two: PyObjectRef) -> PyObjectRef {
     w_bool_from(is_w(w_one, w_two))
+}
+
+/// `ObjSpace.id` (`baseobjspace.py`): ask the object for its immutable unique
+/// id first, then use the moving collector's stable identity hash.
+///
+/// This is the interpreter operation, without the `builtins.id` audit event;
+/// internal users such as `pycode._convert_const` call this layer directly in
+/// PyPy too.
+pub fn id(w_obj: PyObjectRef) -> PyObjectRef {
+    match crate::function::immutable_unique_id(w_obj) {
+        Some(w_id) => w_id,
+        None => w_int_new(pyre_object::gc_hook::gc_identity_hash(w_obj as usize) as i64),
+    }
 }
 
 /// `W_TypeObject.flag_sequence_bug_compat` — set on exactly the builtin

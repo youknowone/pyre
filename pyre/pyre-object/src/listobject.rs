@@ -1098,16 +1098,22 @@ fn all_int_or_float(items: &[PyObjectRef]) -> bool {
         .all(|&item| unsafe { int_or_float_encode_item(item).is_some() })
 }
 
-fn boxed_from_int_or_float(values: &[i64]) -> Vec<PyObjectRef> {
+fn boxed_from_int_or_float(values: &[i64], we_are_jitted: bool) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
+    let mut previous = None;
     for &value in values {
-        let item = if int_or_float_is_int(value) {
+        // listobject.py AbstractUnwrappedStrategy.getitems_copy reuses the
+        // previous wrapper when IntOrFloatListStrategy._quick_cmp succeeds.
+        let item = if !we_are_jitted && previous == Some(value) {
+            crate::gc_roots::shadow_stack_get(crate::gc_roots::shadow_stack_len() - 1)
+        } else if int_or_float_is_int(value) {
             w_int_new(int_or_float_decode_int(value))
         } else {
             w_float_new(f64::from_bits(value as u64))
         };
         let _ = crate::gc_roots::pin_root(item);
+        previous = Some(value);
     }
     let mut items = Vec::with_capacity(values.len());
     for i in 0..values.len() {
@@ -1147,30 +1153,26 @@ unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
     true
 }
 
-/// Wrap an unboxed run into objects, the preallocate-and-index shape
-/// `listobject.py`'s `getitems_copy` uses.
+/// listobject.py AbstractUnwrappedStrategy.getitems_copy.
 ///
-/// The loop shape matches; the BODY does not. Upstream reuses one wrapper
-/// across a run of consecutive-equal unwrapped values —
-/// `if jit.we_are_jitted() or not self._quick_cmp(item, prevvalue)` guards
-/// the re-wrap, with `_quick_cmp` being `a == b` for `IntegerListStrategy`
-/// and `a is b` for `ObjectListStrategy`. pyre wraps every element, so
-/// `[1000] * 3` promoted out of the integer strategy yields three distinct
-/// objects where upstream's interpreter yields three references to one.
-///
-/// Not ported here because upstream itself gives the reuse up under
-/// `jit.we_are_jitted()`, so the identity is not a stable observable to
-/// match; porting it means carrying `prevvalue`/`_quick_cmp` per strategy.
-/// The two hints on the same function — `getitems_unroll =
+/// The two hints on the same function -- `getitems_unroll =
 /// jit.unroll_safe(...)` and `getitems_copy = jit.look_inside_iff(lambda
-/// self, w_list: w_list._unrolling_heuristic())(...)` — are likewise absent;
+/// self, w_list: w_list._unrolling_heuristic())(...)` -- are absent;
 /// `look_inside_iff` needs `jit.isvirtual`/`isconstant`, which pyre has no
 /// intrinsic for yet.
-fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
+fn boxed_from_ints(values: &[i64], we_are_jitted: bool) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
+    let mut previous = None;
     for &value in values {
-        let _ = crate::gc_roots::pin_root(w_int_new(value));
+        // IntegerListStrategy._quick_cmp compares the unboxed values.
+        let item = if !we_are_jitted && previous == Some(value) {
+            crate::gc_roots::shadow_stack_get(crate::gc_roots::shadow_stack_len() - 1)
+        } else {
+            w_int_new(value)
+        };
+        let _ = crate::gc_roots::pin_root(item);
+        previous = Some(value);
     }
     let mut items = Vec::with_capacity(values.len());
     for i in 0..values.len() {
@@ -1179,11 +1181,20 @@ fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
     items
 }
 
-fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
+fn boxed_from_floats(values: &[f64], we_are_jitted: bool) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
+    let mut previous_bits = None;
     for &value in values {
-        let _ = crate::gc_roots::pin_root(w_float_new(value));
+        // FloatListStrategy._quick_cmp compares the raw IEEE-754 payload.
+        let bits = value.to_bits();
+        let item = if !we_are_jitted && previous_bits == Some(bits) {
+            crate::gc_roots::shadow_stack_get(crate::gc_roots::shadow_stack_len() - 1)
+        } else {
+            w_float_new(value)
+        };
+        let _ = crate::gc_roots::pin_root(item);
+        previous_bits = Some(bits);
     }
     let mut items = Vec::with_capacity(values.len());
     for i in 0..values.len() {
@@ -1219,7 +1230,7 @@ fn all_ascii(items: &[PyObjectRef]) -> bool {
 ///
 /// # Safety
 /// `obj_slot` must hold a live `W_ListObject` in the Bytes strategy.
-unsafe fn boxed_from_bytes(obj_slot: usize) -> Vec<PyObjectRef> {
+unsafe fn boxed_from_bytes(obj_slot: usize, we_are_jitted: bool) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let bytes_items = |slot: usize| -> &BytesArray {
@@ -1227,8 +1238,21 @@ unsafe fn boxed_from_bytes(obj_slot: usize) -> Vec<PyObjectRef> {
     };
     let len = bytes_items(obj_slot).len();
     for i in 0..len {
-        let value = bytes_items(obj_slot).as_slice()[i];
-        let _ = crate::gc_roots::pin_root(w_bytes_from_block(value));
+        // BytesListStrategy._quick_cmp is storage identity. Re-read both
+        // slots through the rooted list because wrapping may move its block.
+        let repeated = !we_are_jitted
+            && i > 0
+            && std::ptr::eq(
+                bytes_items(obj_slot).as_slice()[i],
+                bytes_items(obj_slot).as_slice()[i - 1],
+            );
+        let item = if repeated {
+            crate::gc_roots::shadow_stack_get(crate::gc_roots::shadow_stack_len() - 1)
+        } else {
+            let value = bytes_items(obj_slot).as_slice()[i];
+            w_bytes_from_block(value)
+        };
+        let _ = crate::gc_roots::pin_root(item);
     }
     (0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
@@ -1237,7 +1261,7 @@ unsafe fn boxed_from_bytes(obj_slot: usize) -> Vec<PyObjectRef> {
 
 /// Box each erased UTF-8 `rpython str` of the Ascii strategy, re-reading the
 /// array through the rooted list after every allocating wrap.
-unsafe fn boxed_from_ascii(obj_slot: usize) -> Vec<PyObjectRef> {
+unsafe fn boxed_from_ascii(obj_slot: usize, we_are_jitted: bool) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let ascii_items = |slot: usize| -> &UnicodeArray {
@@ -1245,8 +1269,20 @@ unsafe fn boxed_from_ascii(obj_slot: usize) -> Vec<PyObjectRef> {
     };
     let len = ascii_items(obj_slot).len();
     for i in 0..len {
-        let value = ascii_items(obj_slot).as_slice()[i];
-        let _ = crate::gc_roots::pin_root(w_str_from_storage(value as *mut _));
+        // AsciiListStrategy._quick_cmp is storage identity.
+        let repeated = !we_are_jitted
+            && i > 0
+            && std::ptr::eq(
+                ascii_items(obj_slot).as_slice()[i],
+                ascii_items(obj_slot).as_slice()[i - 1],
+            );
+        let item = if repeated {
+            crate::gc_roots::shadow_stack_get(crate::gc_roots::shadow_stack_len() - 1)
+        } else {
+            let value = ascii_items(obj_slot).as_slice()[i];
+            w_str_from_storage(value as *mut _)
+        };
+        let _ = crate::gc_roots::pin_root(item);
     }
     (0..len)
         .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
@@ -1278,13 +1314,22 @@ pub unsafe fn switch_to_object_strategy(list: &mut W_ListObject) -> PyObjectRef 
     let seed: Vec<PyObjectRef> = match list.strategy {
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let values = range_list_values(list);
-            boxed_from_ints(&values)
+            boxed_from_ints(&values, false)
         }
-        ListStrategy::Integer => boxed_from_ints(list.int_items.as_slice()),
-        ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
-        ListStrategy::Float => boxed_from_floats(list.float_items.as_slice()),
-        ListStrategy::Bytes => boxed_from_bytes(obj_slot),
-        ListStrategy::Ascii => boxed_from_ascii(obj_slot),
+        ListStrategy::Integer => {
+            let values = list.int_items.as_slice().to_vec();
+            boxed_from_ints(&values, false)
+        }
+        ListStrategy::IntOrFloat => {
+            let values = list.int_items.as_slice().to_vec();
+            boxed_from_int_or_float(&values, false)
+        }
+        ListStrategy::Float => {
+            let values = list.float_items.as_slice().to_vec();
+            boxed_from_floats(&values, false)
+        }
+        ListStrategy::Bytes => boxed_from_bytes(obj_slot, false),
+        ListStrategy::Ascii => boxed_from_ascii(obj_slot, false),
         ListStrategy::Object | ListStrategy::Empty | ListStrategy::Size => Vec::new(),
     };
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
@@ -3167,7 +3212,7 @@ unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectRef>)
 /// Snapshot all items of a list as a `Vec<PyObjectRef>`, regardless of
 /// strategy. Integer/Float items are wrapped into `W_IntObject` /
 /// `W_FloatObject`, and Bytes items are re-wrapped from their erased strings,
-/// matching listobject.py `_temporarily_as_objects()`.
+/// matching listobject.py `AbstractUnwrappedStrategy.getitems_copy` and
 /// `_temporarily_as_objects()`. Used by callers outside `pyre-object`
 /// (e.g. the interpreter's unpack / set-update / list-to-tuple paths)
 /// that need a uniform object view.
@@ -3175,8 +3220,24 @@ unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectRef>)
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
+    w_list_items_copy_as_vec_mode(obj, false)
+}
+
+/// JIT-context form of [`w_list_items_copy_as_vec`].
+///
+/// `AbstractUnwrappedStrategy.getitems_copy` deliberately skips its
+/// consecutive-wrapper reuse while `jit.we_are_jitted()`: identity-bearing
+/// boxes stay explicit in the trace. The interpreter crate supplies that
+/// symbolic boolean because `pyre-object` sits below `majit-metainterp`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
+pub unsafe fn w_list_items_copy_as_vec_mode(
+    obj: PyObjectRef,
+    we_are_jitted: bool,
+) -> Vec<PyObjectRef> {
     let list = &*(obj as *const W_ListObject);
-    temporarily_as_objects(list)
+    temporarily_as_objects(list, we_are_jitted)
 }
 
 /// Raw `(ptr, len)` view of an Object-strategy list's `PyObjectRef` items for
@@ -3202,41 +3263,29 @@ pub unsafe fn w_list_object_items_ptr_len(obj: PyObjectRef) -> Option<(*const Py
 /// Returns wrapped object items without mutating the source list's strategy.
 /// PyPy creates a temporary W_ListObject with ObjectListStrategy; Rust
 /// returns a Vec<PyObjectRef> copy instead.
-unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
+unsafe fn temporarily_as_objects(list: &W_ListObject, we_are_jitted: bool) -> Vec<PyObjectRef> {
     match list.strategy {
         // listobject.py EmptyListStrategy.getitems returns [].
         ListStrategy::Empty | ListStrategy::Size => Vec::new(),
         ListStrategy::SimpleRange | ListStrategy::Range => {
             let values = range_list_values(list);
-            boxed_from_ints(&values)
+            boxed_from_ints(&values, we_are_jitted)
         }
         ListStrategy::Object => list.object_to_vec(),
         ListStrategy::Integer => {
-            let items = list.int_items.as_slice();
-            let _roots = crate::gc_roots::push_roots();
-            let root_base = crate::gc_roots::shadow_stack_len();
-            for &v in items {
-                let _ = crate::gc_roots::pin_root(w_int_new(v));
-            }
-            let mut objects = Vec::with_capacity(items.len());
-            for i in 0..items.len() {
-                objects.push(crate::gc_roots::shadow_stack_get(root_base + i));
-            }
-            objects
+            // Copy scalar storage before wrapping: allocation may move the
+            // typed block, while getitems_copy itself works from its stable
+            // unwrapped list snapshot.
+            let values = list.int_items.as_slice().to_vec();
+            boxed_from_ints(&values, we_are_jitted)
         }
-        ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
+        ListStrategy::IntOrFloat => {
+            let values = list.int_items.as_slice().to_vec();
+            boxed_from_int_or_float(&values, we_are_jitted)
+        }
         ListStrategy::Float => {
-            let items = list.float_items.as_slice();
-            let _roots = crate::gc_roots::push_roots();
-            let root_base = crate::gc_roots::shadow_stack_len();
-            for &v in items {
-                let _ = crate::gc_roots::pin_root(w_float_new(v));
-            }
-            let mut objects = Vec::with_capacity(items.len());
-            for i in 0..items.len() {
-                objects.push(crate::gc_roots::shadow_stack_get(root_base + i));
-            }
-            objects
+            let values = list.float_items.as_slice().to_vec();
+            boxed_from_floats(&values, we_are_jitted)
         }
         ListStrategy::Bytes => {
             // The wraps allocate, so the list has to be reachable by slot for
@@ -3246,7 +3295,7 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
                 (list as *const W_ListObject as *mut W_ListObject) as PyObjectRef,
             );
             let obj_slot = crate::gc_roots::shadow_stack_len() - 1;
-            boxed_from_bytes(obj_slot)
+            boxed_from_bytes(obj_slot, we_are_jitted)
         }
         ListStrategy::Ascii => {
             let _roots = crate::gc_roots::push_roots();
@@ -3254,7 +3303,7 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
                 (list as *const W_ListObject as *mut W_ListObject) as PyObjectRef,
             );
             let obj_slot = crate::gc_roots::shadow_stack_len() - 1;
-            boxed_from_ascii(obj_slot)
+            boxed_from_ascii(obj_slot, we_are_jitted)
         }
     }
 }
@@ -4252,6 +4301,21 @@ pub unsafe fn w_list_setslice(
     end: usize,
     w_other: PyObjectRef,
 ) -> Result<(), &'static str> {
+    w_list_setslice_mode(obj, start, end, w_other, false)
+}
+
+/// `w_list_setslice` with PyPy's `jit.we_are_jitted()` value threaded to the
+/// donor's `AbstractUnwrappedStrategy.getitems_copy` fallback.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_list_setslice_mode(
+    obj: PyObjectRef,
+    start: usize,
+    end: usize,
+    w_other: PyObjectRef,
+    we_are_jitted: bool,
+) -> Result<(), &'static str> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     crate::gc_roots::publish_roots(&[obj, w_other]);
@@ -4259,7 +4323,7 @@ pub unsafe fn w_list_setslice(
     let obj = crate::gc_roots::shadow_stack_get(root_base);
     let w_other = crate::gc_roots::shadow_stack_get(root_base + 1);
     let old_size = (&*(obj as *const W_ListObject)).live_len();
-    let result = w_list_setslice_inner(obj, start, end, w_other);
+    let result = w_list_setslice_inner(obj, start, end, w_other, we_are_jitted);
     if result.is_ok() {
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let list = &mut *(obj as *mut W_ListObject);
@@ -4275,6 +4339,7 @@ unsafe fn w_list_setslice_inner(
     start: usize,
     end: usize,
     w_other: PyObjectRef,
+    we_are_jitted: bool,
 ) -> Result<(), &'static str> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
@@ -4296,6 +4361,7 @@ unsafe fn w_list_setslice_inner(
             start,
             end,
             crate::gc_roots::shadow_stack_get(root_base + 1),
+            we_are_jitted,
         );
     }
     if is_list(w_other) {
@@ -4395,7 +4461,7 @@ unsafe fn w_list_setslice_inner(
             )
             && integer_to_int_or_float(list)
         {
-            return w_list_setslice_inner(obj, start, end, w_other);
+            return w_list_setslice_inner(obj, start, end, w_other, we_are_jitted);
         }
         if list.strategy == ListStrategy::Float
             && matches!(
@@ -4404,7 +4470,7 @@ unsafe fn w_list_setslice_inner(
             )
             && float_to_int_or_float(list)
         {
-            return w_list_setslice_inner(obj, start, end, w_other);
+            return w_list_setslice_inner(obj, start, end, w_other, we_are_jitted);
         }
         // listobject.py IntOrFloatListStrategy.setslice converts an
         // Integer/Float donor to temporary signed-longlong storage without
@@ -4576,7 +4642,7 @@ unsafe fn w_list_setslice_inner(
     // switch to object strategy, then splice as objects.
     let new_items: Vec<PyObjectRef> = if is_list(w_other) {
         let other = &*(w_other as *const W_ListObject);
-        temporarily_as_objects(other)
+        temporarily_as_objects(other, we_are_jitted)
     } else {
         return Err("non-list iterable");
     };
@@ -4920,6 +4986,33 @@ mod tests {
             assert!(l.ascii_items.block.is_null());
             assert_eq!(w_list_len(list), 4);
             assert_eq!(w_str_storage(w_list_getitem(list, 0).unwrap()), a_storage);
+        }
+    }
+
+    #[test]
+    fn unboxed_getitems_copy_reuses_consecutive_equal_wrappers() {
+        // listobject.py AbstractUnwrappedStrategy.getitems_copy: each typed
+        // strategy applies `_quick_cmp` and retains the preceding wrapper.
+        let integer = w_int_new(1_000_000);
+        let float = crate::floatobject::w_float_new(1.25);
+        let bytes = crate::bytesobject::w_bytes_from_bytes(b"shared");
+        let ascii = crate::w_str_new("shared");
+        for (name, list) in [
+            ("IntegerListStrategy", w_list_new(vec![integer, integer])),
+            ("FloatListStrategy", w_list_new(vec![float, float])),
+            ("BytesListStrategy", w_list_new(vec![bytes, bytes])),
+            ("AsciiListStrategy", w_list_new(vec![ascii, ascii])),
+        ] {
+            let copied = unsafe { w_list_items_copy_as_vec(list) };
+            assert_eq!(copied.len(), 2);
+            assert!(std::ptr::eq(copied[0], copied[1]), "{name}");
+
+            let traced = unsafe { w_list_items_copy_as_vec_mode(list, true) };
+            assert_eq!(traced.len(), 2);
+            assert!(
+                !std::ptr::eq(traced[0], traced[1]),
+                "{name} under we_are_jitted"
+            );
         }
     }
 

@@ -3602,6 +3602,28 @@ impl PyFrame {
         crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
     }
 
+    /// PyPy `space.createframe(code, w_globals, None)` for an already wrapped
+    /// code object, notably `app_main.py:execfile`'s `marshal.load(f)` result.
+    /// Keeping that wrapper preserves its exact first-line, filename and
+    /// decoded-location state; cloning only the compiler `CodeObject` would
+    /// silently discard the wrapper-owned parts of marshal's result.
+    pub fn new_with_context_and_globals_obj(
+        w_code: PyObjectRef,
+        execution_context: Rc<PyExecutionContext>,
+        w_globals: PyObjectRef,
+    ) -> Result<FrameBox, crate::PyError> {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let root_base = _roots.publish(&[w_code, w_globals]);
+        _roots.normalize(root_base, 2);
+        let w_code = _roots.get(root_base);
+        let w_globals = _roots.get(root_base + 1);
+        unsafe {
+            crate::w_code_set_w_globals(w_code, w_globals);
+        }
+        let ctx_ptr = Rc::into_raw(execution_context);
+        crate::createframe_obj(w_code as *const (), w_globals, ctx_ptr, None)
+    }
+
     /// RPython MetaInterp traces against its own MIFrame stack instead of
     /// mutating the live interpreter frame in place. pyre still executes
     /// bytecodes concretely during tracing, so use an owned snapshot when

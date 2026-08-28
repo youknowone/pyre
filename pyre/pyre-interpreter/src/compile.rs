@@ -6,6 +6,8 @@ pub use rustpython_compiler::Mode;
 pub use rustpython_compiler::ast;
 pub use rustpython_compiler::codegen;
 pub use rustpython_compiler::compile as rp_compile;
+pub use rustpython_compiler::compile_with_syntax_warning_handler as rp_compile_with_syntax_warning_handler;
+pub use rustpython_compiler::core::SourceLocation;
 pub use rustpython_compiler::parser;
 pub use rustpython_compiler_core::bytecode::{
     self, BinaryOperator, CodeFlags, CodeObject, ComparisonOperator, ConstantData, Instruction,
@@ -60,6 +62,7 @@ fn default_compile_opts() -> CompileOpts {
     CompileOpts {
         optimize: crate::importing::optimize_flag(),
         debug_ranges: crate::importing::code_debug_ranges_flag(),
+        int_max_str_digits: crate::module::sys::state::int_max_str_digits().max(0) as usize,
         ..Default::default()
     }
 }
@@ -216,6 +219,38 @@ pub fn decode_source_bytes(
     filename: &rustpython_wtf8::Wtf8,
     ignore_cookie: bool,
 ) -> Result<String, crate::PyError> {
+    // PyPy `PegParser.parse_source` performs this scan on the original bytes,
+    // before `_handle_encoding`.  Besides preserving that order, it ensures a
+    // later undecodable byte cannot hide an earlier NUL (bpo-24022/25388).
+    if let Some(null_pos) = source.iter().position(|byte| *byte == 0) {
+        let line_start = source[..null_pos]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let line_end = source[null_pos..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(source.len(), |relative| null_pos + relative);
+        let text = String::from_utf8_lossy(&source[line_start..line_end]);
+        let lineno = source[..null_pos]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            + 1;
+        let offset = String::from_utf8_lossy(&source[line_start..null_pos])
+            .chars()
+            .count()
+            + 1;
+        return Err(crate::PyError::syntax_error_located(
+            "source code cannot contain null bytes",
+            filename,
+            lineno as i64,
+            offset as i64,
+            lineno as i64,
+            offset as i64,
+            Some(&text),
+        ));
+    }
     let has_bom = source.starts_with(b"\xef\xbb\xbf");
     let encoding = if ignore_cookie {
         None

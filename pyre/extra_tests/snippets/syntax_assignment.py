@@ -82,3 +82,18 @@ def a():
 a()[0] += 1
 
 assert n == 1
+
+# The PyPy oracle and CPython 3.14 agree on the parenthesized-target parser
+# diagnostic.  CPython's compiler uses its shorter spelling for the bare
+# starred-value path, so keep both from collapsing onto Ruff's capitalized
+# parser diagnostic.
+for source, message in [
+    ("x = *a", "can't use starred expression here"),
+    ("((*x), y) = 1, 2", "cannot use starred expression here"),
+]:
+    try:
+        compile(source, "<starred-assignment>", "exec")
+    except SyntaxError as error:
+        assert error.msg == message, (source, error.msg)
+    else:
+        raise AssertionError(source)

@@ -249,6 +249,7 @@ pub fn compile_object(
         carried_ignores: Vec::new(),
         line_len: 0,
     };
+    converter.validate_module_mode(object, mode)?;
     // The compiler reads a node's position out of the source text the range
     // indexes, so a tree that came from objects needs a text to index.  Stand
     // one up whose lines are wide enough for every column the tree names; the
@@ -257,9 +258,22 @@ pub fn compile_object(
     let module = converter.module(object)?;
     // compiling.py:73 — the tree is walked before it reaches the compiler.
     crate::astcompiler::validate::validate_ast(&module)?;
-    let source_file = rustpython_compiler::core::SourceFileBuilder::new(filename, text).finish();
-    rustpython_compiler::codegen::compile::compile_top(module, source_file, mode, opts)
-        .map_err(|error| crate::PyError::syntax_error(error.to_string()))
+    let source_file =
+        rustpython_compiler::core::SourceFileBuilder::new(filename, text.clone()).finish();
+    crate::syntax_warnings::compile_ast_with_codegen_warnings(
+        module,
+        source_file,
+        &text,
+        filename,
+        mode,
+        opts,
+    )
+    .map_err(|error| match error {
+        crate::syntax_warnings::SourceCompileError::Compile(error) => {
+            crate::PyError::syntax_error(error.to_string())
+        }
+        crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+    })
 }
 
 /// CPython 3.14 `_PyCompile_AstPreprocess`: apply the same AST preprocessing
@@ -352,6 +366,33 @@ struct ObjectConverter {
 }
 
 impl ObjectConverter {
+    /// CPython `_PyAST_CheckMode`: an AST root supplied to `compile()` must
+    /// match the requested parser start rule.  PyPy's generated AST converter
+    /// owns the same boundary, while Ruff's code generator accepts a `Module`
+    /// with `Mode::Eval` and would otherwise silently produce a code object.
+    fn validate_module_mode(
+        &self,
+        object: PyObjectRef,
+        mode: crate::compile::Mode,
+    ) -> AstResult<()> {
+        let expected = match mode {
+            crate::compile::Mode::Exec | crate::compile::Mode::BlockExpr => "Module",
+            crate::compile::Mode::Eval => "Expression",
+            crate::compile::Mode::Single => "Interactive",
+        };
+        if self.is_node(object, expected)? {
+            return Ok(());
+        }
+        for actual in ["Module", "Expression", "Interactive", "FunctionType"] {
+            if self.is_node(object, actual)? {
+                return Err(crate::PyError::type_error(format!(
+                    "expected {expected} node, got {actual}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Blank text with a line for every line the tree names and columns for
     /// the widest of them, so that `location` can turn a node's `lineno` and
     /// `col_offset` into an offset the compiler can map back.
@@ -381,7 +422,12 @@ impl ObjectConverter {
     /// and must not reject a tree the converter would go on to accept.
     fn scan_extent(&mut self, object: PyObjectRef, extent: &mut (usize, usize)) -> AstResult<()> {
         if unsafe { pyre_object::is_list(object) } {
-            for item in unsafe { pyre_object::w_list_items_copy_as_vec(object) } {
+            for item in unsafe {
+                pyre_object::w_list_items_copy_as_vec_mode(
+                    object,
+                    majit_metainterp::jit::we_are_jitted(),
+                )
+            } {
                 self.recurse(|this| this.scan_extent(item, extent))?;
             }
             return Ok(());
@@ -504,7 +550,12 @@ impl ObjectConverter {
                 class_name(value)
             )));
         }
-        Ok(unsafe { pyre_object::w_list_items_copy_as_vec(value) })
+        Ok(unsafe {
+            pyre_object::w_list_items_copy_as_vec_mode(
+                value,
+                majit_metainterp::jit::we_are_jitted(),
+            )
+        })
     }
 
     fn string(&self, object: PyObjectRef, field: &str, node: &str) -> AstResult<String> {
@@ -602,7 +653,12 @@ impl ObjectConverter {
             )));
         }
         let mut out = Vec::new();
-        for item in unsafe { pyre_object::w_list_items_copy_as_vec(value) } {
+        for item in unsafe {
+            pyre_object::w_list_items_copy_as_vec_mode(
+                value,
+                majit_metainterp::jit::we_are_jitted(),
+            )
+        } {
             if unsafe { pyre_object::is_none(item) } {
                 continue;
             }
@@ -1226,7 +1282,12 @@ impl ObjectConverter {
                 class_name(field)
             )));
         }
-        let values = unsafe { pyre_object::w_list_items_copy_as_vec(field) };
+        let values = unsafe {
+            pyre_object::w_list_items_copy_as_vec_mode(
+                field,
+                majit_metainterp::jit::we_are_jitted(),
+            )
+        };
         if values.is_empty() {
             return Ok(None);
         }
@@ -1834,10 +1895,10 @@ impl ObjectConverter {
             }))
         } else if self.is_node(object, "JoinedStr")? {
             let values = self.exprs(object, "values", "JoinedStr")?;
-            Ok(fstring(Vec::new(), Some(values)))
+            Ok(fstring(range, Vec::new(), Some(values), false))
         } else if self.is_node(object, "FormattedValue")? {
             let element = self.interpolation(object)?;
-            Ok(fstring(vec![element], None))
+            Ok(fstring(range, vec![element], None, true))
         } else if self.is_node(object, "TemplateStr")? {
             let range = self.location(object, "TemplateStr")?;
             let values = self.exprs(object, "values", "TemplateStr")?;
@@ -1861,7 +1922,7 @@ impl ObjectConverter {
         Ok(ast::InterpolatedStringElement::Interpolation(
             ast::InterpolatedElement {
                 node_index: Default::default(),
-                range: Default::default(),
+                range: self.location(object, "FormattedValue")?,
                 expression,
                 debug_text: None,
                 conversion,
@@ -2136,20 +2197,25 @@ impl ObjectConverter {
 /// `FormattedValue` on its own is a single interpolated part, which does fit
 /// the part list.
 fn fstring(
+    range: ruff_text_size::TextRange,
     elements: Vec<ast::InterpolatedStringElement>,
     runtime_joined_str: Option<Vec<ast::Expr>>,
+    standalone_formatted_value: bool,
 ) -> ast::Expr {
     ast::Expr::FString(ast::ExprFString {
         node_index: Default::default(),
-        range: Default::default(),
+        range,
         value: ast::FStringValue::single(ast::FString {
             node_index: Default::default(),
-            range: Default::default(),
+            range,
             elements: elements.into(),
             flags: ast::FStringFlags::empty(),
         }),
         runtime_joined_str,
-        runtime_values: None,
+        // RustPython `_ast::string::formatted_value_to_expr` uses the same
+        // compiler-side carrier for a public FormattedValue and JoinedStr.
+        // An empty slot vector marks the former without changing codegen.
+        runtime_values: standalone_formatted_value.then(Vec::new),
     })
 }
 
@@ -3044,10 +3110,15 @@ impl Converter<'_> {
                     } else {
                         // The members come out of the list as bare pointers, so
                         // each is published before the next clause allocates.
-                        orelse = unsafe { pyre_object::w_list_items_copy_as_vec(body.get()) }
-                            .into_iter()
-                            .map(|item| self.pin(item))
-                            .collect();
+                        orelse = unsafe {
+                            pyre_object::w_list_items_copy_as_vec_mode(
+                                body.get(),
+                                majit_metainterp::jit::we_are_jitted(),
+                            )
+                        }
+                        .into_iter()
+                        .map(|item| self.pin(item))
+                        .collect();
                     }
                 }
                 self.node(
@@ -3444,7 +3515,10 @@ impl Converter<'_> {
                 &[("values", self.expr_list(values)?)],
             );
         }
-        if let Some(values) = node.runtime_values.as_deref() {
+        let standalone_formatted_value = node.runtime_values.as_ref().is_some_and(Vec::is_empty);
+        if let Some(values) = node.runtime_values.as_deref()
+            && !standalone_formatted_value
+        {
             let values = values
                 .iter()
                 .map(|value| {
@@ -3474,6 +3548,9 @@ impl Converter<'_> {
                     self.interpolated_elements(&fstring.elements, fstring.flags.into(), &mut parts)?
                 }
             }
+        }
+        if standalone_formatted_value && let [JoinedPart::Value(value)] = parts.as_slice() {
+            return Ok(*value);
         }
         let values = self.joined_values(parts)?;
         self.node(
@@ -3934,10 +4011,21 @@ impl Converter<'_> {
                     values.into_iter().map(Rooted::get).collect(),
                 ))
             }
-            ast::ConstantValue::Frozenset(_) => {
-                return Err(crate::PyError::not_implemented(
-                    "frozenset AST constants are not implemented",
-                ));
+            ast::ConstantValue::Frozenset(values) => {
+                let values = values
+                    .iter()
+                    .map(|value| self.constant_value(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                // PyPy `PythonCodeGenerator._optimize_comparator` builds a
+                // `W_FrozensetObject`, and `Constant.to_object` passes that
+                // wrapped value through unchanged. Rebuilding RustPython's
+                // structural spelling therefore uses the same ordinary
+                // frozenset storage, just like tuple constants above.
+                // Root every recursively-built member across allocation of the
+                // container, since no untraced Rust vector can own GC objects.
+                self.pin(pyre_object::w_frozenset_from_items(
+                    &values.into_iter().map(Rooted::get).collect::<Vec<_>>(),
+                ))
             }
         })
     }

@@ -616,6 +616,26 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
 /// text.  A cache written by an interpreter with a different token is rejected.
 pub(crate) const PYC_MAGIC_NUMBER_TOKEN: u32 = 0x0A0D_0E2B;
 
+/// `app_main.py:execfile` — validate a `.pyc` script header and unmarshal its
+/// code object.  Script execution deliberately shares the same magic token and
+/// marshal reader as `_imp`/importlib instead of growing a launcher-private
+/// bytecode format.
+pub(crate) fn load_pyc_script(bytes: &[u8]) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    if bytes.get(..4) != Some(PYC_MAGIC_NUMBER_TOKEN.to_le_bytes().as_slice()) {
+        return Err(crate::PyError::runtime_error(
+            "Bad magic number in .pyc file",
+        ));
+    }
+    let Some(payload) = bytes.get(16..) else {
+        return Err(crate::PyError::runtime_error("Truncated .pyc file"));
+    };
+    let w_code = crate::module::marshal::loads_bytes(payload)?;
+    if !unsafe { crate::is_code(w_code) } {
+        return Err(crate::PyError::runtime_error("Bad code object in .pyc file"));
+    }
+    Ok(w_code)
+}
+
 /// Per-process identity shared by every frozen-cache access: the stdlib
 /// `__pycache__` directory, the executable name (segregates backends), and the
 /// executable's modification time in ns (invalidates the cache across

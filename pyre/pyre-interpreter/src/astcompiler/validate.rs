@@ -234,6 +234,11 @@ impl AstValidator {
                 self.validate_expr(&node.value, ast::ExprContext::Load)
             }
             ast::Stmt::AnnAssign(node) => {
+                if node.simple && !matches!(&*node.target, ast::Expr::Name(_)) {
+                    return Err(validation_type_error(
+                        "AnnAssign with simple non-Name target",
+                    ));
+                }
                 self.validate_expr(&node.target, ast::ExprContext::Store)?;
                 self.validate_expr(&node.annotation, ast::ExprContext::Load)?;
                 match &node.value {
@@ -242,6 +247,9 @@ impl AstValidator {
                 }
             }
             ast::Stmt::TypeAlias(node) => {
+                if !matches!(&*node.name, ast::Expr::Name(_)) {
+                    return Err(validation_type_error("TypeAlias with non-Name name"));
+                }
                 self.validate_expr(&node.name, ast::ExprContext::Store)?;
                 self.validate_type_params(node.type_params.as_deref())?;
                 self.validate_expr(&node.value, ast::ExprContext::Load)
