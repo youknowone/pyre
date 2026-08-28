@@ -92,7 +92,7 @@ class MultibyteIncrementalDecoder:
         # PyPy's `MultibyteIncrementalDecoder._initialize` owns one persistent
         # `decodebuf`; these bytes are its `MultibyteCodec_State.c` while the
         # app-level port crosses the Rust engine boundary one call at a time.
-        self.state = bytearray(8)
+        self.state = bytearray(_initial_state(self.codec.name, True))
 
     def decode(self, object, final=False):
         data = self.pending + object
@@ -104,7 +104,7 @@ class MultibyteIncrementalDecoder:
 
     def reset(self):
         self.pending = b""
-        self.state = bytearray(8)
+        self.state = bytearray(_initial_state(self.codec.name, True))
 
     def getstate(self):
         # Pinned v3.14.6
@@ -154,7 +154,7 @@ class MultibyteIncrementalEncoder:
         # PyPy's `MultibyteIncrementalEncoder._initialize` owns one persistent
         # encodebuf.  Carry its `MultibyteCodec_State.c` explicitly so HZ's
         # ASCII/GB shift survives between calls.
-        self.state = bytearray(8)
+        self.state = bytearray(_initial_state(self.codec.name, False))
 
     def encode(self, object, final=False):
         data = self.pending + object
@@ -166,7 +166,7 @@ class MultibyteIncrementalEncoder:
 
     def reset(self):
         self.pending = ""
-        self.state = bytearray(8)
+        self.state = bytearray(_initial_state(self.codec.name, False))
 
     def getstate(self):
         # PyPy `MultibyteIncrementalEncoder.getstate_w`: the state is one

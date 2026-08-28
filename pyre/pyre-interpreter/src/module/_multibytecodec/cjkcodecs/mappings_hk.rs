@@ -3,6 +3,7 @@
 // `cjkcodecs.h::_TRYMAP_DEC` / `_TRYMAP_ENC` index these exact arrays.
 
 pub(super) const UNIINV: u16 = 0xfffe;
+#[allow(dead_code)]
 pub(super) const NOCHAR: u16 = 0xffff;
 #[allow(dead_code)]
 pub(super) const MULTIC: u16 = 0xfffe;

@@ -29,6 +29,9 @@ pub mod _codecs_cn;
 pub mod _codecs_hk;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]
+pub mod _codecs_iso2022;
+#[allow(non_snake_case)]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_jp;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]

@@ -28,6 +28,11 @@ GB18030_RANGE_RE = re.compile(
     r"gb18030_to_unibmp_ranges\[\] = \{(?P<body>.*?)\};",
     re.S,
 )
+PAIR_ENCODE_RE = re.compile(
+    r"static const struct pair_encodemap (?P<name>[A-Za-z0-9_]+)"
+    r"\[(?P<size>[A-Za-z0-9_]+)\] = \{(?P<body>.*?)\n\};",
+    re.S,
+)
 
 RUST_TYPE = {
     "ucs2_t": "u16",
@@ -64,6 +69,7 @@ def translate(source: Path) -> str:
         "// `cjkcodecs.h::_TRYMAP_DEC` / `_TRYMAP_ENC` index these exact arrays.",
         "",
         "pub(super) const UNIINV: u16 = 0xfffe;",
+        "#[allow(dead_code)]",
         "pub(super) const NOCHAR: u16 = 0xffff;",
         "#[allow(dead_code)]",
         "pub(super) const MULTIC: u16 = 0xfffe;",
@@ -92,12 +98,21 @@ def translate(source: Path) -> str:
         c_name = match.group("name")
         name = rust_name(c_name) + "_DATA"
         values = [part.strip() for part in match.group("body").replace("\n", "").split(",")]
-        values = [SENTINEL.get(value, value) for value in values if value]
+        rust_type = RUST_TYPE[match.group("type")]
+        values = [
+            (
+                f"{SENTINEL[value]} as {rust_type}"
+                if value in SENTINEL and rust_type != "u16"
+                else SENTINEL.get(value, value)
+            )
+            for value in values
+            if value
+        ]
         size = int(match.group("size")) if match.group("size") else len(values)
         if len(values) != size:
             raise ValueError(f"{c_name}: declared {size}, parsed {len(values)}")
         arrays[c_name] = size
-        output.append(f"pub(super) static {name}: [{RUST_TYPE[match.group('type')]}; {size}] = [")
+        output.append(f"pub(super) static {name}: [{rust_type}; {size}] = [")
         output.extend(wrap(values))
         output.extend(["];", ""])
 
@@ -145,6 +160,39 @@ def translate(source: Path) -> str:
                 [
                     f"Gb18030Range {{ first: {first}, last: {last}, base: {base} }}"
                     for first, last, base in entries
+                ],
+                120,
+            )
+        )
+        output.extend(["];", ""])
+
+    if match := PAIR_ENCODE_RE.search(text):
+        entries = re.findall(r"\{\s*(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\s*\}", match.group("body"))
+        size_name = match.group("size")
+        size_match = re.search(rf"#define\s+{re.escape(size_name)}\s+(\d+)", text)
+        if size_match is None:
+            raise ValueError(f"{match.group('name')}: unknown size {size_name}")
+        size = int(size_match.group(1))
+        if len(entries) != size:
+            raise ValueError(
+                f"{match.group('name')}: declared {size}, parsed {len(entries)}"
+            )
+        output.extend(
+            [
+                "#[derive(Clone, Copy)]",
+                "pub(super) struct PairEncodeMap {",
+                "    pub(super) uniseq: u32,",
+                "    pub(super) code: u16,",
+                "}",
+                "",
+                f"pub(super) static {match.group('name').upper()}: [PairEncodeMap; {size}] = [",
+            ]
+        )
+        output.extend(
+            wrap(
+                [
+                    f"PairEncodeMap {{ uniseq: {uniseq}, code: {code} }}"
+                    for uniseq, code in entries
                 ],
                 120,
             )

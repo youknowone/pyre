@@ -723,6 +723,8 @@ pub fn install_builtin_modules() {
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_jp);
     #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_iso2022);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_hk);
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_kr);
