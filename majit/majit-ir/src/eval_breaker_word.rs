@@ -353,7 +353,7 @@ pub fn is_back_edge_poll_guard(guard: &crate::resoperation::Op) -> bool {
 // assertion, so there is no operand to compare directly.
 #[allow(clippy::ineffective_bit_mask)]
 const _: () = assert!(
-    (EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC_INTERP | EB_GC)
+    (EB_ASYNC | EB_STW | EB_FINALIZING | EB_GC_INTERP | EB_GC | EB_MEMORY_ERROR)
         < (1 << (EVAL_BREAKER_WORD_SIZE * 8 - 1))
 );
 
