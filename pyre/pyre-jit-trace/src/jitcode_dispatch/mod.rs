@@ -2662,18 +2662,6 @@ pub enum DispatchError {
     /// trace taken here would compile a loop that owes `line` events and
     /// cannot fire them. Decline and leave the frame to the interpreter.
     PortalFrameTracerArmed { pc: usize },
-    /// A residual call reached while the portal frame is being profiled.
-    /// `baseobjspace.py call_args_and_c_profile` brackets a builtin call the
-    /// bytecode made with `c_call` / `c_return`, and the walker DECIDES that
-    /// call rather than tracing through the arm that reports it, so a trace
-    /// taken here would run the tail with no way to fire those events.
-    /// Decline and leave the frame to the interpreter, which fires them.
-    ///
-    /// `is_being_profiled` is an `interp_jit.py` green, so this abort — and the
-    /// `JC_DONT_TRACE_HERE` the ceiling latches after `MAX_TRACE_ABORT_COUNT`
-    /// of them — lands on the PROFILED cell only.  Dropping the profiler keys a
-    /// different cell, which is neither banned nor un-inlinable.
-    ProfiledResidualCall { pc: usize },
     /// `loop_header/i` or `jit_merge_point/iIRFIRF` could not resolve its
     /// jdindex operand to a concrete Int. The assembler encodes the jdindex as a
     /// populated int-constant-pool slot (`assembler.rs loop_header`:
@@ -2856,7 +2844,6 @@ impl DispatchError {
             }
             Self::JitMergePointGreenKeyUnresolved { .. } => "JitMergePointGreenKeyUnresolved",
             Self::PortalFrameTracerArmed { .. } => "PortalFrameTracerArmed",
-            Self::ProfiledResidualCall { .. } => "ProfiledResidualCall",
             Self::LoopHeaderJdIndexUnresolved { .. } => "LoopHeaderJdIndexUnresolved",
             Self::SubWalkClosedLoop { .. } => "SubWalkClosedLoop",
             Self::BranchGuardKeptStackUnsupported { .. } => "BranchGuardKeptStackUnsupported",
@@ -2939,7 +2926,6 @@ impl DispatchError {
             | Self::LastExceptionWithoutActiveException { pc, .. }
             | Self::JitMergePointGreenKeyUnresolved { pc, .. }
             | Self::PortalFrameTracerArmed { pc, .. }
-            | Self::ProfiledResidualCall { pc, .. }
             | Self::LoopHeaderJdIndexUnresolved { pc, .. }
             | Self::SubWalkClosedLoop { pc, .. }
             | Self::BranchGuardKeptStackUnsupported { pc, .. }

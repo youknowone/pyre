@@ -9866,13 +9866,13 @@ thread_local! {
     /// at the abort ceiling, against the `cell_generation` the refusal was
     /// observed at.
     ///
-    /// A loop that a profiler forces to decline — `is_being_profiled` is a
-    /// portal green, and a loop whose body calls anything declines with
-    /// `DispatchError::ProfiledResidualCall` — can never trace, so its cell
-    /// latches and every later back edge re-derives the same refusal. Measured
-    /// with `sys.setprofile` over a warm loop: `abort_ceiling_refused` tracks
-    /// the iteration count one-for-one (194776 at 200k iterations, 794776 at
-    /// 800k), while a loop with no call in its body reads exactly 0. The
+    /// A loop that keeps declining can never trace, so its cell latches and
+    /// every later back edge re-derives the same refusal. Measured against the
+    /// profiled decline this cache was written for — since retired, a profiled
+    /// loop now records its own reporting and compiles — `abort_ceiling_refused`
+    /// tracked the iteration count one-for-one (194776 at 200k iterations,
+    /// 794776 at 800k), while a loop with no call in its body read exactly 0.
+    /// Any remaining latching decline re-derives the same way. The
     /// re-derivation costs a green-key mint, three per-code gate lookups and a
     /// bucket-chain walk per iteration.  Graded as the same tree built twice —
     /// the only valid control, since `PYRE_JIT=0` is read by

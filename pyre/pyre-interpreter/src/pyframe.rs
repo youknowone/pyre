@@ -1830,9 +1830,11 @@ pub fn report_stack_underflow(frame: &PyFrame) {
 /// tracing by `record_portal_debugdata_guard` keeping it from compiling.
 /// `setprofile` owes the same frame-level pair, from the same bracket plus
 /// `leave`'s `_trace('leaveframe')`, and owes `c_call` / `c_return` on top —
-/// which the walker answers by declining a profiled trace at the call itself
-/// (`DispatchError::ProfiledResidualCall`) rather than by refusing the frame.
-/// A profiled loop that calls nothing therefore compiles and reports.
+/// which the residual call helpers fire themselves
+/// (`call_jit.rs residual_call_c_profile_frame`), the walker keeping them
+/// reachable by folding no call while a profiler is installed
+/// (`jitcode_dispatch::residual_call::walker_foldable_runtime_helper`).  A
+/// profiled loop therefore compiles and reports, calls and all.
 pub fn frame_tracing_active(frame: &PyFrame) -> bool {
     !frame.get_w_f_trace().is_null()
 }

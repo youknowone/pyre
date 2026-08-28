@@ -413,14 +413,14 @@ reading 0, i.e. they take the reason ladder's fourth rung — nothing staged,
 fall back to `AbortReason::Generic`, whose integer *is* `ABORT_BRIDGE`. That
 rung has no upstream counterpart: every `SwitchToBlackhole` upstream takes its
 `Counters.ABORT_*` as a constructor argument, so a reason cannot be absent
-there. `PYRE_FBW_DEBUG_ABORT` supplies the name the counters cannot:
+there. `PYRE_FBW_DEBUG_ABORT` supplied the name the counters cannot:
 `DispatchError::ProfiledResidualCall`.
 
-The walker declines a residual call made from a profiled frame because a
+The walker declined a residual call made from a profiled frame because a
 builtin callee owes `c_call` / `c_return`, and the walker *decides* that call —
 folding or residualising it — rather than tracing through the arm that reports
-it, so a trace taken there would run its tail silently. That is right for a
-builtin, and it is applied to every callee; the site's own comment records the
+it, so a trace taken there would run its tail silently. That was right for a
+builtin, and it was applied to every callee; the site's own comment recorded the
 widening as known: a `CallFn` naming a Python callee "owes no `c_call` either,
 but the fold gives the walker no way to tell".
 
@@ -438,34 +438,47 @@ all — so `len`'s `c_call` / `c_return` stop firing while `callee`'s `call` /
 folded builtin. That fixture says so in advance, and it is right: the gate can
 only narrow "with the reporting to back it up".
 
-So the ordering is fixed, and it is the opposite of the tempting one. The
+So the ordering was fixed, and it is the opposite of the tempting one: the
 reporting has to be **recorded into the trace** before the decline can narrow.
-Until that exists, declining is the correct answer and the cliff is the price.
 
-What that costs is now scoped rather than guessed. It is not one insertion per
-fold: `dispatch_residual_call_iRd_kind` sits ahead of every fold, every
-descent and the generic residual emit, so the reporting has one entry point.
-The pair is `ExecutionContext::c_call_trace` / `c_return_trace`, and since
-both funnel into a path that reads the arguments only through `firstarg`, a
-bridge needs `(frame, w_func, first_arg)` and no `Arguments` reconstruction.
-Two `extern "C"` bridges are required rather than raw Rust fns, per the
-residual-fnaddr ABI rule. The effect has to be `MOST_GENERAL` — the hook is
-arbitrary Python — which is mintable at trace time precisely because its raw
-sets are `None` rather than empty, and it has to be emitted through the
-residual path's `CallMayForceN` + `GuardNotForced` rather than a plain
-recorded call, or the declaration lies to the optimizer. The frame is
-reachable per level through `walker_executing_frame_box`, which resolves to
-the portal's virtualizable at the root and to the callee shadow inside an
-inline sub-walk — the split
-`profile_hook_c_call_is_bytecode_level_only` already pins.
+**That is what landed, and the reporting turned out not to need a new trace
+op.** Upstream's own `test_cprofile_builtin` unpacks exactly one loop out of a
+profiled `lst.append` / `lst.pop` pair, so "record, not decline" is upstream's
+answer and not an invention. The invention is only the mechanism, and the shape
+is forced by `resume_snapshot.rs`: pyre's blackhole re-enters Python bytecode
+only, so any walker-emitted guard resumes at the enclosing opcode boundary and
+a three-op bracket — recorded `c_call`, fold, recorded `c_return` — cannot
+exist. Resuming *at* the CALL fires `c_call` twice; resuming *past* it skips
+the builtin. The bracket has to be one residual whose leaf is
+`baseobjspace.py call_args_and_c_profile`, which is also upstream's line.
 
-The hard part is the exit, not the entry: the choke point has one entrance and
-many early returns, one per fold, and `c_return` is owed on all of them
-including the raising one. And the payoff is not yet established — every
-folded builtin in a profiled loop would be bracketed by two forcing calls, so
-the first measurement to run is whether such a compiled loop actually beats
-the interpreted one it replaces. If it does not, the decline is not merely
-safe but right, and this entry's remaining half closes rather than lands.
+pyre already had that leaf, reached through the `profile_frame` parameter
+`call_valuestack` threads down to `call_function_carrier_with_mode`. What it
+did not have was any residual that passed a frame: `flatten.rs
+lower_simple_call_hlop_to_insn` collapses the whole Python CALL to a frameless
+`RuntimeHelperKind::CallFn` residual, so the reporting arm existed in no
+jitcode the walker walks. So the three CALL-family helpers now take
+`call_valuestack`'s own diversion themselves
+(`call_jit.rs residual_call_c_profile_frame`): a residual of one of them *is*
+the bytecode's dispatch, which settles by construction the distinction
+`c_profile_frame` draws between the bytecode's call and one made inside
+`descr_call`, and the executing frame is the context's top frame. The gate is
+upstream's, `frame.get_is_being_profiled() and is_builtin_code(w_func)`, asked
+on the raw callable before the `_Method` unwrap, exactly where `eval.rs`'s own
+CALL asks it. One helper covers tracing, compiled code and the blackhole
+alike, because all three call `bh_call_fn_N`.
+
+The walker's remaining job is the small half: keep those calls reachable.
+`walker_foldable_runtime_helper` answers `RuntimeHelperKind::None` for the
+three while a profiler is installed, so every fold, every descent into a
+builtin's jitcode and the `CALL_ASSEMBLER` door decline exactly as they do for
+a shape they cannot handle, and the uniform decline path is the generic
+residual. The two doors into a *Python* callee were already closed by
+`ec_hook_installed`, which is why the frame-level `call` / `return` never
+needed this. The `iIRd` dispatcher carries the same binding: it has call folds
+of its own and never had a profiled decline, which cost nothing only for as
+long as `iRd`'s decline aborted the whole trace ahead of it, and would have
+been a live hole the moment that decline went.
 
 One claim examined along the way did not survive: that the method-form
 dispatcher carries no profiled decline and so already drops events for a bound

@@ -3,10 +3,10 @@
 # A profile hook is installed, and a loop entered afterwards runs a tail long
 # enough that a compiled one would have taken it over.
 #
-# This is the fixture for the gate `eval_with_jit_inner` keeps on profiled
-# frames, and it is written to fail the moment that gate is narrowed without
-# the reporting to back it up.  Three separate sources owe events here, each
-# failing silently and independently:
+# The frame compiles while profiled, so every event below comes out of compiled
+# code or out of a residual it makes.  This fixture is written to fail the
+# moment one of those routes stops reporting.  Three separate sources owe
+# events here, each failing silently and independently:
 #
 #   * the loop frame's own `call`, from `executioncontext.py call_trace`, and
 #     its `return`, from `leave`'s `_trace('leaveframe')`.  `pyframe.py
@@ -18,11 +18,11 @@
 #     the callee or jumps into its compiled entry, both of which begin at the
 #     callee's first bytecode, past that bracket;
 #   * a builtin's `c_call` / `c_return`, from `baseobjspace.py call_args`'s
-#     profile arm.  Compiled code does not reach that arm at all — measured by
-#     probing `call::c_profile_frame`, neither a folded builtin nor a residual
-#     one goes through the interpreter's call doors — so this is the row that
-#     keeps the gate: `is_being_profiled` is a green, and a profiled trace would
-#     have to be RECORDED with the reporting in it.
+#     profile arm.  A fold reaches no call door at all, and the residual
+#     helpers used not to either, so this is the row that costs the most to
+#     keep: `walker_foldable_runtime_helper` has to leave every call in a
+#     profiled trace residual, and `residual_call_c_profile_frame` has to take
+#     `call_valuestack`'s diversion inside that residual.
 #
 # THE TAIL IS THE TEST for all three.  Each loss is total and permanent rather
 # than partial: the moment a compiled trace takes the frame over the events
@@ -30,7 +30,9 @@
 # narrowed, every count below saturated at the entry threshold — `c_call`
 # stopped at 1041 for `len`, `ord`, `divmod`, `hex`, `sorted`, `max` and
 # `round` alike — so each is checked at TWO tails and must track the difference
-# between them.  A count that saturates fails however large it is.
+# between them.  A count that saturates fails however large it is — that is the
+# shape a fold produces, and it is what the counts read at 1041 before the
+# reporting was recorded.
 #
 # Only builtins are called here.  A class call would report `c_call` /
 # `c_return` for `__new__` and `__init__`, which cpython does not, and that

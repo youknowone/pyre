@@ -5362,11 +5362,26 @@ fn bh_call_kw_impl(
          getexecutioncontext(); the eval loop must pin the execution context \
          before any residual call"
     );
+    // `pyopcode.py CALL_FUNCTION_KW`'s C-profile diversion — see
+    // [`residual_call_c_profile_frame`].  `call_kw` is `call_kw_in_ctx` with
+    // the frame that settles it, plus the caller `FrameLocalsRoot` the
+    // interpreter's own CALL_KW installs.
+    let profile_frame = residual_call_c_profile_frame(ec, callable);
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let result = {
         let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_kw_in_ctx(ec, callable, null_or_self, positional, kwnames)
+        if profile_frame.is_null() {
+            pyre_interpreter::call::call_kw_in_ctx(ec, callable, null_or_self, positional, kwnames)
+        } else {
+            pyre_interpreter::call::call_kw(
+                unsafe { &mut *profile_frame },
+                callable,
+                null_or_self,
+                positional,
+                kwnames,
+            )
+        }
     };
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
@@ -5431,6 +5446,48 @@ bh_call_kw_arity!(bh_call_kw_13; a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a1
 fn bh_null_arg_diag() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| std::env::var_os("PYRE_BH_NULL_ARG").is_some())
+}
+
+/// The frame a CALL-family residual owes `c_call` / `c_return` to, or null.
+///
+/// `baseobjspace.py call_valuestack` diverts to `call_args_and_c_profile` when
+/// the executing frame is profiled AND the callable wraps a builtin code;
+/// `pyopcode.py` CALL_FUNCTION_KW and CALL_FUNCTION_EX take the same diversion
+/// with their own frame.  `eval.rs`'s own CALL asks it at the same point, on
+/// the RAW callable before the `_Method` unwrap, which is where `w_func` is
+/// read upstream — `function.py is_builtin_code` does that unwrap itself.
+///
+/// A residual of one of those three helpers IS the bytecode's own dispatch:
+/// the codewriter emits one only for the CALL family.  So the frame the events
+/// belong to is this context's top frame, and the distinction `call.rs
+/// c_profile_frame` draws — the bytecode's dispatch reports, one made from
+/// inside `descr_call` does not — is settled here by construction rather than
+/// by a test.  Without this the residuals reach the builtin through the
+/// frameless `space.call_args`, where the reporting arm does not exist.
+///
+/// `profilefunc` is read before the frame because `gettopframe_raw` is
+/// `force_vref`: asking the frame first would materialize the virtualizable on
+/// every residual call a compiled loop makes.  It cannot change the answer,
+/// since `executioncontext.py call_trace` sets `is_being_profiled` only while
+/// `profilefunc is not None`.  It can leave a frame whose profiler was
+/// uninstalled mid-loop carrying a stale flag one entry longer than the plain
+/// interpreter would, which costs that frame the profiled green key until its
+/// next interpreted call clears it, and reports nothing either way.
+fn residual_call_c_profile_frame(
+    ec: *const pyre_interpreter::PyExecutionContext,
+    callable: PyObjectRef,
+) -> *mut pyre_interpreter::PyFrame {
+    if ec.is_null() || unsafe { (*ec).profilefunc.is_none() } {
+        return std::ptr::null_mut();
+    }
+    if !pyre_interpreter::function::is_builtin_code(callable) {
+        return std::ptr::null_mut();
+    }
+    let frame = unsafe { (*ec).gettopframe_raw() };
+    if frame.is_null() || !unsafe { (*frame).get_is_being_profiled() } {
+        return std::ptr::null_mut();
+    }
+    frame
 }
 
 fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyObjectRef]) -> i64 {
@@ -5522,6 +5579,36 @@ fn bh_call_fn_impl(callable: PyObjectRef, null_or_self: PyObjectRef, args: &[PyO
                 );
             }
         }
+    }
+    // `call_valuestack`'s C-profile diversion, ahead of every fast path below:
+    // each of them reaches the builtin through an entry that takes no frame
+    // (`builtin_code_call`, `builtin_code_call_positional`), so the arm that
+    // reports would never run.  [`residual_call_c_profile_frame`] carries the
+    // whole rule; `call_callable` is the same door the plain interpreter's
+    // CALL takes for this shape, receiver-prefixed argument vector included.
+    let profile_frame = residual_call_c_profile_frame(ec, _roots.get(root_base));
+    if !profile_frame.is_null() {
+        let call_args = reload_args();
+        let callable = _roots.get(root_base);
+        // The two hooks are application-level Python and can enter compiled
+        // code, which writes the very cells this helper publishes to — the
+        // same nesting the user-function arm below parks across, and for the
+        // same reason: a raise the hook handled internally would otherwise be
+        // read by this call's `GUARD_NO_EXCEPTION` as a pending exception.
+        let parked = park_residual_call_exception();
+        let result = pyre_interpreter::call::call_callable(
+            unsafe { &mut *profile_frame },
+            callable,
+            &call_args,
+        );
+        unpark_residual_call_exception(parked);
+        return match result {
+            Ok(result) => result as i64,
+            Err(mut err) => {
+                publish_residual_call_exception(err.to_exc_object() as i64);
+                0
+            }
+        };
     }
     // A materialized bound Method normally reaches the generic callable
     // dispatcher, which unwraps it, allocates a receiver-prefixed argument
@@ -5715,17 +5802,30 @@ pub extern "C" fn bh_call_function_ex_fn(
          getexecutioncontext(); the eval loop must pin the execution context \
          before any residual call"
     );
+    // `pyopcode.py CALL_FUNCTION_EX`'s C-profile diversion — see
+    // [`residual_call_c_profile_frame`].
+    let profile_frame = residual_call_c_profile_frame(ec, callable as PyObjectRef);
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     pyre_interpreter::call::set_last_exec_ctx(ec);
     let result = {
         let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::call::call_function_ex_in_ctx(
-            ec,
-            callable as PyObjectRef,
-            self_or_null as PyObjectRef,
-            starargs as PyObjectRef,
-            kwargs_or_null as PyObjectRef,
-        )
+        if profile_frame.is_null() {
+            pyre_interpreter::call::call_function_ex_in_ctx(
+                ec,
+                callable as PyObjectRef,
+                self_or_null as PyObjectRef,
+                starargs as PyObjectRef,
+                kwargs_or_null as PyObjectRef,
+            )
+        } else {
+            pyre_interpreter::call::call_function_ex(
+                unsafe { &mut *profile_frame },
+                callable as PyObjectRef,
+                self_or_null as PyObjectRef,
+                starargs as PyObjectRef,
+                kwargs_or_null as PyObjectRef,
+            )
+        }
     };
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {

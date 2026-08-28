@@ -10,8 +10,9 @@
 # cannot come from refusing it.  It comes from the green key instead:
 # `is_being_profiled` is an `interp_jit.py` portal green, so a profiled
 # activation names a different cell from the one the warm-up loop filled, and a
-# trace recorded under that key declines its residual calls
-# (`DispatchError::ProfiledResidualCall`) rather than folding them.
+# trace recorded under that key folds no call
+# (`walker_foldable_runtime_helper`), leaving every one of them a residual that
+# fires its own `c_call` / `c_return` (`residual_call_c_profile_frame`).
 #
 # THE TAIL IS THE TEST.  A `c_call` count that stops at the entry threshold and
 # then holds is what a green key read once, or read before the write, produces;

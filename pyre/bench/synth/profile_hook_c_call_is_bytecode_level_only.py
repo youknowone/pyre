@@ -31,19 +31,25 @@
 # `c_exception_trace` and re-raises, so a raising builtin owes `c_call` and no
 # `c_return`.
 #
-# Every body is warmed past the loop threshold with nothing installed, so each
-# measured loop has already been compiled once when the hook arms.  pyre
-# declines a profiled frame at the portal (see
-# `profile_hook_armed_before_a_hot_loop.py`), so the measured pass itself runs
-# interpreted — which is the point: the answer must not depend on which of the
-# two ran, and the warm pass is what makes that claim testable rather than
-# assumed.
+# BOTH PASSES ARE COMPILED, and that is what puts the first half under load.
+# `is_being_profiled` is an `interp_jit.py` portal green, so the warm pass and
+# the measured pass name different cells; each runs past the loop threshold on
+# its own account, so neither answer is the interpreter's by default.  The
+# compiled arm reaches the profile diversion through
+# `call_jit.rs residual_call_c_profile_frame`, which DOES read
+# `gettopframe_raw` — soundly, because a CALL-family residual is the bytecode's
+# own dispatch and nothing else emits one, so the interior `descr_call` that
+# runs `__new__` and `__init__` never reaches it.  The type calls at zero are
+# what proves that rather than assumes it.
 #
 # Measured on cpython 3.14.6 and pypy3, which agree on every count below.
 import sys
 
-REPEAT = 5
-WARM = 5000  # past the loop threshold (1039) several times over
+# Past the loop threshold (1039) twice over, so the MEASURED pass compiles
+# under its own profiled green key rather than reading back what the warm pass
+# proved about the unprofiled one.
+REPEAT = 2500
+WARM = 5000  # past the same threshold several times over
 
 WARM_ITER = [0] * WARM
 TEST_ITER = [0] * REPEAT
