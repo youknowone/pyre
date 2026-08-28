@@ -4476,12 +4476,23 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-/// Bind `builtins._` best-effort; a missing `builtins` module (early
-/// bootstrap) is ignored.
-fn set_builtins_underscore(value: PyObjectRef) {
-    if let Some(b) = crate::importing::get_sys_module("builtins") {
-        let _ = crate::baseobjspace::setattr_str(b, "_", value);
-    }
+/// The `builtins` entry `sys.modules` holds, which `sys_displayhook_impl`
+/// reads before anything else and refuses to do without.
+///
+/// The entry is read afresh at each use rather than carried: the repr and the
+/// two writes between the first binding and the last each run Python, and a
+/// module reachable only through a Rust local is moved out from under it at
+/// the safepoint that follows.
+fn displayhook_builtins() -> Result<PyObjectRef, crate::PyError> {
+    crate::importing::sys_modules_entry("builtins")
+        .ok_or_else(|| crate::PyError::runtime_error("lost builtins module"))
+}
+
+/// Bind `builtins._`.  A name bound to something that is not a module is
+/// refused by the binding itself, so nothing here tests for it.
+fn set_builtins_underscore(value: PyObjectRef) -> Result<(), crate::PyError> {
+    crate::baseobjspace::setattr_str(displayhook_builtins()?, "_", value)?;
+    Ok(())
 }
 
 /// One `print_item_to(x, sys_stdout())` / `print_newline_to(sys_stdout())`
@@ -4526,12 +4537,15 @@ fn displayhook_write(part: PyObjectRef) -> Result<bool, crate::PyError> {
 /// prints nothing and leaves `_` unchanged (`sys_displayhook` in sysmodule.c).
 pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = args.first().copied().unwrap_or_else(w_none);
+    // The module is read ahead of the `None` test, so a value that is never
+    // rendered still reports a lost `builtins`.
+    displayhook_builtins()?;
     if unsafe { pyre_object::is_none(value) } {
         return Ok(w_none());
     }
     // `_` is cleared before rendering so a failing repr does not leave a
     // stale binding, then set to the value once the write succeeds.
-    set_builtins_underscore(w_none());
+    set_builtins_underscore(w_none())?;
     let repr = pyre_object::w_str_from_wtf8(unsafe { crate::display::py_repr_wtf8(value)? });
     // `pypy/module/sys/app.py:252-253` —
     //     print_item_to(repr(obj), sys_stdout())
@@ -4545,7 +4559,7 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     if !displayhook_write(w_str_new("\n"))? {
         return Ok(w_none());
     }
-    set_builtins_underscore(value);
+    set_builtins_underscore(value)?;
     Ok(w_none())
 }
 

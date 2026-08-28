@@ -2870,13 +2870,34 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // Once installed, the Python-visible dict is the sole semantic module
     // cache.  PyPy's `check_sys_modules` reads `space.sys.get('modules')` and
     // a deleted key is genuinely absent; the process-owned registry below is
-    // only the bootstrap owner/root used before that dict exists.
+    // only the bootstrap owner/root used before that dict exists, and the
+    // `None` sentinel is something only a running program writes, so the
+    // registry has none to drop.
     let dict = sys_modules_dict();
     if !dict.is_null() {
-        return unsafe { pyre_object::w_dict_getitem_str(dict, name) }
-            .filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) });
+        return sys_modules_dict_entry(dict, name).filter(|m| !unsafe { pyre_object::is_none(*m) });
     }
     sys_modules_registry_get(name)
+}
+
+/// `PyImport_GetModule` — whatever `sys.modules` holds under `name`, sentinel
+/// included.
+///
+/// A reader that is not importing owes the program the refusal the binding
+/// itself states: `sys.displayhook` hands the entry to `setattr`, and a name
+/// bound to `None` is refused there rather than treated as absent.
+pub(crate) fn sys_modules_entry(name: &str) -> Option<PyObjectRef> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return sys_modules_registry_get(name);
+    }
+    sys_modules_dict_entry(dict, name)
+}
+
+/// The `sys.modules` dict read both readers above share: a missing key and a
+/// null are the same absence.
+fn sys_modules_dict_entry(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    unsafe { pyre_object::w_dict_getitem_str(dict, name) }.filter(|m| !m.is_null())
 }
 
 /// Look `name` up in `SYS_MODULES`, the process-owned name→module registry.
