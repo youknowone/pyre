@@ -370,3 +370,119 @@ fn standard_object_as_bool(w_ob: PyObjectRef) -> Option<bool> {
     }
     None
 }
+
+// ── the dynamic loader ──────────────────────────────────────────────────
+
+/// `misc.py dlopen_w` — the name to report the library by, the loader handle,
+/// and whether closing the library is this object's to do.
+pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, bool), PyError> {
+    use super::cdataobj::W_CData;
+    use super::ctypeobj;
+
+    if let Some(cdata) = W_CData::from_obj(w_filename) {
+        // 'flags' is ignored in this case.
+        let ct = ctypeobj::ctype_at(cdata.ctype)
+            .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
+        if ct.kind != ctypeobj::KIND_POINTER || !ct.has(ctypeobj::F_VOID_PTR) {
+            return Err(PyError::type_error(format!(
+                "dlopen() takes a file name or 'void *' handle, not '{}'",
+                ct.name()
+            )));
+        }
+        if cdata.ptr.is_null() {
+            return Err(PyError::runtime_error("cannot call dlopen(NULL)"));
+        }
+        let fname = unsafe { ct.extra_repr(cdata.ptr)? };
+        return Ok((fname, adopt_raw_handle(cdata.ptr), false));
+    }
+    let is_none = unsafe { pyre_object::pyobject::is_none(w_filename) };
+    let fname = if is_none {
+        "<None>".to_string()
+    } else {
+        crate::gateway::fsdecode_os_str_wtf8(&filename_of(w_filename)?).to_string()
+    };
+    let handle = open_library(w_filename, is_none, flags, &fname)?;
+    Ok((fname, handle, true))
+}
+
+/// `space.fsencode_w` — a library name is a path, so it reaches the loader in
+/// the filesystem's own units rather than through a lossy decode.
+fn filename_of(w_filename: PyObjectRef) -> Result<std::ffi::OsString, PyError> {
+    unsafe {
+        if pyre_object::bytesobject::is_bytes(w_filename) {
+            return Ok(crate::gateway::os_string_from_fs_bytes(
+                pyre_object::bytesobject::w_bytes_data(w_filename),
+            ));
+        }
+    }
+    Ok(crate::gateway::os_string_from_fs_bytes(
+        &crate::gateway::fsencode(w_filename)?,
+    ))
+}
+
+#[cfg(all(feature = "host_env", unix))]
+fn adopt_raw_handle(handle: *mut u8) -> usize {
+    rustpython_host_env::ctypes::insert_raw_library_handle(handle.cast::<std::ffi::c_void>())
+}
+
+#[cfg(not(all(feature = "host_env", unix)))]
+fn adopt_raw_handle(_handle: *mut u8) -> usize {
+    0
+}
+
+/// `rdynload.dlopen`, whose mode defaults to resolving everything now.
+#[cfg(all(feature = "host_env", unix))]
+fn open_library(
+    w_filename: PyObjectRef,
+    is_none: bool,
+    flags: i64,
+    fname: &str,
+) -> Result<usize, PyError> {
+    let mut mode = flags as libc::c_int;
+    if mode & (libc::RTLD_LAZY | libc::RTLD_NOW) == 0 {
+        mode |= libc::RTLD_NOW;
+    }
+    if is_none {
+        let ptr = rustpython_host_env::ctypes::dlopen_self(mode)
+            .map_err(|e| PyError::os_error(format!("cannot load library {fname}: {e}")))?;
+        return Ok(rustpython_host_env::ctypes::insert_raw_library_handle(ptr));
+    }
+    let name = filename_of(w_filename)?;
+    rustpython_host_env::ctypes::open_library_with_mode(&name, mode).map_err(|e| {
+        PyError::os_error(format!(
+            "cannot load library {fname}: {}",
+            crate::with_causes(&e)
+        ))
+    })
+}
+
+#[cfg(all(feature = "host_env", windows))]
+fn open_library(
+    w_filename: PyObjectRef,
+    is_none: bool,
+    _flags: i64,
+    fname: &str,
+) -> Result<usize, PyError> {
+    if is_none {
+        return Err(PyError::os_error("cannot use None"));
+    }
+    let name = filename_of(w_filename)?;
+    rustpython_host_env::ctypes::open_library(&name).map_err(|e| {
+        PyError::os_error(format!(
+            "cannot load library {fname}: {}",
+            crate::with_causes(&e)
+        ))
+    })
+}
+
+#[cfg(not(all(feature = "host_env", any(unix, windows))))]
+fn open_library(
+    _w_filename: PyObjectRef,
+    _is_none: bool,
+    _flags: i64,
+    fname: &str,
+) -> Result<usize, PyError> {
+    Err(PyError::os_error(format!(
+        "cannot load library {fname}: this build has no dynamic loader"
+    )))
+}

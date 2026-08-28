@@ -22,6 +22,9 @@ pub const FLAVOR_MEM: i64 = 1;
 pub const FLAVOR_NEW_STD: i64 = 2;
 /// `W_CDataSliced` — a slice of an array or pointer, with its own length.
 pub const FLAVOR_SLICED: i64 = 3;
+/// `W_CDataPtrToStructOrUnion` — what `newp()` returns for a `struct *`: it
+/// owns nothing itself and co-owns the `W_CDataNewStd` holding the struct.
+pub const FLAVOR_PTR_TO_STRUCT: i64 = 4;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
 #[crate::pyre_class("_cffi_backend._CDataBase")]
@@ -86,7 +89,7 @@ impl W_CData {
     }
 
     /// `W_CData._repr_extra` and the overrides of it.
-    fn repr_extra(&self) -> Result<String, PyError> {
+    pub fn repr_extra(&self) -> Result<String, PyError> {
         let ct = self.ctype_ref()?;
         match self.flavor {
             FLAVOR_NEW_STD => {
@@ -102,6 +105,11 @@ impl W_CData {
                 Ok(format!("owning {bytes} bytes"))
             }
             FLAVOR_SLICED => Ok(format!("sliced length {}", self.length)),
+            // `W_CDataPtrToStructOrUnion._repr_extra`.
+            FLAVOR_PTR_TO_STRUCT => match W_CData::from_obj(self.w_keepalive) {
+                Some(structobj) => structobj.repr_extra(),
+                None => Ok("NULL".to_string()),
+            },
             _ => unsafe { ct.extra_repr(self.ptr) },
         }
     }
@@ -149,6 +157,51 @@ pub fn new_cdata_mem(w_ctype: PyObjectRef) -> Result<PyObjectRef, PyError> {
         size,
         pyre_object::PY_NULL,
     ))
+}
+
+/// `W_CDataPtrToStructOrUnion.__init__` — a pointer that co-owns the cdata
+/// really holding the struct.
+pub fn new_cdata_ptr_to_struct(
+    ptr: *mut u8,
+    w_ctype: PyObjectRef,
+    w_structobj: PyObjectRef,
+) -> PyObjectRef {
+    new_cdata_full(ptr, w_ctype, FLAVOR_PTR_TO_STRUCT, -1, -1, w_structobj)
+}
+
+/// `W_CTypeStructOrUnion.copy_and_convert_to_object` — a `W_CDataNewStd`
+/// holding a copy of what `source` points at.
+///
+/// # Safety
+/// `source` must be readable for `size` bytes.
+pub unsafe fn new_cdata_copy(
+    w_ctype: PyObjectRef,
+    source: *const u8,
+    size: i64,
+) -> Result<PyObjectRef, PyError> {
+    let ptr = raw_alloc(size, false)?;
+    unsafe { std::ptr::copy_nonoverlapping(source, ptr, size.max(0) as usize) };
+    Ok(new_cdata_full(
+        ptr,
+        w_ctype,
+        FLAVOR_NEW_STD,
+        -1,
+        size,
+        pyre_object::PY_NULL,
+    ))
+}
+
+/// `W_CData.get_structobj` and the two overrides of it — the owning cdata a
+/// variable-length array reads its bound from.
+pub fn structobj_of(w_cdata: PyObjectRef) -> Option<&'static mut W_CData> {
+    let cdata = W_CData::from_obj(w_cdata)?;
+    match cdata.flavor {
+        FLAVOR_NEW_STD => Some(cdata),
+        FLAVOR_PTR_TO_STRUCT => {
+            W_CData::from_obj(cdata.w_keepalive).filter(|s| s.flavor == FLAVOR_NEW_STD)
+        }
+        _ => None,
+    }
 }
 
 /// `allocator.py default_allocator.allocate` — zeroed memory owned by the
@@ -391,9 +444,25 @@ fn cdata_hash(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `W_CData.dir` — the fields of what the cdata points at.
 fn cdata_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let _ = cdata_arg(args[0])?;
+    let cdata = cdata_arg(args[0])?;
+    let mut ct = cdata.ctype_ref()?;
+    if ct.kind == ctypeobj::KIND_POINTER {
+        ct = ctypeobj::ctype_at(ct.ctitem)
+            .ok_or_else(|| PyError::system_error("pointer without an item type"))?;
+    }
     // `W_CType.cdata_dir` is empty for every ctype a struct is not.
-    Ok(pyre_object::w_list_new(Vec::new()))
+    let names = if ct.is_struct_or_union() {
+        super::ctypestruct::cdata_dir(ct)?
+    } else {
+        Vec::new()
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    for name in &names {
+        let _ = roots.pin_root(pyre_object::w_str_new(name));
+    }
+    let items = (0..names.len()).map(|i| roots.get(base + i)).collect();
+    Ok(pyre_object::w_list_new(items))
 }
 
 /// `W_CData.descr_enter`.
@@ -411,6 +480,13 @@ fn cdata_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `W_CData.enter_exit` and the overrides of it.
 pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
     let cdata = cdata_arg(w_cdata)?;
+    // `W_CDataPtrToStructOrUnion.enter_exit` releases the struct it co-owns.
+    if cdata.flavor == FLAVOR_PTR_TO_STRUCT {
+        if exit_now && !cdata.w_keepalive.is_null() {
+            return enter_exit(cdata.w_keepalive, true);
+        }
+        return Ok(());
+    }
     let ct = cdata.ctype_ref()?;
     if cdata.flavor != FLAVOR_NEW_STD || !ct.is_ptr_or_array() {
         return Err(PyError::value_error(
@@ -443,6 +519,9 @@ fn cdata_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 fn cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
+    if ct.kind == ctypeobj::KIND_FUNC {
+        return super::ctypefunc::call(ct, cdata.ptr, &args[1..]);
+    }
     Err(PyError::type_error(format!(
         "cdata '{}' is not callable",
         ct.name()
@@ -453,16 +532,22 @@ fn cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 fn cdata_getattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
-    Err(PyError::attribute_error(format!(
-        "cdata '{}' has no attribute '{}'",
-        ct.name(),
-        crate::baseobjspace::text_w(args[1])?
-    )))
+    let field = ctypeobj::getcfield(ct, crate::baseobjspace::text_w(args[1])?, "read")?;
+    unsafe { super::ctypestruct::read(field, cdata.ptr, args[0]) }
 }
 
 /// `W_CData.setattr`.
 fn cdata_setattr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    cdata_getattr(&args[..2]).map(|_| pyre_object::w_none())
+    // The value outlives a conversion that runs arbitrary Python, so it is
+    // read back out of its slot.
+    let roots = pyre_object::gc_roots::push_roots();
+    let value_slot = roots.base();
+    let _ = roots.pin_root(args[2]);
+    let cdata = cdata_arg(args[0])?;
+    let ct = cdata.ctype_ref()?;
+    let field = ctypeobj::getcfield(ct, crate::baseobjspace::text_w(args[1])?, "write")?;
+    unsafe { super::ctypestruct::write(field, cdata.ptr, roots.get(value_slot))? };
+    Ok(pyre_object::w_none())
 }
 
 // ── comparison ──────────────────────────────────────────────────────────
@@ -550,6 +635,10 @@ fn cdata_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let i = crate::baseobjspace::getindex_w(w_index)?;
     let cdata = cdata_arg(w_self)?;
     let ct = check_subscript_index(cdata, i)?;
+    // `W_CDataPtrToStructOrUnion._do_getitem` — `p[0]` is the struct itself.
+    if cdata.flavor == FLAVOR_PTR_TO_STRUCT {
+        return Ok(cdata.w_keepalive);
+    }
     let item = ctypeobj::ctype_at(ct.ctitem)
         .ok_or_else(|| PyError::system_error("indexed ctype without an item type"))?;
     unsafe { ctypeobj::convert_to_object(item, cdata.ptr.offset((i * item.size) as isize)) }
@@ -591,7 +680,7 @@ fn check_subscript_index(cdata: &W_CData, i: i64) -> Result<&'static mut W_CType
     match ct.kind {
         // `W_CTypePointer._check_subscript_index`.
         ctypeobj::KIND_POINTER => {
-            if cdata.flavor == FLAVOR_NEW_STD {
+            if cdata.flavor == FLAVOR_NEW_STD || cdata.flavor == FLAVOR_PTR_TO_STRUCT {
                 if i != 0 {
                     return Err(PyError::index_error(format!(
                         "cdata '{}' can only be indexed by 0",

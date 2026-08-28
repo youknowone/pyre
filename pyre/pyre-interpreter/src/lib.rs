@@ -1241,49 +1241,57 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             185,
             typed::<crate::module::_cffi_backend::cdataobj::W_CData>(),
         ),
-        // Native-only posix aliases 186 and 187 preserve `build_gc`'s rclass
+        subclass_range_alias(
+            186,
+            typed::<crate::module::_cffi_backend::ctypestruct::W_CField>(),
+        ),
+        subclass_range_alias(
+            187,
+            typed::<crate::module::_cffi_backend::libraryobj::W_Library>(),
+        ),
+        // Native-only posix aliases 188 and 189 preserve `build_gc`'s rclass
         // registration order after the unconditional aliases.  `scandir` has
         // no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(186, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(188, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(187, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(189, typed::<crate::module::posix::W_ScandirIterator>()),
         // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
         // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(188, typed::<crate::module::_ssl::W_SSLContext>()),
+        subclass_range_alias(190, typed::<crate::module::_ssl::W_SSLContext>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(189, typed::<crate::module::_ssl::W_MemoryBIO>()),
+        subclass_range_alias(191, typed::<crate::module::_ssl::W_MemoryBIO>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(190, typed::<crate::module::_ssl::W_SSLSession>()),
+        subclass_range_alias(192, typed::<crate::module::_ssl::W_SSLSession>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(191, typed::<crate::module::_ssl::W_SSLSocket>()),
+        subclass_range_alias(193, typed::<crate::module::_ssl::W_SSLSocket>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(192, typed::<crate::module::_ssl::W_Certificate>()),
+        subclass_range_alias(194, typed::<crate::module::_ssl::W_Certificate>()),
         // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
         // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
         // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        subclass_range_alias(193, typed::<crate::module::mmap::W_MMap>()),
+        subclass_range_alias(195, typed::<crate::module::mmap::W_MMap>()),
         // Windows asyncio's Overlapped owner follows mmap at the native tail.
         // It is a non-subclassable builtin in Python, but still participates
         // in the rclass hierarchy because its managed header and retained
         // buffer/result fields are traced by the ordinary object marker.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(194, typed::<crate::module::_overlapped::W_Overlapped>()),
+        subclass_range_alias(196, typed::<crate::module::_overlapped::W_Overlapped>()),
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(
-            195,
+            197,
             typed::<crate::module::_winapi::overlapped::W_Overlapped>(),
         ),
         // PEP 528's raw console stream follows the two overlapped owners at
         // the append-only Windows tail.  It is subclassable and therefore
         // participates in the same rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(196, typed::<crate::module::_io::W_WindowsConsoleIO>()),
+        subclass_range_alias(198, typed::<crate::module::_io::W_WindowsConsoleIO>()),
     ]
 }
 

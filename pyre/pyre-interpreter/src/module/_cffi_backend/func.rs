@@ -79,11 +79,38 @@ pub fn typeoffsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(args[0])?;
     let w_field_or_index = args[1];
     // `W_CType.direct_typeoffsetof` tries a field name first and falls back
-    // to an index; only the index arm exists while structs are unsupported.
+    // to an index.
     if unsafe { pyre_object::unicodeobject::is_str(w_field_or_index) } {
-        return Err(PyError::type_error(
-            "with a field name argument, expected a struct or union ctype",
-        ));
+        let following = match args.get(2) {
+            Some(&w_following) => crate::baseobjspace::int_w(w_following)?,
+            None => 0,
+        };
+        // `W_CTypePointer.typeoffsetof_field` reads the item's field, but
+        // only for the first element of the array the pointer may be.
+        let owner = if ct.is_struct_or_union() {
+            ct
+        } else if ct.kind == ctypeobj::KIND_POINTER && following == 0 {
+            ctypeobj::ctype_arg(ct.ctitem)?
+        } else {
+            return Err(PyError::type_error(
+                "with a field name argument, expected a struct or union ctype",
+            ));
+        };
+        if !owner.is_struct_or_union() {
+            return Err(PyError::type_error(
+                "with a field name argument, expected a struct or union ctype",
+            ));
+        }
+        let fieldname = crate::baseobjspace::text_w(w_field_or_index)?;
+        let (w_ctype, offset) = super::ctypestruct::typeoffsetof_field(owner, fieldname)?;
+        let roots = pyre_object::gc_roots::push_roots();
+        let field_slot = roots.base();
+        let _ = roots.pin_root(w_ctype);
+        let w_offset = pyre_object::w_int_new(offset);
+        return Ok(pyre_object::w_tuple_new(vec![
+            roots.get(field_slot),
+            w_offset,
+        ]));
     }
     let Ok(index) = crate::baseobjspace::int_w(w_field_or_index) else {
         return Err(PyError::type_error("field name or array index expected"));
@@ -125,7 +152,7 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdataobj::cdata_arg(args[1])?;
     let source_ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
-    if !source_ct.is_ptr_or_array() {
+    if !source_ct.is_ptr_or_array() && !source_ct.is_struct_or_union() {
         return Err(PyError::type_error(
             "expected a cdata struct/union/array/pointer object",
         ));
@@ -209,4 +236,66 @@ pub fn new_pointer_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 pub fn new_array_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let length = newtype::array_length_arg(args[1])?;
     newtype::new_array_type(args[0], length)
+}
+
+/// `newtype.py new_struct_type`.
+pub fn new_struct_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    Ok(newtype::new_struct_type(crate::baseobjspace::text_w(
+        args[0],
+    )?))
+}
+
+/// `newtype.py new_union_type`.
+pub fn new_union_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    Ok(newtype::new_union_type(crate::baseobjspace::text_w(
+        args[0],
+    )?))
+}
+
+/// `newtype.py complete_struct_or_union` — the third argument is ignored, as
+/// its name says, and the last four carry defaults.
+pub fn complete_struct_or_union(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let int_arg = |i: usize, default: i64| -> Result<i64, PyError> {
+        match args.get(i) {
+            Some(&w) => crate::baseobjspace::int_w(w),
+            None => Ok(default),
+        }
+    };
+    newtype::complete_struct_or_union(
+        args[0],
+        args[1],
+        int_arg(3, -1)?,
+        int_arg(4, -1)?,
+        int_arg(5, 0)?,
+        int_arg(6, 0)?,
+    )?;
+    Ok(pyre_object::w_none())
+}
+
+/// `newtype.py new_enum_type`.
+pub fn new_enum_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let name = crate::baseobjspace::text_w(args[0])?;
+    newtype::new_enum_type(name, args[1], args[2], args[3])
+}
+
+/// `newtype.py new_function_type`.
+pub fn new_function_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let ellipsis = match args.get(2) {
+        Some(&w) => crate::baseobjspace::int_w(w)? != 0,
+        None => false,
+    };
+    let abi = match args.get(3) {
+        Some(&w) => crate::baseobjspace::int_w(w)?,
+        None => super::interp_cffi_backend::default_abi() as i64,
+    };
+    newtype::new_function_type(args[0], args[1], ellipsis, abi)
+}
+
+/// `libraryobj.py load_library`.
+pub fn load_library(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let flags = match args.get(1) {
+        Some(&w) => crate::baseobjspace::int_w(w)?,
+        None => 0,
+    };
+    super::libraryobj::load_library(args[0], flags)
 }

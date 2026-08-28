@@ -39,6 +39,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("release", super::func::release, 1),
         ("_get_types", super::func::get_types, 0),
         ("_get_common_types", get_common_types, 1),
+        ("new_struct_type", super::func::new_struct_type, 1),
+        ("new_union_type", super::func::new_union_type, 1),
+        ("new_enum_type", super::func::new_enum_type, 4),
     ] {
         crate::module_ns_store(
             ns,
@@ -57,6 +60,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("string", super::func::string),
         ("typeoffsetof", super::func::typeoffsetof),
         ("rawaddressof", super::func::rawaddressof),
+        ("complete_struct_or_union", super::func::complete_struct_or_union),
+        ("new_function_type", super::func::new_function_type),
+        ("load_library", super::func::load_library),
     ] {
         crate::module_ns_store(
             ns,
@@ -72,6 +78,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         "__CData_iterator",
         super::ctypearray::cdata_iter_type(),
     );
+    crate::module_ns_store(ns, "CField", super::ctypestruct::cfield_type());
+    crate::module_ns_store(ns, "CLibrary", super::libraryobj::clibrary_type());
 }
 
 const MODULE: &str = "_cffi_backend";
@@ -86,7 +94,7 @@ const MODULE: &str = "_cffi_backend";
     ),
     not(any(target_env = "musl", target_env = "sgx"))
 ))]
-fn default_abi() -> u32 {
+pub fn default_abi() -> u32 {
     libffi::raw::ffi_abi_FFI_DEFAULT_ABI
 }
 
@@ -99,7 +107,7 @@ fn default_abi() -> u32 {
     ),
     not(any(target_env = "musl", target_env = "sgx"))
 )))]
-fn default_abi() -> u32 {
+pub fn default_abi() -> u32 {
     // No libffi on this target, so no foreign call can be made at all; the
     // constant still has to exist because cffi's Python half reads it at
     // import time.

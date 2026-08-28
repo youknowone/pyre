@@ -509,7 +509,7 @@ fn instance_ctype(ct: &W_CType) -> PyObjectRef {
 
 /// `W_CTypePrimitiveUnsigned.convert_to_object`'s two arms: a width narrower
 /// than a word is an ordinary `int`, and a full word may need a bigint.
-fn unsigned_as_object(ct: &W_CType, value: u64) -> PyObjectRef {
+pub fn unsigned_as_object(ct: &W_CType, value: u64) -> PyObjectRef {
     if ct.has(ctypeobj::F_VALUE_FITS_LONG) {
         return pyre_object::w_int_new(value as i64);
     }

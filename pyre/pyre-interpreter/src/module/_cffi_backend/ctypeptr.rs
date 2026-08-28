@@ -240,6 +240,7 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
 pub fn pointer_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let item = item_of(ct)?;
+    let w_item = ct.ctitem;
     let mut datasize = item.size;
     if datasize < 0 {
         return Err(PyError::type_error(format!(
@@ -247,15 +248,49 @@ pub fn pointer_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjec
             ct.name()
         )));
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let init_slot = roots.base();
+    let _ = roots.pin_root(w_init);
+    let cdata_slot = init_slot + 1;
+    if item.is_struct_or_union() {
+        // `newp` on a struct-or-union pointer hands back a co-owner of the
+        // cdata that really holds the struct, so `p[0]` is that object.
+        let mut varsize_length = -1;
+        item.force_lazy_struct()?;
+        if item.has(ctypeobj::F_WITH_VAR_ARRAY) {
+            if !unsafe { pyre_object::pyobject::is_none(roots.get(init_slot)) } {
+                datasize = unsafe {
+                    super::ctypestruct::convert_struct_from_object(
+                        item,
+                        std::ptr::null_mut(),
+                        roots.get(init_slot),
+                        datasize,
+                    )?
+                };
+            }
+            varsize_length = datasize;
+        }
+        let w_structobj = cdataobj::new_cdata_owning(w_item, datasize, varsize_length)?;
+        let struct_slot = cdata_slot;
+        let _ = roots.pin_root(w_structobj);
+        let ptr = cdataobj::cdata_arg(roots.get(struct_slot))?.ptr;
+        let w_cdata = cdataobj::new_cdata_ptr_to_struct(ptr, w_ctype, roots.get(struct_slot));
+        let ptr_slot = struct_slot + 1;
+        let _ = roots.pin_root(w_cdata);
+        if !unsafe { pyre_object::pyobject::is_none(roots.get(init_slot)) } {
+            let cdata = cdataobj::cdata_arg(roots.get(ptr_slot))?;
+            let item = ctypeobj::ctype_arg(w_item)?;
+            unsafe {
+                ctypeobj::convert_from_object(item, cdata.ptr, roots.get(init_slot))?;
+            }
+        }
+        return Ok(roots.get(ptr_slot));
+    }
     if ct.is_char_or_unichar_ptr_or_array() {
         // Room for the null character `newp` always adds.
         datasize *= 2;
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let init_slot = roots.base();
-    let _ = roots.pin_root(w_init);
     let w_cdata = cdataobj::new_cdata_owning(w_ctype, datasize, -1)?;
-    let cdata_slot = init_slot + 1;
     let _ = roots.pin_root(w_cdata);
     let w_init = roots.get(init_slot);
     if !unsafe { pyre_object::pyobject::is_none(w_init) } {
@@ -296,7 +331,7 @@ pub fn array_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjectR
 }
 
 /// `W_CTypeArray.get_new_array_length`.
-fn new_array_length(ct: &W_CType, w_value: PyObjectRef) -> Result<(PyObjectRef, i64), PyError> {
+pub fn new_array_length(ct: &W_CType, w_value: PyObjectRef) -> Result<(PyObjectRef, i64), PyError> {
     unsafe {
         if pyre_object::pyobject::is_list(w_value) || pyre_object::pyobject::is_tuple(w_value) {
             let length = crate::runtime_ops::sequence_len(w_value)? as i64;
@@ -506,4 +541,127 @@ fn unpack_wide_string(item: &W_CType, ptr: *mut u8, length: i64) -> Result<PyObj
 pub fn item_of(ct: &W_CType) -> Result<&'static mut W_CType, PyError> {
     ctypeobj::ctype_at(ct.ctitem)
         .ok_or_else(|| PyError::system_error("pointer or array without an item type"))
+}
+
+// ── passing a pointer as a call argument ────────────────────────────────
+
+/// `W_CTypePointer.convert_argument_from_object` — write the pointer into the
+/// exchange slot and record, in the byte before it, what the call owes
+/// afterwards.
+///
+/// # Safety
+/// `cdata` must be an exchange-buffer argument slot with a byte of its own
+/// just before it.
+pub unsafe fn pointer_convert_argument_from_object(
+    ct: &W_CType,
+    cdata: *mut u8,
+    w_ob: PyObjectRef,
+) -> Result<bool, PyError> {
+    use super::ctypefunc::{MUSTFREE_FREE, MUSTFREE_NOTHING, set_mustfree_flag};
+
+    let mut result = MUSTFREE_NOTHING;
+    if W_CData::from_obj(w_ob).is_none() {
+        if ct.has(ctypeobj::F_ACCEPT_STR) && unsafe { pyre_object::bytesobject::is_bytes(w_ob) } {
+            // A `bytes` passed to a `char *` argument reaches C as a copy
+            // with its own null terminator; RPython instead pins or hands
+            // over the string's own characters, which pyre has no equivalent
+            // of because the collector may move them.
+            return unsafe { accept_movable_str(ct, cdata, w_ob) };
+        }
+        result = unsafe { prepare_pointer_call_argument(ct, cdata, w_ob)? };
+    }
+    if result == MUSTFREE_NOTHING {
+        unsafe { pointer_convert_from_object(ct, cdata, w_ob)? };
+    }
+    unsafe { set_mustfree_flag(cdata, result) };
+    Ok(result == MUSTFREE_FREE)
+}
+
+/// `W_CTypePointer.accept_movable_str`.
+///
+/// # Safety
+/// As [`pointer_convert_argument_from_object`].
+unsafe fn accept_movable_str(
+    ct: &W_CType,
+    cdata: *mut u8,
+    w_ob: PyObjectRef,
+) -> Result<bool, PyError> {
+    use super::ctypefunc::{MUSTFREE_FREE, set_mustfree_flag};
+
+    let value = unsafe { pyre_object::bytesobject::w_bytes_data(w_ob) };
+    if item_of(ct)?.kind == ctypeobj::KIND_PRIM_BOOL {
+        must_be_string_of_zero_or_one(value)?;
+    }
+    let buf = cdataobj::raw_alloc(value.len() as i64 + 1, false)?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), buf, value.len());
+        buf.add(value.len()).write(0);
+        cdata.cast::<*mut u8>().write_unaligned(buf);
+        set_mustfree_flag(cdata, MUSTFREE_FREE);
+    }
+    Ok(true)
+}
+
+/// `W_CTypePointer._must_be_string_of_zero_or_one`.
+fn must_be_string_of_zero_or_one(value: &[u8]) -> Result<(), PyError> {
+    if value.iter().any(|&c| c > 1) {
+        return Err(PyError::value_error(
+            "an array of _Bool can only contain \\x00 or \\x01",
+        ));
+    }
+    Ok(())
+}
+
+/// `W_CTypePointer._prepare_pointer_call_argument` — a list, tuple, bytes or
+/// str argument becomes an array this call owns for its duration.
+///
+/// # Safety
+/// As [`pointer_convert_argument_from_object`].
+unsafe fn prepare_pointer_call_argument(
+    ct: &W_CType,
+    cdata: *mut u8,
+    w_init: PyObjectRef,
+) -> Result<u8, PyError> {
+    use super::ctypefunc::{MUSTFREE_FREE, MUSTFREE_NOTHING};
+
+    let item = item_of(ct)?;
+    let length = unsafe {
+        if pyre_object::pyobject::is_list(w_init) || pyre_object::pyobject::is_tuple(w_init) {
+            crate::runtime_ops::sequence_len(w_init)? as i64
+        } else if pyre_object::bytesobject::is_bytes(w_init) {
+            // From a string, we add the null terminator.
+            pyre_object::bytesobject::w_bytes_data(w_init).len() as i64 + 1
+        } else if pyre_object::unicodeobject::is_str(w_init) {
+            let value = pyre_object::w_str_get_wtf8(w_init);
+            let n: i64 = if item.size == 2 {
+                value
+                    .code_points()
+                    .map(|p| if p.to_u32() > 0xFFFF { 2 } else { 1 })
+                    .sum()
+            } else {
+                value.code_points().count() as i64
+            };
+            n + 1
+        } else {
+            return Ok(MUSTFREE_NOTHING);
+        }
+    };
+    let itemsize = if item.size > 0 {
+        item.size
+    } else if item.kind == ctypeobj::KIND_VOID {
+        1
+    } else {
+        return Ok(MUSTFREE_NOTHING);
+    };
+    let datasize = length
+        .checked_mul(itemsize)
+        .filter(|&n| n >= 0)
+        .ok_or_else(|| PyError::overflow_error("array size would overflow a ssize_t"))?;
+    let buf = cdataobj::raw_alloc(datasize, true)?;
+    if let Err(e) = unsafe { convert_array_from_object(ct, buf, w_init) } {
+        unsafe { libc::free(buf.cast::<libc::c_void>()) };
+        return Err(e);
+    }
+    unsafe { cdata.cast::<*mut u8>().write_unaligned(buf) };
+    Ok(MUSTFREE_FREE)
 }

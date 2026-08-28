@@ -38,6 +38,12 @@ pub const KIND_PRIM_COMPLEX: i64 = 8;
 pub const KIND_POINTER: i64 = 9;
 /// `ctypearray.py W_CTypeArray`.
 pub const KIND_ARRAY: i64 = 10;
+/// `ctypestruct.py W_CTypeStruct`.
+pub const KIND_STRUCT: i64 = 11;
+/// `ctypestruct.py W_CTypeUnion`.
+pub const KIND_UNION: i64 = 12;
+/// `ctypefunc.py W_CTypeFunc`.
+pub const KIND_FUNC: i64 = 13;
 
 // ── the boolean class attributes ────────────────────────────────────────
 
@@ -64,6 +70,18 @@ pub const F_VALUE_SMALLER_THAN_LONG: i64 = 1 << 8;
 pub const F_VALUE_FITS_ULONG: i64 = 1 << 9;
 /// `W_CTypePrimitiveUniChar.is_signed_wchar`.
 pub const F_SIGNED_WCHAR: i64 = 1 << 10;
+/// `W_CTypeFunc.ellipsis`.
+pub const F_ELLIPSIS: i64 = 1 << 11;
+/// The ctype is `ctypeenum.py W_CTypeEnumSigned` or `W_CTypeEnumUnsigned`.
+/// `_Mixin_Enum` mixes into the primitive signed and unsigned classes, so an
+/// enum keeps their kind and only adds the two enumerator maps.
+pub const F_ENUM: i64 = 1 << 12;
+/// `W_CTypeStructOrUnion._custom_field_pos`.
+pub const F_CUSTOM_FIELD_POS: i64 = 1 << 13;
+/// `W_CTypeStructOrUnion._with_var_array`.
+pub const F_WITH_VAR_ARRAY: i64 = 1 << 14;
+/// `W_CTypeStructOrUnion._with_packed_change`.
+pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 
 /// `ctypeobj.py W_CType` and the RPython subclasses that share its typedef.
 ///
@@ -102,6 +120,24 @@ pub struct W_CType {
     pub length: i64,
     /// The `F_*` class attributes above.
     pub flags: i64,
+    /// `W_CTypeFunc.fargs` — the argument ctypes, as a tuple.  `PY_NULL` on
+    /// every other kind.
+    pub fargs: PyObjectRef,
+    /// `W_CTypeFunc.abi`, the `FFI_*` calling convention.
+    pub abi: i64,
+    /// `W_CTypeFunc.cif_descr` — the `ffi_cif` this function type was
+    /// prepared with, built once here rather than once per call.  Null for a
+    /// variadic function, whose cif depends on the arguments actually passed.
+    pub cif_descr: *mut u8,
+    /// `W_CTypeStructOrUnion._fields_list` — a list of [`super::ctypestruct::W_CField`]
+    /// in declaration order.  `PY_NULL` while the struct is opaque or lazy.
+    pub fields_list: PyObjectRef,
+    /// `W_CTypeStructOrUnion._fields_dict` — name to `W_CField`.
+    pub fields_dict: PyObjectRef,
+    /// `_Mixin_Enum.enumerators2values` — a dict of `str` to `int`.
+    pub enumerators2values: PyObjectRef,
+    /// `_Mixin_Enum.enumvalues2erators` — a dict of `int` to `str`.
+    pub enumvalues2erators: PyObjectRef,
 }
 
 impl W_CType {
@@ -143,6 +179,34 @@ impl W_CType {
         self.kind == KIND_POINTER || self.kind == KIND_ARRAY
     }
 
+    /// `isinstance(ct, W_CTypeStructOrUnion)`.
+    pub fn is_struct_or_union(&self) -> bool {
+        self.kind == KIND_STRUCT || self.kind == KIND_UNION
+    }
+
+    /// `W_CTypeStructOrUnion.check_complete` — an opaque struct answers
+    /// nothing about its contents.
+    pub fn check_complete(&self, value_error: bool) -> Result<(), PyError> {
+        if self.size >= 0 {
+            return Ok(());
+        }
+        let msg = format!("'{}' is opaque or not completed yet", self.name());
+        Err(if value_error {
+            PyError::value_error(msg)
+        } else {
+            PyError::type_error(msg)
+        })
+    }
+
+    /// `W_CTypeStructOrUnion.force_lazy_struct` — complain if we are opaque.
+    ///
+    /// A struct reaches pyre either complete, from `complete_struct_or_union`,
+    /// or opaque; the lazy state belongs to the compiled-extension path that
+    /// `realize_c_type` drives, so there is nothing to force here yet.
+    pub fn force_lazy_struct(&self) -> Result<(), PyError> {
+        self.check_complete(false)
+    }
+
     /// `W_CTypePtrOrArray.is_unichar_ptr_or_array`.
     pub fn is_unichar_ptr_or_array(&self) -> bool {
         self.is_ptr_or_array()
@@ -174,12 +238,20 @@ impl W_CType {
     /// `W_CType.alignof` — `_alignof` raises for a type that has none.
     pub fn alignof(&self) -> Result<i64, PyError> {
         match self.kind {
-            // `W_CTypePtrBase._alignof` — every pointer aligns as one.
-            KIND_POINTER => Ok(align_of::<*const u8>() as i64),
+            // `W_CTypePtrBase._alignof` — every pointer aligns as one, and
+            // a function type is one of them.
+            KIND_POINTER | KIND_FUNC => Ok(align_of::<*const u8>() as i64),
             // `W_CTypeArray._alignof` — `self.ctitem.alignof()`.
             KIND_ARRAY => ctype_at(self.ctitem)
                 .ok_or_else(|| self.unknown_alignment())?
                 .alignof(),
+            // `W_CTypeStructOrUnion._alignof` — completing the struct is what
+            // computes it.
+            KIND_STRUCT | KIND_UNION => {
+                self.check_complete(true)?;
+                self.force_lazy_struct()?;
+                Ok(self.align)
+            }
             _ if self.align >= 0 => Ok(self.align),
             _ => Err(self.unknown_alignment()),
         }
@@ -225,6 +297,9 @@ impl W_CType {
     pub unsafe fn extra_repr(&self, cdata: *const u8) -> Result<String, PyError> {
         if self.kind == KIND_PRIM_LONGDOUBLE {
             return Ok(unsafe { super::misc::longdouble2str(cdata) });
+        }
+        if self.has(F_ENUM) {
+            return unsafe { super::ctypeenum::extra_repr(self, cdata) };
         }
         if self.is_primitive() {
             // `W_CTypePrimitive.extra_repr` — `repr(convert_to_object(cdata))`.
@@ -317,6 +392,13 @@ impl Default for W_CType {
             ctptr: pyre_object::PY_NULL,
             length: -1,
             flags: 0,
+            fargs: pyre_object::PY_NULL,
+            abi: 0,
+            cif_descr: std::ptr::null_mut(),
+            fields_list: pyre_object::PY_NULL,
+            fields_dict: pyre_object::PY_NULL,
+            enumerators2values: pyre_object::PY_NULL,
+            enumvalues2erators: pyre_object::PY_NULL,
         }
     }
 }
@@ -346,6 +428,7 @@ pub unsafe fn convert_to_object(ct: &W_CType, cdata: *const u8) -> Result<PyObje
     match ct.kind {
         KIND_POINTER => Ok(super::ctypeptr::pointer_convert_to_object(ct, cdata)),
         KIND_ARRAY => Ok(super::ctypeptr::array_convert_to_object(ct, cdata)),
+        KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata),
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_to_object(ct, cdata) },
         _ => Err(PyError::type_error(format!(
             "cannot return a cdata '{}'",
@@ -366,6 +449,9 @@ pub unsafe fn copy_and_convert_to_object(
     if ct.kind == KIND_VOID {
         return Ok(pyre_object::w_none());
     }
+    if ct.is_struct_or_union() {
+        return unsafe { super::ctypestruct::copy_and_convert_to_object(ct, cdata) };
+    }
     unsafe { convert_to_object(ct, cdata) }
 }
 
@@ -381,6 +467,9 @@ pub unsafe fn convert_from_object(
     match ct.kind {
         KIND_POINTER => unsafe { super::ctypeptr::pointer_convert_from_object(ct, cdata, w_ob) },
         KIND_ARRAY => unsafe { super::ctypeptr::array_convert_from_object(ct, cdata, w_ob) },
+        KIND_STRUCT | KIND_UNION => unsafe {
+            super::ctypestruct::convert_from_object(ct, cdata, w_ob)
+        },
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_from_object(ct, cdata, w_ob) },
         _ => Err(PyError::type_error(format!(
             "cannot initialize cdata '{}'",
@@ -487,9 +576,73 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
     let ct = ctype_of(cdata).ok_or_else(|| PyError::type_error("expected a cdata object"))?;
     match ct.kind {
         KIND_POINTER | KIND_ARRAY => super::ctypeptr::string(w_cdata, maxlen),
+        _ if ct.has(F_ENUM) => unsafe { super::ctypeenum::string(ct, cdata.ptr) },
         _ if ct.is_primitive() => super::ctypeprim::string(w_cdata, maxlen),
         _ => Err(unexpected_string_argument(ct)),
     }
+}
+
+/// `W_CType.convert_argument_from_object` — writes one call argument into the
+/// exchange buffer and reports whether the pointer it left there has to be
+/// freed after the call.
+///
+/// # Safety
+/// `cdata` must be writable for `ct.size` bytes, and for the must-free flag
+/// byte just before it when the ctype is a pointer.
+pub unsafe fn convert_argument_from_object(
+    ct: &W_CType,
+    cdata: *mut u8,
+    w_ob: PyObjectRef,
+) -> Result<bool, PyError> {
+    if ct.kind == KIND_POINTER {
+        return unsafe { super::ctypeptr::pointer_convert_argument_from_object(ct, cdata, w_ob) };
+    }
+    unsafe { convert_from_object(ct, cdata, w_ob)? };
+    Ok(false)
+}
+
+/// `W_CType.getcfield` and the two overrides of it, with the mode
+/// `W_CData.getcfield` names in the opaque-struct message.
+pub fn getcfield(
+    ct: &W_CType,
+    attr: &str,
+    mode: &str,
+) -> Result<&'static mut super::ctypestruct::W_CField, PyError> {
+    // `W_CTypePointer.getcfield` — a pointer to a struct reads its fields.
+    let owner = if ct.kind == KIND_POINTER {
+        ctype_at(ct.ctitem).filter(|it| it.is_struct_or_union())
+    } else {
+        None
+    };
+    let owner = match owner {
+        Some(owner) => owner,
+        None if ct.is_struct_or_union() => ct,
+        // `W_CType.getcfield` — nothing else has fields at all.
+        None => {
+            return Err(PyError::attribute_error(format!(
+                "cdata '{}' has no attribute '{attr}'",
+                ct.name()
+            )));
+        }
+    };
+    if owner.fields_dict.is_null() {
+        // `W_CTypeStructOrUnion.getcfield` returns None for an opaque struct,
+        // which `W_CData.getcfield` turns into its own message.
+        owner.check_complete(false).map_err(|_| {
+            PyError::attribute_error(format!(
+                "cdata '{}' points to an opaque type: cannot {mode} fields",
+                ct.name()
+            ))
+        })?;
+        owner.force_lazy_struct()?;
+    }
+    let w_field =
+        unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(owner.fields_dict, attr) };
+    w_field
+        .and_then(super::ctypestruct::W_CField::from_obj)
+        .ok_or_else(|| {
+            PyError::attribute_error(format!("cdata '{}' has no field '{attr}'", ct.name()))
+        })
 }
 
 pub fn unexpected_string_argument(ct: &W_CType) -> PyError {
@@ -633,9 +786,10 @@ fn fget(w_self: PyObjectRef, attrchar: char) -> Result<PyObjectRef, PyError> {
     let ct = ctype_arg(w_self)?;
     match attrchar {
         // `W_CType._fget('k')` — a class attribute in PyPy.
-        'k' => Ok(pyre_object::w_str_new(kind_name(ct.kind))),
+        'k' => Ok(pyre_object::w_str_new(kind_name(ct))),
         'c' => Ok(pyre_object::w_str_new(ct.name)),
-        // `W_CTypePtrOrArray._fget('i')`.
+        // `W_CTypePointer._fget('i')` and `W_CTypeArray._fget('i')`.  A
+        // function type has none: `W_CTypeFunc` reaches `W_CType._fget`.
         'i' if ct.is_ptr_or_array() => Ok(ct.ctitem),
         // `W_CTypeArray._fget('l')`.
         'l' if ct.kind == KIND_ARRAY => Ok(if ct.length >= 0 {
@@ -643,6 +797,17 @@ fn fget(w_self: PyObjectRef, attrchar: char) -> Result<PyObjectRef, PyError> {
         } else {
             pyre_object::w_none()
         }),
+        // `W_CTypeStructOrUnion._fget('f')`.
+        'f' if ct.is_struct_or_union() => super::ctypestruct::fget_fields(ct),
+        // `W_CTypeFunc._fget`.
+        'a' if ct.kind == KIND_FUNC => Ok(ct.fargs),
+        'r' if ct.kind == KIND_FUNC => Ok(ct.ctitem),
+        'E' if ct.kind == KIND_FUNC => Ok(pyre_object::boolobject::w_bool_from(ct.has(F_ELLIPSIS))),
+        'A' if ct.kind == KIND_FUNC => Ok(pyre_object::w_int_new(ct.abi)),
+        // `_Mixin_Enum._fget` builds a fresh dict on each read, so the two
+        // maps a ctype holds stay its own.
+        'e' if ct.has(F_ENUM) => super::ctypeenum::copy_map(ct.enumvalues2erators),
+        'R' if ct.has(F_ENUM) => super::ctypeenum::copy_map(ct.enumerators2values),
         _ => Err(PyError::attribute_error(format!(
             "ctype '{}' has no such attribute",
             ct.name()
@@ -651,11 +816,15 @@ fn fget(w_self: PyObjectRef, attrchar: char) -> Result<PyObjectRef, PyError> {
 }
 
 /// `W_CType.kind`, the class attribute each subclass overrides.
-pub fn kind_name(kind: i64) -> &'static str {
-    match kind {
+pub fn kind_name(ct: &W_CType) -> &'static str {
+    match ct.kind {
         KIND_VOID => "void",
         KIND_POINTER => "pointer",
         KIND_ARRAY => "array",
+        KIND_STRUCT => "struct",
+        KIND_UNION => "union",
+        KIND_FUNC => "function",
+        _ if ct.has(F_ENUM) => "enum",
         _ => "primitive",
     }
 }

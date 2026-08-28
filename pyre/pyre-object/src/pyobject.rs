@@ -692,26 +692,29 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (183, Some(0)),
     (184, Some(0)),
     (185, Some(0)),
-    // Native-only type IDs 186 and 187 represent `posix.DirEntry` and
-    // `posix.ScandirIterator`, matching `build_gc`'s registration order.
-    #[cfg(not(target_arch = "wasm32"))]
+    // `_cffi_backend`'s struct field and library handle close that block.
     (186, Some(0)),
-    #[cfg(not(target_arch = "wasm32"))]
     (187, Some(0)),
-    // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
-    // extend the append-only native rclass tail; wasm omits the host TLS
-    // module and therefore the hierarchy entries as well. Sandbox filtering
-    // belongs to pyre-interpreter, which owns that module configuration.
+    // Native-only type IDs 188 and 189 represent `posix.DirEntry` and
+    // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
     (188, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (189, Some(0)),
+    // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
+    // extend the append-only native rclass tail; wasm omits the host TLS
+    // module and therefore the hierarchy entries as well. Sandbox filtering
+    // belongs to pyre-interpreter, which owns that module configuration.
     #[cfg(not(target_arch = "wasm32"))]
     (190, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (191, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (192, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (193, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (194, Some(0)),
     // `mmap.mmap` owns its native mapping payload — the duplicated fd on POSIX
     // and the file handle on Windows — and follows the optional SSL tail
     // wherever the module is compiled.  The gate must match the alias gate in
@@ -720,20 +723,20 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // A sandbox build has no `mmap` module either, so
     // `active_subclass_range_hierarchy` drops this entry along with SSL's.
     #[cfg(any(unix, windows))]
-    (193, Some(0)),
+    (195, Some(0)),
     // `_overlapped.Overlapped` owns the Windows OVERLAPPED record and its
     // retained Python buffers.  pyre-interpreter supplies the vtable alias;
     // the object layer owns only the append-only hierarchy slot.
     #[cfg(windows)]
-    (194, Some(0)),
+    (196, Some(0)),
     // `_winapi.Overlapped` owns a second Windows OVERLAPPED record, the one
     // waited on through an event of its own rather than a completion port.
     #[cfg(windows)]
-    (195, Some(0)),
+    (197, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload.
     // Its append-only vtable id follows both Windows overlapped owners.
     #[cfg(windows)]
-    (196, Some(0)),
+    (198, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

@@ -885,6 +885,16 @@ unsafe fn cffi_cdata_destructor(obj_addr: usize) {
     };
 }
 
+/// `W_Library._finalize_` — closes a library nothing names any more, unless
+/// the handle was opened by someone else.
+unsafe fn cffi_library_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_cffi_backend::libraryobj::w_library_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -4107,10 +4117,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
     }
 
-    // `_cffi_backend`'s three object types.  A ctype and the array iterator
-    // hold ordinary traced fields; a cdata additionally owns the block that
-    // `newp` malloc'd for it, which its sweep destructor frees.  All three are
-    // unconditional, so they register ahead of the target-gated tail.
+    // `_cffi_backend`'s five object types.  A ctype, the array iterator and a
+    // struct field hold ordinary traced fields; a cdata additionally owns the
+    // block that `newp` malloc'd for it and a library owns its loader handle,
+    // which their sweep destructors release.  All five are unconditional, so
+    // they register ahead of the target-gated tail.
     for descriptor in [
         <pyre_interpreter::module::_cffi_backend::ctypeobj::W_CType
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
@@ -4124,6 +4135,18 @@ fn build_gc() -> Box<MiniMarkGC> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
         let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
         gc.types.set_destructor(tid, cffi_cdata_destructor);
+    }
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_cffi_backend::ctypestruct::W_CField
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    {
+        let descr = <pyre_interpreter::module::_cffi_backend::libraryobj::W_Library
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+        gc.types.set_destructor(tid, cffi_library_destructor);
     }
 
     // Register `posix.DirEntry`'s four inline GC edges and
