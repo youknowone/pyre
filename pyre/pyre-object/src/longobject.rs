@@ -185,40 +185,17 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
     // (PyPy does the same via W_AbstractIntObject's typedef). Wire
     // `w_class` to INT_TYPE.instantiate so `type(x) is int` and
     // `isinstance(x, int)` both hold for long integers.
-    let header = PyObject {
-        ob_type: &LONG_TYPE as *const PyType,
-        w_class: get_instantiate(&INT_TYPE),
-    };
-    // The wrapper must be GC-managed whenever its `value` payload is: a
-    // `BigInt` routed through the GC (`bigint_gc_type_id() != 0`, the
-    // `alloc_bigint_*` condition) is reclaimed by collections, so an immortal
-    // `malloc_typed` wrapper — which the collector never traces — would leave
-    // an untracked edge to a reclaimed RBigInt payload/digit array. Tie the
-    // wrapper's GC path to the same predicate as the payload, not to
-    // `gc_interp::enabled()` alone (unlike int/float, whose payload is inline).
-    if crate::gc_interp::enabled() || bigint_gc_type_id() != 0 {
-        // `alloc_oldgen_typed` is a direct, non-collecting old-gen allocation.
-        // The young immutable payload therefore stays at the same address
-        // until the wrapper is initialized and remembered below.
-        let raw = crate::gc_hook::try_gc_alloc_stable_raw(W_LONG_GC_TYPE_ID, W_LONG_OBJECT_SIZE);
-        if !raw.is_null() {
-            unsafe {
-                std::ptr::write(
-                    raw as *mut W_LongObject,
-                    W_LongObject {
-                        ob_header: header,
-                        value,
-                    },
-                );
-            }
-            // Creation write barrier: the old-gen wrapper may reference a young
-            // bigint, so remember it for the next minor collection's tracer.
-            crate::gc_hook::try_gc_write_barrier(raw);
-            return raw as PyObjectRef;
-        }
-    }
-    crate::lltype::malloc_typed(W_LongObject {
-        ob_header: header,
+    // PyPy's `W_LongObject.__init__` stores only `num`; the allocation itself
+    // is introduced later by `rclass.py`/`rbuiltin.py`.  Keep the Rust host's
+    // non-moving requirement inside the malloc implementation rather than
+    // spelling its allocator branch and aggregate copy in this constructor.
+    // `fuse_boxing_alloc` recognizes this GC-flavoured malloc boundary and
+    // restores the translated `NewWithVtable` plus ordinary field writes.
+    crate::lltype::malloc_typed_stable(W_LongObject {
+        ob_header: PyObject {
+            ob_type: &LONG_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
         value,
     }) as PyObjectRef
 }

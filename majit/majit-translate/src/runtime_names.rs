@@ -120,6 +120,7 @@ pub(crate) mod modules {
     pub(crate) const OBJECT_LLTYPE: &str = "pyre_object.lltype";
     pub(crate) const MALLOC_TYPED: &str = "pyre_object.lltype.malloc_typed";
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";
+    pub(crate) const MALLOC_TYPED_STABLE: &str = "pyre_object.lltype.malloc_typed_stable";
     pub(crate) const MALLOC_RAW: &str = "pyre_object.lltype.malloc_raw";
 }
 

@@ -2396,8 +2396,8 @@ pub(crate) fn ensure_residual_call_args_bound(
 /// skipped via the two narrow branches above) before the trace op
 /// hits the recorder.
 ///
-/// Per-branch concrete-execute status (every non-pure residual call
-/// concrete-executes during the walk, matching
+/// Per-branch concrete-execute status (every residual call with concrete
+/// operands executes during the walk, matching
 /// PyPy `do_residual_call` which runs `executor.execute_varargs` for the
 /// whole forces branch regardless of EI):
 ///
@@ -2406,15 +2406,16 @@ pub(crate) fn ensure_residual_call_args_bound(
 /// | `is_call_release_gil()` | (early-routed to [`direct_call_release_gil`], records `CALL_RELEASE_GIL_*`) | executed as `CallMayForce*` on the **original** `allboxes` via [`try_execute_residual_call_via_executor`] |
 /// | `check_forces_virtual_or_virtualizable()` | `CallMayForce*` + `GuardNotForced` | executed via [`try_execute_residual_call_via_executor`] (active vable bracketed by the token protocol) |
 /// | `extraeffect == LoopInvariant` | `CallLoopinvariant*` | executed on cache miss; [`loopinvariant_lookup`] reuses the cached OpRef on hit (no execute, no record) |
-/// | `check_is_elidable()` | `CallPure*` | executed + cached via [`try_fold_pure_call_via_executor`] (elidable_cannot_raise only — see its caveats) |
+/// | `check_is_elidable()` | `CallPure*` | cannot-raise calls use [`try_fold_pure_call_via_executor`]; can-raise calls use [`try_execute_residual_call_via_executor`] so the exception is transcribed |
 /// | default | `Call*` + (`GuardNoException` iff can_raise) | executed via [`try_execute_residual_call_via_executor`] |
 ///
 /// All three dispatch entry points — [`dispatch_residual_call_iRd_kind`]
 /// (`_opimpl_residual_call1`), [`dispatch_residual_call_iIRd_kind`]
 /// (`_opimpl_residual_call2`), [`dispatch_residual_call_iIRFd_kind`]
 /// (`_opimpl_residual_call3`) — call [`select_residual_call_opcode`],
-/// `record_op_with_descr`, then [`try_fold_pure_call_via_executor`] (pure)
-/// + [`try_execute_residual_call_via_executor`] (non-pure).  The executor
+/// `record_op_with_descr`, then [`try_fold_pure_call_via_executor`] (the
+/// cannot-raise pure fast path) + [`try_execute_residual_call_via_executor`]
+/// (all other calls, including can-raise pure calls).  The executor
 /// self-gates and degrades to recording-only when a precondition fails
 /// (non-authoritative walk, non-const funcbox, unpatched symbolic fnaddr).
 ///
@@ -2512,8 +2513,9 @@ pub(crate) fn select_residual_call_opcode(
 /// regardless of `check_is_elidable()` — the EI flag only selects the
 /// recorded opcode kind (`CALL_PURE_*` vs `CALL_*`), not whether the
 /// helper runs.  This function covers the elidable arm; the
-/// non-elidable arms (`CallMayForce*`, `CallLoopinvariant*`, `Call*`)
-/// are concrete-executed by [`try_execute_residual_call_via_executor`]
+/// remaining arms (`CallMayForce*`, `CallLoopinvariant*`, `Call*`, and
+/// can-raise `CallPure*`) are concrete-executed by
+/// [`try_execute_residual_call_via_executor`]
 /// with raised exceptions surfaced through `BH_LAST_EXC_VALUE` so
 /// `eval_loop_jit` can route them into the bytecode exception handler.
 ///
@@ -3063,35 +3065,23 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
             | OpCode::CallMayForceF
             | OpCode::CallMayForceN
     );
-    // The `CallPure*` shapes reach this dispatcher too, against what the
-    // callers' comments assume: `try_fold_pure_call_via_executor` runs first
-    // and answers only the calls whose every argbox carries a value, and the
-    // rest arrive here.  They are declined like any other opcode this executor
-    // does not run, but they are declined for a different reason and owe a
-    // different follow-up, so name it.
+    // `MIFrame.execute_varargs` executes an elidable call BEFORE it patches the
+    // recorded CALL into CALL_PURE and before `handle_possible_exception`
+    // (`pyjitpl.py`).  The cannot-raise half is already executed by
+    // `try_fold_pure_call_via_executor`; the can-raise half deliberately
+    // reaches this full executor so `BH_LAST_EXC_VALUE` is transcribed into the
+    // walker's exception state instead of being swallowed.
     let is_pure = matches!(
         call_opcode,
         OpCode::CallPureI | OpCode::CallPureR | OpCode::CallPureF | OpCode::CallPureN
     );
-    if is_pure {
-        // Only the CANNOT-raise half is obligation-free.
-        // `select_residual_call_opcode` picks `CallPure*` on
-        // `check_is_elidable()` alone, so `EF_ELIDABLE_CAN_RAISE` arrives
-        // wearing the same opcode, and `try_fold_pure_call_via_executor`
-        // deliberately refuses to run it — there is no metainterp here to
-        // transcribe the exception out of `BH_LAST_EXC_VALUE`.  An elidable
-        // call applies no heap effect either way, but a RAISE is an observable
-        // of its own: waving the can-raise half through opens the no-replay
-        // walk-end roads for a call the interpreter never ran, so the
-        // `ZeroDivisionError` / shift error / `MemoryError` it would have
-        // raised is skipped outright.  Decline it the way every other
-        // unexecuted call is declined, which keeps the replay obligation.
-        if call_descr.get_extra_info().check_can_raise(false) {
-            return Ok(declined_symbolic(call_opcode));
-        }
+    if is_pure && !call_descr.get_extra_info().check_can_raise(false) {
+        // The cannot-raise fast path ran first.  If it could not answer because
+        // an operand was symbolic, keeping CALL_PURE in the trace carries no
+        // missed effect or exception obligation.
         return Ok(ResidualExecOutcome::Declined(ResidualDecline::PureUnfolded));
     }
-    if !plain_or_loopinvariant && !is_may_force {
+    if !plain_or_loopinvariant && !is_may_force && !is_pure {
         return Ok(declined_symbolic(call_opcode));
     }
     if allboxes.is_empty() {
@@ -3251,7 +3241,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         args.push(v);
     }
     // NULL-Ref-arg refusal: same SEGV-avoidance contract as the pure
-    // path (see `try_fold_pure_call_via_executor`'s NULL guard).  Pyre's
+    // fast path (see `try_fold_pure_call_via_executor`'s NULL guard).  Pyre's
     // optimizer emits `guard_nonnull` after this walker fold, so a NULL
     // receiver dereferences before that guard exists; fall through to
     // recording the call op and let the optimizer's guard emission
@@ -5052,7 +5042,7 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     // path that lands a constant result via the executor.execute_varargs
     // stamp) propagates concrete to the dst slot.  Falls back to Null when
     // the result has no recorded concrete (matches the pre-#75.F shape for
-    // every non-elidable call).
+    // every recorded call without an executed concrete result).
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     match dst_bank {
         'r' => {
@@ -6646,11 +6636,25 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // #61: UNARY_POSITIVE `+int` identity fold.  The object-space `pos` on an
-    // exact int returns the operand unchanged, so a provably-int operand folds
-    // to the operand box itself behind a `GUARD_CLASS INT`, eliding the
-    // `CALL_MAY_FORCE` (and its `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`) the
-    // generic residual emits.  A bool (`+True` is int `1`) / non-int operand
+    // UNARY_POSITIVE.  Descend `pos_inner` -- `pos` past the override probe --
+    // rather than re-emit its identity arm by hand, the same shape the invert
+    // and neg descents take.  Sits ahead of the `unary_positive_int` fold so
+    // that fold's `consulted` count reads whether the descent took the site.
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && r_args.len() == 1
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
+        && spec_gate(SpecFold::UnaryPositiveDescent, || {
+            try_walker_orthodox_unary_positive(ctx, op.pc, r_args[0], dst, dst_bank)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
+    // #61: UNARY_POSITIVE `+int` identity fold.  Kept behind the descent so a
+    // build whose `pos_inner` jitcode is missing or unlowered still forwards
+    // an exact-int operand.  A bool (`+True` is int `1`) / non-int operand
     // declines to the generic leg so its `__pos__` still runs.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
@@ -6666,36 +6670,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // UNARY_NEGATIVE.  Descend `neg_inner` -- `neg` past the override probe --
     // rather than re-emit its integer arm by hand, the same shape the invert
-    // descent below takes.  Sits ahead of the `unary_negative_int` fold so that
-    // fold's `consulted` count reads whether the descent took the site.  The
-    // fold is not dead and stays: besides the bool / subclass / non-int operand
-    // it never admitted, it is what serves the `INT_MIN` promotion, which the
-    // descent declines on an unlowered `PyObject` transparent ctor.
+    // descent below takes.  The translated body owns both the ordinary int arm
+    // and the `INT_MIN` promotion through `rbigint.neg` + `W_LongObject`
+    // allocation. Bool, subclass and non-int operands still fall through to
+    // the generic residual so their override semantics are preserved.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
         && spec_gate(SpecFold::UnaryNegativeDescent, || {
             try_walker_orthodox_unary_negative(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // #61: UNARY_NEGATIVE `-int` fold.  `-x` is `0 - x`; the fold emits
-    // `IntSubOvf(0, x)` behind a `GUARD_CLASS INT` (reusing the binary-sub
-    // overflow discipline), eliding the `CALL_MAY_FORCE`.  A bool / subclass /
-    // non-int, and an `INT_MIN` value (whose negation is the `2**63` long),
-    // decline to the generic leg.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && spec_gate(SpecFold::UnaryNegativeInt, || {
-            try_walker_specialize_unary_negative_int(
-                ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
-            )
         })?
         .is_some()
     {
@@ -7528,11 +7512,12 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // downstream walker chain (sub-jitcode bodies that consume the
         // result via `concrete_of_opref`) folds end-to-end.  No-op when
         // any argbox is symbolic, when the EI can raise, or for non-pure
-        // call opcodes.
+        // call opcodes.  The shared executor below handles the can-raise pure
+        // case and transfers its exception state like `MIFrame.execute_varargs`.
         try_fold_pure_call_via_executor(ctx, call_opcode, &allboxes, call_descr, recorded);
 
         // pyjitpl.py `_opimpl_residual_call{1,2,3}` parity
-        // for the non-elidable shapes.  PyPy
+        // for the remaining shapes.  PyPy
         // concrete-executes EVERY residual call regardless of EI — the
         // `exc` flag only selects the *guard* shape downstream
         // (`handle_possible_exception` → `GUARD_EXCEPTION` vs

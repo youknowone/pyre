@@ -306,6 +306,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         crate::runtime_names::modules::MALLOC_TYPED_MANAGED,
         malloc_typed_alloc,
     );
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::modules::MALLOC_TYPED_STABLE,
+        malloc_typed_alloc,
+    );
     // `pyre_object::lltype::malloc_raw` — the raw (non-GC) allocation
     // intrinsic (`lltype.malloc(T, flavor='raw')` parity).  Recognising it
     // as a builtin keeps its `Box::new` / `Box::into_raw` body out of the

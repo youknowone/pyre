@@ -8395,11 +8395,28 @@ impl OptContext {
             }
             return;
         }
+        // A virtual's field list is addressed by position, and the key this
+        // site carries is not one.  [`heap::OptHeap::field_slot_index`] answers
+        // `typeptr` and `w_class` out of a band of their own, above every
+        // position a parent's field list can hand out, precisely because they
+        // resolve through no field list at all.  That is a workable key for the
+        // association lists an `Instance`/`Struct` carries, but `force_box`
+        // walks a virtual's `fields` back through `descr.get_all_fielddescrs()`
+        // BY POSITION, so a banded slot there resolves to nothing.  A virtual
+        // that owns a listed class word records it from
+        // `virtualize.rs optimize_setfield_gc`, which reads the slot off the
+        // layout; nothing is lost by declining here.
+        let is_header_word = op
+            .with_field_descr(|fd| fd.is_typeptr() || fd.is_w_class())
+            .unwrap_or(false);
         // info.py AbstractStructPtrInfo.setfield: mutate `_fields`
         // in the PtrInfo object stored in the operand's `_forwarded` slot.
         // PyPy has the same single-object behavior via `box._forwarded`.
         self.with_ensured_ptr_info_arg0(op, |mut handle| {
             if let Some(mut pi) = handle.as_mut() {
+                if is_header_word && pi.is_virtual() {
+                    return;
+                }
                 pi.setfield(field_idx, value.clone());
             }
         });

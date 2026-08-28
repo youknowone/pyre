@@ -4815,7 +4815,7 @@ impl OpcodeStepExecutor for PyFrame {
     // ── unary_positive ──
     // PyPy: UNARY_POSITIVE → space.pos(w_value)
     fn unary_positive(&mut self, val: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        crate::baseobjspace::pos(val)
+        crate::opcode_ops::unary_positive_value(val)
     }
 
     // ── list_to_tuple ──

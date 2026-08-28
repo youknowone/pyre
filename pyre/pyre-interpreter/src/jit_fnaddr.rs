@@ -346,6 +346,18 @@ fn push_abi_unsound_alias_pair(
     push_raw_fnaddr(entries, root_path, fnptr);
 }
 
+/// Append one `(path, address)` row, dropping a null address.
+///
+/// Every published address reaches this function through one of three kinds
+/// of caller, and that list is the invariant worth keeping: the checked
+/// publishers above (`p*` / `pa*` / `cp*` / `cpa*` / `up*` / `upa*`), which
+/// read the signature; [`push_word_accessor_alias_pair`], whose address was
+/// checked by `runtime_ops`'s `word_fn_addr!` before the arity lookup erased
+/// it; and the two `push_abi_unsound_*` hatches, which name the part of the
+/// signature the residual ABI cannot express. A new caller belongs in the
+/// first group — a raw call here publishes an address nothing checked, and a
+/// mismatch surfaces as a wrong register count at trace-time call, not as a
+/// build error.
 fn push_raw_fnaddr(
     entries: &mut Vec<(&'static str, i64)>,
     full_path: &'static str,
@@ -357,7 +369,18 @@ fn push_raw_fnaddr(
     }
 }
 
-fn push_alias_pair(
+/// Alias-pair form for an address a `runtime_ops` arity-to-address accessor
+/// already checked.
+///
+/// The accessor selects the helper by a runtime count, so it must erase the
+/// signature before returning, and by the time the address arrives here there
+/// is nothing left for [`ResidualSlot`] / [`ResidualRet`] to read. The check
+/// is not skipped, only moved: each accessor takes its address through
+/// `runtime_ops`'s `word_fn_addr!`, which ascribes the fn item to an explicit
+/// `extern "C" fn(i64, ..) -> i64` first. Publishing through this helper
+/// asserts that the address came from such an accessor; anything else uses
+/// the checked publishers above.
+fn push_word_accessor_alias_pair(
     entries: &mut Vec<(&'static str, i64)>,
     module_path: &'static str,
     root_path: &'static str,
@@ -767,14 +790,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // registers every `(path, fn)` into this link-time slice; iterate it
     // instead of hand-listing ~46 module-qualified paths (which mis-resolve
     // inline-mod spellings and miss per-module `cfg` gates).  Register the
-    // crate-stripped alias too, mirroring `push_alias_pair`, so either
-    // spelling of the residual `FunctionPath` resolves.
+    // crate-stripped alias too, so either spelling of the residual
+    // `FunctionPath` resolves.  The descriptor carries the accessor as a
+    // `fn() -> PyObjectRef` rather than an address, so `p0` checks it the same
+    // way it checks a hand-written publication.
     #[cfg(not(target_arch = "wasm32"))]
     for desc in pyre_object::lltype::PYRE_TYPE_OBJECT_FNADDRS {
-        let fnptr = desc.func as *const ();
-        push_raw_fnaddr(&mut entries, desc.path, fnptr);
+        p0(&mut entries, desc.path, desc.func);
         if let Some((_crate_seg, rest)) = desc.path.split_once("::") {
-            push_raw_fnaddr(&mut entries, rest, fnptr);
+            p0(&mut entries, rest, desc.func);
         }
     }
 
@@ -939,6 +963,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::opcode_ops::jit_unary_invert_value",
         "pyre_interpreter::jit_unary_invert_value",
         crate::opcode_ops::jit_unary_invert_value,
+    );
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::jit_unary_positive_value",
+        "pyre_interpreter::jit_unary_positive_value",
+        crate::opcode_ops::jit_unary_positive_value,
     );
     cpa2(
         &mut entries,
@@ -1873,62 +1903,66 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     // Mixed W_LongObject/W_IntObject descriptors call the dedicated
     // rbigint.int_* operations, preserving PyPy's no-temporary-bigint path.
-    for (path, addr) in [
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_add",
-            crate::objspace::descroperation::jit_bigint_int_add as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_sub",
-            crate::objspace::descroperation::jit_bigint_int_sub as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_mul",
-            crate::objspace::descroperation::jit_bigint_int_mul as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_and",
-            crate::objspace::descroperation::jit_bigint_int_and as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_or",
-            crate::objspace::descroperation::jit_bigint_int_or as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_xor",
-            crate::objspace::descroperation::jit_bigint_int_xor as *const (),
-        ),
-    ] {
-        push_raw_fnaddr(&mut entries, path, addr);
-    }
-    for (path, addr) in [
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_eq",
-            crate::objspace::descroperation::jit_bigint_int_eq as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_ne",
-            crate::objspace::descroperation::jit_bigint_int_ne as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_lt",
-            crate::objspace::descroperation::jit_bigint_int_lt as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_le",
-            crate::objspace::descroperation::jit_bigint_int_le as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_gt",
-            crate::objspace::descroperation::jit_bigint_int_gt as *const (),
-        ),
-        (
-            "pyre_interpreter::objspace::descroperation::jit_bigint_int_ge",
-            crate::objspace::descroperation::jit_bigint_int_ge as *const (),
-        ),
-    ] {
-        push_raw_fnaddr(&mut entries, path, addr);
-    }
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_add",
+        crate::objspace::descroperation::jit_bigint_int_add,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_sub",
+        crate::objspace::descroperation::jit_bigint_int_sub,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_mul",
+        crate::objspace::descroperation::jit_bigint_int_mul,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_and",
+        crate::objspace::descroperation::jit_bigint_int_and,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_or",
+        crate::objspace::descroperation::jit_bigint_int_or,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_xor",
+        crate::objspace::descroperation::jit_bigint_int_xor,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_eq",
+        crate::objspace::descroperation::jit_bigint_int_eq,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_ne",
+        crate::objspace::descroperation::jit_bigint_int_ne,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_lt",
+        crate::objspace::descroperation::jit_bigint_int_lt,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_le",
+        crate::objspace::descroperation::jit_bigint_int_le,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_gt",
+        crate::objspace::descroperation::jit_bigint_int_gt,
+    );
+    cp2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::jit_bigint_int_ge",
+        crate::objspace::descroperation::jit_bigint_int_ge,
+    );
     // `bigint_pow_nomod(...)?` is source-level `Result` syntax for
     // RPython's implicit MemoryError edge. The MIR front removes that shell
     // and binds the elidable pointer-ABI payload call here.
@@ -1980,32 +2014,32 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     for (nargs, (module_path, root_path)) in CALLABLE_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::callable_call_helper(nargs) {
-            push_alias_pair(&mut entries, module_path, root_path, fnptr);
+            push_word_accessor_alias_pair(&mut entries, module_path, root_path, fnptr);
         }
     }
     for (nargs, (module_path, root_path)) in KNOWN_BUILTIN_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::known_builtin_call_helper(nargs) {
-            push_alias_pair(&mut entries, module_path, root_path, fnptr);
+            push_word_accessor_alias_pair(&mut entries, module_path, root_path, fnptr);
         }
     }
     for (nargs, (module_path, root_path)) in KNOWN_FUNCTION_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::known_function_call_helper(nargs) {
-            push_alias_pair(&mut entries, module_path, root_path, fnptr);
+            push_word_accessor_alias_pair(&mut entries, module_path, root_path, fnptr);
         }
     }
     for (count, (module_path, root_path)) in LIST_BUILD_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::list_build_helper(count) {
-            push_alias_pair(&mut entries, module_path, root_path, fnptr);
+            push_word_accessor_alias_pair(&mut entries, module_path, root_path, fnptr);
         }
     }
     for (count, (module_path, root_path)) in TUPLE_BUILD_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::tuple_build_helper(count) {
-            push_alias_pair(&mut entries, module_path, root_path, fnptr);
+            push_word_accessor_alias_pair(&mut entries, module_path, root_path, fnptr);
         }
     }
     for (count, (module_path, root_path)) in MAP_BUILD_HELPER_PATHS.iter().enumerate() {
         if let Some(fnptr) = crate::runtime_ops::map_build_helper(count) {
-            push_alias_pair(&mut entries, module_path, root_path, fnptr);
+            push_word_accessor_alias_pair(&mut entries, module_path, root_path, fnptr);
         }
     }
 
@@ -2418,9 +2452,9 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         pyerror_to_exc_object,
     );
     // The same materialisation with the `type_error` constructor folded in, so
-    // the raise site carries neither body. The typed local is the only
-    // compile-time check that the trampoline's signature matches the residual
-    // call — `push_alias_pair` performs none.
+    // the raise site carries neither body. The typed local spells the
+    // trampoline's signature at the call site; `cpa1` checks the same thing
+    // through [`ResidualSlot`] / [`ResidualRet`].
     let pyerror_type_error_to_exc_object: extern "C" fn(i64) -> i64 =
         crate::error::__majit_call_target_pyerror_type_error_to_exc_object;
     cpa1(
@@ -2851,7 +2885,7 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     //    under (per `parse::extract_inherent_impl_methods`).
     //
     // `register_macro_helper_trace_fnaddr` strips the leading segment,
-    // so we register both spellings via `push_alias_pair`: the 3-segment
+    // so we register both spellings as an alias pair: the 3-segment
     // input `pyre_interpreter::PyFrame::pop` produces the 2-segment
     // canonical, and the 4-segment input `pyre_interpreter::pyframe::PyFrame::pop`
     // produces the 3-segment module-qualified form.  Without the second
@@ -3017,8 +3051,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `target_to_path` for a `FunctionPath` returns the segments verbatim,
     // so an in-module bare call resolves to a 1-segment CallPath
     // `["<name>"]` while a cross-module qualified call resolves to
-    // `["pyframe", "<name>"]`.  Use `push_alias_pair` to register both
-    // shapes via the strip-one-segment rule in
+    // `["pyframe", "<name>"]`.  Register both shapes as an alias pair, via
+    // the strip-one-segment rule in
     // `register_macro_helper_trace_fnaddr`.
     let pyframe_get_pycode_fn: unsafe fn(&crate::pyframe::PyFrame) -> *const crate::CodeObject =
         crate::pyframe::pyframe_get_pycode;
@@ -3071,8 +3105,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     // `residual_call` ops and the walker's `goto_if_not` bounds-check
     // aborts with `GotoIfNotValueNotConcrete`.
     //
-    // `push_alias_pair` (vs plain `push_raw_fnaddr`) is required because the
-    // in-module call site `load_fast_var_num_to_index(var_num, op_arg)`
+    // The alias pair (vs a single module-qualified path) is required because
+    // the in-module call site `load_fast_var_num_to_index(var_num, op_arg)`
     // inside `pyopcode.rs` resolves to a bare-segment `CallPath`
     // (`["load_fast_var_num_to_index"]`) that the assertion-aware hint
     // walker DOES populate but the module-qualified-only fnaddr
@@ -3099,8 +3133,8 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
 
     // Paired-local index decode helpers for the LoadFastLoadFast /
     // StoreFastLoadFast / StoreFastStoreFast /
-    // LoadFastBorrowLoadFastBorrow arms — same `push_alias_pair`
-    // rationale as `load_fast_var_num_to_index` above.
+    // LoadFastBorrowLoadFastBorrow arms — same alias-pair rationale as
+    // `load_fast_var_num_to_index` above.
     let var_nums_to_first_index: fn(
         crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
         crate::bytecode::OpArg,

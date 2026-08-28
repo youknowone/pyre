@@ -3614,6 +3614,40 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for NoStruc
     }
 }
 
+/// Whether `owner` names one of the three enum variants `front/mir` gives an
+/// explicit `[tag@0 | payload@8]` shell to.
+///
+/// `front/mir` admits every spelling from the bare `Result::Ok` up to the fully
+/// qualified `std::result::Result::Ok`, and `canonical_struct_name` keeps
+/// whichever the call site used, so this accepts each of them -- but as a
+/// *suffix of the whole path*, matched segment by segment against a `core` or
+/// `std` root.  A plain `ends_with` also admits a user enum declared at
+/// `mycrate::option::Option::Some`, which `front::option_ctor` never gives a
+/// shell to; its payload would then be described at offset 8 behind an injected
+/// discriminant rather than at its registered native layout.  Anchoring at the
+/// root rejects that while keeping every real spelling, the same reason
+/// [`crate::front::option_ctor::option_variant_ctor_tag`] anchors its own head.
+///
+/// A lone leaf (`Ok`) is not enough: the shortest form `front/mir` produces
+/// names the enum as well as the variant.
+fn is_explicit_shell_variant_owner(owner: &str) -> bool {
+    const SHELLED: [&[&str]; 6] = [
+        &["core", "result", "Result", "Ok"],
+        &["std", "result", "Result", "Ok"],
+        &["core", "result", "Result", "Err"],
+        &["std", "result", "Result", "Err"],
+        &["core", "option", "Option", "Some"],
+        &["std", "option", "Option", "Some"],
+    ];
+    let segments: Vec<&str> = owner.split("::").collect();
+    if segments.len() < 2 {
+        return false;
+    }
+    SHELLED
+        .iter()
+        .any(|path| segments.len() <= path.len() && segments == path[path.len() - segments.len()..])
+}
+
 pub(crate) fn bh_size_spec_from_callcontrol(
     cc: &CallControl,
     owner: &str,
@@ -3653,12 +3687,7 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     // blackhole must reconstruct the same inherited tag slot or the payload
     // takes slot 0 here while living at byte 8 there.  `None` carries no
     // payload row, so it needs no reconstruction.
-    let result_variant = layout_owner.ends_with("result::Result::Ok")
-        || layout_owner.ends_with("result::Result::Err")
-        || layout_owner.ends_with("option::Option::Some")
-        || layout_owner == "Result::Ok"
-        || layout_owner == "Result::Err"
-        || layout_owner == "Option::Some";
+    let result_variant = is_explicit_shell_variant_owner(layout_owner);
     // The bare Charon variant can contain only the inherited enum tag while
     // the annotator keeps the payload row on the concrete instantiation
     // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
@@ -5939,6 +5968,64 @@ mod tests {
             majit_ir::descr::ArrayFlag::Pointer
         );
         assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
+    }
+
+    /// A user enum whose path merely ends in `option::Option::Some` gets no
+    /// shell: `front::option_ctor` never writes a tag for it, so its payload
+    /// stays where its own registered layout puts it.
+    #[test]
+    fn a_lookalike_variant_owner_keeps_its_native_layout() {
+        use crate::call::CallControl;
+
+        let owner = "mycrate::option::Option<*mut PyObject>::Some";
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "mycrate::option::Option::Some".to_string(),
+            vec![("__pos_0".to_string(), "*mut PyObject".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let spec = bh_size_spec_from_callcontrol(&cc, owner).expect("lookalike variant size");
+        assert_eq!(spec.size, 8);
+        assert_eq!(spec.all_fielddescrs.len(), 1);
+        assert_eq!(spec.all_fielddescrs[0].field_key(), "__pos_0");
+        assert_eq!(spec.all_fielddescrs[0].offset, 0);
+        assert_eq!(spec.all_fielddescrs[0].index_in_parent, 0);
+    }
+
+    /// Every spelling `front::mir` admits reaches the shell, and only a path
+    /// rooted at `core`/`std` (or short enough to have no root of its own)
+    /// does.  `synthetic_result_ctor_identity_accepts_qualified_spellings`
+    /// pins the same list on the producer side.
+    #[test]
+    fn the_shelled_variant_owners_are_every_rooted_spelling() {
+        for owner in [
+            "Result::Ok",
+            "result::Result::Ok",
+            "std::result::Result::Ok",
+            "core::result::Result::Ok",
+            "Result::Err",
+            "result::Result::Err",
+            "std::result::Result::Err",
+            "core::result::Result::Err",
+            "Option::Some",
+            "option::Option::Some",
+            "std::option::Option::Some",
+            "core::option::Option::Some",
+        ] {
+            assert!(is_explicit_shell_variant_owner(owner), "{owner}");
+        }
+        for owner in [
+            "Ok",
+            "Some",
+            "Option::None",
+            "StepResult::Continue",
+            "mycrate::option::Option::Some",
+            "mycrate::core::option::Option::Some",
+        ] {
+            assert!(!is_explicit_shell_variant_owner(owner), "{owner}");
+        }
     }
 
     #[test]

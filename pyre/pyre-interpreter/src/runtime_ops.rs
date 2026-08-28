@@ -1050,47 +1050,103 @@ define_flat_ref_helper!(
     arg7
 );
 
+/// Take a helper's residual-call address with its word signature spelled out.
+///
+/// The arity-to-address accessors below erase the signature, so the checked
+/// publishers in `jit_fnaddr` (`ResidualSlot` / `ResidualRet`) never see it and
+/// cannot reject a helper the residual ABI is unable to describe.  Ascribing
+/// the fn item to an explicit `extern "C" fn(i64, ..) -> i64` pointer restores
+/// that check at the one point where the type still exists: a helper whose
+/// parameters or result stop being machine words fails to compile here instead
+/// of being published and then called with the wrong number of registers.
+///
+/// The second argument is the helper's machine-argument count, which is not
+/// the Python argument count the accessor matches on: a `jit_call_callable_N`
+/// carries the frame and the callable ahead of its `N` arguments, a
+/// `jit_call_known_builtin_N` carries the callable, and a `jit_build_map_N`
+/// takes a key and a value per pair.  Getting that count wrong is the same
+/// build error as a helper drifting off the word ABI: writing `3` for
+/// `jit_call_callable_2` reports `non-primitive cast: extern "C" fn(i64, i64,
+/// i64, i64) -> i64 {jit_call_callable_2} as extern "C" fn(i64, i64, i64) ->
+/// i64`, naming the call site.  That is how the check is exercised without a
+/// helper that actually violates it.
+macro_rules! word_fn_addr {
+    ($f:ident, 0) => {
+        $f as extern "C" fn() -> i64 as *const ()
+    };
+    ($f:ident, 1) => {
+        $f as extern "C" fn(i64) -> i64 as *const ()
+    };
+    ($f:ident, 2) => {
+        $f as extern "C" fn(i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 3) => {
+        $f as extern "C" fn(i64, i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 4) => {
+        $f as extern "C" fn(i64, i64, i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 5) => {
+        $f as extern "C" fn(i64, i64, i64, i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 6) => {
+        $f as extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 7) => {
+        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 8) => {
+        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 9) => {
+        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+    };
+    ($f:ident, 10) => {
+        $f as extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 as *const ()
+    };
+}
+
 pub fn callable_call_helper(nargs: usize) -> Option<*const ()> {
     Some(match nargs {
-        0 => jit_call_callable_0 as *const (),
-        1 => jit_call_callable_1 as *const (),
-        2 => jit_call_callable_2 as *const (),
-        3 => jit_call_callable_3 as *const (),
-        4 => jit_call_callable_4 as *const (),
-        5 => jit_call_callable_5 as *const (),
-        6 => jit_call_callable_6 as *const (),
-        7 => jit_call_callable_7 as *const (),
-        8 => jit_call_callable_8 as *const (),
+        0 => word_fn_addr!(jit_call_callable_0, 2),
+        1 => word_fn_addr!(jit_call_callable_1, 3),
+        2 => word_fn_addr!(jit_call_callable_2, 4),
+        3 => word_fn_addr!(jit_call_callable_3, 5),
+        4 => word_fn_addr!(jit_call_callable_4, 6),
+        5 => word_fn_addr!(jit_call_callable_5, 7),
+        6 => word_fn_addr!(jit_call_callable_6, 8),
+        7 => word_fn_addr!(jit_call_callable_7, 9),
+        8 => word_fn_addr!(jit_call_callable_8, 10),
         _ => return None,
     })
 }
 
 pub fn known_builtin_call_helper(nargs: usize) -> Option<*const ()> {
     Some(match nargs {
-        0 => jit_call_known_builtin_0 as *const (),
-        1 => jit_call_known_builtin_1 as *const (),
-        2 => jit_call_known_builtin_2 as *const (),
-        3 => jit_call_known_builtin_3 as *const (),
-        4 => jit_call_known_builtin_4 as *const (),
-        5 => jit_call_known_builtin_5 as *const (),
-        6 => jit_call_known_builtin_6 as *const (),
-        7 => jit_call_known_builtin_7 as *const (),
-        8 => jit_call_known_builtin_8 as *const (),
+        0 => word_fn_addr!(jit_call_known_builtin_0, 1),
+        1 => word_fn_addr!(jit_call_known_builtin_1, 2),
+        2 => word_fn_addr!(jit_call_known_builtin_2, 3),
+        3 => word_fn_addr!(jit_call_known_builtin_3, 4),
+        4 => word_fn_addr!(jit_call_known_builtin_4, 5),
+        5 => word_fn_addr!(jit_call_known_builtin_5, 6),
+        6 => word_fn_addr!(jit_call_known_builtin_6, 7),
+        7 => word_fn_addr!(jit_call_known_builtin_7, 8),
+        8 => word_fn_addr!(jit_call_known_builtin_8, 9),
         _ => return None,
     })
 }
 
 pub fn known_function_call_helper(nargs: usize) -> Option<*const ()> {
     Some(match nargs {
-        0 => jit_call_known_function_0 as *const (),
-        1 => jit_call_known_function_1 as *const (),
-        2 => jit_call_known_function_2 as *const (),
-        3 => jit_call_known_function_3 as *const (),
-        4 => jit_call_known_function_4 as *const (),
-        5 => jit_call_known_function_5 as *const (),
-        6 => jit_call_known_function_6 as *const (),
-        7 => jit_call_known_function_7 as *const (),
-        8 => jit_call_known_function_8 as *const (),
+        0 => word_fn_addr!(jit_call_known_function_0, 2),
+        1 => word_fn_addr!(jit_call_known_function_1, 3),
+        2 => word_fn_addr!(jit_call_known_function_2, 4),
+        3 => word_fn_addr!(jit_call_known_function_3, 5),
+        4 => word_fn_addr!(jit_call_known_function_4, 6),
+        5 => word_fn_addr!(jit_call_known_function_5, 7),
+        6 => word_fn_addr!(jit_call_known_function_6, 8),
+        7 => word_fn_addr!(jit_call_known_function_7, 9),
+        8 => word_fn_addr!(jit_call_known_function_8, 10),
         _ => return None,
     })
 }
@@ -1104,41 +1160,41 @@ pub enum FlatBuildKind {
 
 pub fn list_build_helper(count: usize) -> Option<*const ()> {
     Some(match count {
-        0 => jit_build_list_0 as *const (),
-        1 => jit_build_list_1 as *const (),
-        2 => jit_build_list_2 as *const (),
-        3 => jit_build_list_3 as *const (),
-        4 => jit_build_list_4 as *const (),
-        5 => jit_build_list_5 as *const (),
-        6 => jit_build_list_6 as *const (),
-        7 => jit_build_list_7 as *const (),
-        8 => jit_build_list_8 as *const (),
+        0 => word_fn_addr!(jit_build_list_0, 0),
+        1 => word_fn_addr!(jit_build_list_1, 1),
+        2 => word_fn_addr!(jit_build_list_2, 2),
+        3 => word_fn_addr!(jit_build_list_3, 3),
+        4 => word_fn_addr!(jit_build_list_4, 4),
+        5 => word_fn_addr!(jit_build_list_5, 5),
+        6 => word_fn_addr!(jit_build_list_6, 6),
+        7 => word_fn_addr!(jit_build_list_7, 7),
+        8 => word_fn_addr!(jit_build_list_8, 8),
         _ => return None,
     })
 }
 
 pub fn tuple_build_helper(count: usize) -> Option<*const ()> {
     Some(match count {
-        0 => jit_build_tuple_0 as *const (),
-        1 => jit_build_tuple_1 as *const (),
-        2 => jit_build_tuple_2 as *const (),
-        3 => jit_build_tuple_3 as *const (),
-        4 => jit_build_tuple_4 as *const (),
-        5 => jit_build_tuple_5 as *const (),
-        6 => jit_build_tuple_6 as *const (),
-        7 => jit_build_tuple_7 as *const (),
-        8 => jit_build_tuple_8 as *const (),
+        0 => word_fn_addr!(jit_build_tuple_0, 0),
+        1 => word_fn_addr!(jit_build_tuple_1, 1),
+        2 => word_fn_addr!(jit_build_tuple_2, 2),
+        3 => word_fn_addr!(jit_build_tuple_3, 3),
+        4 => word_fn_addr!(jit_build_tuple_4, 4),
+        5 => word_fn_addr!(jit_build_tuple_5, 5),
+        6 => word_fn_addr!(jit_build_tuple_6, 6),
+        7 => word_fn_addr!(jit_build_tuple_7, 7),
+        8 => word_fn_addr!(jit_build_tuple_8, 8),
         _ => return None,
     })
 }
 
 pub fn map_build_helper(pair_count: usize) -> Option<*const ()> {
     Some(match pair_count {
-        0 => jit_build_map_0 as *const (),
-        1 => jit_build_map_1 as *const (),
-        2 => jit_build_map_2 as *const (),
-        3 => jit_build_map_3 as *const (),
-        4 => jit_build_map_4 as *const (),
+        0 => word_fn_addr!(jit_build_map_0, 0),
+        1 => word_fn_addr!(jit_build_map_1, 2),
+        2 => word_fn_addr!(jit_build_map_2, 4),
+        3 => word_fn_addr!(jit_build_map_3, 6),
+        4 => word_fn_addr!(jit_build_map_4, 8),
         _ => return None,
     })
 }

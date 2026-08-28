@@ -68,11 +68,10 @@ pub(crate) fn resolve_gc_tid(
 /// `descr.get_all_fielddescrs()` (info.py:217-225), where `typeptr` is absent,
 /// so upstream never emits this header store from the force path. This is the
 /// same optimizer-layer "value already there" elision as heap.py:88-101.
-fn w_class_store_is_covered_by_alloc(
+pub(crate) fn w_class_value_is_covered_by_alloc(
     size_descr: &DescrRef,
     field_descr: &DescrRef,
-    value: &Operand,
-    ctx: &crate::optimizeopt::OptContext,
+    value: Option<Value>,
 ) -> bool {
     let Some(field) = field_descr.as_field_descr().filter(|fd| fd.is_w_class()) else {
         return false;
@@ -97,9 +96,22 @@ fn w_class_store_is_covered_by_alloc(
         return false;
     }
     matches!(
+        value,
+        Some(Value::Ref(value)) if value == GcRef(w_class as usize)
+    )
+}
+
+fn w_class_store_is_covered_by_alloc(
+    size_descr: &DescrRef,
+    field_descr: &DescrRef,
+    value: &Operand,
+    ctx: &crate::optimizeopt::OptContext,
+) -> bool {
+    w_class_value_is_covered_by_alloc(
+        size_descr,
+        field_descr,
         ctx.resolve_operand_operand_opt(value)
             .and_then(|resolved| resolved.const_value()),
-        Some(Value::Ref(value)) if value == GcRef(w_class as usize)
     )
 }
 
@@ -1315,9 +1327,23 @@ fn force_box_impl(
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                 let value_ref = force_child(&value_ref, ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
-                let descr = descr.expect(
-                    "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
-                );
+                // The key that failed to resolve is the whole diagnosis, and
+                // the list it was looked up in says which numbering it came
+                // from, so name both rather than only the rule they broke.
+                let descr = descr.unwrap_or_else(|| {
+                    panic!(
+                        "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i] \
+                         (field_idx={field_idx} len={} keys={:?})",
+                        cached_fielddescrs.len(),
+                        cached_fielddescrs
+                            .iter()
+                            .map(|d| d
+                                .as_field_descr()
+                                .map(|f| (f.field_key().to_string(), f.index_in_parent()))
+                                .unwrap_or_else(|| ("?".to_string(), 0)))
+                            .collect::<Vec<_>>(),
+                    )
+                });
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
                     continue;
                 }

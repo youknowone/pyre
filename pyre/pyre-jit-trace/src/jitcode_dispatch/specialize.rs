@@ -401,87 +401,6 @@ fn walker_emit_ovf2long_box<Sym: WalkSym>(
     Ok(result)
 }
 
-/// #61: walker-native int specialization for the `UNARY_NEGATIVE` residual
-/// (oopspec [`majit_ir::RuntimeHelperKind::UnaryNegative`]).  `-x` on an exact
-/// int is `0 - x`; the object-space `neg` promotes only `-INT_MIN` to a
-/// `W_LongObject` (`intobject.py` `descr_neg` → `_make_ovf2long`).  Since
-/// majit has no overflow-checked unary negate, the fold expresses `-x` as
-/// `IntSubOvf(0, x)` behind a `GUARD_CLASS INT`, reusing the binary-sub
-/// overflow discipline in both directions: a record value other than `INT_MIN`
-/// emits `GUARD_NO_OVERFLOW` so an `INT_MIN` arrival on the reused trace deopts
-/// rather than wrapping back to `INT_MIN`, and a record value of `INT_MIN`
-/// pins the operand with `GUARD_VALUE` and takes the same `_make_ovf2long` tail
-/// the `BINARY_OP` overflow arm takes, so the `2**63` long is built from the
-/// elidable bigint helper instead of the `CallMayForce` residual.
-///
-/// Returns `Ok(Some(()))` when the fold was emitted (caller returns
-/// `Continue`); `Ok(None)` for a bool / subclass / non-int operand, when the
-/// residual result box is unavailable, or when an `INT_MIN` operand did not
-/// produce the promoted `W_LongObject` the payload read expects.
-pub(crate) fn try_walker_specialize_unary_negative_int<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    let Some((x, x_class)) = walker_unary_int_operand(ctx, operand) else {
-        return Ok(None);
-    };
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-    // `0 - INT_MIN` is the one operand `descr_neg` promotes.
-    let overflows = x == i64::MIN;
-    if overflows {
-        let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
-        if boxed_result_obj == pyre_object::PY_NULL
-            || !unsafe { pyre_object::is_long(boxed_result_obj) }
-        {
-            return Ok(None);
-        }
-    }
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let x_raw = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, operand, x_class)?;
-    let zero_raw = ctx.trace_ctx.const_int(0);
-    let boxed = if overflows {
-        // `0 - x` overflows an i64 for exactly one operand, so "the negate
-        // promoted" and "the operand is INT_MIN" name the same set: guarding
-        // the value admits what `GUARD_OVERFLOW` would and nothing more. The
-        // value form is the one the tail can use — with `x_raw` constant the
-        // elidable bigint call folds to the `2**63` payload it returned while
-        // recording instead of running once per iteration. This is the
-        // `guard_value` spelling the version-tag promotes already use.
-        let int_min = ctx.trace_ctx.const_int(i64::MIN);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[x_raw, int_min])?;
-        walker_emit_ovf2long_box(
-            ctx,
-            op_pc,
-            pyre_object::longobject::jit_bigint_sub_int_int as *const (),
-            (zero_raw, 0),
-            (x_raw, x),
-            boxed_result_i64,
-        )?
-    } else {
-        let result_value = 0i64.wrapping_sub(x);
-        let raw_result = ctx
-            .trace_ctx
-            .record_op(OpCode::IntSubOvf, &[zero_raw, x_raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(raw_result, majit_ir::Value::Int(result_value));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
-        let boxed = walker_box_int(ctx, op_pc, raw_result, result_value)?;
-        ctx.trace_ctx
-            .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result_i64));
-        boxed
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
-}
-
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// the former int fast path's structure (`guard_class` + `getfield_gc_i` per
@@ -8538,15 +8457,11 @@ pub(crate) fn try_walker_orthodox_unary_invert<Sym: WalkSym>(
 /// same reason: upstream traces *through* `descr_neg`, which is ordinary
 /// RPython.
 ///
-/// This does NOT retire `unary_negative_int`, and the census says why. Over
-/// the 484-fixture corpus the descent fires on six fixtures and the fold on
-/// one -- `unary_negative.py`'s `main_int_min`, the `INT_MIN` promotion. The
-/// body reaches that through `w_long_new_fresh_rbigint_handle`, and the
-/// sub-walk stops there on a `PyObject` synthetic transparent ctor this build
-/// does not lower, so the descent declines and the fold's `guard_value` +
-/// ovf2long tail still serves it. What the descent does take is every
-/// non-promoting exact `int` and the exact `long` operand, which reached no
-/// fold at all before.
+/// The descent also owns the `INT_MIN` promotion.  `rbigint.neg` stays an
+/// `EF_ELIDABLE_OR_MEMORYERROR` residual, while `W_LongObject.__init__` lowers
+/// to `NewWithVtable` plus its ordinary `w_class` and `value` field writes.
+/// This is the same allocation/body split PyPy's rtyper and metainterp expose;
+/// no unary-negative manual fold remains beside it.
 ///
 /// `neg` itself cannot be entered: its `__neg__` override probe is
 /// `dont_look_inside` and is the second operation the body executes.
@@ -8641,6 +8556,126 @@ pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] UNARY-NEGATIVE-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Ok(pair) => pair,
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
+}
+
+/// Descend `pos_inner`'s compiled body for `+x` on an exact builtin `int` or
+/// `long`, instead of re-emitting its identity arm by hand.
+///
+/// The same orthodox shape as [`try_walker_orthodox_unary_invert`] and
+/// [`try_walker_orthodox_unary_negative`].  Upstream traces *through*
+/// `descr_pos`.  The exact-int and exact-long arms are identity: they return
+/// the operand, matching `_self_unaryop('pos')`.
+///
+/// `pos` itself cannot be entered: its `__pos__` override probe is
+/// `dont_look_inside` and is the second operation the body executes.
+/// `pos_inner` is that body past it. Unlike `invert`, `pos` has no bool slot
+/// to step over, so the split leaves the probe alone.
+///
+/// The guards emitted here are what let the caller skip the probe: an `int` or
+/// `long` subclass keeps the builtin `ob_type` but retags `w_class` and may
+/// define `__pos__`, so it must side-exit to the residual, which still runs the
+/// whole of `pos`. `bool` is excluded because `+True` is a rewrapping to a
+/// plain int, not identity, and because [`walker_exact_builtin_class`] has no
+/// value to pin on a singleton.
+pub(crate) fn try_walker_orthodox_unary_positive<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operand: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(operand_obj) = walker_concrete_ref_object(ctx, operand) else {
+        return Ok(None);
+    };
+    // SAFETY: `operand_obj` is a live concrete `PyObjectRef` from the walker
+    // shadow.
+    let is_long = unsafe { pyre_object::is_long(operand_obj) };
+    let admitted = unsafe {
+        !pyre_object::is_bool(operand_obj)
+            && (is_long || pyre_object::is_int(operand_obj))
+            && pyre_object::is_exact_builtin_instance(operand_obj)
+    };
+    if !admitted {
+        return Ok(None);
+    }
+    // SAFETY: as above.
+    //
+    // This cannot decline for an admitted operand, by the argument
+    // [`try_walker_orthodox_unary_invert`] gives: the only exact builtins born
+    // with a null `w_class` are the five read-only singletons, and the
+    // admission above already rejects every one of them.
+    let Some(operand_class) = (unsafe { walker_exact_builtin_class(operand_obj) }) else {
+        return Ok(None);
+    };
+
+    // Resolve every possible decline before recording a guard.
+    let Some(jc_arc) = crate::jitcode_runtime::pos_inner_jitcode() else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: set for the lifetime of the enclosing full-body walk.
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let type_addr = if is_long {
+        &pyre_object::pyobject::LONG_TYPE as *const _ as i64
+    } else {
+        &pyre_object::pyobject::INT_TYPE as *const _ as i64
+    };
+    walker_guard_class(ctx, op_pc, operand, type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, operand, operand_class)?;
+    ctx.trace_ctx.set_opref_concrete(
+        operand,
+        majit_ir::Value::Ref(majit_ir::GcRef(operand_obj as usize)),
+    );
+
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        "unary_positive_commit",
+        "pos_inner_call_site",
+        &[],
+        &[],
+        &[operand],
+        &[ConcreteValue::Ref(operand_obj)],
+    );
+    let (walk_outcome, _walk_start) = match walk {
+        // The body reached a helper this build did not lower. Both admitted
+        // arms of `pos_inner` are identity reads, so nothing is committed --
+        // cut the tentative IR, with its snapshots, and let the residual (or
+        // the identity fold behind this descent) serve the operator. The two
+        // guards above are emitted with snapshots attached and name the
+        // discarded operation namespace, so leaving them behind would expose
+        // stale boxes to a later remap.
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] UNARY-POSITIVE-SUBWALK pc={pc}");
             }
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();

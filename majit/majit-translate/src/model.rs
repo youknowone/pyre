@@ -3168,7 +3168,7 @@ pub fn fuse_boxing_alloc(
             if segments.len() >= 2
                 && matches!(
                     segments[segments.len() - 1].as_str(),
-                    "malloc_typed" | "malloc_typed_managed"
+                    "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
                 )
                 && segments[segments.len() - 2] == "lltype")
     };
@@ -7710,46 +7710,73 @@ mod tests {
             "ambiguous leaf layout keeps malloc_typed residual"
         );
 
-        let fused = fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs());
-        assert_eq!(fused, 1, "exactly one boxing cluster must fuse");
+        for allocator in [
+            "malloc_typed",
+            "malloc_typed_managed",
+            "malloc_typed_stable",
+        ] {
+            let mut candidate = graph.clone();
+            let allocation = candidate
+                .block_mut(entry)
+                .operations
+                .iter_mut()
+                .find(|op| op.result.as_ref() == Some(&ret))
+                .expect("malloc operation");
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                ..
+            } = &mut allocation.kind
+            else {
+                panic!("allocation must be a direct call")
+            };
+            *segments.last_mut().expect("allocator leaf") = allocator.to_string();
 
-        let ops = &graph.block(entry).operations;
-        let nwv_pos = ops
-            .iter()
-            .position(|op| {
-                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
-            })
-            .expect("NewWithVtable must be emitted");
-        assert_eq!(
-            ops[nwv_pos].result.as_ref(),
-            Some(&ret),
-            "NewWithVtable must reuse the original malloc result register"
-        );
-        match &ops[nwv_pos + 1].kind {
-            OpKind::FieldWrite {
-                base, field, ty, ..
-            } => {
-                assert_eq!(
-                    base, &ret,
-                    "payload store must target the NewWithVtable result"
-                );
-                assert_eq!(field.name, "floatval", "payload field must be floatval");
-                assert_eq!(
-                    *ty,
-                    ValueType::Float,
-                    "payload store must be retyped to Float"
-                );
+            let fused = fuse_boxing_alloc(&mut candidate, &numeric_boxing_attrs());
+            assert_eq!(
+                fused, 1,
+                "{allocator}: exactly one boxing cluster must fuse"
+            );
+
+            let ops = &candidate.block(entry).operations;
+            let nwv_pos = ops
+                .iter()
+                .position(|op| {
+                    matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+                })
+                .unwrap_or_else(|| panic!("{allocator}: NewWithVtable must be emitted"));
+            assert_eq!(
+                ops[nwv_pos].result.as_ref(),
+                Some(&ret),
+                "{allocator}: NewWithVtable must reuse the malloc result register"
+            );
+            match &ops[nwv_pos + 1].kind {
+                OpKind::FieldWrite {
+                    base, field, ty, ..
+                } => {
+                    assert_eq!(
+                        base, &ret,
+                        "{allocator}: payload store must target the allocation result"
+                    );
+                    assert_eq!(field.name, "floatval", "payload field must be floatval");
+                    assert_eq!(
+                        *ty,
+                        ValueType::Float,
+                        "payload store must be retyped to Float"
+                    );
+                }
+                other => panic!(
+                    "{allocator}: expected payload FieldWrite after NewWithVtable, got {other:?}"
+                ),
             }
-            other => panic!("expected payload FieldWrite after NewWithVtable, got {other:?}"),
+            assert!(
+                !ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some(allocator)
+                )),
+                "{allocator}: no allocation call may survive the fusion"
+            );
         }
-        assert!(
-            !ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
-                    if segments.last().map(String::as_str) == Some("malloc_typed")
-            )),
-            "no malloc_typed call may survive the fusion"
-        );
     }
 
     #[test]

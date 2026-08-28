@@ -152,18 +152,32 @@ pub struct VStringConcatInfo {
 ///
 /// Fields are tracked as OpRefs to the operations that produce their values.
 ///
-/// ## Invariant: `fields` NEVER contains typeptr (offset 0)
+/// ## Invariant: an entry's key is a slot of `all_fielddescrs()`
 ///
 /// Matches RPython upstream: `heaptracker.py all_fielddescrs()` skips
 /// `typeptr`, so `info.py AbstractStructPtrInfo.init_fields` sizes
-/// `_fields` with typeptr excluded from the indexable range. The typeptr
-/// (offset 0) is tracked separately via `known_class` and emitted by the
-/// GC rewriter's `gen_initialize_vtable` path (rewrite.py:479-484), NOT
-/// from the force-path field loop.
+/// `_fields` with it excluded from the indexable range. The typeptr (offset 0)
+/// is therefore never a key here; it is tracked via `known_class` and emitted
+/// by the GC rewriter's `gen_initialize_vtable` path (rewrite.py), NOT from
+/// the force-path field loop.
+///
+/// Pyre's additional Python-level `w_class` header is not the same case: a
+/// layout that lists it holds it at an ordinary slot (`W_BaseException` at 1),
+/// and an entry keyed by that slot resolves like any other. What must never
+/// appear is a key that names no slot — `index_in_parent` off a gc-only header
+/// edge (always 0, which is some value field), or one of
+/// `heap::OptHeap::field_slot_index`'s header/unslotted bands, which are keys
+/// for an association lookup and not positions in any list. `force_box` reads
+/// this list back through `all_fielddescrs()` BY POSITION, so such a key
+/// resolves to the wrong field or to nothing at all.
 ///
 /// Enforced by:
-/// - `virtualize.rs optimize_setfield_gc` Virtual arm: runtime check that
-///   returns early on `offset == Some(0)` before calling `set_field`.
+/// - `virtualize.rs optimize_setfield_gc` Virtual arm: returns early on
+///   typeptr, and keys a class-word store off the layout's
+///   `class_word_index_in_parent` rather than the op's descr.
+/// - `optimizeopt/mod.rs structinfo_setfield`: declines a header word on a
+///   virtual, whose key there comes from `heap::OptHeap::field_slot_index`'s
+///   band and names no slot.
 /// - `virtualize.rs force_virtual_instance`: `debug_assert_no_typeptr`
 ///   at the entry of the field-emit loop.
 /// - `virtualstate.rs export_single_value`:
@@ -182,7 +196,8 @@ pub struct VirtualInfo {
     /// SetfieldGc(ob_type) without polluting `fields` (which feeds rd_virtuals).
     pub ob_type_descr: Option<DescrRef>,
     /// Field values: `(field_descr_index, value_opref)`.
-    /// **Invariant**: never contains typeptr (offset 0) — see struct-level docs.
+    /// **Invariant**: every key is a slot of the descr's `all_fielddescrs()`;
+    /// typeptr is never one — see struct-level docs.
     pub fields: Vec<(u32, Operand)>,
     /// info.py:91-92
     pub last_guard_pos: i32,
