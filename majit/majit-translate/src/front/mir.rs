@@ -32987,29 +32987,26 @@ mod tests {
         }
     }
 
-    /// PyPy's `_match_keywords` indexes its small signature and argument
-    /// lists with ordinary `getitem`.  The Rust `SliceIndex<usize>` shim must
-    /// lower to the same ArrayRead shape instead of remaining an opaque core
-    /// call that prevents the whole builtin-call chain from being annotated.
-    ///
-    /// The `arguments_w` side reaches that shape: its elements are object
-    /// pointers, one target word each, so the ArrayRead's stride is the host
-    /// stride.  `Signature.argnames` does NOT, and must keep its residual
-    /// `Vec::index`: PyPy's `Signature.argnames` is an RPython list of
-    /// `Ptr(STR)` (`rstr.py`, `StringRepr`), but pyre spells it
-    /// `Vec<&'static str>` — a two-word fat pointer per element — and no
-    /// translation converts the container.  Admitting it would make
-    /// `getarrayitem` compute `base + i * 8` over 16-byte elements.  The
-    /// convergence path is on the pyre side: give `Signature` a managed
-    /// string list, the one container whose items really are one GCREF each,
-    /// and this call joins the addressable set through the same
-    /// `first_arg_is_string_array_view` proof the items view already uses.
+    /// PyPy's `_match_keywords` indexes its small argument lists with ordinary
+    /// `getitem`, while `Signature.find_argname` is `@jit.elidable`.  Pyre must
+    /// preserve both boundaries: the signature's host `Vec<&str>` stays behind
+    /// the pure residual call, and `keyword_names_w` / `keywords_w` remain
+    /// parallel one-word GC-pointer lists (represented by shadow-stack slot
+    /// indices in the hand-written root scaffold).  No fat-pointer
+    /// `Vec<Wtf8Buf>::index` may escape into the translated binder graph.
     #[test]
     #[ignore]
     fn bind_kwargs_indexes_lower_to_array_reads() {
         use crate::model::{CallTarget, OpKind};
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
+        let hints = crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        assert!(
+            hints
+                .get("gateway::<Impl>::find_argname")
+                .is_some_and(|values| values.iter().any(|hint| hint == "elidable")),
+            "Signature.find_argname must retain PyPy's @jit.elidable marker"
+        );
         let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
             .expect("lower bind_kwargs_to_signature");
 
@@ -33052,12 +33049,12 @@ mod tests {
                 )
             })
             .collect();
-        assert!(
-            !residual_vec_indexes.is_empty(),
-            "`Signature.argnames: Vec<&'static str>` must keep its residual \
-             Vec::index until the container becomes a managed string list; \
-             a one-word ArrayRead over two-word elements reads the wrong \
-             address from the second element on"
+        assert_eq!(
+            residual_vec_indexes.len(),
+            0,
+            "keyword_names_w/keywords_w must lower through their one-word \
+             rooted-list representation; a residual Vec::index blocks the \
+             whole builtin-call chain: {residual_vec_indexes:#?}"
         );
         assert!(
             graph

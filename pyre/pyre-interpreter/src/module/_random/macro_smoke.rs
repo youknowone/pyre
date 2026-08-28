@@ -199,6 +199,40 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_keywords_pack_from_parallel_rooted_lists() {
+        crate::typedef::init_typeobjects();
+        let signature = crate::gateway::Signature::new(
+            vec!["head"],
+            None,
+            Some("kwargs"),
+            /*kwonlyargcount*/ 0,
+            /*posonlyargcount*/ 0,
+        );
+        let bound = crate::call::bind_kwargs_to_signature(
+            &signature,
+            "probe",
+            &[w_int_new(1)],
+            &[
+                (rustpython_wtf8::Wtf8Buf::from("alpha"), w_int_new(2)),
+                (rustpython_wtf8::Wtf8Buf::from("beta"), w_int_new(3)),
+            ],
+        )
+        .expect("unmatched keywords should pack into **kwargs");
+        assert_eq!(bound.len(), 2);
+        let w_kwargs = bound[1];
+        let w_alpha = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(w_kwargs, "alpha")
+                .expect("alpha in **kwargs")
+        };
+        let w_beta = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(w_kwargs, "beta")
+                .expect("beta in **kwargs")
+        };
+        assert_eq!(unsafe { w_int_get_value(w_alpha) }, 2);
+        assert_eq!(unsafe { w_int_get_value(w_beta) }, 3);
+    }
+
+    #[test]
     fn posonly_marker_makes_leading_param_positional_only() {
         crate::typedef::init_typeobjects();
         let signature = _posonly_bound_probe_pyre_sig().expect("derived signature");

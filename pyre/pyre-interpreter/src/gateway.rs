@@ -156,6 +156,7 @@ impl Signature {
     ///         pass
     ///     return -1
     /// ```
+    #[majit_macros::elidable]
     pub fn find_argname(&self, name: &str) -> isize {
         for (i, arg) in self.argnames.iter().enumerate() {
             if *arg == name {
@@ -179,6 +180,7 @@ impl Signature {
     /// raw `&str`; pyre delegates to `find_argname` after unwrapping the
     /// PyObject via `w_str_get_value`.  Non-string `w_name` returns `-1`
     /// (matches PyPy's RPython unwrap-or-fail semantics for strings).
+    #[majit_macros::elidable]
     pub fn find_w_argname(&self, w_name: PyObjectRef) -> isize {
         if w_name.is_null() {
             return -1;

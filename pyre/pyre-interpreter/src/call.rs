@@ -2640,24 +2640,48 @@ pub(crate) fn bind_kwargs_to_signature(
     // on the same call wins first.
     let too_many_args = n_pos > n_pos_params && !has_varargs;
 
-    let mut result = vec![pyre_object::PY_NULL; nparams];
+    // `argument.py` receives `arguments_w`, `keyword_names_w`, and
+    // `keywords_w` as three GC-pointer lists.  The public Rust call surface
+    // carries keyword names as host Wtf8 buffers instead, so materialise the
+    // wrapped-name list once and keep all three lists on the shadow stack.
+    // This is the manual counterpart of the GC transform rooting those live
+    // RPython lists across each name allocation.
+    let roots = pyre_object::gc_roots::push_roots();
+    let pos_args_slot = roots.base();
+    for &value in pos_args {
+        let _ = roots.pin_root(value);
+    }
+    let keyword_values_slot = pos_args_slot + pos_args.len();
+    for (_, value) in kwargs {
+        let _ = roots.pin_root(*value);
+    }
+    let keyword_names_slot = keyword_values_slot + kwargs.len();
+    for (key, _) in kwargs {
+        let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
+        let _ = roots.pin_root(w_key);
+    }
+    let result_slot = keyword_names_slot + kwargs.len();
+    for _ in 0..nparams {
+        let _ = roots.pin_root(pyre_object::PY_NULL);
+    }
     for i in 0..n_pos.min(n_pos_params) {
-        result[i] = pos_args[i];
+        roots.set(result_slot + i, roots.get(pos_args_slot + i));
     }
 
     // _match_keywords — match each keyword to a param name by index.
     // `argument.py:_collect_keyword_args` keeps keyword names and values in
-    // parallel lists (`keyword_names_w`, `keywords_w`) and uses the mapping
-    // only to select unmatched positions.  Preserve that storage shape: an
-    // inline Rust `(Wtf8Buf, PyObjectRef)` tuple would otherwise become a
-    // list-of-inline-structs that RPython never has.
-    let mut extra_kw_names: Vec<Wtf8Buf> = Vec::new();
-    let mut extra_kw_values: Vec<PyObjectRef> = Vec::new();
+    // parallel lists (`keyword_names_w`, `keywords_w`) and uses
+    // `kwds_mapping` only to select unmatched positions.  Preserve that
+    // storage shape by recording the unmatched indices into the two rooted
+    // lists above; an inline Rust `(Wtf8Buf, PyObjectRef)` tuple would become
+    // a list-of-inline-structs that RPython never has.
+    let mut extra_kw_indices: Vec<usize> = Vec::new();
     let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
     // argument.py:469,481-484 — collected across the whole loop, reported
     // together instead of raising on the first violation found.
     let mut posonly_kwds: Vec<String> = Vec::new();
-    for (key, value) in kwargs {
+    let mut kw_index = 0usize;
+    for (key, _) in kwargs {
         // A lone-surrogate keyword name (not valid UTF-8) never equals a
         // source-level parameter name, so it falls straight to **kwargs or
         // the unexpected-keyword error below.
@@ -2666,42 +2690,43 @@ pub(crate) fn bind_kwargs_to_signature(
         } else {
             None
         };
+        // argument.py `_match_keywords` delegates this lookup to the
+        // elidable Signature method.  Keep that boundary: translating the
+        // host `Vec<&str>` iteration here would expose Rust's fat-pointer
+        // storage to the RPython-shaped low-level array model.
+        let pi = if let Some(name) = key_str {
+            sig.find_argname(name)
+        } else {
+            -1
+        };
         let mut matched = false;
-        for pi in 0..nparams {
-            if key_str == Some(sig.argnames[pi]) {
-                // argument.py:474 — positional-only param passed by keyword:
-                // absorb into **kwargs if present, else error.
-                if pi < posonly {
-                    if has_varkw {
-                        break;
-                    }
+        if pi >= 0 {
+            let pi = pi as usize;
+            // argument.py:474 — positional-only param passed by keyword:
+            // absorb into **kwargs if present, else error.
+            if pi < posonly {
+                if !has_varkw {
                     // argument.py:481-484 — collect and keep scanning
                     // remaining keywords instead of raising immediately.
                     posonly_kwds.push(key.to_string());
                     matched = true;
-                    break;
                 }
-                if !result[pi].is_null() {
+            } else {
+                if !roots.get(result_slot + pi).is_null() {
                     return builtin_multiple_values_failure(fname, key);
                 }
-                result[pi] = *value;
+                roots.set(result_slot + pi, roots.get(keyword_values_slot + kw_index));
                 matched = true;
-                break;
             }
         }
         if !matched {
             if has_varkw {
-                // The name stays a `Wtf8Buf` until the packing bracket below.
-                // Interning it here would allocate once per unmatched keyword,
-                // and every one of those is a safepoint that relocates the
-                // values already accumulated — and the bound parameters in
-                // `result` — while nothing names them.
-                extra_kw_names.push(key.clone());
-                extra_kw_values.push(*value);
+                extra_kw_indices.push(kw_index);
             } else {
                 unmatched_kw_names.push(key.clone());
             }
         }
+        kw_index += 1;
     }
 
     // argument.py — ArgErrPosonlyAsKwds, raised after the full
@@ -2728,27 +2753,28 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
-    // The bound parameters, the unmatched keyword values and both tail objects
-    // are all raw copies held across the packing allocations; see the same
-    // bracket in `resolve_kwargs`, including why a star-less signature returns
-    // before it.  Keyword names are non-GC Wtf8 buffers and remain in their
-    // parallel list.
+    // The bound parameters, keyword names, and keyword values are reloaded
+    // from their rooted parallel lists across the packing allocations.  Here
+    // the bracket starts before keyword matching because materialising PyPy's
+    // `keyword_names_w` list itself can collect.
     if !has_varargs && !has_varkw {
+        let mut result = Vec::with_capacity(nparams);
+        for i in 0..nparams {
+            result.push(roots.get(result_slot + i));
+        }
         return Ok(result);
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let result_slot = roots.base();
-    for &value in &result {
-        let _ = roots.pin_root(value);
-    }
-    let extra_slot = result_slot + result.len();
-    for &value in &extra_kw_values {
-        let _ = roots.pin_root(value);
-    }
-    let varargs_slot = extra_slot + extra_kw_values.len();
+    let varargs_slot = result_slot + nparams;
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
-            pos_args[n_pos_params..n_pos].to_vec()
+            // argument.py `_match_signature` slices `args_w[input_argcount:]`.
+            // Reload the rooted list first so the Rust slice contains the
+            // post-collection addresses, then preserve that upstream slice.
+            let mut rooted_pos_args = Vec::with_capacity(n_pos);
+            for i in 0..n_pos {
+                rooted_pos_args.push(roots.get(pos_args_slot + i));
+            }
+            rooted_pos_args.as_slice()[n_pos_params..n_pos].to_vec()
         } else {
             vec![]
         };
@@ -2757,22 +2783,22 @@ pub(crate) fn bind_kwargs_to_signature(
     let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
         let _ = roots.pin_root(pyre_object::w_dict_new_kwargs());
-        // The index loop lowers to direct element loads; iterator adapters are residual calls.
+        // The index loop lowers to direct one-word element loads; iterator
+        // adapters are residual calls.
         #[allow(clippy::needless_range_loop)]
-        for i in 0..extra_kw_names.len() {
-            let key = &extra_kw_names[i];
+        for i in 0..extra_kw_indices.len() {
+            let kw_index = extra_kw_indices[i];
             unsafe {
-                // The key allocation runs first: as the second argument it
-                // would be evaluated after the receiver, handing
-                // `w_dict_store` the pre-collection dict address.
-                let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
-                pyre_object::w_dict_store(roots.get(varkw_slot), w_key, roots.get(extra_slot + i));
+                pyre_object::w_dict_store(
+                    roots.get(varkw_slot),
+                    roots.get(keyword_names_slot + kw_index),
+                    roots.get(keyword_values_slot + kw_index),
+                );
             }
         }
     }
-    let result_len = result.len();
-    let mut result: Vec<PyObjectRef> = Vec::with_capacity(result_len);
-    for i in 0..result_len {
+    let mut result: Vec<PyObjectRef> = Vec::with_capacity(nparams);
+    for i in 0..nparams {
         result.push(roots.get(result_slot + i));
     }
     if has_varargs {
