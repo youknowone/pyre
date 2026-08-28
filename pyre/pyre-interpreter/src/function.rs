@@ -1023,6 +1023,28 @@ pub unsafe fn is_method_descriptor(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &METHOD_DESCRIPTOR_TYPE) }
 }
 
+/// PyPy `_Method(w_function, w_instance)` binding, restamped so the binding
+/// publishes `public_class` instead of the `Method` typedef and carries
+/// `m_module = None`.
+///
+/// The two `get` arms that restamp differ only in `public_class`, so both go
+/// through here.  The tracer's `super` fold reproduces this call with the same
+/// argument once it has chosen the class, which keeps the value it records and
+/// the value the emitted stores build identical by construction.
+pub fn restamped_bound_method_new(
+    descr: PyObjectRef,
+    obj: PyObjectRef,
+    w_class: PyObjectRef,
+    public_class: PyObjectRef,
+) -> PyObjectRef {
+    let method = pyre_object::w_method_new(descr, obj, w_class);
+    unsafe {
+        pyre_object::function::w_method_set_public_class(method, public_class);
+        pyre_object::function::w_method_set_module(method, pyre_object::w_none());
+    }
+    method
+}
+
 /// PyPy `_Method(w_function, w_instance)` binding with CPython 3.14's
 /// `builtin_function_or_method` public surface and `m_module = None`.
 pub fn builtin_bound_method_new(
@@ -1030,15 +1052,12 @@ pub fn builtin_bound_method_new(
     obj: PyObjectRef,
     w_class: PyObjectRef,
 ) -> PyObjectRef {
-    let method = pyre_object::w_method_new(descr, obj, w_class);
-    unsafe {
-        pyre_object::function::w_method_set_public_class(
-            method,
-            crate::typedef::gettypeobject(&BUILTIN_FUNCTION_TYPE),
-        );
-        pyre_object::function::w_method_set_module(method, pyre_object::w_none());
-    }
-    method
+    restamped_bound_method_new(
+        descr,
+        obj,
+        w_class,
+        crate::typedef::gettypeobject(&BUILTIN_FUNCTION_TYPE),
+    )
 }
 
 /// `descrobject.c PyWrapper_New` — bind a slot wrapper to its receiver.
@@ -1053,15 +1072,12 @@ pub fn method_wrapper_new(
     obj: PyObjectRef,
     w_class: PyObjectRef,
 ) -> PyObjectRef {
-    let method = pyre_object::w_method_new(descr, obj, w_class);
-    unsafe {
-        pyre_object::function::w_method_set_public_class(
-            method,
-            crate::typedef::gettypeobject(&METHOD_WRAPPER_TYPE),
-        );
-        pyre_object::function::w_method_set_module(method, pyre_object::w_none());
-    }
-    method
+    restamped_bound_method_new(
+        descr,
+        obj,
+        w_class,
+        crate::typedef::gettypeobject(&METHOD_WRAPPER_TYPE),
+    )
 }
 
 /// Publish a `ClassMethod` carrier built for a `METH_CLASS` entry as

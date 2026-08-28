@@ -4148,7 +4148,29 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
         },
     );
     frame.fix_array_ptrs();
-    match frame.execute_frame(None, None) {
+    // `pycode.py _compute_flatcall` deliberately rejects a function when a
+    // positional argument is also a cellvar.  That is the shape zero-argument
+    // super gets when a nested function captures `self`/`cls`: it reaches this
+    // generic Function.call_args path even though `PyCode.funcrun` still enters
+    // `frame.run` and is JIT-eligible in PyPy.  Keep the repair scoped to code
+    // which actually names `super`; routing every generic descriptor/protocol
+    // call through pyre's portal changes unrelated stdlib trace topology until
+    // the broader Function.call_args port is ready as one unit.
+    let positional_arg_is_cellvar = code_ref.cellvars.iter().any(|cell| {
+        code_ref
+            .varnames
+            .iter()
+            .take(code_ref.arg_count as usize)
+            .any(|arg| arg == cell)
+    });
+    let names_super = code_ref.names.iter().any(|name| name == "super");
+    let result = if positional_arg_is_cellvar && names_super {
+        let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
+        frame.run_with_jit()
+    } else {
+        frame.execute_frame(None, None)
+    };
+    match result {
         Ok(v) => v,
         Err(e) => {
             set_call_error(e);

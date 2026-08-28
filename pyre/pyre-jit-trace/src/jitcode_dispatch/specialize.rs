@@ -2851,25 +2851,25 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// The `localsplus` slot the `__class__` cell occupies in `code`.
+/// Whether `localsplus[0]` itself needs a cell dereference, and the slot the
+/// `__class__` cell occupies in `code`.
 ///
-/// `None` where `builtins.rs super_operands_from_frame` takes a branch this
-/// does not model: no positional argument at all, and a first argument that is
-/// ALSO a cellvar (`_get_self_location`'s cellvar branch), whose slot holds a
-/// `Cell` rather than the receiver and so takes a second dereference.
-fn bare_super_class_slot(code: &pyre_interpreter::CodeObject) -> Option<usize> {
+/// This is `pyframe.py _get_self_location` plus
+/// `builtins.rs super_operands_from_frame`: a positional argument is required,
+/// and when its name is also a cellvar the fast-local slot holds the `Cell`
+/// shared with closures rather than the receiver directly.
+fn bare_super_frame_layout(code: &pyre_interpreter::CodeObject) -> Option<(bool, usize)> {
     if code.arg_count == 0 {
         return None;
     }
-    if code
+    let self_is_cell = code
         .varnames
         .first()
-        .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first))
-    {
-        return None;
-    }
+        .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first));
     let class_freevar = code.freevars.iter().position(|name| name == "__class__")?;
-    Some(code.varnames.len() + pyre_interpreter::pyframe::npure_cellvars(code) + class_freevar)
+    let class_slot =
+        code.varnames.len() + pyre_interpreter::pyframe::npure_cellvars(code) + class_freevar;
+    Some((self_is_cell, class_slot))
 }
 
 /// The two operands `builtins.rs super_operands_from_frame` reads off the
@@ -2888,7 +2888,7 @@ fn bare_super_class_slot(code: &pyre_interpreter::CodeObject) -> Option<usize> {
 /// Reading them records no op.
 fn walker_bare_super_frame_slots<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
-) -> Option<(OpRef, OpRef)> {
+) -> Option<(OpRef, OpRef, bool)> {
     if let Some(shadow) = ctx.callee_shadow.as_ref() {
         // `u16::MAX` is the strict fresh-frame fold switched off and a `NONE`
         // frame box is a frame register that was never seeded; in neither case
@@ -2898,7 +2898,8 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         }
         // SAFETY: the code object outlives the walk that resolved it; read-only.
         let code = unsafe { shadow.code_ptr.as_ref()? };
-        let class_slot = bare_super_class_slot(code)? as i64;
+        let (self_is_cell, class_slot) = bare_super_frame_layout(code)?;
+        let class_slot = class_slot as i64;
         let slot_op = |slot: i64| -> Option<OpRef> {
             let op = shadow.opref.get(&slot).copied()?;
             // Only an entry recorded through THIS level's frame register
@@ -2906,7 +2907,7 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
             // own-frame vable read applies.
             (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
         };
-        return Some((slot_op(0)?, slot_op(class_slot)?));
+        return Some((slot_op(0)?, slot_op(class_slot)?, self_is_cell));
     }
     // A sub-walk that owns no shadow walks a frame the standard virtualizable
     // does not name, and a trace has exactly one of those.
@@ -2929,7 +2930,7 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
     // SAFETY: the frame is the live standard virtualizable; read-only.
     let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(&*frame) };
     let code = unsafe { code_ptr.as_ref()? };
-    let class_slot = bare_super_class_slot(code)?;
+    let (self_is_cell, class_slot) = bare_super_frame_layout(code)?;
     // `locals_cells_stack_w` is PyFrame's only virtualizable array
     // (`virtualizable_gen.rs arrays`), so array index 0 names it.
     let info = ctx.trace_ctx.virtualizable_info()?;
@@ -2949,7 +2950,7 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         .trace_ctx
         .virtualizable_entry_at(info.get_index_in_array(0, class_slot, lengths))?
         .0;
-    Some((self_op, cell_op))
+    Some((self_op, cell_op, self_is_cell))
 }
 
 /// Zero-argument `super()` folded to the proxy itself rather than re-routed to
@@ -2972,9 +2973,9 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
 /// iteration: the cell a class body fills is written once, before any method
 /// of that class can run, and `w_cell_set` marks the family the moment a
 /// second write happens -- which retires this trace.  A cell that has already
-/// been rebound declines here and keeps the residual, as does a method whose
-/// own `self` is a cellvar and a receiver `super_check` cannot settle without
-/// running Python.
+/// been rebound declines here and keeps the residual.  A method whose own
+/// `self` is a cellvar takes the same guarded live `Cell.contents` read as
+/// LOAD_DEREF before `_super_check` sees the receiver.
 pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -3001,11 +3002,28 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let Some((self_op, class_cell_op)) = walker_bare_super_frame_slots(ctx) else {
+    let Some((raw_self_op, class_cell_op, self_is_cell)) = walker_bare_super_frame_slots(ctx)
+    else {
         return Ok(None);
     };
-    let Some(concrete_self) = walker_concrete_ref_object(ctx, self_op) else {
+    let Some(concrete_raw_self) = walker_concrete_ref_object(ctx, raw_self_op) else {
         return Ok(None);
+    };
+    let (concrete_self, self_cell_ref) = if self_is_cell {
+        if !unsafe { pyre_object::is_cell(concrete_raw_self) } {
+            return Ok(None);
+        }
+        let family = unsafe { pyre_object::w_cell_family(concrete_raw_self) };
+        if family.is_null() || unsafe { (*family).ever_mutated.get() } {
+            return Ok(None);
+        }
+        let contents = unsafe { pyre_object::w_cell_get(concrete_raw_self) };
+        if contents.is_null() {
+            return Ok(None);
+        }
+        (contents, Some(majit_ir::GcRef(concrete_raw_self as usize)))
+    } else {
+        (concrete_raw_self, None)
     };
     let Some(concrete_cell) = walker_concrete_ref_object(ctx, class_cell_op) else {
         return Ok(None);
@@ -3026,11 +3044,8 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
         return Ok(None);
     }
     // `descriptor.py:28-30` -- `None` builds the UNBOUND proxy, whose `w_self`
-    // is null and whose attribute reads take a different arm entirely, and a
-    // class receiver binds with a null `descr_obj`.
-    if unsafe { pyre_object::is_none(concrete_self) }
-        || unsafe { pyre_object::is_type(concrete_self) }
-    {
+    // is null and whose attribute reads take a different arm entirely.
+    if unsafe { pyre_object::is_none(concrete_self) } {
         return Ok(None);
     }
     let Some(objtype) =
@@ -3038,12 +3053,28 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    // The receiver's class is read back out of the object below, so the two
-    // must be the same word: an exception instance carrying the generic stub
-    // resolves its class through the kind registry instead.
-    if !std::ptr::eq(objtype, unsafe { (*concrete_self).w_class }) {
+    let class_mode =
+        unsafe { pyre_object::is_type(concrete_self) } && std::ptr::eq(objtype, concrete_self);
+    // Instance mode reads the receiver class back out of `w_class`; class mode
+    // is `_super_check`'s first arm and pins the class object itself below.
+    if !class_mode && !std::ptr::eq(objtype, unsafe { (*concrete_self).w_class }) {
         return Ok(None);
     }
+
+    // `_get_self_location`'s cellvar arm is the ordinary red-cell LOAD_DEREF
+    // shape.  All of that helper's decline conditions were proved above (and
+    // the inline-resume condition at entry), so once it emits no later
+    // optional branch can abandon a partially-written fold.
+    let self_op = if let Some(cell_ref) = self_cell_ref {
+        let Some(value) =
+            residual_call::try_walker_read_deref_cell(ctx, op.pc, raw_self_op, cell_ref)?
+        else {
+            return Ok(None);
+        };
+        value
+    } else {
+        raw_self_op
+    };
 
     // Which callable `super` names is baked into the emitted body.
     let callable_op = r_args[0];
@@ -3101,6 +3132,7 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
         concrete_cls,
         concrete_self,
         objtype,
+        class_mode,
     )?;
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', proxy_op)?;
     Ok(Some(()))
@@ -4560,9 +4592,12 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((objtype, _version_tag, w_descr)) = (unsafe {
+    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
         pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, &name)
     }) else {
+        return Ok(None);
+    };
+    let Some(binding) = super_attr_binding(w_descr, concrete_self, class_mode) else {
         return Ok(None);
     };
 
@@ -4580,7 +4615,7 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(global_super, super_const);
     }
-    let method_op = walker_emit_super_attr_method(
+    let value_op = walker_emit_super_attr_result(
         ctx,
         op_pc,
         self_obj,
@@ -4589,9 +4624,140 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
         concrete_cls,
         objtype,
         w_descr,
+        class_mode,
+        binding,
     )?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value_op)?;
     Ok(Some(()))
+}
+
+/// A Python-free result of binding the descriptor found by the `super` MRO
+/// suffix walk.  Descriptor identity is protected by the receiver type's
+/// version tag; `slot_pin` additionally protects an in-place replacement of a
+/// staticmethod/classmethod wrapper's `_immutable_fields_` callable slot.
+enum SuperAttrBinding {
+    Constant {
+        value: pyre_object::PyObjectRef,
+        slot_pin: Option<majit_ir::DescrRef>,
+    },
+    Method {
+        w_function: pyre_object::PyObjectRef,
+        header: (bool, pyre_object::PyObjectRef),
+        bind_to_class: bool,
+        slot_pin: Option<majit_ir::DescrRef>,
+    },
+}
+
+/// Classify the exact descriptor shapes for which PyPy's
+/// `space.get(w_descr, descr_obj, objtype)` runs no Python.
+fn super_attr_binding(
+    w_descr: pyre_object::PyObjectRef,
+    concrete_self: pyre_object::PyObjectRef,
+    class_mode: bool,
+) -> Option<SuperAttrBinding> {
+    let descr_ob_type = unsafe { (*w_descr).ob_type };
+    if std::ptr::eq(descr_ob_type, &pyre_interpreter::FUNCTION_TYPE as *const _)
+        || std::ptr::eq(
+            descr_ob_type,
+            &pyre_interpreter::METHOD_DESCRIPTOR_TYPE as *const _,
+        )
+    {
+        if class_mode {
+            return Some(SuperAttrBinding::Constant {
+                value: w_descr,
+                slot_pin: None,
+            });
+        }
+        return Some(SuperAttrBinding::Method {
+            w_function: w_descr,
+            header: super_attr_method_header(w_descr)?,
+            bind_to_class: false,
+            slot_pin: None,
+        });
+    }
+    if unsafe { pyre_object::function::is_exact_staticmethod(w_descr) } {
+        let mut value = unsafe { pyre_object::function::w_staticmethod_get_func(w_descr) };
+        if value.is_null() {
+            value = pyre_object::w_none();
+        }
+        return Some(SuperAttrBinding::Constant {
+            value,
+            slot_pin: Some(crate::descr::staticmethod_w_function_quasi_descr()),
+        });
+    }
+    if unsafe { pyre_object::function::is_exact_classmethod(w_descr) } {
+        let w_function = unsafe { pyre_object::function::w_classmethod_get_func(w_descr) };
+        if w_function.is_null() {
+            return None;
+        }
+        let header = pyre_object::get_instantiate(&pyre_object::function::METHOD_TYPE);
+        if header.is_null() {
+            return None;
+        }
+        return Some(SuperAttrBinding::Method {
+            w_function,
+            header: (false, header),
+            bind_to_class: true,
+            slot_pin: Some(crate::descr::classmethod_w_function_quasi_descr()),
+        });
+    }
+    // `get`'s slot-wrapper arm, which class mode never reaches: there the
+    // descriptor comes back unchanged.  Its instance check is a precondition of
+    // the binding rather than part of it, so it is settled here against the
+    // receiver whose class the emitted guards pin; a receiver it rejects
+    // declines and raises in the interpreter.
+    if !class_mode
+        && unsafe {
+            pyre_interpreter::baseobjspace::super_attr_slot_wrapper_binds(w_descr, concrete_self)
+        }
+    {
+        return Some(SuperAttrBinding::Method {
+            w_function: w_descr,
+            header: super_attr_method_header(w_descr)?,
+            bind_to_class: false,
+            slot_pin: None,
+        });
+    }
+    if unsafe {
+        pyre_interpreter::baseobjspace::super_attr_returns_descr_unchanged(w_descr, class_mode)
+    } {
+        return Some(SuperAttrBinding::Constant {
+            value: w_descr,
+            slot_pin: None,
+        });
+    }
+    None
+}
+
+/// The two words that separate the `Method` `get` builds for the descriptor
+/// typedefs the `super` fold binds.
+///
+/// A `function` binds through `w_method_new`, which leaves `w_module` null and
+/// lets the allocation's own header stand.  The other two arms bind through
+/// `restamped_bound_method_new`, which is that same call followed by two
+/// stores: the Python-visible class becomes `builtin_function_or_method` for a
+/// `method_descriptor` and `method-wrapper` for a slot wrapper, and `w_module`
+/// becomes `None`.  The payload is identical in all three, so one emission
+/// serves them once these two words are chosen.
+///
+/// `None` when the chosen type object is not registered, which is resolved
+/// here — before the caller emits anything — so the decline leaves the trace
+/// untouched.
+fn super_attr_method_header(
+    w_descr: pyre_object::PyObjectRef,
+) -> Option<(bool, pyre_object::PyObjectRef)> {
+    let restamped_class = if unsafe { pyre_interpreter::is_method_descriptor(w_descr) } {
+        Some(&pyre_interpreter::BUILTIN_FUNCTION_TYPE)
+    } else if unsafe { pyre_interpreter::is_slot_wrapper(w_descr) } {
+        Some(&pyre_interpreter::METHOD_WRAPPER_TYPE)
+    } else {
+        None
+    };
+    let header = match restamped_class {
+        Some(ty) => pyre_interpreter::typedef::gettypeobject(ty),
+        None => pyre_object::get_instantiate(&pyre_object::function::METHOD_TYPE),
+    };
+    (!header.is_null()).then_some((restamped_class.is_some(), header))
 }
 
 /// The body `super(cls, self).name` compiles to, once
@@ -4608,7 +4774,7 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
 /// opcode form pins the global it loaded, while the proxy form has a
 /// `GuardClass` on the proxy itself, which no other type can pass.
 #[allow(clippy::too_many_arguments)]
-fn walker_emit_super_attr_method<Sym: WalkSym>(
+fn walker_emit_super_attr_result<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     self_obj: OpRef,
@@ -4617,6 +4783,120 @@ fn walker_emit_super_attr_method<Sym: WalkSym>(
     concrete_cls: pyre_object::PyObjectRef,
     objtype: pyre_object::PyObjectRef,
     w_descr: pyre_object::PyObjectRef,
+    class_mode: bool,
+    binding: SuperAttrBinding,
+) -> Result<OpRef, DispatchError> {
+    let objtype_const = walker_emit_super_attr_lookup_guards(
+        ctx,
+        op_pc,
+        self_obj,
+        cls,
+        concrete_self,
+        concrete_cls,
+        objtype,
+        class_mode,
+    )?;
+
+    let slot_pin = match &binding {
+        SuperAttrBinding::Constant { slot_pin, .. } | SuperAttrBinding::Method { slot_pin, .. } => {
+            slot_pin.clone()
+        }
+    };
+    if let Some(field) = slot_pin {
+        walker_pin_descriptor_slot(ctx, op_pc, w_descr, field)?;
+    }
+
+    let (w_function, method_header, bind_to_class) = match binding {
+        SuperAttrBinding::Constant { value, .. } => {
+            return Ok(ctx.trace_ctx.const_ref(value as i64));
+        }
+        SuperAttrBinding::Method {
+            w_function,
+            header,
+            bind_to_class,
+            ..
+        } => (w_function, header, bind_to_class),
+    };
+
+    // `get(w_descr, self, objtype)` is `w_method_new(w_descr, self, objtype)`
+    // plus the header stamp its allocation performs (`ob_type` comes from the
+    // NewWithVtable's size descr).  [`super_attr_method_header`] has already
+    // picked the header class, and its flag says whether the two extra stores
+    // `builtin_bound_method_new` performs are owed on top.
+    let (restamps_header, header_w_class_obj) = method_header;
+    let func_const = ctx.trace_ctx.const_ref(w_function as i64);
+    let header_w_class = ctx.trace_ctx.const_ref(header_w_class_obj as i64);
+    let bound_self = if bind_to_class {
+        objtype_const
+    } else {
+        self_obj
+    };
+    let method_op = crate::helpers::emit_bound_method_inline(
+        ctx.trace_ctx,
+        func_const,
+        bound_self,
+        objtype_const,
+        header_w_class,
+    );
+    if restamps_header {
+        // `w_method_new` leaves `w_module` null and a virtual reads an
+        // unwritten field as null, so only the restamping arms owe the slot a
+        // store.
+        let module_descr = crate::descr::method_w_module_descr();
+        let module_index = module_descr.index();
+        let none_const = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[method_op, none_const],
+            module_descr,
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(method_op, module_index, none_const);
+    }
+    // The physical layout is `Method` either way: `restamped_bound_method_new`
+    // restamps the Python-visible `w_class`, not `ob_type`.
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(method_op, method_type_addr);
+    // The concrete bound method the walker's own execution must observe; a
+    // fresh `Method` per evaluation is what `getattribute` produces anyway, so
+    // the trace allocating its own is not an identity divergence.
+    let concrete_bound_self = if bind_to_class {
+        objtype
+    } else {
+        concrete_self
+    };
+    let bound = if restamps_header {
+        pyre_interpreter::restamped_bound_method_new(
+            w_function,
+            concrete_bound_self,
+            objtype,
+            header_w_class_obj,
+        )
+    } else {
+        pyre_object::w_method_new(w_function, concrete_bound_self, objtype)
+    };
+    ctx.trace_ctx.set_opref_concrete(
+        method_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(bound as usize)),
+    );
+    Ok(method_op)
+}
+
+/// Emit the guards that make a recording-time `super` MRO suffix answer valid
+/// on every execution.  Kept separate from result binding so a Python property
+/// getter can enter the ordinary inline-call path after the same lookup guards.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    self_obj: OpRef,
+    cls: OpRef,
+    concrete_self: pyre_object::PyObjectRef,
+    concrete_cls: pyre_object::PyObjectRef,
+    objtype: pyre_object::PyObjectRef,
+    class_mode: bool,
 ) -> Result<OpRef, DispatchError> {
     // The class the walk starts after is baked into the emitted body.
     let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
@@ -4625,71 +4905,60 @@ fn walker_emit_super_attr_method<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
     }
 
-    // guard_class(self, ob_type): the physical layout the `w_class` read
-    // below needs.
-    let phys_type = unsafe { (*concrete_self).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(self_obj) {
-        let type_const = ctx.trace_ctx.const_int(phys_type);
+    let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
+    if class_mode {
+        // `_super_check`'s first arm: the receiver is the class whose MRO is
+        // walked.  Pin that class object itself; its `w_class` is a metaclass
+        // and is not the namespace anchor this lookup uses.
+        if !self_obj.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[self_obj, objtype_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(self_obj, objtype_const);
+        }
+    } else {
+        // guard_class(self, ob_type): the physical layout the `w_class` read
+        // below needs.
+        let phys_type = unsafe { (*concrete_self).ob_type } as i64;
+        if !ctx.trace_ctx.heap_cache().is_class_known(self_obj) {
+            let type_const = ctx.trace_ctx.const_int(phys_type);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardClass,
+                &[self_obj, type_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(self_obj, phys_type);
+        }
+
+        // Pin the Python-level class exactly: a subclass reaching the same
+        // physical layout has its own MRO suffix after `cls`.
+        let w_class_op =
+            walker_record_getfield_gc_r_uncached(ctx, self_obj, crate::descr::w_class_descr());
         walker_emit_fold_guard_with_snapshot(
             ctx,
             op_pc,
-            OpCode::GuardClass,
-            &[self_obj, type_const],
+            OpCode::GuardValue,
+            &[w_class_op, objtype_const],
         )?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(self_obj, phys_type);
+            .replace_box(w_class_op, objtype_const);
     }
-
-    // Pin the Python-level class exactly: a subclass reaching the same
-    // physical layout has its own MRO suffix after `cls`.
-    let w_class_op =
-        walker_record_getfield_gc_r_uncached(ctx, self_obj, crate::descr::w_class_descr());
-    let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, objtype_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, objtype_const);
 
     // typeobject.py `promote(self.version_tag())`.  Every class the suffix
     // walk reads is an ancestor of `objtype` and `mutated()` recurses into
     // subclasses, so this one tag covers a dict store or a `__bases__`
     // reassignment anywhere in that suffix.
     walker_pin_type_version_tag(ctx, op_pc, objtype_const)?;
-
-    // `get(w_descr, self, objtype)` for the exact `function` typedef is
-    // `w_method_new(w_descr, self, objtype)` plus the header stamp its
-    // allocation performs (`ob_type` comes from the NewWithVtable's size
-    // descr).
-    let func_const = ctx.trace_ctx.const_ref(w_descr as i64);
-    let header_w_class = ctx
-        .trace_ctx
-        .const_ref(pyre_object::get_instantiate(&pyre_object::function::METHOD_TYPE) as i64);
-    let method_op = crate::helpers::emit_bound_method_inline(
-        ctx.trace_ctx,
-        func_const,
-        self_obj,
-        objtype_const,
-        header_w_class,
-    );
-    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(method_op, method_type_addr);
-    // The concrete bound method the walker's own execution must observe; a
-    // fresh `Method` per evaluation is what `getattribute` produces anyway, so
-    // the trace allocating its own is not an identity divergence.
-    let bound = pyre_object::w_method_new(w_descr, concrete_self, objtype);
-    ctx.trace_ctx.set_opref_concrete(
-        method_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(bound as usize)),
-    );
-    Ok(method_op)
+    Ok(objtype_const)
 }
 
 /// `descriptor.py W_Super.getattribute` for a proxy the trace already holds —
@@ -4711,6 +4980,15 @@ fn walker_emit_super_attr_method<Sym: WalkSym>(
 /// the opcode form carries: only `w_super_new` builds one of these, so a
 /// receiver that passes the guard came from `super()` whatever the global
 /// named at the time.
+///
+/// It does not stand in for the Python class, though.  `super_descr_new`
+/// allocates a subclass instance through `w_super_new` too and then retags only
+/// `w_class`, so `class MySuper(super)` shares the `ob_type` this guard reads
+/// and would reuse the trace.  Its `__getattribute__` override owns the answer,
+/// and this body does not run it, so the operand is pinned on the `w_class`
+/// axis as well -- the same split `walker_exact_builtin_class` handles for the
+/// numeric folds.  A proxy this walk emitted is virtual and carries the
+/// canonical class by construction, so the pin costs it nothing.
 pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -4731,33 +5009,32 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
     if !unsafe { pyre_object::descriptor::is_super(concrete_proxy) } {
         return Ok(None);
     }
+    let Some(proxy_w_class) = (unsafe { walker_exact_builtin_class(concrete_proxy) }) else {
+        return Ok(None);
+    };
     let concrete_cls = unsafe { pyre_object::descriptor::w_super_get_type(concrete_proxy) };
     let concrete_self = unsafe { pyre_object::descriptor::w_super_get_obj(concrete_proxy) };
     // `super_attr_fast_path` refuses a null receiver (the unbound `super(C)`
-    // proxy), a class receiver, `__class__` / `__dict__`, an uncacheable type
-    // and a name no MRO suffix answers -- every shape this must not emit.
-    let Some((objtype, _version_tag, w_descr)) = (unsafe {
+    // proxy), `__class__` / `__dict__`, an uncacheable type and a name no MRO
+    // suffix answers -- every shape this must not emit.
+    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
         pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
     }) else {
         return Ok(None);
     };
+    let Some(binding) = super_attr_binding(w_descr, concrete_self, class_mode) else {
+        return Ok(None);
+    };
 
-    let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(super_type_addr);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, super_type_addr);
-    }
-    let cls_op = walker_read_super_field(
+    let (self_op, cls_op) = walker_guard_and_read_super_proxy(
         ctx,
+        op_pc,
         obj,
-        crate::descr::super_start_type_descr(),
+        proxy_w_class,
+        concrete_self,
         concrete_cls,
-    );
-    let self_op = walker_read_super_field(ctx, obj, crate::descr::super_obj_descr(), concrete_self);
-    let method_op = walker_emit_super_attr_method(
+    )?;
+    let value_op = walker_emit_super_attr_result(
         ctx,
         op_pc,
         self_op,
@@ -4766,9 +5043,45 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
         concrete_cls,
         objtype,
         w_descr,
+        class_mode,
+        binding,
     )?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, method_op)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value_op)?;
     Ok(Some(()))
+}
+
+/// Guard an already-built `super` proxy as the exact builtin implementation
+/// and expose its two live lookup operands to the trace.
+///
+/// Both the Python-free result fold and the property-getter inline use this
+/// prefix.  Descriptor classification happens before entry, so no caller can
+/// decline after these guards merely because the selected descriptor needs a
+/// different binding path.
+pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    proxy_w_class: pyre_object::PyObjectRef,
+    concrete_self: pyre_object::PyObjectRef,
+    concrete_cls: pyre_object::PyObjectRef,
+) -> Result<(OpRef, OpRef), DispatchError> {
+    let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(super_type_addr);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, super_type_addr);
+    }
+    walker_guard_exact_w_class(ctx, op_pc, obj, proxy_w_class)?;
+    let cls_op = walker_read_super_field(
+        ctx,
+        obj,
+        crate::descr::super_start_type_descr(),
+        concrete_cls,
+    );
+    let self_op = walker_read_super_field(ctx, obj, crate::descr::super_obj_descr(), concrete_self);
+    Ok((self_op, cls_op))
 }
 
 /// One `W_Super` field read, with the recording-time value attached when the
@@ -4818,9 +5131,10 @@ fn walker_read_super_field<Sym: WalkSym>(
 /// its third arm asks for `__class__`, which a property answers with arbitrary
 /// Python, and the walk executes its own emissions concretely, so a fold that
 /// reached that arm would run user code at recording time and then repeat it
-/// under the residual on a decline.  A class receiver is refused as well --
-/// `getattribute` binds those with a null `descr_obj`, which is not the body
-/// the attribute fold emits.
+/// under the residual on a decline.  The first arm is the class-method case:
+/// it stores the class itself as both `w_objtype` and `w_self`; the proxy
+/// emission below pins that class object directly rather than reading its
+/// metaclass out of `w_class`.
 pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -4863,9 +5177,7 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     }
     // `descriptor.py:28-30` — `None` builds the UNBOUND proxy, whose `w_self`
     // is null and whose attribute reads take a different arm entirely.
-    if unsafe { pyre_object::is_none(concrete_obj) }
-        || unsafe { pyre_object::is_type(concrete_obj) }
-    {
+    if unsafe { pyre_object::is_none(concrete_obj) } {
         return Ok(None);
     }
     if !unsafe { pyre_object::is_type(concrete_cls) } {
@@ -4876,10 +5188,14 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    // The receiver's class is read back out of the object below, so the two
-    // must be the same word: an exception instance carrying the generic stub
-    // resolves its class through the kind registry instead.
-    if !std::ptr::eq(objtype, unsafe { (*concrete_obj).w_class }) {
+    let class_mode =
+        unsafe { pyre_object::is_type(concrete_obj) } && std::ptr::eq(objtype, concrete_obj);
+    // In instance mode the receiver's class is read back out of the object
+    // below, so the two must be the same word: an exception instance carrying
+    // the generic stub resolves its class through the kind registry instead.
+    // In class mode `_super_check` returns the receiver class itself and its
+    // `w_class` is the metaclass, so identity of `obj_op` is the guard instead.
+    if !class_mode && !std::ptr::eq(objtype, unsafe { (*concrete_obj).w_class }) {
         return Ok(None);
     }
 
@@ -4907,6 +5223,7 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
         concrete_cls,
         concrete_obj,
         objtype,
+        class_mode,
     )?;
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', proxy_op)?;
     Ok(Some(()))
@@ -4931,6 +5248,7 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
     concrete_cls: pyre_object::PyObjectRef,
     concrete_obj: pyre_object::PyObjectRef,
     objtype: pyre_object::PyObjectRef,
+    class_mode: bool,
 ) -> Result<OpRef, DispatchError> {
     let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
     if !cls_op.is_constant() {
@@ -4939,36 +5257,56 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(cls_op, cls_const);
     }
-    // guard_class(obj, ob_type): the physical layout the `w_class` read needs.
-    let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj_op) {
-        let type_const = ctx.trace_ctx.const_int(phys_type);
+    let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
+    if class_mode {
+        // descriptor.py `_super_check`'s first arm returns `w_obj_or_type`
+        // itself.  Pin that class object: guarding its physical TYPE_TYPE
+        // layout would admit every class and reading `w_class` would produce
+        // the metaclass, neither of which protects the baked MRO root.
+        if !obj_op.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[obj_op, objtype_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .replace_box(obj_op, objtype_const);
+        }
+    } else {
+        // guard_class(obj, ob_type): the physical layout the `w_class` read
+        // below needs.
+        let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
+        if !ctx.trace_ctx.heap_cache().is_class_known(obj_op) {
+            let type_const = ctx.trace_ctx.const_int(phys_type);
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardClass,
+                &[obj_op, type_const],
+            )?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .class_now_known(obj_op, phys_type);
+        }
+        // `_super_check`'s answer is baked, so pin the receiver's exact Python
+        // class.  An exception instance carrying the generic stub may resolve
+        // its class through the kind registry instead and was declined above.
+        let w_class_op =
+            walker_record_getfield_gc_r_uncached(ctx, obj_op, crate::descr::w_class_descr());
         walker_emit_fold_guard_with_snapshot(
             ctx,
             op_pc,
-            OpCode::GuardClass,
-            &[obj_op, type_const],
+            OpCode::GuardValue,
+            &[w_class_op, objtype_const],
         )?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .class_now_known(obj_op, phys_type);
+            .replace_box(w_class_op, objtype_const);
     }
-    // `_super_check`'s answer is baked, so pin what it was computed from: the
-    // receiver's exact Python class, and the version tag that a `__bases__`
-    // reassignment anywhere in its ancestry bumps -- which is the one thing
-    // that could make `issubtype_w(objtype, cls)` stop holding.
-    let w_class_op =
-        walker_record_getfield_gc_r_uncached(ctx, obj_op, crate::descr::w_class_descr());
-    let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, objtype_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, objtype_const);
+    // A `__bases__` reassignment anywhere in the selected class's ancestry
+    // bumps this tag and can make `issubtype_w(objtype, cls)` stop holding.
     walker_pin_type_version_tag(ctx, op_pc, objtype_const)?;
 
     let header_w_class = ctx

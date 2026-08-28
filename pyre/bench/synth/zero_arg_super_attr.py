@@ -1,11 +1,12 @@
 # pyre-check: max-pypy-ratio=4
 # pyre-check: skip-cpython
-# The ceiling is 4 rather than 2 because this ratio is host-dependent and the
-# gate has to hold on the worst host, not the best.  Measured on the same
-# commit: 1.5x dynasm / 1.5x cranelift on an arm64 mac runner, 1.9x dynasm on
-# a windows runner, 2.0x dynasm on an x86_64 ubuntu runner -- and 3.0x
-# cranelift on that same ubuntu runner.  The excess is cranelift's x86_64
-# code for the proxy ops, not a decline: the fold fires on every host.
+# pyre-check: spec-folds=load_super_attr,super_attr_unwrap
+# `spec-folds` is the invariant here: those two folds fire or the fixture
+# fails, on every host and backend.  The ratio is a backstop sized to the
+# slowest reading -- 3.0x under cranelift on x86_64 ubuntu against 1.9x under
+# dynasm on that same runner, where the whole macro suite shows the same
+# backend spread with no super in it.  See `name_bound_super_attr.py` for the
+# measurement.
 # The loop folds to one add per iteration on both JITs, so N has to be in
 # the hundreds of millions before pypy's execution time is a measurement
 # rather than a clock tick — and at that size cpython is minutes behind.

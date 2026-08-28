@@ -4529,7 +4529,7 @@ fn super_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     // Routed by name object rather than by `&str` so a name that carries a
     // lone surrogate takes the surrogate-aware lookup instead of demanding a
     // view its buffer cannot give; the string check comes with it.
-    crate::baseobjspace::getattr(args[0], args[1])
+    crate::baseobjspace::super_getattribute(args[0], args[1])
 }
 
 fn super_descr_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {

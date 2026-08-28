@@ -1,24 +1,25 @@
 # pyre-check: max-pypy-ratio=4
 # pyre-check: skip-cpython
-# The ceiling is 4 rather than 2 because this ratio is host-dependent and the
-# gate has to hold on the worst host, not the best.  Measured on the same
-# commit: 1.7x on an arm64 mac runner and 1.8x dynasm on a windows runner,
-# but 2.3x dynasm and 2.5x cranelift on an x86_64 ubuntu runner -- two
-# different backends over 2 on the one host, so 2 is not a ceiling this
-# shape holds anywhere but the fastest machines.
+# pyre-check: spec-folds=bare_super_virtual,load_attr_on_super
+# `spec-folds` is the invariant here: those two folds fire or the fixture
+# fails, on every host and backend.  The ratio is a backstop sized to the
+# slowest reading -- 3.0x under cranelift on x86_64 ubuntu against 1.9x under
+# dynasm on that same runner, where the whole macro suite shows the same
+# backend spread with no super in it.  See `name_bound_super_attr.py` for the
+# measurement.
 # The loop folds to one add per iteration on both JITs, so N has to be in
 # the hundreds of millions before pypy's execution time is a measurement
 # rather than a clock tick — and at that size cpython is minutes behind.
 # Zero-argument `super()` bound to a name, with the loop inside the
-# super-bearing method — the portal-frame twin of
-# `zero_arg_name_bound_super_attr_inlined_callee.py`.
+# super-bearing method.
 #
-# One thing separates them and it is not visible in the Python: the two slots
-# `super()` reads reach the walk on different channels.  A callee the trace
-# inlines owns a slot shadow the inline seeded; a method that carries its own
-# loop is the frame the portal traces, and its slots come out of the standard
-# virtualizable.  A fold reading only the first channel leaves this spelling on
-# the re-routed may-force residual, which is where it was: ~62ns per iteration
+# Which channel the walk reads is not visible in the Python: a callee the trace
+# inlines owns a slot shadow the inline seeded, while a method that carries its
+# own loop is the frame the portal traces and its slots come out of the
+# standard virtualizable.  This fixture is the portal-frame side; the callee
+# side is `super_attr_inlined_callee.py`, and `bare_super_frame_escape.py`
+# pins both channels' answers.  A fold reading only the callee channel leaves
+# this spelling on the re-routed may-force residual, which is where it was: ~62ns per iteration
 # at 2,000,000 iterations, against ~3 for the same body with no `super()` in
 # it at all.
 #

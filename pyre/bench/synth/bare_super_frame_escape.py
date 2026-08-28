@@ -52,10 +52,13 @@
 #      virtualizable -- and a fold that read only one of them would answer for
 #      the wrong frame on the other.
 #   G  a method whose own `self` is also a cellvar, because a nested function
-#      closes over it.  Slot zero then holds a `Cell` rather than the receiver,
-#      which the virtual fold does not model, so G is the site that keeps the
-#      re-routed residual live: both labels in the `spec-folds` header above
-#      have one.
+#      closes over it.  Slot zero then holds a `Cell` rather than the receiver;
+#      the virtual fold must perform the same guarded live dereference as
+#      LOAD_DEREF.
+#   H  a method that has already rebound its `__class__` cell.  The virtual
+#      fold must decline once `CellFamily.ever_mutated` is set, leaving the
+#      frame-explicit `bare_super_call` re-route live.  Together G and H keep
+#      both labels in the `spec-folds` header above covered.
 N = 20000
 
 
@@ -130,6 +133,19 @@ class Captured(Base):
         return s.val() + len(again())
 
 
+class Rebound(Base):
+    """Site H: a live but no-longer-quasi-immutable `__class__` cell."""
+
+    def val(self):
+        def touch_class_cell():
+            nonlocal __class__
+            __class__ = Rebound
+
+        touch_class_cell()
+        s = super()
+        return s.val() + 20
+
+
 class ETrap(Base):
     """Site E's own method, reached only with a `Tricky` receiver.
 
@@ -152,14 +168,17 @@ def main():
     site_d = set()
     site_e = set()
     site_g = set()
+    site_h = set()
     tricky = Tricky()
     captured = Captured()
+    rebound = Rebound()
     total = 0
     for _ in range(N):
         site_a.add(middle.val())
         site_b.add(leaf.val())
         site_c.add(leaf.tag())
         site_g.add(captured.val())
+        site_h.add(rebound.val())
         try:
             Leaf.val(42)
         except TypeError as exc:
@@ -184,6 +203,7 @@ def main():
         ("B", site_b, 111),
         ("C", site_c, "leaf-middle-base"),
         ("G", site_g, 1 + len("base")),
+        ("H", site_h, 21),
         (
             "D",
             site_d,

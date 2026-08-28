@@ -1,3 +1,4 @@
+# pyre-check: spec-folds=builtin_locals
 # `locals()` called from a function the tracer inlines must report the CALLEE's
 # own fastlocals, not the caller's.
 #
@@ -26,10 +27,17 @@
 #   its sorted-names arm.
 # * `probe_nested` -- two calls deep, which is the shape whose inline entries
 #   the walker reports as a sub-walk rather than a plain inline body.
-# * `probe_closure` -- a callee holding a freevar.  Its locals are not plain
-#   fastlocals, so the fold declines and the residual answers; the freevar's
-#   name is part of the expected set, which is what catches a fold that took
-#   the shape anyway.
+# * `probe_closure` -- a callee holding a freevar.  The freevar's name is part
+#   of the expected set, which is what catches a fold that dropped it.
+# * `probe_cell_rebound` -- the same freevar shape, but with the cell REBOUND
+#   between reads.  `Cell.contents` is mutable and STORE_DEREF is lowered as
+#   `PlainCannotRaise`, whose write-descr sets are analyzer-empty, so nothing
+#   tells `OptHeap` that a store invalidates the cell read the expansion emits.
+#   A merged read would report the value the recording iteration saw rather
+#   than the one just assigned.  Two sites: one store per iteration (the hazard
+#   is across the back edge) and a second store mid-iteration (the hazard is
+#   inside one trace body).  The wrong answer is a plausible integer, so this
+#   counts disagreements against a known sequence rather than printing values.
 
 
 def helper_locals(x):
@@ -102,6 +110,36 @@ def probe_closure():
     return outer, last
 
 
+def probe_cell_rebound():
+    cap = -1
+
+    def read_cap():
+        # The modelled mapping and a plain LOAD_DEREF of the same cell are two
+        # different reads of one field; they must agree.
+        d = locals()
+        return d["cap"], cap
+
+    bad_a = 0
+    bad_b = 0
+    mismatched = 0
+    for i in range(20000):
+        cap = i
+        seen, direct = read_cap()
+        if seen != i:
+            bad_a += 1
+        if seen != direct:
+            mismatched += 1
+
+        cap = i + 20000
+        seen_again, direct_again = read_cap()
+        if seen_again != i + 20000:
+            bad_b += 1
+        if seen_again != direct_again:
+            mismatched += 1
+    return bad_a, bad_b, mismatched
+
+
 print(probe_direct())
 print(probe_nested())
 print(probe_closure())
+print(probe_cell_rebound())
