@@ -2816,10 +2816,6 @@ impl Converter<'_> {
             return (start, end);
         };
         let after_decorator = last.range.end().to_u32();
-        if start > after_decorator {
-            // ObjectConverter already received the public def/class location.
-            return (start, end);
-        }
         let bytes = self.source.as_bytes();
         let mut offset = after_decorator as usize;
         let limit = (end as usize).min(bytes.len());

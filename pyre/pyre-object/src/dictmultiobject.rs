@@ -1262,14 +1262,6 @@ pub unsafe fn w_dict_get_strategy(
 /// `W_ModuleDictObject` (`:341-342`).  Polymorphic dispatch: writes
 /// the strategy slot of whichever subclass `obj` points to.
 ///
-/// W_ModuleDictObject's `mstrategy` slot is typed `*mut
-/// ModuleDictStrategy` (concrete) rather than `&'static dyn
-/// DictStrategy` (erased); the panic here mirrors
-/// `<W_ModuleDictObject as W_DictMultiObject>::set_strategy` —
-/// pyre's promotion path is `w_module_dict_switch_to_object_strategy`
-/// per `celldict.py:173-186`, not a direct mstrategy swap, so this
-/// gateway only ever sees regular W_DictObjects today.
-///
 /// # Safety
 /// `obj` must be a valid PyObjectRef pointing at a `W_DictObject` or
 /// `W_ModuleDictObject`.
@@ -1727,24 +1719,10 @@ impl W_DictMultiObject for W_ModuleDictObject {
         unsafe { (*self.mstrategy).imp }
     }
 
-    /// `celldict.py w_dict.set_strategy(strategy)` — the only
-    /// strategy transition out of ModuleDictStrategy is to
-    /// ObjectDictStrategy via `switch_to_object_strategy` (`:173-186`).
-    /// Route through the existing helper so trait-dispatch callers
-    /// (e.g. `optimizeopt` rewrites or future `descr_copy` paths) land
-    /// correctly without panicking; non-Object target strategies stay
-    /// unreachable per the upstream surface.
-    ///
+    /// `dictmultiobject.py W_ModuleDictObject.set_strategy` (`:341-342`) —
+    /// the bare slot write.  `celldict.py switch_to_object_strategy`
+    /// (`:173-186`) is what composes it with the matching `dstorage` swap.
     fn set_strategy(&mut self, strategy: &'static DictStrategyRef) {
-        // Distinct holders have distinct addresses; the singletons they carry
-        // are zero-sized, and comparing *those* addresses is not a valid
-        // identity test.
-        if !std::ptr::eq(strategy, &crate::dictmultiobject::OBJECT_DICT_STRATEGY_REF) {
-            panic!(
-                "W_ModuleDictObject::set_strategy: only ObjectDictStrategy transition is \
-                 implemented (celldict.py:173-186 is the only documented swap target)"
-            );
-        }
         self.mstrategy = strategy as *const DictStrategyRef as *mut DictStrategyRef;
     }
 }
@@ -2226,17 +2204,6 @@ pub unsafe fn w_dict_bump_keys_version(obj: PyObjectRef) {
         let dict = &mut *(obj as *mut W_DictObject);
         dict.keys_version = dict.keys_version.wrapping_add(1);
     }
-}
-
-/// Read the owning storage pointer.
-///
-/// # Safety
-/// `obj` must point to a valid `W_ModuleDictObject`.
-#[inline]
-pub unsafe fn w_module_dict_get_storage(
-    obj: PyObjectRef,
-) -> *mut crate::celldict::ModuleDictStorage {
-    (*(obj as *const W_ModuleDictObject)).dstorage as *mut crate::celldict::ModuleDictStorage
 }
 
 /// `dictmultiobject.py W_DictMultiObject.setitem_str`
@@ -5437,7 +5404,7 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         entries.iter().map(|(k, &v)| (k.obj, v)).collect()
     } else {
         let strategy = &*w_module_dict_get_strategy(obj);
-        let storage = &*w_module_dict_get_storage(obj);
+        let storage = w_module_dict_module_storage(obj);
         // Wrapping a name the intern table has not seen allocates, so a value
         // zipped in before a later wrap would be pre-move in the Rust-heap
         // result.  Wrap every name into a root slot first, then walk the
@@ -5486,13 +5453,13 @@ pub unsafe fn w_module_dict_nth_item_inner(
         return entries.get_slot(index).map(|(k, &v)| (k.obj, v));
     }
     let strategy = &*w_module_dict_get_strategy(obj);
-    let key = strategy.nth_key(&*w_module_dict_get_storage(obj), index)?;
+    let key = strategy.nth_key(w_module_dict_module_storage(obj), index)?;
     // Wrapping the name allocates, so root the wrapper and read the value
     // back afterwards — the cell storage keeps it traced.
     let roots = crate::gc_roots::push_roots();
     let key_slot = roots.base();
     let _ = roots.pin_root(crate::celldict::_wrapkey(key));
-    let value = strategy.nth_unwrapped_value(&*w_module_dict_get_storage(obj), index)?;
+    let value = strategy.nth_unwrapped_value(w_module_dict_module_storage(obj), index)?;
     Some((roots.get(key_slot), value))
 }
 
@@ -5509,7 +5476,7 @@ pub unsafe fn w_module_dict_nth_value_inner(obj: PyObjectRef, index: usize) -> O
         return entries.get_slot(index).map(|(_, &v)| v);
     }
     let strategy = &*w_module_dict_get_strategy(obj);
-    strategy.nth_unwrapped_value(&*w_module_dict_get_storage(obj), index)
+    strategy.nth_unwrapped_value(w_module_dict_module_storage(obj), index)
 }
 
 /// `celldict.py values` — the cells, with no name wrapped.
@@ -5523,7 +5490,7 @@ pub unsafe fn w_module_dict_values_inner(obj: PyObjectRef) -> Vec<PyObjectRef> {
     }
     let strategy = &*w_module_dict_get_strategy(obj);
     strategy
-        .getitervalues(&*w_module_dict_get_storage(obj))
+        .getitervalues(w_module_dict_module_storage(obj))
         .collect()
 }
 

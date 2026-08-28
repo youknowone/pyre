@@ -13,8 +13,8 @@ const LOCATION_ATTRIBUTES: &[&str] = &["lineno", "col_offset", "end_lineno", "en
 static LOAD_SINGLETON: std::sync::OnceLock<Box<usize>> = std::sync::OnceLock::new();
 static AST_TYPE: std::sync::OnceLock<Box<usize>> = std::sync::OnceLock::new();
 
-fn register_ast_type(value: PyObjectRef) {
-    let _ = AST_TYPE.get_or_init(|| {
+fn register_root(cell: &std::sync::OnceLock<Box<usize>>, value: PyObjectRef) {
+    let _ = cell.get_or_init(|| {
         let mut slot = Box::new(value as usize);
         let root = (&mut *slot) as *mut usize as *mut *mut u8;
         unsafe { pyre_object::gc_hook::try_gc_add_root(root) };
@@ -27,15 +27,6 @@ fn ast_type() -> PyObjectRef {
     **AST_TYPE
         .get()
         .expect("_ast AST type initialized before AST operations") as PyObjectRef
-}
-
-fn register_load_singleton(value: PyObjectRef) {
-    let _ = LOAD_SINGLETON.get_or_init(|| {
-        let mut slot = Box::new(value as usize);
-        let root = (&mut *slot) as *mut usize as *mut *mut u8;
-        unsafe { pyre_object::gc_hook::try_gc_add_root(root) };
-        slot
-    });
 }
 
 #[majit_macros::dont_look_inside]
@@ -1417,7 +1408,10 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
     let mut names: Vec<&'static str> = Vec::new();
 
     // Root: AST(object).
-    register_ast_type(make("AST", crate::typedef::w_object(), None));
+    register_root(
+        &AST_TYPE,
+        make("AST", crate::typedef::w_object(), None),
+    );
     let ast_slot = first;
     let _ = roots.pin_root(ast_type());
     names.push("AST");
@@ -1538,7 +1532,10 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
     let load_roots = pyre_object::gc_roots::push_roots();
     let load_type_slot = load_roots.base();
     let _ = load_roots.pin_root(lookup("Load").expect("_ast.Load built"));
-    register_load_singleton(pyre_object::w_instance_new(load_roots.get(load_type_slot)));
+    register_root(
+        &LOAD_SINGLETON,
+        pyre_object::w_instance_new(load_roots.get(load_type_slot)),
+    );
 
     names
         .iter()

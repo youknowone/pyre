@@ -2797,29 +2797,6 @@ pub fn make_builtin_type_with_bases_and_overridetypedef(
     make_builtin_type_with_bases_and_layout_owner(name, init, bases, layout_pytype, overridetypedef)
 }
 
-/// [`make_builtin_type_with_bases_and_overridetypedef`] with an explicit
-/// interpreter TypeDef
-/// identity for a concrete class that introduces its own instance Layout.
-///
-/// PyPy `setup_builtin_type` receives the concrete `instancetypedef` even for
-/// a TypeDef with multiple declared bases.  Most multi-base builtins introduce
-/// no interpreter class and use the wrapper above; concrete owners such as
-/// `interp_group.W_BaseExceptionGroup` take this path.
-pub fn make_builtin_type_with_bases_and_layout(
-    name: &str,
-    init: impl FnOnce(PyObjectRef),
-    bases: &[PyObjectRef],
-    layout_pytype: *const PyType,
-) -> PyObjectRef {
-    make_builtin_type_with_bases_and_layout_owner(
-        name,
-        init,
-        bases,
-        layout_pytype,
-        std::ptr::null(),
-    )
-}
-
 pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
     name: &str,
     init: impl FnOnce(PyObjectRef),
