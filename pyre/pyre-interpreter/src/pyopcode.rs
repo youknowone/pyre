@@ -1741,12 +1741,13 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     }
 
     // ── Intrinsic helper methods ──
+    /// Declared without a body: a default would be the graph the tracer walks,
+    /// and the implementing type's version would never be seen.  `+x` compiles
+    /// to `CALL_INTRINSIC_1`, so this method is the whole route to `pos`.
     fn unary_positive(
         &mut self,
-        _val: <Self as SharedOpcodeHandler>::Value,
-    ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError> {
-        Err(crate::PyError::type_error("unary_positive not implemented"))
-    }
+        val: <Self as SharedOpcodeHandler>::Value,
+    ) -> Result<<Self as SharedOpcodeHandler>::Value, PyError>;
     fn list_to_tuple(
         &mut self,
         _val: <Self as SharedOpcodeHandler>::Value,
