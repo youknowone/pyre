@@ -3719,7 +3719,12 @@ fn pack_inet_addr(
         };
         let sun = unsafe { &mut *(&mut storage as *mut _ as *mut libc::sockaddr_un) };
         sun.sun_family = libc::AF_UNIX as rffi::SaFamily;
-        let abstract_name = cfg!(target_os = "linux") && path_bytes_vec.first() == Some(&0);
+        // The Linux abstract namespace has two members: an address that
+        // starts with a null byte, and the empty address, which asks the
+        // kernel to auto-bind an abstract one.  Both are named by their
+        // length alone, so neither carries a terminator.
+        let abstract_name =
+            cfg!(target_os = "linux") && matches!(path_bytes_vec.first(), None | Some(&0));
         // `rsocket.py UNIXAddress.__init__`: an abstract name may fill
         // `sun_path` exactly, a regular one has to leave room for its
         // terminator.
