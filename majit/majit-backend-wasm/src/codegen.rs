@@ -4738,14 +4738,14 @@ fn build_function(
                 let vi = op.pos.get().raw();
                 if !OpRef::raw_is_constant(vi) {
                     emit_resolve(&mut sink, constants, value_types, op.arg(0).to_opref());
-                    // if val < 0, use 0; else use val
-                    // Wasm: local.tee + i64.const 0 + local.get + i64.lt_s + select
+                    // `select` answers with the FIRST value when its condition
+                    // holds, so the condition is the one that keeps `val`.
                     let tmp_local = value_types.local(vi); // reuse result local as temp
                     sink.local_tee(tmp_local);
                     sink.i64_const(0);
                     sink.local_get(tmp_local);
                     sink.i64_const(0);
-                    sink.i64_lt_s();
+                    sink.i64_ge_s();
                     sink.select();
                     sink.local_set(value_types.local(vi));
                 }
