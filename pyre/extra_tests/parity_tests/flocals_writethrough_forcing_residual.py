@@ -6,6 +6,7 @@
 # against the frame the tracer is stepping a copy of, so it is the tracer's
 # handling of that call -- not the proxy -- that decides whether the write
 # survives.
+# pyre-check: regresses-under: PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS=1 -- without the adopt the walk keeps the box the local held before the call, and both traced iterations lose the write
 
 """A write made through ``f_locals`` by a *called* function must be visible to
 the caller's next read, including on the iteration the caller's loop is traced.
@@ -26,6 +27,14 @@ store itself is the residual and nothing forces at all -- the proxy's own force
 is gated on the live frame's ``vable_token``, which is zero while the walk is
 tracing.  The two lose the write through different paths and are pinned here at
 iterations 1040 and 2105, so the bound sits well past the later of them.
+
+Both are reached only because ``adopt_residual_locals_writes`` reads the slot
+back; the passing run says nothing about that on its own, since a script that
+stopped reaching either iteration would pass too.  The ``regresses-under``
+header is what separates the two: with the adopt switched off this script must
+report ``2 of 4000, first: [(1040, 1039), (2105, 2104)]`` and exit non-zero, so
+a change that stops reaching the shape is reported here rather than read as a
+pass.
 """
 
 import sys
