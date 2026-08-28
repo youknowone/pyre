@@ -36,8 +36,9 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 ///
 /// Separate because a zeroing allocation is charged twice: once for the
 /// allocator's own bookkeeping and once for the `memset` the caller would
-/// otherwise have written itself. `alloc_off_gc_jitframe` is the one this
-/// example is aimed at.
+/// otherwise have written itself. `alloc_off_gc_jitframe` was the one this
+/// example was aimed at, and watching this counter fall is how its removal was
+/// graded.
 static ZEROED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Calls to `dealloc`.
 static FREES: AtomicU64 = AtomicU64::new(0);

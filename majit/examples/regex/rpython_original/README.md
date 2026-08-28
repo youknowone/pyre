@@ -333,7 +333,8 @@ does not depend on the machine: the same binary over the same input allocates
 the same bytes every time. It is also the right unit for this particular gap,
 because the costs in question **are** allocation — a jitframe `alloc_zeroed`ed
 and freed per guard failure, blackhole frames boxed per resume, position tables
-sized by a monotonic counter.
+sized by a monotonic counter. Two of those three are fixed below, and the
+counter is what graded both.
 
 ```sh
 cargo run -p regex --release --no-default-features --features dynasm,alloc-census
@@ -348,10 +349,10 @@ What it says about the three rows, at 1,048,576 characters:
 |---|---:|---:|---:|
 | Rust interp, no JIT | 0.0 | 0 | 0 |
 | majit `&`/`\|` — `jit_interp.rs` | 0.0 | 4 | 0.1 |
-| majit `and`/`or` — `shortcircuit.rs` | **54.0** | **6,948** | 633.8 |
+| majit `and`/`or` — `shortcircuit.rs` | **52.1** | **6,520** | 319.1 |
 
 The masking row allocates four bytes per character and the plain matcher none.
-The branching row calls `malloc` **fifty-four times per input character**. That
+The branching row calls `malloc` **fifty-two times per input character**. That
 is the 4.1x against RPython's own `--opt=jit`, in a unit that can be measured
 while the machine is doing something else — every character deopts, and majit's
 deopt round trip is built out of allocations that upstream takes from a nursery
@@ -373,12 +374,78 @@ input**, which a per-character cost cannot legitimately do:
 | before | 11,687 | 9,750 | **19,559** |
 | after | 11,604 | 8,661 | **6,948** |
 
-`allocs/char` and `frees/char` are unchanged to one decimal place (54.0 and
-51.9 at 1M on both) — the same vectors are still allocated, they are simply
+`allocs/char` and `frees/char` were unchanged to one decimal place (54.0 and
+51.9 at 1M on both, this row's figures before the next fix below) — the same vectors are still allocated, they are simply
 sized by the trace instead of by the family. Before the fix the row's
 per-character allocation doubles between 65,536 and 1,048,576 characters; after
 it, it falls, which is what a per-character cost does. Wall clock could not
 resolve the change on the machine of the day; this did.
+
+#### The second: the jitframe itself
+
+`execute_token` allocated the entry JITFRAME with `alloc_zeroed` off the GC
+heap and freed it on the way out, once per compiled entry — so once per guard
+failure on this row. A block obtained that way carries no header the collector
+recognises, which is why it also needed a process-global `IndexSet` to be
+traced at all (`shadow_stack::register_libc_jitframe`) and a second one to stay
+rooted while the deadframe was being read (`libc_deadframe::LIVE_DEADFRAMES`).
+Upstream has one mechanism and no registry: `llmodel.py malloc_jitframe` is
+`jitframe.JITFRAME.allocate`, i.e. `lltype.malloc(JITFRAME, depth)`, and the
+deadframe is an ordinary local that the translated stack map roots.
+
+`runner::alloc_jitframe` now takes the frame from the nursery under the
+published JITFRAME type id — the same place `dynasm_nursery_slowpath_jitframe`
+already took the CALL_ASSEMBLER callee frames — and the deadframe holds it in a
+root slot, re-reading the address on every access because a collection in that
+window moves it. Nothing is registered and nothing is freed.
+
+The instrument that reads it is not this crate's census but the metainterp's:
+
+```sh
+cargo test -p majit-metainterp --features dynasm --test allocs_per_compiled_entry
+```
+
+```text
+  per call                 4.000      (was 5.000)
+```
+
+One allocation per warm compiled entry, gone, and the two backends agree again:
+that file used to pin 4 for cranelift and 5 for dynasm, and the single row
+between them was this frame.
+
+#### …which needed this crate to have a collector at all
+
+Both numbers above are conditional on one, and this crate had none — no
+`majit/examples/` crate did. That is not a difference from RPython that was
+open to it: **RPython has no configuration without a GC.** `target.py --opt=jit`
+is a translated binary, every translated binary carries a collector, and
+`lltype.malloc(JITFRAME, depth)` — which is all `malloc_jitframe` is — is a GC
+allocation. Running majit's side without one put it on a path no shipped
+configuration takes. `src/gc.rs` installs MiniMark in `main`, which is
+`pyre-jit`'s `init_gc_subsystem` with the pyre-specific parts removed.
+
+Installing it was not enough on its own, and the census is what said so: the
+row did not move. The frame was coming from `alloc_nursery_no_collect_typed`,
+so once the nursery filled — about eighteen thousand entries in — every frame
+after that spilled to old-gen through `rawmalloc`, one process allocation each
+and nothing ever reclaiming them. Upstream's `malloc_jitframe` is an ordinary
+`lltype.malloc` and collects when the nursery is full; it can, because the
+arguments it stores into the frame afterwards (`llmodel.py:306-315`) are RPython
+locals the translated stack map roots across the allocation.
+
+`execute_token` now says the same thing in majit's spelling: the `Ref` arguments
+go on the shadow stack, the allocation is allowed to collect, and the arguments
+are read back from the slots a collection would have rewritten. The frames are a
+nursery bump again and the dead ones are reclaimed.
+
+| `and`/`or` row, per character | allocs | bytes |
+|---|---:|---:|
+| off-GC frame, no collector | 54.0 | 6,948 |
+| collector installed, no-collect frame | 54.0 | 7,000 |
+| collector installed, collecting frame | **52.1** | **6,520** |
+
+The middle row is why the census is worth having: it is the fix applied and not
+working, and nothing else in the run says so.
 
 ### The majit-only ratio
 

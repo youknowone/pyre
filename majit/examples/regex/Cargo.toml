@@ -13,6 +13,8 @@ dynasm = ["majit-metainterp/dynasm"]
 alloc-census = []
 
 [dependencies]
+majit-backend = { workspace = true }
+majit-gc = { workspace = true }
 majit-ir = { workspace = true }
 majit-metainterp = { workspace = true }
 majit-macros = { workspace = true }

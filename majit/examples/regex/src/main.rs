@@ -28,6 +28,7 @@
 
 #[cfg(feature = "alloc-census")]
 pub mod alloc_census;
+pub mod gc;
 pub mod interp;
 pub mod jit_interp;
 pub mod regex;
@@ -242,6 +243,9 @@ fn census(body: &[majit_ir::OpCode]) -> String {
 }
 
 fn main() {
+    // Before anything runs compiled code. `target.py --opt=jit` is a translated
+    // binary and carries a collector; this is majit's side of that.
+    gc::install();
     let started = Instant::now();
     println!("{}", machine());
     println!();
