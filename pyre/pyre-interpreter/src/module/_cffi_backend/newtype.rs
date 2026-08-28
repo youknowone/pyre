@@ -256,6 +256,18 @@ pub fn new_void_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// `newtype.py _new_voidp_type`.
+pub fn new_voidp_type() -> Result<PyObjectRef, PyError> {
+    new_pointer_type(new_void_type())
+}
+
+/// `newtype.py _new_chara_type`.
+pub fn new_chara_type() -> Result<PyObjectRef, PyError> {
+    let w_char = new_primitive_type("char")?;
+    let w_charp = new_pointer_type(w_char)?;
+    new_array_type(w_charp, -1)
+}
+
 /// `newtype.py _new_pointer_type` — `W_CType._pointer_type`'s memo, which
 /// `convert_from_object` relies on to decide pointer compatibility.
 pub fn new_pointer_type(w_ctitem: PyObjectRef) -> Result<PyObjectRef, PyError> {
@@ -437,11 +449,8 @@ pub fn ffi_error() -> PyObjectRef {
     *FFI_ERROR.get_or_init(|| {
         let w_exception = crate::builtins::lookup_exc_class("Exception")
             .expect("Exception must be installed before _cffi_backend init");
-        crate::builtins::make_exc_type(
-            "_cffi_backend.FFIError",
-            crate::builtins::exc_exception_new,
-            w_exception,
-        ) as usize
+        crate::builtins::make_exc_type("ffi.error", crate::builtins::exc_exception_new, w_exception)
+            as usize
     }) as PyObjectRef
 }
 
@@ -471,7 +480,7 @@ fn new_struct_or_union(kind: i64, name: &str) -> PyObjectRef {
 }
 
 /// `newtype.py detect_custom_layout`.
-fn detect_custom_layout(
+pub fn detect_custom_layout(
     ct: &mut W_CType,
     sflags: i64,
     cdef_value: i64,

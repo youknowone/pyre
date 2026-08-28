@@ -138,6 +138,10 @@ pub struct W_CType {
     pub enumerators2values: PyObjectRef,
     /// `_Mixin_Enum.enumvalues2erators` — a dict of `int` to `str`.
     pub enumvalues2erators: PyObjectRef,
+    /// `W_CTypeStructOrUnion._lazy_ffi`, retained until its fields are forced.
+    pub lazy_ffi: PyObjectRef,
+    /// `W_CTypeStructOrUnion._lazy_s` as an index in `ctx.c_struct_unions`.
+    pub lazy_sindex: i64,
 }
 
 impl W_CType {
@@ -200,10 +204,10 @@ impl W_CType {
 
     /// `W_CTypeStructOrUnion.force_lazy_struct` — complain if we are opaque.
     ///
-    /// A struct reaches pyre either complete, from `complete_struct_or_union`,
-    /// or opaque; the lazy state belongs to the compiled-extension path that
-    /// `realize_c_type` drives, so there is nothing to force here yet.
     pub fn force_lazy_struct(&self) -> Result<(), PyError> {
+        if !self.lazy_ffi.is_null() {
+            super::realize_c_type::do_realize_lazy_struct(self.as_object())?;
+        }
         self.check_complete(false)
     }
 
@@ -399,6 +403,8 @@ impl Default for W_CType {
             fields_dict: pyre_object::PY_NULL,
             enumerators2values: pyre_object::PY_NULL,
             enumvalues2erators: pyre_object::PY_NULL,
+            lazy_ffi: pyre_object::PY_NULL,
+            lazy_sindex: -1,
         }
     }
 }

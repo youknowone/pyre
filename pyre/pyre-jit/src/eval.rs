@@ -897,6 +897,16 @@ unsafe fn cffi_library_destructor(obj_addr: usize) {
     };
 }
 
+/// `FreeCtxObj.__del__` — releases an FFI object's copied parser context.
+#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+unsafe fn cffi_ffi_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_cffi_backend::ffi_obj::w_ffi_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -4312,7 +4322,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_WindowsConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its eight
+    // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its ten
     // object types register at the end of the rclass census where the sandbox
     // hierarchy filter can remove one contiguous trailing slice.  A ctype,
     // the array iterator, struct field, allocator, MiniBuffer and offset
@@ -4367,6 +4377,18 @@ fn build_gc() -> Box<MiniMarkGC> {
             &mut gc,
             &mut pytype_to_tid,
             <pyre_interpreter::module::_cffi_backend::func::OffsetInBytes
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        {
+            let descr = <pyre_interpreter::module::_cffi_backend::ffi_obj::W_FFIObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+            let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+            gc.types.set_destructor(tid, cffi_ffi_destructor);
+        }
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_cffi_backend::realize_c_type::W_RawFuncType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
     }

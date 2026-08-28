@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_char, c_int, c_void};
+use std::sync::OnceLock;
 
 /// `_cffi_opcode_t` — a tagged word: the low byte is the opcode, the rest is
 /// its argument.
@@ -200,6 +201,14 @@ pub struct ParseInfoS {
     pub error_message: *const c_char,
 }
 
+/// `parse_c_type.py CTXOBJ` — the copied declaration context and the parser
+/// control record that points back to it.
+#[repr(C)]
+pub struct CtxObj {
+    pub ctx: TypeContextS,
+    pub info: ParseInfoS,
+}
+
 #[repr(C)]
 pub struct ExternPyS {
     pub name: *const c_char,
@@ -233,6 +242,63 @@ unsafe extern "C" {
 /// `parse_c_type.py:internal_output`; a parse is never re-entered because the
 /// opcodes are copied out before anything else can run.
 pub const FFI_COMPLEXITY_OUTPUT: usize = 1200;
+
+/// `parse_c_type.py internal_output`, shared by all ABI-mode parses.
+fn internal_output() -> *mut OpcodeT {
+    static OUTPUT: OnceLock<usize> = OnceLock::new();
+    *OUTPUT.get_or_init(|| {
+        let bytes = FFI_COMPLEXITY_OUTPUT * core::mem::size_of::<OpcodeT>();
+        let output = unsafe { libc::calloc(1, bytes) }.cast::<OpcodeT>();
+        assert!(!output.is_null(), "failed to allocate CFFI parser output");
+        output as usize
+    }) as *mut OpcodeT
+}
+
+/// `parse_c_type.py allocate_ctxobj`.
+pub fn allocate_ctxobj(src_ctx: *const TypeContextS) -> *mut CtxObj {
+    let mut ctx: TypeContextS = unsafe { core::mem::zeroed() };
+    if !src_ctx.is_null() {
+        unsafe { core::ptr::copy_nonoverlapping(src_ctx, &mut ctx, 1) };
+    }
+    let mut obj = Box::new(CtxObj {
+        ctx,
+        info: unsafe { core::mem::zeroed() },
+    });
+    obj.info.ctx = &obj.ctx;
+    obj.info.output = internal_output();
+    obj.info.output_size = FFI_COMPLEXITY_OUTPUT as core::ffi::c_uint;
+    Box::into_raw(obj)
+}
+
+/// `parse_c_type.py free_ctxobj`.
+///
+/// # Safety
+/// `ctxobj` must be a live allocation returned by [`allocate_ctxobj`].
+pub unsafe fn free_ctxobj(ctxobj: *mut CtxObj) {
+    if !ctxobj.is_null() {
+        drop(unsafe { Box::from_raw(ctxobj) });
+    }
+}
+
+/// `parse_c_type.py get_num_types`.
+pub unsafe fn get_num_types(src_ctx: *const TypeContextS) -> usize {
+    unsafe { (*src_ctx).num_types.max(0) as usize }
+}
+
+/// `parse_c_type.py parse_c_type`.
+pub fn parse_type(info: *mut ParseInfoS, input: &core::ffi::CStr) -> isize {
+    unsafe { pypy_parse_c_type(info, input.as_ptr()) as isize }
+}
+
+/// `parse_c_type.py search_in_globals`.
+pub fn search_in_globals(ctx: *const TypeContextS, name: &str) -> isize {
+    unsafe { pypy_search_in_globals(ctx, name.as_ptr().cast(), name.len()) as isize }
+}
+
+/// `parse_c_type.py search_in_struct_unions`.
+pub fn search_in_struct_unions(ctx: *const TypeContextS, name: &str) -> isize {
+    unsafe { pypy_search_in_struct_unions(ctx, name.as_ptr().cast(), name.len()) as isize }
+}
 
 /// `pypy_enum_common_types(index)` decoded into its `(name, replacement)`
 /// pair.  The C side stores the two as one `"name\0replacement"` block, so the

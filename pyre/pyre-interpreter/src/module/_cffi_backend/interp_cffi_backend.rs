@@ -92,6 +92,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "CLibrary", super::libraryobj::clibrary_type());
     crate::module_ns_store(ns, "__FFIAllocator", super::allocator::allocator_type());
     crate::module_ns_store(ns, "buffer", super::cbuffer::buffer_type());
+    crate::module_ns_store(ns, "FFI", super::ffi_obj::ffi_type_object());
 
     #[cfg(windows)]
     crate::module_ns_store(

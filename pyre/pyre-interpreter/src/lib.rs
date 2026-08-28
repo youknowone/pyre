@@ -1275,7 +1275,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(193, typed::<crate::module::_io::W_WindowsConsoleIO>()),
         // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its
-        // eight aliases sit at the tail where the sandbox hierarchy filter can
+        // ten aliases sit at the tail where the sandbox hierarchy filter can
         // remove them as part of one contiguous trailing slice.  The
         // module-presence gate matches `module/mod.rs` exactly.
         #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
@@ -1318,6 +1318,16 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
             CFFI_FIRST_TYPE_ID + 7,
             typed::<crate::module::_cffi_backend::func::OffsetInBytes>(),
         ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 8,
+            typed::<crate::module::_cffi_backend::ffi_obj::W_FFIObject>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 9,
+            typed::<crate::module::_cffi_backend::realize_c_type::W_RawFuncType>(),
+        ),
     ]
 }
 
@@ -1325,7 +1335,7 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
 ///
 /// `_ssl` owns five native hierarchy slots, `mmap` owns one behind them,
 /// Windows owns three more where applicable, and `_cffi_backend` owns the last
-/// eight.  A sandbox build has none of those modules; because the groups form
+/// ten.  A sandbox build has none of those modules; because the groups form
 /// one contiguous tail of `SUBCLASS_RANGE_HIERARCHY`, dropping their combined
 /// slot count leaves exactly the ids such a build registers.
 pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
@@ -1333,7 +1343,7 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
     #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
     {
         const SSL_HIERARCHY_SLOTS: usize = 5;
-        const CFFI_HIERARCHY_SLOTS: usize = 8;
+        const CFFI_HIERARCHY_SLOTS: usize = 10;
         #[cfg(any(unix, windows))]
         const MMAP_HIERARCHY_SLOTS: usize = 1;
         #[cfg(not(any(unix, windows)))]

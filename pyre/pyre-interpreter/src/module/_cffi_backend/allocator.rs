@@ -160,11 +160,28 @@ fn init_allocator_type(ns: PyObjectRef) {
     }
 }
 
-/// `W_Allocator.descr_call`; `ffi_obj.W_FFIObject.ffi_type` arrives in M4.
+/// `W_Allocator.descr_call`.
 fn allocator_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let allocator = W_Allocator::from_obj(args[0])
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    for value in [
+        args[0],
+        args[1],
+        args.get(2).copied().unwrap_or_else(pyre_object::w_none),
+    ] {
+        let _ = roots.pin_root(value);
+    }
+    let allocator = W_Allocator::from_obj(roots.get(base))
         .ok_or_else(|| PyError::type_error("expected an allocator object"))?;
-    let _ = ctypeobj::ctype_arg(args[1])?;
-    let w_init = args.get(2).copied().unwrap_or_else(pyre_object::w_none);
-    ctypeobj::newp_with_allocator(args[1], w_init, args[0])
+    let w_ctype = if allocator.w_ffi.is_null() {
+        let _ = ctypeobj::ctype_arg(roots.get(base + 1))?;
+        roots.get(base + 1)
+    } else {
+        super::ffi_obj::ffi_type(
+            allocator.w_ffi,
+            roots.get(base + 1),
+            super::ffi_obj::ACCEPT_STRING | super::ffi_obj::ACCEPT_CTYPE,
+        )?
+    };
+    ctypeobj::newp_with_allocator(w_ctype, roots.get(base + 2), roots.get(base))
 }

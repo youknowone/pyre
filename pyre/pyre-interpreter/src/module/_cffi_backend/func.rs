@@ -109,20 +109,35 @@ pub fn unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py typeoffsetof`.
 pub fn typeoffsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let ct = ctypeobj::ctype_arg(args[0])?;
-    let w_field_or_index = args[1];
-    // `W_CType.direct_typeoffsetof` tries a field name first and falls back
-    // to an index.
+    let following = match args.get(2) {
+        Some(&w_following) => crate::baseobjspace::int_w(w_following)? != 0,
+        None => false,
+    };
+    let (w_ctype, offset) = direct_typeoffsetof(args[0], args[1], following)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let field_slot = roots.base();
+    let _ = roots.pin_root(w_ctype);
+    let w_offset = pyre_object::w_int_new(offset);
+    Ok(pyre_object::w_tuple_new(vec![
+        roots.get(field_slot),
+        w_offset,
+    ]))
+}
+
+/// `W_CType.direct_typeoffsetof`, shared by the module-level function and
+/// `W_FFIObject._more_{addressof,offsetof}`.
+pub fn direct_typeoffsetof(
+    w_ctype: PyObjectRef,
+    w_field_or_index: PyObjectRef,
+    following: bool,
+) -> Result<(PyObjectRef, i64), PyError> {
+    let ct = ctypeobj::ctype_arg(w_ctype)?;
     if unsafe { pyre_object::unicodeobject::is_str(w_field_or_index) } {
-        let following = match args.get(2) {
-            Some(&w_following) => crate::baseobjspace::int_w(w_following)?,
-            None => 0,
-        };
         // `W_CTypePointer.typeoffsetof_field` reads the item's field, but
         // only for the first element of the array the pointer may be.
         let owner = if ct.is_struct_or_union() {
             ct
-        } else if ct.kind == ctypeobj::KIND_POINTER && following == 0 {
+        } else if ct.kind == ctypeobj::KIND_POINTER && !following {
             ctypeobj::ctype_arg(ct.ctitem)?
         } else {
             return Err(PyError::type_error(
@@ -135,15 +150,7 @@ pub fn typeoffsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             ));
         }
         let fieldname = crate::baseobjspace::text_w(w_field_or_index)?;
-        let (w_ctype, offset) = super::ctypestruct::typeoffsetof_field(owner, fieldname)?;
-        let roots = pyre_object::gc_roots::push_roots();
-        let field_slot = roots.base();
-        let _ = roots.pin_root(w_ctype);
-        let w_offset = pyre_object::w_int_new(offset);
-        return Ok(pyre_object::w_tuple_new(vec![
-            roots.get(field_slot),
-            w_offset,
-        ]));
+        return super::ctypestruct::typeoffsetof_field(owner, fieldname);
     }
     let Ok(index) = crate::baseobjspace::int_w(w_field_or_index) else {
         return Err(PyError::type_error("field name or array index expected"));
@@ -166,14 +173,7 @@ pub fn typeoffsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let offset = index
         .checked_mul(ctitem.size)
         .ok_or_else(|| PyError::overflow_error("array offset would overflow a ssize_t"))?;
-    let roots = pyre_object::gc_roots::push_roots();
-    let item_slot = roots.base();
-    let _ = roots.pin_root(ctitem.as_object());
-    let w_offset = pyre_object::w_int_new(offset);
-    Ok(pyre_object::w_tuple_new(vec![
-        roots.get(item_slot),
-        w_offset,
-    ]))
+    Ok((ctitem.as_object(), offset))
 }
 
 /// `func.py rawaddressof`.
