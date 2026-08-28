@@ -12417,6 +12417,20 @@ fn first_starred_target(
     }
 }
 
+/// The span of the token a statement opens with.
+///
+/// Every compound statement opens with a keyword, and a decorated one with
+/// `@`, so this is the token the expression grammar rejects outright.
+fn leading_token_span(source: &str, statement: &rustpython_compiler::ast::Stmt) -> (usize, usize) {
+    let start = statement.range().start().to_usize();
+    let rest = source.get(start..).unwrap_or_default();
+    let length = rest
+        .find(|character: char| !character.is_alphanumeric() && character != '_')
+        .unwrap_or(rest.len())
+        .max(1);
+    (start, start + length)
+}
+
 /// Whether the target reaches `python.gram:invalid_named_expression`'s third
 /// alternative, which is what prints the `Maybe you meant '=='` form.
 ///
@@ -12609,6 +12623,18 @@ fn assignment_target_error(
     // keyword.  A display keeps its own brackets and unpacks inside them, so
     // `[*a, b] = 1` and `(a, *b) = 1` still report at the operator.
     if matches!(mode, crate::compile::Mode::Eval) {
+        // `expressions` reaches an assignment operator only when the assignment
+        // is the whole source.  A nested one stands behind the keyword that
+        // opens the statement holding it, which is where the parse stopped, so
+        // report there instead -- `def f(): (yield a) = 1` is named at `def`.
+        let top_level = parsed.syntax().body.iter().find(|statement| {
+            let range = statement.range();
+            range.start().to_usize() <= error_index && error_index <= range.end().to_usize()
+        })?;
+        if !std::ptr::eq(top_level, found) {
+            let (start, end) = leading_token_span(source, top_level);
+            return Some(("invalid syntax".to_owned(), start, end));
+        }
         let (target, next) = match found {
             Stmt::AugAssign(node) => (node.target.as_ref(), node.value.as_ref()),
             Stmt::Assign(node) => (

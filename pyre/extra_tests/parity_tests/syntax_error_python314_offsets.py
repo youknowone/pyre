@@ -368,6 +368,12 @@ for source, position in (
     ("(yield) = 1", (1, 9, 1, 10)),
     ("class C:\n    f() = 1\n", (1, 1, 1, 6)),
     ("x: int = f()", (1, 2, 1, 3)),
+    # An assignment inside a statement stands behind the keyword that opens it,
+    # which is where the expression grammar stopped.
+    ("def f(): (yield a) = 1", (1, 1, 1, 4)),
+    ("async def f(): (await a) += 1", (1, 1, 1, 6)),
+    ("with a: x = 1", (1, 1, 1, 5)),
+    ("@d\ndef f(): x = 1", (1, 1, 1, 2)),
 ):
     error = syntax_error(source, "eval")
     assert error.msg == "invalid syntax", (source, error.msg)
