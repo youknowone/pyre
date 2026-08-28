@@ -31,6 +31,51 @@ def _function_type_kwdefaults():
 _function_type_kwdefaults()
 
 
+def _function_type_closure_contract():
+    def plain():
+        return None
+
+    def outer():
+        value = 42
+
+        def inner():
+            return value
+
+        return inner
+
+    closed = outer()
+    cell = closed.__closure__[0]
+
+    with assert_raises(TypeError) as raised:
+        types.FunctionType(closed.__code__, globals())
+    assert str(raised.exception) == "arg 5 (closure) must be tuple"
+
+    with assert_raises(ValueError) as raised:
+        types.FunctionType(closed.__code__, globals(), "inner", None, ())
+    assert str(raised.exception) == "inner requires closure of length 1, not 0"
+
+    with assert_raises(TypeError) as raised:
+        types.FunctionType(closed.__code__, globals(), "inner", None, (42,))
+    assert str(raised.exception) == "arg 5 (closure) expected cell, found int"
+
+    class TupleSubclass(tuple):
+        pass
+
+    closure = TupleSubclass((cell,))
+    clone = types.FunctionType(closed.__code__, globals(), "inner", None, closure)
+    assert clone() == 42
+    assert clone.__closure__ is closure
+
+    empty_closure = ()
+    without_closure = types.FunctionType(
+        plain.__code__, globals(), "plain", None, empty_closure
+    )
+    assert without_closure.__closure__ is empty_closure
+
+
+_function_type_closure_contract()
+
+
 def _union_unhashable_partition_is_stable():
     is_hashable = False
 

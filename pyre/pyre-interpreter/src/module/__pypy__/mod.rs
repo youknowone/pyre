@@ -286,7 +286,10 @@ fn write_unraisable(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
             error
         }
     };
-    error.write_unraisable(pyre_object::w_none(), &where_desc, args[2]);
+    // `interp_magic.write_unraisable` passes `with_traceback=True`: unlike
+    // the default finalizer form, `where` already contains its preposition
+    // (for example `"in: testplace"`).
+    error.write_unraisable_with_traceback(pyre_object::w_none(), &where_desc, args[2], true);
     Ok(pyre_object::w_none())
 }
 

@@ -2927,9 +2927,40 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "arg 3 (name) must be None or string",
         ));
     };
+    // `function.py Function.descr_function__new__` derives the closure
+    // contract from `PyCode.co_freevars`, then validates the tuple length and
+    // every `Cell` before allocating the function.  CPython 3.14's observable
+    // edge differs in two places: a tuple subclass is accepted and an empty
+    // tuple for a code object without free variables is accepted and retained.
+    let nfreevars = unsafe { (&(*code_ptr).freevars).len() };
     let closure = if w_closure.is_null() || unsafe { pyre_object::is_none(w_closure) } {
+        if nfreevars != 0 {
+            return Err(crate::PyError::type_error("arg 5 (closure) must be tuple"));
+        }
         PY_NULL
     } else {
+        if !unsafe { pyre_object::is_tuple(w_closure) } {
+            return Err(crate::PyError::type_error(
+                "arg 5 (closure) must be None or tuple",
+            ));
+        }
+        let nclosure = unsafe { pyre_object::w_tuple_len(w_closure) };
+        if nclosure != nfreevars {
+            return Err(crate::PyError::value_error(format!(
+                "{} requires closure of length {nfreevars}, not {nclosure}",
+                unsafe { &(*code_ptr).obj_name }
+            )));
+        }
+        for index in 0..nclosure {
+            let cell = unsafe { pyre_object::w_tuple_getitem(w_closure, index as i64) }
+                .expect("closure tuple index is in bounds");
+            if !unsafe { pyre_object::is_cell(cell) } {
+                return Err(crate::PyError::type_error(format!(
+                    "arg 5 (closure) expected cell, found {}",
+                    crate::type_methods::arg_type_name(cell)
+                )));
+            }
+        }
         w_closure
     };
     // `function.py self.w_func_globals = w_globals` stores the dict
