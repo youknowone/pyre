@@ -977,6 +977,17 @@ pub extern "C" fn jit_unary_invert_value(value: i64) -> i64 {
 }
 
 #[majit_macros::jit_may_force]
+pub extern "C" fn jit_unary_positive_value(value: i64) -> i64 {
+    match unary_positive_value(value as PyObjectRef) {
+        Ok(result) => result as i64,
+        Err(mut err) => {
+            crate::runtime_ops::jit_publish_exception(err.to_exc_object());
+            0
+        }
+    }
+}
+
+#[majit_macros::jit_may_force]
 pub extern "C" fn jit_getitem(obj: i64, index: i64) -> i64 {
     match getitem(obj as PyObjectRef, index as PyObjectRef) {
         Ok(value) => value as i64,

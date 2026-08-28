@@ -964,6 +964,12 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::jit_unary_invert_value",
         crate::opcode_ops::jit_unary_invert_value,
     );
+    cpa1(
+        &mut entries,
+        "pyre_interpreter::opcode_ops::jit_unary_positive_value",
+        "pyre_interpreter::jit_unary_positive_value",
+        crate::opcode_ops::jit_unary_positive_value,
+    );
     cpa2(
         &mut entries,
         "pyre_interpreter::opcode_ops::jit_getitem",

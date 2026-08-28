@@ -5488,6 +5488,32 @@ pub fn pos(a: PyObjectRef) -> PyResult {
         if let Some(result) = try_numeric_unaryop_override(a, "__pos__")? {
             return Ok(result);
         }
+        pos_inner(a)
+    }
+}
+
+/// [`pos`] past its `__pos__` override probe.
+///
+/// Split out so that a trace can descend this body rather than re-emit it by
+/// hand.  The probe is what stops such a descent: its
+/// `needs_numeric_unaryop_dispatch` is `dont_look_inside` and is the second
+/// operation the body executes.  A caller that has already proven an exact
+/// builtin receiver cannot take it, so entering here records the arm that
+/// receiver selects and nothing else.  Every other caller reaches this through
+/// [`pos`] and is unaffected.
+///
+/// Unlike [`invert_inner`] this keeps the `bool` operand: `+True` is a
+/// rewrapping to a plain int, not a deprecation warning.  Unlike [`neg_inner`]
+/// the exact-int and exact-long arms are identity — they return the operand —
+/// matching `_self_unaryop('pos')` / `W_IntObject.int`.
+///
+/// `inline(never)` is load-bearing: `pos` is a one-call wrapper and rustc
+/// otherwise folds this body into `unary_positive_value`, so the codewriter
+/// never mints a graph the walker can descend.  Same knob as
+/// `w_list_append_inner`.
+#[inline(never)]
+pub fn pos_inner(a: PyObjectRef) -> PyResult {
+    unsafe {
         if is_int(a) && !is_bool(a) && pyre_object::is_exact_builtin_instance(a) {
             // `_self_unaryop('pos')` delegates to `W_IntObject.int`, which
             // returns `self` for the exact builtin representation.  `bool`
