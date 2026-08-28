@@ -1,4 +1,8 @@
-# pyre-check: max-pypy-ratio=73
+# pyre-check: max-pypy-ratio=44
+# Tightened 73 -> 44 when `seeded_callee_resume` stopped requiring the
+# callee's own exception table: execution-only time here fell 2.5x against a
+# same-day build of the parent commit, so the previous headroom is kept and
+# then some -- the ceiling moves by less than the measured gain.
 # A hot compiled CALLEE holding a try block the exception does not stay in used
 # to record its own traceback node TWICE.
 #

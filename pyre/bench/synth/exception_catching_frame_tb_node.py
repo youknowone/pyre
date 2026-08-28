@@ -1,6 +1,10 @@
-# pyre-check: max-pypy-ratio=53
-# The ceiling is twice the slowest ratio observed, 26.2x on the macos
-# runner; the runners read this fixture between 3.0x and 26.2x.
+# pyre-check: max-pypy-ratio=42
+# Tightened 53 -> 42 when `seeded_callee_resume` stopped requiring the
+# callee's own exception table: execution-only time here fell 1.53x against a
+# same-day build of the parent commit, so the previous headroom is kept and
+# then some -- the ceiling moves by less than the measured gain.
+# Before that change the runners read this fixture between 3.0x and 26.2x
+# and the ceiling was twice the slowest of those.
 # The frame holding the `try` contributes its own traceback node, including
 # when its `except` is reached from inside its own compiled trace.
 #

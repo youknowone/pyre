@@ -1,6 +1,10 @@
-# pyre-check: max-pypy-ratio=46
-# The ceiling is twice the slowest ratio observed, 22.7x on the macos
-# runner; the runners read this fixture between 8.0x and 22.7x.
+# pyre-check: max-pypy-ratio=26
+# Tightened 46 -> 26 when `seeded_callee_resume` stopped requiring the
+# callee's own exception table: execution-only time here fell 46x against a
+# same-day build of the parent commit, so the previous headroom is kept and
+# then some -- the ceiling moves by less than the measured gain.
+# Before that change the runners read this fixture between 8.0x and 22.7x
+# and the ceiling was twice the slowest of those.
 # A module-global int accumulator carried through an inlined function that
 # branches on the loop variable `i`, where the loop body ALSO reads `i` at the
 # tail (a branch / dead guard / mid-loop reassignment). The `LOAD_NAME i` folds
