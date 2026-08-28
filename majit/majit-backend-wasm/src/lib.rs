@@ -517,6 +517,23 @@ fn diag_bump(i: usize) {
 const FROZEN_CHAIN_VALUE_SLOTS: usize = 64;
 const FROZEN_CHAIN_REF_HOMES: usize = 128;
 const FROZEN_CHAIN_LABEL_REF_SLOTS: usize = 2;
+/// Slots a frozen layout is rounded up to.
+///
+/// A chained bridge runs in its source token's frame and reaches its target's
+/// label loader, so the two layouts have to agree offset for offset — the
+/// chain is refused outright when they do not. Above the floors the two
+/// numbers are each loop's own spill count, and sibling loops through the same
+/// interpreter differ by a slot or two, which is enough to refuse a chain that
+/// is otherwise exactly the shape the floors exist to keep compiled. Rounding
+/// lands those siblings on one layout; the cost is the rounded-away slots,
+/// bounded by this constant per compiled token.
+const FROZEN_CHAIN_SLOT_GRANULARITY: usize = 16;
+
+/// `n` rounded up to a whole number of [`FROZEN_CHAIN_SLOT_GRANULARITY`] slots.
+fn frozen_slot_count(n: usize) -> usize {
+    n.div_ceil(FROZEN_CHAIN_SLOT_GRANULARITY) * FROZEN_CHAIN_SLOT_GRANULARITY
+}
+
 /// Words a label-parameter entry accepts after `frame_ptr`. One value for
 /// every such entry in the process: a loop-closing JUMP reaches its target
 /// with `return_call_indirect` on the shared table, and that type-checks the
@@ -3506,8 +3523,8 @@ impl majit_backend::Backend for WasmBackend {
         let frame = match entry_bridge_target {
             Some(target) => target.frame,
             None => codegen::FrameGeometry::compact(
-                raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS),
-                raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES) + label_ref_slots,
+                frozen_slot_count(raw_frame_value_slots.max(FROZEN_CHAIN_VALUE_SLOTS)),
+                frozen_slot_count(raw_num_ref_homes.max(FROZEN_CHAIN_REF_HOMES)) + label_ref_slots,
                 label_ref_slots,
             ),
         };
