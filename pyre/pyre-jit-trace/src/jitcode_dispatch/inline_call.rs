@@ -5104,9 +5104,8 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // anywhere.  The screen exemption below is unaffected: it is
                 // reached only when `branchy_handler_scan` is `Some`, which
                 // itself requires `has_exception_table`.
-                let seeded_callee_resume = callable_guard_op.is_constant()
-                    && inline_depth < 2
-                    && try_multiframe;
+                let seeded_callee_resume =
+                    callable_guard_op.is_constant() && inline_depth < 2 && try_multiframe;
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
                 foriter_dirty_bound = entry_is_call_boundary
                     && (bound_method.is_some() || seeded_callee_resume)
