@@ -442,7 +442,16 @@ fn simple_namespace_init(args: &[PyObjectRef]) -> crate::PyResult {
 pub(crate) fn simple_namespace_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     let raw = *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("types.SimpleNamespace", |ns| {
+        // PyPy owns this as the app-level class
+        // `lib_pypy._structseq.SimpleNamespace`, so it keeps `object`'s
+        // TypeDef/Layout instead of introducing an interpreter TypeDef merely
+        // because pyre materialises its methods in Rust.
+        let object = crate::typedef::w_object();
+        let object_layout = unsafe { pyre_object::w_type_get_layout_ptr(object) };
+        let object_typedef = unsafe { (*object_layout).typedef };
+        let tp = crate::typedef::make_builtin_type_with_overridetypedef(
+            "types.SimpleNamespace",
+            |ns| {
             unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     ns,
@@ -500,7 +509,10 @@ pub(crate) fn simple_namespace_type() -> PyObjectRef {
                     crate::typedef::dict_descr(),
                 );
             }
-        });
+            },
+            object,
+            object_typedef,
+        );
         unsafe { w_type_set_hasdict(tp, true) };
         tp as usize
     });

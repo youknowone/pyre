@@ -1018,17 +1018,19 @@ unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
 /// RPython `{str: cell_or_value}` dict) plus
 /// `ModuleDictStrategy.caches` (the per-name `GlobalCache` registry
 /// whose `cell` fields hold live values).  Pyre's W_ModuleDictObject
-/// carries three indirect storages behind raw pointers — none of them
+/// carries two erased fields behind raw pointers — neither is
 /// reachable through inline `gc_ptr_offsets`:
 ///
 ///   * `dstorage` → `ModuleDictStorage.entries` (Vec<(String,
 ///     PyObjectRef)>) — every entry's value
-///   * `mstrategy` → `ModuleDictStrategy.caches` (Option<HashMap<...,
-///     Arc<Mutex<GlobalCache>>>>) — every live cache's `cell`
-///   * `object_storage` → post-`switch_to_object_strategy`
-///     Vec<(PyObjectRef, PyObjectRef)> — both halves of every entry
+///   * `mstrategy` → `DictStrategyRef`, whose traced `owner` points to
+///     `ModuleDictStrategy.caches` while the module strategy is active
 ///
-/// Each of the three is now a GC-managed non-moving storage box (off-GC
+/// After `switch_to_object_strategy`, the same `dstorage` field holds
+/// ObjectDictStorage and `mstrategy` points to the process-wide object holder,
+/// exactly like PyPy's `set_strategy` plus `dstorage` replacement.
+///
+/// Each per-module allocation is a GC-managed non-moving storage box (off-GC
 /// storage), so this trace does two things: it forwards each
 /// box-pointer field slot to grey the box (keeping it off the sweep list,
 /// as `object_object_custom_trace` does for `storage`), then walks the box
@@ -1054,12 +1056,26 @@ unsafe fn module_dict_object_custom_trace(
     if pyre_object::dictmultiobject::is_module_dict(obj) {
         for field in [
             std::ptr::addr_of_mut!(md.dstorage) as *mut *mut u8,
-            std::ptr::addr_of_mut!(md.object_storage) as *mut *mut u8,
             std::ptr::addr_of_mut!(md.mstrategy) as *mut *mut u8,
         ] {
             let boxed = *field;
             if !boxed.is_null() && pyre_object::gc_hook::try_gc_owns_object(boxed) {
                 f(field as *mut majit_ir::GcRef);
+            }
+        }
+        // A module holder owns the concrete ModuleDictStrategy.  Forward the
+        // actual owner slot after forwarding `mstrategy`, so the holder and
+        // its version/cache state have the same reachability chain as PyPy's
+        // strategy instance.  Static strategy holders have a null owner.
+        // Only the per-module holder is collector-owned.  After promotion the
+        // slot points at the immutable process-wide ObjectDictStrategy holder;
+        // do not manufacture a mutable reference to that static.
+        if !md.mstrategy.is_null()
+            && pyre_object::gc_hook::try_gc_owns_object(md.mstrategy as *mut u8)
+        {
+            let holder = &mut *md.mstrategy;
+            if !holder.owner.is_null() && pyre_object::gc_hook::try_gc_owns_object(holder.owner) {
+                f(std::ptr::addr_of_mut!(holder.owner) as *mut majit_ir::GcRef);
             }
         }
     }
@@ -2824,15 +2840,12 @@ fn build_gc() -> Box<MiniMarkGC> {
     // CODE_TYPE (46) and PYTRACEBACK_TYPE (47); placing it between
     // W_DICT and W_SET would shift every subsequent tid by one and
     // break descr ↔ GC tid correspondence.
-    // W_ModuleDictObject carries `dstorage: *mut ModuleDictStorage`
-    // (`Vec<(String, PyObjectRef)>` of cells / raw values),
-    // `mstrategy: *mut ModuleDictStrategy` (whose `caches`
-    // GlobalCache.cell fields hold live cells), and
-    // `object_storage: *mut Vec<(PyObjectRef, PyObjectRef)>` (active
-    // after `switch_to_object_strategy`).  Register a custom trace
-    // hook so the GC walks all three indirect storages — matching
+    // W_ModuleDictObject carries erased `dstorage` and `mstrategy` slots.
+    // The latter points to DictStrategyRef; its owner points to the concrete
+    // ModuleDictStrategy while that strategy is active. Register a custom
+    // trace hook so the GC walks this indirect ownership chain — matching
     // the W_DictObject pattern.
-    // No `.with_destructor_fn`: all three storages are now GC-managed storage
+    // No `.with_destructor_fn`: all per-module storages are GC-managed storage
     // boxes (off-GC storage) whose own tid drop glue
     // (`storage_box_destructor`) is the sole reclaimer. A sweep-time module-dict
     // destructor would race those boxes on the destructor list and double-free —
@@ -4328,11 +4341,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::kwargsdict::KwargsDictStorage>,
         pyre_object::kwargsdict::set_kwargs_dict_storage_gc_type_id,
     );
-    // Module-dict `dstorage` and `mstrategy` storage boxes (off-GC storage
+    // Module-dict `dstorage`, holder and owner storage boxes (off-GC storage
     // epic S3). `module_dict_object_custom_trace` greys each box through its
     // field slot and `w_module_dict_walk_gc_cells` forwards the interior
     // PyObjectRef slots — same leaf contract as the regular-dict boxes above.
-    // The post-switch `object_storage` reuses the ObjectDictStorage box tid
+    // The post-switch `dstorage` reuses the ObjectDictStorage box tid
     // registered above (identical `IndexMap<ObjectKey, PyObjectRef>` type), so
     // it needs no separate registration. Keep these ids at the absolute tail.
     register_leaf_storage_box::<pyre_object::celldict::ModuleDictStorage>(
@@ -4344,6 +4357,13 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut gc,
         pyre_object::gc_storage::storage_box_destructor::<pyre_object::celldict::ModuleDictStrategy>,
         pyre_object::celldict::set_module_dict_strategy_gc_type_id,
+    );
+    register_leaf_storage_box::<pyre_object::dictmultiobject::DictStrategyRef>(
+        &mut gc,
+        pyre_object::gc_storage::storage_box_destructor::<
+            pyre_object::dictmultiobject::DictStrategyRef,
+        >,
+        pyre_object::dictmultiobject::set_dict_strategy_ref_gc_type_id,
     );
     // bytearray `data` storage box (off-GC storage). A leaf `Vec<u8>` (no inner
     // refs); `bytearray_object_custom_trace` greys it through the `data` field
@@ -9697,6 +9717,7 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
         )
     };
     if !at_loop_header {
+        pyre_jit_trace::jitcode_dispatch::fbw_foriter_report_refused_header();
         if pyre_jit_trace::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] deliver REFUSED (live frame not at the loop header for \
@@ -9717,6 +9738,7 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     // `last_instr` are Python bytecode coordinates, matching `body_pc`
     // (the FOR_ITER `orgpc + 1`).
     frame.set_last_instr_from_next_instr(body_pc);
+    pyre_jit_trace::jitcode_dispatch::fbw_foriter_report_delivered();
     true
 }
 

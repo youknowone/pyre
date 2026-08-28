@@ -5,7 +5,7 @@ pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, ClosureRuntimeWithResolver, JitCodeMachine, JitCodeRuntime, JitCodeSym,
     StandaloneFrameStack, residual_write_effect_info, trace_jitcode,
-    trace_jitcode_at_resume_position, trace_jitcode_from_merge_point, trace_jitcode_with_args,
+    trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point, trace_jitcode_with_args,
     trace_jitcode_with_args_and_runtime,
 };
 pub use dispatch::{build_vable_snapshot_boxes, build_vref_snapshot_boxes};
@@ -392,6 +392,12 @@ pub enum AbortReason {
     /// `Counters.ABORT_BRIDGE` / `ABORT_BAD_LOOP`: generic abort path —
     /// used when pyre cannot classify the reason more precisely.
     Generic,
+    /// `Counters.ABORT_BRIDGE`, named: `compile.py giveup()` — a bridge that
+    /// cannot be built at all. Shares [`AbortReason::Generic`]'s integer, so
+    /// the hook payload is unchanged; the point of the separate variant is
+    /// that a give-up site can say so, which keeps it out of the
+    /// nothing-was-staged tally the `abort_trace` fallback keeps.
+    Bridge,
 }
 
 impl AbortReason {
@@ -402,7 +408,7 @@ impl AbortReason {
     pub const fn as_int(self) -> i32 {
         match self {
             AbortReason::TooLong => 12,
-            AbortReason::Generic => 13,
+            AbortReason::Generic | AbortReason::Bridge => 13,
         }
     }
 }
@@ -533,8 +539,8 @@ pub(crate) struct CompiledTrace {
 #[derive(Debug, Clone)]
 pub(crate) struct StoredExitLayout {
     pub(crate) source_op_index: Option<usize>,
-    pub(crate) recovery_layout: Option<ExitRecoveryLayout>,
-    pub(crate) resume_layout: Option<ResumeLayoutSummary>,
+    pub(crate) recovery_layout: Option<std::sync::Arc<ExitRecoveryLayout>>,
+    pub(crate) resume_layout: Option<std::sync::Arc<ResumeLayoutSummary>>,
     /// compile.py `ResumeGuardDescr` storage — single guard-owned
     /// shared pool containing rd_numb / rd_consts / rd_virtuals /
     /// rd_pendingfields. All readers (blackhole resume, bridge
@@ -583,8 +589,8 @@ impl StoredExitLayout {
             exit_types: ExitTypes::from_slice(self.resolve_exit_types()),
             is_finish: self.resolve_is_finish(),
             is_exception_exit: self.resolve_is_exception_exit(),
-            recovery_layout: self.recovery_layout.clone().map(Box::new),
-            resume_layout: self.resume_layout.clone().map(Box::new),
+            recovery_layout: self.recovery_layout.clone(),
+            resume_layout: self.resume_layout.clone(),
             storage: self.storage.clone(),
         }
     }
@@ -3206,7 +3212,7 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types,
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    recovery_layout: layout.recovery_layout.map(Box::new),
+                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
                     resume_layout: None,
                     storage,
                 }
@@ -3229,7 +3235,7 @@ impl<M: Clone> MetaInterp<M> {
                 exit_types: ExitTypes::from_vec(layout.exit_types),
                 is_finish: layout.is_finish,
                 is_exception_exit: layout.is_exception_exit,
-                recovery_layout: layout.recovery_layout.map(Box::new),
+                recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
                 resume_layout: None,
                 storage: None,
             })
@@ -3274,7 +3280,7 @@ impl<M: Clone> MetaInterp<M> {
                         exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                         is_finish: layout.is_finish,
                         is_exception_exit: layout.is_exception_exit,
-                        recovery_layout: layout.recovery_layout.map(Box::new),
+                        recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
                         resume_layout: merged
                             .get(&layout.fail_index)
                             .and_then(|existing| existing.resume_layout.clone()),
@@ -3328,7 +3334,7 @@ impl<M: Clone> MetaInterp<M> {
                             exit_types: ExitTypes::from_vec(layout.exit_types),
                             is_finish: layout.is_finish,
                             is_exception_exit: layout.is_exception_exit,
-                            recovery_layout: layout.recovery_layout.map(Box::new),
+                            recovery_layout: layout.recovery_layout.map(std::sync::Arc::new),
                             resume_layout: merged
                                 .get(&layout.op_index)
                                 .and_then(|existing| existing.exit_layout.resume_layout.clone()),
@@ -9409,7 +9415,7 @@ impl<M: Clone> MetaInterp<M> {
                     &combined_ops,
                     &source_jct,
                     &previous_tokens_strong,
-                    caller_recovery_layout.as_ref(),
+                    caller_recovery_layout.as_deref(),
                 )
             }))
         };
@@ -10934,10 +10940,10 @@ impl<M: Clone> MetaInterp<M> {
                     exit_types: ExitTypes::from_vec(layout.fail_arg_types),
                     is_finish: layout.is_finish,
                     is_exception_exit: layout.is_exception_exit,
-                    recovery_layout: layout.recovery_layout.map(Box::new).or_else(|| {
-                        trace_layout_ref.and_then(|layout| layout.recovery_layout.clone())
-                    }),
-                    resume_layout: resume_layout.map(Box::new),
+                    recovery_layout: layout.recovery_layout.map(std::sync::Arc::new).or_else(
+                        || trace_layout_ref.and_then(|layout| layout.recovery_layout.clone()),
+                    ),
+                    resume_layout: resume_layout.map(std::sync::Arc::new),
                     storage: trace_layout_ref.and_then(|layout| layout.storage.clone()),
                 }
             })
@@ -11554,16 +11560,17 @@ impl<M: Clone> MetaInterp<M> {
                 trace_id,
                 &trace.inputargs,
                 trace_info.as_ref(),
-                recovery_layout.as_ref(),
+                recovery_layout.as_deref(),
             );
             if let Some(exit_layout) = trace.exit_layouts.get_mut(&fail_index) {
-                exit_layout.resume_layout = Some(layout);
+                exit_layout.resume_layout = Some(std::sync::Arc::new(layout));
                 exit_layout.storage = Some(storage);
                 if let Some(summary) = exit_layout.resume_layout.as_ref() {
                     let recovery_layout = summary.to_exit_recovery_layout_with_caller_prefix(
-                        exit_layout.recovery_layout.as_ref(),
+                        exit_layout.recovery_layout.as_deref(),
                     );
-                    exit_layout.recovery_layout = Some(recovery_layout.clone());
+                    exit_layout.recovery_layout =
+                        Some(std::sync::Arc::new(recovery_layout.clone()));
                     patched_recovery_layout = Some(recovery_layout);
                 }
             }
@@ -14077,7 +14084,7 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                         &source_jct,
                         previous_tokens,
-                        caller_recovery_layout.as_ref(),
+                        caller_recovery_layout.as_deref(),
                     )
                 }))
             };
@@ -18643,6 +18650,22 @@ pub struct MetaInterpStaticData {
     /// upstream `finish_setup(codewriter)` callback because pyre's
     /// codewriter pipeline is split across crates.
     pub jitdrivers_sd: Vec<crate::jitdriver::JitDriverStaticData>,
+    /// Blackhole projection of [`Self::jitdrivers_sd`], built on first use.
+    ///
+    /// `bhimpl_jit_merge_point`'s recursive-portal branch indexes
+    /// `metainterp_sd.jitdrivers_sd` in place; upstream builds nothing per
+    /// resume.  pyre's blackhole needs the same rows re-cast — the result kind
+    /// as a `BhReturnType`, the portal runner as a C function pointer, the
+    /// portal calldescr as a `BhCallDescr` — so the cast is memoised beside the
+    /// rows it derives from and each resume seeds the interpreter with an `Arc`
+    /// clone of the one table instead of re-casting every row.
+    ///
+    /// Cleared by [`Self::finish_setup_descrs_for_jitdrivers`], which every
+    /// path that appends a driver or rewrites a result kind already ends in.
+    /// The other two `iter_mut` writers set `virtualizable_info` /
+    /// `greenfield_info`, neither of which this projection reads.
+    pub(crate) bh_jitdrivers_sd:
+        std::sync::OnceLock<std::sync::Arc<[crate::blackhole::BhJitDriverSd]>>,
     /// pyjitpl.py:1314 / 2267 `metainterp_sd.virtualref_info` — shared
     /// `VirtualRefInfo` descriptor block.  Per-process singleton:
     /// descriptor indices for the `virtual_token` / `forced` fields and
@@ -19519,6 +19542,9 @@ impl MetaInterpStaticData {
         // across repeated `register_jitdriver_sd` calls because the backend
         // setters accept the same `Arc` by identity.
         cpu.set_propagate_exception_descr(exc_descr.clone());
+        // The driver list just changed shape or result kind, so the blackhole
+        // projection memoised beside it no longer describes these rows.
+        self.bh_jitdrivers_sd.take();
         // `pyjitpl.py:2274-2281` per-driver attachment.
         for jd in self.jitdrivers_sd.iter_mut() {
             // `pyjitpl.py:2275-2279` `token = getattr(self,
@@ -24051,7 +24077,7 @@ mod tests {
             fail_index,
             StoredExitLayout {
                 source_op_index: Some(0),
-                recovery_layout: Some(recovery_layout),
+                recovery_layout: Some(std::sync::Arc::new(recovery_layout)),
                 resume_layout: None,
                 storage: Some(crate::resume::ResumeStorage::new(
                     vec![7, 8, 9],

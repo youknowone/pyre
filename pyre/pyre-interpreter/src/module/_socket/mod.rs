@@ -5,9 +5,8 @@
 //! plus address conversion / IDNA / error mapping helpers, and
 //! rsocket_rffi carries the host socket layer both platforms reach it
 //! through.  It exists only where such a layer does: a target that is
-//! neither POSIX nor Windows keeps the module's platform-neutral surface
-//! (the error classes, the byte-order helpers, the default timeout) and
-//! nothing that would need a descriptor behind it.
+//! neither POSIX nor Windows has no `_socket` module at all, which is the
+//! absence `socket.py` and its callers are written against.
 
 #[cfg(any(unix, windows))]
 pub(crate) mod rsocket_rffi;

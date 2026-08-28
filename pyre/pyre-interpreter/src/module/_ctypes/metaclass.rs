@@ -34,12 +34,11 @@ type PyResult = Result<PyObjectRef, crate::PyError>;
 /// its ctypes metaclasses are app-level (`class _CDataMeta(type)`,
 /// basics.py:48) and inherit `type`'s instance layout from their base.
 fn make_ctypes_metatype(name: &str, init: impl FnOnce(PyObjectRef)) -> PyObjectRef {
-    let tp = crate::typedef::make_builtin_type_with_layout(
-        name,
-        init,
-        ctype_type(),
-        &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
-    );
+    let base = ctype_type();
+    let layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
+    let tp = crate::typedef::make_builtin_type_with_overridetypedef(name, init, base, unsafe {
+        (*layout).typedef
+    });
     super::finish_cpython_type(tp, "_ctypes", true)
 }
 
@@ -58,11 +57,13 @@ macro_rules! cached_type {
 // metaclass owner for every concrete ctypes metaclass.  Keeping the shared
 // methods here avoids the former pyre-only duplication on every child.
 cached_type!(CTYPE_TYPE, ctype_type, || {
-    let tp = crate::typedef::make_builtin_type_with_layout(
+    let base = crate::typedef::w_type();
+    let layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
+    let tp = crate::typedef::make_builtin_type_with_overridetypedef(
         "CType_Type",
         install_shared_meta,
-        crate::typedef::w_type(),
-        &pyre_object::pyobject::TYPE_TYPE as *const pyre_object::PyType,
+        base,
+        unsafe { (*layout).typedef },
     );
     super::finish_cpython_type(tp, "_ctypes", true)
 });
@@ -158,7 +159,13 @@ cached_type!(CFIELD, cfield_type, || {
         );
     });
     unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
-    super::finish_cpython_type(tp, "ctypes", true)
+    let tp = super::finish_cpython_type(tp, "ctypes", true);
+    // [3.14-spec] CPython's public `ctypes.CField` descriptor type omits
+    // BASETYPE.  PyPy does not publish this private storage owner at all;
+    // keep pyre's existing descriptor implementation but prevent a user
+    // subclass from acquiring an unsupported layout.
+    unsafe { pyre_object::w_type_suppress_cpython_basetype(tp) };
+    tp
 });
 
 cached_type!(PYCARRAYTYPE, pycarraytype_type, || {

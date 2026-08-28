@@ -2093,10 +2093,11 @@ impl DynasmBackend {
     }
 
     /// Resolve a raw `jf_descr` pointer to its `DescrRef`, as
-    /// `LLGraphCPU.get_latest_descr` does. Searches root loop fail descriptors
-    /// first, then all bridge fail_descrs stored in asmmemmgr_blocks.
-    /// RPython does this via AbstractDescr.show() which works for any
-    /// descr from any loop/bridge.
+    /// `LLGraphCPU.get_latest_descr` does.  After the descriptors attached
+    /// to the cpu itself are ruled out by pointer identity, the pointer is
+    /// cast straight back to its `FailDescrCell` — RPython does this via
+    /// `AbstractDescr.show()`, which works for any descr from any
+    /// loop/bridge without consulting the executing token.
     ///
     /// `compile.py`'s four `DoneWithThisFrame*` descriptors
     /// + `ExitFrameWithExceptionDescrRef` singletons attached to
@@ -2112,12 +2113,7 @@ impl DynasmBackend {
     /// `PropagateExceptionDescr.handle_fail`: read `jf_guard_exc`, clear it,
     /// and stage the value into `jf_frame[0]` before synthesizing the
     /// exit-frame-with-exception descr the toplevel consumer expects.
-    fn find_descr_by_ptr(
-        &self,
-        token: &JitCellToken,
-        ptr: usize,
-        frame_ptr: *mut JitFrame,
-    ) -> majit_ir::DescrRef {
+    fn find_descr_by_ptr(&self, ptr: usize, frame_ptr: *mut JitFrame) -> majit_ir::DescrRef {
         let attached = self.attached_descr_ptrs();
         // Check all four `DoneWithThisFrameDescr` variants.
         // Forward through `meta_descr` so the metainterp class hierarchy
@@ -2217,40 +2213,17 @@ impl DynasmBackend {
                 );
         }
 
-        // Search root loop
-        let compiled = Self::get_compiled(token);
-        if let Some(found) = compiled
-            .fail_descrs
-            .iter()
-            .find(|d| Arc::as_ptr(d) as *const () as usize == ptr)
-        {
-            return found.descr.clone();
-        }
-
-        // Search bridge fail_descrs in asmmemmgr_blocks
-        let blocks_clt = token.compiled_loop_token_expect();
-        let blocks = blocks_clt.asmmemmgr_blocks.lock();
-        for block in blocks.iter() {
-            if let Some(bridge) = block.downcast_ref::<CompiledCode>()
-                && let Some(found) = bridge
-                    .fail_descrs
-                    .iter()
-                    .find(|d| Arc::as_ptr(d) as *const () as usize == ptr)
-            {
-                return found.descr.clone();
-            }
-        }
-        drop(blocks);
-
-        // Cross-token fallback: a bridge attached to loop A may JUMP into
-        // loop B's body.  When B's guard fires, the jf_descr ptr identifies
-        // a fail descr owned by B (or by a bridge attached to B), but the
-        // currently-executing `token` is still A.  RPython's
-        // `AbstractDescr.show(jf_descr)` dereferences the pointer directly;
-        // pyre matches that via `recover_fail_descr_cell`, a pure cast
-        // through `Arc::from_raw` against the `FailDescrCell` wrapper that
-        // `register_fail_descrs` pinned onto the owning CLT's
-        // `asmmemmgr_gcreftracers`.
+        // Every remaining `ptr` is the address of a live
+        // `Arc<FailDescrCell>`: the cell that `append_guard_token*` /
+        // `_store_force_index_if_next_guard` baked into the machine code is
+        // the same cell that goes into `CompiledCode::fail_descrs`, and
+        // `register_fail_descrs` pins that slice onto the owning CLT's
+        // `asmmemmgr_gcreftracers` for both `compile_loop` and
+        // `compile_bridge`.  So the cast below answers for a root loop's
+        // guard, for a bridge's guard, and for the cross-token case where a
+        // bridge attached to loop A JUMPs into loop B and B's guard fires
+        // while `token` is still A.  RPython's `AbstractDescr.show(jf_descr)`
+        // dereferences the pointer the same way.
         //
         // A 0 `ptr` here means the JIT-baked code never wrote `jf_descr`
         // (e.g. a force-token flow that bypassed both
@@ -3030,7 +3003,7 @@ impl Backend for DynasmBackend {
 
         // llmodel.py get_latest_descr: read jf_descr from frame.
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
+        let descr = self.find_descr_by_ptr(jf_descr_raw as usize, result_jf);
         let descr_fd = descr
             .as_fail_descr()
             .expect("find_descr_by_ptr result must implement FailDescr");
@@ -3119,7 +3092,7 @@ impl Backend for DynasmBackend {
         let result_jf = unsafe { func(jf_ptr, crate::jit_threadlocalref_base()) };
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
+        let descr = self.find_descr_by_ptr(jf_descr_raw as usize, result_jf);
         let descr_fd = descr
             .as_fail_descr()
             .expect("find_descr_by_ptr result must implement FailDescr");

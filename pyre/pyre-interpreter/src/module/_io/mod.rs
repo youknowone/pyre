@@ -966,23 +966,81 @@ fn init_iobase_type(ns: PyObjectRef) {
 /// it sits in `__new__` rather than in the app-level `__init__`, a subclass
 /// that overrides `__init__` without calling up is registered all the same.
 ///
-/// Every `_io` type keeping the generic instance layout inherits this through
-/// the MRO: `FileIO`, the `_RawIOBase`/`_BufferedIOBase`/`_TextIOBase` bases,
-/// and app-level subclasses of any of them. The typed payloads override
-/// `__new__` and reach the same queue through [`tag_io_instance`].
+/// Each exported type installs its own descriptor, while TypeDef identity
+/// follows PyPy's TypeCache overrides: notably `_RawIOBase` reuses
+/// `W_IOBase.typedef` through `applevel_subclasses_base = W_IOBase`.  Typed
+/// payloads provide their own `__new__` and reach the same queue through
+/// [`tag_io_instance`].
 ///
 /// The extra arguments go to `__init__`; `generic_new_descr` ignores its
 /// `__args__` in the same way.
-fn iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
+fn allocate_iobase_instance(
+    owner: PyObjectRef,
+    owner_name: &str,
+    args: &[PyObjectRef],
+) -> crate::PyResult {
     let (positional, _) = crate::builtins::split_builtin_kwargs(args);
     let Some(&cls) = positional.first() else {
-        return Err(crate::PyError::type_error(
-            "_IOBase.__new__(): not enough arguments",
-        ));
+        return Err(crate::PyError::type_error(format!(
+            "{owner_name}.__new__(): not enough arguments"
+        )));
     };
-    let obj = autoflusher_add(crate::typedef::object_descr_new(&[cls])?);
-    crate::executioncontext::register_finalizer(obj);
-    Ok(obj)
+    crate::typedef::check_user_subclass(owner, cls)?;
+    Ok(tag_io_instance(pyre_object::w_instance_new(cls), cls))
+}
+
+fn iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
+    allocate_iobase_instance(io_base_type(), "_IOBase", args)
+}
+
+fn raw_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
+    allocate_iobase_instance(raw_iobase_type(), "_RawIOBase", args)
+}
+
+fn buffered_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
+    allocate_iobase_instance(buffered_iobase_type(), "_BufferedIOBase", args)
+}
+
+fn text_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
+    allocate_iobase_instance(text_iobase_type(), "_TextIOBase", args)
+}
+
+/// PyPy `W_FileIO.descr_new`: allocate the concrete interpreter owner and run
+/// `W_FileIO.__init__`'s field defaults before the public initializer sees its
+/// arguments.  CPython 3.14 observes an uninitialized FileIO as closed with
+/// mode `wb`; keep that newer public state on the PyPy-shaped instance dict.
+fn fileio_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let obj = allocate_iobase_instance(fileio_type(), "FileIO", args)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    // Build each value before reloading the receiver.  The allocation may
+    // move it, exactly as in `type_ns_store`.
+    let store = |name: &str, value: PyObjectRef| {
+        crate::baseobjspace::setdictvalue_native(
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+            name,
+            value,
+        );
+    };
+    store("__file_fd__", pyre_object::w_int_new(-1));
+    store("__file_closed__", pyre_object::w_bool_from(true));
+    store("__file_closefd__", pyre_object::w_bool_from(true));
+    store("__file_mode__", pyre_object::w_str_new("wb"));
+    store("__file_public_mode__", pyre_object::w_str_new("wb"));
+    store("__file_seekable__", pyre_object::w_none());
+    store(
+        "__file_blksize__",
+        pyre_object::w_int_new(DEFAULT_BUFFER_SIZE),
+    );
+    for name in [
+        "__file_stat_mode__",
+        "__file_stat_size__",
+        "__file_stat_blksize__",
+    ] {
+        store(name, pyre_object::w_none());
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
 }
 
 /// `interp_iobase.py:rawiobase_read_w` — the default raw `read` is a
@@ -1082,6 +1140,11 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
 fn init_rawiobase_type(ns: PyObjectRef) {
     type_method(
         ns,
+        "__new__",
+        crate::typedef::make_new_descr(raw_iobase_new),
+    );
+    type_method(
+        ns,
         "read",
         crate::make_builtin_function("read", rawiobase_read),
     );
@@ -1150,6 +1213,11 @@ fn buffered_iobase_readinto1(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn init_buffered_iobase_type(ns: PyObjectRef) {
+    type_method(
+        ns,
+        "__new__",
+        crate::typedef::make_new_descr(buffered_iobase_new),
+    );
     for (name, function) in [
         (
             "read",
@@ -1208,6 +1276,11 @@ fn text_iobase_none_get(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn init_text_iobase_type(ns: PyObjectRef) {
+    type_method(
+        ns,
+        "__new__",
+        crate::typedef::make_new_descr(text_iobase_new),
+    );
     for (name, function) in [
         ("read", text_iobase_read as crate::gateway::BuiltinCodeFn),
         (
@@ -1258,10 +1331,16 @@ fn io_base_type() -> PyObjectRef {
 pub(super) fn raw_iobase_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_base(
+        let base = io_base_type();
+        let layout = unsafe { pyre_object::w_type_get_layout_ptr(base) };
+        // `W_RawIOBase.typedef.applevel_subclasses_base = W_IOBase`;
+        // `TypeCache.build` therefore supplies W_IOBase's TypeDef as the
+        // override instead of minting a sibling Layout.
+        let tp = crate::typedef::make_builtin_type_with_overridetypedef(
             "_io._RawIOBase",
             init_rawiobase_type,
-            io_base_type(),
+            base,
+            unsafe { (*layout).typedef },
         );
         // `_iomodule.c:ADD_TYPE` creates rawiobase_spec as immutable heap.
         crate::typedef::mark_cpython_heap_type(tp, true);
@@ -1284,6 +1363,11 @@ pub(crate) fn fileio_type() -> PyObjectRef {
         let tp = crate::typedef::make_builtin_type_with_base(
             "_io.FileIO",
             |type_ns| {
+                type_method(
+                    type_ns,
+                    "__new__",
+                    crate::typedef::make_new_descr(fileio_new),
+                );
                 crate::builtins::init_file_wrapper_type(type_ns);
                 crate::builtins::init_fileio_type(type_ns);
                 type_method(

@@ -2915,6 +2915,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_interpreter::typedef::w_object",
         w_object,
     );
+    // `_ast` keeps CPython 3.14's process-wide `Load_singleton` in a rooted
+    // `OnceLock` slot.  Its accessor is opaque for the same reason as the
+    // builtin type accessors above and remains a residual runtime read.
+    let ast_load_singleton: fn() -> pyre_object::PyObjectRef =
+        crate::module::_ast::moduledef::load_singleton;
+    p0(
+        &mut entries,
+        "pyre_interpreter::module::_ast::moduledef::load_singleton",
+        ast_load_singleton,
+    );
 
     // Thread-local / `OnceLock` accessors that carry `#[dont_look_inside]`
     // (the `.with` closure read has no extractable graph): the codewriter

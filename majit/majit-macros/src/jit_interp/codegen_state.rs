@@ -2979,26 +2979,34 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             // `MIFrame.setup_resume_at_op(pc)`: put the walk back at the
             // guard's own jitcode position so the rest of the opcode it sits
             // inside is traced rather than run where the trace cannot see it.
-            // The registers arrive already decoded; nothing here is
-            // machine-specific except the `Sym` type, which is why this
-            // forwards rather than generating a walk of its own.
+            // One frame per encoded resume section, outermost first, each with
+            // its registers already decoded; nothing here is machine-specific
+            // except the `Sym` type, which is why this forwards rather than
+            // generating a walk of its own.
+            // Empty unless `split_dispatch` raised the sub-JitCodes' alloc
+            // floor past the range, which is the only case where a non-root
+            // frame's snapshot loses registers to the identity trim.
+            fn reserved_int_identity_range() -> Option<(usize, usize)> {
+                let (base, end) = (
+                    #int_identity_base,
+                    #int_identity_base + #num_reserved_identity_slots,
+                );
+                (end > base).then_some((base, end))
+            }
+
             fn trace_from_guard_resume_position<__R: majit_metainterp::JitCodeRuntime>(
                 ctx: &mut majit_metainterp::TraceCtx,
                 sym: &mut #sym_ty,
-                dispatch_jitcode: &majit_metainterp::JitCode,
-                resume_pc: usize,
+                frames: &[majit_metainterp::GuardResumeFrame],
                 outer_program_pc: usize,
                 runtime: &__R,
-                regs: &[majit_metainterp::GuardResumeReg],
             ) -> Option<majit_metainterp::TraceAction> {
-                Some(majit_metainterp::trace_jitcode_at_resume_position(
+                Some(majit_metainterp::trace_jitcode_at_resume_framestack(
                     ctx,
                     sym,
-                    dispatch_jitcode,
-                    resume_pc,
+                    frames,
                     outer_program_pc,
                     runtime,
-                    regs,
                 ))
             }
 

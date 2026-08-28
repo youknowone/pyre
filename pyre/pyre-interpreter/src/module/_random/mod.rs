@@ -348,19 +348,12 @@ impl W_Random {
 }
 
 /// Time-based fallback seed — `int(time.time() * 256)`.
+///
+/// Read through the same accessor `time.time()` uses, which is what routes
+/// the reading to the sandbox controller and to the wasm embedder rather than
+/// to a `SystemTime` neither of them has.
 fn seed_from_time() -> u64 {
-    // Under sandbox the clock is read through the trusted controller, not the
-    // host directly.
-    #[cfg(feature = "sandbox")]
-    let secs = crate::host_seam::ops::time().unwrap_or(0.0);
-    #[cfg(not(feature = "sandbox"))]
-    let secs = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0)
-    };
+    let secs = crate::module::time::interp_time::duration_since_epoch().as_secs_f64();
     (secs * 256.0) as u64
 }
 

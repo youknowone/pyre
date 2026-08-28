@@ -229,6 +229,7 @@ fn each_label_sits_at_its_own_slot_constant() {
         ),
         (d::BRIDGE_EC_FROM_PORTAL_RED, "bridge_ec_from_portal_red"),
         (d::BRIDGE_EC_MISSING, "bridge_ec_missing"),
+        (d::FORITER_ITEM_DROPPED, "fbw_foriter_item_dropped"),
     ];
 
     // Exhaustiveness: a slot added to `fbw_diag` grows `LABELS` (rustc enforces

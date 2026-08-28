@@ -93,6 +93,7 @@
 # NOT the same defect as `_pending/loop_callee_for_header_resume.py`, though it
 # is the same field: there the triple `(last_instr, valuestackdepth, cells)` is
 # torn at a resume; here nothing resumes, a live reader just reads the field.
+import opcode
 import sys
 
 N = 20000
@@ -116,6 +117,23 @@ def main():
     print("f_lasti values:", [(o, seen[o]) for o in offsets])
     if len(offsets) != 1:
         print(f"FAIL caller f_lasti diverged across the compile: {offsets}")
+        return 1
+    # Stability alone is not the property under guard: a regression that
+    # consistently reports the WRONG opcode reads as one offset too.  The
+    # reverted widening answered 42, the `LOAD_GLOBAL` that pushes
+    # `refused_inline`, instead of the `CALL` that entered it.  So decode the
+    # caller's own bytecode at the offset and require the CALL itself.
+    #
+    # `refused_inline()` is the only zero-argument call in `main`, so the
+    # oparg pins WHICH call: `seen.get(v, 0)` is 2, `range`/`sorted` are 1.
+    off = offsets[0]
+    code = main.__code__.co_code
+    op, oparg = code[off], code[off + 1]
+    if op != opcode.opmap["CALL"] or oparg != 0:
+        print(
+            f"FAIL caller f_lasti {off} names {opcode.opname[op]} arg={oparg}, "
+            "not the zero-argument CALL of refused_inline"
+        )
         return 1
     print("PASS")
     return 0

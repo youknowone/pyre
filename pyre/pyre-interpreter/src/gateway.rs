@@ -1772,11 +1772,14 @@ pub fn os_string_from_fs_bytes(data: &[u8]) -> std::ffi::OsString {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        // Outside Windows an `OsStr` IS the byte string, on wasm32 as much as
-        // on unix, so these bytes already are its encoding and survive the
-        // round trip `as_encoded_bytes` makes on the way back out.  Carrying
-        // them whole is what lets a name `listdir` reports be a name `stat`
-        // can be called with again.
+        // SAFETY: outside Windows an `OsStr` IS the byte string, on wasm32 as
+        // much as on unix, so any byte sequence is a valid encoding and these
+        // bytes survive the round trip `as_encoded_bytes` makes on the way
+        // back out.  Carrying them whole is what lets a name `listdir` reports
+        // be a name `stat` can be called with again; the safe `from_vec`
+        // constructor that says the same thing is offered only under
+        // `std::os::unix` and `std::os::wasi`, neither of which this target
+        // has, so the unchecked call is the only spelling available here.
         unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(data) }.to_os_string()
     }
 }

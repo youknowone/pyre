@@ -3029,7 +3029,7 @@ fn gc_table_load_inside_a_loop_body_is_emitted_inside_the_loop() {
                     wasmparser::Operator::I32Const { value } if value == gc_table_base as i32 => {
                         gc_table_address_on_stack = true;
                     }
-                    wasmparser::Operator::I32Load { .. } if gc_table_address_on_stack => {
+                    wasmparser::Operator::I64Load32U { .. } if gc_table_address_on_stack => {
                         if control_stack.contains(&true) {
                             loads_inside_loop += 1;
                         } else {

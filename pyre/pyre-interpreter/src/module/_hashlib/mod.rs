@@ -57,11 +57,18 @@ fn lookup_digest_name(name: &[u8]) -> Option<&'static str> {
         .map(|(python_name, _)| *python_name)
 }
 
-const HASH_STATE_WORDS: usize = 64;
+/// Read from the contract rather than restated beside it: a second
+/// spelling of the same number is a second thing to get wrong on a target
+/// whose word is not eight bytes.
+const HASH_STATE_WORDS: usize = pyre_native::hash::HASH_STATE_STORAGE_WORDS;
+/// The embedded array's length: the capacity plus the slack the round-up to a
+/// 16-byte boundary consumes.
+const HASH_STATE_SLOTS: usize =
+    HASH_STATE_WORDS + pyre_native::hash::STATE_STORAGE_ALIGN_SLACK_WORDS;
 
 #[repr(C)]
 struct HashStateStorage {
-    words: [usize; HASH_STATE_WORDS + 1],
+    words: [usize; HASH_STATE_SLOTS],
 }
 
 impl HashStateStorage {
@@ -89,10 +96,6 @@ pub struct W_HashState {
 
 impl W_HashState {
     fn new(name: &'static str, data: &[u8]) -> Result<PyObjectRef, crate::PyError> {
-        assert_eq!(
-            HASH_STATE_WORDS,
-            pyre_native::hash::HASH_STATE_STORAGE_WORDS
-        );
         assert_eq!(16, pyre_native::hash::HASH_STATE_STORAGE_ALIGN);
         let _roots = gc_roots::push_roots();
         let name_slot = gc_roots::shadow_stack_len();
@@ -102,7 +105,7 @@ impl W_HashState {
             name: gc_roots::shadow_stack_get(name_slot),
             digest_size: pyre_native::hash::digest_output_size(name).unwrap_or(0) as i64,
             storage: HashStateStorage {
-                words: [0; HASH_STATE_WORDS + 1],
+                words: [0; HASH_STATE_SLOTS],
             },
         });
         let this = W_HashState::from_obj(state).expect("fresh _HashState");
@@ -144,7 +147,7 @@ impl W_HashState {
             name: gc_roots::shadow_stack_get(name_slot),
             digest_size: digest_size as i64,
             storage: HashStateStorage {
-                words: [0; HASH_STATE_WORDS + 1],
+                words: [0; HASH_STATE_SLOTS],
             },
         });
         let this = W_HashState::from_obj(state).expect("fresh BLAKE2 state");
@@ -285,7 +288,7 @@ mod hash_state_class {
                 name: gc_roots::shadow_stack_get(name_slot),
                 digest_size: self.digest_size,
                 storage: HashStateStorage {
-                    words: [0; HASH_STATE_WORDS + 1],
+                    words: [0; HASH_STATE_SLOTS],
                 },
             });
             let clone = W_HashState::from_obj(clone).expect("fresh _HashState");
@@ -397,11 +400,13 @@ fn unsupported_digestmod(msg: &str) -> crate::PyError {
     err
 }
 
-const HMAC_STATE_WORDS: usize = 128;
+const HMAC_STATE_WORDS: usize = pyre_native::hash::HMAC_STATE_STORAGE_WORDS;
+const HMAC_STATE_SLOTS: usize =
+    HMAC_STATE_WORDS + pyre_native::hash::STATE_STORAGE_ALIGN_SLACK_WORDS;
 
 #[repr(C)]
 struct HmacStateStorage {
-    words: [usize; HMAC_STATE_WORDS + 1],
+    words: [usize; HMAC_STATE_SLOTS],
 }
 
 impl HmacStateStorage {
@@ -426,10 +431,6 @@ pub struct W_Hmac {
 
 impl W_Hmac {
     fn new(name: &'static str, key: &[u8], msg: &[u8]) -> Result<PyObjectRef, crate::PyError> {
-        assert_eq!(
-            HMAC_STATE_WORDS,
-            pyre_native::hash::HMAC_STATE_STORAGE_WORDS
-        );
         assert_eq!(16, pyre_native::hash::HMAC_STATE_STORAGE_ALIGN);
         let digest_size = pyre_native::hash::digest_output_size(name)
             .ok_or_else(|| unsupported_digestmod("unsupported hash type"))?;
@@ -444,7 +445,7 @@ impl W_Hmac {
             digest_size: digest_size as i64,
             block_size: block_size as i64,
             storage: HmacStateStorage {
-                words: [0; HMAC_STATE_WORDS + 1],
+                words: [0; HMAC_STATE_SLOTS],
             },
         });
         let this = W_Hmac::from_obj(obj).expect("fresh HMAC");
@@ -551,7 +552,7 @@ mod hmac_class {
                 digest_size: self.digest_size,
                 block_size: self.block_size,
                 storage: HmacStateStorage {
-                    words: [0; HMAC_STATE_WORDS + 1],
+                    words: [0; HMAC_STATE_SLOTS],
                 },
             });
             let clone = W_Hmac::from_obj(obj).expect("fresh HMAC");
@@ -1122,6 +1123,12 @@ crate::py_module! {
         "get_fips_mode" / 0 = |_| Ok(w_int_new(0)),
     },
     extra_init: |ns| {
+        // [3.14-spec] PyPy owns `HMAC` as the ordinary app-level
+        // `lib_pypy._hashlib.HMAC` class.  CPython 3.14's `_hashlib.HMAC`
+        // rejects use as a base; retain the PyPy class relationship and
+        // suppress only that per-type public capability.
+        let hmac = crate::module_ns_get(ns, "HMAC").expect("_hashlib.HMAC installed");
+        unsafe { pyre_object::w_type_suppress_cpython_basetype(hmac) };
         let _roots = gc_roots::push_roots();
         let mapping_slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(w_dict_new());

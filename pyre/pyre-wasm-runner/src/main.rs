@@ -867,7 +867,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             // copy reads the wrong words and prints them as a walk outcome
             // instead of failing. Named rather than spelled inline so the
             // mirror is something a test can compare.
-            const RING_BASE: u32 = 19;
+            const RING_BASE: u32 = 20;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -1016,6 +1016,13 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "guard_resume_decline_replay_incomplete",
                 "guard_resume_decline_regcount",
                 "guard_resume_decline_unreadable_reg",
+                "guard_resume_decline_unregistered_jitcode",
+                "guard_resume_decline_no_inline_call_site",
+                "guard_resume_decline_call_not_jitcode",
+                "guard_resume_decline_callee_mismatch",
+                "guard_resume_decline_return_slot",
+                "guard_resume_decline_reserved_identity",
+                "inline_frame_trim_blanked_live_int",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
@@ -1182,17 +1189,19 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // divided because check.py folds every `[jit-stats]` line into one flat
         // `key -> value` map and reads each value as an integer.
         //
-        // Four of these are gated: slot 1 (`ROLLED_BACK_WITH_EFFECTS`, walks
+        // Five of these are gated: slot 1 (`ROLLED_BACK_WITH_EFFECTS`, walks
         // that ended uncommitted after a residual had already run an
         // irreversible effect), slot 11 (`STORE_JOURNAL_ROLLBACK_FAILED`, the
         // store restores the rollback could not perform — the one journaled
-        // effect the walk-end subtraction must not silently absorb) and the two
-        // adoption tallies. They carry the same keys the native backends print,
+        // effect the walk-end subtraction must not silently absorb), slot 19
+        // (`FORITER_ITEM_DROPPED`, a consumed FOR_ITER item no leg handed back,
+        // which costs the caller a whole iteration) and the two adoption
+        // tallies. They carry the same keys the native backends print,
         // because `_jit_stats_change` compares by name and a name only one
         // backend emits gates nothing on the others; and they must not resolve
         // to 0 when the export is absent, which reads as healthy. Hence the one
         // lookup feeding the refusal below, and hence this line — not the
-        // counter line — being where those four keys are emitted now.
+        // counter line — being where those five keys are emitted now.
         // The value array is built FROM the label array below, so a label
         // added without a slot (or the reverse) is impossible to write rather
         // than a `zip` that silently drops the tail.
@@ -1216,6 +1225,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             "gate_declined_function_entry",
             "bridge_ec_from_portal_red",
             "bridge_ec_missing",
+            "fbw_foriter_item_dropped",
         ];
         let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")
@@ -1497,33 +1507,48 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
 /// validates that and errors on mismatch. `deserialize_file` runs trusted
 /// precompiled native code and the `.cwasm` is otherwise independent of the
 /// `.wasm` contents, so the cache is bound to the exact bytes it was produced
-/// from: a sidecar `<module>.cwasm.sha256` records the SHA-256 of those bytes,
-/// and the cache is deserialized only when it matches the current module's
-/// hash. A rebuilt module or a pre-placed `.cwasm` therefore recompiles instead
-/// of running a stale or untrusted artifact. Set `PYRE_WASM_NO_CACHE` to bypass
+/// from: a sidecar `<module>.cwasm.sha256` records the SHA-256 of those bytes
+/// along with the size and mtime they were read at, and the cache is
+/// deserialized only when the module still answers to one of the two. A
+/// rebuilt module or a pre-placed `.cwasm` therefore recompiles instead of
+/// running a stale or untrusted artifact. Set `PYRE_WASM_NO_CACHE` to bypass
 /// the cache entirely.
 ///
 /// `variant` separates the artifacts of engine configurations that emit
 /// different code for the same module; see [`cache_variant`].
 fn load_main_module(engine: &Engine, module_path: &Path, variant: &str) -> Result<Module> {
     let cache_disabled = std::env::var_os("PYRE_WASM_NO_CACHE").is_some();
-    let wasm_bytes = std::fs::read(module_path)
-        .with_context(|| format!("read wasm module {}", module_path.display()))?;
     probe_call_hist_note_module(module_path);
-    let hash = wasm_content_hash(&wasm_bytes);
     let cache_path = cache_path_for(module_path, variant);
     let key_path = cache_key_path_for(module_path, variant);
+    let stamp = file_stamp(module_path);
 
-    if !cache_disabled && cache_key_matches(&key_path, &hash) {
-        // SAFETY: the artifact was produced by this runner's own engine via
-        // `Module::serialize`; `deserialize_file` re-checks engine/version
-        // compatibility and returns Err (not UB) if it cannot be trusted. The
-        // key check above further proves it was compiled from the exact bytes
-        // we just read.
-        match unsafe { Module::deserialize_file(engine, &cache_path) } {
-            Ok(m) => return Ok(m),
-            Err(_) => { /* incompatible cache; recompile below */ }
-        }
+    // Reading and hashing the module is 28MB of work on a path that then
+    // throws the bytes away, and every process start pays it. The sidecar
+    // therefore also records the size and mtime the hash was taken from: while
+    // those still describe the file, the bytes are the bytes that were hashed
+    // and the hash is already known.
+    if !cache_disabled
+        && let Some(stamp) = stamp.as_deref()
+        && cache_key_stamp_matches(&key_path, stamp)
+        && let Some(module) = deserialize_cache(engine, &cache_path)
+    {
+        return Ok(module);
+    }
+
+    let wasm_bytes = std::fs::read(module_path)
+        .with_context(|| format!("read wasm module {}", module_path.display()))?;
+    let hash = wasm_content_hash(&wasm_bytes);
+
+    if !cache_disabled
+        && cache_key_matches(&key_path, &hash)
+        && let Some(module) = deserialize_cache(engine, &cache_path)
+    {
+        // Same bytes under a stamp the sidecar does not name -- a rebuild that
+        // reproduced the module, or a checkout that reset the mtime. Record
+        // the stamp so the next run reaches the cache without hashing.
+        write_cache_key(&key_path, &hash, stamp.as_deref());
+        return Ok(module);
     }
 
     let module = Module::new(engine, &wasm_bytes[..])
@@ -1539,13 +1564,24 @@ fn load_main_module(engine: &Engine, module_path: &Path, variant: &str) -> Resul
         let staged = staged_cache_path_for(&cache_path);
         if std::fs::write(&staged, bytes).is_ok() {
             if std::fs::rename(&staged, &cache_path).is_ok() {
-                let _ = std::fs::write(&key_path, &hash);
+                write_cache_key(&key_path, &hash, stamp.as_deref());
             } else {
                 let _ = std::fs::remove_file(&staged);
             }
         }
     }
     Ok(module)
+}
+
+/// Deserialize the cached artifact, or nothing if it cannot be trusted.
+///
+/// SAFETY: the artifact was produced by this runner's own engine via
+/// `Module::serialize`; `deserialize_file` re-checks engine/version
+/// compatibility and returns Err (not UB) if it cannot be trusted. The caller
+/// has further proved, by hash or by stamp, that it was compiled from the
+/// bytes the module path currently holds.
+fn deserialize_cache(engine: &Engine, cache_path: &Path) -> Option<Module> {
+    unsafe { Module::deserialize_file(engine, cache_path) }.ok()
 }
 
 /// The suffix separating the compiled artifacts of engine configurations that
@@ -1599,9 +1635,53 @@ fn wasm_content_hash(bytes: &[u8]) -> String {
     s
 }
 
+/// Size and mtime of the module file, in the spelling the key sidecar records.
+///
+/// Nothing distinguishes two builds that landed in the same nanosecond at the
+/// same length, which is why this only ever admits a hash that was already
+/// taken: it says the file has not been rewritten since, not what is in it.
+fn file_stamp(module_path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(module_path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(format!(
+        "{} {} {}",
+        meta.len(),
+        mtime.as_secs(),
+        mtime.subsec_nanos()
+    ))
+}
+
+/// The sidecar's hash line, then its stamp line if it has one.
+fn read_cache_key(key_path: &Path) -> Option<(String, Option<String>)> {
+    let text = std::fs::read_to_string(key_path).ok()?;
+    let mut lines = text.lines();
+    let hash = lines.next()?.trim().to_string();
+    let stamp = lines.next().map(|line| line.trim().to_string());
+    Some((hash, stamp))
+}
+
+fn write_cache_key(key_path: &Path, hash: &str, stamp: Option<&str>) {
+    let mut text = String::from(hash);
+    if let Some(stamp) = stamp {
+        text.push('\n');
+        text.push_str(stamp);
+    }
+    let _ = std::fs::write(key_path, text);
+}
+
 /// The cache is usable only if its key sidecar exists and matches `hash`.
 fn cache_key_matches(key_path: &Path, hash: &str) -> bool {
-    matches!(std::fs::read_to_string(key_path), Ok(k) if k.trim() == hash)
+    matches!(read_cache_key(key_path), Some((k, _)) if k == hash)
+}
+
+/// The cache is reachable without hashing only if the sidecar names the stamp
+/// the module file still carries.
+fn cache_key_stamp_matches(key_path: &Path, stamp: &str) -> bool {
+    matches!(read_cache_key(key_path), Some((_, Some(s))) if s == stamp)
 }
 
 fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
@@ -1749,7 +1829,102 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>> {
          -> i64 { host_list_dir(&mut caller, path_ptr, path_len, buf_ptr, buf_cap) },
     )?;
 
+    linker.func_wrap(
+        "pyre_host",
+        "host_cwd",
+        |mut caller: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> i64 {
+            host_cwd(&mut caller, buf_ptr, buf_cap)
+        },
+    )?;
+    linker.func_wrap(
+        "pyre_host",
+        "host_random",
+        |mut caller: Caller<'_, Host>, buf_ptr: u32, buf_cap: u32| -> i32 {
+            host_random(&mut caller, buf_ptr, buf_cap)
+        },
+    )?;
+
+    // Host clock imports.  wasm32 has neither a `SystemTime` nor an `Instant`,
+    // so `time` -- and every stdlib module that imports it -- reads the clock
+    // here.  See `pyre-wasm`'s `host_clock`.
+    linker.func_wrap("pyre_host", "host_time_ns", || -> i64 { host_time_ns() })?;
+    linker.func_wrap("pyre_host", "host_monotonic_ns", || -> i64 {
+        host_monotonic_ns()
+    })?;
+    linker.func_wrap("pyre_host", "host_sleep_ns", |nanos: i64| {
+        host_sleep_ns(nanos)
+    })?;
+
     Ok(linker)
+}
+
+/// `pyre_host.host_random`: fill the guest buffer with host entropy.
+///
+/// wasm32-unknown-unknown has no OS entropy of its own, so `os.urandom`,
+/// `secrets` and the string hash key all end up here.
+fn host_random(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i32 {
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    let mut bytes = vec![0u8; buf_cap as usize];
+    if getrandom::fill(&mut bytes).is_err() {
+        return -1;
+    }
+    match memory.write(&mut *caller, buf_ptr as usize, &bytes) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+/// `pyre_host.host_cwd`: write the runner's working directory into the guest
+/// buffer, reporting its length whether or not it fitted.
+fn host_cwd(caller: &mut Caller<'_, Host>, buf_ptr: u32, buf_cap: u32) -> i64 {
+    let Some(memory) = caller.data().memory else {
+        return -1;
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return -1;
+    };
+    let bytes = cwd.as_os_str().as_encoded_bytes();
+    if bytes.len() > buf_cap as usize {
+        return bytes.len() as i64;
+    }
+    match memory.write(&mut *caller, buf_ptr as usize, bytes) {
+        Ok(()) => bytes.len() as i64,
+        Err(_) => -1,
+    }
+}
+
+/// `pyre_host.host_time_ns`: nanoseconds since the unix epoch.
+///
+/// The guest has no `SystemTime` of its own -- reading one panics there --
+/// so the wall clock it reports is this one.
+fn host_time_ns() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos().min(i64::MAX as u128) as i64,
+        Err(_) => -1,
+    }
+}
+
+/// `pyre_host.host_monotonic_ns`: nanoseconds since the runner started.
+///
+/// The origin is taken at the first call and kept for the run, which is all
+/// `time.monotonic()` asks of it: only differences are meaningful, and they
+/// have to not go backwards.
+fn host_monotonic_ns() -> i64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(i64::MAX as u128) as i64
+}
+
+/// `pyre_host.host_sleep_ns`: block the guest for `nanos` nanoseconds.
+fn host_sleep_ns(nanos: i64) {
+    if nanos > 0 {
+        std::thread::sleep(std::time::Duration::from_nanos(nanos as u64));
+    }
 }
 
 /// Read a host path argument out of wasm linear memory as the filesystem name

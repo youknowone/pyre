@@ -33,8 +33,8 @@ pub struct W_SSLContext {
     pub num_tickets: i32,
 }
 
-/// `ssl.MemoryBIO` is subclassable in CPython, so it uses the same mapdict
-/// prefix rather than relying on a side table for subclass attributes.
+/// PyPy owns `MemoryBIO` as an app-level class, so it uses the same mapdict
+/// prefix rather than relying on a side table for instance attributes.
 // `_ssl_exec` creates the immutable MemoryBIO module heap type.
 #[crate::pyre_class("_ssl.MemoryBIO", cpython_heaptype)]
 #[derive(Default)]
@@ -2119,6 +2119,11 @@ mod ssl_socket_methods {
                             break data;
                         }
                         PumpExit::NeedsConfig => {
+                            // The events the acceptor observed belong to the
+                            // context that was current while it read them, so
+                            // they are delivered before the callback below is
+                            // given the chance to choose another one.
+                            settle_received_tls(self)?;
                             unsafe { configure_accepted_server(self as *mut W_SSLSocket) }?
                         }
                         PumpExit::Interrupted => {
@@ -2986,6 +2991,15 @@ crate::py_module! {
         "_test_decode_cert" / 1 = test_decode_cert
     },
     extra_init: |ns| {
+        // [3.14-spec] CPython 3.14 rejects each of these immutable module
+        // heap types as a base.  PyPy's shared public pair, `MemoryBIO` and
+        // `SSLSession`, remain app-level classes in `_cffi_ssl._stdssl`;
+        // preserve those owner/storage choices and suppress only the
+        // caller-visible per-type BASETYPE capability.
+        for name in ["MemoryBIO", "SSLSession", "Certificate", "_SSLSocket"] {
+            let ty = crate::module_ns_get(ns, name).expect("_ssl type installed");
+            unsafe { pyre_object::w_type_suppress_cpython_basetype(ty) };
+        }
         // The Windows-only store readers. They live here rather than in
         // `functions:` because that table has no per-entry platform guard, and
         // `ssl.py:257-258` imports both names behind `sys.platform == "win32"`.

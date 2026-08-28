@@ -9,7 +9,13 @@ use parking_lot::{Condvar, Mutex};
 use pyre_object::*;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+// wasm32 has no `Instant` of its own; the deadlines below read the clock the
+// embedder installs, the same one `time.monotonic()` reports.
+#[cfg(target_arch = "wasm32")]
+use crate::module::time::interp_time::Instant;
 
 /// `PY_TIMEOUT_MAX` — the acquire-timeout bound in microseconds.  A POSIX host
 /// waits on a nanosecond deadline and bounds it at `LLONG_MAX / 1000`; Windows
@@ -2183,8 +2189,10 @@ fn except_hook_args_type() -> PyObjectRef {
         );
         let ty_slot = pin_root_slot(ty);
         unsafe {
-            let ty = pyre_object::gc_roots::shadow_stack_get(ty_slot);
-            pyre_object::w_type_set_acceptable_as_base_class(ty, false);
+            // `make_struct_seq` already applies the per-type CPython BASETYPE
+            // suppression.  Its Layout deliberately retains tuple's TypeDef,
+            // so mutating that shared TypeDef here would make tuple itself
+            // unacceptable as a base.
             let doc =
                 w_str_new("ExceptHookArgs\n\nType used to pass arguments to threading.excepthook.");
             let doc_slot = pin_root_slot(doc);
@@ -2591,7 +2599,16 @@ crate::py_module! {
         // class by `_thread.lock`, so the canonical binding is load-bearing.
         "lock"          => lock_class::type_object(),
         "RLock"         => rlock_class::type_object(),
-        "_ThreadHandle" => handle_class::type_object(),
+        "_ThreadHandle" => {
+            let ty = handle_class::type_object();
+            // [3.14-spec] CPython `ThreadHandle_Type_spec` is an immutable
+            // heap type without `Py_TPFLAGS_BASETYPE`.  PyPy has no public
+            // `_ThreadHandle` class at this version, so retain pyre's
+            // PyPy-shaped interpreter owner and suppress only the observable
+            // per-type subclass capability.
+            unsafe { pyre_object::w_type_suppress_cpython_basetype(ty) };
+            ty
+        },
         "_local"        => local_type(),
         "_ExceptHookArgs" => except_hook_args_type(),
         "TIMEOUT_MAX"   => w_float_new(TIMEOUT_MAX),

@@ -466,6 +466,169 @@ impl<'a> MirGraphLookup<'a> {
     }
 }
 
+/// RPython `specialize.py default_specialize` — the LLBC path's stand-in.
+///
+/// Upstream writes `graph.access_directly = True` for a graph whose ARGUMENT
+/// annotation arrived carrying the flag that the `hint` ExtRegistryEntry in
+/// `rlib/jit.py` mints on `SomeInstance.flags`. That flag travels
+/// callee-ward through the annotator, so the function that SPELLS the hint is
+/// not the flagged one: its own arguments arrive unflagged. What gets flagged
+/// is every callee the hinted value is passed to.
+///
+/// The LLBC front end has no annotator to carry a flag on an annotation, so
+/// the propagation is done here, over the op stream: seed on the
+/// `OpKind::Hint` ops, follow the hinted variables into the arguments of each
+/// `OpKind::Call`, and iterate until the flagged-parameter sets stop growing.
+///
+/// Two deliberate under-approximations, both because the consumer
+/// (`policy::look_inside_graph`) ABORTS translation on a flag it cannot
+/// honour, so a missing flag costs a safety net while an extra one costs the
+/// build:
+///
+/// * **Reached both ways stays unflagged.** `default_specialize` SPECIALIZES:
+///   the flagged callee is a second graph keyed `(AccessDirect, <base key>)`
+///   and unflagged callers keep the original. One graph per function cannot
+///   split, so a parameter is flagged only when EVERY resolved call site
+///   passes a hinted value there.
+/// * **No alias closure.** Only a variable the hint itself produced, or a
+///   parameter that arrives flagged, counts as hinted. A hinted value copied
+///   through an intervening op is not followed.
+///
+/// A callee whose path does not resolve to a lowered function is skipped
+/// entirely — it can neither be flagged nor veto a flag, since there is no
+/// graph for the gate to read.
+pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
+    use std::collections::HashMap;
+
+    fn path_of(f: &SemanticFunction) -> String {
+        if f.module_path.is_empty() {
+            f.name.clone()
+        } else {
+            format!("{}::{}", f.module_path, f.name)
+        }
+    }
+
+    let index: HashMap<String, usize> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (path_of(f), i))
+        .collect();
+
+    // Per function, the parameter positions that arrive carrying the flag.
+    let mut flagged_params: Vec<Vec<usize>> = vec![Vec::new(); functions.len()];
+
+    // `default_specialize` runs per call as the annotator reaches it, so a
+    // flag one call introduces is visible to the next. Iterating to a
+    // fixpoint is how a single pass over a static op stream reproduces that;
+    // the bound is the number of functions, since each round either adds a
+    // flagged parameter or stops.
+    for _round in 0..=functions.len() {
+        // (flagged, unflagged) call-site counts per callee parameter.
+        let mut reaching: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+        for func in functions.iter() {
+            let seeds = access_directly_seeds(func, &flagged_params, &index);
+            for block in &func.graph.blocks {
+                for op in &block.operations {
+                    let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
+                        continue;
+                    };
+                    let Some(callee) = resolve_callee(target, &index) else {
+                        continue;
+                    };
+                    for (pos, arg) in args.iter().enumerate() {
+                        let slot = reaching.entry((callee, pos)).or_insert((0, 0));
+                        if seeds.iter().any(|seed| seed == arg) {
+                            slot.0 += 1;
+                        } else {
+                            slot.1 += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut next: Vec<Vec<usize>> = vec![Vec::new(); functions.len()];
+        for ((callee, pos), (flagged, unflagged)) in reaching {
+            if flagged > 0 && unflagged == 0 {
+                next[callee].push(pos);
+            }
+        }
+        for slots in &mut next {
+            slots.sort_unstable();
+        }
+        if next == flagged_params {
+            break;
+        }
+        flagged_params = next;
+    }
+
+    for (func, slots) in functions.iter_mut().zip(&flagged_params) {
+        func.graph.access_directly = !slots.is_empty();
+    }
+}
+
+/// The variables in `func` that carry the `access_directly` flag: the ones an
+/// `access_directly` hint produced, plus the parameters a caller passed one
+/// to. `hint` is the identity, so both its operand and its result denote the
+/// flagged value.
+fn access_directly_seeds(
+    func: &SemanticFunction,
+    flagged_params: &[Vec<usize>],
+    index: &std::collections::HashMap<String, usize>,
+) -> Vec<crate::flowspace::model::Variable> {
+    let mut seeds = Vec::new();
+    for block in &func.graph.blocks {
+        for op in &block.operations {
+            // `rlib/jit.py` mints `fresh_virtualizable` only alongside
+            // `access_directly`, so both hint spellings seed here.
+            if let crate::model::OpKind::Hint { value, kind } = &op.kind
+                && matches!(
+                    kind,
+                    crate::hints::HintKind::AccessDirectly
+                        | crate::hints::HintKind::FreshVirtualizable
+                )
+            {
+                seeds.push(value.clone());
+                if let Some(result) = &op.result {
+                    seeds.push(result.clone());
+                }
+            }
+        }
+    }
+    let self_path = if func.module_path.is_empty() {
+        func.name.clone()
+    } else {
+        format!("{}::{}", func.module_path, func.name)
+    };
+    if let Some(&me) = index.get(&self_path) {
+        let inputargs = &func.graph.block(func.graph.startblock).inputargs;
+        for &pos in &flagged_params[me] {
+            if let Some(arg) = inputargs.get(pos) {
+                seeds.push(arg.clone());
+            }
+        }
+    }
+    seeds
+}
+
+/// The lowered function a call target names, if it is one.
+///
+/// A call spells its target with the declaration's full `name_path`, while a
+/// `SemanticFunction` is keyed on the crate-stripped path, so the two are
+/// compared after stripping.
+fn resolve_callee(
+    target: &crate::model::CallTarget,
+    index: &std::collections::HashMap<String, usize>,
+) -> Option<usize> {
+    let crate::model::CallTarget::FunctionPath { segments } = target else {
+        return None;
+    };
+    let joined = segments.join("::");
+    index
+        .get(crate::front::mir::strip_crate_prefix(&joined).as_str())
+        .copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +646,160 @@ mod tests {
             trait_qualified: None,
             returns_objectptr: false,
         }
+    }
+
+    /// A caller whose startblock hints its first parameter and then passes
+    /// arguments to each named callee.
+    fn caller_hinting_arg0(
+        name: &str,
+        hint: Option<crate::hints::HintKind>,
+        calls: &[(&str, usize)],
+    ) -> SemanticFunction {
+        use crate::flowspace::model::Variable;
+        use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+
+        let mut f = free_fn(name);
+        let start = f.graph.startblock;
+        let param = Variable::named("frame");
+        f.graph.block_mut(start).inputargs = vec![param.clone()];
+        let hinted = Variable::named("hinted");
+        if let Some(kind) = hint {
+            f.graph.block_mut(start).operations.push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Hint {
+                    value: param.clone(),
+                    kind,
+                },
+            });
+        }
+        // With no hint the same slot passes the bare parameter, so the two
+        // shapes differ only in whether the value was hinted.
+        let passed = if hint.is_some() { hinted } else { param };
+        for (callee, arity) in calls {
+            let args = (0..*arity)
+                .map(|i| {
+                    if i == 0 {
+                        passed.clone()
+                    } else {
+                        Variable::named("other")
+                    }
+                })
+                .collect();
+            f.graph.block_mut(start).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![(*callee).to_string()],
+                    },
+                    args,
+                    result_ty: ValueType::Void,
+                },
+            });
+        }
+        f
+    }
+
+    fn flags(functions: &[SemanticFunction]) -> Vec<(String, bool)> {
+        functions
+            .iter()
+            .map(|f| (f.name.clone(), f.graph.access_directly))
+            .collect()
+    }
+
+    /// `specialize.py default_specialize` flags the CALLEE a flagged argument
+    /// reaches. The function that spells the hint has unflagged arguments of
+    /// its own, so it is not flagged — getting this backwards names exactly
+    /// the one graph upstream leaves alone.
+    #[test]
+    fn the_callee_is_flagged_and_the_hint_site_is_not() {
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("handle_bytecode", 1)],
+            ),
+            free_fn("handle_bytecode"),
+        ];
+        propagate_access_directly(&mut fns);
+        assert_eq!(
+            flags(&fns),
+            vec![
+                ("dispatch".to_string(), false),
+                ("handle_bytecode".to_string(), true),
+            ]
+        );
+    }
+
+    /// The flag travels further than one call: a flagged parameter seeds the
+    /// callee's own calls, which is the fixpoint `default_specialize` gets for
+    /// free by running per call as the annotator reaches it.
+    #[test]
+    fn a_flagged_parameter_seeds_the_next_callee() {
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("handle_bytecode", 1)],
+            ),
+            caller_hinting_arg0("handle_bytecode", None, &[("execute", 1)]),
+            free_fn("execute"),
+        ];
+        propagate_access_directly(&mut fns);
+        assert_eq!(
+            flags(&fns)
+                .into_iter()
+                .filter(|(_, on)| *on)
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>(),
+            vec!["handle_bytecode".to_string(), "execute".to_string()]
+        );
+    }
+
+    /// Upstream SPECIALIZES, so an unflagged caller keeps the original graph.
+    /// One graph per function cannot split, and the consumer aborts the build,
+    /// so a callee reached both ways stays unflagged.
+    #[test]
+    fn a_callee_reached_both_ways_stays_unflagged() {
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("handle_bytecode", 1)],
+            ),
+            caller_hinting_arg0("other_caller", None, &[("handle_bytecode", 1)]),
+            free_fn("handle_bytecode"),
+        ];
+        propagate_access_directly(&mut fns);
+        assert!(
+            !fns[2].graph.access_directly,
+            "reached with and without the flag must stay unflagged"
+        );
+    }
+
+    /// Only the argument position the hinted value occupies is flagged, so a
+    /// callee that never receives it is left alone.
+    #[test]
+    fn an_unrelated_callee_is_not_flagged() {
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("handle_bytecode", 1), ("log", 2)],
+            ),
+            free_fn("handle_bytecode"),
+            free_fn("log"),
+        ];
+        // `log` takes the hinted value at position 0 too in this fixture, so
+        // flip it: give it only the unrelated operand.
+        let crate::model::OpKind::Call { args, .. } =
+            &mut fns[0].graph.block_mut(crate::model::BlockId(0)).operations[2].kind
+        else {
+            panic!("expected the second call")
+        };
+        args[0] = crate::flowspace::model::Variable::named("unrelated");
+        propagate_access_directly(&mut fns);
+        assert!(fns[1].graph.access_directly, "handle_bytecode is flagged");
+        assert!(!fns[2].graph.access_directly, "log is not");
     }
 
     fn impl_method(owner: &str, name: &str) -> SemanticFunction {

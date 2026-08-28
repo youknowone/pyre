@@ -153,6 +153,15 @@ pub trait SourceProvider: Send + Sync {
             "this source provider cannot list a directory",
         ))
     }
+    /// The directory a relative path is resolved against, as the filesystem's
+    /// own bytes.
+    ///
+    /// Defaults to none: a provider serving an in-memory image has no working
+    /// directory to report, and `posix.getcwd` says so rather than naming a
+    /// directory that does not exist.
+    fn cwd(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 #[cfg(feature = "host_env")]
@@ -207,6 +216,11 @@ pub fn source_file_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(feature = "host_env")]
 pub fn source_list_dir(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
     with_source_provider(|p| p.list_dir(path))
+}
+
+#[cfg(feature = "host_env")]
+pub fn source_cwd() -> Option<Vec<u8>> {
+    with_source_provider(|p| p.cwd())
 }
 
 /// [`read_source_bytes`] decoded as plain UTF-8, for callers that hold a
@@ -649,7 +663,6 @@ pub fn install_builtin_modules() {
     // Core pyre modules backed by `interpleveldefs` tables.
     pyre_install_module!(math);
     pyre_install_module!(cmath);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(time);
     pyre_install_module!(sys);
     // `moduledef.py applevel_name = '_operator'` — the interp-level table
@@ -776,6 +789,12 @@ pub fn install_builtin_modules() {
         pyre_install_module!(select);
         #[cfg(unix)]
         pyre_install_module!(termios);
+        // `socket.py`'s module body subclasses `_socket.socket`, so a module
+        // that is present without the host layer behind it fails the import
+        // with AttributeError -- and `platform._node`, `uuid` and the rest
+        // reach for `socket` inside `try/except ImportError`, which that is
+        // not.  A target with no socket layer has no `_socket` at all.
+        #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(_socket);
         #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(_ssl);

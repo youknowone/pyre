@@ -999,22 +999,32 @@ fn format_gc_stat(value: i64) -> String {
 fn gc_stats_public_type() -> PyObjectRef {
     static TYPE: OnceLock<usize> = OnceLock::new();
     *TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type("GcStats", |ns| unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
-                "__init__",
-                crate::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
-            );
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
-                "__repr__",
-                crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
-            );
-            pyre_object::w_dict_setitem_str_no_proxy(ns, "__dict__", crate::typedef::dict_descr());
-        });
-        // app_referents.py:GcStats is an ordinary app-level class.
-        unsafe { typeobject::w_type_set_hasdict(tp, true) };
-        tp as usize
+        // PyPy `app_referents.GcStats` is an ordinary app-level class, not a
+        // second interpreter TypeDef beside `referents.W_GcStats`.  Build it
+        // through `type.__new__`, so it inherits object's allocator and owns
+        // the normal mapdict layout an app-level class receives.
+        let roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = roots.base();
+        let _ = roots.pin_root(pyre_object::w_dict_new());
+        let store = |name: &str, value: PyObjectRef| unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(roots.get(ns_slot), name, value);
+        };
+        store("__module__", w_str_new("gc"));
+        store(
+            "__init__",
+            crate::make_builtin_function_with_arity("__init__", gc_stats_public_init, 2),
+        );
+        store(
+            "__repr__",
+            crate::make_builtin_function_with_arity("__repr__", gc_stats_repr, 1),
+        );
+        let args = [
+            crate::typedef::w_type(),
+            w_str_new("GcStats"),
+            pyre_object::w_tuple_new(vec![crate::typedef::w_object()]),
+            roots.get(ns_slot),
+        ];
+        crate::builtins::type_descr_new(&args).expect("construct app_referents.GcStats") as usize
     }) as PyObjectRef
 }
 

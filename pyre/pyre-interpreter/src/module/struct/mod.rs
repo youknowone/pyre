@@ -586,9 +586,17 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
                 for _ in 0..rep {
                     let arg = values[ai];
                     ai += 1;
-                    let data = unsafe {
-                        accept_bytes(arg, "char format requires a bytes object of length 1")?
-                    };
+                    // PyPy `standardfmttable.pack_char` reaches
+                    // `PackFormatIterator.accept_str_arg` / `space.bytes_w`:
+                    // unlike the `s` and `p` rows, `c` accepts an actual
+                    // bytes object only.  CPython 3.14 has the same observable
+                    // rule (including rejecting a one-byte bytearray).
+                    if !unsafe { bytesobject::is_bytes(arg) } {
+                        return Err(struct_error(
+                            "char format requires a bytes object of length 1",
+                        ));
+                    }
+                    let data = unsafe { bytesobject::w_bytes_data(arg) };
                     if data.len() != 1 {
                         return Err(struct_error(
                             "char format requires a bytes object of length 1",
@@ -674,70 +682,6 @@ fn pack_values(parsed: &Parsed, values: &[PyObjectRef]) -> Result<Vec<u8>, crate
     Ok(out)
 }
 
-/// `space.writebuf_w` — a writable byte slice from a `bytearray` or a
-/// contiguous read-write `memoryview` over one.
-unsafe fn writebuf<'a>(obj: PyObjectRef) -> Result<&'a mut [u8], crate::PyError> {
-    unsafe {
-        if bytearrayobject::is_bytearray(obj) {
-            return Ok(bytearrayobject::w_bytearray_data_mut(obj));
-        }
-        if interp_array::is_array(obj) {
-            return Ok(interp_array::w_array_vec_mut(obj).as_mut_slice());
-        }
-        // `W_MMap.writebuf_w` — the live mapping, unless it was opened
-        // read-only.
-        #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(obj) {
-            let (address, length, readonly) = view?;
-            if !readonly {
-                return Ok(std::slice::from_raw_parts_mut(address as *mut u8, length));
-            }
-        }
-        if memoryview::is_w_memoryview(obj) {
-            crate::builtins::memoryview_check_released(obj)?;
-            if memoryview::w_memoryview_readonly(obj) {
-                return Err(crate::PyError::type_error(
-                    "a read-write bytes-like object is required",
-                ));
-            }
-            let view = memoryview::w_memoryview_view(obj);
-            if crate::builtins::memoryview_contiguity(obj).0 {
-                let off = view.offset() as usize;
-                let len = memoryview::w_memoryview_length(obj) as usize;
-                if let Some(full) = view.backing().as_bytes_mut()
-                    && off <= full.len()
-                    && len <= full.len() - off
-                {
-                    return Ok(&mut full[off..off + len]);
-                }
-            }
-        }
-        Err(crate::PyError::type_error(
-            "argument must be read-write bytes-like object",
-        ))
-    }
-}
-
-/// One export held on a `pack_into` target for as long as the writable slice
-/// is live.  `s_pack_into` keeps the buffer exported across `s_pack_internal`,
-/// so a value coercion that re-enters Python and calls `release()` — or
-/// resizes the exporter — raises instead of leaving the saved slice stale.
-struct PackIntoExport(PyObjectRef);
-
-impl PackIntoExport {
-    /// Returns `None` for an immutable target that carries no export count;
-    /// `writebuf` rejects every unsupported exporter before use.
-    unsafe fn acquire(obj: PyObjectRef) -> Option<Self> {
-        unsafe { crate::builtins::buffer_export_incref(obj).then_some(Self(obj)) }
-    }
-}
-
-impl Drop for PackIntoExport {
-    fn drop(&mut self) {
-        unsafe { crate::builtins::buffer_export_decref(self.0) }
-    }
-}
-
 /// `do_pack_into` — pack `values` into `buffer` starting at `offset`,
 /// resolving a negative offset against the buffer end.
 fn do_pack_into(
@@ -748,8 +692,12 @@ fn do_pack_into(
 ) -> Result<PyObjectRef, crate::PyError> {
     let parsed = parse_format(format)?;
     let size = parsed.calcsize()?;
-    let _export = unsafe { PackIntoExport::acquire(buffer) };
-    let buf = unsafe { writebuf(buffer)? };
+    // PyPy `Struct.pack_into` acquires `space.writebuf_w` once and keeps that
+    // buffer object alive through `s_pack_internal`.  Reuse pyre's common
+    // writable-buffer lease so a C exporter follows the same `bf_getbuffer`
+    // / `bf_releasebuffer` path as every other consumer.
+    let mut export = unsafe { crate::builtins::WritableBuffer::acquire_for_pack_into(buffer) }?;
+    let buf = unsafe { export.as_mut_slice() };
     let buflen = buf.len() as i64;
     let mut offset = offset;
     if offset < 0 {

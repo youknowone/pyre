@@ -6,13 +6,97 @@
 
 use pyre_object::{PY_NULL, PyObjectRef};
 use rustpython_compiler::codegen::{
-    interpolated_string_literal_value, string_literal_part_value, string_literal_value,
+    interpolated_string_literal_value, interpolation_debug_text, string_literal_part_value,
+    string_literal_value,
 };
 use rustpython_compiler::core::{SourceFile, SourceFileBuilder};
 use rustpython_compiler::{ast, parser};
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 type AstResult<T> = Result<T, crate::PyError>;
+
+/// RustPython `_ast::should_report_unsupported_syntax_error`: Ruff records
+/// every version-shaped difference, including compatibility syntax CPython
+/// deliberately still accepts for older feature versions.  Only these are
+/// parser errors at the public `feature_version` boundary.
+fn should_report_unsupported_syntax_error(error: &parser::UnsupportedSyntaxError) -> bool {
+    use parser::UnsupportedSyntaxErrorKind as Kind;
+    matches!(
+        error.kind,
+        Kind::Match
+            | Kind::Walrus
+            | Kind::ExceptStar
+            | Kind::PositionalOnlyParameter
+            | Kind::TypeParameterList
+            | Kind::TypeAliasStatement
+            | Kind::TypeParamDefault
+            | Kind::TemplateStrings
+            | Kind::UnparenthesizedExceptionTypes
+            | Kind::LazyImportStatement
+            | Kind::ParenthesizedKeywordArgumentName
+    )
+}
+
+/// CPython `_PyPegen_new_identifier` refuses a lexer name whose NFKC form is
+/// one of the three constant keywords.  Ruff already performs that same NFKC
+/// conversion when it builds the AST, but (unlike CPython) leaves the result
+/// as an identifier.  Inspecting only `Name` tokens keeps this a parser check:
+/// a literal `None`/`True`/`False` token is, of course, valid.
+fn validate_parser_identifiers(source: &str, tokens: &ast::token::Tokens) -> AstResult<()> {
+    for token in tokens.iter() {
+        if token.kind() != ast::token::TokenKind::Name {
+            continue;
+        }
+        let (_, range) = token.as_tuple();
+        let spelling = &source[range.start().to_usize()..range.end().to_usize()];
+        if spelling.is_ascii() {
+            continue;
+        }
+        let normalized = rustpython_unicode::normalize(
+            rustpython_unicode::NormalizeForm::Nfkc,
+            Wtf8::new(spelling),
+        );
+        let normalized = normalized.to_string_lossy();
+        if matches!(normalized.as_ref(), "None" | "True" | "False") {
+            return Err(crate::PyError::value_error(format!(
+                "identifier field can't represent '{normalized}' constant"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Ruff currently records `TypeParamDefault` for `T = int`, but not for the
+/// sibling `*Ts = int` and `**P = int` spellings.  CPython 3.14 applies the
+/// same 3.13 grammar boundary to all three, so fill only that parser metadata
+/// gap after Ruff has produced the native tree.
+fn has_variadic_type_param_default(module: &ast::Mod) -> bool {
+    use ast::visitor::Visitor;
+
+    #[derive(Default)]
+    struct Finder {
+        found: bool,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_type_param(&mut self, type_param: &'a ast::TypeParam) {
+            self.found |= match type_param {
+                ast::TypeParam::TypeVar(_) => false,
+                ast::TypeParam::TypeVarTuple(node) => node.default.is_some(),
+                ast::TypeParam::ParamSpec(node) => node.default.is_some(),
+            };
+            if !self.found {
+                ast::visitor::walk_type_param(self, type_param);
+            }
+        }
+    }
+
+    let mut finder = Finder::default();
+    if let ast::Mod::Module(module) = module {
+        finder.visit_body(&module.body);
+    }
+    finder.found
+}
 
 /// Convert an interpreter-level `_ast` tree back into Ruff's compiler AST and
 /// compile it.  This is the reverse of `Converter`, corresponding to PyPy's
@@ -117,7 +201,14 @@ pub fn preprocess_object_to_object(
     } else {
         source
     };
-    module_to_object(module, source, mode, ast_module, &converter.carried_ignores)
+    module_to_object(
+        module,
+        source,
+        mode,
+        ast_module,
+        &converter.carried_ignores,
+        false,
+    )
 }
 
 struct ObjectConverter {
@@ -245,6 +336,24 @@ impl ObjectConverter {
         })
     }
 
+    /// PyPy `asdl_py.py:get_field_extractor` checks a present required field
+    /// for `None` after fetching it and before converting its ASDL value.
+    fn required_field(
+        &self,
+        object: PyObjectRef,
+        field: &str,
+        node: &str,
+    ) -> AstResult<PyObjectRef> {
+        let value = self.field(object, field, node)?;
+        if unsafe { pyre_object::is_none(value) } {
+            return Err(crate::PyError::value_error(format!(
+                "field '{field}' is required for {}",
+                class_name(object)
+            )));
+        }
+        Ok(value)
+    }
+
     fn optional_field(&self, object: PyObjectRef, field: &str) -> AstResult<Option<PyObjectRef>> {
         match crate::baseobjspace::getattr_str(object, field) {
             Ok(value) if unsafe { pyre_object::is_none(value) } => Ok(None),
@@ -307,9 +416,31 @@ impl ObjectConverter {
             Some(value) => self.obj_to_int(value)?,
             None => column,
         };
+
+        // [3.14-spec] CPython `VALIDATE_POSITIONS` rejects these ranges before
+        // code generation.  PyPy `AstValidator` has no corresponding check,
+        // but the invalid range and ValueError are observable at compile().
+        if line > end_line {
+            return Err(crate::PyError::value_error(format!(
+                "AST node line range ({line}, {end_line}) is not valid"
+            )));
+        }
+        if (line < 0 && end_line != line) || (column < 0 && column != end_column) {
+            return Err(crate::PyError::value_error(format!(
+                "AST node column range ({column}, {end_column}) for line range ({line}, {end_line}) is not valid"
+            )));
+        }
+        if line == end_line && column > end_column {
+            return Err(crate::PyError::value_error(format!(
+                "line {line}, column {column}-{end_column} is not a valid range"
+            )));
+        }
+
         let start = self.offset_of(line, column);
-        // A tree can name an end before its start; the compiler indexes the
-        // range and a reversed one would panic, so it collapses to the start.
+        // Zero and negative line numbers are accepted when the paired end
+        // position satisfies the checks above.  The synthetic source maps all
+        // of them to its first line, so preserve that valid input even when
+        // the mapping makes its byte offsets coincide or reverse.
         let end = self.offset_of(end_line, end_column).max(start);
         Ok(ruff_text_size::TextRange::new(start.into(), end.into()))
     }
@@ -364,7 +495,7 @@ impl ObjectConverter {
         } else if self.is_node(object, "Interactive")? {
             "Interactive"
         } else if self.is_node(object, "Expression")? {
-            let body = self.field(object, "body", "Expression")?;
+            let body = self.required_field(object, "body", "Expression")?;
             return Ok(ast::Mod::Expression(ast::ModExpression {
                 node_index: Default::default(),
                 range: Default::default(),
@@ -394,7 +525,7 @@ impl ObjectConverter {
                 "FunctionDef"
             };
             let name = self.identifier(object, "name", node)?;
-            let args = self.field(object, "args", node)?;
+            let args = self.required_field(object, "args", node)?;
             let parameters = Box::new(self.recurse(|this| this.parameters(args))?);
             let body = self.body(object, "body", node)?;
             let decorator_list = self.decorators(object, node)?;
@@ -421,7 +552,7 @@ impl ObjectConverter {
                 range,
             }))
         } else if self.is_node(object, "Expr")? {
-            let value = self.field(object, "value", "Expr")?;
+            let value = self.required_field(object, "value", "Expr")?;
             Ok(ast::Stmt::Expr(ast::StmtExpr {
                 node_index: Default::default(),
                 range,
@@ -445,7 +576,7 @@ impl ObjectConverter {
                     self.recurse(|this| this.expr(value))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let value = self.field(object, "value", "Assign")?;
+            let value = self.required_field(object, "value", "Assign")?;
             Ok(ast::Stmt::Assign(ast::StmtAssign {
                 node_index: Default::default(),
                 range,
@@ -511,7 +642,7 @@ impl ObjectConverter {
             }))
         } else if self.is_node(object, "AugAssign")? {
             let target = self.req_expr(object, "target", "AugAssign")?;
-            let op = self.field(object, "op", "AugAssign")?;
+            let op = self.required_field(object, "op", "AugAssign")?;
             let value = self.req_expr(object, "value", "AugAssign")?;
             Ok(ast::Stmt::AugAssign(ast::StmtAugAssign {
                 node_index: Default::default(),
@@ -582,7 +713,7 @@ impl ObjectConverter {
                     let clause_test = self.req_expr(nested, "test", "If")?;
                     let clause_body = self.body(nested, "body", "If")?;
                     elif_else_clauses.push(ast::ElifElseClause {
-                        range,
+                        range: self.location(nested, "If")?,
                         node_index: Default::default(),
                         test: Some(*clause_test),
                         body: clause_body,
@@ -1007,7 +1138,7 @@ impl ObjectConverter {
     }
 
     fn match_case(&mut self, object: PyObjectRef) -> AstResult<ast::MatchCase> {
-        let pattern = self.field(object, "pattern", "match_case")?;
+        let pattern = self.required_field(object, "pattern", "match_case")?;
         let pattern = self.recurse(|this| this.pattern(pattern))?;
         Ok(ast::MatchCase {
             range: Default::default(),
@@ -1186,7 +1317,7 @@ impl ObjectConverter {
         field: &str,
         node: &str,
     ) -> AstResult<Box<ast::Expr>> {
-        let value = self.field(object, field, node)?;
+        let value = self.required_field(object, field, node)?;
         Ok(Box::new(self.recurse(|this| this.expr(value))?))
     }
 
@@ -1202,8 +1333,14 @@ impl ObjectConverter {
         field: &str,
         node: &str,
     ) -> AstResult<ast::Identifier> {
+        let value = self.required_field(object, field, node)?;
+        if !unsafe { pyre_object::is_str(value) } {
+            return Err(crate::PyError::type_error(
+                "AST identifier must be of type str",
+            ));
+        }
         Ok(ast::Identifier::new(
-            self.string(object, field, node)?,
+            unsafe { pyre_object::w_str_get_value(value) }.to_string(),
             Default::default(),
         ))
     }
@@ -1273,8 +1410,8 @@ impl ObjectConverter {
     fn expr(&mut self, object: PyObjectRef) -> AstResult<ast::Expr> {
         let range = self.location(object, "expr")?;
         if self.is_node(object, "UnaryOp")? {
-            let operand = self.field(object, "operand", "UnaryOp")?;
-            let op = self.field(object, "op", "UnaryOp")?;
+            let operand = self.required_field(object, "operand", "UnaryOp")?;
+            let op = self.required_field(object, "op", "UnaryOp")?;
             Ok(ast::Expr::UnaryOp(ast::ExprUnaryOp {
                 node_index: Default::default(),
                 range,
@@ -1282,9 +1419,9 @@ impl ObjectConverter {
                 operand: Box::new(self.recurse(|this| this.expr(operand))?),
             }))
         } else if self.is_node(object, "BinOp")? {
-            let left = self.field(object, "left", "BinOp")?;
-            let right = self.field(object, "right", "BinOp")?;
-            let op = self.field(object, "op", "BinOp")?;
+            let left = self.required_field(object, "left", "BinOp")?;
+            let right = self.required_field(object, "right", "BinOp")?;
+            let op = self.required_field(object, "op", "BinOp")?;
             Ok(ast::Expr::BinOp(ast::ExprBinOp {
                 node_index: Default::default(),
                 range,
@@ -1293,7 +1430,7 @@ impl ObjectConverter {
                 right: Box::new(self.recurse(|this| this.expr(right))?),
             }))
         } else if self.is_node(object, "Call")? {
-            let func = self.field(object, "func", "Call")?;
+            let func = self.required_field(object, "func", "Call")?;
             let args = self
                 .list(object, "args", "Call")?
                 .into_iter()
@@ -1321,8 +1458,8 @@ impl ObjectConverter {
                 },
             }))
         } else if self.is_node(object, "Attribute")? {
-            let value = self.field(object, "value", "Attribute")?;
-            let ctx = self.field(object, "ctx", "Attribute")?;
+            let value = self.required_field(object, "value", "Attribute")?;
+            let ctx = self.required_field(object, "ctx", "Attribute")?;
             Ok(ast::Expr::Attribute(ast::ExprAttribute {
                 node_index: Default::default(),
                 range,
@@ -1343,7 +1480,7 @@ impl ObjectConverter {
                     self.recurse(|this| this.expr(element))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let ctx = self.context(self.field(object, "ctx", "sequence")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "sequence")?)?;
             if is_tuple {
                 Ok(ast::Expr::Tuple(ast::ExprTuple {
                     node_index: Default::default(),
@@ -1363,7 +1500,7 @@ impl ObjectConverter {
                 }))
             }
         } else if self.is_node(object, "Name")? {
-            let ctx = self.context(self.field(object, "ctx", "Name")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "Name")?)?;
             Ok(ast::Expr::Name(ast::ExprName {
                 node_index: Default::default(),
                 range,
@@ -1380,7 +1517,7 @@ impl ObjectConverter {
                 invalid_type: None,
             }))
         } else if self.is_node(object, "BoolOp")? {
-            let op = self.field(object, "op", "BoolOp")?;
+            let op = self.required_field(object, "op", "BoolOp")?;
             Ok(ast::Expr::BoolOp(ast::ExprBoolOp {
                 node_index: Default::default(),
                 range,
@@ -1398,7 +1535,7 @@ impl ObjectConverter {
                 value,
             }))
         } else if self.is_node(object, "Lambda")? {
-            let args = self.field(object, "args", "Lambda")?;
+            let args = self.required_field(object, "args", "Lambda")?;
             let parameters = self.recurse(|this| this.parameters(args))?;
             let body = self.req_expr(object, "body", "Lambda")?;
             Ok(ast::Expr::Lambda(ast::ExprLambda {
@@ -1532,7 +1669,7 @@ impl ObjectConverter {
         } else if self.is_node(object, "Subscript")? {
             let value = self.req_expr(object, "value", "Subscript")?;
             let slice = self.req_expr(object, "slice", "Subscript")?;
-            let ctx = self.context(self.field(object, "ctx", "Subscript")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "Subscript")?)?;
             Ok(ast::Expr::Subscript(ast::ExprSubscript {
                 node_index: Default::default(),
                 range,
@@ -1542,7 +1679,7 @@ impl ObjectConverter {
             }))
         } else if self.is_node(object, "Starred")? {
             let value = self.req_expr(object, "value", "Starred")?;
-            let ctx = self.context(self.field(object, "ctx", "Starred")?)?;
+            let ctx = self.context(self.required_field(object, "ctx", "Starred")?)?;
             Ok(ast::Expr::Starred(ast::ExprStarred {
                 node_index: Default::default(),
                 range,
@@ -1563,6 +1700,14 @@ impl ObjectConverter {
         } else if self.is_node(object, "FormattedValue")? {
             let element = self.interpolation(object)?;
             Ok(fstring(vec![element], None))
+        } else if self.is_node(object, "TemplateStr")? {
+            let range = self.location(object, "TemplateStr")?;
+            let values = self.exprs(object, "values", "TemplateStr")?;
+            Ok(tstring(range, Vec::new(), Some(values)))
+        } else if self.is_node(object, "Interpolation")? {
+            let range = self.location(object, "Interpolation")?;
+            let element = self.tstring_interpolation(object)?;
+            Ok(tstring(range, vec![element], None))
         } else {
             Err(crate::PyError::type_error(crate::display::wtf8_format!(
                 "expected some sort of expr, but got ",
@@ -1573,7 +1718,7 @@ impl ObjectConverter {
 
     fn interpolation(&mut self, object: PyObjectRef) -> AstResult<ast::InterpolatedStringElement> {
         let expression = self.req_expr(object, "value", "FormattedValue")?;
-        let conversion = self.conversion(object)?;
+        let conversion = self.conversion(object, "FormattedValue")?;
         let format_spec = self.opt_expr(object, "format_spec")?;
         Ok(ast::InterpolatedStringElement::Interpolation(
             ast::InterpolatedElement {
@@ -1595,11 +1740,40 @@ impl ObjectConverter {
         ))
     }
 
+    /// RustPython `_ast::string::tstring_interpolation_from_object_with_range`:
+    /// the public `Interpolation` is represented by a one-element native
+    /// t-string.  Its `str` and object-form format spec stay in the runtime
+    /// fields consumed by `compile_runtime_interpolation`.
+    fn tstring_interpolation(
+        &mut self,
+        object: PyObjectRef,
+    ) -> AstResult<ast::InterpolatedStringElement> {
+        let range = self.location(object, "Interpolation")?;
+        let expression = self.req_expr(object, "value", "Interpolation")?;
+        let str_value = self.field(object, "str", "Interpolation")?;
+        let runtime_str = Some(self.constant_value(str_value)?);
+        let conversion = self.conversion(object, "Interpolation")?;
+        let format_spec = self.opt_expr(object, "format_spec")?;
+        Ok(ast::InterpolatedStringElement::Interpolation(
+            ast::InterpolatedElement {
+                node_index: Default::default(),
+                range,
+                expression,
+                debug_text: None,
+                conversion,
+                format_spec: None,
+                runtime_str,
+                runtime_interpolation_format_spec: format_spec,
+                runtime_formatted_value_format_spec: None,
+            },
+        ))
+    }
+
     /// `visit_FormattedValue` (codegen.py) matches `s`, `r` and `a` and
     /// leaves anything else at no conversion at all; 3.14 stops instead, so a
     /// character it does not know is an error here.
-    fn conversion(&self, object: PyObjectRef) -> AstResult<ast::ConversionFlag> {
-        match self.int_field(object, "conversion", "FormattedValue")? {
+    fn conversion(&self, object: PyObjectRef, node: &str) -> AstResult<ast::ConversionFlag> {
+        match self.int_field(object, "conversion", node)? {
             -1 => Ok(ast::ConversionFlag::None),
             value if value == i64::from(b's') => Ok(ast::ConversionFlag::Str),
             value if value == i64::from(b'r') => Ok(ast::ConversionFlag::Repr),
@@ -1661,7 +1835,7 @@ impl ObjectConverter {
                 ))
             })
             .transpose()?;
-        let value = self.field(object, "value", "keyword")?;
+        let value = self.required_field(object, "value", "keyword")?;
         Ok(ast::Keyword {
             node_index: Default::default(),
             range,
@@ -1845,6 +2019,28 @@ fn fstring(
     })
 }
 
+/// RustPython `_ast::string::template_str_to_expr`: object-form values ride
+/// beside an otherwise empty native t-string, while a standalone public
+/// `Interpolation` is represented by its single native element.
+fn tstring(
+    range: ruff_text_size::TextRange,
+    elements: Vec<ast::InterpolatedStringElement>,
+    runtime_template_str: Option<Vec<ast::Expr>>,
+) -> ast::Expr {
+    ast::Expr::TString(ast::ExprTString {
+        node_index: Default::default(),
+        range,
+        value: ast::TStringValue::single(ast::TString {
+            node_index: Default::default(),
+            range,
+            elements: elements.into(),
+            flags: ast::TStringFlags::empty(),
+        }),
+        runtime_template_str,
+        runtime_values: None,
+    })
+}
+
 pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyResult {
     parse_to_object_with_opts(
         source,
@@ -1852,6 +2048,7 @@ pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyRes
         crate::compile::CompileOpts::default(),
         true,
         false,
+        -1,
     )
 }
 
@@ -1863,6 +2060,7 @@ pub fn parse_to_object_with_opts(
     opts: crate::compile::CompileOpts,
     syntax_check_only: bool,
     type_comments: bool,
+    feature_version: i64,
 ) -> crate::PyResult {
     // The tokenizer sees a source whose line terminators are all `\n`
     // (`pytokenizer.py:654-662`), so the same rewrite runs here; the nodes and
@@ -1870,26 +2068,49 @@ pub fn parse_to_object_with_opts(
     let source = &*crate::compile::universal_newline(source);
     // A comment leaves no node behind, so a `type_comments=True` parse reads
     // the token list the parser hands back beside the tree.
-    let mut collected = super::type_comments::TypeComments::default();
-    let mut module = match mode {
-        // An expression has none of the five positions a `TYPE_COMMENT` is
-        // accepted in, so the comments are collected here only to be refused.
-        crate::compile::Mode::Eval => parser::parse_expression(source).map(|parsed| {
-            if type_comments {
-                collected = super::type_comments::collect(parsed.tokens(), source);
-            }
-            ast::Mod::Expression(parsed.into_syntax())
-        }),
+    let parse_mode = match mode {
+        crate::compile::Mode::Eval => parser::Mode::Expression,
         crate::compile::Mode::Exec
         | crate::compile::Mode::Single
-        | crate::compile::Mode::BlockExpr => parser::parse_module(source).map(|parsed| {
-            if type_comments {
-                collected = super::type_comments::collect(parsed.tokens(), source);
-            }
-            ast::Mod::Module(parsed.into_syntax())
-        }),
+        | crate::compile::Mode::BlockExpr => parser::Mode::Module,
+    };
+    // PyPy `CompileInfo.feature_version` carries the requested grammar version
+    // into `PythonParser.parse_source`.  CPython 3.14 treats every negative
+    // value and every future minor as the current grammar, so never expose
+    // Ruff's preview 3.15 grammar through this 3.14 boundary.
+    let minor = if feature_version < 0 {
+        14
+    } else {
+        feature_version.min(14) as u8
+    };
+    let options = parser::ParseOptions::from(parse_mode)
+        .with_target_version(ast::PythonVersion { major: 3, minor });
+    let parsed = parser::parse(source, options)
+        .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
+    // [3.14-spec] CPython `_PyPegen_new_identifier` performs this check as it
+    // interns each identifier.  PyPy `new_identifier` has the same NFKC
+    // spelling, while its parser-owned tree deliberately bypasses
+    // `AstValidator`; keep the check at that parser boundary too.
+    validate_parser_identifiers(source, parsed.tokens())?;
+    if let Some(error) = parsed
+        .unsupported_syntax_errors()
+        .iter()
+        .find(|error| should_report_unsupported_syntax_error(error))
+    {
+        return Err(crate::PyError::syntax_error(error.to_string()));
     }
-    .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
+    let mut collected = super::type_comments::TypeComments::default();
+    if type_comments {
+        // An expression has none of the five positions a `TYPE_COMMENT` is
+        // accepted in, so the comments are collected here only to be refused.
+        collected = super::type_comments::collect(parsed.tokens(), source);
+    }
+    let mut module = parsed.into_syntax();
+    if minor < 13 && has_variadic_type_param_default(&module) {
+        return Err(crate::PyError::syntax_error(
+            "Type parameter defaults are only supported in Python 3.13 and greater",
+        ));
+    }
     if type_comments {
         collected.attach(&mut module);
         // What attachment left over is a token no rule accepted, which the
@@ -1911,7 +2132,7 @@ pub fn parse_to_object_with_opts(
         0,
         crate::call::take_last_exec_ctx(),
     )?;
-    module_to_object(module, source, mode, ast_module, &collected.ignores)
+    module_to_object(module, source, mode, ast_module, &collected.ignores, true)
 }
 
 fn module_to_object(
@@ -1920,6 +2141,7 @@ fn module_to_object(
     mode: crate::compile::Mode,
     module_object: PyObjectRef,
     ignores: &[super::type_comments::TypeComment],
+    parser_locations: bool,
 ) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let ast_module = Rooted(pyre_object::gc_roots::shadow_stack_len());
@@ -1928,6 +2150,7 @@ fn module_to_object(
         source,
         source_file: SourceFileBuilder::new("<unknown>", source).finish(),
         ast_module,
+        parser_locations,
     };
     let root = match module {
         ast::Mod::Expression(module) => converter.node(
@@ -2001,6 +2224,10 @@ struct Converter<'a> {
     /// a `SourceFile` to slice it by range.
     source_file: SourceFile,
     ast_module: Rooted,
+    /// Ruff parser nodes include a few tokens that public PyPy/CPython AST
+    /// locations exclude.  ObjectConverter inputs already carry public
+    /// locations and must never receive those parser-only adaptations again.
+    parser_locations: bool,
 }
 
 impl Converter<'_> {
@@ -2054,7 +2281,16 @@ impl Converter<'_> {
         }
         if let Some((start, end)) = range {
             let (lineno, col_offset) = self.location(start as usize);
-            let (end_lineno, end_col_offset) = self.location(end as usize);
+            let (mut end_lineno, mut end_col_offset) = self.location(end as usize);
+            // [3.14-spec] CPython `remove_docstring` replaces a sole optimized
+            // docstring with a four-column synthetic Pass on its start line.
+            // RustPython `remove_docstring_from_body` has to encode that in a
+            // byte TextRange, which crosses a newline for a short multiline
+            // literal; PyPy has no optimized-AST parse path to preserve here.
+            if name == "Pass" && end == start.saturating_add(4) && end_lineno != lineno {
+                end_lineno = lineno;
+                end_col_offset = col_offset.saturating_add(4);
+            }
             for (field, value) in [
                 ("lineno", lineno),
                 ("col_offset", col_offset),
@@ -2082,6 +2318,47 @@ impl Converter<'_> {
             prefix.iter().filter(|byte| **byte == b'\n').count() + 1,
             offset - line_start,
         )
+    }
+
+    /// PyPy `BaseParser.set_decorators` attaches decorators while preserving
+    /// the raw FunctionDef/ClassDef `target.location()`.  Ruff instead starts
+    /// the statement range at the first `@`, so recover the first code token
+    /// after the final decorator for the public node's location.
+    fn definition_range(
+        &self,
+        statement: ruff_text_size::TextRange,
+        decorators: &[ast::Decorator],
+    ) -> (u32, u32) {
+        let (start, end) = range(statement);
+        if !self.parser_locations {
+            return (start, end);
+        }
+        let Some(last) = decorators.last() else {
+            return (start, end);
+        };
+        let after_decorator = last.range.end().to_u32();
+        if start > after_decorator {
+            // ObjectConverter already received the public def/class location.
+            return (start, end);
+        }
+        let bytes = self.source.as_bytes();
+        let mut offset = after_decorator as usize;
+        let limit = (end as usize).min(bytes.len());
+        while offset < limit {
+            while offset < limit && matches!(bytes[offset], b' ' | b'\t' | b'\x0c' | b'\n') {
+                offset += 1;
+            }
+            if offset < limit && bytes[offset] == b'#' {
+                while offset < limit && bytes[offset] != b'\n' {
+                    offset += 1;
+                }
+                continue;
+            }
+            if offset < limit {
+                return (offset as u32, end);
+            }
+        }
+        (start, end)
     }
 
     fn stmt_list(&self, stmts: &[ast::Stmt]) -> RootedResult {
@@ -2125,7 +2402,7 @@ impl Converter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.node(
                     name,
-                    Some(range(node.range)),
+                    Some(self.definition_range(node.range, &node.decorator_list)),
                     &[
                         ("name", self.string(node.name.as_str())),
                         ("args", self.parameters(&node.parameters)?),
@@ -2166,7 +2443,7 @@ impl Converter<'_> {
                 };
                 self.node(
                     "ClassDef",
-                    Some(range(node.range)),
+                    Some(self.definition_range(node.range, &node.decorator_list)),
                     &[
                         ("name", self.string(node.name.as_str())),
                         ("bases", bases),
@@ -2272,9 +2549,17 @@ impl Converter<'_> {
                 for clause in node.elif_else_clauses.iter().rev() {
                     let body = self.stmt_list(&clause.body)?;
                     if let Some(test) = clause.test.as_ref() {
+                        // PyPy PEG `elif_stmt` is recursive, so its LOCATIONS
+                        // end at the tail of the whole elif/else chain.
+                        let (start, clause_end) = range(clause.range);
+                        let end = if self.parser_locations {
+                            node.range.end().to_u32()
+                        } else {
+                            clause_end
+                        };
                         orelse = vec![self.node(
                             "If",
-                            Some(range(clause.range)),
+                            Some((start, end)),
                             &[
                                 ("test", self.expr(test)?),
                                 ("body", body),
@@ -2669,8 +2954,9 @@ impl Converter<'_> {
                 ],
             ),
             Expr::FString(n) => self.fstring(n),
-            Expr::TString(_) | Expr::IpyEscapeCommand(_) => Err(crate::PyError::not_implemented(
-                "AST conversion for template strings is not implemented",
+            Expr::TString(n) => self.tstring(n),
+            Expr::IpyEscapeCommand(_) => Err(crate::PyError::not_implemented(
+                "AST conversion for IPython escape commands is not implemented",
             )),
         }
     }
@@ -2722,6 +3008,187 @@ impl Converter<'_> {
         )
     }
 
+    /// RustPython `_ast::string::tstring_to_object`: publish the compiler's
+    /// t-string parts as the 3.14 `TemplateStr`/`Interpolation` public nodes.
+    fn tstring(&self, node: &ast::ExprTString) -> RootedResult {
+        if let Some(values) = node.runtime_template_str.as_deref() {
+            return self.node(
+                "TemplateStr",
+                Some(range(node.range)),
+                &[("values", self.expr_list(values)?)],
+            );
+        }
+        if let Some(values) = node.runtime_values.as_deref() {
+            let values = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_ref()
+                        .map(|value| self.expr(value))
+                        .transpose()
+                        .map(|value| self.optional(value))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return self.node(
+                "TemplateStr",
+                Some(range(node.range)),
+                &[("values", self.list(values))],
+            );
+        }
+
+        // RustPython `_ast::string::standalone_tstring_interpolation_to_object`:
+        // an object-form `Interpolation` uses a one-part native t-string as
+        // its carrier and must come back as that node, not as a nested
+        // `TemplateStr`.
+        if let [tstring] = node.value.as_slice() {
+            let mut elements = tstring.elements.iter();
+            if let Some(ast::InterpolatedStringElement::Interpolation(interpolation)) =
+                elements.next()
+                && elements.next().is_none()
+                && interpolation.runtime_str.is_some()
+            {
+                let mut parts = Vec::new();
+                self.template_elements(&tstring.elements, tstring.flags.into(), &mut parts)?;
+                if let [JoinedPart::Value(value)] = parts.as_slice() {
+                    return Ok(*value);
+                }
+            }
+        }
+
+        let mut parts = Vec::new();
+        for tstring in node.value.as_slice() {
+            self.template_elements(&tstring.elements, tstring.flags.into(), &mut parts)?;
+        }
+        let values = self.joined_values(parts)?;
+        self.node(
+            "TemplateStr",
+            Some(range(node.range)),
+            &[("values", self.list(values))],
+        )
+    }
+
+    fn template_elements(
+        &self,
+        elements: &[ast::InterpolatedStringElement],
+        flags: ast::AnyStringFlags,
+        parts: &mut Vec<JoinedPart>,
+    ) -> Result<(), crate::PyError> {
+        use ruff_text_size::Ranged;
+
+        for element in elements {
+            match element {
+                ast::InterpolatedStringElement::Literal(literal) => push_literal(
+                    parts,
+                    range(literal.range),
+                    &interpolated_string_literal_value(&self.source_file, literal, flags),
+                ),
+                ast::InterpolatedStringElement::Interpolation(interpolation) => {
+                    let mut conversion = interpolation.conversion;
+                    let expression_str =
+                        if let Some(runtime_str) = interpolation.runtime_str.as_ref() {
+                            self.constant_value(runtime_str)?
+                        } else if let Some(debug_text) = interpolation.debug_text.as_ref() {
+                            let (text, text_range) = interpolation_debug_text(
+                                &self.source_file,
+                                debug_text,
+                                interpolation.expression.range(),
+                            );
+                            push_literal(parts, range(text_range), Wtf8::new(text.as_str()));
+                            conversion =
+                                debug_conversion(conversion, interpolation.format_spec.is_some());
+                            let expression_range = extend_expr_range_with_wrapping_parens(
+                                self.source,
+                                interpolation.range,
+                                interpolation.expression.range(),
+                            )
+                            .unwrap_or_else(|| interpolation.expression.range());
+                            let (start, end) = range(expression_range);
+                            let expression = self.source[start as usize..end as usize].to_owned();
+                            self.string(&strip_interpolation_expr(
+                                &[
+                                    debug_text.leading.as_str(),
+                                    expression.as_str(),
+                                    debug_text.trailing.as_str(),
+                                ]
+                                .concat(),
+                            ))
+                        } else {
+                            self.string(&self.tstring_interpolation_expr_str(interpolation))
+                        };
+                    let format_spec = if let Some(spec) =
+                        interpolation.runtime_interpolation_format_spec.as_deref()
+                    {
+                        Some(self.expr(spec)?)
+                    } else {
+                        self.format_spec(&interpolation.format_spec, flags)?
+                    };
+                    parts.push(JoinedPart::Value(self.node(
+                        "Interpolation",
+                        Some(range(interpolation.range)),
+                        &[
+                            ("value", self.expr(&interpolation.expression)?),
+                            ("str", expression_str),
+                            (
+                                "conversion",
+                                self.pin(pyre_object::w_int_new(conversion as i8 as i64)),
+                            ),
+                            ("format_spec", self.optional(format_spec)),
+                        ],
+                    )?));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn format_spec(
+        &self,
+        format_spec: &Option<Box<ast::InterpolatedStringFormatSpec>>,
+        flags: ast::AnyStringFlags,
+    ) -> Result<Option<Rooted>, crate::PyError> {
+        format_spec
+            .as_deref()
+            .map(|spec| {
+                let mut spec_parts = Vec::new();
+                self.interpolated_elements(&spec.elements, flags, &mut spec_parts)?;
+                let values = self.joined_values(spec_parts)?;
+                // RustPython `_ast::string::ruff_format_spec_to_joined_str`:
+                // the public `JoinedStr` includes the opening colon while its
+                // constant children begin after it.
+                let (mut start, end) = range(spec.range);
+                if start > 0 && self.source.as_bytes().get(start as usize - 1) == Some(&b':') {
+                    start -= 1;
+                }
+                self.node(
+                    "JoinedStr",
+                    Some((start, end)),
+                    &[("values", self.list(values))],
+                )
+            })
+            .transpose()
+    }
+
+    fn tstring_interpolation_expr_str(&self, interpolation: &ast::InterpolatedElement) -> String {
+        use ruff_text_size::Ranged;
+
+        let interpolation_range = interpolation.range;
+        let expression_range = extend_expr_range_with_wrapping_parens(
+            self.source,
+            interpolation_range,
+            interpolation.expression.range(),
+        )
+        .unwrap_or_else(|| interpolation.expression.range());
+        let after_open_brace = interpolation_range.start() + ruff_text_size::TextSize::from(1);
+        let start = if after_open_brace > expression_range.end() {
+            expression_range.start()
+        } else {
+            after_open_brace
+        };
+        let start = start.to_u32() as usize;
+        let end = expression_range.end().to_u32() as usize;
+        strip_interpolation_expr(&self.source[start..end])
+    }
+
     fn joined_values(&self, parts: Vec<JoinedPart>) -> Result<Vec<Rooted>, crate::PyError> {
         parts
             .into_iter()
@@ -2761,20 +3228,13 @@ impl Converter<'_> {
                             conversion = ast::ConversionFlag::Repr;
                         }
                     }
-                    let format_spec = interpolation
-                        .format_spec
-                        .as_deref()
-                        .map(|spec| {
-                            let mut spec_parts = Vec::new();
-                            self.interpolated_elements(&spec.elements, flags, &mut spec_parts)?;
-                            let values = self.joined_values(spec_parts)?;
-                            self.node(
-                                "JoinedStr",
-                                Some(range(spec.range)),
-                                &[("values", self.list(values))],
-                            )
-                        })
-                        .transpose()?;
+                    let format_spec = if let Some(spec) =
+                        interpolation.runtime_formatted_value_format_spec.as_deref()
+                    {
+                        Some(self.expr(spec)?)
+                    } else {
+                        self.format_spec(&interpolation.format_spec, flags)?
+                    };
                     parts.push(JoinedPart::Value(self.node(
                         "FormattedValue",
                         Some(range(interpolation.range)),
@@ -3077,17 +3537,17 @@ impl Converter<'_> {
         let posonlyargs = p
             .posonlyargs
             .iter()
-            .map(|p| self.parameter(&p.parameter))
+            .map(|p| self.parameter(&p.parameter, 0))
             .collect::<Result<Vec<_>, _>>()?;
         let args = p
             .args
             .iter()
-            .map(|p| self.parameter(&p.parameter))
+            .map(|p| self.parameter(&p.parameter, 0))
             .collect::<Result<Vec<_>, _>>()?;
         let kwonlyargs = p
             .kwonlyargs
             .iter()
-            .map(|p| self.parameter(&p.parameter))
+            .map(|p| self.parameter(&p.parameter, 0))
             .collect::<Result<Vec<_>, _>>()?;
         let mut defaults = Vec::new();
         defaults.extend(
@@ -3117,23 +3577,38 @@ impl Converter<'_> {
                 ("args", self.list(args)),
                 (
                     "vararg",
-                    self.optional(p.vararg.as_deref().map(|v| self.parameter(v)).transpose()?),
+                    self.optional(
+                        p.vararg
+                            .as_deref()
+                            .map(|v| self.parameter(v, 1))
+                            .transpose()?,
+                    ),
                 ),
                 ("kwonlyargs", self.list(kwonlyargs)),
                 ("kw_defaults", self.list(kw_defaults)),
                 (
                     "kwarg",
-                    self.optional(p.kwarg.as_deref().map(|v| self.parameter(v)).transpose()?),
+                    self.optional(
+                        p.kwarg
+                            .as_deref()
+                            .map(|v| self.parameter(v, 2))
+                            .transpose()?,
+                    ),
                 ),
                 ("defaults", self.list(defaults)),
             ],
         )
     }
 
-    fn parameter(&self, p: &ast::Parameter) -> RootedResult {
+    fn parameter(&self, p: &ast::Parameter, star_width: u32) -> RootedResult {
+        let (start, end) = range(p.range);
+        // PyPy PEG `star_etc`/`kwds` build `ast.arg` from `param_no_default`,
+        // after consuming `*` or `**`; Ruff includes those tokens in range.
+        let star_width = if self.parser_locations { star_width } else { 0 };
+        let start = start.saturating_add(star_width).min(end);
         self.node(
             "arg",
-            Some(range(p.range)),
+            Some((start, end)),
             &[
                 ("arg", self.string(p.name.as_str())),
                 (
@@ -3401,6 +3876,62 @@ fn strip_debug_comments(text: &str) -> String {
         }
     }
     result
+}
+
+/// RustPython `_ast::string::debug_conversion`, following CPython
+/// `_get_interpolation_conversion` for `{expr=}`.
+fn debug_conversion(conversion: ast::ConversionFlag, has_format_spec: bool) -> ast::ConversionFlag {
+    if matches!(conversion, ast::ConversionFlag::None) && !has_format_spec {
+        ast::ConversionFlag::Repr
+    } else {
+        conversion
+    }
+}
+
+/// RustPython `_ast::string::extend_expr_range_with_wrapping_parens` keeps
+/// parentheses which belong to the spelling stored in `Interpolation.str`.
+fn extend_expr_range_with_wrapping_parens(
+    source: &str,
+    interpolation_range: ruff_text_size::TextRange,
+    expression_range: ruff_text_size::TextRange,
+) -> Option<ruff_text_size::TextRange> {
+    let (interpolation_start, interpolation_end) = range(interpolation_range);
+    let (expression_start, expression_end) = range(expression_range);
+    let left_slice = &source[interpolation_start as usize..expression_start as usize];
+    let (left_index, left_char) = left_slice
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    if left_char != '(' {
+        return None;
+    }
+
+    let right_slice = &source[expression_end as usize..interpolation_end as usize];
+    let (right_index, right_char) = right_slice
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())?;
+    if right_char != ')' {
+        return None;
+    }
+
+    Some(ruff_text_size::TextRange::new(
+        (interpolation_start + left_index as u32).into(),
+        (expression_end + right_index as u32 + 1).into(),
+    ))
+}
+
+/// CPython `_strip_interpolation_expr`: remove the debug marker and trailing
+/// whitespace from the expression spelling exposed as `Interpolation.str`.
+fn strip_interpolation_expr(expression: &str) -> String {
+    let mut end = expression.len();
+    for (index, ch) in expression.char_indices().rev() {
+        if ch.is_whitespace() || ch == '=' {
+            end = index;
+        } else {
+            break;
+        }
+    }
+    expression[..end].to_owned()
 }
 
 fn range(range: impl RangeParts) -> (u32, u32) {

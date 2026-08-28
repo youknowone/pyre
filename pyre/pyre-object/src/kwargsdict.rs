@@ -57,6 +57,7 @@ pub static KWARGS_DICT_STRATEGY: KwargsDictStrategy = KwargsDictStrategy;
 pub static KWARGS_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
     crate::dictmultiobject::DictStrategyRef {
         imp: &KWARGS_DICT_STRATEGY,
+        owner: std::ptr::null_mut(),
     };
 
 /// `KwargsDictStrategy` backing — erased `([], [])` parallel arrays

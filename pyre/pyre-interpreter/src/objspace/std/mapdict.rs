@@ -460,15 +460,14 @@ pub fn new_dict_terminator(w_cls: PyObjectRef) -> MapRef {
 /// paths (`plain_direct_write` type change / `holder_pick_attr` mismatch), and
 /// the affected instances rebuild boxed storage via `convert_to_boxed`.
 ///
-/// typeobject.py:255-257 builds a `DictTerminator` only when
+/// `W_TypeObject.__init__` builds a `DictTerminator` only when
 /// `self.hasdict and not typedef.hasdict` — a type whose layout typedef
 /// already manages its own dict (e.g. module) gets a `NoDictTerminator`.
-/// `typedef_hasdict` is `Layout.typedef_hasdict` (typedef.py:40). On the
-/// current shared-Layout model it is `false` for every reachable instance
-/// layout (all reuse INSTANCE_TYPE's Layout, whose typedef declares no
-/// `__dict__`), so the term is inert today; populating it `true` for the
-/// dict-managing typedefs is deferred to the distinct-TypeDef convergence
-/// (alongside the parked `Layout.acceptable_as_base_class`).
+/// `typedef_hasdict` is the native-owner projection of
+/// `Layout.typedef.hasdict` (`TypeDef.__init__`).  A concrete RPython owner
+/// manages that dictionary itself; a PyPy app-level-shaped owner collapsed
+/// onto pyre's generic `INSTANCE_TYPE` keeps the same TypeDef metadata but
+/// uses mapdict as its physical dictionary.
 pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdict: bool) -> MapRef {
     // `hasdict and not typedef.hasdict`, expressed without a bare `!` so the
     // annotator can lower it on the JIT-reachable terminator path.
@@ -5170,6 +5169,7 @@ pub static MAP_DICT_STRATEGY: MapDictStrategy = MapDictStrategy;
 pub static MAP_DICT_STRATEGY_REF: pyre_object::dictmultiobject::DictStrategyRef =
     pyre_object::dictmultiobject::DictStrategyRef {
         imp: &MAP_DICT_STRATEGY,
+        owner: std::ptr::null_mut(),
     };
 
 impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {

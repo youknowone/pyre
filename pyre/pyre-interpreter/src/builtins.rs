@@ -836,18 +836,24 @@ fn memoryview_adjust_fmt(fmt: &str) -> Result<(), crate::PyError> {
 }
 
 /// Box one `itemsize`-wide element at byte offset `base` per the view's
-/// format (`buffer.py value_from_bytes`).  Numeric typecodes route through
-/// the shared array decoder (`unpack_value`); `c` yields a length-1 bytes,
-/// `?` a bool, and any code the decoder rejects falls back to a little-endian
-/// read that is signed once the item is a full word wide.
+/// format.  PyPy's `buffer.py value_from_bytes` supplies the numeric decoding
+/// shape; CPython 3.14 `unpack_single` supplies the observable rejection of an
+/// unsupported one-character code.  `c` yields a length-1 bytes and `?` a
+/// bool.
 unsafe fn memoryview_unpack_element(
     fmt: &str,
     data: &[u8],
     base: usize,
     itemsize: usize,
-) -> PyObjectRef {
+) -> Result<PyObjectRef, crate::PyError> {
+    if memoryview_native_fmtchar(fmt).is_none() {
+        return Err(crate::PyError::not_implemented(format!(
+            "memoryview: format {} not supported",
+            fmt.strip_prefix('@').unwrap_or(fmt)
+        )));
+    }
     let buf = &data[base..base + itemsize];
-    match memoryview_format_code(fmt) {
+    Ok(match memoryview_format_code(fmt) {
         b'c' => pyre_object::bytesobject::w_bytes_from_bytes(buf),
         b'?' => w_bool_from(buf.iter().any(|&x| x != 0)),
         b'e' => {
@@ -878,7 +884,7 @@ unsafe fn memoryview_unpack_element(
                 pyre_object::bytesobject::w_bytes_from_bytes(buf)
             }
         }
-    }
+    })
 }
 
 /// Pack `w_val` into `itemsize` native-order bytes per `fmt`
@@ -890,6 +896,17 @@ fn memoryview_pack_value(
     itemsize: usize,
     w_val: PyObjectRef,
 ) -> Result<Vec<u8>, crate::PyError> {
+    // CPython 3.14 `pack_single` distinguishes a recognised scalar whose
+    // operand is wrong from a one-character PEP-3118 code memoryview does not
+    // implement at all.  PyPy reaches the same struct-table dispatch through
+    // `BufferView.bytes_from_value`; keep that dispatch boundary explicit so
+    // `s` is not misreported as a bad scalar operand.
+    if memoryview_native_fmtchar(fmt).is_none() {
+        return Err(crate::PyError::not_implemented(format!(
+            "memoryview: format {} not supported",
+            fmt.strip_prefix('@').unwrap_or(fmt)
+        )));
+    }
     // `type_error_int` / `value_error_int` — the wrong kind of object and a
     // value the format cannot hold are reported separately.
     let bad_type =
@@ -974,7 +991,8 @@ fn memoryview_pack_value(
         }
         b'e' => {
             let v = crate::baseobjspace::float_w(w_val).map_err(fix_error)?;
-            crate::module::r#struct::pack_half(v)?
+            crate::module::r#struct::pack_half(v)
+                .map_err(fix_error)?
                 .to_ne_bytes()
                 .to_vec()
         }
@@ -987,6 +1005,12 @@ fn memoryview_pack_value(
                 if d.len() == 1 {
                     return Ok(d.to_vec());
                 }
+                // CPython 3.14 `memoryview.c: pack_single`: an actual bytes
+                // object of the wrong length is a value error.  PyPy's
+                // `BufferView.bytes_from_value` still folds this StructError
+                // into TypeError, so this is the observable 3.14 exception
+                // split over the same single-item packing shape.
+                return Err(bad_value());
             }
             return Err(bad_type());
         }
@@ -999,7 +1023,7 @@ fn memoryview_pack_value(
 /// Each element is pinned as built and read back inside the scope
 /// `w_list_new` runs in, so neither a later element's allocation nor the
 /// list's own can strand an earlier one (`build_list_storage`).
-unsafe fn memoryview_value_list(mv: PyObjectRef) -> PyObjectRef {
+unsafe fn memoryview_value_list(mv: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         let itemsize = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
         let fmt = pyre_object::memoryview::w_memoryview_format_str(mv);
@@ -1009,16 +1033,15 @@ unsafe fn memoryview_value_list(mv: PyObjectRef) -> PyObjectRef {
         let mut count = 0;
         let mut base = 0;
         while itemsize > 0 && base + itemsize <= data.len() {
-            let _ = pyre_object::gc_roots::pin_root(memoryview_unpack_element(
-                fmt, &data, base, itemsize,
-            ));
+            let element = memoryview_unpack_element(fmt, &data, base, itemsize)?;
+            let _ = pyre_object::gc_roots::pin_root(element);
             base += itemsize;
             count += 1;
         }
         let items = (0..count)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(sp + i))
             .collect();
-        w_list_new(items)
+        Ok(w_list_new(items))
     }
 }
 
@@ -1198,7 +1221,7 @@ unsafe fn memoryview_unpack_at(
     indices: &[i64],
     fmt: &str,
     itemsize: usize,
-) -> PyObjectRef {
+) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         let element = pyre_object::memoryview::w_memoryview_view(mv).element_ptr(indices);
         let bytes = std::slice::from_raw_parts(element, itemsize);
@@ -1265,7 +1288,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
             // not `length / itemsize`.
             let index = memoryview_check_dimension(mv, 0, i)?;
             let fmt = w_memoryview_format_str(mv);
-            return Ok(memoryview_unpack_at(mv, &[index], fmt, itemsize as usize));
+            return memoryview_unpack_at(mv, &[index], fmt, itemsize as usize);
         }
         if pyre_object::is_tuple(index) {
             let (all_index, all_slice) = memoryview_tuple_kind(index);
@@ -1285,7 +1308,7 @@ fn memoryview_getitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 let indices = memoryview_start_from_tuple(mv, index)?;
                 let itemsize = w_memoryview_itemsize(mv);
                 let fmt = w_memoryview_format_str(mv);
-                return Ok(memoryview_unpack_at(mv, &indices, fmt, itemsize as usize));
+                return memoryview_unpack_at(mv, &indices, fmt, itemsize as usize);
             }
             if all_slice {
                 return Err(crate::PyError::not_implemented(
@@ -1494,6 +1517,15 @@ fn memoryview_setitem(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
                 "memoryview: invalid slice key, must be int or slice",
             ));
         }
+        // PyPy `W_MemoryView.descr_getitem` rejects an integer selecting the
+        // leading dimension of an N-D view because that would have to return
+        // a sub-view.  Assignment has the same structural boundary: only a
+        // full N-D tuple reaches the scalar packing path above.
+        if w_memoryview_ndim(mv) > 1 {
+            return Err(crate::PyError::not_implemented(
+                "multi-dimensional sub-views are not implemented",
+            ));
+        }
         let i = getindex_w(index)?;
         // `memory_ass_sub`: `__index__` is arbitrary Python code and may have
         // released this view before the offset reads its geometry (gh-92888).
@@ -1570,7 +1602,7 @@ fn memoryview_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     unsafe {
         memoryview_check_released(mv)?;
         memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
-        crate::baseobjspace::iter(memoryview_value_list(mv))
+        crate::baseobjspace::iter(memoryview_value_list(mv)?)
     }
 }
 
@@ -1704,7 +1736,7 @@ unsafe fn memoryview_tolist_rec(
     isz: usize,
     idim: usize,
     cursor: &mut usize,
-) -> PyObjectRef {
+) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         let dimshape = shape.get(idim).copied().unwrap_or(0).max(0);
         // Every element is pinned as built, the sublists included, and read
@@ -1719,9 +1751,9 @@ unsafe fn memoryview_tolist_rec(
                 }
                 let at = *cursor;
                 *cursor += isz;
-                memoryview_unpack_element(fmt, data, at, isz)
+                memoryview_unpack_element(fmt, data, at, isz)?
             } else {
-                memoryview_tolist_rec(shape, fmt, data, isz, idim + 1, cursor)
+                memoryview_tolist_rec(shape, fmt, data, isz, idim + 1, cursor)?
             };
             let _ = pyre_object::gc_roots::pin_root(element);
             count += 1;
@@ -1729,7 +1761,7 @@ unsafe fn memoryview_tolist_rec(
         let items = (0..count)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(sp + i))
             .collect();
-        w_list_new(items)
+        Ok(w_list_new(items))
     }
 }
 
@@ -1743,7 +1775,7 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         memoryview_adjust_fmt(pyre_object::memoryview::w_memoryview_format_str(mv))?;
         let ndim = pyre_object::memoryview::w_memoryview_ndim(mv);
         if ndim == 1 {
-            return Ok(memoryview_value_list(mv));
+            return memoryview_value_list(mv);
         }
         let isz = pyre_object::memoryview::w_memoryview_itemsize(mv) as usize;
         let fmt = pyre_object::memoryview::w_memoryview_format_str(mv);
@@ -1754,18 +1786,11 @@ fn memoryview_tolist(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                     "memoryview: unsupported format",
                 ));
             }
-            return Ok(memoryview_unpack_element(fmt, &data, 0, isz));
+            return memoryview_unpack_element(fmt, &data, 0, isz);
         }
         let shape = pyre_object::memoryview::w_memoryview_native_shape(mv);
         let mut cursor = 0;
-        Ok(memoryview_tolist_rec(
-            &shape,
-            fmt,
-            &data,
-            isz,
-            0,
-            &mut cursor,
-        ))
+        memoryview_tolist_rec(&shape, fmt, &data, isz, 0, &mut cursor)
     }
 }
 
@@ -2304,7 +2329,7 @@ unsafe fn memoryview_unpack_compared(
 ) -> Result<PyObjectRef, crate::PyError> {
     unsafe {
         match native {
-            true => Ok(memoryview_unpack_element(fmt, data, base, itemsize)),
+            true => memoryview_unpack_element(fmt, data, base, itemsize),
             false => crate::module::r#struct::unpack_single(fmt, &data[base..base + itemsize]),
         }
     }
@@ -2510,6 +2535,19 @@ unsafe fn memoryview_hash_value(mv: PyObjectRef) -> Result<i64, crate::PyError> 
             if !pyre_object::memoryview::w_memoryview_readonly(mv) {
                 return Err(crate::PyError::value_error(
                     "cannot hash writable memoryview object",
+                ));
+            }
+            // [3.14-spec] CPython `memory_hash` rejects every format except
+            // the native single-character `B`, `b`, and `c`.  PyPy's
+            // `W_MemoryView`'s byte-hash path historically hashes other readonly
+            // formats too; retain its byte-hash/caching structure below but
+            // apply the caller-visible 3.14 format contract here.
+            let fmt = pyre_object::memoryview::w_memoryview_format_str(mv);
+            if !memoryview_native_fmtchar(fmt)
+                .is_some_and(|(code, _)| matches!(code, b'B' | b'b' | b'c'))
+            {
+                return Err(crate::PyError::value_error(
+                    "memoryview: hashing is restricted to formats 'B', 'b' or 'c'",
                 ));
             }
             // CPython 3.14 `memory_hash`: hash the exporter while holding a
@@ -8828,9 +8866,27 @@ fn exception_layout_pytype(name: &str, base: PyObjectRef) -> *const pyre_object:
             if parent.is_null() {
                 &exc::EXCEPTION_TYPE
             } else {
-                (*parent).typedef
+                (*(*parent).typedef).instance_type
             }
         },
+    }
+}
+
+/// PyPy `TypeCache.build`: `_new_exception` assigns
+/// `typedef.applevel_subclasses_base`, and the cache passes that real base's
+/// TypeDef as `overridetypedef`.  Concrete `W_*` exception classes instead
+/// retain their own TypeDef even when the Python-level base is related.
+fn exception_overridetypedef(
+    layout_pytype: *const pyre_object::PyType,
+    base: PyObjectRef,
+) -> *const pyre_object::typeobject::InterpreterTypeDef {
+    unsafe {
+        let parent = pyre_object::w_type_get_layout_ptr(base);
+        if parent.is_null() || !std::ptr::eq((*(*parent).typedef).instance_type, layout_pytype) {
+            std::ptr::null()
+        } else {
+            (*parent).typedef
+        }
     }
 }
 
@@ -8858,7 +8914,8 @@ pub(crate) fn make_exc_type_with_init(
     // rejecting the sibling layouts `(UnicodeTranslateError,
     // UnicodeEncodeError)`.
     let layout_pytype = exception_layout_pytype(name, base);
-    let cls = crate::typedef::make_builtin_type_with_layout(
+    let overridetypedef = exception_overridetypedef(layout_pytype, base);
+    let cls = crate::typedef::make_builtin_type_with_layout_owner(
         name,
         move |ns| {
             // The producer's own root slot tracks its copy of the namespace,
@@ -9342,6 +9399,7 @@ pub(crate) fn make_exc_type_with_init(
         },
         base,
         layout_pytype,
+        overridetypedef,
     );
     if name == "SyntaxError" {
         for member_name in [
@@ -9430,7 +9488,7 @@ pub(crate) fn make_exc_type_multi(
     if let Some(cls) = lookup_exc_class(name) {
         return cls;
     }
-    let cls = crate::typedef::make_builtin_type_with_bases(
+    let cls = crate::typedef::make_builtin_type_with_bases_and_overridetypedef(
         name,
         move |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
@@ -10093,7 +10151,8 @@ fn make_exception_group_type(
         return cls;
     }
     let layout_pytype = exception_layout_pytype(name, bases[0]);
-    let cls = crate::typedef::make_builtin_type_with_bases_and_layout(
+    let overridetypedef = exception_overridetypedef(layout_pytype, bases[0]);
+    let cls = crate::typedef::make_builtin_type_with_bases_and_layout_owner(
         name,
         move |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
@@ -10191,6 +10250,7 @@ fn make_exception_group_type(
         },
         bases,
         layout_pytype,
+        overridetypedef,
     );
     if name == "BaseExceptionGroup" {
         for member_name in ["message", "exceptions"] {
@@ -14046,6 +14106,17 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         Some(v) => crate::baseobjspace::gateway_int_w(v)?,
         None => -1,
     };
+    // PyPy `PythonAstCompiler.compile_to_ast` passes this keyword-only value
+    // through `CompileInfo.feature_version` to the parser.
+    let feature_version = match kwarg_get(kwargs, "_feature_version") {
+        Some(value) => {
+            let value = crate::baseobjspace::gateway_int_w(value)?;
+            i64::from(i32::try_from(value).map_err(|_| {
+                crate::PyError::overflow_error("Python int too large to convert to C int")
+            })?)
+        }
+        None => -1,
+    };
 
     // Any bit outside the recognised compilation-flag set is rejected.
     let recognized = COMPILER_FLAGS
@@ -14147,20 +14218,17 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // own `opts` has been moved into by then.
         let retry_opts = opts.clone();
         let result = if source_is_ast {
-            // An already materialised AST under plain `PyCF_ONLY_AST` is
-            // handed straight back, so `compile(tree, ..., PyCF_ONLY_AST) is
-            // tree`.  Re-converting it would hand out a copy instead.
-            if syntax_check_only {
-                Ok(source)
-            } else {
-                crate::module::_ast::convert::preprocess_object_to_object(
-                    source,
-                    "",
-                    mode,
-                    opts,
-                    syntax_check_only,
-                )
-            }
+            // [3.14-spec] CPython `_PyAST_obj2mod` validates the root for the
+            // requested mode and `_PyAST_mod2obj` publishes a fresh tree even
+            // for plain ONLY_AST.  PyPy `compile_to_ast` returns its input
+            // object unchanged; the observable 3.14 copy/TypeError wins here.
+            crate::module::_ast::convert::preprocess_object_to_object(
+                source,
+                "",
+                mode,
+                opts,
+                syntax_check_only,
+            )
         } else {
             crate::module::_ast::convert::parse_to_object_with_opts(
                 source_str
@@ -14170,6 +14238,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 opts,
                 syntax_check_only,
                 flags & PYCF_TYPE_COMMENTS != 0,
+                feature_version,
             )
         };
         return result.map_err(|error| {
@@ -17518,6 +17587,19 @@ impl WritableBuffer {
         })
     }
 
+    /// `_struct.pack_into` uses the same `space.acquire_writebuf` lease as
+    /// `FileIO.readinto`; only its argument converter owns different wording
+    /// for a rejected exporter.  Keep non-type failures (notably a released
+    /// memoryview's `ValueError`) unchanged.
+    pub(crate) unsafe fn acquire_for_pack_into(obj: PyObjectRef) -> Result<Self, crate::PyError> {
+        unsafe { Self::acquire(obj) }.map_err(|err| match err.kind {
+            crate::PyErrorKind::TypeError => {
+                crate::PyError::type_error("argument must be read-write bytes-like object")
+            }
+            _ => err,
+        })
+    }
+
     pub(crate) unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.address, self.length) }
     }
@@ -20808,8 +20890,33 @@ mod tests {
     #[test]
     fn exception_layouts_follow_concrete_pypy_interpreter_classes() {
         let _ = new_builtin_module_dict();
+        let base_exception = lookup_exc_class("BaseException").unwrap();
+        let exception = lookup_exc_class("Exception").unwrap();
         let value_error = lookup_exc_class("ValueError").unwrap();
         let os_error = lookup_exc_class("OSError").unwrap();
+        let import_error = lookup_exc_class("ImportError").unwrap();
+        let module_not_found = lookup_exc_class("ModuleNotFoundError").unwrap();
+        unsafe {
+            // `TypeCache.build` substitutes `applevel_subclasses_base.typedef`
+            // for `_new_exception` classes, but concrete W_* owners start a
+            // new Layout and their fieldless descendants reuse that one.
+            assert_eq!(
+                pyre_object::w_type_get_layout_ptr(base_exception),
+                pyre_object::w_type_get_layout_ptr(exception),
+            );
+            assert_eq!(
+                pyre_object::w_type_get_layout_ptr(exception),
+                pyre_object::w_type_get_layout_ptr(value_error),
+            );
+            assert_ne!(
+                pyre_object::w_type_get_layout_ptr(exception),
+                pyre_object::w_type_get_layout_ptr(import_error),
+            );
+            assert_eq!(
+                pyre_object::w_type_get_layout_ptr(import_error),
+                pyre_object::w_type_get_layout_ptr(module_not_found),
+            );
+        }
         let compatible = pyre_object::w_tuple_new(vec![value_error, os_error]);
         let best = unsafe { crate::call::check_and_find_best_base(compatible) }.unwrap();
         assert!(std::ptr::eq(best, os_error));

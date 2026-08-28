@@ -690,6 +690,11 @@ fn zdecompress_type() -> PyObjectRef {
         // `zlib_exec` creates ZlibDecompressorType from an immutable heap
         // spec, unlike Compress and Decompress.
         crate::typedef::mark_cpython_heap_type(tp, true);
+        // [3.14-spec] CPython's `ZlibDecompressorType` omits BASETYPE.  PyPy
+        // has no separate `_ZlibDecompressor` owner; keep this existing
+        // compatibility payload isolated and suppress its public base
+        // capability without changing object's TypeDef.
+        unsafe { pyre_object::w_type_suppress_cpython_basetype(tp) };
         pyre_object::pyobject::set_instantiate(
             unsafe { &*<W_ZlibDecompressor as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
             tp,

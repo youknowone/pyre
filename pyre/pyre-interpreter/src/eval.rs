@@ -3034,6 +3034,22 @@ unsafe fn load_global_via_cache(
         if raw.mstrategy.is_null() || raw.dstorage.is_null() {
             return Ok(None);
         }
+        // `celldict.py ModuleDictStrategy.switch_to_object_strategy` swaps the
+        // live strategy, so its module-only global-cache method is no longer
+        // available.  Continue through the ordinary mapping lookup just as
+        // `_load_global_fallback` does upstream.
+        if pyre_object::dictmultiobject::w_module_dict_is_object_strategy(w_module_dict) {
+            if let Some(value) = crate::baseobjspace::finditem_str(w_module_dict, name)? {
+                return Ok(Some(value));
+            }
+            if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
+                let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
+                if !w_builtin_dict.is_null() {
+                    return crate::baseobjspace::finditem_str(w_builtin_dict, name);
+                }
+            }
+            return Ok(None);
+        }
         // `celldict.py:315-322`: the slow-path install just routes through
         // `w_globals.get_global_cache(varname)` and writes
         // `pycode._globals_caches[nameindex] = cache.ref`.
@@ -3043,8 +3059,9 @@ unsafe fn load_global_via_cache(
         // `builtincache` — that branch is dead in
         // `ModuleDictStrategy::get_global_cache` per its line-by-line port
         // of `celldict.py not space.config.objspace.honor__builtins__`.
-        let strategy = &mut *raw.mstrategy;
-        let storage = &*raw.dstorage;
+        let strategy =
+            pyre_object::dictmultiobject::w_module_dict_module_strategy_mut(w_module_dict);
+        let storage = pyre_object::dictmultiobject::w_module_dict_module_storage(w_module_dict);
         let cache = strategy.get_global_cache(storage, name);
         // `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`.
         if !pycode.is_null() {

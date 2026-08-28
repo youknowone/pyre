@@ -3968,6 +3968,25 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
+    // The control for `[fbw-mergepoint-in-helper]` in `mod.rs`: that probe answers
+    // 0, and this line is what says the 0 describes the arm rather than a helper
+    // walk that never happens.  Over the 491 synthetic fixtures this one fires
+    // on `pickle_ctor_args` alone, for `__majit_wrap_load`.  One line per helper
+    // jitcode, not per walk, so the pair stays readable next to the rest of what
+    // this knob prints.
+    if fbw_debug_abort_enabled() {
+        thread_local! {
+            static SEEN: std::cell::RefCell<std::collections::HashSet<usize>> =
+                std::cell::RefCell::new(std::collections::HashSet::new());
+        }
+        if SEEN.with(|seen| seen.borrow_mut().insert(jitcode.index())) {
+            eprintln!(
+                "[fbw-helper-walk-enter] jitcode_index={} name={}",
+                jitcode.index(),
+                jitcode.name
+            );
+        }
+    }
     // `transparent_helper_subwalk` is set by `run_sub_jitcode_walk` on the
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
@@ -5066,22 +5085,48 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             CalleeReplaySafety::Dirty => {
                 // The generated resume chain is sound for a constant callable
-                // with one paused caller when the callee owns an exception
-                // table and `try_multiframe` gives it a seeded frame.  That
-                // frame makes each in-callee guard carry the callee's own
-                // resume coordinate, so deopt does not replay the whole body
-                // from the caller's CALL boundary.  A stored bound method
-                // reaches the path on `bound_method` alone; one that also meets
-                // these terms takes the same screen exemption below.
-                let seeded_callee_resume = body_facts.has_exception_table
-                    && callable_guard_op.is_constant()
-                    && inline_depth < 2
-                    && try_multiframe;
+                // with one paused caller when `try_multiframe` gives the callee
+                // a seeded frame.  That frame makes each in-callee guard carry
+                // the callee's own resume coordinate, so deopt does not replay
+                // the whole body from the caller's CALL boundary.  A stored
+                // bound method reaches the path on `bound_method` alone; one
+                // that also meets these terms takes the same screen exemption
+                // below.
+                //
+                // The callee's own exception table is NOT a term here.  It was
+                // one because the route was written for handler-bearing bodies,
+                // not because the resume coordinate needs a handler: what the
+                // seeded frame answers is where a deopt lands, which is the same
+                // question for a body with no `try` at all.  Requiring it
+                // refused 17 sites in 14 `bench/synth` fixtures that met every
+                // other term — `entry_is_call_boundary`, a constant callable,
+                // depth 0, and `try_multiframe` — for having no handler, while
+                // the same body carrying one was admitted.  `pyjitpl.py:1415`
+                // `perform_call` pushes a real `MIFrame` for every callee
+                // `can_inline_callable` admits and tests no exception table
+                // anywhere.  The screen exemption below is unaffected: it is
+                // reached only when `branchy_handler_scan` is `Some`, which
+                // itself requires `has_exception_table`.
+                let seeded_callee_resume =
+                    callable_guard_op.is_constant() && inline_depth < 2 && try_multiframe;
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
                 foriter_dirty_bound = entry_is_call_boundary
                     && (bound_method.is_some() || seeded_callee_resume)
                     && !pyre_interpreter::code_has_for_iter(callee_code)
                     && !pyre_interpreter::code_is_self_recursive(callee_code);
+                if !foriter_dirty_bound && fbw_inline_diag_enabled() {
+                    eprintln!(
+                        "[inline-foriter-dirty] pc={} boundary={entry_is_call_boundary} \
+                         bound={} exc_table={} const_callable={} depth={inline_depth} \
+                         mf={try_multiframe} strict={strict_inlinable} for_iter={} selfrec={}",
+                        op.pc,
+                        bound_method.is_some(),
+                        body_facts.has_exception_table,
+                        callable_guard_op.is_constant(),
+                        pyre_interpreter::code_has_for_iter(callee_code),
+                        pyre_interpreter::code_is_self_recursive(callee_code),
+                    );
+                }
                 foriter_dirty_bound
             }
         };

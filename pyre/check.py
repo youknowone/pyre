@@ -1363,6 +1363,22 @@ JITSTATS_BADNESS_FIELDS = (
     "fbw_midbody_latch_new_unjournaled",
     "fbw_escape_plain_fallback",
     "fbw_escape_plain_fallback_unclean",
+    # `fbw_foriter_item_dropped` counts a FOR_ITER item the walk consumed
+    # concretely and no leg handed back, so the caller's loop runs one
+    # iteration fewer than the program says. It is the same kind of counter as
+    # `fbw_rolled_back_with_effects` and for the same reason: the refusals that
+    # produce it are each correct in isolation (delivering would double a
+    # committed effect, or push onto a stack the frame is not parked on), and
+    # the price of being correct is a WRONG ANSWER rather than a slow one.
+    #
+    # Its witness is `class_stmt_after_attr_store_keeps_the_iteration`: before
+    # the class-body qmut abort latched its operand stack, a `class` statement
+    # after `obj.attr = v` in a loop body lost 5 of 10000 iterations on both
+    # native backends, and the only reason anyone found it was reading a census
+    # by hand. Nothing in the corpus reaches either refusal now — the four
+    # profiler fixtures that take an in-flight item deliver all 19 of them —
+    # which is what makes zero the value to arm.
+    "fbw_foriter_item_dropped",
 )
 
 # A zero-valued badness counter is meaningful only if its source census ran.

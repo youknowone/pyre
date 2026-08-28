@@ -3092,10 +3092,35 @@ pub fn census_record_for_iter_gate_decline(code_ptr: usize, kind: &'static str) 
     first
 }
 
+/// What became of one in-flight FOR_ITER continuation, from the walk that
+/// stashed it to the interpreter re-entry that either resumed its body or did
+/// not.  The three refusal columns are three different defects and only one of
+/// them is about effects, so a single `refused` total cannot be read: an
+/// effect that must not be re-run, a frame parked where the push would corrupt
+/// the operand stack, and an entry no frame was ever offered.  Each one costs
+/// the iteration its stashed item belonged to.
 #[derive(Clone, Copy, Default)]
-struct ForiterInflightCensusCounts {
-    delivered: usize,
-    refused: usize,
+pub(crate) struct ForiterInflightCensusCounts {
+    /// The item was pushed and the frame repositioned to its body pc.
+    pub(crate) delivered: usize,
+    /// R1: a body effect committed since the consume, so re-running the body
+    /// would double it.
+    pub(crate) refused_effect: usize,
+    /// The live frame was not parked at the header this body pc names, so the
+    /// push would have landed on the wrong operand stack.
+    pub(crate) refused_header: usize,
+    /// Destroyed by the take's single-delivery clear: a different entry was
+    /// the one the parked frame could accept.
+    pub(crate) dropped_unmatched: usize,
+}
+
+/// Which column [`census_record_foriter_inflight`] bumps.
+#[derive(Clone, Copy)]
+pub(crate) enum ForiterInflightOutcome {
+    Delivered,
+    RefusedEffect,
+    RefusedHeader,
+    DroppedUnmatched,
 }
 
 thread_local! {
@@ -3112,6 +3137,13 @@ thread_local! {
 /// compute a census key before recording share this gate, so resolving the key
 /// costs nothing when the diagnostic is off.
 pub(crate) fn foriter_inflight_census_enabled() -> bool {
+    // Always collect under `cfg(test)`: the unit tests drive each outcome
+    // directly, and they are the only control this census has -- no corpus
+    // fixture reaches a refusal, so a run that reads zero everywhere cannot
+    // tell a quiet census from a broken one.
+    if cfg!(test) {
+        return true;
+    }
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("PYRE_FORITER_INFLIGHT_CENSUS").is_some()
@@ -3119,21 +3151,45 @@ pub(crate) fn foriter_inflight_census_enabled() -> bool {
     })
 }
 
+/// The census row for one `(code, body pc)` key, for a test that just drove an
+/// outcome through [`fbw_foriter_inflight_take`] and the deliver site.
+#[cfg(test)]
+pub(crate) fn census_foriter_inflight_row(
+    code_ptr: usize,
+    body_pc: usize,
+) -> ForiterInflightCensusCounts {
+    FORITER_INFLIGHT_CENSUS
+        .with(|c| c.borrow().get(&(code_ptr, body_pc)).copied())
+        .unwrap_or_default()
+}
+
+/// Drop every accumulated row, so one test's outcomes cannot be read by the
+/// next one on the same thread.
+#[cfg(test)]
+pub(crate) fn census_foriter_inflight_reset() {
+    FORITER_INFLIGHT_CENSUS.with(|c| c.borrow_mut().clear());
+}
+
 /// Record one legacy in-flight FOR_ITER delivery decision. Like
 /// [`census_record_for_iter_gate_decline`], the collection gate precedes the
 /// thread-local lookup, so the census costs nothing when diagnostics are off.
-fn census_record_foriter_inflight(code_ptr: usize, body_pc: usize, delivered: bool) {
+pub(crate) fn census_record_foriter_inflight(
+    code_ptr: usize,
+    body_pc: usize,
+    outcome: ForiterInflightOutcome,
+) {
     if !foriter_inflight_census_enabled() {
         return;
     }
     FORITER_INFLIGHT_CENSUS.with(|c| {
         let mut map = c.borrow_mut();
         let counts = map.entry((code_ptr, body_pc)).or_default();
-        if delivered {
-            counts.delivered += 1;
-        } else {
-            counts.refused += 1;
-        }
+        *match outcome {
+            ForiterInflightOutcome::Delivered => &mut counts.delivered,
+            ForiterInflightOutcome::RefusedEffect => &mut counts.refused_effect,
+            ForiterInflightOutcome::RefusedHeader => &mut counts.refused_header,
+            ForiterInflightOutcome::DroppedUnmatched => &mut counts.dropped_unmatched,
+        } += 1;
     });
     census_dump_foriter_inflight();
 }
@@ -3141,6 +3197,13 @@ fn census_record_foriter_inflight(code_ptr: usize, body_pc: usize, delivered: bo
 /// Print the accumulated in-flight delivery table after each observation, so
 /// the last block in a process log is its final tally without an exit hook.
 fn census_dump_foriter_inflight() {
+    // Only the env-var reader wants the running table on stderr; under
+    // `cfg(test)` the census collects for the assertions alone.
+    if !(std::env::var_os("PYRE_FORITER_INFLIGHT_CENSUS").is_some()
+        || std::env::var_os("PYRE_FBW_DEBUG_ABORT").is_some())
+    {
+        return;
+    }
     FORITER_INFLIGHT_CENSUS.with(|c| {
         for (&(code_ptr, body_pc), counts) in c.borrow().iter() {
             let (name, source) = if code_ptr == 0 {
@@ -3153,8 +3216,12 @@ fn census_dump_foriter_inflight() {
             };
             eprintln!(
                 "[fbw-foriter-census] code=0x{code_ptr:x} name={name:?} source={source:?} \
-                 body_pc={body_pc} DELIVERED={} REFUSED={}",
-                counts.delivered, counts.refused
+                 body_pc={body_pc} DELIVERED={} REFUSED_EFFECT={} REFUSED_HEADER={} \
+                 DROPPED_UNMATCHED={}",
+                counts.delivered,
+                counts.refused_effect,
+                counts.refused_header,
+                counts.dropped_unmatched
             );
         }
     });
@@ -12531,15 +12598,45 @@ fn handle<Sym: WalkSym>(
             // loop against the caller's frame — publishing the header pc over the
             // caller's post-loop operand stack, which `FOR_ITER` then advances as
             // if it were the iterator (`loop_callee_for_header_resume`).
-            let callee_code = (!ctx.is_top_level)
-                .then(|| {
+            //
+            // A transparent helper walk is NOT such a portal frame: it is a
+            // Rust helper body descended into, and `framestack.last()` there
+            // describes the helper's own entry (or, for a root helper walk that
+            // pushes none, an unrelated caller). The arm is reachable from one:
+            // `_unpackiterable_unknown_length` is a second jit driver and the
+            // only helper jitcode in the build that carries a
+            // `jit_merge_point` -- 2 of 2939 do, and the other is the portal
+            // `eval_loop_jit` itself. So exclude it explicitly rather than
+            // relying on the token lookup to miss.
+            //
+            // No corpus program reaches the arm this way today: over the 491
+            // synthetic fixtures the print below never fires while its control
+            // in `inline_call.rs` does, on one fixture and one helper. The
+            // exclusion is the invariant, not a repair of an observed answer.
+            if fbw_debug_abort_enabled() && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
+            {
+                eprintln!(
+                    "[fbw-mergepoint-in-helper] jitcode_index={:?} is_top_level={} \
+                     framestack_top_w_code={:?}",
+                    ctx.fbw_mode.transparent_helper_jitcode_index,
+                    ctx.is_top_level,
                     ctx.session
                         .borrow()
                         .framestack
                         .last()
-                        .map(|frame| frame.w_code)
-                })
-                .flatten();
+                        .map(|frame| frame.w_code),
+                );
+            }
+            let callee_code = (!ctx.is_top_level
+                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
+            .then(|| {
+                ctx.session
+                    .borrow()
+                    .framestack
+                    .last()
+                    .map(|frame| frame.w_code)
+            })
+            .flatten();
             if let Some(callee_code) = callee_code {
                 let callee_key = crate::driver::make_green_key(
                     callee_code as *const (),

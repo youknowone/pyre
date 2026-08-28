@@ -2888,6 +2888,7 @@ dependencies = [
 name = "pyre-wasm-runner"
 version = "0.0.2"
 dependencies = [
+ "getrandom 0.4.3",
  "rustc-demangle",
  "sha2 0.10.9",
  "wasmi",
@@ -3119,6 +3120,15 @@ dependencies = [
  "rustc-hash",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "regex"
+version = "0.0.2"
+dependencies = [
+ "majit-ir",
+ "majit-macros",
+ "majit-metainterp",
 ]
 
 [[package]]
