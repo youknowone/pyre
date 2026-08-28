@@ -485,9 +485,9 @@ pub struct JitCodeExecState {
     pub call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
     /// Bytecode offset of the `BC_JIT_MERGE_POINT(_C)` opcode byte for
     /// the dispatch JitCode emitted by `lower_dispatch_body`.  `None`
-    /// for non-dispatch JitCodes (helpers, sub-arms) — exactly one
-    /// `jit_merge_point` op is allowed per dispatch JitCode and the
-    /// builder asserts that contract on the second call.
+    /// for non-dispatch JitCodes (helpers, sub-arms). The LLBC route
+    /// permits one marker per dispatch body; `JitCodeBuilder` tolerates
+    /// additional markers and retains the first marker's offset.
     ///
     /// Captured by `JitCodeBuilder::jit_merge_point` at the
     /// `self.code.len()` immediately before the opcode byte is pushed,

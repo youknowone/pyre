@@ -2480,11 +2480,12 @@ impl Assembler {
                 reds_r,
                 reds_f,
             } => {
-                // `JitCodeBuilder::jit_merge_point` asserts the same contract
-                // on its second call: `jtransform.py` emits at most one marker
-                // per portal graph, so a body reaching here twice means two
-                // markers were lowered into one graph and the offset below
-                // would name whichever won.
+                // This LLBC route enforces `jtransform.py`'s at-most-one-marker
+                // contract per portal graph. The sibling
+                // `JitCodeBuilder::jit_merge_point` route tolerates later
+                // markers while retaining the first offset; a body reaching
+                // this route twice means two markers were lowered into one
+                // graph and the offset below would name whichever won.
                 assert!(
                     state.jit_merge_point_offset.is_none(),
                     "a second jit_merge_point in one assembled body",
