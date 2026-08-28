@@ -1632,7 +1632,11 @@ pub(super) unsafe fn vectorcall_function(raw: *mut CPyObject) -> Option<Vectorca
     }
     let tp = unsafe { (*raw).ob_type };
     if tp.is_null()
-        || unsafe { (*tp).tp_flags } & super::typeobject::PY_TPFLAGS_HAVE_VECTORCALL == 0
+        || !unsafe {
+            (*tp)
+                .tp_flags
+                .contains(super::typeobject::TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
+        }
     {
         return None;
     }

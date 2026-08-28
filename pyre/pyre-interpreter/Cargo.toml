@@ -51,6 +51,11 @@ pyre-native = { workspace = true }
 # `pyre_object::lltype::PYRE_CLASS_DESCRIPTORS`; the attribute path must resolve
 # in this crate too.
 linkme = { workspace = true }
+# `Py_TPFLAGS_*` is one `unsigned long` an extension writes into, so the
+# flags type stays `#[repr(transparent)]` over `c_ulong`; `Flags::FLAGS`
+# is what lets the test below compare each one against the header that
+# ships it.
+bitflags = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 rustpython-literal = { workspace = true }
 rustpython-common = { workspace = true }

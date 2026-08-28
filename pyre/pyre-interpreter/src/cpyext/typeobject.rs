@@ -201,7 +201,7 @@ pub struct CPyTypeObject {
     pub tp_getattro: *const c_void,
     pub tp_setattro: *const c_void,
     pub tp_as_buffer: *mut CPyBufferProcs,
-    pub tp_flags: std::ffi::c_ulong,
+    pub tp_flags: TpFlags,
     pub tp_doc: *const c_char,
     pub tp_traverse: *const c_void,
     pub tp_clear: *const c_void,
@@ -257,59 +257,96 @@ pub struct CPyHeapTypeObject {
     pub ht_module: *mut CPyObject,
 }
 
-pub const PY_TPFLAGS_DEFAULT: std::ffi::c_ulong = 0;
-pub const PY_TPFLAGS_STATIC_BUILTIN: std::ffi::c_ulong = 1 << 1;
-pub const PY_TPFLAGS_DISALLOW_INSTANTIATION: std::ffi::c_ulong = 1 << 7;
-pub const PY_TPFLAGS_HEAPTYPE: std::ffi::c_ulong = 1 << 9;
-pub const PY_TPFLAGS_BASETYPE: std::ffi::c_ulong = 1 << 10;
-/// PEP 590 -- the type lends its instances a `vectorcallfunc`, stored in
-/// each of them at `tp_vectorcall_offset`.  A type carrying the bit is
-/// readied with `tp_call` filled and the offset positive, so the two are
-/// read together and never apart.
-pub const PY_TPFLAGS_HAVE_VECTORCALL: std::ffi::c_ulong = 1 << 11;
-pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
-pub const PY_TPFLAGS_READYING: std::ffi::c_ulong = 1 << 13;
-pub const PY_TPFLAGS_HAVE_GC: std::ffi::c_ulong = 1 << 14;
-pub const PY_TPFLAGS_IMMUTABLETYPE: std::ffi::c_ulong = 1 << 8;
-pub const PY_TPFLAGS_ITEMS_AT_END: std::ffi::c_ulong = 1 << 23;
+bitflags::bitflags! {
+    /// The `object.h` type flags.
+    ///
+    /// `tp_flags` is one `unsigned long` that two places spell: the header an
+    /// extension compiles against, and this file.  Upstream keeps no such
+    /// pair -- `cpyext/api.py` reads each value out of the real header with
+    /// `rffi_platform.ConstantInteger` -- so the test at the foot of this file
+    /// compares the two, walking `Flags::FLAGS` rather than a list somebody
+    /// has to remember to extend.
+    ///
+    /// The names are the header's, prefix and all: a constant here is the flag
+    /// `Py_TPFLAGS_*` names in C, at the bit C gives it.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct TpFlags: std::ffi::c_ulong {
+        const PY_TPFLAGS_DEFAULT = 0;
+        /// `_Py_TPFLAGS_STATIC_BUILTIN` is internal to CPython, so the header
+        /// an extension compiles against declares it no more than `Python.h`
+        /// does.  It is the one flag here with no header counterpart.
+        const PY_TPFLAGS_STATIC_BUILTIN = 1 << 1;
+        const PY_TPFLAGS_DISALLOW_INSTANTIATION = 1 << 7;
+        const PY_TPFLAGS_IMMUTABLETYPE = 1 << 8;
+        const PY_TPFLAGS_HEAPTYPE = 1 << 9;
+        const PY_TPFLAGS_BASETYPE = 1 << 10;
+        /// PEP 590 -- the type lends its instances a `vectorcallfunc`, stored
+        /// in each of them at `tp_vectorcall_offset`.  A type carrying the bit
+        /// is readied with `tp_call` filled and the offset positive, so the
+        /// two are read together and never apart.
+        const PY_TPFLAGS_HAVE_VECTORCALL = 1 << 11;
+        const PY_TPFLAGS_READY = 1 << 12;
+        const PY_TPFLAGS_READYING = 1 << 13;
+        const PY_TPFLAGS_HAVE_GC = 1 << 14;
+        const PY_TPFLAGS_ITEMS_AT_END = 1 << 23;
+        /// The fast-subclass flags -- `inherit_special`'s "Setup fast subclass
+        /// flags".
+        ///
+        /// A `Py*_Check` written for C is a flag test rather than a call, so a
+        /// type whose bit is clear reads as not being one.
+        const PY_TPFLAGS_LONG_SUBCLASS = 1 << 24;
+        const PY_TPFLAGS_LIST_SUBCLASS = 1 << 25;
+        const PY_TPFLAGS_TUPLE_SUBCLASS = 1 << 26;
+        const PY_TPFLAGS_BYTES_SUBCLASS = 1 << 27;
+        const PY_TPFLAGS_UNICODE_SUBCLASS = 1 << 28;
+        const PY_TPFLAGS_DICT_SUBCLASS = 1 << 29;
+        const PY_TPFLAGS_BASE_EXC_SUBCLASS = 1 << 30;
+        const PY_TPFLAGS_TYPE_SUBCLASS = 1 << 31;
+    }
+}
 
-/// The fast-subclass flags -- `inherit_special`'s "Setup fast subclass flags".
-///
-/// A `Py*_Check` written for C is a flag test rather than a call, so a type
-/// whose bit is clear reads as not being one.
-pub const PY_TPFLAGS_LONG_SUBCLASS: std::ffi::c_ulong = 1 << 24;
-pub const PY_TPFLAGS_LIST_SUBCLASS: std::ffi::c_ulong = 1 << 25;
-pub const PY_TPFLAGS_TUPLE_SUBCLASS: std::ffi::c_ulong = 1 << 26;
-pub const PY_TPFLAGS_BYTES_SUBCLASS: std::ffi::c_ulong = 1 << 27;
-pub const PY_TPFLAGS_UNICODE_SUBCLASS: std::ffi::c_ulong = 1 << 28;
-pub const PY_TPFLAGS_DICT_SUBCLASS: std::ffi::c_ulong = 1 << 29;
-pub const PY_TPFLAGS_BASE_EXC_SUBCLASS: std::ffi::c_ulong = 1 << 30;
-pub const PY_TPFLAGS_TYPE_SUBCLASS: std::ffi::c_ulong = 1 << 31;
+/// C writes `tp_flags` through its own `unsigned long` declaration, so the
+/// mirror's field has to be that word and nothing wider or narrower.
+const _: () = assert!(size_of::<TpFlags>() == size_of::<std::ffi::c_ulong>());
+const _: () = assert!(align_of::<TpFlags>() == align_of::<std::ffi::c_ulong>());
 
 /// The fast-subclass flags, in the order `inherit_special` tests them
 /// (`typeobject.py:492-509`): the first base that matches wins, so a type is
 /// only ever marked as one of these.
-const FAST_SUBCLASS_FLAGS: [(&pyre_object::pyobject::PyType, std::ffi::c_ulong); 8] = [
+const FAST_SUBCLASS_FLAGS: [(&pyre_object::pyobject::PyType, TpFlags); 8] = [
     (
         &pyre_object::interp_exceptions::EXCEPTION_TYPE,
-        PY_TPFLAGS_BASE_EXC_SUBCLASS,
+        TpFlags::PY_TPFLAGS_BASE_EXC_SUBCLASS,
     ),
-    (&pyre_object::pyobject::TYPE_TYPE, PY_TPFLAGS_TYPE_SUBCLASS),
-    (&pyre_object::pyobject::INT_TYPE, PY_TPFLAGS_LONG_SUBCLASS),
+    (
+        &pyre_object::pyobject::TYPE_TYPE,
+        TpFlags::PY_TPFLAGS_TYPE_SUBCLASS,
+    ),
+    (
+        &pyre_object::pyobject::INT_TYPE,
+        TpFlags::PY_TPFLAGS_LONG_SUBCLASS,
+    ),
     (
         &pyre_object::bytesobject::BYTES_TYPE,
-        PY_TPFLAGS_BYTES_SUBCLASS,
+        TpFlags::PY_TPFLAGS_BYTES_SUBCLASS,
     ),
     (
         &pyre_object::pyobject::STR_TYPE,
-        PY_TPFLAGS_UNICODE_SUBCLASS,
+        TpFlags::PY_TPFLAGS_UNICODE_SUBCLASS,
     ),
     (
         &pyre_object::pyobject::TUPLE_TYPE,
-        PY_TPFLAGS_TUPLE_SUBCLASS,
+        TpFlags::PY_TPFLAGS_TUPLE_SUBCLASS,
     ),
-    (&pyre_object::pyobject::LIST_TYPE, PY_TPFLAGS_LIST_SUBCLASS),
-    (&pyre_object::pyobject::DICT_TYPE, PY_TPFLAGS_DICT_SUBCLASS),
+    (
+        &pyre_object::pyobject::LIST_TYPE,
+        TpFlags::PY_TPFLAGS_LIST_SUBCLASS,
+    ),
+    (
+        &pyre_object::pyobject::DICT_TYPE,
+        TpFlags::PY_TPFLAGS_DICT_SUBCLASS,
+    ),
 ];
 
 /// Mark `tp` with the one fast-subclass flag its base chain earns it.
@@ -355,7 +392,7 @@ const fn immortal_type() -> CPyTypeObject {
         tp_getattro: std::ptr::null(),
         tp_setattro: std::ptr::null(),
         tp_as_buffer: std::ptr::null_mut(),
-        tp_flags: PY_TPFLAGS_DEFAULT,
+        tp_flags: TpFlags::PY_TPFLAGS_DEFAULT,
         tp_doc: std::ptr::null(),
         tp_traverse: std::ptr::null(),
         tp_clear: std::ptr::null(),
@@ -775,24 +812,24 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
     // this pointer valid.
     let pointer = name.as_ptr();
     let heaptype = match unsafe { pyre_object::w_type_is_cpython_heaptype(w_type) } {
-        true => PY_TPFLAGS_HEAPTYPE,
-        false => 0,
+        true => TpFlags::PY_TPFLAGS_HEAPTYPE,
+        false => TpFlags::empty(),
     };
     let static_builtin = match unsafe { pyre_object::w_type_is_cpython_static_builtin(w_type) } {
-        true => PY_TPFLAGS_STATIC_BUILTIN,
-        false => 0,
+        true => TpFlags::PY_TPFLAGS_STATIC_BUILTIN,
+        false => TpFlags::empty(),
     };
     let immutabletype = match unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
-        true => PY_TPFLAGS_IMMUTABLETYPE,
-        false => 0,
+        true => TpFlags::PY_TPFLAGS_IMMUTABLETYPE,
+        false => TpFlags::empty(),
     };
     unsafe {
         (*mirror).tp_name = pointer;
         (*mirror).tp_basicsize = mirror_basicsize(w_type);
         (*mirror).tp_itemsize = mirror_itemsize(w_type);
-        (*mirror).tp_flags = PY_TPFLAGS_DEFAULT
-            | PY_TPFLAGS_READY
-            | PY_TPFLAGS_BASETYPE
+        (*mirror).tp_flags = TpFlags::PY_TPFLAGS_DEFAULT
+            | TpFlags::PY_TPFLAGS_READY
+            | TpFlags::PY_TPFLAGS_BASETYPE
             | heaptype
             | static_builtin
             | immutabletype;
@@ -2276,7 +2313,7 @@ pub(super) fn finish_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyObje
     // written in Python, which is `object`'s own `tp_new` and nothing else.
     if unsafe { (*mirror).tp_new.is_null() } && !base.is_null() {
         let derived = !std::ptr::eq(base, &raw mut PyBaseObject_Type)
-            || unsafe { (*mirror).tp_flags } & PY_TPFLAGS_HEAPTYPE != 0;
+            || unsafe { (*mirror).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) };
         if derived {
             unsafe { (*mirror).tp_new = (*base).tp_new };
         }
@@ -2408,8 +2445,12 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         // filled by the base's `tp_new`.  `fill_interpreter_slots` runs after
         // this and installs the trampoline in `tp_call`, so the test for a
         // `tp_call` of the subclass's own has to happen here.
-        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
-            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        if (*tp).tp_call.is_null()
+            && (*base)
+                .tp_flags
+                .contains(TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
+        {
+            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_HAVE_VECTORCALL;
         }
     }
 }
@@ -2418,7 +2459,7 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
 /// the predicate `type_dealloc` and `_dealloc` both branch on
 /// (`typeobject.py:716`, `object.py:72`).
 pub(super) fn is_heap_type(tp: *mut CPyTypeObject) -> bool {
-    !tp.is_null() && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE != 0
+    !tp.is_null() && unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) }
 }
 
 /// `true` when a mirror is a `PyModuleDef` rather than a linked object.
@@ -4589,8 +4630,12 @@ fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         if (*tp).tp_vectorcall_offset == 0 {
             (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
         }
-        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
-            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        if (*tp).tp_call.is_null()
+            && (*base)
+                .tp_flags
+                .contains(TpFlags::PY_TPFLAGS_HAVE_VECTORCALL)
+        {
+            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_HAVE_VECTORCALL;
         }
     }
     macro_rules! inherit {
@@ -5169,20 +5214,20 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     // fills the rest: what the metaclass check asks is whether the extension
     // *declared* one, which the field stops answering a few lines from here.
     record_declared_tp_new(tp);
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_READY != 0 {
+    if unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_READY) } {
         return Ok(());
     }
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_READYING != 0 {
+    if unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_READYING) } {
         return Err(crate::PyError::runtime_error(
             "PyType_Ready(): circular type hierarchy",
         ));
     }
-    unsafe { (*tp).tp_flags |= PY_TPFLAGS_READYING };
+    unsafe { (*tp).tp_flags |= TpFlags::PY_TPFLAGS_READYING };
     // CPython 3.14 `PyType_Ready`: legacy non-heap extension statics are
     // immutable, but do not receive the private STATIC_BUILTIN bit reserved
     // for interpreter-core `_PyStaticType_InitBuiltin` owners.
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
-        unsafe { (*tp).tp_flags |= PY_TPFLAGS_IMMUTABLETYPE };
+    if !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
+        unsafe { (*tp).tp_flags |= TpFlags::PY_TPFLAGS_IMMUTABLETYPE };
     }
 
     let base = unsafe { (*tp).tp_base };
@@ -5206,12 +5251,16 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     // against, so the type refuses instantiation instead.  A heap type is the
     // runtime's own and does inherit, as does one derived from any other base.
     if !declares_tp_new(tp)
-        && unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0
+        && !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) }
         && base_is_object(base)
     {
-        unsafe { (*tp).tp_flags |= PY_TPFLAGS_DISALLOW_INSTANTIATION };
+        unsafe { (*tp).tp_flags |= TpFlags::PY_TPFLAGS_DISALLOW_INSTANTIATION };
     }
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_DISALLOW_INSTANTIATION != 0 {
+    if unsafe {
+        (*tp)
+            .tp_flags
+            .contains(TpFlags::PY_TPFLAGS_DISALLOW_INSTANTIATION)
+    } {
         // `inherit_slots` copies a base's `tp_new` for every slot alike, and
         // this is the one slot a type carrying the flag must not have.
         unsafe { (*tp).tp_new = std::ptr::null() };
@@ -5307,9 +5356,9 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
     unsafe {
         pyre_object::w_type_set_cpython_type_flags(
             w_type,
-            (*tp).tp_flags & PY_TPFLAGS_HEAPTYPE != 0,
+            (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE),
             false,
-            (*tp).tp_flags & PY_TPFLAGS_IMMUTABLETYPE != 0,
+            (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_IMMUTABLETYPE),
         );
     }
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5327,7 +5376,7 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         // behaviour the PyPy cpyext oracle exposes.
         pyre_object::typeobject::w_type_set_weakrefable(
             pyre_object::gc_roots::shadow_stack_get(type_slot),
-            (*tp).tp_weaklistoffset != 0 || (*tp).tp_flags & PY_TPFLAGS_HEAPTYPE != 0,
+            (*tp).tp_weaklistoffset != 0 || (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE),
         );
         // `type_call`'s own test, which is the slot rather than the flag: a
         // subtype of a type that carries the flag inherits the empty slot
@@ -5383,7 +5432,8 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         let metatype = pyobject::type_mirror(pyre_object::gc_roots::shadow_stack_get(type_slot));
         (*tp).ob_base.ob_base.ob_type = metatype;
         pyobject::own_heap_type(metatype);
-        (*tp).tp_flags = ((*tp).tp_flags & !PY_TPFLAGS_READYING) | PY_TPFLAGS_READY;
+        (*tp).tp_flags =
+            ((*tp).tp_flags & !TpFlags::PY_TPFLAGS_READYING) | TpFlags::PY_TPFLAGS_READY;
     }
     set_fast_subclass_flags(tp, pyre_object::gc_roots::shadow_stack_get(type_slot));
     Ok(())
@@ -5533,7 +5583,7 @@ pub unsafe extern "C" fn PyType_Ready(tp: *mut CPyTypeObject) -> c_int {
         Ok(()) => 0,
         Err(error) => {
             if !tp.is_null() {
-                unsafe { (*tp).tp_flags &= !PY_TPFLAGS_READYING };
+                unsafe { (*tp).tp_flags &= !TpFlags::PY_TPFLAGS_READYING };
             }
             super::pyerrors::set_pending_error(error);
             -1
@@ -5995,7 +6045,8 @@ fn from_spec(
     unsafe {
         (*tp).tp_name = (*spec).name;
         (*tp).tp_itemsize = (*spec).itemsize as isize;
-        (*tp).tp_flags = (*spec).flags as std::ffi::c_ulong | PY_TPFLAGS_HEAPTYPE;
+        (*tp).tp_flags = TpFlags::from_bits_retain((*spec).flags as std::ffi::c_ulong)
+            | TpFlags::PY_TPFLAGS_HEAPTYPE;
         (*tp).tp_base = single_base(pyobject::from_ref(bases))?;
     }
     let mut token: *mut c_void = std::ptr::null_mut();
@@ -6516,7 +6567,7 @@ pub unsafe extern "C" fn PyType_GetFlags(tp: *mut CPyTypeObject) -> std::ffi::c_
     if tp.is_null() {
         return 0;
     }
-    unsafe { (*tp).tp_flags }
+    unsafe { (*tp).tp_flags }.bits()
 }
 
 // ── what a type reports about its module, its token and its data ────────
@@ -6552,7 +6603,7 @@ pub unsafe extern "C" fn PyType_GetModule(tp: *mut CPyTypeObject) -> *mut CPyObj
         unsafe { super::pyerrors::PyErr_BadInternalCall() };
         return std::ptr::null_mut();
     }
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+    if !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
         super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
             "PyType_GetModule: Type '{}' is not a heap type",
             type_name_of(tp)
@@ -6626,7 +6677,7 @@ pub unsafe extern "C" fn PyType_GetBaseByToken(
         return -1;
     }
     // A static type has no heap-type superclass, so the walk cannot find one.
-    if unsafe { (*tp).tp_flags } & PY_TPFLAGS_HEAPTYPE == 0 {
+    if !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_HEAPTYPE) } {
         return 0;
     }
     let wanted = token as usize;
@@ -6689,7 +6740,7 @@ pub unsafe extern "C" fn PyObject_GetItemData(object: *mut CPyObject) -> *mut c_
         return std::ptr::null_mut();
     }
     let tp = unsafe { (*object).ob_type };
-    if tp.is_null() || unsafe { (*tp).tp_flags } & PY_TPFLAGS_ITEMS_AT_END == 0 {
+    if tp.is_null() || !unsafe { (*tp).tp_flags.contains(TpFlags::PY_TPFLAGS_ITEMS_AT_END) } {
         super::pyerrors::set_pending_error(crate::PyError::type_error(format!(
             "type '{}' does not have Py_TPFLAGS_ITEMS_AT_END",
             type_name_of(tp)
@@ -6757,7 +6808,7 @@ pub unsafe extern "C" fn PyType_Freeze(tp: *mut CPyTypeObject) -> c_int {
         // Freezing changes CPython's immutable axis but not its HEAPTYPE owner.
         pyre_object::w_type_set_cpython_immutabletype(w_type, true);
         if !tp.is_null() {
-            (*tp).tp_flags |= PY_TPFLAGS_IMMUTABLETYPE;
+            (*tp).tp_flags |= TpFlags::PY_TPFLAGS_IMMUTABLETYPE;
         }
         crate::baseobjspace::mutated(w_type, None);
     }
@@ -7098,6 +7149,89 @@ mod tests {
             super::slot_id::ALL.len(),
             "the header defines {checked} slot identifiers and slot_id has {}",
             super::slot_id::ALL.len()
+        );
+    }
+
+    /// `tp_flags` is one word two places spell: an extension compiled against
+    /// `include/pyre3.14t/object.h` puts bits into it, and this file tests
+    /// them.  Nothing ties the two together -- upstream has no such pair,
+    /// because `api.py` reads each value out of the real header with
+    /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
+    /// any flag whose bit the Rust side spells differently.
+    ///
+    /// `TpFlags::FLAGS` is what makes the walk complete: it carries every
+    /// constant the `bitflags!` block declares, so a flag added there is
+    /// compared here without anyone remembering to list it.
+    #[test]
+    fn every_tp_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        // `(1UL << N)`, and the bare `0UL` that `DEFAULT` and the Stackless
+        // extension carry.  A composite body names other flags rather than a
+        // number -- `Py_TPFLAGS_PREHEADER` is the only one -- and is skipped.
+        let mut header: Vec<(&str, std::ffi::c_ulong)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define Py_TPFLAGS_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let value = if let Some(shift) = body
+                .strip_prefix("(1UL <<")
+                .and_then(|body| body.strip_suffix(')'))
+            {
+                let Ok(bit) = shift.trim().parse::<u32>() else {
+                    continue;
+                };
+                1 << bit
+            } else if let Some(digits) = body.strip_suffix("UL") {
+                let Ok(value) = digits.parse::<std::ffi::c_ulong>() else {
+                    continue;
+                };
+                value
+            } else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        // A parser that read nothing would agree with every flag below, so the
+        // floor comes first.  The header carries 29 flags a number can be read
+        // off; the bound is loose enough to survive one being added.
+        assert!(
+            header.len() >= 25,
+            "object.h declares more type flags than the {} this read",
+            header.len()
+        );
+
+        let mut checked = 0;
+        for flag in super::TpFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("PY_TPFLAGS_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let Some((_, theirs)) = header.iter().find(|(known, _)| *known == name) else {
+                assert_eq!(
+                    name, "STATIC_BUILTIN",
+                    "object.h declares no Py_TPFLAGS_{name}"
+                );
+                continue;
+            };
+            assert_eq!(
+                ours, *theirs,
+                "Py_TPFLAGS_{name} is {theirs:#x} in object.h and {ours:#x} here"
+            );
+            checked += 1;
+        }
+
+        assert_eq!(
+            checked,
+            super::TpFlags::FLAGS.len() - 1,
+            "every flag but STATIC_BUILTIN has a header counterpart"
         );
     }
 }

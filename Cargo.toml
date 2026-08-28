@@ -113,6 +113,7 @@ malachite-bigint = "0.11"
 num-traits = "0.2"
 num-integer = "0.1"
 bit-set = "0.10"
+bitflags = "2"
 vecset = "0.0.4"
 vecmap_rs = { package = "vecmap-rs", version = "0.2.4", features = ["serde"] }
 indexmap = { version = "2.14", features = ["serde"] }
