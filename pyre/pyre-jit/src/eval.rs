@@ -997,16 +997,14 @@ unsafe fn queue_simplequeue_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     unsafe { pyre_interpreter::module::_queue::w_simplequeue_custom_trace(obj_addr, f) };
 }
 
-/// `_ssl._SSLSocket` owns its context, transport endpoints, cached unbound
-/// socket methods, public owner, and hostname directly on the typed object.
+/// `_ssl._SSLSocket` owns its context, transport endpoints, public owner,
+/// and hostname directly on the typed object.
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 unsafe fn ssl_socket_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let socket = unsafe { &mut *(obj_addr as *mut pyre_interpreter::module::_ssl::W_SSLSocket) };
     f(std::ptr::addr_of_mut!(socket.ob.w_class) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.context) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.socket) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.socket_send) as *mut majit_ir::GcRef);
-    f(std::ptr::addr_of_mut!(socket.socket_recv) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.incoming) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.outgoing) as *mut majit_ir::GcRef);
     f(std::ptr::addr_of_mut!(socket.owner) as *mut majit_ir::GcRef);
