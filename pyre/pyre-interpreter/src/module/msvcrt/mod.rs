@@ -101,5 +101,12 @@ crate::py_module! {
         fn GetErrorMode() -> u32 {
             host_msvcrt::get_error_mode()
         }
+    },
+    extra_init: |ns| {
+        // The C runtime assembly version the build's own toolset named; the
+        // build script leaves it unset when no toolset header answered.
+        if let Some(version) = option_env!("PYRE_CRT_ASSEMBLY_VERSION") {
+            crate::module_ns_store(ns, "CRT_ASSEMBLY_VERSION", pyre_object::w_str_new(version));
+        }
     }
 }
