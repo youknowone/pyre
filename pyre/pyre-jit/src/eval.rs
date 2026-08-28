@@ -7662,6 +7662,12 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             | I::ContainsOp { .. }
             // string formatting: produces immutable strings
             | I::FormatSimple
+            // `f"{v:spec}"`. `codewriter.rs` lowers it to one
+            // `format_with_spec` MayForce residual over (value, spec) that
+            // pushes a fresh string -- the `FormatSimple` arm with a second
+            // operand. A user `__format__` may run Python, exactly as a user
+            // `__str__` may under the `ConvertValue` below it.
+            | I::FormatWithSpec
             | I::ConvertValue { .. }
             | I::BuildString { .. }
             // misc read-only: len(), iterator cleanup, local delete,
