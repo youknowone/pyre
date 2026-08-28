@@ -1030,6 +1030,30 @@ fn adopt_seeded_dispatch(
 /// hands over that shape; only one that mints the dispatch body at run time
 /// (`JitCodeBuilder`, the `#[jit_interp]` route) has an unnumbered portal to
 /// append.
+/// The registry for a dispatch jitcode the seed already numbers, or `None` when
+/// it carries no index and has to be appended instead.
+///
+/// Split out because it reads the dispatch and never takes it: a consumer whose
+/// table is a build artefact holds every body behind an `Arc` and has no owned
+/// copy to give, and the arm it needs is exactly this one.
+fn build_seeded_jitcode_registry(
+    seed: &[std::sync::Arc<crate::jitcode::JitCode>],
+    dispatch: &crate::jitcode::JitCode,
+) -> Option<(
+    Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    std::sync::Arc<crate::jitcode::JitCode>,
+)> {
+    let index = dispatch.try_index()?;
+    let registry = seed.to_vec();
+    // The seed's own `Arc`, never the caller's copy: `codewriter.py:80
+    // all_jitcodes[jitcode.index] is jitcode` is the identity every `j` operand
+    // at `index` resolves through, and the driver's `mainjitcode` has to be that
+    // same object. Nothing is appended, so the registry is the seed — which the
+    // build-time table already numbered end to end.
+    let seeded = adopt_seeded_dispatch(&registry, index, dispatch);
+    Some((registry, seeded))
+}
+
 fn build_jitcode_registry(
     seed: &[std::sync::Arc<crate::jitcode::JitCode>],
     dispatch: crate::jitcode::JitCode,
@@ -1037,16 +1061,10 @@ fn build_jitcode_registry(
     Vec<std::sync::Arc<crate::jitcode::JitCode>>,
     std::sync::Arc<crate::jitcode::JitCode>,
 ) {
-    let mut registry = seed.to_vec();
-    if let Some(index) = dispatch.try_index() {
-        // The seed's own `Arc`, never the caller's copy: `codewriter.py:80
-        // all_jitcodes[jitcode.index] is jitcode` is the identity every `j`
-        // operand at `index` resolves through, and the driver's `mainjitcode`
-        // has to be that same object. Nothing is appended, so the registry is
-        // the seed — which the build-time table already numbered end to end.
-        let seeded = adopt_seeded_dispatch(&registry, index, &dispatch);
-        return (registry, seeded);
+    if let Some(seeded) = build_seeded_jitcode_registry(seed, &dispatch) {
+        return seeded;
     }
+    let mut registry = seed.to_vec();
     let dispatch_position = registry.len();
     dispatch.set_index(dispatch_position);
     let dispatch_arc = std::sync::Arc::new(dispatch);
@@ -2096,6 +2114,46 @@ impl<S: JitState> JitDriver<S> {
         validate_dispatch_jitcode_payload(self, &jitcode);
         let (registry, dispatch_arc) =
             build_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode);
+        self.adopt_dispatch_registry(registry, dispatch_arc);
+    }
+
+    /// Register a dispatch JitCode the build-time table already holds.
+    ///
+    /// Same registration as [`Self::register_dispatch_jitcode`], for the other
+    /// shape of consumer: one whose jitcodes are a build artefact published
+    /// behind `Arc`, with no owned copy to hand over. Without this door such a
+    /// consumer can only reach [`crate::pyjitpl::MetaInterp::install_jitcodes`],
+    /// which publishes the table and nothing else — no `BC_JIT_MERGE_POINT`
+    /// payload cross-check against the declared schema, and neither half of the
+    /// `call.py grab_initial_jitcodes` back-pointer, so `is_main_jitcode` is
+    /// false for the portal and a blackhole chain walks off its bottom.
+    ///
+    /// The jitcode must already name its index, which a build-time table
+    /// assigns to every entry; an unnumbered one has to be appended, and
+    /// appending needs ownership.
+    pub fn register_dispatch_jitcode_shared(
+        &mut self,
+        jitcode: &std::sync::Arc<crate::jitcode::JitCode>,
+    ) {
+        validate_dispatch_jitcode_payload(self, jitcode);
+        let (registry, dispatch_arc) =
+            build_seeded_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "register_dispatch_jitcode_shared: dispatch JitCode {:?} names no index,                          so it is not one the build-time table numbered; a jitcode that has to be                          appended must be passed by value through `register_dispatch_jitcode`",
+                        jitcode.name(),
+                    )
+                });
+        self.adopt_dispatch_registry(registry, dispatch_arc);
+    }
+
+    /// The registration both doors share, once the registry and the portal's
+    /// own `Arc` have been decided.
+    fn adopt_dispatch_registry(
+        &mut self,
+        registry: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+        dispatch_arc: std::sync::Arc<crate::jitcode::JitCode>,
+    ) {
         // call.py `grab_initial_jitcodes`:
         //
         //     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
@@ -11079,6 +11137,33 @@ mod jitcode_registry_tests {
     use super::*;
     use crate::jitcode::{JitCode, RuntimeBhDescr};
     use std::sync::Arc;
+
+    /// The arm a consumer holding only an `Arc` reaches through
+    /// `register_dispatch_jitcode_shared`.
+    ///
+    /// It has to answer for a dispatch it never takes: the seeded case returns
+    /// the seed's own entry, and the unnumbered case declines rather than
+    /// inventing a position, because appending needs an owned value.
+    #[test]
+    fn the_seeded_registry_arm_reads_a_dispatch_it_does_not_take() {
+        let seed = vec![jitcode("other", Some(0)), jitcode("dispatch", Some(1))];
+        let shared = Arc::clone(&seed[1]);
+
+        let (registry, adopted) = build_seeded_jitcode_registry(&seed, &shared)
+            .expect("a dispatch the seed numbers is adopted from the seed");
+        assert_eq!(registry.len(), seed.len(), "nothing is appended");
+        assert!(
+            Arc::ptr_eq(&adopted, &seed[1]),
+            "the adopted portal is the seed's own entry, which is the identity \
+             every `j` operand at that index resolves through",
+        );
+
+        let unnumbered = jitcode("runtime_built", None);
+        assert!(
+            build_seeded_jitcode_registry(&seed, &unnumbered).is_none(),
+            "a jitcode carrying no index has to be appended, and appending needs ownership",
+        );
+    }
 
     /// A jitcode with a committed body, optionally already numbered the way a
     /// build-time table numbers its entries.
