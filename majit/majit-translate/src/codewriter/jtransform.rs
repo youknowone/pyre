@@ -8968,6 +8968,95 @@ mod tests {
         );
     }
 
+    /// `s1 + s2` over two Ref operands, as one graph, for the two tests below.
+    fn str_concat_graph() -> FunctionGraph {
+        let mut graph = FunctionGraph::new("str_concat");
+        let lhs = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+        graph
+    }
+
+    /// The concat callee is supplied by the embedding pipeline on the same
+    /// terms as the integer-render helper above.
+    #[test]
+    fn a_named_str_concat_helper_is_the_call_target() {
+        let graph = str_concat_graph();
+        let config = GraphTransformConfig {
+            str_concat_helper: "grain_concat".to_string(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 5, "Input + Input + fnptr + call + Live");
+        let expected =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["grain_concat"]));
+        assert!(
+            matches!(&ops[2].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected),
+            "the fnptr names the configured helper, not this layer's default",
+        );
+    }
+
+    /// An unnamed concat helper declines the rewrite, matching the integer
+    /// helper's empty-name contract.
+    #[test]
+    fn an_unnamed_str_concat_helper_leaves_the_op_alone() {
+        let graph = str_concat_graph();
+        let config = GraphTransformConfig {
+            str_concat_helper: String::new(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "no helper is named, so nothing is called: {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op: name, .. } if name == "add"
+            )),
+            "the op survives for whatever lowers it next: {ops:?}",
+        );
+    }
+
     #[test]
     fn transform_graph_tags_vable_fields() {
         let mut graph = FunctionGraph::new("test");
