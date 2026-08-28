@@ -10224,15 +10224,44 @@ pub(crate) fn try_walker_specialize_builtin_zip<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Unrolling bound for [`try_walker_specialize_builtin_locals`].
+/// Ops the modelled `fast2locals` expansion records per bound slot.
 ///
-/// The modelled expansion is a straight-line unroll of `fast2locals`' slot
-/// loop, one guard plus at most one store per fastlocal.  Upstream bounds the
-/// same unroll by `@jit.unroll_safe` on a loop whose trip count is the code
-/// object's `numlocals`; the explicit ceiling here keeps a pathologically
-/// wide frame from turning one `locals()` into hundreds of trace ops.  Over
-/// the bound the fold declines and the generic residual runs (SAFE).
-const MAX_MODELLED_FASTLOCALS: usize = 32;
+/// The unroll emits at most one guard and one store for each of them, so this
+/// is what [`locals_expansion_fits_trace_limit`] multiplies by to say how far
+/// one `locals()` opcode can take the history.
+const OPS_PER_MODELLED_SLOT: usize = 2;
+
+/// Whether an expansion over `nslots` slots still fits inside `trace_limit`.
+///
+/// `pyjitpl.py` `MetaInterp._interpret` asks `history.length() > trace_limit`
+/// after every jitcode step, so the `fast2locals` it looks into is interrupted
+/// between its own steps and the overshoot is one jitcode wide.  Both arms
+/// here emit the whole unroll inside ONE Python opcode step, and the walk asks
+/// that question only once the step returns (`mod.rs`), so an expansion that
+/// does not ask it overshoots by the frame's own `co_nlocals` with nothing
+/// bounding it.
+///
+/// Asking it here leaves the bound where upstream leaves it -- `trace_limit`,
+/// not a constant.  A frame is never refused for being wide; it is refused for
+/// not fitting in what is left, which is the same question asked at the
+/// granularity this fold records at.
+fn locals_expansion_fits_trace_limit<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    nslots: usize,
+) -> bool {
+    locals_expansion_fits(
+        ctx.trace_ctx.num_recorded_ops(),
+        ctx.trace_ctx.trace_limit(),
+        nslots,
+    )
+}
+
+/// The arithmetic [`locals_expansion_fits_trace_limit`] asks, apart from the
+/// walk it reads the two counts off.  Both additions saturate: the answer for
+/// a width no history could hold is "no", not a wrap into "yes".
+pub(super) fn locals_expansion_fits(recorded: usize, limit: usize, nslots: usize) -> bool {
+    recorded.saturating_add(nslots.saturating_mul(OPS_PER_MODELLED_SLOT)) <= limit
+}
 
 /// Which builtin [`try_walker_specialize_builtin_locals`] is standing in for.
 ///
@@ -10312,9 +10341,9 @@ enum FrameLocalsBuiltin {
 /// a bound receiver, any argument, a frame that is not the
 /// standard virtualizable the boxes describe, a hidden top frame, a
 /// non-OPTIMIZED (module / class / exec) frame, cellvars / freevars /
-/// `CO_FAST_HIDDEN` slots, a slot the shadow cannot answer with a Ref, a frame
-/// wider than [`MAX_MODELLED_FASTLOCALS`], a shadow whose mapping is not the
-/// frame's, and a frame-owned mapping that is not an exact dict.
+/// `CO_FAST_HIDDEN` slots, a slot the shadow cannot answer with a Ref, a
+/// shadow whose mapping is not the frame's, and a frame-owned mapping that is
+/// not an exact dict.
 pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -10396,7 +10425,13 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         return Ok(None);
     }
     let numlocals = code_obj.varnames.len();
-    if numlocals > MAX_MODELLED_FASTLOCALS {
+    // Width is not the question; fitting is.  `pyframe.py`
+    // `PyFrame.fast2locals` carries `@jit.unroll_safe` and no ceiling, and the
+    // size question is `trace_limit`'s.  A fixed ceiling of 32 slots asked a
+    // different one, so a frame answered `locals()` from a residual because of
+    // its own local count while a trace many times longer was recorded beside
+    // it.
+    if !locals_expansion_fits_trace_limit(ctx, numlocals) {
         return Ok(None);
     }
     // `locals_cells_stack_w` is PyFrame's only virtualizable array
@@ -10860,10 +10895,24 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
 /// would collapse to the caller's CALL boundary, a level with no shadow, an
 /// inactive strict fold or unseeded frame register, a top frame that is not
 /// this level's own, a shadow describing another code object, a non-OPTIMIZED
-/// frame, cellvars / freevars / `CO_FAST_HIDDEN` slots, a frame wider than
-/// [`MAX_MODELLED_FASTLOCALS`], a frame that already carries a locals mapping
-/// or an `f_extra_locals` dict, and a written slot the shadow cannot resolve
-/// back to a Ref.
+/// frame, cellvars / freevars / `CO_FAST_HIDDEN` slots, a frame that already
+/// carries a locals mapping or an `f_extra_locals` dict, and a written slot
+/// the shadow cannot resolve back to a Ref.  `PYRE_FBW_DEBUG_ABORT` names
+/// which of them declined.
+/// What [`try_walker_specialize_builtin_locals_in_callee_expand`] did.
+enum CalleeLocalsExpansion {
+    /// The mapping was emitted and the opcode is done.
+    Expanded,
+    /// The expansion models no part of this shape.  Answered by refusing the
+    /// callee, because the residual this would otherwise fall through to
+    /// escapes the level's vable and costs the enclosing loop.
+    DeclinedShape,
+    /// The expansion would not fit in what is left of `trace_limit`.  That is
+    /// a property of the trace so far and not of this body, so it is answered
+    /// by falling through rather than by remembering a refusal.
+    DeclinedBudget,
+}
+
 fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -10872,7 +10921,7 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     concrete_callable: pyre_object::PyObjectRef,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if let Some(done) = try_walker_specialize_builtin_locals_in_callee_expand(
+    match try_walker_specialize_builtin_locals_in_callee_expand(
         ctx,
         op,
         fold,
@@ -10880,7 +10929,14 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
         concrete_callable,
         dst,
     )? {
-        return Ok(Some(done));
+        CalleeLocalsExpansion::Expanded => return Ok(Some(())),
+        // Falling through here costs the enclosing loop the same way the
+        // refusal below is written to avoid, and that is the right price: a
+        // walk with no room left for this expansion has none for the rest of
+        // the iteration either, and `trace_limit` is about to end it anyway.
+        // What must not happen is the callee carrying the blame afterwards.
+        CalleeLocalsExpansion::DeclinedBudget => return Ok(None),
+        CalleeLocalsExpansion::DeclinedShape => {}
     }
     // The expansion declined, so this level is about to run the opaque
     // residual -- and that residual's `force_frame_before_locals_read` clears
@@ -10896,9 +10952,25 @@ fn try_walker_specialize_builtin_locals_in_callee<Sym: WalkSym>(
     // never been admitted, and the escape never happens: same answer, one
     // decline instead of an abort.  What reaches this line is a shape the
     // expansion models no part of -- a non-OPTIMIZED frame, a `CO_FAST_HIDDEN`
-    // slot, more slots than `MAX_MODELLED_FASTLOCALS`, a frame already
-    // carrying an `f_locals` mapping, or a slot whose value this walk never
-    // saw -- and for all of those the refusal is the whole answer.
+    // slot, a frame already carrying an `f_locals` mapping or an
+    // `f_extra_locals` dict, or a slot whose value this walk never saw.  Each
+    // of those is named under `PYRE_FBW_DEBUG_ABORT`, because the refusal is
+    // not the answer: it stands in for an expansion that does not model the
+    // shape yet, and widening the expansion until this line is unreachable is
+    // the convergence path.
+    //
+    // It is unreachable today.  Measured 2026-08-29 on release dynasm over the
+    // 504 `bench/synth` fixtures, all of which exit 0: not one `[decline-why]
+    // LOCALS-IN-CALLEE` line anywhere, so no shape in the corpus reaches this
+    // refusal.  Before the width gate came off, `locals_in_wide_inlined_callee`
+    // reported the single line `nslots-over-cap nslots=42 name=wide`; that was
+    // the only one the corpus produced, and no other gate has ever been
+    // observed to fire.  The budget refusal above is deliberately not one of
+    // them: it does not reach this line at all.  Each gate below now records why it does not: the
+    // non-OPTIMIZED refusal is the answer rather than a gap, its
+    // `CO_FAST_HIDDEN` half is a bit this compiler never sets, and the two
+    // frame-payload gates sit behind writers that need a reference to the
+    // level's own live frame.
     if let Some(callee) = super::fbw_state::fbw_innermost_inline_callee_key(ctx) {
         return Err(super::fbw_state::fbw_decline_inline_callee(
             ctx,
@@ -10954,22 +11026,40 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     r_args: &[OpRef],
     concrete_callable: pyre_object::PyObjectRef,
     dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<CalleeLocalsExpansion, DispatchError> {
+    /// Name the gate that declined.  Unlike the portal arm's decline, which
+    /// falls through to the generic residual, this one costs the caller its
+    /// whole inlined callee, so "the expansion models no part of this shape"
+    /// has to be attributable to one gate rather than re-derived by reading.
+    macro_rules! decline {
+        ($why:literal) => {{
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LOCALS-IN-CALLEE {}", $why);
+            }
+            return Ok(CalleeLocalsExpansion::DeclinedShape);
+        }};
+        ($why:literal, $($arg:tt)*) => {{
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LOCALS-IN-CALLEE {}", format!($why, $($arg)*));
+            }
+            return Ok(CalleeLocalsExpansion::DeclinedShape);
+        }};
+    }
     // Under a single-frame collapse the resume re-executes the whole call, so
     // a guard emitted here re-runs every side effect the inline region already
     // sequenced.  Same gate the other folds that run under a sub-walk take.
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
-        return Ok(None);
+        decline!("subwalk-no-callee-resume");
     }
     let (fold_frame_reg, shadow_code_ptr) = {
         let Some(shadow) = ctx.callee_shadow.as_ref() else {
-            return Ok(None);
+            decline!("no-callee-shadow");
         };
         // `u16::MAX` is the strict fresh-frame fold switched off, and a
         // `NONE` frame box is a frame register that was never seeded — in
         // neither case is the shadow the authority for this level's slots.
         if shadow.fold_frame_reg == u16::MAX || shadow.frame_box.is_none() {
-            return Ok(None);
+            decline!("unseeded-frame-register");
         }
         (shadow.fold_frame_reg, shadow.code_ptr)
     };
@@ -10983,22 +11073,30 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     let inline_frame = current_inline_concrete_frame();
     let ec = pyre_interpreter::call::getexecutioncontext();
     if inline_frame == 0 || ec.is_null() {
-        return Ok(None);
+        decline!("no-inline-frame-or-ec");
     }
     let frame = unsafe { (*ec).gettopframe_nohidden() };
     if frame.is_null() || frame as usize != inline_frame {
-        return Ok(None);
+        decline!("top-frame-not-this-level");
     }
     let frame_ref = unsafe { &*frame };
     let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(frame_ref) };
     // The shadow's slots index the code object it was opened for; a
     // disagreement means the map does not describe this frame's fastlocals.
     if code_ptr.is_null() || !std::ptr::eq(code_ptr, shadow_code_ptr) {
-        return Ok(None);
+        decline!("shadow-names-other-code");
     }
     let code_obj = unsafe { &*code_ptr };
+    // Two conditions, and only the first can fire.  A non-OPTIMIZED frame
+    // answers `locals()` from `PyFrame::getdictscope` — its LIVE namespace,
+    // not the independent copy this arm builds — so declining is the answer
+    // rather than a gap.  The `CO_FAST_HIDDEN` half is inert: `pycode.rs`
+    // builds `localspluskinds` out of `CO_FAST_LOCAL` and `CO_FAST_CELL`
+    // alone, so nothing this compiler produces carries the bit, and
+    // `PyFrame::fast2locals` skips such a slot only on a frame this arm has
+    // already refused.
     if !pyre_interpreter::PyFrame::code_locals_are_modelled_fastlocals(code_obj) {
-        return Ok(None);
+        decline!("not-modelled-fastlocals");
     }
     let numlocals = code_obj.varnames.len();
     // The pure cellvars and the freevars occupy the slots above `varnames` in
@@ -11007,16 +11105,38 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     // named by `varnames` and is only a CELL there, which the per-slot kind
     // below picks up.
     let nslots = numlocals + pyre_interpreter::PyFrame::cell_slot_names(code_obj).count();
-    if nslots > MAX_MODELLED_FASTLOCALS {
-        return Ok(None);
+    // No width ceiling here, and none on the portal arm either: upstream
+    // bounds this unroll with `@jit.unroll_safe` on `pyframe.py`
+    // `PyFrame.fast2locals` and nothing else, and leaves the length question
+    // to `trace_limit`.  What made the ceiling worth removing HERE first is
+    // the price of the refusal: the portal arm's decline falls through to the
+    // generic residual, while a decline on this arm denies the callee for the
+    // rest of the thread's tracing, so the ceiling decided inlinability from a
+    // callee's local count.
+    //
+    // The budget answer keeps that price off the callee.  Not fitting is a
+    // property of the trace so far, not of this body -- the same callee fits
+    // in a shorter one -- so it is reported apart from the shape declines and
+    // the caller falls through instead of remembering a refusal.
+    if !locals_expansion_fits_trace_limit(ctx, nslots) {
+        return Ok(CalleeLocalsExpansion::DeclinedBudget);
     }
+
     // Fresh mapping only.  A frame that already carries one — an `f_locals`
     // write (PEP 667), a `setdictscope` — is the portal arm's frame-owned
     // shape, whose rewrite has to reach the frame's own dict across calls;
     // this level's frame is rebuilt from scratch by the compiled trace when it
     // is built at all, so that shape has no counterpart here and declines.
+    //
+    // Never observed to fire, and the reason is structural: this arm has
+    // already required an OPTIMIZED frame, and on one of those `w_locals` has
+    // no writer the answer can follow.  `bind_unoptimized_locals_scope`
+    // returns before binding it, `PyFrame::fget_getdictscope` hands an
+    // optimized frame a `FrameLocalsProxy` rather than calling
+    // `getdictscope`, and the line-tracing call to `fast2locals` is guarded on
+    // `w_locals` being non-null already, so it cannot be the first setter.
     if !frame_ref.get_w_locals().is_null() {
-        return Ok(None);
+        decline!("frame-has-w-locals");
     }
     // A null `w_locals` is NOT on its own a fresh mapping.  A proxy write
     // whose key names no writable fast local goes to `f_extra_locals`
@@ -11026,8 +11146,16 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     // key.  Read the LIVE callee frame, which is the only holder: this level's
     // frame is built by the compiled trace, so its payload starts empty every
     // iteration and only a residual on the recorded path can have filled it.
+    //
+    // Never observed to fire either, and an earlier gate is why.  The one
+    // writer is `FrameLocalsProxy::setitem_value`, so filling the dict takes a
+    // reference to this level's own live frame, and that write calls
+    // `force_locals` before it stores.  `locals_proxy_extra_key_hot` drives
+    // exactly that shape one frame in and reports no decline at all: the
+    // expansion is not reached there, because the callee is no longer an
+    // un-escaped inline level by the time `locals()` is recorded.
     if !frame_ref.get_extra_locals().is_null() {
-        return Ok(None);
+        decline!("frame-has-extra-locals");
     }
     // Collect each slot's shadow entry first, so a slot the shadow cannot
     // answer declines from a clean trace position and nothing is emitted.
@@ -11039,7 +11167,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     let mut slot_oprefs: Vec<Option<OpRef>> = Vec::with_capacity(nslots);
     {
         let Some(shadow) = ctx.callee_shadow.as_ref() else {
-            return Ok(None);
+            decline!("shadow-vanished");
         };
         for slot in 0..nslots as i64 {
             match (shadow.opref.get(&slot).copied(), shadow.concrete.get(&slot)) {
@@ -11053,7 +11181,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
                 // absence here means the walk never READ it, not that the name
                 // is unbound.  There is no SSA value to bind and guessing
                 // "unbound" would drop a live name, so decline.
-                (None, None) if is_cell_slot(slot as usize) => return Ok(None),
+                (None, None) if is_cell_slot(slot as usize) => decline!("cell-slot-unread"),
                 (None, None) => slot_oprefs.push(None),
                 // Only an entry recorded through THIS level's frame register
                 // describes this frame — the same per-frame isolation the
@@ -11063,7 +11191,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
                 }
                 // Written with no reconstructable concrete half, or through
                 // another frame's register: decline rather than guess.
-                _ => return Ok(None),
+                _ => decline!("slot-not-this-frame"),
             }
         }
     }
@@ -11083,10 +11211,10 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         // the table is the GC-forwarded channel, so a Ref that moved across an
         // earlier residual is current there.
         let Some(majit_ir::Value::Ref(gcref)) = ctx.trace_ctx.concrete_of_opref(slot_op) else {
-            return Ok(None);
+            decline!("slot-concrete-not-ref");
         };
         if gcref == majit_ir::GcRef::NO_CONCRETE {
-            return Ok(None);
+            decline!("slot-no-concrete");
         }
         let held = gcref.as_usize() as pyre_object::PyObjectRef;
         let cell = is_cell_slot(index);
@@ -11096,7 +11224,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
             // `MAKE_CELL` / `COPY_FREE_VARS` prologue, and modelling it would
             // need a second arm with its own guard, so decline instead.
             if held.is_null() || !unsafe { pyre_object::is_cell(held) } {
-                return Ok(None);
+                decline!("cell-slot-not-a-cell");
             }
         }
         let value = if cell {
@@ -11109,7 +11237,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
             // so it binds no key for it — but only a NULL the trace holds as a
             // constant is unbound on every execution of the compiled path.
             if !slot_op.is_constant() {
-                return Ok(None);
+                decline!("unbound-slot-not-constant");
             }
             continue;
         }
@@ -11183,9 +11311,9 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     };
     // A slot rewrite or the tail reports a failure as PY_NULL instead of
     // publishing it; nothing has been emitted yet, so decline and let the
-    // residual raise.
+    // caller record the plain call, which raises the same way.
     if concrete_result.is_null() {
-        return Ok(None);
+        decline!("concrete-result-null");
     }
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
@@ -11315,7 +11443,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         None => dict_op,
     };
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result_op)?;
-    Ok(Some(()))
+    Ok(CalleeLocalsExpansion::Expanded)
 }
 
 /// `sys._getframe()` / `sys._getframe(0)` at the top walk level: publish the

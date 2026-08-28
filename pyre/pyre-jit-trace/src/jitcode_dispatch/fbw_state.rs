@@ -2235,8 +2235,32 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
 /// Denying is what stops the decline being a property of the framestack, which
 /// the next attempt rebuilds identically: without it the abort recurs
 /// byte-for-byte until the enclosing location is retired, so the loop never
-/// compiles at all.  Upstream answers the same situation by denying the callee
-/// and letting the enclosing loop retrace (`pyjitpl.py` `MetaInterp.blackhole_if_trace_too_long`).
+/// compiles at all.
+///
+/// The trigger has no upstream counterpart, and the citation this used to
+/// carry named a different question.  `disable_noninlinable_function`
+/// (`warmstate.py` `WarmEnterState.disable_noninlinable_function`) has exactly
+/// one caller, `pyjitpl.py` `MetaInterp.blackhole_if_trace_too_long`, and that
+/// one asks a SIZE question — `history.length() > trace_limit`, or
+/// `trace_tag_overflow()` — and then denies the greenkey
+/// `MetaInterp.find_biggest_function` names, which need not be the callee at
+/// hand.  A vable escape denies nothing: `MetaInterp.vable_after_residual_call`
+/// raises `SwitchToBlackhole(ABORT_ESCAPE, raising_exception=True)` and
+/// `MetaInterp.run_blackhole_interp_to_cancel_tracing` hands that to
+/// `blackhole.py` `convert_and_run_from_pyjitpl`, which carries the frame
+/// FORWARD.  Reaching the upstream API from this trigger is therefore an
+/// extension of it, not a port of it.
+///
+/// For the caller that refuses at a declined `locals()` expansion, the reason
+/// upstream never arrives here is that the escape does not happen:
+/// `pyframe.py` `PyFrame.fast2locals` is `@jit.unroll_safe`, so the tracer
+/// descends into it rather than leaving a residual, and inside a graph it
+/// looks into, `jtransform.py` `Transformer.rewrite_op_jit_force_virtualizable`
+/// erases the force outright.  What stands in for that here is
+/// `try_walker_specialize_builtin_locals_in_callee_expand`, and this refusal
+/// covers exactly the shapes that expansion declines.  Widening it until the
+/// refusal is unreachable is the convergence path; the refusal is not the
+/// answer.
 ///
 /// `callee_code_key` is `None` when no callee could be named, in which case the
 /// decline still unwinds but nothing is remembered.
@@ -2256,14 +2280,16 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
         // `fbw_deny_hazardous_inline` writes a thread-local set that only
         // this walker reads, so the deny stayed invisible to the warm
         // state: `dont_trace_here` counted zero on every fixture that
-        // reaches here.  The upstream answer cited above is
-        // `disable_noninlinable_function(greenkey_of_huge_function)`
-        // (`pyjitpl.py` `MetaInterp.blackhole_if_trace_too_long`), which sets `JC_DONT_TRACE_HERE` on the
-        // callee's cell (`warmstate.py` `WarmEnterState.disable_noninlinable_function`).  The recursion-bound deny
-        // in `inline_call.rs` already calls it for the callee it names;
-        // this one names a callee the same way and had no reason not to.
-        // Pass the typed key so the verdict lands on the same
-        // comparekey-bearing cell consulted at the next call.
+        // reaches here.  `warmstate.py`
+        // `WarmEnterState.disable_noninlinable_function` is the call that sets
+        // `JC_DONT_TRACE_HERE` on the callee's cell, and that bit is what
+        // `can_inline_callable` reads, so the deny is spelled through it
+        // rather than beside it.  The mechanism is upstream's; the trigger is
+        // not, and the doc above says which.  The recursion-bound deny in
+        // `inline_call.rs` already calls it for the callee it names; this one
+        // names a callee the same way and had no reason not to.  Pass the
+        // typed key so the verdict lands on the same comparekey-bearing cell
+        // consulted at the next call.
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             let key = crate::driver::make_green_key_typed(
                 callee_code_key as *const (),

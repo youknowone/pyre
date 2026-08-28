@@ -39,6 +39,18 @@ lines, which are added to the environment of every runner for that script
 only. Without this a script can keep passing after the shape it exercises
 stops being reachable, i.e. cover nothing while still looking green.
 
+A fix that ships ON, with a switch that restores the defect, has an arm
+nothing runs: the corpus covers the fix, and the switch is exercised once by
+whoever measured it. A script names that arm with
+
+    # pyre-check: regresses-under: NAME=VALUE [NAME=VALUE ...] -- <reason>
+
+and is then run a second time on each pyre backend with those names set,
+where it must FAIL. Passing there is reported as XPASS, the same way a
+`pypy-diverges` script that starts passing is: either the switch stopped
+changing the answer, or the script stopped reaching the shape, and both
+turn the default-ON run green for a reason its header no longer states.
+
 Usage:
     python3 pyre/extra_tests/parity_tests/run.py
         [--dynasm-only|--cranelift-only] [--gc-poison]
@@ -140,6 +152,10 @@ def _scripts() -> tuple[list[Path], list[Path]]:
                         f"{p.name}: `{PYPY_DIVERGES_PREFIX}` with no reason — the "
                         f"directive exists to say which divergence is expected"
                     )
+        # Read here for the raise alone. The arm below reads it again once it
+        # knows which runners are pyre's, and an unparseable directive there
+        # would arrive as a traceback out of the middle of the table.
+        _regresses_under(p)
         (out if _runs_here(p) else skipped).append(p)
     return out, skipped
 
@@ -160,6 +176,40 @@ def _script_env(script: Path) -> dict[str, str]:
     """Environment a script pins for itself with `# parity-env: NAME=VALUE`."""
     text = script.read_text(encoding="utf-8", errors="replace")
     return {m.group(1): m.group(2) for m in _ENV_DIRECTIVE.finditer(text)}
+
+
+REGRESSES_UNDER_PREFIX = "# pyre-check: regresses-under:"
+
+# `# pyre-check: regresses-under: NAME=VALUE [NAME=VALUE ...] -- <reason>`.
+# The reason is part of the syntax rather than a convention: this directive
+# asserts a failure, and a failure nobody wrote down reads as the script being
+# broken by whoever next runs it.
+_REGRESSES_UNDER = re.compile(
+    r"^#\s*pyre-check:\s*regresses-under:\s*"
+    r"((?:\w+=\S*\s+)*\w+=\S*)"
+    r"\s+--\s+(\S.*?)\s*$"
+)
+
+
+def _regresses_under(script: Path) -> list[tuple[dict[str, str], str]]:
+    """The configurations this script declares it must fail under, with reasons.
+
+    Raises on a directive that does not parse, so a typo reads as an authoring
+    error rather than as a script that quietly declares nothing.
+    """
+    out = []
+    for line in script.read_text(encoding="utf-8").splitlines()[:20]:
+        if not line.startswith(REGRESSES_UNDER_PREFIX):
+            continue
+        parsed = _REGRESSES_UNDER.match(line)
+        if parsed is None:
+            raise RuntimeError(
+                f"{script.name}: `{REGRESSES_UNDER_PREFIX}` needs "
+                f"`NAME=VALUE [NAME=VALUE ...] -- <reason>`, got: {line.strip()}"
+            )
+        settings = dict(pair.split("=", 1) for pair in parsed.group(1).split())
+        out.append((settings, parsed.group(2)))
+    return out
 
 
 TIMEOUT = 30
@@ -368,18 +418,30 @@ def _annotate(failures: list[Failure]) -> None:
         print(f"::error file={path},title=parity::{escaped}")
 
 
+class Runner(NamedTuple):
+    """One interpreter the corpus is run against."""
+
+    name: str
+    cmd: list[str]
+    env: dict[str, str] | None
+    # Whether this runner reads pyre's own configuration. `regresses-under`
+    # only says anything on one that does: every other runtime ignores the
+    # name, passes, and would be reported as the control having gone dead.
+    pyre: bool
+
+
 def _runners(
     only_dynasm: bool, only_cranelift: bool, gc_poison: bool
-) -> list[tuple[str, list[str], dict[str, str] | None]]:
-    runners: list[tuple[str, list[str], dict[str, str] | None]] = []
-    runners.append(("cpython", [_cpython()], None))
+) -> list[Runner]:
+    runners: list[Runner] = []
+    runners.append(Runner("cpython", [_cpython()], None, False))
     pyre_env = {"MAJIT_GC_NURSERY_POISON": "1"} if gc_poison else None
     dynasm = TARGET_RELEASE / f"pyre-dynasm{EXE}"
     cranelift = TARGET_RELEASE / f"pyre-cranelift{EXE}"
     if not only_cranelift and dynasm.exists():
-        runners.append(("dynasm", [str(dynasm)], pyre_env))
+        runners.append(Runner("dynasm", [str(dynasm)], pyre_env, True))
     if not only_dynasm and cranelift.exists():
-        runners.append(("cranelift", [str(cranelift)], pyre_env))
+        runners.append(Runner("cranelift", [str(cranelift)], pyre_env, True))
     return runners
 
 
@@ -406,7 +468,7 @@ def main() -> int:
         print("no parity test scripts found", file=sys.stderr)
         return 1
 
-    print(f"runners: {[name for name, _, _ in runners]}")
+    print(f"runners: {[runner.name for runner in runners]}")
     if pypy is None:
         print(f"pypy cross-check: off — {pypy_off}")
     else:
@@ -422,13 +484,37 @@ def main() -> int:
         pinned = _script_env(script)
         row: list[str] = [f"  {name:<36s}"]
         reasons: list[str] = []
-        for backend, cmd, env in runners:
-            merged = {**(env or {}), **pinned}
-            ok, reason, err = _run(cmd, script, merged or None)
-            row.append(f"{backend}={'OK' if ok else 'FAIL'}")
+        for runner in runners:
+            merged = {**(runner.env or {}), **pinned}
+            ok, reason, err = _run(runner.cmd, script, merged or None)
+            row.append(f"{runner.name}={'OK' if ok else 'FAIL'}")
             if not ok:
-                failures.append(Failure(name, backend, reason, err))
-                reasons.append(f"      {backend}: {reason}")
+                failures.append(Failure(name, runner.name, reason, err))
+                reasons.append(f"      {runner.name}: {reason}")
+        for settings, why in _regresses_under(script):
+            spelled = " ".join(f"{key}={value}" for key, value in settings.items())
+            for runner in runners:
+                if not runner.pyre:
+                    continue
+                ok = _run(
+                    runner.cmd,
+                    script,
+                    {**(runner.env or {}), **pinned, **settings},
+                )[0]
+                if not ok:
+                    row.append(f"{runner.name}:regresses=xfail")
+                    continue
+                # The default-ON run above is green either way, so this is the
+                # only place the switch it depends on is measured at all.
+                row.append(f"{runner.name}:regresses=XPASS")
+                stale = (
+                    f"passed with {spelled} set, which its header says it "
+                    f"regresses under: {why!r} — either the switch stopped "
+                    f"changing the answer or the script stopped reaching the "
+                    f"shape, and the passing run above no longer covers it"
+                )
+                failures.append(Failure(name, f"{runner.name} {spelled}", stale, ""))
+                reasons.append(f"      {runner.name} [{spelled}]: {stale}")
         if pypy is not None:
             declared = _pypy_divergence(script)
             ok, reason, err = _run([pypy], script, pinned or None)
