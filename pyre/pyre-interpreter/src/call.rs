@@ -1387,6 +1387,20 @@ fn call_function_ex_impl(
             .collect()
     };
 
+    // CPython 3.14's AST tp_init is the one builtin constructor that receives
+    // its raw kwargs dict before enforcing string keys.  Preserve that narrow
+    // type-slot boundary; every ordinary callable continues through PyPy's
+    // Arguments merge below, where non-string names are rejected.
+    if !kwargs_or_null().is_null()
+        && let Some(result) = crate::module::_ast::moduledef::call_type_with_raw_kwargs(
+            callable(),
+            &args(),
+            kwargs_or_null(),
+        )
+    {
+        return result;
+    }
+
     // Merge the `**` mapping into the call.  argument.py:106-150
     // `_combine_starstarargs_wrapped` accepts any mapping — the dict fast
     // path or an arbitrary object via `keys()` / `__getitem__` — raising
@@ -5495,7 +5509,7 @@ fn build_class_inner(
 /// Pack `(name, value)` keyword pairs into the `__pyre_kw__`-tagged
 /// trailing dict that the builtin kwargs ABI (`split_builtin_kwargs`)
 /// consumes.  Mirrors the producer in `call_with_kwargs`.
-fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
+pub(crate) fn pack_pyre_kwargs(kw_items: &[(PyObjectRef, PyObjectRef)]) -> PyObjectRef {
     // The dict is born young, and `w_dict_store` allocates when it promotes the
     // strategy — see the bracket in `call_with_kwargs`. `kw_items` is the
     // caller's array of raw references, so the pairs still to be installed are
@@ -6031,7 +6045,11 @@ pub unsafe fn create_all_slots(
         // typeobject.py:1199-1204: layout computation
         let nslots = base_nslots + newslotnames.len() as u32;
         let typedef = if base_layout.is_null() {
-            &pyre_object::pyobject::INSTANCE_TYPE as *const _
+            pyre_object::typeobject::leak_interpreter_typedef(
+                &pyre_object::pyobject::INSTANCE_TYPE,
+                true,
+                false,
+            )
         } else {
             (*base_layout).typedef
         };
@@ -6043,14 +6061,6 @@ pub unsafe fn create_all_slots(
                 nslots,
                 newslotnames,
                 base_layout,
-                acceptable_as_base_class: true,
-                // typedef.py:51-53: inherit typedef.hasdict along the base
-                // layout chain (terminates at object's Layout = false).
-                typedef_hasdict: if base_layout.is_null() {
-                    false
-                } else {
-                    (*base_layout).typedef_hasdict
-                },
                 dict_data_slot: pyre_object::typeobject::DICT_DATA_SLOT_UNRESOLVED,
             })
         };
@@ -6215,10 +6225,13 @@ pub(crate) unsafe fn check_and_find_best_base(
                     let native_layout_conflict = !layout.is_null()
                         && !std::ptr::eq((*best_layout).typedef, (*layout).typedef)
                         && !std::ptr::eq(
-                            (*best_layout).typedef,
+                            (*(*best_layout).typedef).instance_type,
                             &pyre_object::pyobject::INSTANCE_TYPE,
                         )
-                        && !std::ptr::eq((*layout).typedef, &pyre_object::pyobject::INSTANCE_TYPE)
+                        && !std::ptr::eq(
+                            (*(*layout).typedef).instance_type,
+                            &pyre_object::pyobject::INSTANCE_TYPE,
+                        )
                         && !exception_layouts;
                     if !layout.is_null()
                         && (!(*best_layout).issublayout(layout) || native_layout_conflict)
@@ -6246,7 +6259,7 @@ unsafe fn is_exception_layout(mut layout: *const pyre_object::typeobject::Layout
     unsafe {
         while !layout.is_null() {
             if std::ptr::eq(
-                (*layout).typedef,
+                (*(*layout).typedef).instance_type,
                 &pyre_object::interp_exceptions::EXCEPTION_TYPE,
             ) {
                 return true;
@@ -6260,5 +6273,14 @@ unsafe fn is_exception_layout(mut layout: *const pyre_object::typeobject::Layout
 /// typedef.py `acceptable_as_base_class = '__new__' in rawdict`.
 /// typeobject.py:1116 checks this flag on the bestbase.
 unsafe fn is_acceptable_base_class(w_type: pyre_object::PyObjectRef) -> bool {
-    unsafe { pyre_object::w_type_get_acceptable_as_base_class(w_type) }
+    // [3.14-spec] CPython 3.14 rejects a type whose own
+    // `Py_TPFLAGS_BASETYPE` capability is absent.  PyPy normally owns it
+    // on the shared TypeDef; app-level-shaped stand-ins such as structseqs and
+    // Context enforce the same restriction in their metaclass instead.  Read
+    // pyre's per-type projection after the canonical TypeDef value so those
+    // stand-ins keep PyPy's shared Layout without poisoning tuple/object.
+    unsafe {
+        pyre_object::w_type_get_acceptable_as_base_class(w_type)
+            && !pyre_object::w_type_is_cpython_basetype_suppressed(w_type)
+    }
 }

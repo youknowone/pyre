@@ -264,6 +264,22 @@ crate::py_module! {
         "length_hint"  / * = op_length_hint,
         "_compare_digest" / 2 = op_compare_digest,
     },
+    extra_init: |ns| {
+        // [3.14-spec] PyPy `app_operator.py` deliberately owns these as
+        // ordinary app-level classes, and no JIT/immutability hint decorates
+        // their definitions.  CPython 3.14's three static factory types omit
+        // `Py_TPFLAGS_BASETYPE`; preserve the PyPy classes and suppress only
+        // that caller-visible per-type capability.
+        for name in ["itemgetter", "attrgetter", "methodcaller"] {
+            let ty = crate::module_ns_get(ns, name)
+                .expect("operator app-level factory class must be installed");
+            // CPython exposes these as immutable module heap types.  This is
+            // a public projection only; PyPy's app-level class remains the
+            // implementation and storage owner.
+            crate::typedef::mark_cpython_heap_type(ty, true);
+            unsafe { pyre_object::w_type_suppress_cpython_basetype(ty) };
+        }
+    },
     // The `__lt__ = lt` / `__add__ = add` dunder aliases belong to
     // `operator.py`, which binds them after its `from _operator import *`;
     // this module carries only the names that tail imports.

@@ -5761,7 +5761,10 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
             lookup_where(obj_type.as_ptr(), "__dict__").is_some_and(|(owner, _)| {
                 let layout = pyre_object::w_type_get_layout_ptr(owner);
                 !layout.is_null()
-                    && std::ptr::eq((*layout).typedef, &pyre_object::pyobject::INSTANCE_TYPE)
+                    && std::ptr::eq(
+                        (*(*layout).typedef).instance_type,
+                        &pyre_object::pyobject::INSTANCE_TYPE,
+                    )
             })
         };
         if !module_type.is_null()

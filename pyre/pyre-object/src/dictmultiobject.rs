@@ -1123,6 +1123,13 @@ dict_storage_gc_type_id!(
     BytesDictStorage,
     "Runtime-assigned GC type id for the `BytesDictStorage` box."
 );
+dict_storage_gc_type_id!(
+    DICT_STRATEGY_REF_GC_TYPE_ID,
+    set_dict_strategy_ref_gc_type_id,
+    dict_strategy_ref_gc_type_id,
+    DictStrategyRef,
+    "Runtime-assigned GC type id for a per-dict `DictStrategyRef` holder."
+);
 
 /// Reclaim an off-GC `ObjectDictStorage` box that is NOT collector-owned.
 ///
@@ -1200,7 +1207,7 @@ pub unsafe fn w_dict_get_strategy(
 ) -> &'static dyn crate::dictmultiobject::DictStrategy {
     if is_module_dict(obj) {
         let strat_ptr = (*(obj as *const W_ModuleDictObject)).mstrategy;
-        return &*strat_ptr;
+        return (*strat_ptr).imp;
     }
     let dict = &*(obj as *const W_DictObject);
     dict.dstrategy.imp
@@ -1225,10 +1232,10 @@ pub unsafe fn w_dict_get_strategy(
 #[inline]
 pub unsafe fn w_dict_set_strategy(obj: PyObjectRef, strategy: &'static DictStrategyRef) {
     if is_module_dict(obj) {
-        panic!(
-            "w_dict_set_strategy: W_ModuleDictObject strategy swap is not the canonical \
-             path; use w_module_dict_switch_to_object_strategy (celldict.py:173-186)"
-        );
+        (*(obj as *mut W_ModuleDictObject)).mstrategy =
+            strategy as *const DictStrategyRef as *mut DictStrategyRef;
+        dict_write_barrier(obj);
+        return;
     }
     let dict = &mut *(obj as *mut W_DictObject);
     dict.dstrategy = strategy;
@@ -1238,7 +1245,7 @@ pub unsafe fn w_dict_set_strategy(obj: PyObjectRef, strategy: &'static DictStrat
 /// global cell fast path.  Returns the insertion-order index of `name`
 /// inside the module dict's `ModuleDictStorage`, or `None` when `obj` is
 /// not a `W_ModuleDictObject` in `ModuleDictStrategy` mode (after
-/// `switch_to_object_strategy` the `object_storage` is authoritative and
+/// `switch_to_object_strategy` the erased `dstorage` holds ObjectDictStorage and
 /// the version-keyed cell path is permanently invalid).  The index is
 /// stable across in-place cell mutation and value overwrite (`IndexMap`
 /// keeps the slot position), so it serves as the elidable lookup key.
@@ -1250,10 +1257,12 @@ pub unsafe fn module_dict_cell_slot_of(obj: PyObjectRef, name: &str) -> Option<u
         return None;
     }
     let md = &*(obj as *const W_ModuleDictObject);
-    if !md.object_storage.is_null() || md.dstorage.is_null() {
+    if w_module_dict_is_object_strategy(obj) || md.dstorage.is_null() {
         return None;
     }
-    (*md.dstorage).entries.get_index_of(name)
+    (*(md.dstorage as *const crate::celldict::ModuleDictStorage))
+        .entries
+        .get_index_of(name)
 }
 
 /// `celldict.py _getdictvalue_no_unwrapping_pure` — the raw stored
@@ -1268,10 +1277,10 @@ pub unsafe fn module_dict_cell_at(obj: PyObjectRef, slot: usize) -> Option<PyObj
         return None;
     }
     let md = &*(obj as *const W_ModuleDictObject);
-    if !md.object_storage.is_null() || md.dstorage.is_null() {
+    if w_module_dict_is_object_strategy(obj) || md.dstorage.is_null() {
         return None;
     }
-    (*md.dstorage)
+    (*(md.dstorage as *const crate::celldict::ModuleDictStorage))
         .entries
         .get_index(slot)
         .map(|(_, v)| *v)
@@ -1291,10 +1300,10 @@ pub unsafe fn module_dict_storage_len(obj: PyObjectRef) -> Option<usize> {
         return None;
     }
     let md = &*(obj as *const W_ModuleDictObject);
-    if !md.object_storage.is_null() || md.dstorage.is_null() {
+    if w_module_dict_is_object_strategy(obj) || md.dstorage.is_null() {
         return None;
     }
-    Some((*md.dstorage).len())
+    Some((*(md.dstorage as *const crate::celldict::ModuleDictStorage)).len())
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for a module dict
@@ -1627,29 +1636,21 @@ pub static MODULE_DICT_TYPE: PyType = new_pytype("dict");
 pub struct W_ModuleDictObject {
     pub ob_header: PyObject,
     /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py`).
-    /// A GC-managed non-moving storage box (off-GC storage);
-    /// reassignment is a `setfield_gc`.  Authoritative while
-    /// `object_storage` is null (ModuleDictStrategy mode); after
-    /// `switch_to_object_strategy` it is cleared and not consulted.
-    pub dstorage: *mut crate::celldict::ModuleDictStorage,
+    /// A GC-managed non-moving erased storage box (off-GC storage).
+    /// Reassignment is a `setfield_gc`; its concrete type follows the live
+    /// strategy exactly as `rerased` storage does upstream.
+    pub dstorage: *mut u8,
     /// `mstrategy` from `W_ModuleDictObject.__slots__` (`:331`).
     /// A GC-managed non-moving storage box (off-GC storage).
-    pub mstrategy: *mut crate::celldict::ModuleDictStrategy,
-    /// `dstorage` after a `switch_to_object_strategy`
-    /// (`celldict.py:173-186`).  Null while the dict is in
-    /// ModuleDictStrategy mode; non-null once a non-str key forces the
-    /// strategy swap.  Holds the unified ObjectKey-keyed entries that
-    /// PyPy keeps inside the new `ObjectDictStrategy` storage after the
-    /// switch — `dstorage`'s entries are drained into this IndexMap in
-    /// their original insertion order so `items()` / `popitem()` LIFO
-    /// parity is preserved across mixed-key inserts.  Backing matches
-    /// `ObjectDictStrategy` (`dictmultiobject.py r_dict(space.eq_w,
-    /// space.hash_w)`) — same `ObjectKey { hash, obj }` precomputed-hash
-    /// + `dict_keys_equal` equality.
-    pub object_storage: *mut ObjectDictStorage,
+    pub mstrategy: *mut DictStrategyRef,
     /// Key-set mutation state corresponding to the live iterator held by
     /// PyPy's ModuleDictStrategy iterator implementation.
     pub keys_version: usize,
+    /// The same iterator restart generation carried by `W_DictObject`.
+    /// Keeping the concrete layouts prefix-identical lets the ordinary
+    /// ObjectDictStrategy operate on a module dict after PyPy's literal
+    /// `mstrategy`/`dstorage` swap.
+    pub clear_gen: usize,
 }
 
 /// GC type id assigned to `W_ModuleDictObject`.  Lands at slot 48,
@@ -1679,7 +1680,7 @@ impl crate::lltype::GcType for W_ModuleDictObject {
 impl W_DictMultiObject for W_ModuleDictObject {
     #[inline]
     fn get_strategy(&self) -> &dyn crate::dictmultiobject::DictStrategy {
-        unsafe { &*self.mstrategy }
+        unsafe { (*self.mstrategy).imp }
     }
 
     /// `celldict.py w_dict.set_strategy(strategy)` — the only
@@ -1690,11 +1691,6 @@ impl W_DictMultiObject for W_ModuleDictObject {
     /// correctly without panicking; non-Object target strategies stay
     /// unreachable per the upstream surface.
     ///
-    /// TODO: pyre carries `object_storage` as a
-    /// side field instead of swapping `dstorage` wholesale (PyPy's
-    /// `w_dict.dstorage = strategy.erase(d_new)`).  The trait method
-    /// hides that adapter from callers; the side-field layout retires
-    /// alongside typed-strategy storage migration.
     fn set_strategy(&mut self, strategy: &'static DictStrategyRef) {
         // Distinct holders have distinct addresses; the singletons they carry
         // are zero-sized, and comparing *those* addresses is not a valid
@@ -1705,8 +1701,7 @@ impl W_DictMultiObject for W_ModuleDictObject {
                  implemented (celldict.py:173-186 is the only documented swap target)"
             );
         }
-        let obj = self as *mut Self as PyObjectRef;
-        unsafe { w_module_dict_switch_to_object_strategy(obj) };
+        self.mstrategy = strategy as *const DictStrategyRef as *mut DictStrategyRef;
     }
 }
 
@@ -1733,16 +1728,34 @@ impl W_DictMultiObject for W_ModuleDictObject {
 /// plain GCREF with no discriminant to erase.
 #[majit_macros::dont_look_inside]
 pub fn w_module_dict_new() -> PyObjectRef {
+    let roots = crate::gc_roots::push_roots();
     let strategy = crate::gc_storage::gc_alloc_storage_box(
         crate::celldict::ModuleDictStrategy::new(),
         crate::celldict::module_dict_strategy_gc_type_id(),
     );
+    let strategy_slot = roots.publish(&[strategy as PyObjectRef]);
+    let strategy = roots.get(strategy_slot) as *mut crate::celldict::ModuleDictStrategy;
+    // The strategy box is non-moving and lives as long as this holder.  The
+    // holder's `owner` word is explicitly traced by the module-dict custom
+    // trace, so extending the reference lifetime expresses that GC ownership
+    // without leaking a process-global strategy.
+    let imp: &'static dyn DictStrategy =
+        unsafe { std::mem::transmute::<&dyn DictStrategy, &'static dyn DictStrategy>(&*strategy) };
+    let strategy_ref = crate::gc_storage::gc_alloc_storage_box(
+        DictStrategyRef {
+            imp,
+            owner: strategy as *mut u8,
+        },
+        dict_strategy_ref_gc_type_id(),
+    );
+    let strategy_ref_slot = roots.publish(&[strategy_ref as PyObjectRef]);
     let storage = unsafe {
         crate::gc_storage::gc_alloc_storage_box(
             (*strategy).get_empty_storage(),
             crate::celldict::module_dict_storage_gc_type_id(),
         )
     };
+    let storage_slot = roots.publish(&[storage as PyObjectRef]);
     crate::lltype::malloc_typed_stable(W_ModuleDictObject {
         ob_header: PyObject {
             // `dictmultiobject.py:67 space.allocate_instance(...,
@@ -1753,10 +1766,10 @@ pub fn w_module_dict_new() -> PyObjectRef {
             ob_type: &MODULE_DICT_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_DICT_TYPE),
         },
-        dstorage: storage,
-        mstrategy: strategy,
-        object_storage: std::ptr::null_mut(),
+        dstorage: roots.get(storage_slot) as *mut u8,
+        mstrategy: roots.get(strategy_ref_slot) as *mut DictStrategyRef,
         keys_version: 0,
+        clear_gen: 0,
     }) as PyObjectRef
 }
 
@@ -1844,20 +1857,19 @@ macro_rules! lock_dict_refs {
 pub fn module_dict_locks_after_fork_child() {}
 
 /// Predicate: dict is in ObjectDictStrategy mode (post-switch).  When
-/// true, `object_storage` is authoritative and `dstorage` is empty +
-/// not consulted.  Mirrors `W_DictMultiObject.get_strategy()` returning
+/// true, `dstorage` contains ObjectDictStorage. Mirrors
+/// `W_DictMultiObject.get_strategy()` returning
 /// `ObjectDictStrategy` vs `ModuleDictStrategy` (`dictmultiobject.py`).
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ModuleDictObject`.
 #[inline]
 pub unsafe fn w_module_dict_is_object_strategy(obj: PyObjectRef) -> bool {
-    !(*(obj as *const W_ModuleDictObject))
-        .object_storage
-        .is_null()
+    let strategy = (*(obj as *const W_ModuleDictObject)).mstrategy;
+    !strategy.is_null() && (*strategy).strategy_kind() == StrategyKind::Object
 }
 
-/// Read-only view of the unified object_storage IndexMap; returns `None`
+/// Read-only view of ObjectDictStrategy's erased storage; returns `None`
 /// when the dict is still in ModuleDictStrategy mode.
 ///
 /// # Safety
@@ -1865,14 +1877,14 @@ pub unsafe fn w_module_dict_is_object_strategy(obj: PyObjectRef) -> bool {
 #[inline]
 pub unsafe fn w_module_dict_object_storage<'a>(obj: PyObjectRef) -> Option<&'a ObjectDictStorage> {
     let raw = &*(obj as *const W_ModuleDictObject);
-    if raw.object_storage.is_null() {
+    if !w_module_dict_is_object_strategy(obj) {
         None
     } else {
-        Some(&*raw.object_storage)
+        Some(&*(raw.dstorage as *const ObjectDictStorage))
     }
 }
 
-/// Mutable view of the unified object_storage IndexMap; requires the
+/// Mutable view of ObjectDictStrategy's erased storage; requires the
 /// dict to already be in object-strategy mode.
 ///
 /// # Safety
@@ -1881,11 +1893,11 @@ pub unsafe fn w_module_dict_object_storage<'a>(obj: PyObjectRef) -> Option<&'a O
 #[inline]
 pub unsafe fn w_module_dict_object_storage_mut<'a>(obj: PyObjectRef) -> &'a mut ObjectDictStorage {
     let raw = &mut *(obj as *mut W_ModuleDictObject);
-    debug_assert!(!raw.object_storage.is_null());
-    &mut *raw.object_storage
+    debug_assert!(w_module_dict_is_object_strategy(obj));
+    &mut *(raw.dstorage as *mut ObjectDictStorage)
 }
 
-/// Mutable view of the unified object_storage IndexMap when present;
+/// Mutable view of ObjectDictStrategy's erased storage when present;
 /// returns `None` while the dict is still in ModuleDictStrategy mode.
 /// Use this variant when the caller does not control the strategy
 /// state at the call site (e.g. trait-dispatch entry points that
@@ -1898,11 +1910,41 @@ pub unsafe fn w_module_dict_object_storage_mut_opt<'a>(
     obj: PyObjectRef,
 ) -> Option<&'a mut ObjectDictStorage> {
     let raw = &mut *(obj as *mut W_ModuleDictObject);
-    if raw.object_storage.is_null() {
+    if !w_module_dict_is_object_strategy(obj) {
         None
     } else {
-        Some(&mut *raw.object_storage)
+        Some(&mut *(raw.dstorage as *mut ObjectDictStorage))
     }
+}
+
+/// Concrete strategy payload for `ModuleDictStrategy.unerase`.  The erased
+/// dispatch holder is the live `mstrategy`; its traced `owner` carries the
+/// per-module state (version and global caches) while that strategy is active.
+#[inline]
+pub unsafe fn w_module_dict_module_strategy_mut<'a>(
+    obj: PyObjectRef,
+) -> &'a mut crate::celldict::ModuleDictStrategy {
+    let holder = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
+    debug_assert_eq!(holder.strategy_kind(), StrategyKind::Module);
+    debug_assert!(!holder.owner.is_null());
+    &mut *(holder.owner as *mut crate::celldict::ModuleDictStrategy)
+}
+
+/// Concrete storage behind `ModuleDictStrategy.unerase(w_dict.dstorage)`.
+#[inline]
+pub unsafe fn w_module_dict_module_storage_mut<'a>(
+    obj: PyObjectRef,
+) -> &'a mut crate::celldict::ModuleDictStorage {
+    debug_assert!(!w_module_dict_is_object_strategy(obj));
+    &mut *((*(obj as *mut W_ModuleDictObject)).dstorage as *mut crate::celldict::ModuleDictStorage)
+}
+
+#[inline]
+pub unsafe fn w_module_dict_module_storage<'a>(
+    obj: PyObjectRef,
+) -> &'a crate::celldict::ModuleDictStorage {
+    debug_assert!(!w_module_dict_is_object_strategy(obj));
+    &*((*(obj as *const W_ModuleDictObject)).dstorage as *const crate::celldict::ModuleDictStorage)
 }
 
 /// `pypy/objspace/std/celldict.py switch_to_object_strategy`:
@@ -1924,37 +1966,10 @@ pub unsafe fn w_module_dict_object_storage_mut_opt<'a>(
 ///     w_dict.dstorage = strategy.erase(d_new)
 /// ```
 ///
-/// Drains all str entries from `dstorage` into a fresh
-/// `object_storage` Vec, preserving insertion order (PyPy's
-/// `iteritems` over an RPython dict yields insertion order), clears
-/// `dstorage`, and bumps `mstrategy.version` so any quasi-immutable
-/// JIT cache keyed on the previous version invalidates.  After this
-/// call, all reads / writes route through `object_storage` regardless
-/// of key type — matching PyPy's `ObjectDictStrategy` semantics.
-///
-/// **TODO** vs `celldict.py:185-186`:
-/// PyPy actually swaps the strategy (`w_dict.set_strategy(strategy)`)
-/// and replaces `w_dict.dstorage` with the new `strategy.erase(d_new)`
-/// payload.  Pyre carries TWO storages (`dstorage` + `object_storage`)
-/// and flips a flag (`object_storage` non-null) to route reads/writes
-/// to the new container.  Functionally equivalent: after the switch,
-/// `dstorage` is cleared and never consulted; `object_storage` is the
-/// authoritative payload, exactly mirroring the post-`set_strategy`
-/// PyPy state.
-///
-/// **Why it diverges**: full structural parity requires a
-/// `DictStrategy` trait + concrete `ObjectDictStrategy` /
-/// `UnicodeDictStrategy` ports (see `dictmultiobject.py`)
-/// so `set_strategy` can replace both the dispatch object and the
-/// erased storage type uniformly.  That hierarchy is a large effort
-/// (750+ LOC across 4 strategies, 200+ call sites in
-/// `dictmultiobject.py` consuming `w_dict.get_strategy()` and
-/// `space.fromcache(<Strategy>)`).
-///
-/// **Convergence path**: when the strategy hierarchy ports land,
-/// drop `object_storage` and replace this two-slot carrier with a
-/// single `dstorage: *mut dyn DictStorageErased` whose concrete
-/// type is dictated by `mstrategy`'s runtime tag.
+/// Copies all str entries from the old erased ModuleDictStorage into fresh
+/// ObjectDictStorage, preserving insertion order, invalidates the displaced
+/// module caches, then replaces both `mstrategy` and `dstorage`. This is the
+/// literal shape of `celldict.py ModuleDictStrategy.switch_to_object_strategy`.
 ///
 /// No-op when already in object-strategy mode.
 ///
@@ -1968,14 +1983,16 @@ pub unsafe fn w_module_dict_object_storage_mut_opt<'a>(
 pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     lock_dict_refs!(_module_guard, obj);
     let raw = &mut *(obj as *mut W_ModuleDictObject);
-    if !raw.object_storage.is_null() {
+    if w_module_dict_is_object_strategy(obj) {
         return;
     }
-    // The promotion mints young key objects into the fresh object_storage
+    // The promotion mints young key objects into the fresh object storage
     // (prebuilt-family storage; see `w_module_dict_setitem_str_internal`).
     crate::gc_roots::mark_prebuilt_roots_dirty();
-    let strategy = &mut *raw.mstrategy;
-    let storage = &mut *raw.dstorage;
+    let holder = &mut *raw.mstrategy;
+    debug_assert_eq!(holder.strategy_kind(), StrategyKind::Module);
+    let strategy = &mut *(holder.owner as *mut crate::celldict::ModuleDictStrategy);
+    let storage = &mut *(raw.dstorage as *mut crate::celldict::ModuleDictStorage);
     let mut new_storage = object_dict_storage_with_capacity(storage.entries.len());
     for (k, v) in strategy
         .getiterkeys(storage)
@@ -1984,14 +2001,16 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
         let key_obj = crate::celldict::_wrapkey(k);
         new_storage.insert(object_key_for(key_obj), v);
     }
-    raw.object_storage =
+    let new_storage =
         crate::gc_storage::gc_alloc_storage_box(new_storage, object_dict_storage_gc_type_id());
-    storage.clear();
     // `celldict.py`: every live GlobalCache becomes invalid
     // because the strategy is being swapped out; the JIT must
     // recompile any trace keyed on the prior version.
     strategy.invalidate_caches();
     strategy.mutated();
+    raw.mstrategy = &OBJECT_DICT_STRATEGY_REF as *const DictStrategyRef as *mut DictStrategyRef;
+    raw.dstorage = new_storage as *mut u8;
+    dict_write_barrier(obj);
 }
 
 /// `dictmultiobject.py _never_equal_to_string`:
@@ -2037,7 +2056,11 @@ pub unsafe fn is_module_dict(obj: PyObjectRef) -> bool {
 pub unsafe fn w_module_dict_get_strategy(
     obj: PyObjectRef,
 ) -> *mut crate::celldict::ModuleDictStrategy {
-    (*(obj as *const W_ModuleDictObject)).mstrategy
+    if w_module_dict_is_object_strategy(obj) {
+        return std::ptr::null_mut();
+    }
+    (*(*(obj as *const W_ModuleDictObject)).mstrategy).owner
+        as *mut crate::celldict::ModuleDictStrategy
 }
 
 /// [`w_module_dict_get_strategy`] for a caller that has not yet proven the
@@ -2068,7 +2091,7 @@ pub unsafe fn w_module_dict_strategy_or_null(
 /// Returns a `usize` that is stable across the dict's lifetime as long
 /// as no strategy transition occurs, and changes whenever the strategy
 /// transitions (e.g. `W_ModuleDictObject::switch_to_object_strategy`
-/// flipping `object_storage` from null to non-null).  Distinct dicts
+/// replacing `mstrategy`). Distinct dicts
 /// MAY share the same id when they share the strategy singleton
 /// (e.g. two regular W_DictObject instances both on
 /// `OBJECT_DICT_STRATEGY`); iterator parity is preserved because
@@ -2080,12 +2103,6 @@ pub unsafe fn w_module_dict_strategy_or_null(
 pub unsafe fn w_dict_strategy_id(obj: PyObjectRef) -> usize {
     if is_module_dict(obj) {
         let m = &*(obj as *const W_ModuleDictObject);
-        if !m.object_storage.is_null() {
-            // `switch_to_object_strategy` flipped the dict; tag with the
-            // object_storage address so the id is distinct from any
-            // pre-switch mstrategy stamp.
-            return m.object_storage as usize;
-        }
         return m.mstrategy as usize;
     }
     let d = &*(obj as *const W_DictObject);
@@ -2175,7 +2192,7 @@ pub unsafe fn w_dict_bump_keys_version(obj: PyObjectRef) {
 pub unsafe fn w_module_dict_get_storage(
     obj: PyObjectRef,
 ) -> *mut crate::celldict::ModuleDictStorage {
-    (*(obj as *const W_ModuleDictObject)).dstorage
+    (*(obj as *const W_ModuleDictObject)).dstorage as *mut crate::celldict::ModuleDictStorage
 }
 
 /// `dictmultiobject.py W_DictMultiObject.setitem_str`
@@ -2238,14 +2255,12 @@ unsafe fn w_module_dict_setitem_str_internal(obj: PyObjectRef, key: &str, w_valu
                 w_dict_bump_keys_version(obj);
             }
         };
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        strategy.mutated();
         dict_write_barrier(obj);
         return;
     }
     {
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
+        let strategy = w_module_dict_module_strategy_mut(obj);
+        let storage = w_module_dict_module_storage_mut(obj);
         let old_len = storage.len();
         strategy.setitem_str(storage, key, w_value);
         if storage.len() != old_len {
@@ -2271,8 +2286,8 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
         return dict_entries_get_str(entries, key, 0);
     }
     {
-        let strategy = &*(*(obj as *const W_ModuleDictObject)).mstrategy;
-        let storage = &*(*(obj as *const W_ModuleDictObject)).dstorage;
+        let strategy = &*w_module_dict_get_strategy(obj);
+        let storage = w_module_dict_module_storage(obj);
         if let Some(v) = strategy.getitem_str(storage, key) {
             return Some(v);
         }
@@ -2284,7 +2299,7 @@ pub unsafe fn w_module_dict_getitem_str(obj: PyObjectRef, key: &str) -> Option<P
 ///
 /// A module dict's authoritative storage is reached only behind raw
 /// pointers — the `dstorage` cell map, the post-`switch_to_object_strategy`
-/// `object_storage`, and the `mstrategy.caches` cell registry — none of which are inline
+/// erased `dstorage` and the module strategy cache registry — neither is inline
 /// `gc_ptr_offsets`. The non-moving W_ModuleDictObject's registered
 /// `module_dict_object_custom_trace` invokes this walk; the explicit frame
 /// root walker does too for raw globals/builtins carriers. Without the walk,
@@ -2310,14 +2325,8 @@ pub unsafe fn w_module_dict_walk_gc_cells(
         return;
     }
     let md = &mut *(obj as *mut W_ModuleDictObject);
-    if !md.dstorage.is_null() {
-        let storage = &mut *md.dstorage;
-        for value in storage.iter_values_mut() {
-            crate::celldict::walk_module_value_slot(value, visitor);
-        }
-    }
-    if !md.object_storage.is_null() {
-        let object_storage = &mut *md.object_storage;
+    if w_module_dict_is_object_strategy(obj) {
+        let object_storage = &mut *(md.dstorage as *mut ObjectDictStorage);
         for (key, value) in object_storage.iter_mut() {
             // ObjectKey.hash is precomputed and identity-stable across GC
             // moves, so writing through the raw obj slot does not desync
@@ -2326,9 +2335,12 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             visitor(&mut (*key_ptr).obj);
             crate::celldict::walk_module_value_slot(value, visitor);
         }
-    }
-    if !md.mstrategy.is_null() {
-        (*md.mstrategy).walk_cache_cells(visitor);
+    } else {
+        let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
+        for value in storage.iter_values_mut() {
+            crate::celldict::walk_module_value_slot(value, visitor);
+        }
+        w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);
     }
 }
 
@@ -2360,16 +2372,14 @@ unsafe fn w_module_dict_delitem_str_internal(obj: PyObjectRef, key: &str) -> Opt
         let w_key = crate::w_str_new(key);
         let entries = w_module_dict_object_storage_mut(obj);
         if let Some(removed) = entries.shift_remove(&object_key_for(w_key)) {
-            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-            strategy.mutated();
             w_dict_bump_keys_version(obj);
             return Some(removed);
         }
         return None;
     }
     let removed = {
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
+        let strategy = w_module_dict_module_strategy_mut(obj);
+        let storage = w_module_dict_module_storage_mut(obj);
         strategy.delitem_str(storage, key)
     };
     if removed.is_some() {
@@ -2388,8 +2398,8 @@ pub unsafe fn w_module_dict_length(obj: PyObjectRef) -> usize {
     if let Some(entries) = w_module_dict_object_storage(obj) {
         entries.len()
     } else {
-        let strategy = &*(*(obj as *const W_ModuleDictObject)).mstrategy;
-        let storage = &*(*(obj as *const W_ModuleDictObject)).dstorage;
+        let strategy = &*w_module_dict_get_strategy(obj);
+        let storage = w_module_dict_module_storage(obj);
         strategy.length(storage)
     }
 }
@@ -3511,8 +3521,6 @@ pub unsafe fn w_module_dict_store_inner(obj: PyObjectRef, key: PyObjectRef, valu
     let object_key = object_key_for(key);
     let inserted =
         dict_entries_insert_hashed(entries, object_key.hash, object_key.obj, value).is_none();
-    let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-    strategy.mutated();
     if inserted {
         w_dict_bump_keys_version(obj);
     }
@@ -3549,8 +3557,6 @@ pub unsafe fn w_module_dict_store_inner_checked(
         dict_entries_pop_last(entries);
         return Err(DictKeyError);
     }
-    let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-    strategy.mutated();
     if previous.is_none() {
         w_dict_bump_keys_version(obj);
     }
@@ -3924,8 +3930,6 @@ pub unsafe fn w_dict_delitem_wtf8_no_proxy(obj: PyObjectRef, key: &rustpython_wt
         let w_key = crate::w_str_from_wtf8(key.to_wtf8_buf());
         let removed = entries.shift_remove(&object_key_for(w_key)).is_some();
         if removed {
-            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-            strategy.mutated();
             w_dict_bump_keys_version(obj);
         }
         return removed;
@@ -4086,8 +4090,6 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
                 }
                 Some(index) => {
                     entries.shift_remove_index(index);
-                    let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-                    strategy.mutated();
                     w_dict_bump_keys_version(obj);
                     true
                 }
@@ -4115,8 +4117,6 @@ pub unsafe fn w_dict_delitem_if_value_is_checked(
             return Ok(false);
         }
         entries.shift_remove_index(index);
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        strategy.mutated();
         w_dict_bump_keys_version(obj);
         return Ok(true);
     }
@@ -4240,8 +4240,6 @@ pub unsafe fn w_dict_move_to_end_checked(
                     // invalidated (as in w_dict_delitem_if_value_is_checked).
                     if index != target {
                         entries.move_index(index, target);
-                        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-                        strategy.mutated();
                         w_dict_bump_keys_version(obj);
                     }
                     true
@@ -4263,8 +4261,6 @@ pub unsafe fn w_dict_move_to_end_checked(
         let target = if last { entries.len() - 1 } else { 0 };
         if index != target {
             entries.move_index(index, target);
-            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-            strategy.mutated();
             w_dict_bump_keys_version(obj);
         }
         return Ok(true);
@@ -4421,8 +4417,6 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     if w_module_dict_is_object_strategy(obj) {
         let entries = w_module_dict_object_storage_mut(obj);
         if dict_entries_remove_object(entries, key) {
-            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-            strategy.mutated();
             w_dict_bump_keys_version(obj);
             return true;
         }
@@ -4438,8 +4432,6 @@ pub unsafe fn w_module_dict_delitem_inner(obj: PyObjectRef, key: PyObjectRef) ->
     let obj = _module_guard.root(0);
     let entries = w_module_dict_object_storage_mut(obj);
     if dict_entries_remove_object(entries, key) {
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        strategy.mutated();
         w_dict_bump_keys_version(obj);
         return true;
     }
@@ -4463,8 +4455,6 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
             return Err(DictKeyError);
         }
         if removed {
-            let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-            strategy.mutated();
             w_dict_bump_keys_version(obj);
             return Ok(true);
         }
@@ -4485,8 +4475,6 @@ pub unsafe fn w_module_dict_delitem_inner_checked(
         return Err(DictKeyError);
     }
     if removed {
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        strategy.mutated();
         w_dict_bump_keys_version(obj);
         return Ok(true);
     }
@@ -4540,14 +4528,12 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
         let entries = w_module_dict_object_storage_mut(obj);
         let changed = !entries.is_empty();
         entries.clear();
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        strategy.mutated();
         if changed {
             w_dict_bump_keys_version(obj);
         }
     } else {
-        let strategy = &mut *(*(obj as *mut W_ModuleDictObject)).mstrategy;
-        let storage = &mut *(*(obj as *mut W_ModuleDictObject)).dstorage;
+        let strategy = w_module_dict_module_strategy_mut(obj);
+        let storage = w_module_dict_module_storage_mut(obj);
         let changed = !storage.is_empty();
         strategy.clear(storage);
         if changed {
@@ -6359,6 +6345,11 @@ pub trait DictStrategy {
 #[repr(C)]
 pub struct DictStrategyRef {
     pub imp: &'static dyn crate::dictmultiobject::DictStrategy,
+    /// GC owner of a per-dict strategy instance.  Stateless
+    /// `space.fromcache(...)` holders leave this null; a module dict's holder
+    /// points at its `ModuleDictStrategy`, matching PyPy's `mstrategy` instance
+    /// while keeping the Rust trait object behind a one-word dict slot.
+    pub owner: *mut u8,
 }
 
 /// The holders below wrap only the stateless unit-struct singletons, which are
@@ -6418,21 +6409,27 @@ pub static INT_DICT_STRATEGY: IntDictStrategy = IntDictStrategy;
 /// are zero-sized and need not be.
 pub static OBJECT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
     imp: &OBJECT_DICT_STRATEGY,
+    owner: std::ptr::null_mut(),
 };
 pub static EMPTY_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
     imp: &EMPTY_DICT_STRATEGY,
+    owner: std::ptr::null_mut(),
 };
 pub static EMPTY_KWARGS_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
     imp: &EMPTY_KWARGS_DICT_STRATEGY,
+    owner: std::ptr::null_mut(),
 };
 pub static BYTES_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
     imp: &BYTES_DICT_STRATEGY,
+    owner: std::ptr::null_mut(),
 };
 pub static UNICODE_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
     imp: &UNICODE_DICT_STRATEGY,
+    owner: std::ptr::null_mut(),
 };
 pub static INT_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
     imp: &INT_DICT_STRATEGY,
+    owner: std::ptr::null_mut(),
 };
 
 /// `dictmultiobject.py EmptyDictStrategy`.
@@ -8035,6 +8032,37 @@ mod tests {
             assert!(w_dict_delitem_str(md, "alpha"));
             assert!(w_dict_getitem_str(md, "alpha").is_none());
             assert_eq!(w_dict_len(md), 1);
+        }
+    }
+
+    #[test]
+    fn module_dict_strategy_switch_replaces_both_erased_slots() {
+        install_test_hash_hook();
+        let md = w_module_dict_new();
+        unsafe {
+            w_dict_setitem_str(md, "alpha", w_int_new(11));
+            let raw = &*(md as *const W_ModuleDictObject);
+            let module_holder = raw.mstrategy;
+            let module_storage = raw.dstorage;
+
+            w_dict_setitem(md, 7, w_int_new(22));
+
+            let raw = &*(md as *const W_ModuleDictObject);
+            assert!(w_module_dict_is_object_strategy(md));
+            assert_ne!(raw.mstrategy, module_holder);
+            assert_ne!(raw.dstorage, module_storage);
+            assert!(std::ptr::eq(
+                raw.mstrategy,
+                &OBJECT_DICT_STRATEGY_REF as *const DictStrategyRef as *mut DictStrategyRef,
+            ));
+            assert_eq!(
+                w_int_get_value(w_dict_getitem_str(md, "alpha").unwrap()),
+                11
+            );
+            assert_eq!(
+                w_int_get_value(w_dict_lookup(md, w_int_new(7)).unwrap()),
+                22,
+            );
         }
     }
 

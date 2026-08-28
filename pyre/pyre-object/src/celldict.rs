@@ -1275,7 +1275,8 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// (key, cell) from the IndexMap, mutated(), unwrap the cell, and
     /// return (`_wrapkey(space, key)`, `unwrap_cell(space, cell)`).
     /// O(1) via `IndexMap::pop`; after a `switch_to_object_strategy` the
-    /// entries live in `object_storage` and are popped already unwrapped.
+    /// entries live in ObjectDictStrategy's erased storage and are popped
+    /// already unwrapped.
     unsafe fn popitem(&self, w_dict: PyObjectRef) -> Option<(PyObjectRef, PyObjectRef)> {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage_mut_opt(w_dict)
         {
@@ -1284,14 +1285,11 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             // through this strategy, so a compiled trace that pinned a global
             // stays valid until `version` is reassigned. `delitem` pairs the
             // two calls the same way on the object-storage arm.
-            let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
-            (*module.mstrategy).mutated();
             crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
             return Some((k.obj, v));
         }
-        let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
-        let strategy = &mut *module.mstrategy;
-        let storage = &mut *module.dstorage;
+        let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);
+        let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
         let (key, cell) = storage.entries.pop()?;
         strategy.mutated();
         crate::dictmultiobject::w_dict_bump_keys_version(w_dict);
@@ -1308,8 +1306,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
         if let Some(entries) = crate::dictmultiobject::w_module_dict_object_storage(w_dict) {
             return entries.iter().rev().map(|(k, &v)| (k.obj, v)).collect();
         }
-        let module = &*(w_dict as *const crate::dictmultiobject::W_ModuleDictObject);
-        let storage = &*module.dstorage;
+        let storage = crate::dictmultiobject::w_module_dict_module_storage(w_dict);
         storage
             .entries
             .iter()
@@ -1336,8 +1333,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             }
             return new_dict;
         }
-        let module = &*(w_dict as *const crate::dictmultiobject::W_ModuleDictObject);
-        let storage = &*module.dstorage;
+        let storage = crate::dictmultiobject::w_module_dict_module_storage(w_dict);
         for (key, &cell) in storage.entries.iter() {
             let unwrapped = unwrap_cell(cell);
             let key_obj = _wrapkey(key);
@@ -1384,9 +1380,8 @@ pub unsafe fn remove_cell(w_dict: PyObjectRef, name: &str) {
     ) {
         return;
     }
-    let module = &mut *(w_dict as *mut crate::dictmultiobject::W_ModuleDictObject);
-    let strategy = &mut *module.mstrategy;
-    let storage = &mut *module.dstorage;
+    let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);
+    let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
     let Some(w_value) = strategy.getitem_str(storage, name) else {
         return;
     };

@@ -855,6 +855,11 @@ crate::py_module! {
                         semlock_rebuild,
                     )),
                 );
+                // PyPy `W_SemLock.typedef` owns `descr_new` in its rawdict,
+                // so `TypeDef.acceptable_as_base_class` is true.  This manual
+                // type installs the same descriptor after construction;
+                // reflect that rawdict result on its own TypeDef now.
+                pyre_object::w_type_set_acceptable_as_base_class(semlock_type, true);
             }
 
             crate::module_ns_store(
