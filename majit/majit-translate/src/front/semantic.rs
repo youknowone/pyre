@@ -510,16 +510,12 @@ impl<'a> MirGraphLookup<'a> {
 /// deletion — without it the pass would hand `policy::look_inside_graph` a
 /// flag on exactly the graphs it aborts on.
 ///
-/// One half of the minter is NOT reproduced here. `rlib/jit.py`'s `hint`
-/// entry only sets the flag when the value is a `SomeInstance` whose
-/// classdesc declares `_virtualizable_`, and deletes it otherwise; this pass
-/// seeds on the `OpKind::Hint` op whatever the value is. Reproducing it needs
-/// the virtualizable class-root set at front-end time, and pyre declares that
-/// set out of band as a data table the BUILD SCRIPT turns into
-/// `GraphTransformConfig::vable_fields` for the codewriter, so the check
-/// cannot be made without threading that config into `front::mir`. Until
-/// then, a hint spelled on a non-virtualizable value would seed where
-/// upstream erases.
+/// `rlib/jit.py`'s `hint` entry only mints the flag for a `SomeInstance`
+/// whose classdesc declares `_virtualizable_`, and deletes it on every other
+/// value. `virtualizable_roots` is that declaration, registered out of band
+/// by the consumer (`virtualizable_decl`), and `class_roots` is how far the
+/// lowered graph records the analogue of `s_x.classdef`. A hint on a value
+/// whose root is unrecorded or undeclared seeds nothing — the erasing branch.
 ///
 /// A callee that does not resolve to a lowered function is skipped entirely
 /// — it can neither be flagged nor veto a flag, since there is no graph for
@@ -528,30 +524,30 @@ impl<'a> MirGraphLookup<'a> {
 /// the `(receiver root, method leaf)` pair, and an ambiguous pair is treated
 /// as unresolved.
 ///
-/// On the interpreter's own graph the first under-approximation is the one
-/// that binds, and it binds everywhere. `eval::dispatch` is the clearest
-/// case: the seed reaches `handle_jitexception`'s argument, that callee
-/// resolves, and it is still not flagged, because `handle_jitexception` is
-/// also reached from callers holding no hinted frame. Nearly every callee a
-/// hinted frame reaches is reached that way too, so the flag lands on no
-/// graph at all until pyre can specialize a second one. That leans the safe
-/// way — `policy::look_inside_graph` aborts on a flag it cannot honour, and
-/// the suppression the flag would buy (dropping a `jit_force_virtualizable`)
-/// has no injector on this path yet — but it means the gate is quiet by
-/// absence, not by agreement, and a census is the only way to tell which.
+/// Measured on the interpreter's own graph, of the five hint sites only
+/// `eval::dispatch` seeds — the one whose hinted value is a `&mut PyFrame`,
+/// so `class_roots` reads `PyFrame` off the parameter's `Ref` leaf. The two
+/// frame constructors hint a `PyFrame` held BY VALUE, and the front end
+/// re-mints that aggregate's `Variable` between the transparent constructor
+/// and its uses without an op this pass follows, so its root is unrecorded
+/// and the minter's class test fails closed.
+///
+/// Even the site that seeds flags nothing, and the first under-approximation
+/// is why. The seed reaches `handle_jitexception`'s argument and that callee
+/// resolves, but `handle_jitexception` is also reached from callers holding
+/// no hinted frame. Nearly every callee a hinted frame reaches is reached
+/// that way too, so the flag lands on no graph until pyre can specialize a
+/// second one. That leans the safe way — `policy::look_inside_graph` aborts
+/// on a flag it cannot honour, and the suppression the flag would buy
+/// (dropping a `jit_force_virtualizable`) has no injector on this path yet —
+/// but it means the gate is quiet by absence, not by agreement, and a census
+/// is the only way to tell which.
 pub(crate) fn propagate_access_directly(
     functions: &mut [SemanticFunction],
     dont_look_inside: &std::collections::HashSet<String>,
+    virtualizable_roots: &std::collections::HashSet<String>,
 ) {
-    use std::collections::HashMap;
-
-    fn path_of(f: &SemanticFunction) -> String {
-        if f.module_path.is_empty() {
-            f.name.clone()
-        } else {
-            format!("{}::{}", f.module_path, f.name)
-        }
-    }
+    use std::collections::{HashMap, HashSet};
 
     // `None` marks a path more than one lowered function answers to.
     // `cachedgraph(key)` upstream is keyed on the `FunctionDesc`, i.e. the
@@ -585,12 +581,52 @@ pub(crate) fn propagate_access_directly(
             .or_insert(Some(i));
     }
 
-    // Indexed by the same position as `functions`, so the inner loop tests a
-    // bool instead of rebuilding a path string per call op.
-    let opaque: Vec<bool> = functions
-        .iter()
-        .map(|f| dont_look_inside.contains(&path_of(f)))
-        .collect();
+    // Everything below is derived once, because none of it depends on which
+    // parameters are flagged: the call edges, the aliasing pairs a seed
+    // travels along, and the seeds the hints themselves mint. Only the
+    // flagged-parameter seeds change between rounds.
+    let mut edges: Vec<Vec<(usize, usize, u64)>> = Vec::with_capacity(functions.len());
+    let mut aliases: Vec<Vec<(u64, u64)>> = Vec::with_capacity(functions.len());
+    let mut hint_seeds: Vec<HashSet<u64>> = Vec::with_capacity(functions.len());
+    let mut killed: Vec<HashSet<u64>> = Vec::with_capacity(functions.len());
+    for func in functions.iter() {
+        aliases.push(alias_pairs(func));
+        let (seeds, dead) = hint_seed_sets(func, virtualizable_roots);
+        hint_seeds.push(seeds);
+        killed.push(dead);
+        let mut func_edges = Vec::new();
+        for block in &func.graph.blocks {
+            for op in &block.operations {
+                let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
+                    continue;
+                };
+                let Some(callee) = resolve_callee(target, &index, &method_index) else {
+                    continue;
+                };
+                // `default_specialize` reads `_jit_look_inside_` off the
+                // callee and, when it is False, DELETES `access_directly`
+                // from the argument annotation instead of specializing — so a
+                // `dont_look_inside` graph is never flagged, no matter which
+                // caller reaches it. Dropping the edge here is that deletion:
+                // the argument neither flags the callee nor travels further
+                // through it.
+                if dont_look_inside.contains(&path_of(&functions[callee])) {
+                    continue;
+                }
+                for (pos, arg) in args.iter().enumerate() {
+                    func_edges.push((callee, pos, arg.id()));
+                }
+            }
+        }
+        edges.push(func_edges);
+    }
+    // Close the hint seeds over the aliases once: they never change.
+    for (i, seeds) in hint_seeds.iter_mut().enumerate() {
+        close_ids_over_aliases(&aliases[i], seeds);
+        let mut dead = killed[i].clone();
+        close_ids_over_aliases(&aliases[i], &mut dead);
+        seeds.retain(|id| !dead.contains(id));
+    }
 
     // Per function, the parameter positions that arrive carrying the flag.
     let mut flagged_params: Vec<Vec<usize>> = vec![Vec::new(); functions.len()];
@@ -603,34 +639,24 @@ pub(crate) fn propagate_access_directly(
     for _round in 0..=functions.len() {
         // (flagged, unflagged) call-site counts per callee parameter.
         let mut reaching: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
-        for func in functions.iter() {
-            let seeds = access_directly_seeds(func, &flagged_params, &index);
-            for block in &func.graph.blocks {
-                for op in &block.operations {
-                    let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
-                        continue;
-                    };
-                    let Some(callee) = resolve_callee(target, &index, &method_index) else {
-                        continue;
-                    };
-                    // `default_specialize` reads `_jit_look_inside_` off the
-                    // callee and, when it is False, DELETES `access_directly`
-                    // from the argument annotation instead of specializing —
-                    // so a `dont_look_inside` graph is never flagged, no
-                    // matter which caller reaches it. Skipping it here is
-                    // that deletion: the argument neither flags the callee
-                    // nor travels further through it.
-                    if opaque[callee] {
-                        continue;
+        for (i, func) in functions.iter().enumerate() {
+            let mut seeds = hint_seeds[i].clone();
+            if !flagged_params[i].is_empty() {
+                let inputargs = &func.graph.block(func.graph.startblock).inputargs;
+                for &pos in &flagged_params[i] {
+                    if let Some(arg) = inputargs.get(pos) {
+                        seeds.insert(arg.id());
                     }
-                    for (pos, arg) in args.iter().enumerate() {
-                        let slot = reaching.entry((callee, pos)).or_insert((0, 0));
-                        if seeds.iter().any(|seed| seed == arg) {
-                            slot.0 += 1;
-                        } else {
-                            slot.1 += 1;
-                        }
-                    }
+                }
+                close_ids_over_aliases(&aliases[i], &mut seeds);
+                seeds.retain(|id| !killed[i].contains(id));
+            }
+            for &(callee, pos, arg) in &edges[i] {
+                let slot = reaching.entry((callee, pos)).or_insert((0, 0));
+                if seeds.contains(&arg) {
+                    slot.0 += 1;
+                } else {
+                    slot.1 += 1;
                 }
             }
         }
@@ -655,21 +681,34 @@ pub(crate) fn propagate_access_directly(
     }
 }
 
-/// The variables in `func` that carry the `access_directly` flag: the ones an
-/// `access_directly` hint produced, plus the parameters a caller passed one
-/// to. `hint` is the identity, so both its operand and its result denote the
-/// flagged value.
-fn access_directly_seeds(
+fn path_of(f: &SemanticFunction) -> String {
+    if f.module_path.is_empty() {
+        f.name.clone()
+    } else {
+        format!("{}::{}", f.module_path, f.name)
+    }
+}
+
+/// The seeds the hint ops themselves mint, and the values the
+/// `access_directly=False` spelling strips.
+///
+/// `rlib/jit.py`'s `hint` entry sets the flag only when the value is a
+/// `SomeInstance` whose classdesc declares `_virtualizable_`, and deletes it
+/// on every other value. `virtualizable_roots` is that declaration set,
+/// supplied by the consumer the same way the codewriter's `vable_fields` is,
+/// and `class_roots` is how far the lowered graph records the analogue of
+/// `s_x.classdef`. A value whose root the graph does not record is not seeded,
+/// which is the erasing branch.
+fn hint_seed_sets(
     func: &SemanticFunction,
-    flagged_params: &[Vec<usize>],
-    index: &std::collections::HashMap<String, Option<usize>>,
-) -> Vec<crate::flowspace::model::Variable> {
-    let mut seeds = Vec::new();
-    // `hint(x, access_directly=False)` deletes the flags rather than setting
-    // them, so its RESULT is unflagged even when its operand was. Upstream
-    // gets that from re-binding the name to the stripped annotation; here the
-    // result variable has to be excluded from the seeds by hand.
-    let mut killed = Vec::new();
+    virtualizable_roots: &std::collections::HashSet<String>,
+) -> (
+    std::collections::HashSet<u64>,
+    std::collections::HashSet<u64>,
+) {
+    let roots = class_roots(func);
+    let mut seeds = std::collections::HashSet::new();
+    let mut killed = std::collections::HashSet::new();
     for block in &func.graph.blocks {
         for op in &block.operations {
             let crate::model::OpKind::Hint { value, kind } = &op.kind else {
@@ -680,41 +719,128 @@ fn access_directly_seeds(
                 // `access_directly`, so both spellings seed.
                 crate::hints::HintKind::AccessDirectly
                 | crate::hints::HintKind::FreshVirtualizable => {
-                    seeds.push(value.clone());
+                    let virtualizable = roots
+                        .get(&value.id())
+                        .is_some_and(|root| virtualizable_roots.contains(root));
+                    if !virtualizable {
+                        continue;
+                    }
+                    seeds.insert(value.id());
                     if let Some(result) = &op.result {
-                        seeds.push(result.clone());
+                        seeds.insert(result.id());
                     }
                 }
+                // `hint(x, access_directly=False)` deletes the flags rather
+                // than setting them, so its RESULT is unflagged even when its
+                // operand was. Upstream gets that from re-binding the name to
+                // the stripped annotation; here the result has to be excluded
+                // by hand.
                 crate::hints::HintKind::NoAccessDirectly => {
                     if let Some(result) = &op.result {
-                        killed.push(result.clone());
+                        killed.insert(result.id());
                     }
                 }
                 _ => {}
             }
         }
     }
-    let self_path = if func.module_path.is_empty() {
-        func.name.clone()
-    } else {
-        format!("{}::{}", func.module_path, func.name)
-    };
-    if let Some(Some(me)) = index.get(&self_path).copied() {
-        let inputargs = &func.graph.block(func.graph.startblock).inputargs;
-        for &pos in &flagged_params[me] {
-            if let Some(arg) = inputargs.get(pos) {
-                seeds.push(arg.clone());
+    (seeds, killed)
+}
+
+/// The class root each value carries, as far as the lowered graph records it.
+///
+/// Upstream reads `s_x.classdef.classdesc` straight off the annotation. The
+/// LLBC front end records the same identity in three places — a parameter's
+/// `class_root` or `Ref` leaf, a call's `result_ty` leaf, and the `<Root>`
+/// segment of a representation-cast marker — and carries it across `Hint` ops
+/// and `Link`s, which is why this walks to a fixpoint.
+fn class_roots(func: &SemanticFunction) -> std::collections::HashMap<u64, String> {
+    use crate::model::{CallTarget, OpKind, ValueType};
+
+    fn leaf_root(ty: &ValueType) -> Option<&str> {
+        match ty {
+            ValueType::Ref(Some(root)) => Some(root.as_str()),
+            _ => None,
+        }
+    }
+
+    let mut roots: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for block in &func.graph.blocks {
+        for op in &block.operations {
+            let Some(result) = &op.result else {
+                continue;
+            };
+            let root = match &op.kind {
+                OpKind::Input { ty, class_root, .. } => class_root
+                    .as_deref()
+                    .or_else(|| leaf_root(ty))
+                    .map(str::to_string),
+                OpKind::Call {
+                    target, result_ty, ..
+                } => leaf_root(result_ty).map(str::to_string).or_else(|| {
+                    match target {
+                        // A struct literal names the type it builds; the
+                        // front end spells one as a transparent ctor.
+                        CallTarget::SyntheticTransparentCtor {
+                            name, is_struct, ..
+                        } if *is_struct => Some(name.clone()),
+                        // `__cast_pointer/<Root>` and
+                        // `__cast_instance_intrinsic/<Root>` carry the target
+                        // class in the path.
+                        CallTarget::FunctionPath { segments }
+                            if is_representation_cast(segments) =>
+                        {
+                            segments.get(1).cloned()
+                        }
+                        _ => None,
+                    }
+                }),
+                _ => None,
+            };
+            if let Some(root) = root {
+                roots.insert(result.id(), root);
             }
         }
     }
-    // A hinted value reaches its callee through the front end's
-    // representation casts, which are `same_as` once lowered; follow them on
-    // both sets so a cast neither loses a flag nor smuggles a killed one
-    // past the `access_directly=False` spelling.
-    close_over_aliases(func, &mut seeds);
-    close_over_aliases(func, &mut killed);
-    seeds.retain(|seed| !killed.iter().any(|dead| dead == seed));
-    seeds
+    // `Hint` and `Link` are identity for the class; propagate across both.
+    loop {
+        let mut grew = false;
+        for block in &func.graph.blocks {
+            for op in &block.operations {
+                let OpKind::Hint { value, .. } = &op.kind else {
+                    continue;
+                };
+                let (Some(result), Some(root)) =
+                    (op.result.as_ref(), roots.get(&value.id()).cloned())
+                else {
+                    continue;
+                };
+                if roots.insert(result.id(), root).is_none() {
+                    grew = true;
+                }
+            }
+            for link in &block.exits {
+                let target = func.graph.block(link.target);
+                for (pos, arg) in link.args.iter().enumerate() {
+                    let (Some(arg), Some(inputarg)) =
+                        (arg.as_variable(), target.inputargs.get(pos))
+                    else {
+                        continue;
+                    };
+                    let Some(root) = roots.get(&arg.id()).cloned() else {
+                        continue;
+                    };
+                    if roots.insert(inputarg.id(), root).is_none() {
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    roots
 }
 
 /// The leaf segment of a lowered function's name.
@@ -779,61 +905,53 @@ fn is_representation_cast(segments: &[String]) -> bool {
     )
 }
 
-/// Extend `vars` with every value that aliases one already in it, to a
-/// fixpoint: across a representation cast, and across a `Link` into the
-/// `inputarg` it binds.
+/// Every `(from, to)` pair a value aliases along: a `Link` into the
+/// `inputarg` it binds, and a representation cast into its result.
 ///
 /// The link half is what upstream gets for free. `annotator.py` propagates an
 /// annotation along a `Link` into the target block's `inputargs`, so a value
-/// that crosses a block boundary keeps its `SomeInstance.flags`. Pyre's
-/// front end mints a fresh `Variable` for each `inputarg`, exactly as
+/// that crosses a block boundary keeps its `SomeInstance.flags`. Pyre's front
+/// end mints a fresh `Variable` for each `inputarg`, exactly as
 /// `flowspace/model.py` does, so without this the flag dies at the first
 /// branch — and every hint site in the interpreter has one between the hint
 /// and the calls that consume the frame.
-fn close_over_aliases(func: &SemanticFunction, vars: &mut Vec<crate::flowspace::model::Variable>) {
-    loop {
-        let mut grew = false;
-        let mut admit =
-            |v: &crate::flowspace::model::Variable,
-             vars: &mut Vec<crate::flowspace::model::Variable>| {
-                if !vars.iter().any(|seen| seen == v) {
-                    vars.push(v.clone());
-                    true
-                } else {
-                    false
-                }
+fn alias_pairs(func: &SemanticFunction) -> Vec<(u64, u64)> {
+    let mut pairs = Vec::new();
+    for block in &func.graph.blocks {
+        for op in &block.operations {
+            let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
             };
-        for block in &func.graph.blocks {
-            for op in &block.operations {
-                let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
-                    continue;
-                };
-                let crate::model::CallTarget::FunctionPath { segments } = target else {
-                    continue;
-                };
-                if !is_representation_cast(segments) {
-                    continue;
-                }
-                let (Some(src), Some(result)) = (args.first(), op.result.as_ref()) else {
-                    continue;
-                };
-                if vars.iter().any(|v| v == src) {
-                    grew |= admit(result, vars);
+            let crate::model::CallTarget::FunctionPath { segments } = target else {
+                continue;
+            };
+            if !is_representation_cast(segments) {
+                continue;
+            }
+            if let (Some(src), Some(result)) = (args.first(), op.result.as_ref()) {
+                pairs.push((src.id(), result.id()));
+            }
+        }
+        for link in &block.exits {
+            let target = func.graph.block(link.target);
+            for (pos, arg) in link.args.iter().enumerate() {
+                if let (Some(arg), Some(inputarg)) = (arg.as_variable(), target.inputargs.get(pos))
+                {
+                    pairs.push((arg.id(), inputarg.id()));
                 }
             }
-            for link in &block.exits {
-                let target = func.graph.block(link.target);
-                for (pos, arg) in link.args.iter().enumerate() {
-                    let Some(arg) = arg.as_variable() else {
-                        continue;
-                    };
-                    let Some(inputarg) = target.inputargs.get(pos) else {
-                        continue;
-                    };
-                    if vars.iter().any(|v| v == arg) {
-                        grew |= admit(inputarg, vars);
-                    }
-                }
+        }
+    }
+    pairs
+}
+
+/// Extend `ids` along `pairs` to a fixpoint.
+fn close_ids_over_aliases(pairs: &[(u64, u64)], ids: &mut std::collections::HashSet<u64>) {
+    loop {
+        let mut grew = false;
+        for (from, to) in pairs {
+            if ids.contains(from) {
+                grew |= ids.insert(*to);
             }
         }
         if !grew {
@@ -872,9 +990,9 @@ mod tests {
         use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
 
         let mut f = free_fn(name);
-        let start = f.graph.startblock;
         let param = Variable::named("frame");
-        f.graph.block_mut(start).inputargs = vec![param.clone()];
+        declare_frame_param(&mut f, &param);
+        let start = f.graph.startblock;
         let hinted = Variable::named("hinted");
         if let Some(kind) = hint {
             f.graph.block_mut(start).operations.push(SpaceOperation {
@@ -933,9 +1051,9 @@ mod tests {
         use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
 
         let mut f = free_fn(name);
-        let start = f.graph.startblock;
         let param = Variable::named("frame");
-        f.graph.block_mut(start).inputargs = vec![param.clone()];
+        declare_frame_param(&mut f, &param);
+        let start = f.graph.startblock;
         let hinted = Variable::named("hinted");
         f.graph.block_mut(start).operations.push(SpaceOperation {
             result: Some(hinted.clone()),
@@ -975,6 +1093,30 @@ mod tests {
         f
     }
 
+    /// Declare `param` a `PyFrame`-rooted input on `f`'s startblock, the way
+    /// `front::mir` records a typed pointer parameter. Without it the minter's
+    /// class test has nothing to read and the hint seeds nothing.
+    fn declare_frame_param(f: &mut SemanticFunction, param: &crate::flowspace::model::Variable) {
+        use crate::model::{OpKind, SpaceOperation, ValueType};
+        let start = f.graph.startblock;
+        f.graph.block_mut(start).inputargs = vec![param.clone()];
+        f.graph.block_mut(start).operations.push(SpaceOperation {
+            result: Some(param.clone()),
+            kind: OpKind::Input {
+                name: "frame".to_string(),
+                ty: ValueType::Ref(Some("PyFrame".to_string())),
+                class_root: None,
+            },
+        });
+    }
+
+    /// The `_virtualizable_` declaration the tests hint against. Every test
+    /// helper types its hinted value `Ref(Some("PyFrame"))`, so this is the
+    /// set that makes the minter's class test pass.
+    fn vable_roots() -> std::collections::HashSet<String> {
+        ["PyFrame".to_string()].into()
+    }
+
     fn flags(functions: &[SemanticFunction]) -> Vec<(String, bool)> {
         functions
             .iter()
@@ -996,7 +1138,7 @@ mod tests {
             ),
             free_fn("handle_bytecode"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert_eq!(
             flags(&fns),
             vec![
@@ -1020,7 +1162,7 @@ mod tests {
             caller_hinting_arg0("handle_bytecode", None, &[("execute", 1)]),
             free_fn("execute"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert_eq!(
             flags(&fns)
                 .into_iter()
@@ -1045,7 +1187,7 @@ mod tests {
             ),
             impl_method_qualified("PyFrame", "initialize_frame_scopes"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(!fns[0].graph.access_directly);
         assert!(
             fns[1].graph.access_directly,
@@ -1063,7 +1205,7 @@ mod tests {
             impl_method_qualified("PyFrame", "run"),
             impl_method_qualified("PyFrame", "run"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(!fns[1].graph.access_directly);
         assert!(!fns[2].graph.access_directly);
     }
@@ -1079,9 +1221,9 @@ mod tests {
         use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
 
         let mut caller = free_fn("dispatch");
-        let start = caller.graph.startblock;
         let param = Variable::named("frame");
-        caller.graph.block_mut(start).inputargs = vec![param.clone()];
+        declare_frame_param(&mut caller, &param);
+        let start = caller.graph.startblock;
         let hinted = Variable::named("hinted");
         caller
             .graph
@@ -1118,7 +1260,7 @@ mod tests {
         caller.graph.set_goto(start, body, vec![hinted]);
 
         let mut fns = vec![caller, impl_method_qualified("PyFrame", "handle_bytecode")];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
             fns[1].graph.access_directly,
             "a Link must carry the flag into the successor's inputarg"
@@ -1135,10 +1277,33 @@ mod tests {
             caller_hinting_into_method("app_profile_call", true, "PyFrame", "getclass"),
             impl_method_qualified("PyFrame", "getclass"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
             fns[1].graph.access_directly,
             "a representation cast must not lose the flag"
+        );
+    }
+
+    /// `rlib/jit.py`'s `hint` entry mints the flag only for a `SomeInstance`
+    /// whose classdesc declares `_virtualizable_`, and deletes it on every
+    /// other value. A hint spelled on something the consumer never declared
+    /// must therefore seed nothing — otherwise a stray hint hands
+    /// `policy::look_inside_graph` a flag it aborts on.
+    #[test]
+    fn a_hint_on_an_undeclared_root_seeds_nothing() {
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("handle_bytecode", 1)],
+            ),
+            free_fn("handle_bytecode"),
+        ];
+        // The hinted value is rooted `PyFrame`, but nothing declares it.
+        propagate_access_directly(&mut fns, &Default::default(), &Default::default());
+        assert!(
+            !fns[1].graph.access_directly,
+            "a hint on an undeclared class must not seed"
         );
     }
 
@@ -1158,7 +1323,7 @@ mod tests {
             free_fn("residual"),
         ];
         let opaque: std::collections::HashSet<String> = ["residual".to_string()].into();
-        propagate_access_directly(&mut fns, &opaque);
+        propagate_access_directly(&mut fns, &opaque, &vable_roots());
         assert!(
             !fns[1].graph.access_directly,
             "a dont_look_inside callee must never carry the flag"
@@ -1179,7 +1344,7 @@ mod tests {
             free_fn("handle_bytecode"),
             free_fn("handle_bytecode"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(!fns[1].graph.access_directly);
         assert!(!fns[2].graph.access_directly);
     }
@@ -1198,7 +1363,7 @@ mod tests {
             caller_hinting_arg0("other_caller", None, &[("handle_bytecode", 1)]),
             free_fn("handle_bytecode"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
             !fns[2].graph.access_directly,
             "reached with and without the flag must stay unflagged"
@@ -1253,7 +1418,7 @@ mod tests {
             mid,
             free_fn("call_function"),
         ];
-        propagate_access_directly(&mut fns, &Default::default());
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(
             fns[1].graph.access_directly,
             "app_profile_call itself is reached with the flag"
@@ -1278,14 +1443,26 @@ mod tests {
             free_fn("log"),
         ];
         // `log` takes the hinted value at position 0 too in this fixture, so
-        // flip it: give it only the unrelated operand.
-        let crate::model::OpKind::Call { args, .. } =
-            &mut fns[0].graph.block_mut(crate::model::BlockId(0)).operations[2].kind
-        else {
-            panic!("expected the second call")
-        };
-        args[0] = crate::flowspace::model::Variable::named("unrelated");
-        propagate_access_directly(&mut fns, &Default::default());
+        // flip it: give it only the unrelated operand.  Found by target
+        // rather than by index — the startblock also carries the parameter
+        // declaration and the hint.
+        let start = fns[0].graph.startblock;
+        let log_call = fns[0]
+            .graph
+            .block_mut(start)
+            .operations
+            .iter_mut()
+            .find_map(|op| match &mut op.kind {
+                crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if segments.last().is_some_and(|leaf| leaf == "log") => Some(args),
+                _ => None,
+            })
+            .expect("the log call");
+        log_call[0] = crate::flowspace::model::Variable::named("unrelated");
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
         assert!(fns[1].graph.access_directly, "handle_bytecode is flagged");
         assert!(!fns[2].graph.access_directly, "log is not");
     }

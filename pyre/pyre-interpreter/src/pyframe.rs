@@ -5804,7 +5804,7 @@ pub fn createframe_obj(
     ));
     let locals_cells_stack_w =
         unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc) };
-    let frame = FrameBox::new(PyFrame {
+    let frame = PyFrame {
         ob_header: frame_ob_header(),
         pycode: _roots.get(root_base) as *const (),
         locals_cells_stack_w,
@@ -5819,14 +5819,17 @@ pub fn createframe_obj(
         w_yielding_from: PY_NULL,
         f_backref: std::ptr::null_mut(),
         w_builtin: _roots.get(root_base + 2),
-    });
+    };
     // pyframe.py `__init__` — `self = hint(self, access_directly=True,
     // fresh_virtualizable=True)`.  Upstream spells the two kwargs on one
-    // `hint()`; pyre dispatches one helper per kwarg, and both precede the
-    // globals store as `__init__` does.
-    let mut frame = majit_metainterp::jit::hint_fresh_virtualizable(
+    // `hint()`; pyre dispatches one helper per kwarg.  On the frame itself,
+    // before the box: `self` upstream is the frame, and the propagation reads
+    // the hinted value's class root.  Both precede the globals store, as
+    // `__init__` does.
+    let frame = majit_metainterp::jit::hint_fresh_virtualizable(
         majit_metainterp::jit::hint_access_directly(frame),
     );
+    let mut frame = FrameBox::new(frame);
     if frame_stores_global {
         frame.set_w_globals(_roots.get(root_base + 1));
     }

@@ -5522,9 +5522,10 @@ pub struct FunctionGraph {
     /// stays unflagged, because one graph per function cannot carry both
     /// access modes and `policy::look_inside_graph` aborts on a flag it
     /// cannot honour; the alias closure follows only `Link`s and the
-    /// representation casts; and the `_virtualizable_` half of the minter has
-    /// no front-end counterpart. A `false` here therefore does not mean the
-    /// value never reached the graph.
+    /// representation casts; and a value is taken for a virtualizable
+    /// instance only when the lowered graph records a class root the
+    /// consumer declared through `virtualizable_decl`. A `false` here
+    /// therefore does not mean the value never reached the graph.
     pub access_directly: bool,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
