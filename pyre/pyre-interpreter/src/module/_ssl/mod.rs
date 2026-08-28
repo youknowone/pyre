@@ -747,6 +747,36 @@ mod context_methods {
         }
 
         #[getter]
+        fn keylog_filename(&self) -> PyObjectRef {
+            self.keylog_filename
+        }
+
+        #[setter]
+        fn set_keylog_filename(&mut self, value: PyObjectRef) -> Result<(), crate::PyError> {
+            // PyPy `_SSLContext.keylog_filename` accepts exactly str or None,
+            // closes the old BIO first, opens the replacement in append mode,
+            // and retains the original Python str object for the getter.
+            if unsafe { is_none(value) } {
+                native_result(unsafe {
+                    pyre_native::ssl::context_set_keylog_filename(self.backend, None)
+                })?;
+                pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+                self.keylog_filename = w_none();
+                return Ok(());
+            }
+            if !unsafe { crate::baseobjspace::isinstance_str_w(value) } {
+                return Err(crate::PyError::type_error("str path expected"));
+            }
+            let path = fs_path(value)?;
+            native_result(unsafe {
+                pyre_native::ssl::context_set_keylog_filename(self.backend, Some(&path))
+            })?;
+            pyre_object::gc_hook::try_gc_write_barrier(self as *mut W_SSLContext as *mut u8);
+            self.keylog_filename = value;
+            Ok(())
+        }
+
+        #[getter]
         fn num_tickets(&self) -> i64 {
             self.num_tickets as i64
         }
@@ -1545,6 +1575,8 @@ mod ssl_socket_methods {
                     PumpExit::Interrupted => {
                         crate::module::signal::interp_signal::checksignals_now()?
                     }
+                    PumpExit::Failed { write, code }
+                        if wait_for_transport(transport, fd, write, code)? => {}
                     exit => return Err(pump_error(transport, exit)),
                 }
             }
@@ -1561,6 +1593,7 @@ mod ssl_socket_methods {
             // after them.
             let transport = transport_socket(socket)?;
             let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
+            crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, true)?;
             let sent = match crate::module::_socket::interp_socket::socket_send_bytes(
                 transport, fd, &data, 0,
             ) {
@@ -1690,6 +1723,25 @@ mod ssl_socket_methods {
         }
     }
 
+    /// `_ssl_select`: a transport call that could not proceed waits for the
+    /// half it needs, and the exchange resumes where it stopped.  Only a
+    /// socket carrying a positive timeout has anything to wait for — a
+    /// blocking one never reports would-block, and a non-blocking one owes its
+    /// caller the `WANT_READ`/`WANT_WRITE` it is asking for — so this is also
+    /// where an exchange that outlasts its socket's timeout is cut off, with
+    /// the `TimeoutError` `wait_for_data` raises.
+    fn wait_for_transport(
+        transport: PyObjectRef,
+        fd: crate::module::_socket::rsocket_rffi::Socket,
+        write: bool,
+        code: i32,
+    ) -> Result<bool, crate::PyError> {
+        if !crate::module::_socket::rsocket_rffi::error_is_would_block(code) {
+            return Ok(false);
+        }
+        crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, write)
+    }
+
     /// The exception a released run's transport failure raises, once the
     /// interpreter is back.  Every caller answers the exits that are not
     /// failures - and `Rejected`, whose alert has to go out first - before
@@ -1775,6 +1827,7 @@ mod ssl_socket_methods {
 
         let transport = transport_socket(socket)?;
         let fd = crate::module::_socket::interp_socket::socket_fd(transport)?;
+        crate::module::_socket::interp_socket::socket_wait_for_data(transport, fd, false)?;
         let mut buf = vec![0u8; 32 * 1024];
         let read = match crate::module::_socket::interp_socket::socket_recv_bytes(
             transport, fd, &mut buf, 0,
@@ -2019,6 +2072,11 @@ mod ssl_socket_methods {
                             crate::module::signal::interp_signal::checksignals_now()?;
                             continue;
                         }
+                        PumpExit::Failed { write, code }
+                            if wait_for_transport(transport, fd, write, code)? =>
+                        {
+                            continue;
+                        }
                         PumpExit::Rejected(error) => {
                             // rustls may have queued the fatal alert describing
                             // this protocol error. Send it before unwinding so
@@ -2129,6 +2187,8 @@ mod ssl_socket_methods {
                         PumpExit::Interrupted => {
                             crate::module::signal::interp_signal::checksignals_now()?
                         }
+                        PumpExit::Failed { write, code }
+                            if wait_for_transport(transport, fd, write, code)? => {}
                         PumpExit::Rejected(error) => {
                             // rustls may have queued the fatal alert describing
                             // this protocol error. Send it before unwinding so
@@ -2327,6 +2387,11 @@ mod ssl_socket_methods {
                 self.shutdown_started = true;
             }
             flush_transport(self)?;
+            // A `MemoryBIO` pair has no descriptor to wait on, so
+            // `_ssl_select` answers `SOCKET_IS_NONBLOCKING` for it and
+            // `shutdown` leaves the loop with the error `SSL_shutdown` last
+            // reported.  Until the peer's close-notify has been fed in, that
+            // is `WANT_READ`.
             if !unsafe { is_none(self.incoming) } {
                 receive_transport(self)?;
                 if !unsafe { pyre_native::ssl::connection_peer_closed(self.backend) } {

@@ -2578,9 +2578,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
     );
     upa1(
         &mut entries,
-        "pyre_object::dictmultiobject::dict_entries_capacity",
-        "pyre_object::dict_entries_capacity",
-        pyre_object::dictmultiobject::dict_entries_capacity,
+        "pyre_object::dictmultiobject::dict_entries_generation",
+        "pyre_object::dict_entries_generation",
+        pyre_object::dictmultiobject::dict_entries_generation,
+    );
+    upa1(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_slot_count",
+        "pyre_object::dict_entries_slot_count",
+        pyre_object::dictmultiobject::dict_entries_slot_count,
     );
     upa3(
         &mut entries,

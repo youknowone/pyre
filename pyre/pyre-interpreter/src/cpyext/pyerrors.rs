@@ -85,14 +85,6 @@ pub(super) fn trap<T>(result: Result<T, crate::PyError>) -> Option<T> {
     }
 }
 
-/// Raise a `TypeError` from a C entry point handed the wrong kind of object.
-pub(super) fn bad_argument<T>(function: &str) -> Option<T> {
-    set_pending_error(crate::PyError::type_error(format!(
-        "bad argument type for built-in operation {function}()"
-    )));
-    None
-}
-
 // ── the StopIteration mirror ────────────────────────────────────────────
 
 /// C-visible `PyStopIterationObject`, the twin of the struct in
@@ -978,9 +970,9 @@ pub unsafe extern "C" fn PyTraceBack_Print(tb: *mut CPyObject, file: *mut CPyObj
     }
     let roots = pyre_object::gc_roots::push_roots();
     let traceback_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(traceback);
+    let _ = roots.pin_root(traceback);
     let file_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(file);
+    let _ = roots.pin_root(file);
     let reload = pyre_object::gc_roots::shadow_stack_get;
     let header = crate::baseobjspace::call_method(
         reload(file_slot),
@@ -996,7 +988,7 @@ pub unsafe extern "C" fn PyTraceBack_Print(tb: *mut CPyObject, file: *mut CPyObj
         return -1;
     };
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    roots.pin_root(module);
+    let _ = roots.pin_root(module);
     let printed = crate::baseobjspace::call_method(
         reload(module_slot),
         "print_tb",

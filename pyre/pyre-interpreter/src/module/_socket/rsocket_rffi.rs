@@ -172,17 +172,41 @@ pub fn error_is_interrupted(code: i32) -> bool {
     code == ws::WSAEINTR
 }
 
-/// Whether a code means the operation would have blocked.  A positive timeout
-/// is carried by `SO_RCVTIMEO`/`SO_SNDTIMEO`, whose expiry WinSock reports as
-/// `WSAETIMEDOUT` rather than as a would-block, so both spell the same
-/// `TimeoutError` here.
+/// Whether a code means the operation would have blocked.  PyPy keeps every
+/// socket with a non-negative timeout in non-blocking mode and brackets the
+/// actual operation with `RSocket._select`, so this is the result of a raced
+/// readiness notification rather than a kernel socket-option timeout.
 #[cfg(unix)]
 pub fn error_is_would_block(code: i32) -> bool {
     code == libc::EAGAIN || code == libc::EWOULDBLOCK
 }
 #[cfg(windows)]
 pub fn error_is_would_block(code: i32) -> bool {
-    code == ws::WSAEWOULDBLOCK || code == ws::WSAETIMEDOUT
+    code == ws::WSAEWOULDBLOCK
+}
+
+/// `rsocket.py HAVE_SOCK_CLOEXEC` / `HAVE_SOCK_NONBLOCK`: the two creation
+/// flags Linux carries inside `socket()`'s type argument.  A host without them
+/// gets zero, which makes both the mask and the test that read them the
+/// no-ops the `HAVE_*` guards stand for.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const SOCK_CLOEXEC: libc::c_int = libc::SOCK_CLOEXEC;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const SOCK_CLOEXEC: libc::c_int = 0;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const SOCK_NONBLOCK: libc::c_int = libc::SOCK_NONBLOCK;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const SOCK_NONBLOCK: libc::c_int = 0;
+
+/// The non-blocking `connect` result for which `RSocket._connect` waits for
+/// writability before reading `SO_ERROR`.
+#[cfg(unix)]
+pub fn error_is_connect_in_progress(code: i32) -> bool {
+    code == libc::EINPROGRESS
+}
+#[cfg(windows)]
+pub fn error_is_connect_in_progress(code: i32) -> bool {
+    code == ws::WSAEWOULDBLOCK
 }
 
 /// `gai_strerror`.  Unix only: the symbol is a header-level inline over the
@@ -358,12 +382,11 @@ pub fn set_inheritable(_s: Socket, _inheritable: bool) -> std::io::Result<()> {
 // ── blocking mode and timeouts ──
 
 /// `rsocket.py:RSocket.settimeout` — put a live socket into the blocking mode
-/// a Python timeout asks for.  A negative `timeout` is the `None` sentinel
-/// (block indefinitely), `0.0` is non-blocking, and a positive one blocks with
-/// `SO_RCVTIMEO`/`SO_SNDTIMEO` bounding each wait.
-///
-/// POSIX carries the mode in the descriptor's `O_NONBLOCK` and the durations
-/// as `struct timeval`; WinSock has `FIONBIO` and a `DWORD` of milliseconds.
+/// a Python timeout asks for.  `RSocket.settimeout` calls
+/// `_setblocking(self.timeout < 0.0)`: a negative `timeout` is the `None`
+/// sentinel and blocks indefinitely, while zero and positive timeouts both
+/// leave the descriptor non-blocking.  Positive waits belong to `_select`,
+/// not to `SO_RCVTIMEO`/`SO_SNDTIMEO`.
 #[cfg(unix)]
 pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(s, libc::F_GETFL, 0) };
@@ -372,7 +395,7 @@ pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
     }
     // Bit-clear without unary `!` so the static analyzer accepts the helper
     // (the analyzer rejects bitwise-not on signed `c_int`).
-    let new_flags = if timeout == 0.0 {
+    let new_flags = if timeout >= 0.0 {
         flags | libc::O_NONBLOCK
     } else if (flags & libc::O_NONBLOCK) != 0 {
         flags - libc::O_NONBLOCK
@@ -382,61 +405,14 @@ pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
     if new_flags != flags && unsafe { libc::fcntl(s, libc::F_SETFL, new_flags) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    let tv = if timeout > 0.0 {
-        libc::timeval {
-            tv_sec: timeout.trunc() as libc::time_t,
-            tv_usec: ((timeout - timeout.trunc()) * 1_000_000.0).round() as libc::suseconds_t,
-        }
-    } else {
-        libc::timeval {
-            tv_sec: 0,
-            tv_usec: 0,
-        }
-    };
-    for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
-        let r = unsafe {
-            libc::setsockopt(
-                s,
-                libc::SOL_SOCKET,
-                option,
-                &tv as *const _ as *const libc::c_void,
-                core::mem::size_of::<libc::timeval>() as SockLen,
-            )
-        };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
     Ok(())
 }
 
 #[cfg(windows)]
 pub fn apply_timeout(s: Socket, timeout: f64) -> std::io::Result<()> {
-    let mut nonblocking: u32 = u32::from(timeout == 0.0);
+    let mut nonblocking: u32 = u32::from(timeout >= 0.0);
     if unsafe { ws::ioctlsocket(s, ws::FIONBIO, &mut nonblocking) } == ws::SOCKET_ERROR {
         return Err(last_error());
-    }
-    // `SO_RCVTIMEO` reads a millisecond count, and zero there means "no
-    // timeout"; a sub-millisecond request still has to expire, so it waits the
-    // shortest period the option can express.
-    let millis: u32 = if timeout > 0.0 {
-        ((timeout * 1000.0).round() as u64).clamp(1, u32::MAX as u64) as u32
-    } else {
-        0
-    };
-    for option in [ws::SO_RCVTIMEO, ws::SO_SNDTIMEO] {
-        let r = unsafe {
-            ws::setsockopt(
-                s,
-                ws::SOL_SOCKET,
-                option,
-                &millis as *const u32 as *const u8,
-                core::mem::size_of::<u32>() as i32,
-            )
-        };
-        if r == ws::SOCKET_ERROR {
-            return Err(last_error());
-        }
     }
     Ok(())
 }
@@ -455,6 +431,22 @@ pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
         libc::poll(&mut pollfd, 1, timeout_ms)
     })
 }
+
+/// Writable half of `RSocket._select(True)`.  Keep this beside
+/// [`poll_readable`]: both are the host spelling of `wait_for_data`, and a
+/// finite `sendall` deadline must survive handled signals instead of starting
+/// a fresh kernel timeout after every EINTR.
+#[cfg(unix)]
+pub fn poll_writable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
+    let mut pollfd = libc::pollfd {
+        fd: s,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    crate::module::thread::call_external_function(|| unsafe {
+        libc::poll(&mut pollfd, 1, timeout_ms)
+    })
+}
 #[cfg(windows)]
 pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
     poll_one(s, ws::POLLIN, timeout_ms)
@@ -462,8 +454,7 @@ pub fn poll_readable(s: Socket, timeout_ms: libc::c_int) -> (libc::c_int, i32) {
 
 /// The other half of `RSocket._select`, which `internal_connect` waits on: a
 /// connection started in non-blocking mode reports its outcome by making the
-/// socket writable.  Windows-only because `SO_SNDTIMEO` already bounds a
-/// POSIX connect.
+/// socket writable.
 ///
 /// `select` with the socket in `exceptfds` as well as `writefds`, which is how
 /// `internal_select(connect=1)` waits: a refused connection makes the socket

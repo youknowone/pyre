@@ -6780,6 +6780,14 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                     // store no hash and `w_dict_nth_hashed_key` returns `None`
                     // for them, which selects the plain walk below.
                     let source_now = resolve_dict_backing(data());
+                    // `i` names an entry slot, and a delete leaves a tombstone
+                    // between the live ones, so step to the next live slot
+                    // rather than assuming the numbering is dense.
+                    let Some(live) = pyre_object::dictmultiobject::w_dict_next_slot(source_now, i)
+                    else {
+                        break;
+                    };
+                    i = live;
                     let hashed = pyre_object::is_exact_type(source_now, &pyre_object::DICT_TYPE)
                         .then(|| pyre_object::dictmultiobject::w_dict_nth_hashed_key(source_now, i))
                         .flatten();

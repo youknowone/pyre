@@ -9175,7 +9175,12 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     match portal_activation_result(frame) {
         Ok(r) => r,
         Err(mut err) => {
-            crate::call_jit::store_jit_exception(err.to_exc_object() as i64);
+            // `ll_portal_runner_shim` is shared by compiled CALL_ASSEMBLER
+            // and `BlackholeInterpreter::bhimpl_recursive_call_*`. The former
+            // observes the backend exception cell; the latter observes
+            // `BH_LAST_EXC_VALUE` after the C ABI call returns. This is the
+            // same dual-executor boundary as every may-force residual helper.
+            crate::call_jit::publish_residual_call_exception(err.to_exc_object() as i64);
             pyre_object::PY_NULL
         }
     }

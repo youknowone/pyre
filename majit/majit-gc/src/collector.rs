@@ -938,6 +938,13 @@ pub struct MiniMarkGC {
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
     prebuilt_root_objects: Vec<usize>,
+    /// High-water capacity of [`Self::enumerate_labeled_root_walker_values`]'s
+    /// snapshot, so the next one asks the allocator once instead of growing
+    /// through it.  `collect_roots` materializes nothing upstream — it calls
+    /// `_collect_ref_stk` per root — so the reallocation ladder is pyre's own,
+    /// and it runs over every registered root on every major cycle.  A `Cell`
+    /// because the snapshot is a `&self` reader.
+    root_snapshot_capacity: std::cell::Cell<usize>,
     /// incminimark.py: objects with GCFLAG_CARDS_SET bit.
     /// Card bits are stored inline before each object's GcHeader.
     /// This list tracks which objects have at least one card bit set.
@@ -1259,6 +1266,7 @@ impl MiniMarkGC {
             roots: RootSet::new(),
             remembered_set: Vec::new(),
             prebuilt_root_objects: Vec::new(),
+            root_snapshot_capacity: std::cell::Cell::new(0),
             old_objects_with_cards_set: Vec::new(),
             young_objects_with_weakrefs: Vec::new(),
             old_objects_with_weakrefs: Vec::new(),
@@ -4839,14 +4847,21 @@ impl MiniMarkGC {
         }
 
         let type_info = self.types.get(type_id);
-        let gc_ptr_offsets: Vec<usize> = type_info.gc_ptr_offsets.clone();
+        let noffsets = type_info.gc_ptr_offsets.len();
         let items_have_gc_ptrs = type_info.items_have_gc_ptrs;
         let item_size = type_info.item_size;
         let length_offset = type_info.length_offset;
         let base_size = type_info.size;
 
         // Process fixed-part GC pointer fields.
-        for &offset in &gc_ptr_offsets {
+        //
+        // Read by index rather than over a copy of the offsets: `base.py:286-289
+        // trace` walks `offsets_to_gc_pointers(typeid)[i]` in place, and this
+        // loop runs once per traced object, so a `Vec` clone here was a malloc
+        // and a memcpy per object on the minor collector's hot path.  The major
+        // mark's equivalent already avoids it with a reusable buffer.
+        for i in 0..noffsets {
+            let offset = self.types.get(type_id).gc_ptr_offsets[i];
             let slot = (obj_addr + offset) as *mut GcRef;
             let field_ref = unsafe { *slot };
             self.assert_traced_slot_initialized(
@@ -5095,7 +5110,7 @@ impl MiniMarkGC {
     fn enumerate_labeled_root_walker_values(&self) -> Vec<(GcRef, &'static str)> {
         // incminimark.py collect_roots: root_walker.walk_roots()
         // walks the same root sets as minor collection.
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(self.root_snapshot_capacity.get());
         // Read the registered roots in place. The minor path copies this list
         // first because `drag_out_root` takes `&mut self` while it walks; here
         // the walk only reads, so the copy would be one allocation and one pass
@@ -5177,6 +5192,10 @@ impl MiniMarkGC {
         crate::shadow_stack::walk_extra_roots(|gcref| {
             result.push((*gcref, "extra_root"));
         });
+        // Monotone: the hint only ever grows, so a collection that happens to
+        // see fewer roots does not send the next one back through the ladder.
+        self.root_snapshot_capacity
+            .set(self.root_snapshot_capacity.get().max(result.len()));
         result
     }
 
@@ -5220,9 +5239,16 @@ impl MiniMarkGC {
         // seeds stack roots for a major marking cycle. Mirror the same
         // root sets as minor collection, but mark old objects instead of
         // copying nursery objects.
-        let prebuilt = self.prebuilt_root_objects.clone();
-        for addr in prebuilt {
+        // `prebuilt_root_objects.foreach(self._collect_obj, None)`
+        // (incminimark.py:2707) walks the stack in place.  Index rather than
+        // clone: `seed_prebuilt_root` only sets header flags and pushes onto
+        // the gray stack, so the list cannot move under the loop, and the
+        // clone was a full copy of every prebuilt root per major cycle.
+        let mut i = 0;
+        while i < self.prebuilt_root_objects.len() {
+            let addr = self.prebuilt_root_objects[i];
             self.seed_prebuilt_root(addr);
+            i += 1;
         }
         let mut roots = self.enumerate_labeled_root_walker_values();
         // Objects already moved to a death queue remain ordinary roots until
@@ -5655,10 +5681,11 @@ impl MiniMarkGC {
     /// bit covers internal structs that share a Python-object prefix but have
     /// no app-level typedef.
     ///
-    /// This is the single predicate behind every app-level inspector — the
-    /// `gc.get_objects` filter, the `get_rpy_*` wrap decision, and the walk
-    /// terminator in [`Self::do_get_referents`] — because upstream passes the
-    /// one `try_cast_gcref_to_w_root` to all three.
+    /// This is the predicate behind the `gc.get_objects` filter and the
+    /// `get_rpy_*` wrap decision. The referents walk has one deliberate extra
+    /// boundary: an OBJECT-layout value hidden from enumeration (the
+    /// CPython-compatible execution-frame shape described on
+    /// `TypeInfo::hide_from_app_level_inspector`) still stops traversal.
     fn is_app_level_object_ref(&self, obj: GcRef) -> bool {
         // `referents.py rgc.get_gcflag_dummy(gcref)`: a dummy stands in for
         // an object the collector no longer holds, so it is never an app-level
@@ -5677,6 +5704,30 @@ impl MiniMarkGC {
         }
         let info = self.types.get(type_id);
         info.is_object && !info.hide_from_app_level_inspector
+    }
+
+    /// Whether app-level referents inspection must stop at `obj`.
+    ///
+    /// PyPy `referents._list_w_obj_referents` stops at every valid `W_Root`.
+    /// Pyre additionally omits executing frames from `gc.get_objects()` to
+    /// match CPython, but a frame is still a Python object and
+    /// `traceback.tb_frame` remains a direct referent boundary. Looking
+    /// through it incorrectly attributes all frame locals to the traceback.
+    fn is_app_level_referent_boundary(&self, obj: GcRef) -> bool {
+        // Preserve every ordinary app-level boundary first, including
+        // prebuilt/foreign W_Root objects which are not managed by this heap.
+        if self.is_app_level_object_ref(obj) {
+            return true;
+        }
+        if !self.is_managed_heap_object(obj.0)
+            || unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
+        {
+            return false;
+        }
+        let Some(type_id) = self.get_actual_typeid(obj) else {
+            return false;
+        };
+        (type_id as usize) < self.types.len() && self.types.get(type_id).is_object
     }
 
     /// `pypy/module/gc/referents.py _list_w_obj_referents`: visit the
@@ -5734,7 +5785,7 @@ impl MiniMarkGC {
             while i < pending.len() {
                 parent = pending[i];
                 i += 1;
-                if self.is_app_level_object_ref(parent) {
+                if self.is_app_level_referent_boundary(parent) {
                     result.push(parent);
                 } else {
                     expand = true;
@@ -5764,9 +5815,12 @@ impl MiniMarkGC {
     /// roots are deliberately not repeated here: upstream repeats only
     /// `collect_nonstack_roots`, not `collect_roots`.
     fn rescan_major_nonstack_roots_and_drain(&mut self) {
-        let prebuilt = self.prebuilt_root_objects.clone();
-        for addr in prebuilt {
+        // In place, for the reason `seed_major_roots` gives.
+        let mut i = 0;
+        while i < self.prebuilt_root_objects.len() {
+            let addr = self.prebuilt_root_objects[i];
             self.seed_prebuilt_root(addr);
+            i += 1;
         }
         crate::shadow_stack::walk_extra_roots(|gcref| {
             self.seed_major_root(*gcref, "rescan_extra_root");
@@ -6455,7 +6509,12 @@ impl MiniMarkGC {
     /// the black ones gray again; this can only add survivors, never free a
     /// reachable object.
     fn rescan_major_stack_roots_black_and_drain(&mut self) {
-        for gcref in self.enumerate_root_walker_values() {
+        // The labeled list directly: `enumerate_root_walker_values` drops the
+        // labels into a second full-population `Vec` because `GcRef` and
+        // `(GcRef, &str)` are different widths, and this pass runs once per
+        // major cycle over every root.  The label is what inspection wants,
+        // not this walk.
+        for (gcref, _) in self.enumerate_labeled_root_walker_values() {
             if gcref.is_null() {
                 continue;
             }
@@ -7139,10 +7198,22 @@ impl MiniMarkGC {
         // Minor collection first to empty the nursery.
         // This is the `_minor_collection()` performed by upstream's
         // `gc_step_until(STATE_MARKING)` before it starts the fresh cycle.
+        // Upstream calls the low-level `_minor_collection`, which has no
+        // major-progress tail, so suppress this wrapper's tail the way
+        // `gc_step_until_scanning_with_minors` does.
+        let was_enabled = self.enabled;
+        self.enabled = false;
         self.do_collect_nursery();
+        self.enabled = was_enabled;
 
+        // The rest of that same `gc_step_until(STATE_MARKING)` iteration.
+        // Reaching MARKING through `major_collection_step` is what runs the
+        // STATE_SCANNING arm (incminimark.py:2438-2447), which resets
+        // `size_objects_made_old` / `threshold_objects_made_old` before
+        // `collect_roots`; calling `start_incremental_cycle` directly opened
+        // the cycle with the finishing cycle's counters still in place.
         if self.gc_state == GcState::Scanning {
-            self.start_incremental_cycle();
+            self.major_collection_step();
         }
         self.gc_step_until_scanning_with_minors();
 
@@ -9504,11 +9575,12 @@ mod tests {
         gc.roots.clear();
     }
 
-    /// `referents.py` terminates a branch on `try_cast_gcref_to_w_root`,
-    /// so the two rejections that helper opens with — the dummy flag and the
-    /// missing typedef — look *through* a node here rather than reporting it.
+    /// A hidden OBJECT is omitted from `get_objects` but remains a direct
+    /// referent boundary (the execution-frame case). A DUMMY is not a live
+    /// Python object and is still looked through, matching
+    /// `referents._list_w_obj_referents`.
     #[test]
-    fn get_referents_looks_through_a_hidden_or_dummy_node() {
+    fn get_referents_stops_at_hidden_object_and_looks_through_dummy() {
         let ptr_size = std::mem::size_of::<GcRef>();
         let mut gc = test_gc(4096);
         let object_tid = gc.register_type(TypeInfo::object_with_gc_ptrs(ptr_size, vec![0]));
@@ -9532,7 +9604,9 @@ mod tests {
 
         let mut referents = Vec::new();
         gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
-        assert_eq!(referents, vec![leaf]);
+        assert_eq!(referents, vec![hidden]);
+        assert!(!gc.is_app_level_object_ref(hidden));
+        assert!(gc.is_app_level_referent_boundary(hidden));
 
         unsafe { *(holder.0 as *mut GcRef) = dummy };
         let mut referents = Vec::new();

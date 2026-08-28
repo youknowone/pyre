@@ -2050,6 +2050,8 @@ impl PyError {
 
     /// `PySys_WriteStderr` -- one line of a report, on `sys.stderr` when there
     /// is one and on the host's stream when there is not.
+    ///
+    /// The one caller is in `cpyext`, which the same condition builds.
     #[cfg(all(
         feature = "cpyext",
         not(feature = "sandbox"),

@@ -262,6 +262,11 @@ pub const PY_TPFLAGS_STATIC_BUILTIN: std::ffi::c_ulong = 1 << 1;
 pub const PY_TPFLAGS_DISALLOW_INSTANTIATION: std::ffi::c_ulong = 1 << 7;
 pub const PY_TPFLAGS_HEAPTYPE: std::ffi::c_ulong = 1 << 9;
 pub const PY_TPFLAGS_BASETYPE: std::ffi::c_ulong = 1 << 10;
+/// PEP 590 -- the type lends its instances a `vectorcallfunc`, stored in
+/// each of them at `tp_vectorcall_offset`.  A type carrying the bit is
+/// readied with `tp_call` filled and the offset positive, so the two are
+/// read together and never apart.
+pub const PY_TPFLAGS_HAVE_VECTORCALL: std::ffi::c_ulong = 1 << 11;
 pub const PY_TPFLAGS_READY: std::ffi::c_ulong = 1 << 12;
 pub const PY_TPFLAGS_READYING: std::ffi::c_ulong = 1 << 13;
 pub const PY_TPFLAGS_HAVE_GC: std::ffi::c_ulong = 1 << 14;
@@ -2397,6 +2402,15 @@ fn inherit_mirror_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
         if (*tp).tp_vectorcall_offset == 0 {
             (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
         }
+        // A class derived in Python from a C type that lends its instances a
+        // function keeps lending it: the instance is sized by the base's
+        // `tp_basicsize`, which the caller copies for exactly that reason, and
+        // filled by the base's `tp_new`.  `fill_interpreter_slots` runs after
+        // this and installs the trampoline in `tp_call`, so the test for a
+        // `tp_call` of the subclass's own has to happen here.
+        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
+            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        }
     }
 }
 
@@ -2419,6 +2433,38 @@ pub(super) fn interpreter_type(tp: *mut CPyTypeObject) -> PyObjectRef {
         return pyre_object::PY_NULL;
     }
     unsafe { pyobject::from_ref(&raw mut (*tp).ob_base.ob_base) }
+}
+
+/// `Py_tp_vectorcall` — the class object's own call, which answers `Type(...)`
+/// instead of `__new__`/`__init__`.
+///
+/// Only a type `w_type_has_vectorcall` reports arrives here, so the mirror is
+/// the extension's own static or the block `PyType_FromSpec` leaked: both
+/// outlive the call, and neither is synthesized on demand.
+///
+/// `vectorcallfunc` takes the callable, the values, the count and the keyword
+/// names in that order, which is `METH_FASTCALL | METH_KEYWORDS` — the count
+/// goes over without `PY_VECTORCALL_ARGUMENTS_OFFSET`, the bit a caller sets
+/// only to lend the callee the slot in front of the vector.
+pub fn type_vectorcall(
+    w_type: PyObjectRef,
+    positional: &[PyObjectRef],
+    keywords: &[(String, PyObjectRef)],
+) -> Result<PyObjectRef, crate::PyError> {
+    let tp = pyobject::as_pyobj(w_type) as *mut CPyTypeObject;
+    if tp.is_null() {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SystemError,
+            "type declares a vectorcall but has no mirror",
+        ));
+    }
+    super::call_cfunction(
+        unsafe { (*tp).tp_vectorcall },
+        super::methodobject::METH_FASTCALL | super::methodobject::METH_KEYWORDS,
+        w_type,
+        positional,
+        keywords,
+    )
 }
 
 // ── slot lookup ─────────────────────────────────────────────────────────
@@ -3465,13 +3511,31 @@ fn slot_call(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, c
     if slot.is_null() {
         return Err(crate::PyError::type_error("cpyext object is not callable"));
     }
-    super::call_cfunction(
-        slot,
-        super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
-        w_self,
-        &positional,
-        &keywords,
-    )
+    // `_PyObject_VectorcallTstate`: the function the callable's type lends it
+    // answers ahead of `tp_call`, and takes the values as they already lie.
+    // The two routes end in the same function whenever `tp_call` is
+    // `PyVectorcall_Call` -- but reaching it that way builds a tuple, and a
+    // dict for the keywords, only for `_PyStack_UnpackDict` to take both apart
+    // again on the other side.  Cython gives every compiled function and
+    // `cdef` method this shape, so the round trip is most of what calling one
+    // costs.
+    //
+    // `vectorcallfunc` takes the callable, the values, the count and the
+    // keyword names, which is `METH_FASTCALL | METH_KEYWORDS`; the count goes
+    // over without `PY_VECTORCALL_ARGUMENTS_OFFSET`, the bit a caller sets only
+    // to lend the callee the slot in front of the vector.
+    let vectorcall = unsafe { super::object::vectorcall_function(pyobject::as_pyobj(w_self)) };
+    let (function, flags) = match vectorcall {
+        Some(function) => (
+            function as *const c_void,
+            super::methodobject::METH_FASTCALL | super::methodobject::METH_KEYWORDS,
+        ),
+        None => (
+            slot,
+            super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
+        ),
+    };
+    super::call_cfunction(function, flags, w_self, &positional, &keywords)
 }
 
 /// Run a `(self) -> PyObject *` slot.
@@ -4512,6 +4576,23 @@ fn inherit_slots(tp: *mut CPyTypeObject, base: *mut CPyTypeObject) {
     if base.is_null() {
         return;
     }
+    // The offset always travels, so that `PyVectorcall_Call` -- which reads it
+    // without consulting the flag -- keeps working for a subclass; the flag
+    // travels only to a subclass that leaves `tp_call` alone, and decides
+    // whether the offset is read of its own accord.
+    //
+    // Both have to happen before the copy below fills `tp_call` in, because
+    // afterwards every subclass reads as having declared one.  A subclass that
+    // does declare its own `tp_call` means it, and it is `tp_call` -- not the
+    // function its base lends instances -- that has to answer for it.
+    unsafe {
+        if (*tp).tp_vectorcall_offset == 0 {
+            (*tp).tp_vectorcall_offset = (*base).tp_vectorcall_offset;
+        }
+        if (*tp).tp_call.is_null() && (*base).tp_flags & PY_TPFLAGS_HAVE_VECTORCALL != 0 {
+            (*tp).tp_flags |= PY_TPFLAGS_HAVE_VECTORCALL;
+        }
+    }
     macro_rules! inherit {
         ($($field:ident),* $(,)?) => {
             $(
@@ -5259,6 +5340,14 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
                 pyre_object::gc_roots::shadow_stack_get(type_slot),
             );
         }
+        // `tp_vectorcall` is read off the class object itself, so it belongs
+        // to this type alone: it is in no `COPYSLOT` list, so a subclass
+        // readies with the null it declared and takes the ordinary route.
+        if !(*tp).tp_vectorcall.is_null() {
+            pyre_object::typeobject::w_type_set_has_vectorcall(
+                pyre_object::gc_roots::shadow_stack_get(type_slot),
+            );
+        }
     };
     // `finish_type_2`'s `pto.c_tp_mro`, once there is a type to read one off.
     {
@@ -5695,6 +5784,10 @@ fn apply_slot(tp: *mut CPyTypeObject, id: c_int, value: *mut c_void) -> Result<(
         TP_TRAVERSE => own!(tp_traverse, *const c_void),
         TP_FINALIZE => own!(tp_finalize, *const c_void),
         TP_FREE => own!(tp_free, *const c_void),
+        // `typeslots.inc`'s last entry but one, `{-1, offsetof(PyTypeObject,
+        // tp_vectorcall)}`: the field is written like any other, and it is
+        // `PyType_Ready` that arms the type for it.
+        TP_VECTORCALL => own!(tp_vectorcall, *const c_void),
         // `Py_tp_bases` is a tuple, which the caller may also pass through
         // `PyType_FromSpecWithBases`; both land in `single_base`.
         TP_BASES => {
@@ -6176,6 +6269,7 @@ pub unsafe extern "C" fn PyType_GetSlot(tp: *mut CPyTypeObject, id: c_int) -> *m
         TP_RICHCOMPARE => unsafe { (*tp).tp_richcompare },
         TP_SETATTRO => unsafe { (*tp).tp_setattro },
         TP_STR => unsafe { (*tp).tp_str },
+        TP_VECTORCALL => unsafe { (*tp).tp_vectorcall },
         _ => std::ptr::null(),
     };
     value as *mut c_void

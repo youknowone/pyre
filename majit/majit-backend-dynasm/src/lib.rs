@@ -77,9 +77,9 @@ pub fn majit_j2plan_log_enabled() -> bool {
 /// Read once per residual call and twice per compiled-trace entry, so the
 /// uncached form put `getenv` on the hottest paths the backend has.
 pub fn gc_freelist_diag_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_FREELIST_DIAG").is_some());
-    *ENABLED
+    // One cache for the whole process: `majit_gc` reads the same variable in
+    // `free_arena`.
+    majit_gc::gc_freelist_diag_enabled()
 }
 
 /// Whether `MAJIT_DYNASM_EXEC_DIAG` is set, cached at first access.

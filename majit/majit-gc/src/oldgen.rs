@@ -18,6 +18,13 @@ const DEFAULT_PAGE_SIZE: usize = 1024 * WORD;
 const DEFAULT_ARENA_SIZE: usize = 65536 * WORD;
 const SMALL_REQUEST_THRESHOLD: usize = 35 * WORD;
 
+/// Width of the rawmalloc page filter, as a power of two.  16 bits is an 8 KB
+/// table, one allocation for the process — wide enough that the live large
+/// objects of an ordinary heap leave most of it clear, which is what makes the
+/// "no" answer worth asking for.
+const RAWMALLOC_PAGE_FILTER_BITS_LOG2: u32 = 16;
+const RAWMALLOC_PAGE_FILTER_WORDS: usize = (1 << RAWMALLOC_PAGE_FILTER_BITS_LOG2) / 64;
+
 /// incminimark.py `old_rawmalloced_objects` entry.  The list shape is kept
 /// because upstream individually frees objects above the small threshold.
 struct RawMallocedObject {
@@ -51,6 +58,24 @@ pub struct OldGen {
     /// incminimark.py:1219-1221 and 2153-2158.  Unlike the removed F2-era
     /// payload side table, it has no entry for ordinary arena survivors.
     rawmalloced_payloads: AddressSet,
+    /// One bit per page of `rawmalloced_payloads` address, so a miss can be
+    /// answered by a load and a test instead of a hash of the whole set.
+    ///
+    /// Every asker that reaches the set has already been rejected by the
+    /// nursery range and the arena index, so it is either a large object or
+    /// not a GC object at all — an immortal builtin, or a `malloc_typed` type
+    /// object.  On a heap with nothing but the interpreter loaded those
+    /// non-objects are the overwhelming majority of the traffic, and the
+    /// filter answers them without touching the table.
+    ///
+    /// Over-admission is harmless: a set bit sends the address to the exact
+    /// set behind it, which still decides.  [`Self::rawmalloced_pages_freed`]
+    /// keeps the over-admission bounded.
+    rawmalloced_pages: Box<[u64; RAWMALLOC_PAGE_FILTER_WORDS]>,
+    /// Payloads dropped since the filter was last rebuilt.  A free cannot
+    /// clear a bit — another live payload may share the page — so the filter
+    /// is rebuilt from the set once the dropped count passes what is left.
+    rawmalloced_pages_freed: usize,
     rawmalloced_total_size: usize,
     /// incminimark.py:386,1073-1074 `rawmalloced_peak_size`.
     rawmalloced_peak_size: usize,
@@ -74,6 +99,8 @@ impl OldGen {
             young_rawmalloced_payloads: AddressSet::default(),
             raw_malloc_might_sweep: Vec::new(),
             rawmalloced_payloads: AddressSet::default(),
+            rawmalloced_pages: Box::new([0; RAWMALLOC_PAGE_FILTER_WORDS]),
+            rawmalloced_pages_freed: 0,
             rawmalloced_total_size: 0,
             rawmalloced_peak_size: 0,
             poison_on_alloc: std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some(),
@@ -178,8 +205,10 @@ impl OldGen {
             unsafe { ptr::write_bytes(raw, 0, card_header_bytes) };
         }
         let header_ptr = unsafe { raw.add(card_header_bytes) };
-        self.rawmalloced_payloads
-            .insert(header_ptr as usize + GcHeader::SIZE);
+        let payload = header_ptr as usize + GcHeader::SIZE;
+        self.rawmalloced_payloads.insert(payload);
+        let (word, mask) = Self::rawmalloced_page_slot(payload);
+        self.rawmalloced_pages[word] |= mask;
         self.rawmalloced_total_size += alloc_size;
         self.rawmalloced_peak_size = self.rawmalloced_peak_size.max(self.rawmalloced_total_size);
         Some((
@@ -234,6 +263,8 @@ impl OldGen {
     /// Runs at the END of the minor collection, after every root and every
     /// remembered old parent has had its chance to stamp the flag.
     pub fn free_young_rawmalloced_objects(&mut self) {
+        // Once, above the loop: see `sweep_arenas_step`.
+        let log_free = crate::gc_lifetime_log_enabled();
         let young = std::mem::take(&mut self.young_rawmalloced_objects);
         self.young_rawmalloced_payloads.clear();
         for object in young {
@@ -243,7 +274,7 @@ impl OldGen {
                 self.old_rawmalloced_objects.push(object);
                 continue;
             }
-            if crate::gc_lifetime_log_enabled() {
+            if log_free {
                 eprintln!(
                     "[gc][free] addr={:#x} type_id={} kind=raw-young",
                     object.header_addr + GcHeader::SIZE,
@@ -255,6 +286,7 @@ impl OldGen {
                 .rawmalloced_payloads
                 .remove(&(object.header_addr + GcHeader::SIZE));
             debug_assert!(removed);
+            self.note_rawmalloced_payload_freed();
             unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
         }
     }
@@ -359,6 +391,8 @@ impl OldGen {
     /// Process at most `nobjects` candidates and return the unused part of the
     /// budget, exactly like the upstream routine.
     pub fn sweep_rawmalloc_step(&mut self, mut nobjects: usize) -> usize {
+        // Once, above the loop: see `sweep_arenas_step`.
+        let log_free = crate::gc_lifetime_log_enabled();
         while !self.raw_malloc_might_sweep.is_empty() && nobjects > 0 {
             let object = self.raw_malloc_might_sweep.pop().unwrap();
             let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
@@ -366,7 +400,7 @@ impl OldGen {
                 hdr.clear_flag(flags::VISITED);
                 self.old_rawmalloced_objects.push(object);
             } else {
-                if crate::gc_lifetime_log_enabled() {
+                if log_free {
                     eprintln!(
                         "[gc][free] addr={:#x} type_id={} kind=raw",
                         object.header_addr + GcHeader::SIZE,
@@ -378,6 +412,7 @@ impl OldGen {
                     .rawmalloced_payloads
                     .remove(&(object.header_addr + GcHeader::SIZE));
                 debug_assert!(removed);
+                self.note_rawmalloced_payload_freed();
                 unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
             }
             nobjects -= 1;
@@ -392,6 +427,12 @@ impl OldGen {
 
     /// incminimark.py:2549-2555: sweep at most `max_pages` frozen arena pages.
     pub fn sweep_arenas_step(&mut self, max_pages: usize) -> bool {
+        // Read the diagnostic gate once, outside the per-block callback:
+        // `gc_lifetime_log_enabled` is a `LazyLock`, so its acquire load
+        // cannot be hoisted out of the loop the closure inlines into.
+        // `_free_if_unvisited` (incminimark.py:2650-2656) is a flag test, a
+        // flag clear and a return.
+        let log_free = crate::gc_lifetime_log_enabled();
         self.ac.mass_free_incremental(
             &mut |header_ptr| unsafe {
                 let hdr = &mut *(header_ptr as *mut GcHeader);
@@ -399,7 +440,7 @@ impl OldGen {
                     hdr.clear_flag(flags::VISITED);
                     false
                 } else {
-                    if crate::gc_lifetime_log_enabled() {
+                    if log_free {
                         eprintln!(
                             "[gc][free] addr={:#x} type_id={} kind=arena",
                             header_ptr as usize + GcHeader::SIZE,
@@ -456,9 +497,52 @@ impl OldGen {
         self.ac.contains(obj_addr) || self.rawmalloced_contains(obj_addr)
     }
 
-    #[inline(never)]
+    /// Split again inside: the filter test inlines into `contains`, the hashed
+    /// lookup does not.
+    ///
+    /// Upstream never asks whether an address belongs to its heap at all —
+    /// RPython's type system settles it, so `visit` reads header flags
+    /// straight off the child (incminimark.py:2793-2798).  pyre's hybrid heap
+    /// has to ask, and the answer for an off-GC or arena address is "no", so
+    /// make that answer a load and a test rather than a hash of the whole set.
+    #[inline]
     fn rawmalloced_contains(&self, obj_addr: usize) -> bool {
-        !self.rawmalloced_payloads.is_empty() && self.rawmalloced_payloads.contains(&obj_addr)
+        let (word, mask) = Self::rawmalloced_page_slot(obj_addr);
+        self.rawmalloced_pages[word] & mask != 0 && self.rawmalloced_payload_set_contains(obj_addr)
+    }
+
+    #[inline(never)]
+    fn rawmalloced_payload_set_contains(&self, obj_addr: usize) -> bool {
+        self.rawmalloced_payloads.contains(&obj_addr)
+    }
+
+    /// The filter word and bit an address's page maps to.
+    ///
+    /// The page number is spread over the whole word before it is truncated,
+    /// for the reason `AddressHasher::spread` gives: consecutive pages differ
+    /// only in their low bits, so taking those bits alone would pile a whole
+    /// heap region onto a short run of the table.
+    #[inline]
+    fn rawmalloced_page_slot(addr: usize) -> (usize, u64) {
+        let spread = ((addr >> 12) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let bit = (spread >> (64 - RAWMALLOC_PAGE_FILTER_BITS_LOG2)) as usize;
+        (bit >> 6, 1u64 << (bit & 63))
+    }
+
+    /// Account for a dropped payload, rebuilding the filter once the dropped
+    /// count has passed what is left in the set.
+    fn note_rawmalloced_payload_freed(&mut self) {
+        self.rawmalloced_pages_freed += 1;
+        if self.rawmalloced_pages_freed <= self.rawmalloced_payloads.len() {
+            return;
+        }
+        self.rawmalloced_pages_freed = 0;
+        let mut pages = Box::new([0u64; RAWMALLOC_PAGE_FILTER_WORDS]);
+        for &payload in self.rawmalloced_payloads.iter() {
+            let (word, mask) = Self::rawmalloced_page_slot(payload);
+            pages[word] |= mask;
+        }
+        self.rawmalloced_pages = pages;
     }
 
     pub fn mark_visited(obj_addr: usize) {

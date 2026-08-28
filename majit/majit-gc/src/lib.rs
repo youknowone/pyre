@@ -152,6 +152,19 @@ pub fn gc_lifetime_log_enabled() -> bool {
     *ENABLED
 }
 
+/// `MAJIT_GC_FREELIST_DIAG` — dump the intra-page free lists around an arena
+/// release.
+///
+/// Read once, for the reason [`gc_lifetime_log_enabled`] gives: the gate opens
+/// `free_arena`, which runs at the end of every completed sweep, and upstream's
+/// whole-arena-empty branch (minimarkpage.py:404-411) touches no environment
+/// at all.
+pub fn gc_freelist_diag_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_GC_FREELIST_DIAG").is_some());
+    *ENABLED
+}
+
 /// `MAJIT_LOG`, read once — the same gate `majit_metainterp::majit_log_enabled`
 /// caches, for the collector's own per-collection sites.
 pub fn majit_log_enabled() -> bool {
@@ -1323,7 +1336,14 @@ impl GcAllocator for GcHandle {
         gc_sync::gc_op(|gc| gc.alloc_oldgen_typed(type_id, size))
     }
     fn write_barrier(&mut self, obj: GcRef) {
-        gc_sync::gc_op_with_root(obj, |gc, obj| gc.write_barrier(obj))
+        // No root bracket: the barrier neither allocates nor collects, so
+        // nothing inside it can move `obj`.  `do_write_barrier` /
+        // `remember_young_pointer` (collector.rs) read headers, append to the
+        // host-allocated `remembered_set`, and clear a tid flag — which is why
+        // upstream inlines the barrier at the store (framework.py:533-537) and
+        // publishes no shadow-stack root anywhere in it.  Restore the bracket
+        // if the remembered set ever becomes GC-managed.
+        gc_sync::gc_op(|gc| gc.write_barrier(obj))
     }
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.jit_remember_young_pointer_from_array(obj))
@@ -2880,16 +2900,28 @@ pub fn gc_mark_finalizer_run(addr: usize) {
 /// allocator with its own nursery, which a single published pair cannot
 /// describe, so that path disarms this permanently
 /// ([`disarm_published_nursery`]).
-static PUBLISHED_NURSERY_START: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static PUBLISHED_NURSERY_END: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-static PUBLISHED_NURSERY_TAGGED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static PUBLISHED_NURSERY_ARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static PUBLISHED_NURSERY_REFUSED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+///
+/// One object rather than five statics: upstream answers `is_in_nursery` from
+/// `self.nursery` and `self.nursery_top`, two adjacent fields of the GC, so
+/// the whole query is one address and two loads.  Five separate statics cost
+/// the query one address materialization each, and can spread the answer over
+/// as many cache lines.
+#[repr(C)]
+struct PublishedNursery {
+    start: std::sync::atomic::AtomicUsize,
+    end: std::sync::atomic::AtomicUsize,
+    tagged: std::sync::atomic::AtomicBool,
+    armed: std::sync::atomic::AtomicBool,
+    refused: std::sync::atomic::AtomicBool,
+}
+
+static PUBLISHED_NURSERY: PublishedNursery = PublishedNursery {
+    start: std::sync::atomic::AtomicUsize::new(0),
+    end: std::sync::atomic::AtomicUsize::new(0),
+    tagged: std::sync::atomic::AtomicBool::new(false),
+    armed: std::sync::atomic::AtomicBool::new(false),
+    refused: std::sync::atomic::AtomicBool::new(false),
+};
 
 /// Publish the singleton's nursery bounds.  A `None` from `nursery_bounds`
 /// (a stub allocator, or one whose nursery is not a fixed range) leaves the
@@ -2901,24 +2933,30 @@ static PUBLISHED_NURSERY_REFUSED: std::sync::atomic::AtomicBool =
 /// for; the hook path they replace is no more synchronized, since the swap
 /// behind it is not atomic against a query either.
 pub fn publish_singleton_nursery(gc: &dyn GcAllocator) {
-    PUBLISHED_NURSERY_ARMED.store(false, std::sync::atomic::Ordering::Release);
-    if PUBLISHED_NURSERY_REFUSED.load(std::sync::atomic::Ordering::Acquire) {
+    let n = &PUBLISHED_NURSERY;
+    n.armed.store(false, std::sync::atomic::Ordering::Release);
+    if n.refused.load(std::sync::atomic::Ordering::Acquire) {
         return;
     }
     let Some((start, end)) = gc.nursery_bounds() else {
         return;
     };
-    PUBLISHED_NURSERY_START.store(start, std::sync::atomic::Ordering::Relaxed);
-    PUBLISHED_NURSERY_END.store(end, std::sync::atomic::Ordering::Relaxed);
-    PUBLISHED_NURSERY_TAGGED.store(gc.taggedpointers(), std::sync::atomic::Ordering::Relaxed);
-    PUBLISHED_NURSERY_ARMED.store(true, std::sync::atomic::Ordering::Release);
+    n.start.store(start, std::sync::atomic::Ordering::Relaxed);
+    n.end.store(end, std::sync::atomic::Ordering::Relaxed);
+    n.tagged
+        .store(gc.taggedpointers(), std::sync::atomic::Ordering::Relaxed);
+    n.armed.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Permanently retire the published fast path: a per-thread allocator box is
 /// in play, so "the nursery" is no longer a single process-wide range.
 pub fn disarm_published_nursery() {
-    PUBLISHED_NURSERY_REFUSED.store(true, std::sync::atomic::Ordering::Release);
-    PUBLISHED_NURSERY_ARMED.store(false, std::sync::atomic::Ordering::Release);
+    PUBLISHED_NURSERY
+        .refused
+        .store(true, std::sync::atomic::Ordering::Release);
+    PUBLISHED_NURSERY
+        .armed
+        .store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Whether `addr` is a live object in the active backend's nursery.
@@ -2927,17 +2965,28 @@ pub fn disarm_published_nursery() {
 /// that matter are the per-pin / per-barrier queries next door.
 #[inline]
 pub fn gc_is_nursery_object(addr: usize) -> bool {
-    if PUBLISHED_NURSERY_ARMED.load(std::sync::atomic::Ordering::Acquire) {
-        // `is_nursery_object_start` = `is_valid_gc_object && is_in_nursery`.
-        if addr == 0
-            || (PUBLISHED_NURSERY_TAGGED.load(std::sync::atomic::Ordering::Relaxed)
-                && addr & 1 == 1)
-        {
-            return false;
-        }
-        return addr >= PUBLISHED_NURSERY_START.load(std::sync::atomic::Ordering::Relaxed)
-            && addr < PUBLISHED_NURSERY_END.load(std::sync::atomic::Ordering::Relaxed);
+    let n = &PUBLISHED_NURSERY;
+    if n.armed.load(std::sync::atomic::Ordering::Acquire) {
+        // `is_nursery_object_start` = `is_valid_gc_object && is_in_nursery`,
+        // with the range test first because it is what answers almost every
+        // query.  It subsumes the null half of `is_valid_gc_object`: a null
+        // is below any published `start`, and a `start` left at 0 by an
+        // allocator with no fixed range leaves `end` at 0 too, which rejects
+        // everything.  The tagged half cannot be folded in — an odd word can
+        // land inside the range by coincidence — but it rides behind the
+        // range test rather than ahead of it.
+        return addr >= n.start.load(std::sync::atomic::Ordering::Relaxed)
+            && addr < n.end.load(std::sync::atomic::Ordering::Relaxed)
+            && !(n.tagged.load(std::sync::atomic::Ordering::Relaxed) && addr & 1 == 1);
     }
+    unpublished_is_nursery_object(addr)
+}
+
+/// [`gc_is_nursery_object`] before the singleton publishes its nursery, and
+/// for a process whose per-thread allocator boxes retired the published range.
+#[cold]
+#[inline(never)]
+fn unpublished_is_nursery_object(addr: usize) -> bool {
     match ACTIVE_GC_IS_NURSERY_OBJECT.get() {
         Some(f) => f(addr),
         None if gc_sync::is_initialized() => {
@@ -2982,13 +3031,14 @@ pub fn gc_current_object_address(addr: usize) -> usize {
 /// compare pair.
 #[inline]
 pub fn published_nursery_window() -> Option<(usize, usize, bool)> {
-    if !PUBLISHED_NURSERY_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+    let n = &PUBLISHED_NURSERY;
+    if !n.armed.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }
     Some((
-        PUBLISHED_NURSERY_START.load(std::sync::atomic::Ordering::Relaxed),
-        PUBLISHED_NURSERY_END.load(std::sync::atomic::Ordering::Relaxed),
-        PUBLISHED_NURSERY_TAGGED.load(std::sync::atomic::Ordering::Relaxed),
+        n.start.load(std::sync::atomic::Ordering::Relaxed),
+        n.end.load(std::sync::atomic::Ordering::Relaxed),
+        n.tagged.load(std::sync::atomic::Ordering::Relaxed),
     ))
 }
 

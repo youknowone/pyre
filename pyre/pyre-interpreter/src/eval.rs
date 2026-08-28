@@ -891,6 +891,52 @@ unsafe fn walk_depth(f: &PyFrame, arr: &FixedObjectArray) -> usize {
     f.valuestackdepth.max(f.stack_base()).min(arr.len())
 }
 
+/// The module dicts one [`walk_pyframe_roots_area`] pass has already walked.
+///
+/// A frame chain names the same globals dict once per frame from that module,
+/// and every frame on it names the same builtins dict, so the per-frame cell
+/// walk ran over the same storage as many times as there were frames.  Upstream
+/// reaches an object once per collection because `_collect_obj` sets VISITED
+/// before pushing it (incminimark.py:2739-2752); these dicts carry no such
+/// mark of their own — a Box-immortal one has no GC header at all — so the
+/// pass carries the marks itself.
+///
+/// The window is fixed because the walk must not allocate: a frame chain names
+/// a handful of distinct module dicts, and past the window every further one is
+/// walked again, which is what every one of them got before.
+struct WalkedModuleDicts {
+    seen: [usize; Self::CAPACITY],
+    len: usize,
+}
+
+impl WalkedModuleDicts {
+    /// Above the number of loaded modules a frame chain can name, so the
+    /// degradation past it stays theoretical: an interpreter with 184 modules
+    /// imported still puts every distinct globals dict a stack can reach
+    /// inside one 1 KB stack array.
+    const CAPACITY: usize = 128;
+
+    fn new() -> Self {
+        Self {
+            seen: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// Whether `w_dict` still needs walking on this pass, recording it if so.
+    fn claim(&mut self, w_dict: PyObjectRef) -> bool {
+        let addr = w_dict as usize;
+        if addr == 0 || self.seen[..self.len].contains(&addr) {
+            return false;
+        }
+        if self.len < Self::CAPACITY {
+            self.seen[self.len] = addr;
+            self.len += 1;
+        }
+        true
+    }
+}
+
 /// Walk one captured thread's active frame and interpreter root state.
 ///
 /// # Safety
@@ -932,6 +978,10 @@ pub unsafe fn walk_pyframe_roots_area(
         || pyre_object::gc_roots::prebuilt_roots_dirty()
         || !gc_prebuilt_remember_enabled();
     let cf = unsafe { &*area.current_frame };
+    // Kept across the whole frame loop: the dicts it names repeat, the walk
+    // does not have to.  Not shared with `walk_import_roots_area` below, whose
+    // `forward` visits strictly more per slot.
+    let mut walked_module_dicts = WalkedModuleDicts::new();
     {
         // Forward `CURRENT_FRAME` itself: when the top frame is a
         // nursery-allocated `PyFrame`
@@ -1135,17 +1185,21 @@ pub unsafe fn walk_pyframe_roots_area(
                         visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
                         walk_raw_function_roots(*slot, visitor);
                     };
-                    pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
-                        live_obj,
-                        &mut forward,
-                    );
+                    if walked_module_dicts.claim(live_obj) {
+                        pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
+                            live_obj,
+                            &mut forward,
+                        );
+                    }
                     let w_builtin = (*frame).w_builtin;
                     if !w_builtin.is_null() && pyre_object::is_module(w_builtin) {
                         let w_builtin_dict = pyre_object::w_module_get_w_dict(w_builtin);
-                        pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
-                            w_builtin_dict,
-                            &mut forward,
-                        );
+                        if walked_module_dicts.claim(w_builtin_dict) {
+                            pyre_object::dictmultiobject::w_module_dict_walk_gc_cells(
+                                w_builtin_dict,
+                                &mut forward,
+                            );
+                        }
                     }
                 }
                 let f = &*frame;
@@ -1854,9 +1908,11 @@ pub fn handle_exception_with_context(
     if err.exc_object.is_null() {
         err.exc_object = exc_obj;
     }
-    // Implicit __context__ chaining: any exception raised while another is being
-    // handled records that active exception as its __context__, not only an
-    // explicit `raise`.
+    // PyPy `PyFrame.handle_bytecode` calls `OperationError.record_context`
+    // only on the ordinary OperationError arm. `RaiseWithExplicitTraceback`
+    // (RERAISE) goes straight to `handle_operation_error(attach_tb=False)`:
+    // the same exception is still propagating and must not acquire the
+    // exception handled by an intervening finally block as a new context.
     //
     // `error.py record_context` records it once and then marks the
     // OperationError, so the frames the SAME error merely unwinds through never
@@ -1864,7 +1920,7 @@ pub fn handle_exception_with_context(
     // error outward because the dispatch loop moves the same value into
     // `Err(err)` on propagation.  The mark is set below whether or not an active
     // exception was found, mirroring the `finally`.
-    if !err.context_recorded {
+    if err.attach_tb && !err.context_recorded {
         let active = match context_source {
             ContextSource::GeneratorChain => get_sys_exception(),
             ContextSource::ResumedFrameOnly => get_current_exception(),
@@ -4471,6 +4527,13 @@ impl OpcodeStepExecutor for PyFrame {
                     frame.last_instr as i64,
                 );
             }
+            // `record_application_traceback` publishes a propagating error in
+            // `IN_FLIGHT_EXCEPTION`. This wrapper is no longer propagating:
+            // CHECK_EG_MATCH has transferred it to the value stack and
+            // `sys_exc_value`, exactly as `push_exc_info` does for an ordinary
+            // caught exception. Leaving the side channel set makes the
+            // temporary group a permanent collector root after POP_EXCEPT.
+            set_in_flight_exception(pyre_object::PY_NULL);
         }
         Ok(())
     }

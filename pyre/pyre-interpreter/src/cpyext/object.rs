@@ -1610,6 +1610,39 @@ type VectorcallFunc = unsafe extern "C" fn(
     *mut CPyObject,
 ) -> *mut CPyObject;
 
+/// `_PyVectorcall_FunctionInline` -- the function a callable's type lends it,
+/// read out of the callable itself at the offset the type names.
+///
+/// The flag and the offset are one fact in two places: `type_ready_pre_checks`
+/// refuses a type that sets the bit without filling `tp_call` and a positive
+/// offset, so the bit alone answers whether the read is meant.  Upstream
+/// asserts the offset instead of testing it, which is a wild read in a build
+/// with assertions off; the test costs a compare and cannot be the thing that
+/// goes wrong.
+///
+/// A null stored at the offset is not an error -- `_PyObject_VectorcallTstate`
+/// answers `NULL` for it and its caller falls back to `tp_call`.
+///
+/// # Safety
+/// `raw` must be a live mirror, and its type's `tp_vectorcall_offset` must
+/// describe that mirror's own storage -- which is what the flag asserts.
+pub(super) unsafe fn vectorcall_function(raw: *mut CPyObject) -> Option<VectorcallFunc> {
+    if raw.is_null() {
+        return None;
+    }
+    let tp = unsafe { (*raw).ob_type };
+    if tp.is_null()
+        || unsafe { (*tp).tp_flags } & super::typeobject::PY_TPFLAGS_HAVE_VECTORCALL == 0
+    {
+        return None;
+    }
+    let offset = unsafe { (*tp).tp_vectorcall_offset };
+    if offset <= 0 {
+        return None;
+    }
+    unsafe { *((raw as *mut u8).offset(offset) as *const Option<VectorcallFunc>) }
+}
+
 /// `PyVectorcall_Call(callable, tuple, dict)` — the tuple/dict spelling of a
 /// vectorcall, which is what a type's `tp_call` is set to when it declares one
 /// (`src/call.c PyVectorcall_Call`).

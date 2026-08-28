@@ -201,11 +201,18 @@ impl RootStack {
         }
     }
 
-    /// Address of slot `index`, panicking exactly like indexing did.
+    /// Address of slot `index`.
     #[inline(always)]
     fn slot(&self, index: usize) -> *mut PyObjectRef {
-        assert!(index < self.len(), "shadow-stack index out of range");
-        // SAFETY: bounds-checked against the live length just above.
+        // Debug-only, because upstream reaches a shadow-stack slot by pointer
+        // arithmetic off `root_stack_top` with no check at all
+        // (shadowstack.py:76-88 stores at a compile-time colour offset).
+        // A panic path in the release body is a call, which forces a stack
+        // frame onto `normalize_published_slot` and keeps it from inlining
+        // into the pin it belongs to.  Every caller claimed `index` from
+        // `incr_stack` inside a bracket that is still open.
+        debug_assert!(index < self.len(), "shadow-stack index out of range");
+        // SAFETY: the claimed index is inside the live buffer.
         unsafe { self.base.get().add(index) }
     }
 }
@@ -303,9 +310,17 @@ fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
 /// collection between argument marshalling and the callee's root push rewrites
 /// the value the callee sees.  A native JIT call copies the argument into the
 /// host ABI first: its jitframe home is rewritten, but that register/stack copy
-/// can still name the forwarding stub when the callee publishes it.  Follow
-/// same-thread nursery forwarding unconditionally before applying the
-/// free-threaded synchronization path.
+/// can still name the forwarding stub when the callee publishes it, so follow
+/// nursery forwarding once here.
+///
+/// One query answers it.  `gc_current_object_address` is a nursery range
+/// compare plus, for a nursery address, the `is_forwarded` header test
+/// (`incminimark.py:1235-1252`); a forwarding target is always an old-gen
+/// address, so asking a second time about the value the first store left can
+/// only return it unchanged.  Nor does the slot need re-reading for a foreign
+/// mutator: it is *published*, which is exactly what lets a foreign root walk
+/// rewrite it in place, the same protocol upstream relies on and the reason
+/// its mutator never asks whether a root has moved.
 #[inline]
 fn normalize_published_slot(stack: &RootStack, index: usize) -> PyObjectRef {
     if let Some((start, end, tagged)) = majit_gc::published_nursery_window()
@@ -386,25 +401,14 @@ fn normalize_published_run(stack: &RootStack, base: usize, len: usize) -> bool {
 fn normalize_published_slot_hooked(stack: &RootStack, index: usize) -> PyObjectRef {
     // SAFETY: callers claimed `index` before entering this helper and keep the
     // surrounding RootScope alive throughout it.
-    let mut root = unsafe { *stack.slot(index) };
+    let slot = stack.slot(index);
+    let root = unsafe { *slot };
     let current = majit_gc::gc_current_object_address(root as usize) as PyObjectRef;
     if current != root {
         // SAFETY: same live slot.
-        unsafe { *stack.slot(index) = current };
-        root = current;
+        unsafe { *slot = current };
     }
-    if !majit_gc::gc_sync::foreign_mutator_seen() {
-        return root;
-    }
-    // This query is a safepoint.  The slot already contains the locally
-    // normalized value and is therefore safe for a foreign root walk.
-    root = unsafe { *stack.slot(index) };
-    let normalized = crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
-    if normalized != root {
-        // SAFETY: same live slot.
-        unsafe { *stack.slot(index) = normalized };
-    }
-    normalized
+    current
 }
 
 /// `increase_root_stack_depth(new_depth)` (`rlib/rgc.py` →

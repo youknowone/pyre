@@ -1731,7 +1731,6 @@ class GeneralModuleTests(unittest.TestCase):
             except socket.gaierror:
                 pass
 
-    @unittest.skipIf(_testcapi is None, "requires _testcapi")
     def test_getaddrinfo_int_port_overflow(self):
         # gh-74895: Test that getaddrinfo does not raise OverflowError on port.
         #
@@ -1745,7 +1744,19 @@ class GeneralModuleTests(unittest.TestCase):
         # prior to 3.12 did for ints outside of a [LONG_MIN, LONG_MAX] range.
         # Leave the error up to the underlying string based platform C API.
 
-        from _testcapi import ULONG_MAX, LONG_MAX, LONG_MIN
+        if _testcapi is None:
+            # `_testcapi` only supplies platform C integer limits here.  Pyre
+            # deliberately does not provide a partial test-helper module, so
+            # derive the same values from the native `long` ABI and keep the
+            # public getaddrinfo behavior covered.
+            long_bits = struct.calcsize("@l") * 8
+            LONG_MAX = (1 << (long_bits - 1)) - 1
+            LONG_MIN = -(1 << (long_bits - 1))
+            ULONG_MAX = (1 << long_bits) - 1
+        else:
+            ULONG_MAX = _testcapi.ULONG_MAX
+            LONG_MAX = _testcapi.LONG_MAX
+            LONG_MIN = _testcapi.LONG_MIN
         try:
             socket.getaddrinfo(None, ULONG_MAX + 1, type=socket.SOCK_STREAM)
         except OverflowError:
@@ -5720,6 +5731,7 @@ class UnbufferedFileObjectClassTestCase(FileObjectClassTestCase):
 
     @unittest.skipUnless(hasattr(sys, 'getrefcount'),
                          'test needs sys.getrefcount()')
+    @support.refcount_test
     def testMakefileCloseSocketDestroy(self):
         refcount_before = sys.getrefcount(self.cli_conn)
         self.read_file.close()

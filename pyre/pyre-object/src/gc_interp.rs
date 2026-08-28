@@ -200,13 +200,36 @@ pub fn enabled() -> bool {
     match STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => {
-            let value = std::env::var_os("PYRE_GC_INTERP");
-            let on = enabled_from_env(value.as_deref());
-            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
+        _ => init_interp_state(),
     }
+}
+
+/// First-touch halves of [`enabled`] and [`collect_enabled`], out of line.
+///
+/// `env::var_os` allocates and unwinds, so leaving it inlined puts its frame
+/// on whoever inlines the switch — and that is [`safepoint`], which the
+/// dispatch loop calls on every bytecode.  Cold and never inlined, the switch
+/// itself is an atomic load and a branch, which is all upstream's equivalent
+/// gate is (`bytecode_trace` reads a field of the prebuilt `ActionFlag`).
+///
+/// Each names its own variable at the `env::var_os` call, which is what marks
+/// the gate live for `gate_triage_complete`.
+#[cold]
+#[inline(never)]
+fn init_interp_state() -> bool {
+    store_from_env(&STATE, std::env::var_os("PYRE_GC_INTERP"))
+}
+
+#[cold]
+#[inline(never)]
+fn init_collect_state() -> bool {
+    store_from_env(&COLLECT_STATE, std::env::var_os("PYRE_GC_INTERP_COLLECT"))
+}
+
+fn store_from_env(state: &AtomicU8, value: Option<std::ffi::OsString>) -> bool {
+    let on = enabled_from_env(value.as_deref());
+    state.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
 }
 
 /// Pure half of [`enabled`] and [`collect_enabled`], kept separate so the
@@ -375,12 +398,7 @@ pub fn collect_enabled() -> bool {
     match COLLECT_STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => {
-            let value = std::env::var_os("PYRE_GC_INTERP_COLLECT");
-            let on = enabled_from_env(value.as_deref());
-            COLLECT_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
+        _ => init_collect_state(),
     }
 }
 

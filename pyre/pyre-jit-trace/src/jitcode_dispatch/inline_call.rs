@@ -7382,6 +7382,12 @@ pub(crate) fn try_walker_inline_type_call<Sym: WalkSym>(
     } {
         return type_call_decline("not instantiable, abstract, or has __del__");
     }
+    // `Py_tp_vectorcall` replaces the whole of `type.__call__` for the class
+    // that declares it: the body this emit builds -- allocate, then run
+    // `__init__` -- is not what such a call does at all.
+    if unsafe { pyre_object::typeobject::w_type_has_vectorcall(w_type) } {
+        return type_call_decline("type declares a vectorcall");
+    }
     // `map` is baked as a constant, so install the terminator now if the type
     // has not been asked for one yet — a class nobody has read an attribute off
     // still carries null, and baking that would hand every traced instance a

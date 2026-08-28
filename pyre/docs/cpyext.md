@@ -351,7 +351,12 @@ header declaring it wrongly.
   `PyObject_Call` / `CallObject` / `CallNoArgs` / `CallOneArg`, and the
   vectorcall spellings `PyObject_Vectorcall`, `PyObject_VectorcallMethod` and
   `PyVectorcall_Call`, which unpack the argument vector and go through the
-  interpreter's own call path rather than a type's `tp_vectorcall`. The
+  interpreter's own call path. Both halves of PEP 590 are taken: a type
+  declaring `Py_TPFLAGS_HAVE_VECTORCALL` has the function read out of the
+  instance at `tp_vectorcall_offset` and called with the values as they lie,
+  ahead of the `tp_call` such a type is also required to carry
+  (`_PyVectorcall_FunctionInline`), and the flag travels to a subclass that
+  leaves `tp_call` alone. The
   variadic ones -- `PyObject_CallFunction` / `CallMethod`, the two `ObjArgs`
   spellings, `CallMethodNoArgs` / `CallMethodOneArg` and `PyVectorcall_NARGS`
   -- are `static inline` in the header, like `PyArg_ParseTuple`;
@@ -429,9 +434,10 @@ header declaring it wrongly.
   `tp_setattro`, `tp_descr_get` and `tp_descr_set`;
 - heap types: `PyType_FromSpec`, `PyType_FromSpecWithBases`,
   `PyType_FromModuleAndSpec`, `PyType_GetSlot`, `PyType_GetName` and
-  `PyType_GetQualName`, with every `typeslots.h` identifier except
-  `Py_tp_vectorcall` and `Py_tp_token`, which name a type field pyre never
-  reads;
+  `PyType_GetQualName`, with every `typeslots.h` identifier, `Py_tp_token` and
+  `Py_tp_vectorcall` included -- the latter answering `Type(...)` ahead of
+  `__new__`/`__init__` the way `PyType_Type`'s own
+  `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` arrange for it;
 - the `tp_as_number`, `tp_as_sequence` and `tp_as_mapping` tables, each slot
   becoming the dunder `slotdefs.py` names for it, and the `PyNumber_*`,
   `PySequence_*` and `PyMapping_*` entry points (`cpyext/number.rs`,
@@ -622,26 +628,22 @@ Known divergences, each documented at its definition:
 
 ## What remains
 
-5. The *dispatch* half of vectorcall -- a type declaring
-   `Py_TPFLAGS_HAVE_VECTORCALL` and `tp_vectorcall_offset` is called through
-   `tp_call`, which such a type is required to have
-   (`cpython/Objects/typeobject.c:8455-8459`), so the slot is an optimisation
-   pyre does not take; and the remaining generated API. Of the 746 public
-   `PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
-   `Include/*.h` -- public meaning the declared name does not begin with an
-   underscore -- 460 are present, counting every form `Python.h` offers one
-   in: an export, a `static inline`, or a macro of either kind. (The
-   previously recorded 763/292 came from a pattern that missed the
-   declarations annotated `_Py_NO_RETURN` on one side and the object-like
-   aliases on the other. The 749/434 recorded after that was read with a
-   census script of its own; the population is now read with
-   `cpyext-abi.py`'s own declaration reader, the same one the gate uses,
-   which finds three fewer declarations in the same headers.) The figure
-   counts only that population, so the private `_PyLong_*ByteArray` pair and
-   the unchecked accessor macros the extensions below need do not appear in
-   it. The exported *data* is a separate population, counted and checked
-   separately (see below): 121 of the objects the header declares are
-   measured against CPython's own declaration for them;
+The remaining generated API. Of the 746 public
+`PyAPI_FUNC` entry points CPython 3.14.7 declares in its top-level
+`Include/*.h` -- public meaning the declared name does not begin with an
+underscore -- 460 are present, counting every form `Python.h` offers one
+in: an export, a `static inline`, or a macro of either kind. (The
+previously recorded 763/292 came from a pattern that missed the
+declarations annotated `_Py_NO_RETURN` on one side and the object-like
+aliases on the other. The 749/434 recorded after that was read with a
+census script of its own; the population is now read with
+`cpyext-abi.py`'s own declaration reader, the same one the gate uses,
+which finds three fewer declarations in the same headers.) The figure
+counts only that population, so the private `_PyLong_*ByteArray` pair and
+the unchecked accessor macros the extensions below need do not appear in
+it. The exported *data* is a separate population, counted and checked
+separately (see below): 121 of the objects the header declares are
+measured against CPython's own declaration for them;
 6. Windows API DLL/import-library packaging.
 
 `PyCFunction_Type` is the one `PyAPI_DATA(PyTypeObject)` name deliberately

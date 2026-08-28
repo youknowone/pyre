@@ -213,6 +213,13 @@ pub mod test_hooks {
     /// enable `test-hooks` can install the hook at their own test chokepoints
     /// for `#[test]`s that never reach `init_typeobjects`.
     pub fn install_hash_hook() {
+        // libtest gives each `#[test]` its own thread, and a thread that has
+        // not entered the runtime holds no GIL -- while the dict this test is
+        // about to build probes the method cache, whose only guard is that
+        // GIL.  `RUNTIME_THREAD` names the unit tests that drive the
+        // interpreter directly among the entry points that acquire, and its
+        // destructor gives the registration back when the thread exits.
+        crate::module::thread::ensure_runtime_thread();
         pyre_object::dict_eq_hook::register_hash_w_hook(test_hash_w);
         pyre_object::dict_eq_hook::register_hash_str_hook(test_hash_str);
     }

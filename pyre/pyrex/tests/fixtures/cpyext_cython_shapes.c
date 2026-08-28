@@ -61,6 +61,78 @@ static PyType_Spec caller_spec = {
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_VECTORCALL,
     caller_slots};
 
+/* ── which of the two routes answers ─────────────────────────────────────
+   `Caller` above cannot say: its `tp_call` *is* `PyVectorcall_Call`, so both
+   routes end in the same function and only the allocations in front of them
+   differ.  This one fills `tp_call` with a function of its own, so the value
+   it leaves behind names the route that ran.  `_PyObject_VectorcallTstate`
+   consults the vectorcall first and reaches `tp_call` only for a callable
+   that has none, which makes `via == 1` the answer for every type carrying
+   the flag -- and `Plain`, the same object without it, the control. */
+typedef struct {
+    PyObject_HEAD
+    vectorcallfunc vectorcall;
+    long via;
+    long calls;
+} Routed;
+
+static PyObject *routed_vectorcall(PyObject *self, PyObject *const *args,
+                                   size_t nargsf, PyObject *kwnames)
+{
+    Routed *routed = (Routed *)self;
+    Py_ssize_t named = kwnames ? PyTuple_GET_SIZE(kwnames) : 0;
+    (void)args;
+    routed->via = 1;
+    routed->calls += 1;
+    return Py_BuildValue("(nn)", PyVectorcall_NARGS(nargsf), named);
+}
+
+static PyObject *routed_call(PyObject *self, PyObject *args, PyObject *kwds)
+{
+    Routed *routed = (Routed *)self;
+    routed->via = 2;
+    routed->calls += 1;
+    return Py_BuildValue("(nn)", PyTuple_GET_SIZE(args),
+                         kwds ? PyDict_Size(kwds) : 0);
+}
+
+static PyObject *routed_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+{
+    Routed *self;
+    (void)args; (void)kwds;
+    self = (Routed *)type->tp_alloc(type, 0);
+    if (self != NULL) {
+        self->vectorcall = routed_vectorcall;
+        self->via = 0;
+        self->calls = 0;
+    }
+    return (PyObject *)self;
+}
+
+static PyMemberDef routed_members[] = {
+    {"__vectorcalloffset__", T_PYSSIZET, offsetof(Routed, vectorcall), READONLY, NULL},
+    {"via", T_LONG, offsetof(Routed, via), READONLY, NULL},
+    {"calls", T_LONG, offsetof(Routed, calls), READONLY, NULL},
+    {NULL, 0, 0, 0, NULL}};
+
+static PyType_Slot routed_slots[] = {
+    {Py_tp_new, (void *)routed_new},
+    {Py_tp_call, (void *)routed_call},
+    {Py_tp_members, (void *)routed_members},
+    {0, NULL}};
+
+static PyType_Spec routed_spec = {
+    "cpyext_cython_shapes.Routed", sizeof(Routed), 0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_VECTORCALL,
+    routed_slots};
+
+/* The same layout and the same slots without the flag: `tp_call` is the only
+   route a type that never declared the protocol has. */
+static PyType_Spec plain_spec = {
+    "cpyext_cython_shapes.Plain", sizeof(Routed), 0,
+    Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    routed_slots};
+
 /* ── the ancestry a `cdef class` is laid out against ─────────────────────
    `__Pyx_MergeVtables` takes `PyTuple_GET_SIZE(type->tp_bases)`, so a null
    there is a size read off nothing. */
@@ -252,10 +324,24 @@ PyMODINIT_FUNC PyInit_cpyext_cython_shapes(void)
 {
     PyObject *module = PyModule_Create(&def);
     PyObject *caller;
+    PyObject *routed;
+    PyObject *plain;
     if (module == NULL) return NULL;
     caller = PyType_FromSpec(&caller_spec);
     if (caller == NULL || PyModule_AddObject(module, "Caller", caller) < 0) {
         Py_XDECREF(caller);
+        Py_DECREF(module);
+        return NULL;
+    }
+    routed = PyType_FromSpec(&routed_spec);
+    if (routed == NULL || PyModule_AddObject(module, "Routed", routed) < 0) {
+        Py_XDECREF(routed);
+        Py_DECREF(module);
+        return NULL;
+    }
+    plain = PyType_FromSpec(&plain_spec);
+    if (plain == NULL || PyModule_AddObject(module, "Plain", plain) < 0) {
+        Py_XDECREF(plain);
         Py_DECREF(module);
         return NULL;
     }

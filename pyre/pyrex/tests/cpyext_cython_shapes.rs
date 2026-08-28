@@ -36,6 +36,60 @@ eq('positional', call('a', 'b'), (2, None, 'a', None))
 eq('keyword', call('a', k='v'), (1, ('k',), 'a', 'v'))
 eq('keywords only', call(k='v', j='w'), (0, ('k', 'j'), None, 'w'))
 
+# ── the vectorcall answers ahead of `tp_call` ──────────────────────────
+# `Caller` cannot show this: its `tp_call` *is* `PyVectorcall_Call`, so both
+# routes end in the same function.  `Routed` fills `tp_call` with one of its
+# own and records which ran -- 1 for the vectorcall, 2 for `tp_call`.  Every
+# answer below is what CPython 3.14 gives for this same C.
+routed = m.Routed()
+eq('routed no arguments', routed(), (0, 0))
+eq('routed route', routed.via, 1)
+eq('routed positional', routed('a', 'b'), (2, 0))
+eq('routed keyword', routed('a', k='v'), (1, 1))
+eq('routed route after keywords', routed.via, 1)
+eq('routed calls', routed.calls, 3)
+
+# The same layout and slots without `Py_TPFLAGS_HAVE_VECTORCALL`: the offset
+# is there to read and must not be read, because the type never declared the
+# protocol.
+plain = m.Plain()
+eq('plain no arguments', plain(), (0, 0))
+eq('plain route', plain.via, 2)
+eq('plain keyword', plain('a', k='v'), (1, 1))
+eq('plain route after keywords', plain.via, 2)
+
+# The flag travels to a subclass that leaves `tp_call` alone, and the offset
+# with it; a subclass of the type without the flag stays without it.
+class Inherits(m.Routed):
+    pass
+
+class Stays(m.Plain):
+    pass
+
+inherited = Inherits()
+eq('subclass call', inherited(), (0, 0))
+eq('subclass route', inherited.via, 1)
+stayed = Stays()
+eq('plain subclass call', stayed(), (0, 0))
+eq('plain subclass route', stayed.via, 2)
+
+# A `__call__` written in Python is the class's own and answers before either.
+class Overrides(m.Routed):
+    def __call__(self, *args, **keywords):
+        return 'python'
+
+overridden = Overrides()
+eq('override', overridden(), 'python')
+eq('override route', overridden.via, 0)
+
+# A loop is what the tracer records, and it must answer as the first call did.
+for _ in range(2000):
+    assert routed('a') == (1, 0)
+eq('route after the loop', routed.via, 1)
+for _ in range(2000):
+    assert plain('a') == (1, 0)
+eq('plain route after the loop', plain.via, 2)
+
 # ── the ancestry a `cdef class` is laid out against ────────────────────
 # A type built from C, one this runtime defines, and a class written in
 # Python all have to answer.

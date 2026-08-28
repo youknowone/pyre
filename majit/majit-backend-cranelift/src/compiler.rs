@@ -2034,7 +2034,8 @@ fn gc_write_barrier_via_active_runtime(obj: GcRef) {
     if gc_box::present() {
         with_cranelift_gc(|gc| gc.write_barrier(obj));
     } else if majit_gc::gc_sync::is_initialized() {
-        majit_gc::gc_sync::gc_op_with_root(obj, |gc, obj| gc.write_barrier(obj));
+        // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
+        majit_gc::gc_sync::gc_op(|gc| gc.write_barrier(obj));
     }
 }
 

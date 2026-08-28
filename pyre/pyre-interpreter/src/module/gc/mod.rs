@@ -756,13 +756,18 @@ fn pin_unboxed_container_referents(source_slot: usize) {
                 return;
             }
             let len = dictmultiobject::w_dict_len(w_obj);
-            for index in 0..len {
+            // A slot walk: a deleted entry leaves a tombstone the count of
+            // live pairs does not name.
+            let mut cursor = 0;
+            for _ in 0..len {
                 let dict = pyre_object::gc_roots::shadow_stack_get(source_slot);
-                if let Some((key, _)) = dictmultiobject::w_dict_nth_item(dict, index) {
-                    // The typed strategy's GC walker already reported the
-                    // boxed value; only its native i64/Vec<u8> key was absent.
-                    let _ = pyre_object::gc_roots::pin_root(key);
-                }
+                let Some((slot, key, _)) = dictmultiobject::w_dict_next_item(dict, cursor) else {
+                    break;
+                };
+                cursor = slot + 1;
+                // The typed strategy's GC walker already reported the
+                // boxed value; only its native i64/Vec<u8> key was absent.
+                let _ = pyre_object::gc_roots::pin_root(key);
             }
         } else if is_specialised_tuple_ii(w_obj) || is_specialised_tuple_ff(w_obj) {
             // Both items live in inline i64/f64 fields, so these two variants

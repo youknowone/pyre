@@ -361,7 +361,7 @@ impl ArenaCollection {
                 let surviving = self.walk_page(page, block_size, ok_to_free_func);
                 let nextpage = unsafe { (*page).nextpage };
                 if surviving == nblocks {
-                    assert_eq!(step, 0, "a non-full page became full while freeing");
+                    debug_assert_eq!(step, 0, "a non-full page became full while freeing");
                     unsafe { (*page).nextpage = remaining_full_pages };
                     remaining_full_pages = page;
                 } else if surviving > 0 {
@@ -423,7 +423,12 @@ impl ArenaCollection {
                     prevfreeblockat = obj as *mut *mut u8;
                     freeblock = *prevfreeblockat;
                 } else {
-                    assert!(
+                    // minimarkpage.py:541-542 spells this `ll_assert`, which
+                    // the C backend emits as `RPyAssert` — nothing at all
+                    // unless RPY_ASSERT is defined — so a shipping PyPy runs
+                    // no compare here.  `debug_validate_freeblocks` and the
+                    // randomized `mass_free` tests keep enforcing it.
+                    debug_assert!(
                         (freeblock as usize) > obj as usize,
                         "freeblocks are not ordered"
                     );
@@ -519,7 +524,7 @@ impl ArenaCollection {
     unsafe fn free_arena(&mut self, arena: *mut ArenaReference) {
         unsafe {
             let base = (*arena).base as usize;
-            if std::env::var_os("MAJIT_GC_FREELIST_DIAG").is_some() {
+            if crate::gc_freelist_diag_enabled() {
                 let end = base + (*arena).layout.size();
                 for size_class in 1..self.page_for_size.len() {
                     for (kind, mut page) in [

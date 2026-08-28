@@ -303,6 +303,18 @@ pub struct W_TypeObject {
     /// once after construction via `w_type_set_disallow_instantiation`;
     /// never inherited by heap subclasses (the default is `false`).
     pub flag_disallow_instantiation: std::sync::atomic::AtomicBool,
+    /// `tp_vectorcall` — whether calling this type runs a function of its
+    /// own instead of `__new__`/`__init__`.
+    ///
+    /// `PyType_Type` carries `Py_TPFLAGS_HAVE_VECTORCALL` with
+    /// `tp_vectorcall_offset == offsetof(PyTypeObject, tp_vectorcall)`, so a
+    /// class object is called through the field the ordinary instance rule
+    /// reads off it.  A class here is not a `PyTypeObject`, so
+    /// `type.__call__` asks this instead and goes to `cpyext` for the
+    /// pointer.  Set once by `PyType_Ready` for a type whose spec named
+    /// `Py_tp_vectorcall`; never inherited by a subclass (the default is
+    /// `false`), which is the field's own rule.
+    pub flag_has_vectorcall: std::sync::atomic::AtomicBool,
     /// typeobject.py/216 `flag_abstract?` — set from the
     /// `__abstractmethods__` setattr hook; gates `object.__new__`.
     pub flag_abstract: std::sync::atomic::AtomicBool,
@@ -538,6 +550,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // Heap subclasses are always instantiable (their `tp_new` is the
         // slot wrapper); only builtin disallow-types flip this.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
+        flag_has_vectorcall: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
@@ -666,6 +679,7 @@ pub fn w_type_new_builtin(
         // generator / coroutine / frame typedefs flip it via
         // `w_type_set_disallow_instantiation`.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
+        flag_has_vectorcall: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
@@ -776,6 +790,34 @@ pub unsafe fn w_type_set_disallow_instantiation(w_type: PyObjectRef) {
     }
     let t = &*(w_type as *const W_TypeObject);
     t.flag_disallow_instantiation
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// `tp_vectorcall` reader — `True` when calling `w_type` runs the type's own
+/// function rather than `__new__`/`__init__`.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_has_vectorcall(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_has_vectorcall
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// `tp_vectorcall` setter — `PyType_Ready` calls this for a type whose spec
+/// named `Py_tp_vectorcall`.  The pointer itself stays on the mirror.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_set_has_vectorcall(w_type: PyObjectRef) {
+    if w_type.is_null() || !is_type(w_type) {
+        return;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_has_vectorcall
         .store(true, std::sync::atomic::Ordering::Release);
 }
 
