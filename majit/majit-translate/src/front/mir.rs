@@ -4704,6 +4704,62 @@ impl<'a> Lowering<'a> {
                         array_type_id: alias.array_type_id.clone(),
                         nolength: false,
                     }
+                } else if let Some(owner) = self.string_array_remove_owner() {
+                    // Tail of RPython `ll_delitem_nonneg`: after
+                    // `ll_arraymove`, clear `l[newlength]` to the null GC
+                    // pointer before shrinking the logical length.  Rust
+                    // spells this one site as `*p = null_mut()`, but the
+                    // translated operation is a setitem on the same
+                    // GcArray(GCREF) as the move.
+                    let list = self
+                        .local_var
+                        .get(1)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: string-array remove lost self before null clear"
+                            ))
+                        })?;
+                    let block = self.emit_string_array_items_read(bb_id, list.clone(), owner);
+                    let arr = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(block),
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )
+                        .as_variable()
+                        .expect("a string-items view stays a Variable")
+                        .clone();
+                    let length = self.emit_string_array_len_read(bb_id, list, owner);
+                    let one = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(one.clone()),
+                        kind: OpKind::ConstUInt(1),
+                    });
+                    let newlength = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(newlength.clone()),
+                        kind: OpKind::BinOp {
+                            op: "sub".to_string(),
+                            lhs: length,
+                            rhs: one,
+                            result_ty: ValueType::Unsigned,
+                        },
+                    });
+                    value = self.narrow_value_to_instance_root(bb_id, value, "str");
+                    OpKind::ArrayWrite {
+                        base: arr,
+                        index: newlength,
+                        value: value.clone(),
+                        item_ty: ValueType::Str,
+                        array_type_id: Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
+                        nolength: false,
+                    }
                 } else {
                     // `*p = val` — no IR-level FieldWrite/ArrayWrite
                     // fits.  Emit a synthetic 2-arg Call so the write
@@ -8443,6 +8499,104 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `BytesArray::remove` / `UnicodeArray::remove` spell
+                // `rlist.ll_delitem_nonneg`'s overlap-safe
+                // `ll_arraymove(l, index + 1, index, newlength - index)` as
+                // raw `ptr::copy(src, dst, count)`.  Recover the logical
+                // GcArray plus those three indices here and route the call to
+                // the exact RPython helper marker.  The match is both
+                // graph-scoped and callee-exact; an arbitrary raw copy keeps
+                // its Rust semantics.
+                if args.len() == 3 && self.is_string_array_remove_ptr_copy(&reg) {
+                    let owner = self
+                        .string_array_remove_owner()
+                        .expect("ptr-copy gate proved a string-array remove owner");
+                    let list = self
+                        .local_var
+                        .get(1)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: string-array remove lost self before ll_arraymove"
+                            ))
+                        })?;
+                    let index = self
+                        .local_var
+                        .get(2)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: string-array remove lost index before ll_arraymove"
+                            ))
+                        })?;
+                    let block = self.emit_string_array_items_read(bb_id, list, owner);
+                    let array = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(block),
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )
+                        .as_variable()
+                        .expect("a string-items view stays a Variable")
+                        .clone();
+                    let one = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(one.clone()),
+                        kind: OpKind::ConstUInt(1),
+                    });
+                    let source_start = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(source_start.clone()),
+                        kind: OpKind::BinOp {
+                            op: "add".to_string(),
+                            lhs: index.clone(),
+                            rhs: one,
+                            result_ty: ValueType::Unsigned,
+                        },
+                    });
+                    let result = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    crate::runtime_names::shims::LL_ARRAYMOVE.to_string(),
+                                ],
+                            },
+                            args: vec![array, source_start, index, args[2].clone()],
+                            result_ty: ValueType::Void,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(result);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Every raw pointer offset in those same adapters feeds only
+                // the `ptr::copy` or the final null clear reconstructed above
+                // and below.  Once the logical indices are recovered, the
+                // interior pointer has no translated value of its own; alias
+                // it to its base so no Rust pointer arithmetic leaks into the
+                // RPython graph.
+                if args.len() == 2
+                    && self.string_array_remove_owner().is_some()
+                    && regular_call_is_ptr_add(&reg, self.llbc)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -12739,6 +12893,31 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Owner of the two Rust storage adapters whose `remove` body is the
+    /// concrete spelling of RPython `rlist.ll_delitem_nonneg`.
+    fn string_array_remove_owner(&self) -> Option<&'static str> {
+        match self.graph.name.as_str() {
+            "pyre_object::bytes_array::<Impl>::remove" => Some("BytesArray"),
+            "pyre_object::unicode_array::<Impl>::remove" => Some("UnicodeArray"),
+            _ => None,
+        }
+    }
+
+    /// `std::ptr::copy` inside the exact string-list `remove` adapters.  The
+    /// caller reconstructs the logical array and indices and emits the
+    /// RPython `rgc.ll_arraymove` marker; no arbitrary raw copy qualifies.
+    fn is_string_array_remove_ptr_copy(&self, reg: &RegularCall) -> bool {
+        if self.string_array_remove_owner().is_none() {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::ptr::copy")
+    }
+
     /// The body-side `from_raw_parts` half of
     /// [`Self::string_array_slice_view_owner`].
     fn is_string_array_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
@@ -12788,6 +12967,34 @@ impl<'a> Lowering<'a> {
                     majit_ir::descr::StructId::from_canonical(canonical_owner),
                 )),
                 ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        result
+    }
+
+    fn emit_string_array_len_read(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        owner: &str,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let canonical_owner = match owner {
+            "BytesArray" => "bytes_array::BytesArray",
+            "UnicodeArray" => "unicode_array::UnicodeArray",
+            _ => unreachable!("string array owner is closed"),
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("len", Some(owner.to_string())).with_owner_id(Some(
+                    majit_ir::descr::StructId::from_canonical(canonical_owner),
+                )),
+                ty: ValueType::Unsigned,
                 pure: false,
             },
         });
@@ -31157,6 +31364,8 @@ mod tests {
         for function in [
             "pyre_object::bytes_array::<Impl>::pop",
             "pyre_object::unicode_array::<Impl>::pop",
+            "pyre_object::bytes_array::<Impl>::remove",
+            "pyre_object::unicode_array::<Impl>::remove",
         ] {
             let graph = super::lower_function(&llbc, function)
                 .unwrap_or_else(|err| panic!("lower {function}: {err}"));
@@ -31199,6 +31408,29 @@ mod tests {
                 )),
                 "{function} must not retain a Rust raw-slice/read-write boundary"
             );
+            if function.ends_with("::remove") {
+                assert!(
+                    operations.iter().any(|operation| matches!(
+                        &operation.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &[crate::runtime_names::shims::LL_ARRAYMOVE.to_string()]
+                    )),
+                    "{function} must restore ptr::copy to RPython rgc.ll_arraymove"
+                );
+                assert!(
+                    !operations.iter().any(|operation| matches!(
+                        &operation.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.as_slice() == ["core", "ptr", "copy"]
+                            || segments.as_slice() == ["core", "ptr", "mut_ptr", "<Impl>", "add"]
+                    )),
+                    "{function} must not retain Rust pointer-copy arithmetic"
+                );
+            }
         }
     }
 

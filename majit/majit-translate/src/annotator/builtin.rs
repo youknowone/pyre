@@ -366,6 +366,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         crate::runtime_names::shims::CAST_ADDRESS,
         cast_address_intrinsic,
     );
+    analyzer_for(
+        &mut reg,
+        crate::runtime_names::shims::LL_ARRAYMOVE,
+        ll_arraymove_intrinsic,
+    );
     // Rust `String::new()` / `String::with_capacity(n)` construct an empty
     // owned UTF-8 buffer; both annotate as a mutable `SomeString` so the
     // `String.new` / `String.with_capacity` HOST_ENV stubs do not reach the
@@ -1461,6 +1466,43 @@ fn cast_address_intrinsic(
         can_be_none,
         std::collections::BTreeMap::new(),
     )))
+}
+
+/// Annotation of the Rust-adapter spelling of
+/// `rgc.ll_arraymove(array, source_start, dest_start, length)`.
+///
+/// The MIR front has already recovered a logical list-items array from the
+/// raw pointers before emitting this call.  Preserve the exact upstream
+/// surface: one list plus three integer indices, no result value.
+fn ll_arraymove_intrinsic(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 4 {
+        return Err(AnnotatorError::new(
+            "__majit_ll_arraymove expects (array, source_start, dest_start, length)",
+        ));
+    }
+    if !matches!(
+        arg_at(args_s, 0, crate::runtime_names::shims::LL_ARRAYMOVE),
+        SomeValue::List(_)
+    ) {
+        return Err(AnnotatorError::new(
+            "__majit_ll_arraymove array argument must be SomeList",
+        ));
+    }
+    for index in 1..4 {
+        if !matches!(
+            arg_at(args_s, index, crate::runtime_names::shims::LL_ARRAYMOVE),
+            SomeValue::Integer(_)
+        ) {
+            return Err(AnnotatorError::new(format!(
+                "__majit_ll_arraymove argument {index} must be SomeInteger"
+            )));
+        }
+    }
+    Ok(s_none())
 }
 
 /// Analyzer for `__cast_instance_intrinsic` — the front-end pointer-downcast

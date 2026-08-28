@@ -90,6 +90,10 @@ impl FixedSizeListRepr {
             external_item_repr,
         })
     }
+
+    pub(crate) fn item_lowleveltype(&self) -> LowLevelType {
+        self.item_repr.lowleveltype().clone()
+    }
 }
 
 /// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py`):
@@ -2617,7 +2621,7 @@ fn build_ll_arraycopy_helper_graph(
 /// fast-path machinery of upstream `rgc.ll_arraycopy` is a translation-time
 /// concern; the lowered body is the bare element loop (`getarrayitem` +
 /// `setarrayitem`).
-fn build_ll_arraycopy_general_helper_graph(
+pub(crate) fn build_ll_arraycopy_general_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -2790,6 +2794,195 @@ fn build_ll_arraycopy_general_helper_graph(
         vec![
             "source".to_string(),
             "dest".to_string(),
+            "source_start".to_string(),
+            "dest_start".to_string(),
+            "length".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise the forward-copy branch of
+/// `rgc.ll_arraymove(array, source_start, dest_start, length)`
+/// (`rpython/rlib/rgc.py:415-456`) with the upstream four-argument shape.
+///
+/// The caller proves `source_start > dest_start`, which is upstream's
+/// `delta < 0` case.  Copying from low to high indices is therefore the
+/// overlap-safe direction used by RPython's slow path:
+///
+/// ```python
+/// i = 0
+/// while i < length:
+///     array[dest_start + i] = array[source_start + i]
+///     i += 1
+/// ```
+///
+/// Lowering each assignment as `setarrayitem` retains pyre's ordinary GC
+/// write barrier.  This is stronger than upstream's bulk-move fast path and
+/// has the same pointer-reachability semantics.
+pub(crate) fn build_ll_arraymove_left_helper_graph(
+    name: &str,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    let array = variable_with_lltype("array", items_ptr.clone());
+    let src_start = variable_with_lltype("source_start", LowLevelType::Signed);
+    let dst_start = variable_with_lltype("dest_start", LowLevelType::Signed);
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(array.clone()),
+        Hlvalue::Variable(src_start.clone()),
+        Hlvalue::Variable(dst_start.clone()),
+        Hlvalue::Variable(length.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Loop blocks carry (array, source_start, dest_start, length, i).
+    let array_c = variable_with_lltype("array", items_ptr.clone());
+    let src_start_c = variable_with_lltype("source_start", LowLevelType::Signed);
+    let dst_start_c = variable_with_lltype("dest_start", LowLevelType::Signed);
+    let length_c = variable_with_lltype("length", LowLevelType::Signed);
+    let i_c = variable_with_lltype("i", LowLevelType::Signed);
+    let block_cond = Block::shared(vec![
+        Hlvalue::Variable(array_c.clone()),
+        Hlvalue::Variable(src_start_c.clone()),
+        Hlvalue::Variable(dst_start_c.clone()),
+        Hlvalue::Variable(length_c.clone()),
+        Hlvalue::Variable(i_c.clone()),
+    ]);
+
+    let array_b = variable_with_lltype("array", items_ptr.clone());
+    let src_start_b = variable_with_lltype("source_start", LowLevelType::Signed);
+    let dst_start_b = variable_with_lltype("dest_start", LowLevelType::Signed);
+    let length_b = variable_with_lltype("length", LowLevelType::Signed);
+    let i_b = variable_with_lltype("i", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(array_b.clone()),
+        Hlvalue::Variable(src_start_b.clone()),
+        Hlvalue::Variable(dst_start_b.clone()),
+        Hlvalue::Variable(length_b.clone()),
+        Hlvalue::Variable(i_b.clone()),
+    ]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(array),
+                Hlvalue::Variable(src_start),
+                Hlvalue::Variable(dst_start),
+                Hlvalue::Variable(length),
+                signed_const(0),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    block_cond.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(i_c.clone()),
+            Hlvalue::Variable(length_c.clone()),
+        ],
+        Hlvalue::Variable(cond.clone()),
+    ));
+    block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(array_c),
+                Hlvalue::Variable(src_start_c),
+                Hlvalue::Variable(dst_start_c),
+                Hlvalue::Variable(length_c),
+                Hlvalue::Variable(i_c),
+            ],
+            Some(block_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let source_index = variable_with_lltype("source_index", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![
+            Hlvalue::Variable(src_start_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+        ],
+        Hlvalue::Variable(source_index.clone()),
+    ));
+    let dest_index = variable_with_lltype("dest_index", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![
+            Hlvalue::Variable(dst_start_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+        ],
+        Hlvalue::Variable(dest_index.clone()),
+    ));
+    let item = variable_with_lltype("item", item_lltype);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "getarrayitem",
+        vec![
+            Hlvalue::Variable(array_b.clone()),
+            Hlvalue::Variable(source_index),
+        ],
+        Hlvalue::Variable(item.clone()),
+    ));
+    let store_void = variable_with_lltype("store", LowLevelType::Void);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(array_b.clone()),
+            Hlvalue::Variable(dest_index),
+            Hlvalue::Variable(item),
+        ],
+        Hlvalue::Variable(store_void),
+    ));
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(i_b), signed_const(1)],
+        Hlvalue::Variable(i_next.clone()),
+    ));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(array_b),
+                Hlvalue::Variable(src_start_b),
+                Hlvalue::Variable(dst_start_b),
+                Hlvalue::Variable(length_b),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "array".to_string(),
             "source_start".to_string(),
             "dest_start".to_string(),
             "length".to_string(),

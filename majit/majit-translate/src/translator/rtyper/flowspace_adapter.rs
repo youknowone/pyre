@@ -1870,6 +1870,32 @@ pub fn translate_op(
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
+                    // Exact RPython `rgc.ll_arraymove` call reconstructed by
+                    // the MIR list-storage adapter from Rust `ptr::copy`.
+                    if segments.len() == 1
+                        && segments[0] == crate::runtime_names::shims::LL_ARRAYMOVE
+                    {
+                        if arg_hls.len() != 4 {
+                            return Err(TyperError::message(format!(
+                                "__majit_ll_arraymove requires exactly four args, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let callable_host = HOST_ENV
+                            .lookup_builtin(crate::runtime_names::shims::LL_ARRAYMOVE)
+                            .ok_or_else(|| {
+                                TyperError::message(
+                                    "__majit_ll_arraymove missing from HOST_ENV bootstrap"
+                                        .to_string(),
+                                )
+                            })?;
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            callable_host,
+                        ))));
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
                     // `front::range_iter`'s synthesized `range(start, stop)`
                     // (the exclusive int-`Range` for-loop divert).  It carries
                     // the reserved `__majit_range` spelling rather than a bare

@@ -91,8 +91,10 @@ pub(crate) mod artifacts {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
 }
 
-/// Host shims — callables the consumer exports for the flowspace HOST_ENV that
-/// have no RPython counterpart, so no upstream name to port.
+/// Host adapter spellings — callables the consumer exports for the flowspace
+/// HOST_ENV when Rust source has no directly importable RPython callable.
+/// Most are translation-only shims; `LL_ARRAYMOVE` explicitly restores the
+/// corresponding RPython operation at a proven adapter boundary.
 ///
 /// Registered in `flowspace::model`, given an annotator in
 /// `annotator::builtin`, and resolved in `translator::rtyper`. All three must
@@ -104,6 +106,9 @@ pub(crate) mod shims {
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";
+    /// Rust `ptr::copy` at a proven list-storage adapter boundary, restored
+    /// to RPython `rgc.ll_arraymove(array, source_start, dest_start, length)`.
+    pub(crate) const LL_ARRAYMOVE: &str = "__majit_ll_arraymove";
     /// Prefix, not a whole name: the wrapping arithmetic shims are
     /// `__majit_wrap_<op>`, matched by prefix where the op is not known.
     pub(crate) const WRAP_PREFIX: &str = "__majit_wrap_";
