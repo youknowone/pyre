@@ -713,7 +713,7 @@ mod tests {
         unsafe { (*frame).jf_gcmap = sentinel };
         drop(JitFrameDeadFrame::borrowing(
             GcRef(frame as usize),
-            a_descr(),
+            ExitDescr::owned(a_descr()),
             None,
         ));
         assert_eq!(
@@ -725,7 +725,7 @@ mod tests {
         unsafe { (*frame).jf_gcmap = sentinel };
         drop(JitFrameDeadFrame::new(
             GcRef(frame as usize),
-            a_descr(),
+            ExitDescr::owned(a_descr()),
             None,
             None,
         ));
