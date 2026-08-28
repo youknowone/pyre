@@ -323,19 +323,46 @@ pub fn reset_call_shot_totals() {
 /// nanoseconds — the floor under every single-shot figure.
 ///
 /// Measured HERE rather than in the harness so it is the same clock, the same
-/// crate and the same optimization settings as the reading it corrects. Taking
-/// the minimum rather than the mean: the pair cannot run faster than it is, so
-/// the smallest of many readings is the least contaminated one, and subtracting
-/// a mean inflated by scheduler noise would under-report the call.
+/// crate and the same optimization settings as the reading it corrects.
+///
+/// ⚠ THE MINIMUM OF SINGLE READINGS CANNOT BE USED, and the reason is a
+/// property of the clock rather than of the pair. `Instant` is backed by a
+/// counter whose tick is coarse compared with the pair — 41.67 ns on Apple
+/// silicon's 24 MHz counter, against a pair that reads about 15 ns — so a pair
+/// whose two reads land inside one tick reports exactly `0`. Over thousands of
+/// tries such a pair occurs on essentially every batch, so `min` converges to
+/// zero and the "floor" stops being a cost at all: it becomes a measurement of
+/// the granularity. Subtracting it then corrects nothing, and the whole clock
+/// pair stays inside the single-shot figure it was supposed to be removed
+/// from — which shows up downstream as a residual stage going NEGATIVE, the
+/// parts of the call summing to more than the call.
+///
+/// So each batch is AMORTIZED first: `PER_BATCH` pairs are accumulated before
+/// anything is divided, which is what makes a batch mean immune to the
+/// granularity — quantization is unbiased when the start phase is uniform, so
+/// it averages out of a sum while it dominates any single term. The minimum is
+/// then taken over the batch MEANS, which keeps the original intent (the least
+/// scheduler-contaminated reading wins) while making each candidate a real
+/// cost.
+///
+/// What is subtracted is what the pair adds to a READING, not what it costs to
+/// execute — those differ, because the pair's own latency partly overlaps
+/// whatever sits between its two reads. An empty bracket has nothing to overlap
+/// with, so this is the largest the correction can legitimately be.
 #[cfg(feature = "__execute-stage-probe")]
 pub fn execute_stage_clock_floor_ns() -> f64 {
-    let mut best = u128::MAX;
-    for _ in 0..4096 {
-        let start = std::time::Instant::now();
-        let seen = start.elapsed().as_nanos();
-        best = best.min(seen);
+    const BATCHES: u32 = 32;
+    const PER_BATCH: u32 = 4096;
+    let mut best = f64::INFINITY;
+    for _ in 0..BATCHES {
+        let mut acc = 0u128;
+        for _ in 0..PER_BATCH {
+            let start = std::time::Instant::now();
+            acc += start.elapsed().as_nanos();
+        }
+        best = best.min(acc as f64 / f64::from(PER_BATCH));
     }
-    best as f64
+    best
 }
 
 /// compile.py `forget_optimization_info` — discard optimizer-only
@@ -23188,6 +23215,33 @@ mod metainterp_static_data_tests {
         };
         let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
         assert_eq!(sd.jitdrivers_sd[idx].index, Some(idx));
+    }
+
+    /// The clock floor must be a cost, not the clock's granularity.
+    ///
+    /// A pair of `Instant` reads cannot be free, so a floor of zero does not
+    /// mean "the clock is fast" — it means every candidate reading collapsed
+    /// into one tick of a coarse counter and the minimum found one of them.
+    /// That is how this function read for as long as it took its minimum over
+    /// single readings, and the correction it feeds silently subtracted
+    /// nothing. Pin the property rather than a number: the tick differs per
+    /// platform, but "an empty bracket costs something" does not.
+    #[cfg(feature = "__execute-stage-probe")]
+    #[test]
+    fn the_clock_floor_measures_the_pair_and_not_the_counters_tick() {
+        let floor = super::execute_stage_clock_floor_ns();
+        assert!(
+            floor > 0.0,
+            "clock floor read {floor} ns; a zero floor means the minimum found \
+             a bracket whose two reads shared one counter tick, so the figure \
+             is the tick and not the pair"
+        );
+        // A pair that reads as microseconds is a broken clock, not a slow one,
+        // and would over-subtract every single-shot figure into nonsense.
+        assert!(
+            floor < 1_000.0,
+            "clock floor read {floor} ns, implausibly slow"
+        );
     }
 
     #[test]
