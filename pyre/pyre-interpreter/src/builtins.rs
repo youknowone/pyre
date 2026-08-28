@@ -14160,6 +14160,27 @@ fn source_as_str(
     filename: &rustpython_wtf8::Wtf8,
     flags: &mut i64,
 ) -> Result<String, crate::PyError> {
+    let text = source_text(source, funcname, what, filename, flags)?;
+    // A null ends the C string the tokenizer would read, so the source is
+    // refused whole rather than at the character.  The error carries no
+    // position for the same reason: nothing was tokenized to have one, and a
+    // reported line would invite a fix to that line instead of to the string.
+    if *flags & PYCF_ACCEPT_NULL_BYTES == 0 && text.contains('\0') {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SyntaxError,
+            "source code string cannot contain null bytes",
+        ));
+    }
+    Ok(text)
+}
+
+fn source_text(
+    source: PyObjectRef,
+    funcname: &str,
+    what: &str,
+    filename: &rustpython_wtf8::Wtf8,
+    flags: &mut i64,
+) -> Result<String, crate::PyError> {
     unsafe {
         if pyre_object::is_str(source) {
             // A text source is encoded strictly and coding-cookie detection is

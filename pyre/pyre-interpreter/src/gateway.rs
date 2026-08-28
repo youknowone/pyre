@@ -2036,7 +2036,7 @@ fn path_or_fd_w(
     if as_fd == -1 && !nonstrict && data.contains(&0) {
         let text = match caller {
             Some((name, arg)) => format!("{name}: embedded null character in {arg}"),
-            None => "embedded null character".to_string(),
+            None => "embedded null byte".to_string(),
         };
         return Err(crate::PyError::value_error(text));
     }
