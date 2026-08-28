@@ -58,7 +58,7 @@ fn definition_site(graph: &FunctionGraph, var: &Variable) -> String {
                 }
                 let origin = match link.args.get(position) {
                     Some(LinkArg::Value(source)) => {
-                        producing_op(graph, source).unwrap_or_else(|| format!("id={}", source.id()))
+                        origin_of(graph, source, &mut HashSet::new(), ORIGIN_WALK_DEPTH)
                     }
                     Some(other) => format!("{other:?}"),
                     None => "<link arity mismatch>".to_string(),
@@ -75,6 +75,11 @@ fn definition_site(graph: &FunctionGraph, var: &Variable) -> String {
     "no definition site found in this graph".to_string()
 }
 
+/// Hop budget for [`origin_of`]. A forwarded value crosses a handful of blocks
+/// at most; the bound is what keeps a loop in the link graph from recursing
+/// without end, alongside the visited set.
+const ORIGIN_WALK_DEPTH: usize = 16;
+
 /// `block N op I \`label\`` for the operation whose result is `var`.
 fn producing_op(graph: &FunctionGraph, var: &Variable) -> Option<String> {
     for block in &graph.blocks {
@@ -89,6 +94,50 @@ fn producing_op(graph: &FunctionGraph, var: &Variable) -> Option<String> {
         }
     }
     None
+}
+
+/// Resolve a value back to the operation that actually produces it, walking
+/// through block inputargs for as long as the value is only being forwarded.
+///
+/// A block inputarg has no defining operation, so resolving one hop lands on
+/// another inputarg whenever a value is threaded through a chain of blocks —
+/// and the report then stops at a bare `id=`, which names nothing. Each hop
+/// takes the incoming link argument in the same position; distinct origins are
+/// reported side by side because a block with several predecessors genuinely
+/// has several.
+fn origin_of(graph: &FunctionGraph, var: &Variable, seen: &mut HashSet<u64>, depth: usize) -> String {
+    if let Some(site) = producing_op(graph, var) {
+        return site;
+    }
+    if depth == 0 || !seen.insert(var.id()) {
+        return format!("id={}", var.id());
+    }
+    for block in &graph.blocks {
+        let Some(position) = block.inputargs.iter().position(|arg| arg.id() == var.id()) else {
+            continue;
+        };
+        let mut origins: Vec<String> = Vec::new();
+        for pred in &graph.blocks {
+            for link in &pred.exits {
+                if link.target != block.id {
+                    continue;
+                }
+                let origin = match link.args.get(position) {
+                    Some(LinkArg::Value(source)) => origin_of(graph, source, seen, depth - 1),
+                    Some(other) => format!("{other:?}"),
+                    None => "<link arity mismatch>".to_string(),
+                };
+                if !origins.contains(&origin) {
+                    origins.push(origin);
+                }
+            }
+        }
+        if !origins.is_empty() {
+            return origins.join(" | ");
+        }
+        break;
+    }
+    format!("id={}", var.id())
 }
 
 /// Every use of a variable at or after the split point, keyed by
