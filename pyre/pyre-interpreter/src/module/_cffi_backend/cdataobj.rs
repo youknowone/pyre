@@ -25,6 +25,14 @@ pub const FLAVOR_SLICED: i64 = 3;
 /// `W_CDataPtrToStructOrUnion` — what `newp()` returns for a `struct *`: it
 /// owns nothing itself and co-owns the `W_CDataNewStd` holding the struct.
 pub const FLAVOR_PTR_TO_STRUCT: i64 = 4;
+/// `W_CDataHandle` — a non-moving cdata whose address hides a Python object.
+pub const FLAVOR_HANDLE: i64 = 5;
+/// `W_CDataFromBuffer` — a borrowed raw buffer with a retained export.
+pub const FLAVOR_FROM_BUFFER: i64 = 6;
+/// `W_CDataGCP` — a cdata view with an application-level destructor.
+pub const FLAVOR_GCP: i64 = 7;
+/// `W_CDataNewNonStd` — memory returned by an application allocator.
+pub const FLAVOR_NEW_NONSTD: i64 = 8;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
 #[crate::pyre_class("_cffi_backend._CDataBase")]
@@ -40,13 +48,19 @@ pub struct W_CData {
     /// `W_CDataSliced.length` for a slice.  -1 when neither applies.
     pub length: i64,
     /// `W_CDataNewStd.datasize`, which becomes -1 once the memory is freed.
+    /// A `W_CDataFromBuffer` keeps no size here and uses the slot for whether
+    /// it still holds the export it must decref, which `release` clears.
     pub datasize: i64,
     /// Whatever the cdata must keep alive: `W_CDataPtrToStructOrUnion`'s
     /// `structobj`, `W_CDataFromBuffer`'s `w_keepalive`, `W_CDataGCP`'s
     /// `w_original_cdata`.
     pub w_keepalive: PyObjectRef,
-    /// `W_CDataGCP.w_destructor`.
+    /// `W_CDataGCP.w_destructor`, and the object a `W_CDataFromBuffer` took
+    /// its export from — the one whose export it decrefs on release.
     pub w_destructor: PyObjectRef,
+    /// The translated `special_memory_pressure` field installed for classes
+    /// passed as the object argument to `rgc.add_memory_pressure`.
+    pub special_memory_pressure: i64,
 }
 
 impl W_CData {
@@ -58,7 +72,7 @@ impl W_CData {
     fn sizeof(&self) -> Result<i64, PyError> {
         let ct = self.ctype_ref()?;
         match self.flavor {
-            FLAVOR_NEW_STD if self.length >= 0 => {
+            FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD if self.length >= 0 => {
                 if ct.kind == ctypeobj::KIND_ARRAY {
                     let item = ctypeobj::ctype_at(ct.ctitem)
                         .ok_or_else(|| PyError::system_error("array without an item type"))?;
@@ -68,7 +82,7 @@ impl W_CData {
                     Ok(self.length)
                 }
             }
-            FLAVOR_SLICED => {
+            FLAVOR_SLICED | FLAVOR_FROM_BUFFER if ct.kind == ctypeobj::KIND_ARRAY => {
                 let item = ctypeobj::ctype_at(ct.ctitem)
                     .ok_or_else(|| PyError::system_error("slice without an item type"))?;
                 Ok(self.length * item.size)
@@ -80,7 +94,9 @@ impl W_CData {
     /// `W_CData.get_array_length`.
     pub fn array_length(&self) -> Result<i64, PyError> {
         match self.flavor {
-            FLAVOR_NEW_STD | FLAVOR_SLICED => Ok(self.length),
+            FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD | FLAVOR_SLICED | FLAVOR_FROM_BUFFER => {
+                Ok(self.length)
+            }
             _ => {
                 let ct = self.ctype_ref()?;
                 Ok(ct.length)
@@ -92,7 +108,7 @@ impl W_CData {
     pub fn repr_extra(&self) -> Result<String, PyError> {
         let ct = self.ctype_ref()?;
         match self.flavor {
-            FLAVOR_NEW_STD => {
+            FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD => {
                 // `W_CData._repr_extra_owning`: a pointer reports the size of
                 // what it points at, not the size of the pointer.
                 let bytes = if ct.kind == ctypeobj::KIND_POINTER {
@@ -110,6 +126,31 @@ impl W_CData {
                 Some(structobj) => structobj.repr_extra(),
                 None => Ok("NULL".to_string()),
             },
+            // `W_CDataHandle._repr_extra`.
+            FLAVOR_HANDLE => {
+                let roots = pyre_object::gc_roots::push_roots();
+                let keepalive_slot = roots.base();
+                let _ = roots.pin_root(self.w_keepalive);
+                let w_repr = crate::builtins::builtin_repr(&[roots.get(keepalive_slot)])?;
+                Ok(format!("handle to {}", unsafe {
+                    pyre_object::w_str_get_value(w_repr)
+                }))
+            }
+            // `W_CDataFromBuffer._repr_extra`.
+            FLAVOR_FROM_BUFFER => {
+                if self.w_keepalive.is_null() {
+                    return Ok("buffer RELEASED".to_string());
+                }
+                let type_name = crate::type_methods::arg_type_name(self.w_keepalive);
+                if ct.kind == ctypeobj::KIND_ARRAY {
+                    Ok(format!(
+                        "buffer len {} from '{}' object",
+                        self.length, type_name
+                    ))
+                } else {
+                    Ok(format!("buffer from '{}' object", type_name))
+                }
+            }
             _ => unsafe { ct.extra_repr(self.ptr) },
         }
     }
@@ -169,6 +210,96 @@ pub fn new_cdata_ptr_to_struct(
     new_cdata_full(ptr, w_ctype, FLAVOR_PTR_TO_STRUCT, -1, -1, w_structobj)
 }
 
+/// `W_CDataHandle.__init__`.
+pub fn new_cdata_handle(w_ctype: PyObjectRef, w_keepalive: PyObjectRef) -> PyObjectRef {
+    // `allocate_stable` supplies the non-moving address that `hide_object`
+    // exposes.  Fill the pointer after allocation because it is the object's
+    // own address.
+    let obj = new_cdata_full(
+        std::ptr::null_mut(),
+        w_ctype,
+        FLAVOR_HANDLE,
+        -1,
+        -1,
+        w_keepalive,
+    );
+    W_CData::from_obj(obj)
+        .expect("new_cdata_full returns a cdata")
+        .ptr = obj.cast::<u8>();
+    obj
+}
+
+/// `W_CDataFromBuffer.__init__`.
+pub fn new_cdata_from_buffer(
+    ptr: *mut u8,
+    length: i64,
+    w_ctype: PyObjectRef,
+    w_keepalive: PyObjectRef,
+    w_export_owner: PyObjectRef,
+    export_held: bool,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let owner_slot = roots.base();
+    let _ = roots.pin_root(w_export_owner);
+    let obj = new_cdata_full(
+        ptr,
+        w_ctype,
+        FLAVOR_FROM_BUFFER,
+        length,
+        i64::from(export_held),
+        w_keepalive,
+    );
+    W_CData::from_obj(obj)
+        .expect("new_cdata_full returns a cdata")
+        .w_destructor = roots.get(owner_slot);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    if export_held {
+        crate::executioncontext::register_finalizer(obj);
+    }
+    obj
+}
+
+/// `W_CDataGCP.__init__`.
+pub fn new_cdata_gcp(
+    ptr: *mut u8,
+    w_ctype: PyObjectRef,
+    w_original: PyObjectRef,
+    w_destructor: PyObjectRef,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let destructor_slot = roots.base();
+    let _ = roots.pin_root(w_destructor);
+    let obj = new_cdata_full(ptr, w_ctype, FLAVOR_GCP, -1, -1, w_original);
+    W_CData::from_obj(obj)
+        .expect("new_cdata_full returns a cdata")
+        .w_destructor = roots.get(destructor_slot);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    crate::executioncontext::register_finalizer(obj);
+    obj
+}
+
+/// `W_CDataNewNonStd.__init__`.
+pub fn new_cdata_nonstd(
+    ptr: *mut u8,
+    w_ctype: PyObjectRef,
+    length: i64,
+    w_raw_cdata: PyObjectRef,
+    w_free: PyObjectRef,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let free_slot = roots.base();
+    let _ = roots.pin_root(w_free);
+    let obj = new_cdata_full(ptr, w_ctype, FLAVOR_NEW_NONSTD, length, -1, w_raw_cdata);
+    W_CData::from_obj(obj)
+        .expect("new_cdata_full returns a cdata")
+        .w_destructor = roots.get(free_slot);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    if !roots.get(free_slot).is_null() {
+        crate::executioncontext::register_finalizer(obj);
+    }
+    obj
+}
+
 /// `W_CTypeStructOrUnion.copy_and_convert_to_object` — a `W_CDataNewStd`
 /// holding a copy of what `source` points at.
 ///
@@ -196,10 +327,9 @@ pub unsafe fn new_cdata_copy(
 pub fn structobj_of(w_cdata: PyObjectRef) -> Option<&'static mut W_CData> {
     let cdata = W_CData::from_obj(w_cdata)?;
     match cdata.flavor {
-        FLAVOR_NEW_STD => Some(cdata),
-        FLAVOR_PTR_TO_STRUCT => {
-            W_CData::from_obj(cdata.w_keepalive).filter(|s| s.flavor == FLAVOR_NEW_STD)
-        }
+        FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD => Some(cdata),
+        FLAVOR_PTR_TO_STRUCT => W_CData::from_obj(cdata.w_keepalive)
+            .filter(|s| matches!(s.flavor, FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD)),
         _ => None,
     }
 }
@@ -212,14 +342,16 @@ pub fn new_cdata_owning(
     length: i64,
 ) -> Result<PyObjectRef, PyError> {
     let ptr = raw_alloc(datasize, true)?;
-    Ok(new_cdata_full(
+    let obj = new_cdata_full(
         ptr,
         w_ctype,
         FLAVOR_NEW_STD,
         length,
         datasize,
         pyre_object::PY_NULL,
-    ))
+    );
+    add_memory_pressure(obj, datasize);
+    Ok(obj)
 }
 
 fn new_cdata_full(
@@ -253,6 +385,32 @@ fn new_cdata_full(
     // the barrier has to run again after this write.
     pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
     obj
+}
+
+/// `W_CDataNewStd.__init__` for an allocator-selected raw block.
+pub fn new_cdata_full_for_allocator(
+    ptr: *mut u8,
+    w_ctype: PyObjectRef,
+    length: i64,
+    datasize: i64,
+) -> PyObjectRef {
+    let obj = new_cdata_full(
+        ptr,
+        w_ctype,
+        FLAVOR_NEW_STD,
+        length,
+        datasize,
+        pyre_object::PY_NULL,
+    );
+    add_memory_pressure(obj, datasize);
+    obj
+}
+
+/// `rgc.add_memory_pressure(size, cdata)`.
+pub fn add_memory_pressure(w_cdata: PyObjectRef, size: i64) {
+    if size != 0 {
+        majit_gc::add_memory_pressure(size as isize, majit_ir::GcRef(w_cdata as usize));
+    }
 }
 
 /// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')`.  A zero-size request
@@ -291,6 +449,58 @@ pub unsafe fn w_cdata_dealloc(obj: PyObjectRef) {
     }
     cdata.ptr = std::ptr::null_mut();
     cdata.datasize = -1;
+}
+
+/// `W_CDataFromBuffer._finalize_`, `W_CDataGCP._finalize_`, and
+/// `W_CDataNewNonStd._finalize_`.
+///
+/// This runs from the interpreter finalizer queue, where calling Python is
+/// permitted.  It is separate from [`w_cdata_dealloc`], the allocation-free
+/// sweep destructor.
+pub fn finalize(w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let flavor = cdata_arg(w_cdata)?.flavor;
+    match flavor {
+        FLAVOR_FROM_BUFFER => release_buffer_export(w_cdata),
+        FLAVOR_GCP | FLAVOR_NEW_NONSTD => invoke_destructor(w_cdata),
+        _ => Ok(()),
+    }
+}
+
+/// `W_CDataGCP.invoke_finalizer` and `W_CDataNewNonStd._do_exit`.
+fn invoke_destructor(w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cdata_slot = roots.base();
+    let _ = roots.pin_root(w_cdata);
+    let destructor_slot = cdata_slot + 1;
+    let _ = roots.pin_root(cdata_arg(roots.get(cdata_slot))?.w_destructor);
+    if roots.get(destructor_slot).is_null() {
+        return Ok(());
+    }
+    // Clear first: a recursive release or a resurrected cdata must not call
+    // the destructor twice.
+    cdata_arg(roots.get(cdata_slot))?.w_destructor = pyre_object::PY_NULL;
+    let original = cdata_arg(roots.get(cdata_slot))?.w_keepalive;
+    let original_slot = destructor_slot + 1;
+    let _ = roots.pin_root(original);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(roots.get(cdata_slot).cast::<u8>());
+    crate::call::call_function_impl_result(
+        roots.get(destructor_slot),
+        &[roots.get(original_slot)],
+    )?;
+    Ok(())
+}
+
+/// `W_CDataFromBuffer.enter_exit`'s export release.
+fn release_buffer_export(w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let cdata = cdata_arg(w_cdata)?;
+    if cdata.datasize != 0 && !cdata.w_destructor.is_null() {
+        unsafe { crate::builtins::buffer_export_decref(cdata.w_destructor) };
+        cdata.datasize = 0;
+    }
+    cdata.w_keepalive = pyre_object::PY_NULL;
+    cdata.w_destructor = pyre_object::PY_NULL;
+    pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata.cast::<u8>());
+    Ok(())
 }
 
 // ── the Python type ─────────────────────────────────────────────────────
@@ -487,6 +697,23 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
         }
         return Ok(());
     }
+    if cdata.flavor == FLAVOR_FROM_BUFFER {
+        if exit_now {
+            release_buffer_export(w_cdata)?;
+            crate::executioncontext::may_ignore_finalizer(w_cdata);
+        }
+        return Ok(());
+    }
+    if matches!(cdata.flavor, FLAVOR_GCP | FLAVOR_NEW_NONSTD) {
+        if exit_now {
+            if cdata.flavor == FLAVOR_NEW_NONSTD && !cdata.w_destructor.is_null() {
+                add_memory_pressure(w_cdata, -cdata.sizeof()?);
+            }
+            invoke_destructor(w_cdata)?;
+            crate::executioncontext::may_ignore_finalizer(w_cdata);
+        }
+        return Ok(());
+    }
     let ct = cdata.ctype_ref()?;
     if cdata.flavor != FLAVOR_NEW_STD || !ct.is_ptr_or_array() {
         return Err(PyError::value_error(
@@ -495,11 +722,49 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
     }
     if exit_now && cdata.datasize >= 0 {
         // `W_CDataNewStd._do_exit`.
+        add_memory_pressure(w_cdata, -cdata.datasize);
         cdata.datasize = -1;
         unsafe { libc::free(cdata.ptr.cast::<libc::c_void>()) };
         cdata.ptr = std::ptr::null_mut();
     }
     Ok(())
+}
+
+/// `W_CData.with_gc`.
+pub fn with_gc(
+    w_cdata: PyObjectRef,
+    w_destructor: PyObjectRef,
+    size: i64,
+) -> Result<PyObjectRef, PyError> {
+    let cdata = cdata_arg(w_cdata)?;
+    if unsafe { pyre_object::pyobject::is_none(w_destructor) } {
+        if cdata.flavor != FLAVOR_GCP {
+            return Err(PyError::type_error(
+                "Can remove destructor only on a object previously returned by ffi.gc()",
+            ));
+        }
+        cdata.w_destructor = pyre_object::PY_NULL;
+        pyre_object::gc_hook::try_gc_write_barrier_managed(w_cdata.cast::<u8>());
+        crate::executioncontext::may_ignore_finalizer(w_cdata);
+        add_memory_pressure(w_cdata, size);
+        return Ok(pyre_object::w_none());
+    }
+    let result = new_cdata_gcp(cdata.ptr, cdata.ctype, w_cdata, w_destructor);
+    add_memory_pressure(result, size);
+    Ok(result)
+}
+
+/// `W_CData.get_maximum_buffer_size` and its owning overrides.
+pub fn maximum_buffer_size(w_cdata: PyObjectRef) -> Result<i64, PyError> {
+    let cdata = cdata_arg(w_cdata)?;
+    match cdata.flavor {
+        FLAVOR_NEW_STD => Ok(cdata.datasize),
+        FLAVOR_PTR_TO_STRUCT => match W_CData::from_obj(cdata.w_keepalive) {
+            Some(structobj) => structobj.sizeof(),
+            None => Ok(-1),
+        },
+        _ => Ok(-1),
+    }
 }
 
 /// `W_CData.iter`.
@@ -680,7 +945,10 @@ fn check_subscript_index(cdata: &W_CData, i: i64) -> Result<&'static mut W_CType
     match ct.kind {
         // `W_CTypePointer._check_subscript_index`.
         ctypeobj::KIND_POINTER => {
-            if cdata.flavor == FLAVOR_NEW_STD || cdata.flavor == FLAVOR_PTR_TO_STRUCT {
+            if matches!(
+                cdata.flavor,
+                FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD | FLAVOR_PTR_TO_STRUCT
+            ) {
                 if i != 0 {
                     return Err(PyError::index_error(format!(
                         "cdata '{}' can only be indexed by 0",

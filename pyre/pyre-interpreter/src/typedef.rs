@@ -22290,6 +22290,12 @@ pub(crate) fn buffer_as_bytes_like(
             pyre_object::interp_array::w_array_bytes(obj)
         })));
     }
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    if let Some((address, length)) = crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+    {
+        let data = unsafe { std::slice::from_raw_parts(address, length) };
+        return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
+    }
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     if let Some(data) = crate::module::_ctypes::cdata::cdata_bytes_object(obj) {
         return Ok(Some(data));

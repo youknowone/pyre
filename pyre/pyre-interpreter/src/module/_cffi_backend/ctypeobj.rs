@@ -85,7 +85,7 @@ pub const F_WITH_PACKED_CHANGE: i64 = 1 << 15;
 
 /// `ctypeobj.py W_CType` and the RPython subclasses that share its typedef.
 ///
-/// PyPy caches every ctype and reaches the derived ones through weak
+/// `UniqueCache` caches every ctype and reaches the derived ones through weak
 /// references (`W_CType._pointer_type`, `W_CTypePointer._array_types`), so a
 /// ctype dies once the last user does.  pyre holds them strongly and roots
 /// them for the process instead: the memo has to survive because
@@ -493,10 +493,19 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
 
 /// `W_CType.newp`.
 pub fn newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    newp_with_allocator(w_ctype, w_init, pyre_object::PY_NULL)
+}
+
+/// `W_CType.newp(w_init, allocator)`.
+pub fn newp_with_allocator(
+    w_ctype: PyObjectRef,
+    w_init: PyObjectRef,
+    w_allocator: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
     let ct = ctype_arg(w_ctype)?;
     match ct.kind {
-        KIND_POINTER => super::ctypeptr::pointer_newp(w_ctype, w_init),
-        KIND_ARRAY => super::ctypeptr::array_newp(w_ctype, w_init),
+        KIND_POINTER => super::ctypeptr::pointer_newp(w_ctype, w_init, w_allocator),
+        KIND_ARRAY => super::ctypeptr::array_newp(w_ctype, w_init, w_allocator),
         _ => Err(PyError::type_error(format!(
             "expected a pointer or array ctype, got '{}'",
             ct.name()

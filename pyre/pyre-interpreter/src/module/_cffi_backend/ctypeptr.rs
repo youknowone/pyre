@@ -167,11 +167,10 @@ pub unsafe fn convert_array_from_object(
             return Err(ct.convert_error("unicode or list or tuple", w_ob));
         }
         let value = unsafe { pyre_object::w_str_get_wtf8(w_ob) };
-        let points: Vec<u32> = value.code_points().map(|p| p.to_u32()).collect();
         let n = if item.size == 2 {
-            points.iter().map(|&p| if p > 0xFFFF { 2 } else { 1 }).sum()
+            super::wchar_helper::utf8_size_as_char16(value)
         } else {
-            points.len() as i64
+            value.code_points().count() as i64
         };
         if ct.length >= 0 && n > ct.length {
             return Err(PyError::index_error(format!(
@@ -179,37 +178,12 @@ pub unsafe fn convert_array_from_object(
                 ct.name()
             )));
         }
-        let mut at = 0isize;
-        for point in points {
-            unsafe {
-                if item.size == 2 && point > 0xFFFF {
-                    // A code point past the BMP is a surrogate pair in a
-                    // `char16_t` array.
-                    let unit = point - 0x10000;
-                    misc::write_raw_unsigned_data(
-                        cdata.offset(at * 2),
-                        u64::from(0xD800 + (unit >> 10)),
-                        2,
-                    )?;
-                    misc::write_raw_unsigned_data(
-                        cdata.offset((at + 1) * 2),
-                        u64::from(0xDC00 + (unit & 0x3FF)),
-                        2,
-                    )?;
-                    at += 2;
-                } else {
-                    misc::write_raw_unsigned_data(
-                        cdata.offset(at * item.size as isize),
-                        u64::from(point),
-                        item.size,
-                    )?;
-                    at += 1;
-                }
-            }
-        }
-        if n != ct.length {
-            unsafe {
-                misc::write_raw_unsigned_data(cdata.offset(at * item.size as isize), 0, item.size)?;
+        let add_final_zero = n != ct.length;
+        unsafe {
+            if item.size == 2 {
+                super::wchar_helper::utf8_to_char16(value, cdata, n, add_final_zero)?;
+            } else {
+                super::wchar_helper::utf8_to_char32(value, cdata, n, add_final_zero)?;
             }
         }
         return Ok(());
@@ -237,7 +211,11 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
 }
 
 /// `W_CTypePointer.newp`.
-pub fn pointer_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn pointer_newp(
+    w_ctype: PyObjectRef,
+    w_init: PyObjectRef,
+    w_allocator: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let item = item_of(ct)?;
     let w_item = ct.ctitem;
@@ -270,7 +248,12 @@ pub fn pointer_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjec
             }
             varsize_length = datasize;
         }
-        let w_structobj = cdataobj::new_cdata_owning(w_item, datasize, varsize_length)?;
+        let w_structobj = super::allocator::allocate(
+            super::allocator::W_Allocator::from_obj(w_allocator),
+            datasize,
+            w_item,
+            varsize_length,
+        )?;
         let struct_slot = cdata_slot;
         let _ = roots.pin_root(w_structobj);
         let ptr = cdataobj::cdata_arg(roots.get(struct_slot))?.ptr;
@@ -290,7 +273,12 @@ pub fn pointer_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjec
         // Room for the null character `newp` always adds.
         datasize *= 2;
     }
-    let w_cdata = cdataobj::new_cdata_owning(w_ctype, datasize, -1)?;
+    let w_cdata = super::allocator::allocate(
+        super::allocator::W_Allocator::from_obj(w_allocator),
+        datasize,
+        w_ctype,
+        -1,
+    )?;
     let _ = roots.pin_root(w_cdata);
     let w_init = roots.get(init_slot);
     if !unsafe { pyre_object::pyobject::is_none(w_init) } {
@@ -303,7 +291,11 @@ pub fn pointer_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjec
 }
 
 /// `W_CTypeArray.newp`.
-pub fn array_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjectRef, PyError> {
+pub fn array_newp(
+    w_ctype: PyObjectRef,
+    w_init: PyObjectRef,
+    w_allocator: PyObjectRef,
+) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let roots = pyre_object::gc_roots::push_roots();
     let init_slot = roots.base();
@@ -318,7 +310,12 @@ pub fn array_newp(w_ctype: PyObjectRef, w_init: PyObjectRef) -> Result<PyObjectR
     };
     let init_slot2 = init_slot + 1;
     let _ = roots.pin_root(w_init);
-    let w_cdata = cdataobj::new_cdata_owning(w_ctype, datasize, length)?;
+    let w_cdata = super::allocator::allocate(
+        super::allocator::W_Allocator::from_obj(w_allocator),
+        datasize,
+        w_ctype,
+        length,
+    )?;
     let cdata_slot = init_slot2 + 1;
     let _ = roots.pin_root(w_cdata);
     let w_init = roots.get(init_slot2);
@@ -429,7 +426,13 @@ pub fn string(w_cdata: PyObjectRef, maxlen: i64) -> Result<PyObjectRef, PyError>
         return Ok(pyre_object::bytesobject::w_bytes_from_bytes(bytes));
     }
     if ct.is_unichar_ptr_or_array() {
-        let measured = unsafe { measure_wide_length(cdata.ptr, item.size, length)? };
+        let measured = unsafe {
+            if item.size == 2 {
+                super::wchar_helper::measure_length_16(cdata.ptr, length)?
+            } else {
+                super::wchar_helper::measure_length_32(cdata.ptr, length)?
+            }
+        };
         return unpack_ptr(ct, item, cdata.ptr, measured);
     }
     Err(ctypeobj::unexpected_string_argument(ct))
@@ -451,24 +454,6 @@ unsafe fn read_until_nul(ptr: *const u8, length: i64) -> &'static [u8] {
         n += 1;
     }
     unsafe { std::slice::from_raw_parts(ptr, n) }
-}
-
-/// `wchar_helper.measure_length_16` / `measure_length_32`.
-///
-/// # Safety
-/// `ptr` must be readable up to the first zero unit, or for `length` units.
-unsafe fn measure_wide_length(ptr: *const u8, unit_size: i64, length: i64) -> Result<i64, PyError> {
-    let mut n = 0i64;
-    while length < 0 || n < length {
-        let unit = unsafe {
-            misc::read_raw_unsigned_data(ptr.offset((n * unit_size) as isize), unit_size)?
-        };
-        if unit == 0 {
-            break;
-        }
-        n += 1;
-    }
-    Ok(n)
 }
 
 /// `W_CType.unpack_ptr` and the primitive fast paths over it.
@@ -508,32 +493,13 @@ pub fn unpack_ptr(
 
 /// `wchar_helper.utf8_from_char16` / `utf8_from_char32`.
 fn unpack_wide_string(item: &W_CType, ptr: *mut u8, length: i64) -> Result<PyObjectRef, PyError> {
-    let mut out = rustpython_wtf8::Wtf8Buf::new();
-    let mut i = 0i64;
-    while i < length {
-        let mut value = unsafe {
-            misc::read_raw_unsigned_data(ptr.offset((i * item.size) as isize), item.size)?
-        } as u32;
-        i += 1;
-        // A `char16_t` array carries a surrogate pair for anything past the
-        // BMP; a lone surrogate stays one, which WTF-8 can hold.
-        if item.size == 2 && (0xD800..0xDC00).contains(&value) && i < length {
-            let low = unsafe {
-                misc::read_raw_unsigned_data(ptr.offset((i * item.size) as isize), item.size)?
-            } as u32;
-            if (0xDC00..0xE000).contains(&low) {
-                value = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
-                i += 1;
-            }
+    let (out, _) = unsafe {
+        if item.size == 2 {
+            super::wchar_helper::utf8_from_char16(ptr, length)?
+        } else {
+            super::wchar_helper::utf8_from_char32(ptr, length)?
         }
-        let Some(point) = rustpython_wtf8::CodePoint::from_u32(value) else {
-            return Err(PyError::value_error(format!(
-                "{} out of range for conversion to unicode: {value:#x}",
-                item.name()
-            )));
-        };
-        out.push(point);
-    }
+    };
     Ok(pyre_object::w_str_from_wtf8(out))
 }
 
@@ -561,6 +527,15 @@ pub unsafe fn pointer_convert_argument_from_object(
 
     let mut result = MUSTFREE_NOTHING;
     if W_CData::from_obj(w_ob).is_none() {
+        if ct.has(ctypeobj::F_ACCEPT_STR)
+            && let Some(offset) = super::func::OffsetInBytes::from_obj(w_ob)
+        {
+            let value = unsafe { pyre_object::bytesobject::w_bytes_data(offset.w_bytes) };
+            let ptr = unsafe { value.as_ptr().offset(offset.offset as isize) };
+            unsafe { cdata.cast::<*const u8>().cast_mut().write_unaligned(ptr) };
+            set_mustfree_flag(cdata, MUSTFREE_NOTHING);
+            return Ok(false);
+        }
         if ct.has(ctypeobj::F_ACCEPT_STR) && unsafe { pyre_object::bytesobject::is_bytes(w_ob) } {
             // A `bytes` passed to a `char *` argument reaches C as a copy
             // with its own null terminator; RPython instead pins or hands

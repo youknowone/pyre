@@ -182,7 +182,11 @@ fn do_call(
                 mustfree_max_plus_1 = i + 1;
             }
         }
+        // `clibffi.py jit_ffi_call` swaps the thread's alternate errno into
+        // the C runtime around every foreign call.
+        super::cerrno::errno_before();
         unsafe { invoke(cif, funcaddr, buffer, args_w.len()) };
+        super::cerrno::errno_after();
         let resultdata = unsafe { buffer.add(exchange_result(cif)) };
         unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     })();

@@ -16,6 +16,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     let abi = default_abi() as i64;
     crate::module_ns_store(ns, "FFI_DEFAULT_ABI", pyre_object::w_int_new(abi));
     crate::module_ns_store(ns, "FFI_CDECL", pyre_object::w_int_new(abi));
+    if let Some(stdcall) = super::ctypefunc::stdcall_abi() {
+        crate::module_ns_store(ns, "FFI_STDCALL", pyre_object::w_int_new(stdcall));
+    }
 
     register_rtld_constants(ns);
 
@@ -37,6 +40,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("unpack", super::func::unpack, 2),
         ("memmove", super::func::memmove, 3),
         ("release", super::func::release, 1),
+        ("newp_handle", super::handle::newp_handle, 2),
+        ("from_handle", super::handle::from_handle, 1),
+        ("get_errno", super::cerrno::get_errno, 0),
+        ("set_errno", super::cerrno::set_errno, 1),
         ("_get_types", super::func::get_types, 0),
         ("_get_common_types", get_common_types, 1),
         ("new_struct_type", super::func::new_struct_type, 1),
@@ -63,6 +70,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("complete_struct_or_union", super::func::complete_struct_or_union),
         ("new_function_type", super::func::new_function_type),
         ("load_library", super::func::load_library),
+        ("from_buffer", super::func::from_buffer),
+        ("gcp", super::func::gcp),
+        ("_offset_in_bytes", super::func::offset_in_bytes),
     ] {
         crate::module_ns_store(
             ns,
@@ -80,6 +90,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     );
     crate::module_ns_store(ns, "CField", super::ctypestruct::cfield_type());
     crate::module_ns_store(ns, "CLibrary", super::libraryobj::clibrary_type());
+    crate::module_ns_store(ns, "__FFIAllocator", super::allocator::allocator_type());
+    crate::module_ns_store(ns, "buffer", super::cbuffer::buffer_type());
+
+    #[cfg(windows)]
+    crate::module_ns_store(
+        ns,
+        "getwinerror",
+        crate::gateway::with_module(
+            MODULE,
+            crate::make_module_builtin_function("getwinerror", super::cerrno::getwinerror),
+        ),
+    );
 }
 
 const MODULE: &str = "_cffi_backend";

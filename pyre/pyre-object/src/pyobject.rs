@@ -478,6 +478,14 @@ pub const fn subclass_range_alias(type_id: u32, pytype: &'static PyType) -> Subc
     SubclassRangeAlias { type_id, pytype }
 }
 
+/// Where `_cffi_backend`'s eight tail slots start.  The three Windows
+/// payloads ahead of them exist only there, so the group begins three ids
+/// later on Windows than anywhere else.
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 194;
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 191;
+
 /// Canonical `rclass.OBJECT` inheritance census in GC registration order.
 ///
 /// Each entry is `(typeid, parent_typeid)`. This is the shared input for the
@@ -686,35 +694,26 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (180, Some(0)),
     (181, Some(0)),
     (182, Some(0)),
-    // `_cffi_backend`'s ctype, cdata, and array-iterator payloads.  All three
-    // are unconditional, so they precede the target-gated native tail and keep
-    // one id on every target.
-    (183, Some(0)),
-    (184, Some(0)),
-    (185, Some(0)),
-    // `_cffi_backend`'s struct field and library handle close that block.
-    (186, Some(0)),
-    (187, Some(0)),
-    // Native-only type IDs 188 and 189 represent `posix.DirEntry` and
+    // Native-only type IDs 183 and 184 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (188, Some(0)),
+    (183, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (189, Some(0)),
+    (184, Some(0)),
     // rustls `_ssl` context, MemoryBIO, and session native payloads.  These
     // extend the append-only native rclass tail; wasm omits the host TLS
     // module and therefore the hierarchy entries as well. Sandbox filtering
     // belongs to pyre-interpreter, which owns that module configuration.
     #[cfg(not(target_arch = "wasm32"))]
-    (190, Some(0)),
+    (185, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (191, Some(0)),
+    (186, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (192, Some(0)),
+    (187, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (193, Some(0)),
+    (188, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (194, Some(0)),
+    (189, Some(0)),
     // `mmap.mmap` owns its native mapping payload — the duplicated fd on POSIX
     // and the file handle on Windows — and follows the optional SSL tail
     // wherever the module is compiled.  The gate must match the alias gate in
@@ -723,20 +722,44 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // A sandbox build has no `mmap` module either, so
     // `active_subclass_range_hierarchy` drops this entry along with SSL's.
     #[cfg(any(unix, windows))]
-    (195, Some(0)),
+    (190, Some(0)),
     // `_overlapped.Overlapped` owns the Windows OVERLAPPED record and its
     // retained Python buffers.  pyre-interpreter supplies the vtable alias;
     // the object layer owns only the append-only hierarchy slot.
     #[cfg(windows)]
-    (196, Some(0)),
+    (191, Some(0)),
     // `_winapi.Overlapped` owns a second Windows OVERLAPPED record, the one
     // waited on through an event of its own rather than a completion port.
     #[cfg(windows)]
-    (197, Some(0)),
+    (192, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload.
     // Its append-only vtable id follows both Windows overlapped owners.
     #[cfg(windows)]
-    (198, Some(0)),
+    (193, Some(0)),
+    // `_cffi_backend` is absent on wasm32 and in sandbox builds.  Its eight
+    // hierarchy slots sit at the tail because the interpreter's sandbox
+    // filter can only remove a contiguous trailing slice.
+    // `_cffi_backend`'s ctype, cdata, and array-iterator payloads precede the
+    // remaining payloads in the group.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 1, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 2, Some(0)),
+    // `_cffi_backend`'s struct field and library handle follow them.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 3, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 4, Some(0)),
+    // `_cffi_backend`'s allocator and MiniBuffer follow the existing owners.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 5, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 6, Some(0)),
+    // `_cffi_backend._OffsetInBytes` is the internal pointer-call carrier.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 7, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

@@ -3,10 +3,43 @@
 
 use crate::PyError;
 use pyre_object::PyObjectRef;
+use std::sync::OnceLock;
 
 use super::cdataobj::{self, W_CData};
 use super::ctypeobj;
 use super::newtype;
+
+/// `func.py OffsetInBytes`.
+#[crate::pyre_class("_cffi_backend._OffsetInBytes")]
+#[derive(Default)]
+pub struct OffsetInBytes {
+    /// `OffsetInBytes.bytes`.
+    pub w_bytes: PyObjectRef,
+    /// `OffsetInBytes.offset`.
+    pub offset: i64,
+}
+
+static OFFSET_IN_BYTES_TYPE_OBJ: OnceLock<usize> = OnceLock::new();
+
+fn offset_in_bytes_type() -> PyObjectRef {
+    *OFFSET_IN_BYTES_TYPE_OBJ.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type_with_layout(
+            "_cffi_backend._OffsetInBytes",
+            |_| {},
+            crate::typedef::w_object(),
+            <OffsetInBytes as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE,
+        );
+        pyre_object::pyobject::set_instantiate(
+            unsafe { &*<OffsetInBytes as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE },
+            tp,
+        );
+        unsafe {
+            pyre_object::w_type_set_disallow_instantiation(tp);
+            pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+        }
+        tp as usize
+    }) as PyObjectRef
+}
 
 /// `func.py newp`.
 pub fn newp(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
@@ -165,6 +198,125 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(cdataobj::new_cdata(ptr, args[0]))
 }
 
+/// `func.py from_buffer`.
+pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let w_ctype = args[0];
+    let ct = ctypeobj::ctype_arg(w_ctype)?;
+    if !ct.is_ptr_or_array() {
+        return Err(PyError::type_error(format!(
+            "expected a poiunter or array ctype, got '{}'",
+            ct.name()
+        )));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let object_slot = roots.base();
+    let _ = roots.pin_root(args[1]);
+    if unsafe { pyre_object::unicodeobject::is_str(roots.get(object_slot)) } {
+        return Err(PyError::type_error(
+            "from_buffer() cannot return the address of a unicode object",
+        ));
+    }
+    let require_writable = match args.get(2) {
+        Some(&w) => crate::baseobjspace::int_w(w)? != 0,
+        None => false,
+    };
+    let (ptr, buffersize, owner) = if require_writable {
+        let (data, owner, _) = unsafe { crate::builtins::fileio_writebuf(roots.get(object_slot)) }?;
+        (data.as_mut_ptr(), data.len() as i64, owner)
+    } else {
+        let data = unsafe { crate::builtins::acquire_readbuf(roots.get(object_slot)) }?;
+        (
+            data.as_ptr().cast_mut(),
+            data.len() as i64,
+            roots.get(object_slot),
+        )
+    };
+    let owner_slot = object_slot + 1;
+    let _ = roots.pin_root(owner);
+    let held = unsafe { crate::builtins::buffer_export_incref(roots.get(owner_slot)) };
+
+    let arraylength = if ct.kind != ctypeobj::KIND_ARRAY {
+        buffersize
+    } else if ct.length >= 0 {
+        if buffersize < ct.size {
+            if held {
+                unsafe { crate::builtins::buffer_export_decref(roots.get(owner_slot)) };
+            }
+            return Err(PyError::value_error(format!(
+                "buffer is too small ({buffersize} bytes) for '{}' ({} bytes)",
+                ct.name(),
+                ct.size
+            )));
+        }
+        ct.length
+    } else {
+        let itemsize = super::ctypeptr::item_of(ct)?.size;
+        if itemsize == 1 {
+            buffersize
+        } else if itemsize > 0 {
+            buffersize / itemsize
+        } else {
+            if held {
+                unsafe { crate::builtins::buffer_export_decref(roots.get(owner_slot)) };
+            }
+            return Err(PyError::new(
+                crate::PyErrorKind::ZeroDivisionError,
+                format!(
+                    "from_buffer('{}', ..): the actual length of the array cannot be computed",
+                    ct.name()
+                ),
+            ));
+        }
+    };
+    Ok(cdataobj::new_cdata_from_buffer(
+        ptr,
+        arraylength,
+        w_ctype,
+        roots.get(object_slot),
+        roots.get(owner_slot),
+        held,
+    ))
+}
+
+/// `func.py gcp`.
+pub fn gcp(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let cdata_slot = roots.base();
+    let _ = roots.pin_root(args[0]);
+    let destructor_slot = cdata_slot + 1;
+    let _ = roots.pin_root(args[1]);
+    let size = match args.get(2) {
+        Some(&w_size) => crate::baseobjspace::int_w(w_size)?,
+        None => 0,
+    };
+    cdataobj::with_gc(roots.get(cdata_slot), roots.get(destructor_slot), size)
+}
+
+/// `func.py offset_in_bytes`.
+pub fn offset_in_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    if !unsafe { pyre_object::bytesobject::is_bytes(args[0]) } {
+        return Err(PyError::type_error(format!(
+            "must be bytes, not {}",
+            crate::type_methods::arg_type_name(args[0])
+        )));
+    }
+    let _ = offset_in_bytes_type();
+    let roots = pyre_object::gc_roots::push_roots();
+    let bytes_slot = roots.base();
+    let _ = roots.pin_root(args[0]);
+    let offset = crate::baseobjspace::int_w(args[1])?;
+    let obj = OffsetInBytes::allocate_stable(OffsetInBytes {
+        offset,
+        ..Default::default()
+    });
+    OffsetInBytes::from_obj(obj)
+        .expect("allocate_stable hands back this layout")
+        .w_bytes = roots.get(bytes_slot);
+    // The wrapper is born old-gen and the bytes object may be young.
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
+    Ok(obj)
+}
+
 /// `func.py memmove`.
 pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // A `bytes` source hands back an interior pointer, and the size argument's
@@ -176,23 +328,49 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if n < 0 {
         return Err(PyError::value_error("negative size"));
     }
-    let dest = writable_address(args[0])?;
-    let src = readable_address(roots.get(src_slot))?;
+    let mut dest_buffer = None;
+    let dest = if let Some(cdata) = W_CData::from_obj(args[0]) {
+        unsafe_escaping_ptr_for_ptr_or_array(cdata)?
+    } else {
+        dest_buffer = Some(unsafe { crate::builtins::WritableBuffer::acquire(args[0]) }?);
+        unsafe {
+            dest_buffer
+                .as_mut()
+                .expect("just filled")
+                .as_mut_slice()
+                .as_mut_ptr()
+        }
+    };
+    let mut source_buffer = None;
+    let src = if let Some(cdata) = W_CData::from_obj(roots.get(src_slot)) {
+        unsafe_escaping_ptr_for_ptr_or_array(cdata)?.cast_const()
+    } else {
+        let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(roots.get(src_slot))? else {
+            return Err(PyError::type_error("expected a readable buffer"));
+        };
+        let ptr = buffer.as_bytes().as_ptr();
+        source_buffer = Some(buffer);
+        ptr
+    };
     unsafe { std::ptr::copy(src, dest, n as usize) };
+    if let Some(buffer) = source_buffer {
+        buffer.release();
+    }
+    drop(dest_buffer);
     Ok(pyre_object::w_none())
 }
 
-fn writable_address(w_obj: PyObjectRef) -> Result<*mut u8, PyError> {
-    let cdata = W_CData::from_obj(w_obj)
-        .ok_or_else(|| PyError::type_error("expected a cdata pointer, got a non-cdata object"))?;
-    Ok(cdata.ptr)
-}
-
-fn readable_address(w_obj: PyObjectRef) -> Result<*const u8, PyError> {
-    if unsafe { pyre_object::bytesobject::is_bytes(w_obj) } {
-        return Ok(unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) }.as_ptr());
+/// `func.py unsafe_escaping_ptr_for_ptr_or_array`.
+fn unsafe_escaping_ptr_for_ptr_or_array(cdata: &W_CData) -> Result<*mut u8, PyError> {
+    let ct = ctypeobj::ctype_at(cdata.ctype)
+        .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
+    if !ct.has(ctypeobj::F_NONFUNC_POINTER_OR_ARRAY) {
+        return Err(PyError::type_error(format!(
+            "expected a pointer or array ctype, got '{}'",
+            ct.name()
+        )));
     }
-    Ok(writable_address(w_obj)?.cast_const())
+    Ok(cdata.ptr)
 }
 
 /// `func.py release` — `W_CData.enter_exit(exit_now=True)`.

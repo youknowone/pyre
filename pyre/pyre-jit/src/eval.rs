@@ -877,6 +877,7 @@ unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
 
 /// Frees the block a `newp`-owned cdata malloc'd; a cdata that only borrows
 /// someone else's memory frees nothing.
+#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_cdata_destructor(obj_addr: usize) {
     unsafe {
         pyre_interpreter::module::_cffi_backend::cdataobj::w_cdata_dealloc(
@@ -887,6 +888,7 @@ unsafe fn cffi_cdata_destructor(obj_addr: usize) {
 
 /// `W_Library._finalize_` — closes a library nothing names any more, unless
 /// the handle was opened by someone else.
+#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
 unsafe fn cffi_library_destructor(obj_addr: usize) {
     unsafe {
         pyre_interpreter::module::_cffi_backend::libraryobj::w_library_dealloc(
@@ -1967,38 +1969,49 @@ fn build_gc() -> Box<MiniMarkGC> {
     // returns — drift indicates the manual constant in the
     // `#[pyre_class(... type_id = N)]` attribute is out of step
     // with the registration order here.
-    let register_pyre_class = |gc: &mut MiniMarkGC,
-                               pytype_to_tid: &mut HashMap<usize, u32>,
-                               descr: &'static pyre_object::lltype::PyreClassDescriptor|
-     -> u32 {
-        let tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
-            descr.object_size,
-            object_tid,
-            descr.ptr_offsets.to_vec(),
-        ));
-        // Auto-id mode (cell == UNASSIGNED): stamp the cell with
-        // the freshly-assigned tid so runtime readers see it.
-        // Explicit-id mode (cell pre-initialized): drift-check that
-        // the declared id matches registration order.
-        if descr.gc_type_id.is_unassigned() {
-            descr.gc_type_id.set(tid);
-        } else {
-            debug_assert_eq!(
-                tid,
-                descr.gc_type_id.get(),
-                "PyreClassDescriptor::gc_type_id mismatch — adjust `#[pyre_class(type_id = N)]` or drop the explicit id",
+    let register_pyre_class_with_pressure =
+        |gc: &mut MiniMarkGC,
+         pytype_to_tid: &mut HashMap<usize, u32>,
+         descr: &'static pyre_object::lltype::PyreClassDescriptor,
+         memory_pressure_offset: Option<usize>|
+         -> u32 {
+            let mut type_info = TypeInfo::object_subclass_with_gc_ptrs(
+                descr.object_size,
+                object_tid,
+                descr.ptr_offsets.to_vec(),
             );
-        }
-        let pytype_ptr = descr.pytype_ptr as usize;
-        majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
-        pytype_to_tid.insert(pytype_ptr, tid);
-        // Register this type's inline `gc_ptr_offsets` for the interpreter's
-        // generic immortal-root walker (`walk_raw_immortal_roots`).  Covers
-        // every `#[pyre_class]` type — immortal AND managed; the walker's
-        // immortality gate skips managed ones at walk time.
-        pyre_object::gc_hook::register_pyre_class_offsets(pytype_ptr, descr.ptr_offsets);
-        tid
-    };
+            if let Some(offset) = memory_pressure_offset {
+                type_info = type_info.with_memory_pressure_offset(offset);
+            }
+            let tid = gc.register_type(type_info);
+            // Auto-id mode (cell == UNASSIGNED): stamp the cell with
+            // the freshly-assigned tid so runtime readers see it.
+            // Explicit-id mode (cell pre-initialized): drift-check that
+            // the declared id matches registration order.
+            if descr.gc_type_id.is_unassigned() {
+                descr.gc_type_id.set(tid);
+            } else {
+                debug_assert_eq!(
+                    tid,
+                    descr.gc_type_id.get(),
+                    "PyreClassDescriptor::gc_type_id mismatch — adjust `#[pyre_class(type_id = N)]` or drop the explicit id",
+                );
+            }
+            let pytype_ptr = descr.pytype_ptr as usize;
+            majit_gc::GcAllocator::register_vtable_for_type(gc, pytype_ptr, tid);
+            pytype_to_tid.insert(pytype_ptr, tid);
+            // Register this type's inline `gc_ptr_offsets` for the interpreter's
+            // generic immortal-root walker (`walk_raw_immortal_roots`).  Covers
+            // every `#[pyre_class]` type — immortal AND managed; the walker's
+            // immortality gate skips managed ones at walk time.
+            pyre_object::gc_hook::register_pyre_class_offsets(pytype_ptr, descr.ptr_offsets);
+            tid
+        };
+    let register_pyre_class =
+        |gc: &mut MiniMarkGC,
+         pytype_to_tid: &mut HashMap<usize, u32>,
+         descr: &'static pyre_object::lltype::PyreClassDescriptor|
+         -> u32 { register_pyre_class_with_pressure(gc, pytype_to_tid, descr, None) };
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
         &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
@@ -4117,38 +4130,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
     }
 
-    // `_cffi_backend`'s five object types.  A ctype, the array iterator and a
-    // struct field hold ordinary traced fields; a cdata additionally owns the
-    // block that `newp` malloc'd for it and a library owns its loader handle,
-    // which their sweep destructors release.  All five are unconditional, so
-    // they register ahead of the target-gated tail.
-    for descriptor in [
-        <pyre_interpreter::module::_cffi_backend::ctypeobj::W_CType
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-        <pyre_interpreter::module::_cffi_backend::ctypearray::W_CDataIter
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    ] {
-        register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
-    }
-    {
-        let descr = <pyre_interpreter::module::_cffi_backend::cdataobj::W_CData
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
-        gc.types.set_destructor(tid, cffi_cdata_destructor);
-    }
-    register_pyre_class(
-        &mut gc,
-        &mut pytype_to_tid,
-        <pyre_interpreter::module::_cffi_backend::ctypestruct::W_CField
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
-    );
-    {
-        let descr = <pyre_interpreter::module::_cffi_backend::libraryobj::W_Library
-            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
-        gc.types.set_destructor(tid, cffi_library_destructor);
-    }
-
     // Register `posix.DirEntry`'s four inline GC edges and
     // `posix.ScandirIterator`'s entries-list edge. The entries in
     // `SUBCLASS_RANGE_HIERARCHY` and `all_subclass_range_aliases` are
@@ -4331,6 +4312,64 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_WindowsConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
+    // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its eight
+    // object types register at the end of the rclass census where the sandbox
+    // hierarchy filter can remove one contiguous trailing slice.  A ctype,
+    // the array iterator, struct field, allocator, MiniBuffer and offset
+    // carrier hold ordinary traced fields; a cdata additionally owns the block
+    // that `newp` malloc'd for it and a library owns its loader handle, which
+    // their sweep destructors release.
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    {
+        for descriptor in [
+            <pyre_interpreter::module::_cffi_backend::ctypeobj::W_CType
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            <pyre_interpreter::module::_cffi_backend::ctypearray::W_CDataIter
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        ] {
+            register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+        }
+        {
+            let descr = <pyre_interpreter::module::_cffi_backend::cdataobj::W_CData
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+            let tid = register_pyre_class_with_pressure(
+                &mut gc,
+                &mut pytype_to_tid,
+                descr,
+                Some(std::mem::offset_of!(
+                    pyre_interpreter::module::_cffi_backend::cdataobj::W_CData,
+                    special_memory_pressure
+                )),
+            );
+            gc.types.set_destructor(tid, cffi_cdata_destructor);
+        }
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_cffi_backend::ctypestruct::W_CField
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+        {
+            let descr = <pyre_interpreter::module::_cffi_backend::libraryobj::W_Library
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+            let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+            gc.types.set_destructor(tid, cffi_library_destructor);
+        }
+        for descriptor in [
+            <pyre_interpreter::module::_cffi_backend::allocator::W_Allocator
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            <pyre_interpreter::module::_cffi_backend::cbuffer::MiniBuffer
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        ] {
+            register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+        }
+        register_pyre_class(
+            &mut gc,
+            &mut pytype_to_tid,
+            <pyre_interpreter::module::_cffi_backend::func::OffsetInBytes
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        );
+    }
     // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an
     // rclass.OBJECT subclass and has no Python-visible vtable, so it takes a

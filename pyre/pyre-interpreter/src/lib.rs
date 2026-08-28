@@ -1117,6 +1117,10 @@ pub fn all_immortal_w_class_only_descriptors()
 pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeAlias> {
     use pyre_object::lltype::PyreClassPyTypeOf;
     use pyre_object::pyobject::subclass_range_alias;
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32"), windows))]
+    const CFFI_FIRST_TYPE_ID: u32 = 194;
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32"), not(windows)))]
+    const CFFI_FIRST_TYPE_ID: u32 = 191;
 
     fn typed<T: PyreClassPyTypeOf>() -> &'static pyre_object::PyType {
         // Every `#[pyre_class]` descriptor points at its macro-emitted static
@@ -1227,85 +1231,109 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(180, typed::<crate::pycode::W_LineIterObject>()),
         subclass_range_alias(181, typed::<crate::pycode::W_PositionsIterObject>()),
         subclass_range_alias(182, typed::<crate::pycode::W_BranchesIterObject>()),
-        // `_cffi_backend`'s three object types, registered ahead of the
-        // target-gated native aliases so their ids agree on every target.
-        subclass_range_alias(
-            183,
-            typed::<crate::module::_cffi_backend::ctypeobj::W_CType>(),
-        ),
-        subclass_range_alias(
-            184,
-            typed::<crate::module::_cffi_backend::ctypearray::W_CDataIter>(),
-        ),
-        subclass_range_alias(
-            185,
-            typed::<crate::module::_cffi_backend::cdataobj::W_CData>(),
-        ),
-        subclass_range_alias(
-            186,
-            typed::<crate::module::_cffi_backend::ctypestruct::W_CField>(),
-        ),
-        subclass_range_alias(
-            187,
-            typed::<crate::module::_cffi_backend::libraryobj::W_Library>(),
-        ),
-        // Native-only posix aliases 188 and 189 preserve `build_gc`'s rclass
+        // Native-only posix aliases 183 and 184 preserve `build_gc`'s rclass
         // registration order after the unconditional aliases.  `scandir` has
         // no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(188, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(183, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(189, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(184, typed::<crate::module::posix::W_ScandirIterator>()),
         // The rustls-backed `_ssl` aliases preserve `build_gc`'s registration
         // order for `W_SSLContext`, `W_MemoryBIO`, and `W_SSLSession`.
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(190, typed::<crate::module::_ssl::W_SSLContext>()),
+        subclass_range_alias(185, typed::<crate::module::_ssl::W_SSLContext>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(191, typed::<crate::module::_ssl::W_MemoryBIO>()),
+        subclass_range_alias(186, typed::<crate::module::_ssl::W_MemoryBIO>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(192, typed::<crate::module::_ssl::W_SSLSession>()),
+        subclass_range_alias(187, typed::<crate::module::_ssl::W_SSLSession>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(193, typed::<crate::module::_ssl::W_SSLSocket>()),
+        subclass_range_alias(188, typed::<crate::module::_ssl::W_SSLSocket>()),
         #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
-        subclass_range_alias(194, typed::<crate::module::_ssl::W_Certificate>()),
+        subclass_range_alias(189, typed::<crate::module::_ssl::W_Certificate>()),
         // `mmap.mmap` follows the optional SSL tail on ordinary Unix builds.
         // A sandbox build has no `mmap` module at all (`module/mod.rs`), so it
         // contributes no alias rather than sliding into the vacated SSL slot.
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
-        subclass_range_alias(195, typed::<crate::module::mmap::W_MMap>()),
+        subclass_range_alias(190, typed::<crate::module::mmap::W_MMap>()),
         // Windows asyncio's Overlapped owner follows mmap at the native tail.
         // It is a non-subclassable builtin in Python, but still participates
         // in the rclass hierarchy because its managed header and retained
         // buffer/result fields are traced by the ordinary object marker.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(196, typed::<crate::module::_overlapped::W_Overlapped>()),
+        subclass_range_alias(191, typed::<crate::module::_overlapped::W_Overlapped>()),
         // `_winapi.Overlapped` follows it: a second record of the same kind,
         // owning its own event and transfer buffer rather than retained
         // Python objects, so nothing of it is traced beyond the header.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
         subclass_range_alias(
-            197,
+            192,
             typed::<crate::module::_winapi::overlapped::W_Overlapped>(),
         ),
         // PEP 528's raw console stream follows the two overlapped owners at
         // the append-only Windows tail.  It is subclassable and therefore
         // participates in the same rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(198, typed::<crate::module::_io::W_WindowsConsoleIO>()),
+        subclass_range_alias(193, typed::<crate::module::_io::W_WindowsConsoleIO>()),
+        // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its
+        // eight aliases sit at the tail where the sandbox hierarchy filter can
+        // remove them as part of one contiguous trailing slice.  The
+        // module-presence gate matches `module/mod.rs` exactly.
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID,
+            typed::<crate::module::_cffi_backend::ctypeobj::W_CType>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 1,
+            typed::<crate::module::_cffi_backend::ctypearray::W_CDataIter>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 2,
+            typed::<crate::module::_cffi_backend::cdataobj::W_CData>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 3,
+            typed::<crate::module::_cffi_backend::ctypestruct::W_CField>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 4,
+            typed::<crate::module::_cffi_backend::libraryobj::W_Library>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 5,
+            typed::<crate::module::_cffi_backend::allocator::W_Allocator>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 6,
+            typed::<crate::module::_cffi_backend::cbuffer::MiniBuffer>(),
+        ),
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        subclass_range_alias(
+            CFFI_FIRST_TYPE_ID + 7,
+            typed::<crate::module::_cffi_backend::func::OffsetInBytes>(),
+        ),
     ]
 }
 
 /// The rclass hierarchy present in this interpreter configuration.
 ///
-/// `_ssl` owns five native hierarchy slots and `mmap` owns one behind them
-/// wherever it is compiled.  A sandbox build has neither module, and both sit
-/// at the tail of `SUBCLASS_RANGE_HIERARCHY`, so dropping that many trailing
-/// entries leaves exactly the ids such a build registers.
+/// `_ssl` owns five native hierarchy slots, `mmap` owns one behind them,
+/// Windows owns three more where applicable, and `_cffi_backend` owns the last
+/// eight.  A sandbox build has none of those modules; because the groups form
+/// one contiguous tail of `SUBCLASS_RANGE_HIERARCHY`, dropping their combined
+/// slot count leaves exactly the ids such a build registers.
 pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
     #[cfg(all(not(target_arch = "wasm32"), feature = "sandbox"))]
     {
         const SSL_HIERARCHY_SLOTS: usize = 5;
+        const CFFI_HIERARCHY_SLOTS: usize = 8;
         #[cfg(any(unix, windows))]
         const MMAP_HIERARCHY_SLOTS: usize = 1;
         #[cfg(not(any(unix, windows)))]
@@ -1319,7 +1347,8 @@ pub fn active_subclass_range_hierarchy() -> &'static [(u32, Option<u32>)] {
         &hierarchy[..hierarchy.len()
             - SSL_HIERARCHY_SLOTS
             - MMAP_HIERARCHY_SLOTS
-            - OVERLAPPED_HIERARCHY_SLOTS]
+            - OVERLAPPED_HIERARCHY_SLOTS
+            - CFFI_HIERARCHY_SLOTS]
     }
     #[cfg(not(all(not(target_arch = "wasm32"), feature = "sandbox")))]
     {
