@@ -5,9 +5,9 @@
 """Python 3.14 SyntaxError positions use character, not UTF-8 byte, columns."""
 
 
-def syntax_error(source):
+def syntax_error(source, mode="exec"):
     try:
-        compile(source, "<fragment>", "exec")
+        compile(source, "<fragment>", mode)
     except SyntaxError as error:
         return error
     raise AssertionError("source unexpectedly compiled")
@@ -312,5 +312,72 @@ for source in (
     'print = 1',
 ):
     compile(source, "<fragment>", "exec")
+
+# `invalid_assignment` is a grammar alternative, so it is reached only by a
+# statement whose tokens lexed and parsed.  A literal whose own content is wrong
+# names that failure instead, wherever in the statement it sits, and so does a
+# call's unparenthesized generator expression.
+for source, message, position in (
+    ("b'\u00e4' = 1", "bytes can only contain ASCII literal characters", (1, 1, 1, 5)),
+    ("b'\u00e4' += 1", "bytes can only contain ASCII literal characters", (1, 1, 1, 5)),
+    ("'\\N{' = 1", "(unicode error) 'unicodeescape' codec can't decode bytes in position 0-2: malformed \\N character escape", (1, 1, 1, 6)),
+    ("b'\\x' = 1", "(value error) invalid \\x escape at position 0", (1, 1, 1, 6)),
+    ("f'{x!z}' = 1", "f-string: invalid conversion character 'z': expected 's', 'r', or 'a'", (1, 6, 1, 7)),
+    ("f(x for x in y, 1) = 2", "Generator expression must be parenthesized", (1, 3, 1, 15)),
+    ("bu'x' = 1", "'u' and 'b' prefixes are incompatible", (1, 1, 1, 3)),
+    ("ub'x' = 1", "'u' and 'b' prefixes are incompatible", (1, 1, 1, 3)),
+    ("bu'x' += 1", "'u' and 'b' prefixes are incompatible", (1, 1, 1, 3)),
+):
+    error = syntax_error(source)
+    assert error.msg == message, (source, error.msg)
+    assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == position, (
+        source,
+        error.lineno,
+        error.offset,
+        error.end_lineno,
+        error.end_offset,
+    )
+
+
+# `eval` is `expressions NEWLINE* ENDMARKER` and has no assignment rule at all,
+# so the parse stops at the operator.  A starred element of an unparenthesized
+# tuple and an unparenthesized `yield` fail earlier still, at their own first
+# token; a display keeps its own brackets, so unpacking inside one does not.
+for source, position in (
+    ("f() = 1", (1, 5, 1, 6)),
+    ("f() += 1", (1, 5, 1, 7)),
+    ("x = 1", (1, 3, 1, 4)),
+    ("x.y = 1", (1, 5, 1, 6)),
+    ("1 = 2", (1, 3, 1, 4)),
+    ("(a, b) = 1", (1, 8, 1, 9)),
+    ("[x for x in y] = 1", (1, 16, 1, 17)),
+    ("{1:2} = 1", (1, 7, 1, 8)),
+    ("a if b else c = 1", (1, 15, 1, 16)),
+    ("a = b = 1", (1, 3, 1, 4)),
+    ("x[0] = 1", (1, 6, 1, 7)),
+    ("a @= b", (1, 3, 1, 5)),
+    ("*x = 1", (1, 1, 1, 2)),
+    ("*a, b = 1", (1, 1, 1, 2)),
+    ("a, *b = 1", (1, 4, 1, 5)),
+    ("(a, *b) = 1", (1, 9, 1, 10)),
+    ("(a) = 1", (1, 5, 1, 6)),
+    ("((a)) = 1", (1, 7, 1, 8)),
+    ("(a := 1) = 2", (1, 10, 1, 11)),
+    ("[*a, b] = 1", (1, 9, 1, 10)),
+    ("yield = 1", (1, 1, 1, 6)),
+    ("(yield) = 1", (1, 9, 1, 10)),
+    ("class C:\n    f() = 1\n", (1, 1, 1, 6)),
+    ("x: int = f()", (1, 2, 1, 3)),
+):
+    error = syntax_error(source, "eval")
+    assert error.msg == "invalid syntax", (source, error.msg)
+    assert (error.lineno, error.offset, error.end_lineno, error.end_offset) == position, (
+        source,
+        error.lineno,
+        error.offset,
+        error.end_lineno,
+        error.end_offset,
+    )
+
 
 print("OK")

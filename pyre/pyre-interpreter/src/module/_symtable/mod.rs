@@ -207,7 +207,7 @@ fn symtable_data(args: &[PyObjectRef]) -> crate::PyResult {
         .map_err(|err| crate::PyError::value_error(err.to_string()))?;
     let table =
         rustpython_compiler::compile_symtable(&source, mode, &filename).map_err(|compile_err| {
-            let mut err = crate::builtins::compile_err_to_syntax_error(compile_err, &source);
+            let mut err = crate::builtins::compile_err_to_syntax_error(compile_err, &source, mode);
             err.replace_syntax_error_filename(pyre_object::gc_roots::shadow_stack_get(
                 filename_slot,
             ));
