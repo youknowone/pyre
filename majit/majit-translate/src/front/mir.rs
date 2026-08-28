@@ -32967,6 +32967,25 @@ mod tests {
             residual.is_empty(),
             "owned Wtf8Buf appends must lift to StringBuilder operations: {residual:#?}"
         );
+        let residual_vec_indexes: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
+                )
+            })
+            .collect();
+        assert!(
+            residual_vec_indexes.is_empty(),
+            "repr string lists must iterate without a fat-pointer Vec::index: \
+             {residual_vec_indexes:#?}"
+        );
         for block in &graph.blocks {
             let mut defined: std::collections::HashSet<u64> =
                 block.inputargs.iter().map(|var| var.id()).collect();
@@ -33116,11 +33135,11 @@ mod tests {
     /// Real-LLBC anchors for three roots that spell one PyPy operation —
     /// an ordinary list read — over three different host containers.
     ///
-    /// Only `combine_starargs_wrapped` may lower: its elements are object
-    /// pointers, one target word each, so the emitted getarrayitem's stride
-    /// is the host stride.  `dict_repr` and `bind_builtin_kwargs` are held
-    /// here as counter-examples on purpose; being the same PyPy shape is not
-    /// what makes a read addressable, the element width is.
+    /// `combine_starargs_wrapped` lowers because its elements are object
+    /// pointers, one target word each. `dict_repr` must first flatten its
+    /// host-width key/value pairs into the same one-word rooted-list shape.
+    /// `bind_builtin_kwargs` remains the counter-example: being the same PyPy
+    /// shape is not what makes a read addressable, the element width is.
     #[test]
     #[ignore]
     fn pypy_list_item_roots_have_no_residual_vec_index() {
@@ -33154,32 +33173,20 @@ mod tests {
             "argument-list concatenation indexes object pointers, one target \
              word each, so its getitems must not remain Vec::index"
         );
-        // The other two are NOT in that set, and must not be added by widening
-        // the element gate.  Both are the same PyPy list read over a host
-        // container whose element is WIDER than one word, and no translation
-        // replaces the container:
-        //
-        // * `dict_repr` indexes `w_dict_items`'s
-        //   `Vec<(PyObjectRef, PyObjectRef)>`.  PyPy's `dictmultiobject.py`
-        //   pair really is one GC pointer per item, but only inside a list the
-        //   translation builds; here it is an INLINE 16-byte tuple, so a
-        //   one-word getarrayitem would read each pair's key twice and never
-        //   its value.
-        // * `bind_builtin_kwargs` indexes `names: &[&str]`.  PyPy's
-        //   `Signature.argnames` is a list of `Ptr(STR)`, but `&str` is a
-        //   two-word fat pointer here, so the same read would land mid-element
-        //   from the second name on.
-        //
-        // Lowering either means giving the pyre side a managed list — the one
-        // container whose items are one GCREF each — not relaxing the width
-        // proof in the element gate.
-        for fname in ["dict_repr", "bind_builtin_kwargs"] {
-            assert!(
-                residual_vec_indexes(fname) > 0,
-                "{fname}: a wider-than-one-word host element must keep its \
-                 residual Vec::index"
-            );
-        }
+        assert_eq!(
+            residual_vec_indexes("dict_repr"),
+            0,
+            "dict_repr must flatten host-width pairs before translated reads"
+        );
+        // `bind_builtin_kwargs` indexes `names: &[&str]`. PyPy's
+        // `Signature.argnames` is a list of `Ptr(STR)`, but `&str` is a
+        // two-word fat pointer here, so a one-word getarrayitem would land
+        // mid-element from the second name on. Lowering it requires a managed
+        // string list, not a wider element gate.
+        assert!(
+            residual_vec_indexes("bind_builtin_kwargs") > 0,
+            "a wider-than-one-word host element must keep its residual Vec::index"
+        );
     }
 
     /// `exception_descr_str_wtf8` indexes the Python unicode carrier through

@@ -422,8 +422,7 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // taken before a collection addresses the pre-move object.
     let _roots = pyre_object::gc_roots::push_roots();
     let mut flat: Vec<PyObjectRef> = Vec::with_capacity(entries.len() * 2);
-    for i in 0..entries.len() {
-        let (k, v) = entries[i];
+    for &(k, v) in entries.as_slice() {
         flat.push(k);
         flat.push(v);
     }
@@ -1172,11 +1171,13 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 }
             }
             let mut joined = Wtf8Buf::new();
-            for index in 0..parts.len() {
-                if index > 0 {
+            let mut first = true;
+            for part in parts.as_slice() {
+                if !first {
                     joined.push_str(" | ");
                 }
-                joined.push_wtf8(&parts[index]);
+                joined.push_wtf8(part);
+                first = false;
             }
             return Ok(joined);
         } else if std::ptr::eq(tp, &pyre_object::GENERIC_ALIAS_TYPE as *const PyType) {
