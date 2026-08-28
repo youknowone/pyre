@@ -29,10 +29,6 @@
       "dynasm": "PASS",
       "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for os.startfile"
     },
-    "test.test_venv": {
-      "dynasm": "FAIL",
-      "reason": "EnvBuilder.setup_python's nt branch copies venvlaunchert.exe / venvwlaunchert.exe out of venv/scripts/nt, which holds only activate.bat and deactivate.bat, so Scripts/<exe> is never produced and every case that looks for it fails. The POSIX branch copies the interpreter itself"
-    },
     "test.test_winapi": {
       "dynasm": "PASS",
       "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for import _winapi"

@@ -388,6 +388,16 @@ class EnvBuilder:
                     f'pythonw{exe_t}{exe_d}.exe': pythonw_exe,
                 }
 
+            # Every name above is one a launcher stub answers to, so a runtime
+            # named anything else ends up with no copy of itself here -- while
+            # the POSIX branch always writes one, since it names the venv's
+            # executable after the base interpreter's own basename.  Restore
+            # that copy; `setdefault` leaves the mapping alone for a runtime
+            # already called by one of the names above.
+            own_exe = os.path.basename(context.executable)
+            link_sources.setdefault(own_exe, context.executable)
+            copy_sources.setdefault(own_exe, context.executable)
+
             do_copies = True
             if self.symlinks:
                 do_copies = False
