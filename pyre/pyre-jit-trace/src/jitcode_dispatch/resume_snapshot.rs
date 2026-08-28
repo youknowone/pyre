@@ -1417,11 +1417,19 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     // `resume_pos` is the CALL's post-call `live/`; the `catch_exception/L` for
     // the enclosing try sits right after it (`finishframe_exception` lookahead),
     // so read the handler target forward from there.
-    let rejoins = crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos)
-        .is_some_and(|catch_target| {
-            crate::jitcode_dispatch::exc_handler_rejoins_loop(caller_jitcode, catch_target)
-        });
-    if rejoins {
+    //
+    // `after_residual_call_resume_for_jitcode_pc` answers through a
+    // predecessor tier as well as an exact one, so a `Some` is not on its own
+    // proof that THIS call sits in a try-block: a call that carries no marker
+    // of its own resolves to the nearest preceding one.  The `catch_exception`
+    // lookahead is what settles it, and when it finds nothing there is no
+    // handler to rewrite a caller cell and nothing to decline for.
+    let Some(catch_target) =
+        crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos)
+    else {
+        return Ok(());
+    };
+    if crate::jitcode_dispatch::exc_handler_rejoins_loop(caller_jitcode, catch_target) {
         return Ok(());
     }
     Err(InlineCallerFrameDecline::TryBlockCatchMarker)

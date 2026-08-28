@@ -730,15 +730,33 @@ fn done_descr_ref_for_tests() -> DescrRef {
 
 #[test]
 fn inline_caller_frame_distinguishes_try_block_catch_marker_decline() {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let catch_exception = insns["catch_exception/L"];
+    let void_return = insns["void_return/"];
+
     // No after-residual catch resume → not a try-block CALL → accept.
     assert_eq!(
         decline_inline_caller_frame_for_catch_marker(None, &[], true),
         Ok(()),
     );
-    // A try-block CALL with no resolvable catch (empty jitcode) cannot prove its
-    // handler rejoins a loop → decline.
+    // A marker with no `catch_exception` at the resume position names no
+    // handler, so there is no cell for a handler cleanup to clear → accept.
+    // `after_residual_call_resume_for_jitcode_pc` answers through a
+    // predecessor tier, so this is the CALL that carries no marker of its own.
     assert_eq!(
         decline_inline_caller_frame_for_catch_marker(Some(42), &[], true),
+        Ok(()),
+    );
+    // A callee with no free variables cannot read a caller cell at all.
+    let handler_returns = [catch_exception, 3, 0, void_return];
+    assert_eq!(
+        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, false),
+        Ok(()),
+    );
+    // A closure callee at a CALL whose `catch_exception` routes to a handler
+    // that returns out of the frame rather than rejoining a loop → decline.
+    assert_eq!(
+        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, true),
         Err(InlineCallerFrameDecline::TryBlockCatchMarker),
     );
 }
