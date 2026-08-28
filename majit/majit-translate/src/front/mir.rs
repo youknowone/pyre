@@ -2256,9 +2256,8 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
 }
 
 /// The MIR locals that can be a fresh string-builder accumulator: the
-/// destination of a `Wtf8Buf` / `String` `new` / `with_capacity` /
-/// `from_string` CALL
-/// terminator in the accumulator range `(arg_count+1..n_locals)`.
+/// destination of an [`is_str_builder_ctor`] CALL terminator in the
+/// accumulator range `(arg_count+1..n_locals)`.
 ///
 /// [`is_fresh_str_builder`] sets its `ctor_def` flag only in the
 /// call-terminator arm, so no other local can pass it — iterating these
@@ -2275,10 +2274,7 @@ fn builder_ctor_dest_locals<'a>(
         if let Ok(TermKind::Call { call, .. }) = bb.term()
             && let PlaceKind::Local(i) = call.dest.kind
             && (arg_count + 1..n_locals).contains(&(i as usize))
-            && matches!(
-                wtf8buf_method_leaf(llbc, &call),
-                Some("new") | Some("with_capacity") | Some("from_string")
-            )
+            && is_str_builder_ctor(wtf8buf_method_leaf(llbc, &call))
         {
             Some(i as usize)
         } else {
@@ -16965,11 +16961,43 @@ fn is_str_builder_owner(owner: Option<&str>) -> bool {
     matches!(owner, Some("Wtf8Buf") | Some("String"))
 }
 
+/// The owner of a *seed* constructor — one called on a borrowed string to
+/// build a fresh buffer, rather than one called on the buffer itself.
+///
+/// `Wtf8::to_wtf8_buf(&self) -> Wtf8Buf` is `Wtf8Buf { bytes:
+/// self.bytes.to_vec() }`: an unconditional fresh allocation holding a copy of
+/// the receiver, which is what `Wtf8Buf::from_string` already contributes on
+/// the owned side.  Seeding an accumulator from an existing string is the
+/// shape `do_stringformat` (`rstr.py`) builds, and a slice feeding one is
+/// sound because upstream's `getslice` is a copy, not a view
+/// (`ll_stringslice_startonly`, `rstr.py`).
+fn is_str_builder_seed_owner(owner: Option<&str>) -> bool {
+    matches!(owner, Some("Wtf8"))
+}
+
+/// Whether a [`str_builder_ctor_leaf`] leaf CONSTRUCTS a fresh buffer, as
+/// opposed to appending to one already built.
+///
+/// Named once because [`builder_ctor_dest_locals`] and
+/// [`is_fresh_str_builder`] must agree: the first selects the candidate
+/// locals, the second proves each one has no second definition.  Two
+/// hand-kept copies of this set would let a leaf be a candidate that can
+/// never pass, or pass a local the candidate scan never offers.
+fn is_str_builder_ctor(leaf: Option<&str>) -> bool {
+    matches!(
+        leaf,
+        Some("new") | Some("with_capacity") | Some("from_string") | Some("to_wtf8_buf")
+    )
+}
+
 /// The string-builder ctor leaf a MIR call resolves to, restricted to the
-/// fresh-buffer constructors this pass models (`new` / `with_capacity` /
-/// `from_string`) on a `Wtf8Buf` or `String`; `None` for any other callee.  The cheap leaf check
-/// runs before the impl-owner resolution so the type lookup only fires for the
-/// candidate names.  Appends are recognised separately by
+/// fresh-buffer constructors this pass models — `new` / `with_capacity` /
+/// `from_string` on a `Wtf8Buf` or `String`, and `to_wtf8_buf` on the borrowed
+/// `Wtf8` ([`is_str_builder_seed_owner`]); `None` for any other callee.  Each
+/// leaf carries the owner predicate it is admitted under, because a seed ctor
+/// is called on the borrowed string and the rest on the buffer.  The cheap
+/// leaf check runs before the impl-owner resolution so the type lookup only
+/// fires for the candidate names.  Appends are recognised separately by
 /// [`str_builder_append_args`].
 fn wtf8buf_method_leaf(llbc: &Llbc, call: &CallPayload) -> Option<&'static str> {
     let CallFunc::Regular(reg) = &call.func else {
@@ -16984,16 +17012,18 @@ fn str_builder_ctor_leaf(llbc: &Llbc, reg: &RegularCall) -> Option<&'static str>
     };
     let fd = llbc.fn_by_id(*id)?;
     let np = fd.item_meta.name_path();
-    let leaf = match np.rsplit("::").next()? {
-        "new" => "new",
-        "with_capacity" => "with_capacity",
-        "from_string" => "from_string",
-        "push" => "push",
-        "push_str" => "push_str",
-        "push_wtf8" => "push_wtf8",
-        _ => return None,
-    };
-    is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
+    let (leaf, owner_accepted): (&'static str, fn(Option<&str>) -> bool) =
+        match np.rsplit("::").next()? {
+            "new" => ("new", is_str_builder_owner),
+            "with_capacity" => ("with_capacity", is_str_builder_owner),
+            "from_string" => ("from_string", is_str_builder_owner),
+            "to_wtf8_buf" => ("to_wtf8_buf", is_str_builder_seed_owner),
+            "push" => ("push", is_str_builder_owner),
+            "push_str" => ("push_str", is_str_builder_owner),
+            "push_wtf8" => ("push_wtf8", is_str_builder_owner),
+            _ => return None,
+        };
+    owner_accepted(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
 }
 
 /// If `reg` is a functional-concat string append, its `(accumulator, piece)`
@@ -17452,9 +17482,9 @@ fn append_arg_of_borrow(
 }
 
 /// Whether MIR local `c` is a fresh owned string-builder accumulator: it has
-/// exactly one def and that def is a `Wtf8Buf` / `String` `new` /
-/// `with_capacity` / `from_string` call.  A local with a second def, or one defined by a
-/// non-ctor rvalue, is not a fresh accumulator and keeps its residual.
+/// exactly one def and that def is an [`is_str_builder_ctor`] call.  A local
+/// with a second def, or one defined by a non-ctor rvalue, is not a fresh
+/// accumulator and keeps its residual.
 fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     let mut def_count = 0usize;
     let mut ctor_def = false;
@@ -17470,10 +17500,7 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
             && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == c)
         {
             def_count += 1;
-            ctor_def = matches!(
-                wtf8buf_method_leaf(llbc, &call),
-                Some("new") | Some("with_capacity") | Some("from_string")
-            );
+            ctor_def = is_str_builder_ctor(wtf8buf_method_leaf(llbc, &call));
         }
     }
     def_count == 1 && ctor_def
@@ -17483,13 +17510,13 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
 /// local `rt` passed as the append's accumulator argument (`push` / `push_str` /
 /// `push_wtf8` receiver, or `Wtf8Piece::push_onto` `&mut buf` argument).  `rt`
 /// borrows the accumulator directly (method autoref) or through a single
-/// two-phase reborrow; the owning `buf` is the fresh `new` / `with_capacity`
-/// local whose every borrow feeds such an append and whose append-receiver set
+/// two-phase reborrow; the owning `buf` is the [`is_str_builder_ctor`] local
+/// whose every borrow feeds such an append and whose append-receiver set
 /// ([`clean_accumulator_ref_temps`]) contains `rt`.  Resolved on demand from
 /// the MIR body, so the recognizer keeps no per-local side table; the append
 /// call-lowering arm then rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
 fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    // Only a `Wtf8Buf` / `String` ctor dest can pass [`is_fresh_str_builder`]
+    // Only an [`is_str_builder_ctor`] dest can pass [`is_fresh_str_builder`]
     // ([`builder_ctor_dest_locals`], which already excludes locals 0 / the
     // parameters), and a ref-temp borrows exactly one local so at most one
     // accumulator's receiver set contains `rt`; check those candidates instead
