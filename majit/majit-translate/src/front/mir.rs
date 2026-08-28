@@ -3255,6 +3255,11 @@ struct Lowering<'a> {
     /// where `ord(s[i])` is the scalar byte read; the consumer gate below
     /// uses this provenance to emit exactly that pair of flowspace ops.
     string_byte_view_locals: Vec<usize>,
+    /// MIR locals holding the `ll_items(l)` view returned by the string-list
+    /// slice adapters.  Rust spells the element as a concrete raw pointer,
+    /// but both byte and unicode strategies expose the same external `str`
+    /// over one internal `GcArray(GCREF)`.
+    string_array_view_locals: Vec<usize>,
     /// Result `Variable`s of calls to callees whose declared result is
     /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -3578,6 +3583,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
             string_byte_view_locals: Vec::new(),
+            string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
@@ -6226,7 +6232,15 @@ impl<'a> Lowering<'a> {
                         .string_byte_view_locals
                         .iter()
                         .any(|&local| place_references_local(&inner, local));
-                    let (array_type_id, nolength) = array_projection_metadata(&inner.ty, self.llbc);
+                    let string_array_view = self
+                        .string_array_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(&inner, local));
+                    let (mut array_type_id, nolength) =
+                        array_projection_metadata(&inner.ty, self.llbc);
+                    if string_array_view {
+                        array_type_id = Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string());
+                    }
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let res = self
@@ -6244,7 +6258,11 @@ impl<'a> Lowering<'a> {
                         OpKind::ArrayRead {
                             base,
                             index: idx_var,
-                            item_ty: tyref_to_value_type(&place_ty, self.llbc),
+                            item_ty: if string_array_view {
+                                ValueType::Str
+                            } else {
+                                tyref_to_value_type(&place_ty, self.llbc)
+                            },
                             array_type_id,
                             nolength,
                             pure: false,
@@ -7774,6 +7792,14 @@ impl<'a> Lowering<'a> {
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
+        let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
+            self.string_array_view_locals.iter().any(|&local| {
+                self.local_var
+                    .get(local)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|current| current == arg)
+            })
+        });
 
         let class = call.func.classify();
         // Full `name_path()` of a `CallKind::Fun` callee, captured for the
@@ -8242,6 +8268,12 @@ impl<'a> Lowering<'a> {
                 // ([`narrow_item_array_type_id`]); a `Vec<u8>` read strides by
                 // 8 without it.
                 let index_element = index_leg.then(|| {
+                    if first_arg_is_string_array_view {
+                        return (
+                            ValueType::Str,
+                            Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
+                        );
+                    }
                     let item_ty = tyref_deref_value_type(&call.dest.ty, self.llbc);
                     // The `pyre_`-fenced workspace arm has exactly three
                     // element banks — `FixedObjectArray`, `IntArray`,
@@ -9078,6 +9110,33 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `BytesArray::as_slice` / `UnicodeArray::as_slice` are the
+                // Rust fat-slice spelling around RPython's `ll_items(l)`.
+                // Their caller keeps the separate logical `l.length`; the
+                // one-word translated value is therefore the backing
+                // `GcArray(GCREF)`, with its external item kept as `str`.
+                // Fold only these two adapter bodies: an arbitrary
+                // `from_raw_parts(base, logical_len)` cannot discard its
+                // second word.
+                if args.len() == 2 && self.is_string_array_view_from_raw_parts(&reg) {
+                    let view = self.narrow_value_to_instance_root(
+                        bb_id,
+                        LinkArg::Value(args[0].clone()),
+                        STRING_GCREF_GCARRAY_TYPE_ID,
+                    );
+                    self.local_var[dest_local] = Some(
+                        view.as_variable()
+                            .expect("a string-items view stays a Variable")
+                            .clone(),
+                    );
+                    if !self.string_array_view_locals.contains(&dest_local) {
+                        self.string_array_view_locals.push(dest_local);
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `RBigInt::digits{,_mut}` is a Rust view adapter around a
                 // typed-items GcArray:
                 // `slice::from_raw_parts(items_base(block), capacity)`.  The
@@ -9435,6 +9494,34 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `BytesArray::as_slice` / `UnicodeArray::as_slice` expose
+                // the backing items field, not the enclosing `{ block, len }`
+                // storage record.  This is RPython `ll_items(l)`: read the
+                // `block` field and project it to the logical `[str]` array
+                // before the consumer's getitem.  The caller's explicit
+                // `self.len` check remains the logical-length guard.
+                if args.len() == 1
+                    && let Some(owner) = self.string_array_slice_view_owner(&reg)
+                {
+                    let block = self.emit_string_array_items_read(bb_id, args[0].clone(), owner);
+                    let view = self.narrow_value_to_instance_root(
+                        bb_id,
+                        LinkArg::Value(block),
+                        STRING_GCREF_GCARRAY_TYPE_ID,
+                    );
+                    self.local_var[dest_local] = Some(
+                        view.as_variable()
+                            .expect("a string-items view stays a Variable")
+                            .clone(),
+                    );
+                    if !self.string_array_view_locals.contains(&dest_local) {
+                        self.string_array_view_locals.push(dest_local);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -12634,6 +12721,77 @@ impl<'a> Lowering<'a> {
                     | "pyre_object::float_array::<Impl>::as_mut_slice"
             )
         })
+    }
+
+    /// Return the source owner for the string-list items-view adapters.
+    /// RPython's `ll_items(l)` reads the `items` field from the resized list;
+    /// pyre's source spelling calls that field `block`.
+    fn string_array_slice_view_owner(&self, reg: &RegularCall) -> Option<&'static str> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+            "pyre_object::bytes_array::<Impl>::as_slice"
+            | "pyre_object::bytes_array::<Impl>::as_mut_slice" => Some("BytesArray"),
+            "pyre_object::unicode_array::<Impl>::as_slice"
+            | "pyre_object::unicode_array::<Impl>::as_mut_slice" => Some("UnicodeArray"),
+            _ => None,
+        }
+    }
+
+    /// The body-side `from_raw_parts` half of
+    /// [`Self::string_array_slice_view_owner`].
+    fn is_string_array_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
+        if !(self.graph.name.ends_with("bytes_array::<Impl>::as_slice")
+            || self
+                .graph
+                .name
+                .ends_with("bytes_array::<Impl>::as_mut_slice")
+            || self.graph.name.ends_with("unicode_array::<Impl>::as_slice")
+            || self
+                .graph
+                .name
+                .ends_with("unicode_array::<Impl>::as_mut_slice"))
+        {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
+            )
+        })
+    }
+
+    fn emit_string_array_items_read(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        owner: &str,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let canonical_owner = match owner {
+            "BytesArray" => "bytes_array::BytesArray",
+            "UnicodeArray" => "unicode_array::UnicodeArray",
+            _ => unreachable!("string array owner is closed"),
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("block", Some(owner.to_string())).with_owner_id(Some(
+                    majit_ir::descr::StructId::from_canonical(canonical_owner),
+                )),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        result
     }
 
     /// `<[T]>::as_ptr` — the data-pointer projection of a slice receiver.  In
@@ -30882,7 +31040,7 @@ mod tests {
         );
     }
 
-    /// The scalar unwrapped-list storage adapters are Rust spellings of
+    /// The unwrapped-list storage adapters are Rust spellings of
     /// RPython's `l.items` GcArray.  A live `push` must therefore end in the
     /// same `setarrayitem` shape as `rlist.ll_append_noresize`, never in the
     /// synthetic raw-pointer write that blocks annotation.  The adapter body
@@ -30971,6 +31129,75 @@ mod tests {
                     } if segments == &["__deref_write".to_string()]
                 )),
                 "{function} must not retain a raw-pointer write"
+            );
+        }
+
+        for function in [
+            "pyre_object::bytes_array::<Impl>::as_slice",
+            "pyre_object::unicode_array::<Impl>::as_slice",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|err| panic!("lower {function}: {err}"));
+            assert!(
+                !graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.last().is_some_and(|leaf| leaf == "from_raw_parts")
+                    )),
+                "{function} must be the direct RPython list-items view"
+            );
+        }
+
+        for function in [
+            "pyre_object::bytes_array::<Impl>::pop",
+            "pyre_object::unicode_array::<Impl>::pop",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|err| panic!("lower {function}: {err}"));
+            let operations: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .collect();
+            assert!(
+                operations.iter().any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::ArrayRead {
+                        item_ty: ValueType::Str,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID
+                )),
+                "{function} must read its external string through GcArray(GCREF)"
+            );
+            assert!(
+                operations.iter().any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::ArrayWrite {
+                        item_ty: ValueType::Str,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID
+                )),
+                "{function} must clear the released slot through the same GcArray(GCREF)"
+            );
+            assert!(
+                !operations.iter().any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().is_some_and(|leaf| {
+                        leaf == "from_raw_parts" || leaf == "__deref_write"
+                    })
+                )),
+                "{function} must not retain a Rust raw-slice/read-write boundary"
             );
         }
     }
