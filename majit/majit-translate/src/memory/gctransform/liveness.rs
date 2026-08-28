@@ -840,10 +840,7 @@ pub fn scan(
             let mut locals: Vec<String> = still.iter().map(|l| gc_locals[l].clone()).collect();
             locals.sort();
             movable.sort();
-            let at = body.body[b]
-                .statements
-                .last()
-                .map_or(&fd.item_meta.span.data, |s| &s.span.data);
+            let at = &body.body[b].terminator.span.data;
             stats.stale_pin_reads.push(StalePinRead {
                 func_name: fd.item_meta.name_path(),
                 file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
@@ -883,13 +880,10 @@ pub fn scan(
                 after.remove(&d);
             }
             after.retain(|l| gc_locals.contains_key(l));
-            // One span answers every column below: a call with no statement to
-            // stand on falls back to the function's own span, and a file taken
-            // from anywhere else would then name a different one.
-            let at = bb
-                .statements
-                .last()
-                .map_or(&fd.item_meta.span.data, |s| &s.span.data);
+            // One span answers every column below, and it is the
+            // terminator's own: the call being reported *is* the terminator,
+            // so the block's last statement names a line that runs after it.
+            let at = &bb.terminator.span.data;
             if !unbracketed.contains(&b) {
                 stats.withheld_under_a_bracket += 1;
                 // Withholding the call is right -- a bracket does dominate it
@@ -987,13 +981,10 @@ pub fn scan(
                 .map(|l| gc_locals[l].clone())
                 .collect();
             movable_use.sort();
-            // One span answers both columns: a call with no statement to
-            // stand on falls back to the function's own span, and a file
-            // taken from anywhere else would then name a different one.
-            let at = bb
-                .statements
-                .last()
-                .map_or(&fd.item_meta.span.data, |s| &s.span.data);
+            // One span answers both columns, and it is the terminator's
+            // own: the call being reported *is* the terminator, so the
+            // block's last statement names a line that runs after it.
+            let at = &bb.terminator.span.data;
             findings.push(Finding {
                 func: id,
                 func_name: fd.item_meta.name_path(),
