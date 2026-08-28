@@ -83,6 +83,26 @@ fn majit_log_enabled() -> bool {
     *ENABLED
 }
 
+/// The three flags a compiled entry reads, resolved together.
+#[derive(Clone, Copy)]
+struct EntryFlags {
+    log_enabled: bool,
+    debug_prints: bool,
+    verify_enabled: bool,
+}
+
+/// One `LazyLock` check per entry instead of three; each is an env var fixed
+/// at process start.
+#[inline]
+fn entry_flags() -> EntryFlags {
+    static FLAGS: std::sync::LazyLock<EntryFlags> = std::sync::LazyLock::new(|| EntryFlags {
+        log_enabled: majit_log_enabled(),
+        debug_prints: majit_ir::debug::have_debug_prints(),
+        verify_enabled: majit_verify_enabled(),
+    });
+    *FLAGS
+}
+
 /// Whether `MAJIT_VERIFY` is set, cached at first access.
 fn majit_verify_enabled() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
@@ -8094,9 +8114,11 @@ fn run_compiled_code_inner(
     // Read once, ahead of the run. Each of these is a `Once`-guarded load of a
     // flag fixed at process start, and the compiled call between the sites
     // below is opaque to the optimizer, so asking again after it re-reads.
-    let log_enabled = majit_log_enabled();
-    let debug_prints = majit_ir::debug::have_debug_prints();
-    let verify_enabled = majit_verify_enabled();
+    let EntryFlags {
+        log_enabled,
+        debug_prints,
+        verify_enabled,
+    } = entry_flags();
     if log_enabled {
         eprintln!(
             "[jf-alloc] frame_depth={} depth={} max_output={} inputs={} ref_roots={}",
