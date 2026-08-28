@@ -4861,7 +4861,7 @@ fn create_callee_frame_impl_1_boxed(
     let args = args.as_ref();
 
     alloc_callee_frame(
-        w_code,
+        w_code as *const (),
         args,
         w_globals,
         pyre_interpreter::call::getexecutioncontext(),
