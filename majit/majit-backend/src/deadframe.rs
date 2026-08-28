@@ -110,9 +110,49 @@ impl Drop for FrameHeapOwner {
 /// footprint without costing the ordinary one anything.
 const FRAME_POOL_CAPACITY: usize = 8;
 
-#[derive(Default)]
+/// A buffer parked on the free list: the `Vec<i64>`'s pointer and capacity,
+/// with its length taken to equal its capacity.
+#[derive(Clone, Copy)]
+struct ParkedBuf {
+    ptr: *mut i64,
+    cap: usize,
+}
+
+impl ParkedBuf {
+    const EMPTY: ParkedBuf = ParkedBuf {
+        ptr: std::ptr::null_mut(),
+        cap: 0,
+    };
+
+    fn park(buf: Vec<i64>) -> Self {
+        let mut buf = std::mem::ManuallyDrop::new(buf);
+        // `take_pooled_frame_buf` sizes by `len`, so keep the two equal.
+        let cap = buf.capacity();
+        // Safety: `cap <= capacity`, and the elements are `i64`, so any
+        // word in the allocation is initialised for the purpose of `resize`.
+        unsafe { buf.set_len(cap) };
+        ParkedBuf {
+            ptr: buf.as_mut_ptr(),
+            cap,
+        }
+    }
+
+    fn unpark(self) -> Vec<i64> {
+        // Safety: `park` took these from a live `Vec<i64>` and nothing else
+        // has owned them since.
+        unsafe { Vec::from_raw_parts(self.ptr, self.cap, self.cap) }
+    }
+}
+
+/// `Copy`, and so without a destructor: that is what lets `FRAME_POOL` be a
+/// `const`-initialised thread-local with no lazy state and no registered
+/// destructor, which is the fast access path. The price is that a thread's
+/// parked buffers are not freed when it exits — at most eight frames of a
+/// few hundred bytes each.
+#[derive(Clone, Copy)]
 struct FramePool {
-    free: Vec<Vec<i64>>,
+    free: [ParkedBuf; FRAME_POOL_CAPACITY],
+    free_len: usize,
     /// Buffers the owned arm asked the allocator for.
     owned: u64,
     /// Buffers the pooled arm handed out.
@@ -129,15 +169,13 @@ thread_local! {
     /// threads costs an uncontended atomic read-modify-write pair to take and to
     /// return a buffer, which is the same order as the saving, so a process-wide
     /// free list would hand back what it was built to remove. Sharding by thread
-    /// is what leaves the take and the return as plain `Vec` pops and pushes.
+    /// is what leaves the take and the return as plain pops and pushes.
     ///
     /// A field would be the alternative to a `thread_local!`, and there is no
     /// object to make it a field of: `run_compiled_code` and
-    /// `run_compiled_code_inner` (`majit-backend-cranelift/src/compiler.rs`) are
-    /// free functions whose only context is a `&CpuDescrAttachments`, a shared
-    /// reference. Compiled entries also nest — `execute_bridge` recurses and
-    /// CALL_ASSEMBLER hops re-enter — so a `&mut` owner threaded down to the
-    /// allocation could not be re-borrowed by the inner entry.
+    /// `FrameHeapOwner::drop` share no owner, and the buffer is taken by one
+    /// and returned by the other, in a different scope and after the caller
+    /// has moved on.
     ///
     /// Per-thread is also the right scope for the lifetime, not merely a cheap
     /// one. A buffer is taken and returned inside one compiled entry, which runs
@@ -150,7 +188,13 @@ thread_local! {
     /// TLS teardown would otherwise panic inside a `Drop`, and falling back to
     /// the allocator is the answer there.
     static FRAME_POOL: RefCell<FramePool> = const {
-        RefCell::new(FramePool { free: Vec::new(), owned: 0, taken: 0, misses: 0 })
+        RefCell::new(FramePool {
+            free: [ParkedBuf::EMPTY; FRAME_POOL_CAPACITY],
+            free_len: 0,
+            owned: 0,
+            taken: 0,
+            misses: 0,
+        })
     };
 }
 
@@ -158,12 +202,12 @@ fn take_pooled_frame_buf(words: usize) -> Vec<i64> {
     let pooled = FRAME_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
         pool.taken += 1;
-        match pool.free.pop() {
-            Some(buf) => Some(buf),
-            None => {
-                pool.misses += 1;
-                None
-            }
+        if pool.free_len == 0 {
+            pool.misses += 1;
+            None
+        } else {
+            pool.free_len -= 1;
+            Some(pool.free[pool.free_len].unpark())
         }
     });
     match pooled {
@@ -182,10 +226,13 @@ fn take_pooled_frame_buf(words: usize) -> Vec<i64> {
 }
 
 fn give_back_pooled_frame_buf(buf: Vec<i64>) {
+    // A full list, or no list: `buf` drops and the allocator takes it back.
     let _ = FRAME_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.free.len() < FRAME_POOL_CAPACITY {
-            pool.free.push(buf);
+        if pool.free_len < FRAME_POOL_CAPACITY {
+            let at = pool.free_len;
+            pool.free[at] = ParkedBuf::park(buf);
+            pool.free_len += 1;
         }
     });
 }
