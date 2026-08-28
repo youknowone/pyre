@@ -3,9 +3,9 @@
 //!
 //! Upstream reads the answer straight off the flow graph with
 //! `hop.livevars_after_op()`, then brackets the operation with
-//! `push_roots` / `pop_roots`.  pyre's interpreter is compiled by rustc, so
-//! there is no flow graph to rewrite; this pass computes the same live set over
-//! the ULLBC body and reports the operations where the bracket is *missing*.
+//! `push_roots` / `pop_roots`. Until the framework marker-insertion handlers
+//! are ported, this audit computes the same live set over the ULLBC body and
+//! reports the operations where the existing source bracket is *missing*.
 //!
 //! # One deliberate divergence from upstream
 //!
@@ -29,6 +29,10 @@ use majit_charon_reader::ullbc::{
 pub struct Finding {
     pub func: u64,
     pub func_name: String,
+    /// Source path of [`Finding::line`], read out of the same span, so the
+    /// two cannot name different files.  Empty when the artefact carries no
+    /// file table.
+    pub file: String,
     pub line: u64,
     pub callee_id: u64,
     pub callee_name: String,
@@ -458,13 +462,18 @@ pub fn scan(
                 .map(|l| gc_locals[l].clone())
                 .collect();
             movable_use.sort();
+            // One span answers both columns: a call with no statement to
+            // stand on falls back to the function's own span, and a file
+            // taken from anywhere else would then name a different one.
+            let at = bb
+                .statements
+                .last()
+                .map_or(&fd.item_meta.span.data, |s| &s.span.data);
             findings.push(Finding {
                 func: id,
                 func_name: fd.item_meta.name_path(),
-                line: bb
-                    .statements
-                    .last()
-                    .map_or(fd.item_meta.span.data.beg.line, |s| s.span.data.beg.line),
+                file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
+                line: at.beg.line,
                 callee_id: *callee,
                 callee_name: cg.names.get(callee).cloned().unwrap_or_default(),
                 live_non_arg: non_arg,
