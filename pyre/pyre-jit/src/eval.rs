@@ -9074,6 +9074,24 @@ fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpret
     }
 }
 
+/// Both screens a compiled-run exception exit owes before its own frame's
+/// exception table is consulted.  Returns false when the frame must propagate
+/// instead, in which case `err` is left untouched.
+///
+/// `LoopResult::ExitFrameWithException` has three consumers — the eval loop's
+/// back-edge site, `try_function_entry_jit`'s function-entry site, and
+/// `handle_jitexception` — and they must agree, because a single producer
+/// (`compile_and_run_once`'s `FinishConcrete::Raise`) feeds all three.  The
+/// back-edge one applied only the traceback screen while claiming, in the
+/// comment on its sibling, to perform "the same delivery".
+fn screen_exit_frame_delivery(frame: *mut PyFrame, err: &mut pyre_interpreter::PyError) -> bool {
+    if exit_frame_handler_needs_unwritten_stack(unsafe { &*frame }) {
+        return false;
+    }
+    screen_frame_already_recorded(frame as *const PyFrame, err);
+    true
+}
+
 /// warmspot.py `ExitFrameWithExceptionRef` delivery for a compiled-run
 /// exit that surfaced outside the eval loop (the `handle_jit_outcome` /
 /// compile-once path).  Offer the pending exception to `frame`'s exception
@@ -9101,10 +9119,9 @@ fn deliver_exit_frame_exception(
     // the dead address into `handle_jitexception`'s own root.
     let mut frame_root = FrameRoot::new(frame);
     let mut handler_instr = frame_root.frame().next_instr();
-    if exit_frame_handler_needs_unwritten_stack(frame_root.frame()) {
+    if !screen_exit_frame_delivery(frame_root.frame() as *mut PyFrame, &mut err) {
         return Err(err);
     }
-    screen_frame_already_recorded(frame_root.frame() as *const PyFrame, &mut err);
     if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
         frame_root
             .frame()
@@ -9639,7 +9656,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // per-opcode `Err` arm below); resume at the handler pc when
                     // caught, otherwise propagate it out as a plain `Done(Err)`.
                     if let LoopResult::ExitFrameWithException(mut err) = loop_result {
-                        screen_frame_already_recorded(f as *const PyFrame, &mut err);
+                        if !screen_exit_frame_delivery(f, &mut err) {
+                            return LoopResult::Done(Err(err));
+                        }
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
                             &mut err,

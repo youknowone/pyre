@@ -1317,10 +1317,31 @@ pub extern "C" fn bh_portal_runner_c(
         );
     }
     frame.set_last_instr_from_next_instr(next_instr as usize);
-    // `bhimpl_recursive_call_r` performs a call the traced code made, so the
-    // frame it hands over is entering its body for the first time and owes
-    // `execute_frame`'s hook bracket.  The CRN arms below resume a frame whose
-    // activation already began and take the unbracketed entry instead.
+    // The blackhole wrote the failing guard's recorded operand depth into the
+    // frame; resuming at the merge-point `next_instr` (a different pc) would
+    // carry that over-count and overflow the frame at its peak stack use.
+    // Re-derive the depth from the resume pc — the same correction the
+    // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
+    crate::eval::correct_resume_vsd(frame, next_instr as usize);
+    // The bracket is owed, but not for the reason a reading of
+    // `bhimpl_recursive_call_r` suggests.  pyre's codewriter emits no
+    // `recursive_call`, so the live door here is `bhimpl_jit_merge_point`'s
+    // recursive-portal arm (blackhole.py), taken when `nextblackholeinterp`
+    // is not None — a frame that already has a caller in the resumed chain,
+    // i.e. an inlined callee, mid-body at its own loop header.  That IS a
+    // resume, and upstream reaches it through `portal_ptr` = `dispatch`, one
+    // level below `execute_frame`.  What makes it an activation for pyre is
+    // where the frame came from: `emit_new_pyframe_inline_with_params` built
+    // it inside compiled code, and `walker_ec_enter` records only `enter`'s
+    // frame-chain half, never `call_trace` — so this is the frame's first and
+    // only bracket, not a second one.  The bottom level, which is the frame
+    // the interpreter itself bracketed, never arrives here: it raises
+    // `ContinueRunningNormally` and takes the unbracketed entry instead.
+    //
+    // `ec` is a red arg and the frame no longer carries one, so publish it for
+    // the duration of the call: `execute_frame` reads its execution context
+    // through `space.getexecutioncontext()`, which is what the bracket below
+    // will consult.
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
@@ -1725,22 +1746,29 @@ pub extern "C" fn jit_force_self_recursive_call_raw_1(caller_frame: i64, raw_int
     result
 }
 
-/// Dynasm x86/assembler.py `_build_stack_check_slowpath` parity.
+/// x86/assembler.py `_build_stack_check_slowpath` parity, for every backend
+/// whose prologue emits the inline probe.
 ///
-/// The interpreter-level slowpath stores the RecursionError in the
-/// current thread's pending JIT exception slot for non-dynasm backend
-/// glue. Dynasm's prologue, however, mirrors RPython's
-/// `pos_exception()` path: after this call returns non-zero, emitted
-/// code transfers `majit_backend_dynasm`'s `JIT_EXC_VALUE` into
-/// `jf_guard_exc` and stamps `propagate_exception_descr` into
-/// `jf_descr`. Bridge the two exception slots here.
+/// Upstream's slowpath raises into `pos_exception()`, which is exactly the cell
+/// the emitted overflow arm then moves into `jf_guard_exc` before jumping to
+/// `propagate_exception_path`.  pyre's interpreter-level slowpath parks the
+/// `RecursionError` in the thread's pending slot instead — a different cell, and
+/// not one any emitted code reads — so republish it into the backend's
+/// exception cells here.
+///
+/// This is shared rather than per-backend because the emitted store sequence is
+/// the same on both: registering the undrained slowpath leaves `JIT_EXC_VALUE`
+/// at zero, and the prologue then publishes that zero as the overflow's
+/// exception, which the propagate path resolves through its
+/// `memory_error_singleton_ref()` fallback — a `MemoryError` where the program
+/// is owed a `RecursionError`.
 #[cfg(feature = "dynasm")]
-extern "C" fn dynasm_stack_check_slowpath_for_backend(current: usize) -> u8 {
+extern "C" fn jit_prologue_stack_check_slowpath(current: usize) -> u8 {
     let result = pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend(current);
-    if result != 0 {
-        if let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception() {
-            majit_backend_dynasm::jit_exc_raise(exc.to_exc_object() as i64);
-        }
+    if result != 0
+        && let Err(mut exc) = pyre_interpreter::stack_check::drain_jit_pending_exception()
+    {
+        store_jit_exception(exc.to_exc_object() as i64);
     }
     result
 }
@@ -1912,8 +1940,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_cranelift::register_stack_check_addresses(
                 pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
                 pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
-                pyre_interpreter::stack_check::pyre_stack_check_slowpath_for_backend as *const ()
-                    as usize,
+                jit_prologue_stack_check_slowpath as *const () as usize,
             );
             majit_backend_cranelift::register_prologue_probe_addr(
                 pyre_interpreter::stack_check::pyre_stack_check_for_jit_prologue as *const ()
@@ -1935,7 +1962,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_dynasm::register_stack_check_addresses(
                 pyre_interpreter::stack_check::pyre_stack_get_end_adr(),
                 pyre_interpreter::stack_check::pyre_stack_get_length_adr(),
-                dynasm_stack_check_slowpath_for_backend as *const () as usize,
+                jit_prologue_stack_check_slowpath as *const () as usize,
             );
         }
     });
