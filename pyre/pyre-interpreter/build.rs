@@ -42,12 +42,14 @@ fn main() {
 
     // PyPy's `_multibytecodec` uses the cjkcodecs engine and mapping tables
     // verbatim (`pypy/module/_multibytecodec/c_codecs.py` ECI). Compile the
-    // Japanese codec unit together with the shared stateful buffer engine;
-    // Rust only provides the interpreter wrappers around this ABI.
+    // Chinese and Japanese codec units together with the shared stateful
+    // buffer engine; Rust only provides the interpreter wrappers around this
+    // ABI.
     let target = std::env::var("TARGET").unwrap_or_default();
     if !target.starts_with("wasm32-") {
         let cjk_root = Path::new("src/module/_multibytecodec");
         let cjk_sources = [
+            "src/module/_multibytecodec/src/cjkcodecs/_codecs_cn.c",
             "src/module/_multibytecodec/src/cjkcodecs/_codecs_jp.c",
             "src/module/_multibytecodec/src/cjkcodecs/multibytecodec.c",
         ];
@@ -60,6 +62,7 @@ fn main() {
             "src/cjkcodecs/cjkcodecs.h",
             "src/cjkcodecs/emu_jisx0213_2000.h",
             "src/cjkcodecs/fixnames.h",
+            "src/cjkcodecs/mappings_cn.h",
             "src/cjkcodecs/mappings_jisx0213_pair.h",
             "src/cjkcodecs/mappings_jp.h",
             "src/cjkcodecs/multibytecodec.h",
@@ -70,7 +73,7 @@ fn main() {
             .files(cjk_sources)
             .include(cjk_root)
             .warnings(false)
-            .compile("pyre_cjkcodecs_jp");
+            .compile("pyre_cjkcodecs");
     }
 
     // cffi's declaration parser is the format a compiled cffi extension module

@@ -113,6 +113,10 @@ pypymbc_ssize_t pypy_cjk_dec_inbuf_consumed(struct pypy_cjk_dec_s* d);
 RPY_EXTERN
 pypymbc_ssize_t pypy_cjk_dec_replace_on_error(struct pypy_cjk_dec_s* d,
                             pypymbc_wchar_t *, pypymbc_ssize_t, pypymbc_ssize_t);
+RPY_EXTERN
+void pypy_cjk_dec_getstate(struct pypy_cjk_dec_s *d, unsigned char *buf);
+RPY_EXTERN
+void pypy_cjk_dec_setstate(struct pypy_cjk_dec_s *d, const unsigned char *buf);
 
 struct pypy_cjk_enc_s {
   const MultibyteCodec *codec;
@@ -147,6 +151,10 @@ RPY_EXTERN
 const MultibyteCodec *pypy_cjk_enc_getcodec(struct pypy_cjk_enc_s *);
 RPY_EXTERN
 void pypy_cjk_enc_copystate(struct pypy_cjk_enc_s *dst, struct pypy_cjk_enc_s *src);
+RPY_EXTERN
+void pypy_cjk_enc_getstate(struct pypy_cjk_enc_s *d, unsigned char *buf);
+RPY_EXTERN
+void pypy_cjk_enc_setstate(struct pypy_cjk_enc_s *d, const unsigned char *buf);
 
 /* list of codecs defined in the .c files */
 

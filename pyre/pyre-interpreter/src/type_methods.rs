@@ -4618,17 +4618,14 @@ fn call_decode_error_handler(
     // in: the reread object (unicodeobject.c insize), or the one it started
     // on (`multibytecodec_decerror`'s `size`).
     let length = new_bytes.as_ref().map_or(data.len(), Vec::len) as i64;
-    // `call_errorhandler` keeps the negative fold in the `else` clause of the
-    // conversion, so it runs only for a position that converted.  One that did
-    // not convert is refused by the conversion's own error rather than folded:
-    // folding would land on 0 for a one-unit input and hand the same span back
-    // to the handler forever, and the error a position outside the machine
-    // integer raises is what a caller observes -- `OverflowError`, not the
-    // `IndexError` a substituted -1 sentinel would reach the bounds test with.
-    let newpos = match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4))?
-    {
-        n if n < 0 => n + length,
-        n => n,
+    // PyPy `_make_errorhandler.call_errorhandler`: a position outside the
+    // machine integer becomes -1, then reaches the common bounds check.  Only
+    // successfully converted negative positions fold against the input length.
+    let newpos = match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4)) {
+        Ok(n) if n < 0 => n + length,
+        Ok(n) => n,
+        Err(error) if error.kind == crate::PyErrorKind::OverflowError => -1,
+        Err(error) => return Err(error),
     };
     if newpos < 0 || newpos > length {
         return Err(crate::PyError::new(
@@ -4716,12 +4713,13 @@ pub(crate) fn call_registered_encode_error_handler(
     // newpos folds against the source CHARACTER length and resumes into the
     // original code-point sequence.
     let length = char_len as i64;
-    // The negative fold applies only to a position that converted, exactly as
-    // in the decode branch above, and one that did not is refused by the
-    // conversion's own error rather than folded.
-    let newpos = match crate::baseobjspace::int_w(w_newpos)? {
-        n if n < 0 => n + length,
-        n => n,
+    // Same PyPy `_make_errorhandler.call_errorhandler` conversion as the
+    // decode branch: overflow becomes -1 and is rejected by the bounds check.
+    let newpos = match crate::baseobjspace::int_w(w_newpos) {
+        Ok(n) if n < 0 => n + length,
+        Ok(n) => n,
+        Err(error) if error.kind == crate::PyErrorKind::OverflowError => -1,
+        Err(error) => return Err(error),
     };
     if newpos < 0 || newpos > length {
         return Err(crate::PyError::new(

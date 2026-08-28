@@ -54,7 +54,31 @@ class MultibyteCodec:
         return _decode(self.name, input, _codec_errors_arg("decode", errors), True)
 
 
+def _get_errors(self):
+    return self._errors
+
+
+def _set_errors(self, value):
+    if not isinstance(value, str):
+        raise TypeError("errors must be a string")
+    self._errors = value
+
+
+def _del_errors(self):
+    raise AttributeError("cannot delete attribute")
+
+
+# PyPy `MultibyteIncrementalBase.errors` is a GetSetProperty backed by
+# `fget_errors`/`fset_errors`, so it cannot be deleted and every write is
+# text-checked.  Sharing the descriptor preserves that behavior without making
+# the internal PyPy base an observable Python `__base__`; both exported types
+# have `object` there in the real pypy3 and pinned 3.14.  The messages are the
+# pinned 3.14 observable spellings.
+_errors_property = property(_get_errors, _set_errors, _del_errors)
+
+
 class MultibyteIncrementalDecoder:
+    errors = _errors_property
     # The name and argument position the initializer reports a non-str
     # `errors` under; `MultibyteStreamReader` reuses the body under its own.
     _init_name = "IncrementalDecoder"
@@ -62,23 +86,34 @@ class MultibyteIncrementalDecoder:
 
     def __init__(self, errors=_OMITTED):
         cls = type(self)
-        self.errors = _errors_arg(cls._init_name, cls._init_errors_position, errors)
+        self._errors = _errors_arg(cls._init_name, cls._init_errors_position, errors)
         self.codec = _codec_of(self)
         self.pending = b""
-        self.state = 0
+        # PyPy's `MultibyteIncrementalDecoder._initialize` owns one persistent
+        # `decodebuf`; these bytes are its `MultibyteCodec_State.c` while the
+        # app-level port crosses the Rust engine boundary one call at a time.
+        self.state = bytearray(8)
 
     def decode(self, object, final=False):
         data = self.pending + object
-        output, consumed = _decode(self.codec.name, data, self.errors, final)
+        output, consumed = _decode_stateful(
+            self.codec.name, data, self.errors, (final, self.state)
+        )
         self.pending = data[consumed:]
         return output
 
     def reset(self):
         self.pending = b""
-        self.state = 0
+        self.state = bytearray(8)
 
     def getstate(self):
-        return self.pending, self.state
+        # Pinned v3.14.6
+        # `Modules/cjkcodecs/multibytecodec.c::_multibytecodec_MultibyteIncrementalDecoder_getstate_impl`
+        # exposes the decoder's native `state.c` as the second tuple item.
+        # PyPy `MultibyteIncrementalDecoder.getstate_w` returns its separate
+        # integer field instead.  Keep PyPy's persistent decodebuf engineering;
+        # only this observable integer boundary is a 3.14-spec adaptation.
+        return self.pending, int.from_bytes(self.state, "little")
 
     def setstate(self, state):
         # `mbidecoder_setstate` parses `(bytes, int)`; the pending buffer holds
@@ -101,45 +136,48 @@ class MultibyteIncrementalDecoder:
             raise UnicodeDecodeError(
                 self.codec.name, buffer, 0, len(buffer), "pending buffer too large"
             )
+        codec_state = flag.to_bytes(8, "little")
         self.pending = buffer
-        self.state = flag
+        self.state = bytearray(codec_state)
 
 
 class MultibyteIncrementalEncoder:
+    errors = _errors_property
     _init_name = "IncrementalEncoder"
     _init_errors_position = 1
 
     def __init__(self, errors=_OMITTED):
         cls = type(self)
-        self.errors = _errors_arg(cls._init_name, cls._init_errors_position, errors)
+        self._errors = _errors_arg(cls._init_name, cls._init_errors_position, errors)
         self.codec = _codec_of(self)
         self.pending = ""
-        # `MultibyteCodec_State`, the shift state a stateful codec threads
-        # through its encode calls.  Every codec `_codecs_jp` carries is
-        # stateless, so nothing here ever writes it -- `encreset` is NULL for
-        # them, which is also why `reset` below leaves it alone -- but
-        # `setstate` still has to give it back, so it is carried verbatim.
-        self.state = bytes(8)
+        # PyPy's `MultibyteIncrementalEncoder._initialize` owns one persistent
+        # encodebuf.  Carry its `MultibyteCodec_State.c` explicitly so HZ's
+        # ASCII/GB shift survives between calls.
+        self.state = bytearray(8)
 
     def encode(self, object, final=False):
         data = self.pending + object
-        output, consumed = _encode(self.codec.name, data, self.errors, final)
+        output, consumed = _encode_stateful(
+            self.codec.name, data, self.errors, (final, self.state)
+        )
         self.pending = data[consumed:]
         return output
 
     def reset(self):
         self.pending = ""
+        self.state = bytearray(8)
 
     def getstate(self):
-        # `interp_incremental.py:152-164`.  The state is one little-endian
-        # integer over a 17-byte buffer:
+        # PyPy `MultibyteIncrementalEncoder.getstate_w`: the state is one
+        # little-endian integer over a 17-byte buffer:
         #   byte 0             length of the pending utf-8, 0..8
         #   bytes 1..1+length  the pending code points, utf-8
         #   the 8 bytes after  the codec state
         pending = self.pending.encode("utf-8")
         if len(pending) > 8:
             raise UnicodeError("pending buffer too large")
-        buffer = bytes([len(pending)]) + pending + self.state
+        buffer = bytes([len(pending)]) + pending + bytes(self.state)
         return int.from_bytes(buffer, "little")
 
     def setstate(self, state):
@@ -169,7 +207,7 @@ class MultibyteIncrementalEncoder:
                 "invalid utf-8 in setstate pending buffer",
             ) from None
         self.pending = decoded
-        self.state = buffer[1 + pending_len : 9 + pending_len]
+        self.state = bytearray(buffer[1 + pending_len : 9 + pending_len])
 
 
 class MultibyteStreamReader(MultibyteIncrementalDecoder):

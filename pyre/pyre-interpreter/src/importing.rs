@@ -719,6 +719,8 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
     #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_cn);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_jp);
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_multibytecodec);

@@ -23,6 +23,9 @@ pub mod _cffi_backend;
 pub mod _codecs;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]
+pub mod _codecs_cn;
+#[allow(non_snake_case)]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_jp;
 #[allow(non_snake_case)]
 pub mod _collections;

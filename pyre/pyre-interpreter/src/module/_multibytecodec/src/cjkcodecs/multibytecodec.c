@@ -117,6 +117,21 @@ Py_ssize_t pypy_cjk_dec_replace_on_error(struct pypy_cjk_dec_s* d,
   return 0;
 }
 
+/* Pinned v3.14.6
+ * _multibytecodec_MultibyteIncrementalDecoder_getstate_impl exposes state.c;
+ * PyPy MultibyteIncrementalDecoder.getstate_w returns a separate integer.
+ * These accessors serialize PyPy's persistent decodebuf across pyre's
+ * app/Rust call boundary while giving the caller the pinned observable. */
+void pypy_cjk_dec_getstate(struct pypy_cjk_dec_s *d, unsigned char *buf)
+{
+    memcpy(buf, d->state.c, sizeof(d->state.c));
+}
+
+void pypy_cjk_dec_setstate(struct pypy_cjk_dec_s *d, const unsigned char *buf)
+{
+    memcpy(d->state.c, buf, sizeof(d->state.c));
+}
+
 /************************************************************/
 
 struct pypy_cjk_enc_s *pypy_cjk_enc_new(const MultibyteCodec *codec)
@@ -137,6 +152,16 @@ struct pypy_cjk_enc_s *pypy_cjk_enc_new(const MultibyteCodec *codec)
 void pypy_cjk_enc_copystate(struct pypy_cjk_enc_s *dst, struct pypy_cjk_enc_s *src)
 {
     dst->state = src->state;
+}
+
+void pypy_cjk_enc_getstate(struct pypy_cjk_enc_s *d, unsigned char *buf)
+{
+    memcpy(buf, d->state.c, sizeof(d->state.c));
+}
+
+void pypy_cjk_enc_setstate(struct pypy_cjk_enc_s *d, const unsigned char *buf)
+{
+    memcpy(d->state.c, buf, sizeof(d->state.c));
 }
 
 Py_ssize_t pypy_cjk_enc_init(struct pypy_cjk_enc_s *d,
