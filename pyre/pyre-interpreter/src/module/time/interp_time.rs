@@ -61,6 +61,49 @@ fn with_clock<R>(f: impl FnOnce(&dyn ClockProvider) -> R, unclocked: R) -> R {
     }
 }
 
+/// A reading of the monotonic clock, standing in for `std::time::Instant`.
+///
+/// wasm32 answers `Instant::now()` with a panic rather than a reading, so
+/// every caller that needs a deadline -- a lock wait, a join timeout -- takes
+/// it from the embedder's clock instead, which is the clock
+/// `time.monotonic()` already reports.  Only the surface those callers use is
+/// offered.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Instant(i128);
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    pub(crate) fn now() -> Self {
+        Self(monotonic_nanos())
+    }
+
+    pub(crate) fn elapsed(&self) -> std::time::Duration {
+        Self::now() - *self
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::ops::Add<std::time::Duration> for Instant {
+    type Output = Self;
+
+    fn add(self, rhs: std::time::Duration) -> Self {
+        Self(self.0 + rhs.as_nanos() as i128)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::ops::Sub for Instant {
+    type Output = std::time::Duration;
+
+    /// Saturating, matching the clock: a reading earlier than `rhs` is a
+    /// duration of zero rather than one that wrapped.
+    fn sub(self, rhs: Self) -> std::time::Duration {
+        let nanos = (self.0 - rhs.0).max(0) as u128;
+        std::time::Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+    }
+}
+
 /// Process-start `Instant` used as the monotonic-clock origin whenever
 /// `clock_gettime(CLOCK_MONOTONIC)` is unavailable.  Keeping a single
 /// baseline preserves `time.monotonic()`'s non-decreasing guarantee.

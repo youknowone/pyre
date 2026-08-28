@@ -9,7 +9,13 @@ use parking_lot::{Condvar, Mutex};
 use pyre_object::*;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+// wasm32 has no `Instant` of its own; the deadlines below read the clock the
+// embedder installs, the same one `time.monotonic()` reports.
+#[cfg(target_arch = "wasm32")]
+use crate::module::time::interp_time::Instant;
 
 /// `PY_TIMEOUT_MAX` — the acquire-timeout bound in microseconds.  A POSIX host
 /// waits on a nanosecond deadline and bounds it at `LLONG_MAX / 1000`; Windows
