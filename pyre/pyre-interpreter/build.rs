@@ -73,6 +73,32 @@ fn main() {
             .compile("pyre_cjkcodecs_jp");
     }
 
+    // cffi's declaration parser is the format a compiled cffi extension module
+    // embeds its type information in, so both interpreters compile the same C
+    // translation unit rather than re-spell the grammar
+    // (`pypy/module/_cffi_backend/parse_c_type.py`'s ECI).  `commontypes.c` is
+    // `#include`d by `parse_c_type.c` and is not a unit of its own.
+    if std::env::var_os("CARGO_FEATURE_SANDBOX").is_none() && !target.starts_with("wasm32-") {
+        let cffi_root = Path::new("src/module/_cffi_backend");
+        let cffi_source = "src/module/_cffi_backend/src/parse_c_type.c";
+        println!("cargo:rerun-if-changed={cffi_source}");
+        for header in [
+            "src/precommondefs.h",
+            "src/parse_c_type.h",
+            "src/commontypes.c",
+        ] {
+            println!(
+                "cargo:rerun-if-changed={}",
+                cffi_root.join(header).display()
+            );
+        }
+        cc::Build::new()
+            .file(cffi_source)
+            .include(cffi_root)
+            .warnings(false)
+            .compile("pyre_cffi_parse_c_type");
+    }
+
     // The variadic C-API entry points cannot have Rust bodies -- no Rust
     // compiler walks a `va_list` -- so they are C translation units compiled
     // into the interpreter, which is what `pypy/module/cpyext/src/` is.  The

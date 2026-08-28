@@ -17,6 +17,9 @@ pub mod _blake2;
 #[allow(non_snake_case)]
 pub mod _bz2;
 #[allow(non_snake_case)]
+#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+pub mod _cffi_backend;
+#[allow(non_snake_case)]
 pub mod _codecs;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]
