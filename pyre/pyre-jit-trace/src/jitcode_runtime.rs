@@ -356,16 +356,6 @@ static LIST_POP_END_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of `w_tuple_getitem`, resolved by graph key
 /// rather than by name -- see [`compute_pathed_jitcode_index`].
 static TUPLE_GETITEM_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `invert_inner`, resolved by graph key: `neg`
-/// and `invert` held indices 2798/2809 in only two of eight observed cache
-/// generations, so an index is not stable across builds and a path is.
-static INVERT_INNER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `neg_inner`, resolved by graph key for the
-/// reason given above.
-static NEG_INNER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
-/// Cached `ALL_JITCODES` index of `pos_inner`, resolved by graph key for the
-/// reason given above.
-static POS_INNER_JITCODE_INDEX: OnceLock<Option<usize>> = OnceLock::new();
 /// Cached `ALL_JITCODES` index of the interpreter-source
 /// `load_super_attr_value_w` body. The fused opcode reaches this ordinary
 /// graph so `_super_check` and `W_Super.getattribute` are traced from their
@@ -429,6 +419,27 @@ pub(crate) fn pathed_jitcode(canonical_path: &str) -> Option<Arc<JitCode>> {
     get_jitcode_by_index(compute_pathed_jitcode_index(canonical_path)?)
 }
 
+thread_local! {
+    /// `canonical_path` → its `ALL_JITCODES` index, resolved once per thread.
+    /// The `None` answer is cached too: a helper absent from the build-time
+    /// pipeline is asked for on every consult of its site.
+    static PATHED_JITCODE_INDEX: std::cell::RefCell<std::collections::HashMap<&'static str, Option<usize>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// [`pathed_jitcode`] for a descent's fixed target, cached per thread.  The
+/// descents this serves are rows of a table (`specialize.rs UnaryDescent`),
+/// so the path is a literal and the cache is keyed by it.
+pub(crate) fn pathed_jitcode_cached(canonical_path: &'static str) -> Option<Arc<JitCode>> {
+    let idx = PATHED_JITCODE_INDEX.with(|cache| {
+        *cache
+            .borrow_mut()
+            .entry(canonical_path)
+            .or_insert_with(|| compute_pathed_jitcode_index(canonical_path))
+    })?;
+    get_jitcode_by_index(idx)
+}
+
 /// Resolve an ordinary portal-closure JitCode by its unique graph leaf name.
 /// Prefer stable graph paths at build time; this runtime helper exists for
 /// diagnostics and tests whose serialized artifact stores names only.
@@ -458,6 +469,15 @@ pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
     get_jitcode_by_index(idx)
 }
 
+/// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
+/// graph key the codewriter allocated it under and cached process-wide.
+pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {
+    let idx = (*LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX.get_or_init(|| {
+        compute_pathed_jitcode_index("pyre_interpreter::eval::load_super_attr_value_w")
+    }))?;
+    get_jitcode_by_index(idx)
+}
+
 /// The charon `w_tuple_getitem` body in `ALL_JITCODES`, resolved by the graph
 /// key the codewriter allocated it under and cached process-wide. `None` if the
 /// helper is absent from the build-time pipeline.
@@ -474,71 +494,6 @@ pub fn list_pop_end_jitcode() -> Option<Arc<JitCode>> {
 /// `_known` reader is what keeps the length test in the trace: the caller's
 /// trace-time range check proves only that THIS receiver is long enough, while
 /// the recorded `arraylen` guard is what holds for the next one.
-/// The charon `invert_inner` body in `ALL_JITCODES`, resolved by the graph key
-/// the codewriter allocated it under and cached process-wide. `None` if the
-/// helper is absent from the build-time pipeline.
-///
-/// This is `descroperation.rs` `invert` past its `__invert__` override probe
-/// and its bool slot -- the two arms a descent cannot take. What is left is the
-/// `int` arm, the `long` arm, the instance fallback and the terminal
-/// `TypeError`, so a caller that has pinned an exact `int` or `long` receiver
-/// records one of the first two and nothing else.
-pub fn invert_inner_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*INVERT_INNER_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::invert_inner")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
-/// The charon `neg_inner` body in `ALL_JITCODES`, resolved by the graph key the
-/// codewriter allocated it under and cached process-wide. `None` if the helper is
-/// absent from the build-time pipeline.
-///
-/// This is `descroperation.rs` `neg` past its `__neg__` override probe -- the
-/// one arm a descent cannot take. What is left is the integer arm (including
-/// the `checked_neg` promotion of `INT_MIN`), the `long`, `float` and `complex`
-/// arms, the instance fallback and the terminal `TypeError`, so a caller that
-/// has pinned an exact `int` or `long` receiver records one of the first two
-/// and nothing else.
-pub fn neg_inner_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*NEG_INNER_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::neg_inner")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
-/// The charon `pos_inner` body in `ALL_JITCODES`, resolved by the graph key the
-/// codewriter allocated it under and cached process-wide. `None` if the helper is
-/// absent from the build-time pipeline.
-///
-/// This is `descroperation.rs` `pos` past its `__pos__` override probe -- the
-/// one arm a descent cannot take. What is left is the exact-int identity, the
-/// bool/int rewrap, the long/float/complex arms, the instance fallback and the
-/// terminal `TypeError`, so a caller that has pinned an exact `int` or `long`
-/// receiver records one of the identity arms and nothing else.
-///
-/// `+x` is `CALL_INTRINSIC_1`, so the only route to this body runs through
-/// `OpcodeStepExecutor::unary_positive`, which is declared without a body for
-/// that reason: a default there is the graph the walker takes, and `PyFrame`'s
-/// implementation -- and with it `pos` and `pos_inner` -- is never reached.
-/// `None` here is the helper's absence from the build-time pipeline, and the
-/// identity fold behind the descent still serves exact-int `+x`.
-pub fn pos_inner_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*POS_INNER_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::objspace::descroperation::pos_inner")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
-/// The wrapped-name interpreter-source value half of `LOAD_SUPER_ATTR`, resolved by the
-/// graph key the codewriter allocated it under and cached process-wide.
-pub fn load_super_attr_value_jitcode() -> Option<Arc<JitCode>> {
-    let idx = (*LOAD_SUPER_ATTR_VALUE_JITCODE_INDEX.get_or_init(|| {
-        compute_pathed_jitcode_index("pyre_interpreter::eval::load_super_attr_value_w")
-    }))?;
-    get_jitcode_by_index(idx)
-}
-
 pub fn tuple_getitem_jitcode() -> Option<Arc<JitCode>> {
     let idx = (*TUPLE_GETITEM_JITCODE_INDEX.get_or_init(|| {
         compute_pathed_jitcode_index("pyre_object::tupleobject::w_tuple_getitem")

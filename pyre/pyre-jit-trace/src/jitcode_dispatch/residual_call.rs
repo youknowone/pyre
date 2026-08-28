@@ -6998,10 +6998,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
-    // UNARY_POSITIVE.  Descend `pos_inner` -- `pos` past the override probe --
-    // rather than re-emit its identity arm by hand, the same shape the invert
-    // and neg descents take.  Sits ahead of the `unary_positive_int` fold so
-    // that fold's `consulted` count reads whether the descent took the site.
+    // UNARY_POSITIVE.  Descend `pos` whole rather than re-emit its identity
+    // arm by hand; the body's own `guard_class` and promoted `w_class` select
+    // the arm.  Sits ahead of the `unary_positive_int` fold so that fold's
+    // `consulted` count reads whether the descent took the site.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
@@ -7015,7 +7015,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
 
     // #61: UNARY_POSITIVE `+int` identity fold.  Kept behind the descent so a
-    // build whose `pos_inner` jitcode is missing or unlowered still forwards
+    // build whose `pos` jitcode is missing or unlowered still forwards
     // an exact-int operand.  A bool (`+True` is int `1`) / non-int operand
     // declines to the generic leg so its `__pos__` still runs.
     if ctx.is_authoritative_executor
@@ -7030,12 +7030,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // UNARY_NEGATIVE.  Descend `neg_inner` -- `neg` past the override probe --
-    // rather than re-emit its integer arm by hand, the same shape the invert
-    // descent below takes.  The translated body owns the ordinary int arm and
-    // the exact `long` operand. Bool, subclass and non-int operands still fall
-    // through to the generic residual so their override semantics are
-    // preserved, and the `INT_MIN` promotion declines to the fold below.
+    // UNARY_NEGATIVE.  Descend `neg` whole rather than re-emit its integer arm
+    // by hand.  The translated body owns both the ordinary int arm
+    // and the `INT_MIN` promotion through `rbigint.neg` + `W_LongObject`
+    // allocation. Bool, subclass and non-int operands still fall through to
+    // the generic residual so their override semantics are preserved.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
@@ -7048,27 +7047,8 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
-    // #61: UNARY_NEGATIVE `-int`.  Kept behind the descent, which declines the
-    // one operand `descr_neg` promotes: the fold pins that operand with
-    // `guard_value` and takes the `_make_ovf2long` tail, so the `2**63` long is
-    // a constant the ops reading it fold against.  It also serves an exact-int
-    // operand in a build whose `neg_inner` jitcode is missing or unlowered.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && spec_gate(SpecFold::UnaryNegativeInt, || {
-            try_walker_specialize_unary_negative_int(
-                ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
-            )
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // UNARY_INVERT.  Descend `invert_inner` -- `invert` past the override probe
-    // and the bool slot -- rather than re-emit its integer arm by hand.  This
+    // UNARY_INVERT.  Descend `invert` whole rather than re-emit its integer arm
+    // by hand.  This
     // replaced `unary_invert_int`, whose site it took whole: with the descent
     // in, that fold measured `consulted=0` on every fixture that exercises `~`.
     // Falls through to the generic residual when the body is absent from this
