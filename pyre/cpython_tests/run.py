@@ -402,6 +402,27 @@ def failure_digest(out: str, err: str) -> str:
     return " | ".join(part for part in (verdict, *shown) if part)
 
 
+# The Windows loader refusing to start a process, which is not the module
+# crashing but the module never running.
+STATUS_DLL_INIT_FAILED = 0xC0000142
+
+# Windows kills a faulting process by setting its exit status to the NTSTATUS
+# it died of, so these arrive where a POSIX signal number would.
+NTSTATUS_NAMES = {
+    0xC0000005: "ACCESS_VIOLATION",
+    0xC0000017: "NO_MEMORY",
+    0xC000001D: "ILLEGAL_INSTRUCTION",
+    0xC0000094: "INTEGER_DIVIDE_BY_ZERO",
+    0xC00000FD: "STACK_OVERFLOW",
+    0xC000013A: "CONTROL_C_EXIT",
+    0xC0000135: "DLL_NOT_FOUND",
+    0xC0000139: "ENTRYPOINT_NOT_FOUND",
+    STATUS_DLL_INIT_FAILED: "DLL_INIT_FAILED",
+    0xC0000374: "HEAP_CORRUPTION",
+    0xC0000409: "STACK_BUFFER_OVERRUN",
+}
+
+
 def death_signal(rc: int) -> str:
     """`SIGBUS` for a run killed by a signal, else a bare return code.
 
@@ -409,7 +430,18 @@ def death_signal(rc: int) -> str:
     shell-mediated one arrives as 128+n. Naming the signal is what separates
     "the interpreter faulted" from "the interpreter aborted an assertion",
     and those two want completely different investigations.
+
+    Windows has no signal to name and reports the NTSTATUS instead, which
+    reaches here as a ten-digit number that reads as nothing: three modules
+    of a full run were filed as interpreter crashes on the strength of one,
+    and it was the loader saying it had not started them.
     """
+    if sys.platform == "win32":
+        named = NTSTATUS_NAMES.get(rc)
+        if named is not None:
+            return named
+        if rc >= 0xC0000000:
+            return f"NTSTATUS 0x{rc:08X}"
     num = -rc if rc < 0 else rc - 128
     try:
         return signal.Signals(num).name
@@ -835,31 +867,41 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             if module_env is env:
                 module_env = env.copy()
             module_env.setdefault("PYTHONREGRTEST_UNICODE_GUARD", "æ")
-        # `subprocess.run(timeout=)` cannot be used here: its own recovery
-        # drains the pipes after killing the child alone, and `reap` documents
-        # why that never returns for a module holding spawned workers.
-        # `with`, as `subprocess.run` has: one module of the four hundred
-        # leaking its two pipe handles is one the run cannot afford.
-        with subprocess.Popen(
-            cmd, cwd=cwd, env=module_env,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-        ) as proc:
-            try:
-                out, err = proc.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired as expired:
-                # A bare "timeout 120s" says only that the module is slow,
-                # never which case it stopped in — and unittest's progress
-                # dots, the one record of how far it got, were being thrown
-                # away here. `text=True` decodes what `communicate()` returns;
-                # the timeout path raises with the raw chunks it had joined,
-                # which is bytes on POSIX and str on Windows, so both
-                # spellings have to be accepted.
-                partial = expired.stderr or ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", "replace")
-                reap(proc)
-                return "TIMEOUT", f"timeout {timeout}s {last_stderr_line(partial)}"[:300]
+        relaunched = False
+        while True:
+            # `subprocess.run(timeout=)` cannot be used here: its own recovery
+            # drains the pipes after killing the child alone, and `reap`
+            # documents why that never returns for a module holding spawned
+            # workers.  `with`, as `subprocess.run` has: one module of the four
+            # hundred leaking its two pipe handles is one the run cannot
+            # afford.
+            with subprocess.Popen(
+                cmd, cwd=cwd, env=module_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+            ) as proc:
+                try:
+                    out, err = proc.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired as expired:
+                    # A bare "timeout 120s" says only that the module is slow,
+                    # never which case it stopped in — and unittest's progress
+                    # dots, the one record of how far it got, were being
+                    # thrown away here. `text=True` decodes what
+                    # `communicate()` returns; the timeout path raises with the
+                    # raw chunks it had joined, which is bytes on POSIX and str
+                    # on Windows, so both spellings have to be accepted.
+                    partial = expired.stderr or ""
+                    if isinstance(partial, bytes):
+                        partial = partial.decode("utf-8", "replace")
+                    reap(proc)
+                    return "TIMEOUT", f"timeout {timeout}s {last_stderr_line(partial)}"[:300]
+            # The resource the loader ran out of is one this suite spends
+            # itself, sixteen modules at a time, so the second launch of the
+            # same command usually succeeds.  Nothing is hidden by trying: an
+            # interpreter that genuinely cannot load fails twice.
+            if relaunched or proc.returncode != STATUS_DLL_INIT_FAILED:
+                break
+            relaunched = True
     return classify(proc.returncode, out or "", err or "")
 
 
