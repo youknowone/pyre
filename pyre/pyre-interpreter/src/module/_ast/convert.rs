@@ -15,6 +15,89 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 type AstResult<T> = Result<T, crate::PyError>;
 
+/// RustPython `_ast::should_report_unsupported_syntax_error`: Ruff records
+/// every version-shaped difference, including compatibility syntax CPython
+/// deliberately still accepts for older feature versions.  Only these are
+/// parser errors at the public `feature_version` boundary.
+fn should_report_unsupported_syntax_error(error: &parser::UnsupportedSyntaxError) -> bool {
+    use parser::UnsupportedSyntaxErrorKind as Kind;
+    matches!(
+        error.kind,
+        Kind::Match
+            | Kind::Walrus
+            | Kind::ExceptStar
+            | Kind::PositionalOnlyParameter
+            | Kind::TypeParameterList
+            | Kind::TypeAliasStatement
+            | Kind::TypeParamDefault
+            | Kind::TemplateStrings
+            | Kind::UnparenthesizedExceptionTypes
+            | Kind::LazyImportStatement
+            | Kind::ParenthesizedKeywordArgumentName
+    )
+}
+
+/// CPython `_PyPegen_new_identifier` refuses a lexer name whose NFKC form is
+/// one of the three constant keywords.  Ruff already performs that same NFKC
+/// conversion when it builds the AST, but (unlike CPython) leaves the result
+/// as an identifier.  Inspecting only `Name` tokens keeps this a parser check:
+/// a literal `None`/`True`/`False` token is, of course, valid.
+fn validate_parser_identifiers(source: &str, tokens: &ast::token::Tokens) -> AstResult<()> {
+    for token in tokens.iter() {
+        if token.kind() != ast::token::TokenKind::Name {
+            continue;
+        }
+        let (_, range) = token.as_tuple();
+        let spelling = &source[range.start().to_usize()..range.end().to_usize()];
+        if spelling.is_ascii() {
+            continue;
+        }
+        let normalized = rustpython_unicode::normalize(
+            rustpython_unicode::NormalizeForm::Nfkc,
+            Wtf8::new(spelling),
+        );
+        let normalized = normalized.to_string_lossy();
+        if matches!(normalized.as_ref(), "None" | "True" | "False") {
+            return Err(crate::PyError::value_error(format!(
+                "identifier field can't represent '{normalized}' constant"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Ruff currently records `TypeParamDefault` for `T = int`, but not for the
+/// sibling `*Ts = int` and `**P = int` spellings.  CPython 3.14 applies the
+/// same 3.13 grammar boundary to all three, so fill only that parser metadata
+/// gap after Ruff has produced the native tree.
+fn has_variadic_type_param_default(module: &ast::Mod) -> bool {
+    use ast::visitor::Visitor;
+
+    #[derive(Default)]
+    struct Finder {
+        found: bool,
+    }
+
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_type_param(&mut self, type_param: &'a ast::TypeParam) {
+            self.found |= match type_param {
+                ast::TypeParam::TypeVar(_) => false,
+                ast::TypeParam::TypeVarTuple(node) => node.default.is_some(),
+                ast::TypeParam::ParamSpec(node) => node.default.is_some(),
+            };
+            if !self.found {
+                ast::visitor::walk_type_param(self, type_param);
+            }
+        }
+    }
+
+    let mut finder = Finder::default();
+    if let ast::Mod::Module(module) = module {
+        finder.visit_body(&module.body);
+    }
+    finder.found
+}
+
 /// Convert an interpreter-level `_ast` tree back into Ruff's compiler AST and
 /// compile it.  This is the reverse of `Converter`, corresponding to PyPy's
 /// generated `ast_from_object` boundary.
@@ -1958,6 +2041,7 @@ pub fn parse_to_object(source: &str, mode: crate::compile::Mode) -> crate::PyRes
         crate::compile::CompileOpts::default(),
         true,
         false,
+        -1,
     )
 }
 
@@ -1969,6 +2053,7 @@ pub fn parse_to_object_with_opts(
     opts: crate::compile::CompileOpts,
     syntax_check_only: bool,
     type_comments: bool,
+    feature_version: i64,
 ) -> crate::PyResult {
     // The tokenizer sees a source whose line terminators are all `\n`
     // (`pytokenizer.py:654-662`), so the same rewrite runs here; the nodes and
@@ -1976,26 +2061,49 @@ pub fn parse_to_object_with_opts(
     let source = &*crate::compile::universal_newline(source);
     // A comment leaves no node behind, so a `type_comments=True` parse reads
     // the token list the parser hands back beside the tree.
-    let mut collected = super::type_comments::TypeComments::default();
-    let mut module = match mode {
-        // An expression has none of the five positions a `TYPE_COMMENT` is
-        // accepted in, so the comments are collected here only to be refused.
-        crate::compile::Mode::Eval => parser::parse_expression(source).map(|parsed| {
-            if type_comments {
-                collected = super::type_comments::collect(parsed.tokens(), source);
-            }
-            ast::Mod::Expression(parsed.into_syntax())
-        }),
+    let parse_mode = match mode {
+        crate::compile::Mode::Eval => parser::Mode::Expression,
         crate::compile::Mode::Exec
         | crate::compile::Mode::Single
-        | crate::compile::Mode::BlockExpr => parser::parse_module(source).map(|parsed| {
-            if type_comments {
-                collected = super::type_comments::collect(parsed.tokens(), source);
-            }
-            ast::Mod::Module(parsed.into_syntax())
-        }),
+        | crate::compile::Mode::BlockExpr => parser::Mode::Module,
+    };
+    // PyPy `CompileInfo.feature_version` carries the requested grammar version
+    // into `PythonParser.parse_source`.  CPython 3.14 treats every negative
+    // value and every future minor as the current grammar, so never expose
+    // Ruff's preview 3.15 grammar through this 3.14 boundary.
+    let minor = if feature_version < 0 {
+        14
+    } else {
+        feature_version.min(14) as u8
+    };
+    let options = parser::ParseOptions::from(parse_mode)
+        .with_target_version(ast::PythonVersion { major: 3, minor });
+    let parsed = parser::parse(source, options)
+        .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
+    // [3.14-spec] CPython `_PyPegen_new_identifier` performs this check as it
+    // interns each identifier.  PyPy `new_identifier` has the same NFKC
+    // spelling, while its parser-owned tree deliberately bypasses
+    // `AstValidator`; keep the check at that parser boundary too.
+    validate_parser_identifiers(source, parsed.tokens())?;
+    if let Some(error) = parsed
+        .unsupported_syntax_errors()
+        .iter()
+        .find(|error| should_report_unsupported_syntax_error(error))
+    {
+        return Err(crate::PyError::syntax_error(error.to_string()));
     }
-    .map_err(|error| crate::PyError::syntax_error(error.to_string()))?;
+    let mut collected = super::type_comments::TypeComments::default();
+    if type_comments {
+        // An expression has none of the five positions a `TYPE_COMMENT` is
+        // accepted in, so the comments are collected here only to be refused.
+        collected = super::type_comments::collect(parsed.tokens(), source);
+    }
+    let mut module = parsed.into_syntax();
+    if minor < 13 && has_variadic_type_param_default(&module) {
+        return Err(crate::PyError::syntax_error(
+            "Type parameter defaults are only supported in Python 3.13 and greater",
+        ));
+    }
     if type_comments {
         collected.attach(&mut module);
         // What attachment left over is a token no rule accepted, which the

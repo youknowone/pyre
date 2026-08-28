@@ -14106,6 +14106,17 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         Some(v) => crate::baseobjspace::gateway_int_w(v)?,
         None => -1,
     };
+    // PyPy `PythonAstCompiler.compile_to_ast` passes this keyword-only value
+    // through `CompileInfo.feature_version` to the parser.
+    let feature_version = match kwarg_get(kwargs, "_feature_version") {
+        Some(value) => {
+            let value = crate::baseobjspace::gateway_int_w(value)?;
+            i64::from(i32::try_from(value).map_err(|_| {
+                crate::PyError::overflow_error("Python int too large to convert to C int")
+            })?)
+        }
+        None => -1,
+    };
 
     // Any bit outside the recognised compilation-flag set is rejected.
     let recognized = COMPILER_FLAGS
@@ -14230,6 +14241,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
                 opts,
                 syntax_check_only,
                 flags & PYCF_TYPE_COMMENTS != 0,
+                feature_version,
             )
         };
         return result.map_err(|error| {
