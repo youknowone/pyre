@@ -426,9 +426,8 @@ configuration takes. `src/gc.rs` installs MiniMark in `main`, which is
 
 Installing it was not enough on its own, and the census is what said so: the
 row did not move. The frame was coming from `alloc_nursery_no_collect_typed`,
-so once the nursery filled — about eighteen thousand entries in — every frame
-after that spilled to old-gen through `rawmalloc`, one process allocation each
-and nothing ever reclaiming them. Upstream's `malloc_jitframe` is an ordinary
+so once the nursery filled every frame after that spilled to old-gen through
+`rawmalloc`, one process allocation each and nothing ever reclaiming them. Upstream's `malloc_jitframe` is an ordinary
 `lltype.malloc` and collects when the nursery is full; it can, because the
 arguments it stores into the frame afterwards (`llmodel.py:306-315`) are RPython
 locals the translated stack map roots across the allocation.
