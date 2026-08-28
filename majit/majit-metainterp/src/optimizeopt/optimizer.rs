@@ -569,14 +569,26 @@ pub(crate) fn lower_typed_constants_to_const_pool(
     pool
 }
 
-fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> bit_set::BitSet {
-    let mut live_positions = bit_set::BitSet::new();
+/// The runtime OpRefs `ops` defines, as a set.
+///
+/// A set rather than a `BitSet` keyed by the raw. Pyre's OpRefs come from a
+/// monotonic counter and a bridge mints its own at `[parent_high_water..)`, so
+/// a bitmap indexed by the bare raw is sized by everything the trace family has
+/// compiled so far — one more of the positional side tables `optimizer.py` does
+/// not have, since it forwards on the box object (`op.set_forwarded(newop)`)
+/// and keeps no table at all. The membership tests below run once per constant
+/// and once per considered op, both bounded by the trace, so hashing is the
+/// cheaper half of the trade.
+fn live_runtime_positions<'a>(
+    ops: impl IntoIterator<Item = &'a Op>,
+) -> rustc_hash::FxHashSet<u32> {
+    let mut live_positions = rustc_hash::FxHashSet::default();
     for op in ops {
         let pos = op.pos.get();
         if pos.is_none() || pos.is_constant() {
             continue;
         }
-        live_positions.insert(pos.raw() as usize);
+        live_positions.insert(pos.raw());
     }
     live_positions
 }
@@ -586,7 +598,7 @@ pub(crate) fn sanitize_backend_constants_for_ops<'a>(
     constants: &mut majit_ir::ConstMap<majit_ir::Value>,
 ) {
     let live_positions = live_runtime_positions(ops);
-    constants.retain(|idx, _| !live_positions.contains(*idx as usize));
+    constants.retain(|idx, _| !live_positions.contains(idx));
 }
 
 /// Export newly-discovered constants from `OptContext` into the
@@ -620,7 +632,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if pos.is_none() || pos.is_constant() {
             return;
         }
-        let idx = pos.raw() as usize;
+        let idx = pos.raw();
         let value = match op.forwarded.borrow().clone() {
             majit_ir::forwarding::Forwarded::Const(c) => c.to_value(),
             _ => return,
@@ -639,10 +651,10 @@ pub(crate) fn merge_backend_constants_from_ctx(
         if matches!(value, majit_ir::Value::Ref(_)) {
             return;
         }
-        if live_positions.contains(idx) {
+        if live_positions.contains(&idx) {
             return;
         }
-        let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
+        let key = OptContext::op_ref_for_value(idx, &value).raw();
         constants.entry(key).or_insert_with(|| value);
     };
     for op in &ctx.new_operations {
