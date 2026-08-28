@@ -1045,76 +1045,73 @@ fn switch_discriminant_read_vars(graph: &LegacyGraph) -> std::collections::HashS
     out
 }
 
-/// Results of a variant-payload `FieldRead` whose *only* op consumer is a
-/// `FieldWrite` of the same field name — the extract-then-repack of an
+/// Results of a variant-payload `FieldRead` whose *only* op consumer is the
+/// value position of a `FieldWrite` — the extract-then-repack of an
 /// identity `match` re-wrap (`match step { Return(v) => Ok(Return(v)),
 /// CloseLoop { jump_args, loop_header_pc } => Ok(CloseLoop { .. }), … }`,
 /// `pyopcode.rs:1945`).  Each arm reads the incoming variant's payload
 /// (`FieldRead("__pos_0" | "loop_header_pc", owner = StepResult::Variant)`)
 /// and immediately writes it into a freshly-built outgoing variant
-/// (`FieldWrite(same field, owner = StepResult<…>::Variant)`).
+/// (`FieldWrite(_, owner = StepResult<…>::Variant)`).  Rust tuple variants
+/// can rename the storage field while preserving the value — notably
+/// `Option::Some.__pos_0` → `StepResult::CloseLoop.jump_args` — so field-name
+/// equality is not part of the identity relation.
 ///
 /// The real path lowers the enclosing `Result` through the uniform
 /// exception-transform (`front/result_exc.rs`), which recognises the `Ok(step)`
 /// identity and **elides** the whole extract-repack, so the legacy read result
 /// is never typed under its own Variable identity (`real=None`) — the same
 /// rebuilt-block artifact as [`switch_discriminant_read_vars`], for the payload
-/// projection rather than the tag.  Requiring the sole op-use to be a same-name
-/// `FieldWrite` keeps this from over-reaching a payload the arm actually
-/// consumes (a non-identity `match` that transforms the value flows the read
-/// into some other op, so it is excluded).
+/// projection rather than the tag.  Requiring the sole op-use to be the raw
+/// value operand of a `FieldWrite` keeps this from over-reaching a payload the
+/// arm actually consumes: any transform or call is another op-use and excludes
+/// the candidate.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
 fn repack_payload_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
     use crate::model::OpKind;
-    // For each candidate FieldRead result, the field name it reads.
-    let mut read_field: HashMap<Variable, String> = HashMap::new();
+    let mut read_results = std::collections::HashSet::new();
     for block in &graph.blocks {
         for op in &block.operations {
             if let (Some(r), OpKind::FieldRead { field, .. }) = (&op.result, &op.kind)
                 && field.name != "__discriminant"
             {
-                read_field.insert(r.clone(), field.name.clone());
+                read_results.insert(r.clone());
             }
         }
     }
-    if read_field.is_empty() {
+    if read_results.is_empty() {
         return std::collections::HashSet::new();
     }
     // Tally every op-use of each candidate: `repack` counts a use as the
-    // `value` operand of a same-field `FieldWrite`; `other` counts any other
-    // op-use.  A candidate survives only when it has ≥1 repack use and no
-    // other use (a genuinely consumed payload has an `other` use).
-    let mut repack_use: HashMap<Variable, bool> = HashMap::new();
+    // `value` operand of a `FieldWrite`; `other` counts any other op-use. A
+    // candidate survives only when it has ≥1 repack use and no other use.
+    let mut repack_use = std::collections::HashSet::new();
     let mut other_use: std::collections::HashSet<Variable> = std::collections::HashSet::new();
     for block in &graph.blocks {
         for op in &block.operations {
-            // A same-field `FieldWrite` value operand is the repack use; the
-            // `base` operand (the target struct) is a different use and is
-            // handled by the generic operand scan below.
+            // A `FieldWrite` value operand is the repack use; the base operand
+            // is handled by the generic operand scan below.
             if let OpKind::FieldWrite {
-                field,
                 value: crate::model::LinkArg::Value(v),
                 ..
             } = &op.kind
-                && let Some(read_name) = read_field.get(v)
-                && *read_name == field.name
+                && read_results.contains(v)
             {
-                repack_use.insert(v.clone(), true);
+                repack_use.insert(v.clone());
             }
             for used in crate::front::result_exc::op_operand_vars(&op.kind) {
-                if !read_field.contains_key(&used) {
+                if !read_results.contains(&used) {
                     continue;
                 }
-                // Re-derive whether THIS op is the matching same-field
-                // `FieldWrite` value use; every other operand position counts
-                // as an `other` use that disqualifies the candidate.
+                // Every position other than the FieldWrite's raw value is an
+                // actual use that disqualifies the candidate.
                 let is_repack_value = matches!(
                     &op.kind,
-                    OpKind::FieldWrite { field, value: crate::model::LinkArg::Value(vv), .. }
-                        if vv == &used && read_field.get(&used) == Some(&field.name)
+                    OpKind::FieldWrite { value: crate::model::LinkArg::Value(vv), .. }
+                        if vv == &used
                 );
                 if !is_repack_value {
                     other_use.insert(used);
@@ -1122,9 +1119,9 @@ fn repack_payload_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Va
             }
         }
     }
-    read_field
-        .into_keys()
-        .filter(|v| repack_use.contains_key(v) && !other_use.contains(v))
+    read_results
+        .into_iter()
+        .filter(|v| repack_use.contains(v) && !other_use.contains(v))
         .collect()
 }
 
@@ -3368,6 +3365,7 @@ fn drive_subject(
 
     if do_rtype {
         select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)?;
+        reconcile_projection_aliases(legacy, &mut value_to_var);
     }
     Ok((
         graph,
@@ -4035,6 +4033,135 @@ fn run_phase_b_rtype_isolated(
     // lands, take()+finish() rtyper.annmixlevel here.
 }
 
+/// Reconnect a legacy [`crate::model::OpKind::Hint`] result to the typed
+/// representative of its operand when the real path removed the result
+/// identity.
+///
+/// The flowspace adapter emits `same_as(value)` for a Hint
+/// (`flowspace_adapter.rs`), and RPython's rtyper treats `same_as` as an
+/// internal rename.  Its JIT codewriter then returns `None` from
+/// `rewrite_op_hint` specifically to force `op.result` equal to `op.args[0]`
+/// (`rpython/jit/codewriter/jtransform.py:608-614`).  The typed graph can
+/// therefore contain only the operand representative while the legacy graph
+/// still names the result.  Restoring that alias in the existing adapter map
+/// preserves the one upstream value; it does not invent a type or suppress a
+/// genuine kind conflict.  An already-typed result mapping wins; an adapter
+/// placeholder whose `concretetype` is still empty is the erased identity and
+/// is replaced.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn reconcile_elided_hint_results(legacy: &LegacyGraph, value_to_var: &mut LegacyToTyped) {
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            let crate::model::OpKind::Hint { value, .. } = &op.kind else {
+                continue;
+            };
+            let Some(result) = &op.result else {
+                continue;
+            };
+            if value_to_var
+                .get(result)
+                .is_some_and(|typed| typed.concretetype().is_some())
+            {
+                continue;
+            }
+            let Some(operand_twin) = value_to_var.get(value).cloned() else {
+                continue;
+            };
+            value_to_var.insert(result.clone(), operand_twin);
+        }
+    }
+}
+
+/// Reconnect a block inputarg to the typed representative shared by all of
+/// its incoming phi arguments when flowspace simplification removed the
+/// inputarg identity.
+///
+/// RPython `remove_identical_vars_SSA` unions an input with its incoming
+/// value when every `phi_arg` has the same union-find representative
+/// (`rpython/translator/simplify.py:548-601`).  A one-predecessor phi is the
+/// common case.  `join_blocks` performs the same rename while merging a
+/// linear edge (`simplify.py:271-315`).  The adapter map predates those
+/// mutations, so its original inputarg twin may remain untyped even though
+/// every surviving operation was renamed to the predecessor's typed value.
+///
+/// Reproduce only that upstream identity relation in the projection map:
+/// every incoming argument must be a Variable, already have a positively
+/// typed representative, and resolve to the exact same representative.
+/// Conflicting phi inputs and already-typed inputargs are left untouched.
+/// Iterate to a fixpoint because upstream's union-find collapses chains of
+/// single-predecessor blocks transitively.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn reconcile_elided_phi_inputargs(legacy: &LegacyGraph, value_to_var: &mut LegacyToTyped) {
+    loop {
+        let mut aliases = Vec::new();
+        for target in &legacy.blocks {
+            if target.id == legacy.startblock
+                || target.id == legacy.returnblock
+                || target.id == legacy.exceptblock
+            {
+                continue;
+            }
+            for (column, input) in target.inputargs.iter().enumerate() {
+                if value_to_var
+                    .get(input)
+                    .is_some_and(|typed| typed.concretetype().is_some())
+                {
+                    continue;
+                }
+                let mut saw_incoming = false;
+                let mut shared: Option<Variable> = None;
+                let mut valid = true;
+                for source in &legacy.blocks {
+                    for link in source.exits.iter().filter(|link| link.target == target.id) {
+                        saw_incoming = true;
+                        let Some(crate::model::LinkArg::Value(source_var)) = link.args.get(column)
+                        else {
+                            valid = false;
+                            break;
+                        };
+                        let Some(source_typed) = value_to_var
+                            .get(source_var)
+                            .filter(|typed| typed.concretetype().is_some())
+                        else {
+                            valid = false;
+                            break;
+                        };
+                        if shared
+                            .as_ref()
+                            .is_some_and(|representative| representative != source_typed)
+                        {
+                            valid = false;
+                            break;
+                        }
+                        shared.get_or_insert_with(|| source_typed.clone());
+                    }
+                    if !valid {
+                        break;
+                    }
+                }
+                if valid
+                    && saw_incoming
+                    && let Some(shared) = shared
+                {
+                    aliases.push((input.clone(), shared));
+                }
+            }
+        }
+        if aliases.is_empty() {
+            break;
+        }
+        for (input, shared) in aliases {
+            value_to_var.insert(input, shared);
+        }
+    }
+}
+
 /// Backfill the low-level type of a call-result Variable the real path
 /// left untyped, from the front-end `OpKind::Call { result_ty }` the
 /// call site declared.
@@ -4053,12 +4180,19 @@ fn run_phase_b_rtype_isolated(
 ///
 /// Mirror that single rule into the real path so the two converge: for a
 /// call result whose declared `result_ty` projects to `GcRef`, stamp the
-/// canonical `GCREF` pointer onto the twin.  Scoped to `Ref` only — an
-/// `Int`/`Float`/`Void` *declared* result (`result_ty`) is a genuine kind
-/// question, not the erased-pointer gap, and `GcRef` is the sole kind
-/// whose value is unconditionally colorable (the `Void` slot has no
-/// regalloc class — see the `collect_divergences` `object_key_for_checked`
-/// note).
+/// canonical `GCREF` pointer onto the twin.
+///
+/// One equally erased scalar shape is admitted, but only at the producer
+/// which proves it: `front::option_closure_select` replaces
+/// `Option::unwrap_or_else` with the direct discriminant diamond RPython's
+/// closure-free source would have built and synthesizes a closure
+/// `call_once` in the `None` arm.  Charon retains the concrete `FnOnce::Output`
+/// as that op's `result_ty` but does not monomorphize it into the registered
+/// closure method, so the real rtyper can default the live result to `Void`.
+/// For that synthesized closure call alone, carry a declared `Signed` or
+/// `Float` result onto the twin.  An ordinary scalar call is deliberately not
+/// covered: its `Signed`/`Float` versus `Void` pairing remains a genuine kind
+/// divergence and falls back to legacy.
 ///
 /// Overrides both the untyped (`None`) twin and a twin the rtyper
 /// collapsed to `Void`: a call the front-end declared pointer-returning
@@ -4069,8 +4203,8 @@ fn run_phase_b_rtype_isolated(
 /// projection to unit.  It would otherwise be colored by
 /// `emit_call_result_arg` (the op's declared non-void `result_kind`
 /// forces the `>X` result argcode, `assembler.rs:2226`) and panic in
-/// `lookup_coloring`.  A twin the rtyper *positively* typed `Signed` /
-/// `Float` is left untouched — that is a real kind conflict → Skip.
+/// `lookup_coloring`.  A twin the rtyper positively typed to another non-void
+/// kind is left untouched — that is a real kind conflict → Skip.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -4079,12 +4213,34 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
     use crate::translator::rtyper::lltypesystem::lltype::GCREF;
     for block in &legacy.blocks {
         for op in &block.operations {
-            let crate::model::OpKind::Call { result_ty, .. } = &op.kind else {
+            let crate::model::OpKind::Call {
+                target, result_ty, ..
+            } = &op.kind
+            else {
                 continue;
             };
-            if valuetype_to_concrete(result_ty) != ConcreteType::GcRef {
+            let declared_kind = valuetype_to_concrete(result_ty);
+            let closure_call_once = matches!(
+                target,
+                crate::model::CallTarget::Method {
+                    name,
+                    receiver_root: Some(root),
+                    ..
+                } if name == "call_once"
+                    && root.rsplit("::").next().is_some_and(
+                        majit_charon_reader::ullbc::is_closure_leaf
+                    )
+            );
+            let declared_lltype = match declared_kind {
+                ConcreteType::GcRef => Some(GCREF.clone()),
+                ConcreteType::Signed | ConcreteType::Float if closure_call_once => {
+                    crate::model::concrete_to_canonical_lltype(declared_kind)
+                }
+                _ => None,
+            };
+            let Some(declared_lltype) = declared_lltype else {
                 continue;
-            }
+            };
             let Some(legacy_result) = &op.result else {
                 continue;
             };
@@ -4095,10 +4251,22 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
                 .concretetype()
                 .map(|lltype| lowleveltype_to_concrete(&lltype).unwrap_or(ConcreteType::Unknown));
             if matches!(twin_kind, None | Some(ConcreteType::Void)) {
-                typed.set_concretetype(Some(GCREF.clone()));
+                typed.set_concretetype(Some(declared_lltype));
             }
         }
     }
+}
+
+/// Apply projection repairs in dependency order.
+///
+/// Declared call results and `same_as` hints are phi sources in real portal
+/// graphs, so their representatives must be recovered before the transitive
+/// phi-union pass.  Keeping the order here prevents the direct and cached
+/// dual-gate paths from drifting apart.
+fn reconcile_projection_aliases(legacy: &LegacyGraph, value_to_var: &mut LegacyToTyped) {
+    backfill_untyped_call_results(legacy, value_to_var);
+    reconcile_elided_hint_results(legacy, value_to_var);
+    reconcile_elided_phi_inputargs(legacy, value_to_var);
 }
 
 /// Two-phase publish: derive the [`DualGateOutcome`] for `legacy` from the
@@ -4139,6 +4307,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
     };
     select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
         .map_err(|e| e.to_string())?;
+    reconcile_projection_aliases(legacy, &mut value_to_var);
 
     // Validate the cached lltypes project to concrete kinds (the Step-4 check
     // deferred from `drive_subject`, which did not rtype in Phase A).
@@ -4159,13 +4328,6 @@ pub(crate) fn dual_gate_outcome_from_cache(
             ));
         }
     }
-
-    // Carry the front-end call `result_ty` into the real path: stamp the
-    // canonical `GCREF` onto call results the rtyper left untyped because
-    // Charon erased their generic `<E>::Value` associated return type. This
-    // mirrors the legacy walker's identical `result_ty`-driven typing so the
-    // two paths converge instead of diverging at `real=Unknown`.
-    backfill_untyped_call_results(legacy, &value_to_var);
 
     // Legacy-baseline comparison oracle (the `dual_gate_check_with_registry`
     // pattern): the real path is trusted only when it agrees with the proven
@@ -4238,6 +4400,197 @@ mod tests {
         vids: &[usize],
     ) -> Vec<crate::flowspace::model::Variable> {
         vids.iter().map(|&i| vars[i].clone()).collect()
+    }
+
+    fn hint_alias_fixture() -> (LegacyGraph, Variable, Variable, LegacyToTyped) {
+        let mut graph = LegacyGraph::new("hint_alias_fixture");
+        let value = graph.alloc_value_var();
+        let result = graph.alloc_value_var();
+        let startblock = graph.startblock;
+        graph
+            .block_mut(startblock)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Hint {
+                    value: value.clone(),
+                    kind: crate::hints::HintKind::Promote,
+                },
+            });
+        let typed_value = Variable::new();
+        typed_value.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        ));
+        let value_to_var = HashMap::from([(value, typed_value.clone())]);
+        (graph, result, typed_value, value_to_var)
+    }
+
+    #[test]
+    fn reconcile_elided_hint_results_reuses_the_operand_representative() {
+        let (graph, result, typed_value, mut value_to_var) = hint_alias_fixture();
+        reconcile_elided_hint_results(&graph, &mut value_to_var);
+        assert_eq!(
+            value_to_var.get(&result),
+            Some(&typed_value),
+            "RPython's same_as elimination must preserve one representative for value and result"
+        );
+    }
+
+    #[test]
+    fn reconcile_elided_hint_results_replaces_an_untyped_placeholder() {
+        let (graph, result, typed_value, mut value_to_var) = hint_alias_fixture();
+        value_to_var.insert(result.clone(), Variable::new());
+        reconcile_elided_hint_results(&graph, &mut value_to_var);
+        assert_eq!(
+            value_to_var.get(&result),
+            Some(&typed_value),
+            "an empty same_as result twin is the erased alias, not an authoritative type"
+        );
+    }
+
+    #[test]
+    fn reconcile_elided_hint_results_preserves_an_existing_result_mapping() {
+        let (graph, result, _typed_value, mut value_to_var) = hint_alias_fixture();
+        let typed_result = Variable::new();
+        typed_result.set_concretetype(Some(LowLevelType::Signed));
+        value_to_var.insert(result.clone(), typed_result.clone());
+        reconcile_elided_hint_results(&graph, &mut value_to_var);
+        assert_eq!(
+            value_to_var.get(&result),
+            Some(&typed_result),
+            "an independently typed result is authoritative and must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn reconcile_elided_phi_inputargs_follows_a_transitive_single_predecessor_chain() {
+        let mut graph = LegacyGraph::new("phi_alias_chain");
+        let source = graph.alloc_value_var();
+        graph.block_mut(graph.startblock).inputargs = vec![source.clone()];
+        let (middle_id, middle_args) = graph.create_block_with_arg_vars(1);
+        let middle = middle_args[0].clone();
+        let (tail_id, tail_args) = graph.create_block_with_arg_vars(1);
+        let tail = tail_args[0].clone();
+        graph.block_mut(graph.startblock).exits = vec![crate::model::Link::new_mixed(
+            vec![LinkArg::Value(source.clone())],
+            middle_id,
+            None,
+        )];
+        graph.block_mut(middle_id).exits = vec![crate::model::Link::new_mixed(
+            vec![LinkArg::Value(middle.clone())],
+            tail_id,
+            None,
+        )];
+
+        let typed_source = Variable::new();
+        typed_source.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        ));
+        let mut value_to_var = HashMap::from([
+            (source, typed_source.clone()),
+            (middle.clone(), Variable::new()),
+            (tail.clone(), Variable::new()),
+        ]);
+
+        reconcile_elided_phi_inputargs(&graph, &mut value_to_var);
+        assert_eq!(value_to_var.get(&middle), Some(&typed_source));
+        assert_eq!(value_to_var.get(&tail), Some(&typed_source));
+    }
+
+    #[test]
+    fn reconcile_elided_phi_inputargs_requires_one_shared_representative() {
+        let mut graph = LegacyGraph::new("phi_alias_conflict");
+        let left = graph.alloc_value_var();
+        let right = graph.alloc_value_var();
+        graph.block_mut(graph.startblock).inputargs = vec![left.clone(), right.clone()];
+        let (target_id, target_args) = graph.create_block_with_arg_vars(1);
+        let target = target_args[0].clone();
+        graph.block_mut(graph.startblock).exits = vec![
+            crate::model::Link::new_mixed(vec![LinkArg::Value(left.clone())], target_id, None),
+            crate::model::Link::new_mixed(vec![LinkArg::Value(right.clone())], target_id, None),
+        ];
+        let typed_left = Variable::new();
+        typed_left.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        ));
+        let typed_right = Variable::new();
+        typed_right.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        ));
+        let untyped_target = Variable::new();
+        let mut value_to_var = HashMap::from([
+            (left, typed_left),
+            (right, typed_right),
+            (target.clone(), untyped_target.clone()),
+        ]);
+
+        reconcile_elided_phi_inputargs(&graph, &mut value_to_var);
+        assert_eq!(
+            value_to_var.get(&target),
+            Some(&untyped_target),
+            "same kind is insufficient: upstream unions exact phi representatives"
+        );
+    }
+
+    fn backfill_call_result_fixture(
+        target: crate::model::CallTarget,
+        result_ty: ValueType,
+    ) -> (LegacyGraph, Variable, LegacyToTyped) {
+        let mut graph = LegacyGraph::new("backfill_call_result_fixture");
+        let result = graph.alloc_value_var();
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target,
+                    args: Vec::new(),
+                    result_ty,
+                },
+            });
+        let typed = Variable::new();
+        typed.set_concretetype(Some(LowLevelType::Void));
+        let value_to_var = HashMap::from([(result.clone(), typed)]);
+        (graph, result, value_to_var)
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_carries_synthesized_closure_scalar_output() {
+        for (result_ty, expected) in [
+            (ValueType::Int, ConcreteType::Signed),
+            (ValueType::Float, ConcreteType::Float),
+        ] {
+            let (graph, result, value_to_var) = backfill_call_result_fixture(
+                crate::model::CallTarget::method(
+                    "call_once",
+                    Some("module::function::closure#2".to_string()),
+                ),
+                result_ty,
+            );
+            backfill_untyped_call_results(&graph, &value_to_var);
+            assert_eq!(
+                kind_of_in(&value_to_var, &result),
+                expected,
+                "the closure's declared FnOnce::Output must survive Charon erasure"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_leaves_ordinary_scalar_conflict_visible() {
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["ordinary_scalar_call".to_string()],
+            },
+            ValueType::Int,
+        );
+        backfill_untyped_call_results(&graph, &value_to_var);
+        assert_eq!(
+            kind_of_in(&value_to_var, &result),
+            ConcreteType::Void,
+            "an ordinary Signed/Void conflict must still reach the dual-gate divergence"
+        );
     }
 
     #[test]
@@ -4929,7 +5282,7 @@ mod tests {
     }
 
     /// Build a single block that reads `base.field` into `pay` and, when
-    /// `repack` is set, writes `pay` back into `dst.field` (the extract→repack
+    /// `repack` is set, writes `pay` into `dst.jump_args` (the extract→repack
     /// of an identity `match` re-wrap).  With `repack=false` the read result
     /// is instead fed to a `Call` (a genuine consumer), so it is NOT a repack
     /// payload.
@@ -4963,7 +5316,7 @@ mod tests {
                 kind: crate::model::OpKind::FieldWrite {
                     base: dst.clone(),
                     field: crate::model::FieldDescriptor {
-                        name: "loop_header_pc".to_string(),
+                        name: "jump_args".to_string(),
                         owner_root: Some(
                             "pyre_interpreter::pyopcode::StepResult<*mut PyObject>::CloseLoop"
                                 .to_string(),
@@ -5024,14 +5377,14 @@ mod tests {
     }
 
     #[test]
-    fn repack_payload_read_vars_classifies_only_same_field_writeback() {
-        // A payload read whose sole consumer is a same-field `FieldWrite` is
-        // the extract→repack artifact and is classified; the same read fed to
-        // any other op (here a `Call`) is a genuine use and is NOT classified.
+    fn repack_payload_read_vars_classifies_cross_variant_writeback() {
+        // A payload read whose sole consumer is a `FieldWrite` remains the raw
+        // extract→repack value even when Rust's destination variant renames
+        // the field; the same read fed to a Call is a genuine use.
         let (repack_graph, pay_r, _) = build_payload_graph(true);
         assert!(
             repack_payload_read_vars(&repack_graph).contains(&pay_r),
-            "a payload read consumed only by a same-field FieldWrite is classified"
+            "a payload read consumed only by a cross-variant FieldWrite is classified"
         );
         let (consumed_graph, pay_c, _) = build_payload_graph(false);
         assert!(
