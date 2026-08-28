@@ -959,6 +959,20 @@ impl OptHeap {
     /// `get_current_constant_fieldvalue`. It is answered as a verdict rather
     /// than an assert, and skipped for an op that carries no captured value —
     /// the namespace twin, which records a slot index there instead.
+    ///
+    /// ⚠️Answering it as a verdict is LOAD-BEARING here and must not be
+    /// demoted to the `debug_assert!` upstream has (gh#964 proposes exactly
+    /// that, on the reading that the identity test above already decides
+    /// every real invalidation). It does not:
+    /// `mapdict::delattr_would_force_quasi_immut` states in its own doc that
+    /// the `PlainAttribute.delete` -> `_copy_attr` -> `add_attr` ->
+    /// `pick_attr` re-add chain is deliberately NOT modelled, and that what
+    /// makes a missed force cost only a wasted trace rather than a wrong
+    /// answer is this revalidation discarding a loop whose recorded value
+    /// moved. A missed force leaves the instance linked, so `is_current` is
+    /// true and only the value has changed — precisely the case the identity
+    /// test cannot see. Modelling that chain, or installing the watcher along
+    /// it, is what has to come first.
     fn quasiimmut_field_still_valid(
         op: &Op,
         obj: OpRef,
