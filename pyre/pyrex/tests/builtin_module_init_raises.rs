@@ -16,6 +16,12 @@
 //! program that blocks any one and then imports `_collections` decides whether
 //! the initializer can fail.
 //!
+//! Where such a source is answered is the same question once removed. A body
+//! that binds the module (`import operator as _operator`) takes whatever the
+//! program left under the name and reports it much later and somewhere else,
+//! so these sources name what they need (`from operator import index`) and the
+//! import is where a blocked name comes back.
+//!
 //! Only an end-to-end run sees this: the failure is a process abort, which no
 //! in-process test can observe, and the path runs a whole app-level module body
 //! from inside a builtin module's initializer.
@@ -52,11 +58,28 @@ else:
     print('imported')
 ";
 
-#[test]
-fn a_blocked_import_in_a_builtins_app_source_raises_instead_of_aborting() {
+/// Blocks the name `_blake2_app.py` imports, then asks for the module that
+/// installs it. A source that binds whatever the program left under the name
+/// instead reports it much later and somewhere else -- `_operator.index` on an
+/// `int` raised an `AttributeError` from inside `blake2b` -- so the `except`
+/// here is what says the import is where it is answered.
+const BINDS_JUNK_PROGRAM: &str = "\
+import sys
+sys.modules['operator'] = 42
+try:
+    import _blake2
+except ImportError:
+    print('raised')
+else:
+    print('imported')
+";
+
+/// Run `program` as a file and return its trimmed stdout, failing the test on
+/// a panic or a non-zero exit with the tail of stderr attached.
+fn stdout_of(name: &str, program: &str) -> String {
     let mut path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-    path.push("builtin_module_init_raises.py");
-    std::fs::write(&path, PROGRAM).expect("write the program under test");
+    path.push(name);
+    std::fs::write(&path, program).expect("write the program under test");
 
     let out = Command::new(PYRE)
         .arg(&path)
@@ -72,7 +95,23 @@ fn a_blocked_import_in_a_builtins_app_source_raises_instead_of_aborting() {
 
     assert!(!stderr.contains("panicked at"), "{report}");
     assert!(out.status.success(), "{report}");
+    stdout.trim().to_string()
+}
+
+#[test]
+fn a_blocked_import_in_a_builtins_app_source_raises_instead_of_aborting() {
     // The blocked name is what the source's own `from __pypy__ import ...`
     // hits, so the import that asked for `_collections` is the one that fails.
-    assert_eq!(stdout.trim(), "raised", "{report}");
+    assert_eq!(
+        stdout_of("builtin_module_init_raises.py", PROGRAM),
+        "raised"
+    );
+}
+
+#[test]
+fn a_builtins_app_source_names_what_it_imports_instead_of_binding_it() {
+    assert_eq!(
+        stdout_of("builtin_module_init_binds_junk.py", BINDS_JUNK_PROGRAM),
+        "raised"
+    );
 }
