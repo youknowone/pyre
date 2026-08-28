@@ -1128,6 +1128,93 @@ fn repack_payload_read_vars(graph: &LegacyGraph) -> std::collections::HashSet<Va
         .collect()
 }
 
+/// Variant-carrier input Variables whose only observable work is the
+/// extract→repack payload reads classified by
+/// [`repack_payload_read_vars`].  The Result/StepResult exception transform
+/// elides the entire identity arm, including this block-local carrier, so the
+/// real flowspace graph has neither a typed representative for the carrier nor
+/// for its payload reads.  This is the inputarg counterpart of the payload
+/// result identity reconciliation above.
+///
+/// Keep the classification structural and narrow: every op-use of the carrier
+/// must be as the base of an already-classified payload read, it must not feed
+/// an exitswitch, and it must not be forwarded by a link.  A carrier used by
+/// any real computation therefore remains a divergence.  This mirrors the
+/// identity removal performed by the upstream-style flowspace simplification;
+/// it does not assign a type or invent a parallel side table.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn repack_payload_carrier_vars(graph: &LegacyGraph) -> std::collections::HashSet<Variable> {
+    use crate::model::{ExitSwitch, LinkArg, OpKind};
+
+    let payloads = repack_payload_read_vars(graph);
+    let block_inputargs: std::collections::HashSet<_> = graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.id != graph.startblock
+                && block.id != graph.returnblock
+                && block.id != graph.exceptblock
+        })
+        .flat_map(|block| block.inputargs.iter().cloned())
+        .collect();
+    let mut carriers = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let (Some(result), OpKind::FieldRead { base, field, .. }) = (&op.result, &op.kind)
+                && field.name != "__discriminant"
+                && payloads.contains(result)
+                && block_inputargs.contains(base)
+            {
+                carriers.insert(base.clone());
+            }
+        }
+    }
+    if carriers.is_empty() {
+        return carriers;
+    }
+
+    let mut disqualified = std::collections::HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            for used in crate::front::result_exc::op_operand_vars(&op.kind) {
+                if !carriers.contains(&used) {
+                    continue;
+                }
+                let is_elided_payload_base = matches!(
+                    (&op.result, &op.kind),
+                    (Some(result), OpKind::FieldRead { base, field, .. })
+                        if base == &used
+                            && field.name != "__discriminant"
+                            && payloads.contains(result)
+                );
+                if !is_elided_payload_base {
+                    disqualified.insert(used);
+                }
+            }
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) if carriers.contains(var) => {
+                disqualified.insert(var.clone());
+            }
+            Some(ExitSwitch::Fused { args, .. }) => {
+                disqualified.extend(args.iter().filter(|var| carriers.contains(*var)).cloned());
+            }
+            _ => {}
+        }
+        for link in &block.exits {
+            disqualified.extend(link.args.iter().filter_map(|arg| match arg {
+                LinkArg::Value(var) if carriers.contains(var) => Some(var.clone()),
+                _ => None,
+            }));
+        }
+    }
+    carriers.retain(|var| !disqualified.contains(var));
+    carriers
+}
+
 /// Whether an op's result may be dropped when unread, mirroring RPython's
 /// `transform_dead_op_vars` `canremove(op, block)` gate (`simplify.py`):
 /// only side-effect-free ops (`op.opname in CanRemove`) have their result
@@ -1190,6 +1277,7 @@ fn collect_divergences(
     let dead_op_results = dead_op_result_vars(legacy_graph);
     let switch_discriminant_reads = switch_discriminant_read_vars(legacy_graph);
     let repack_payload_reads = repack_payload_read_vars(legacy_graph);
+    let repack_payload_carriers = repack_payload_carrier_vars(legacy_graph);
     let mut divergences = Vec::new();
     for (pos, var) in legacy_graph.iter_variables().iter().enumerate() {
         // `iterblocks()` parity: the real path annotates only the
@@ -1319,6 +1407,11 @@ fn collect_divergences(
         // [`repack_payload_read_vars`].
         let real_elided_repack_payload =
             real_present.is_none() && repack_payload_reads.contains(var);
+        // The block-local variant carrier feeding only the elided payload
+        // reads disappears with the same identity arm.  It has no typed twin,
+        // but no surviving real-path operation consumes it either.
+        let real_elided_repack_carrier =
+            real_present.is_none() && repack_payload_carriers.contains(var);
         let diverges = if real_refines_gcref_to_void
             || real_refines_gcref_to_signed
             || real_refines_gcref_to_float
@@ -1326,6 +1419,7 @@ fn collect_divergences(
             || real_dropped_dead_op_result
             || real_rebuilt_switch_discriminant
             || real_elided_repack_payload
+            || real_elided_repack_carrier
         {
             false
         } else if legacy_kind != ConcreteType::Unknown {
@@ -4839,12 +4933,14 @@ mod tests {
     /// of an identity `match` re-wrap).  With `repack=false` the read result
     /// is instead fed to a `Call` (a genuine consumer), so it is NOT a repack
     /// payload.
-    fn build_payload_graph(repack: bool) -> (LegacyGraph, Variable) {
+    fn build_payload_graph(repack: bool) -> (LegacyGraph, Variable, Variable) {
         let mut graph = LegacyGraph::new("payload_probe");
-        let vars = mint_vars(&mut graph, 4);
-        let base = vars[0].clone();
-        let pay = vars[1].clone();
-        let dst = vars[2].clone();
+        let vars = mint_vars(&mut graph, 5);
+        let source = vars[0].clone();
+        let base = vars[1].clone();
+        let pay = vars[2].clone();
+        let dst = vars[3].clone();
+        let mid_id = crate::model::BlockId(7);
         let field = crate::model::FieldDescriptor {
             name: "loop_header_pc".to_string(),
             owner_root: Some("StepResult::CloseLoop".to_string()),
@@ -4892,17 +4988,39 @@ mod tests {
                 },
             }
         };
-        let block = Block {
+        let startblock = Block {
             id: graph.startblock,
             inputargs: block_inputargs(&vars, &[0]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![LinkArg::Value(source)],
+                mid_id,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let midblock = Block {
+            id: mid_id,
+            inputargs: block_inputargs(&vars, &[1]),
             operations: vec![read, consumer],
             exitswitch: None,
             exits: vec![link_to_returnblock(vec![], graph.returnblock)],
             framestate: None,
             dead: false,
         };
-        graph.blocks = vec![block];
-        (graph, pay)
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, midblock, returnblock];
+        (graph, pay, base)
     }
 
     #[test]
@@ -4910,15 +5028,55 @@ mod tests {
         // A payload read whose sole consumer is a same-field `FieldWrite` is
         // the extract→repack artifact and is classified; the same read fed to
         // any other op (here a `Call`) is a genuine use and is NOT classified.
-        let (repack_graph, pay_r) = build_payload_graph(true);
+        let (repack_graph, pay_r, _) = build_payload_graph(true);
         assert!(
             repack_payload_read_vars(&repack_graph).contains(&pay_r),
             "a payload read consumed only by a same-field FieldWrite is classified"
         );
-        let (consumed_graph, pay_c) = build_payload_graph(false);
+        let (consumed_graph, pay_c, _) = build_payload_graph(false);
         assert!(
             !repack_payload_read_vars(&consumed_graph).contains(&pay_c),
             "a payload read fed to a real consumer is NOT classified"
+        );
+    }
+
+    #[test]
+    fn repack_payload_carrier_vars_require_only_elided_payload_reads() {
+        let (repack_graph, _, carrier) = build_payload_graph(true);
+        assert!(
+            repack_payload_carrier_vars(&repack_graph).contains(&carrier),
+            "the block-local carrier used only by identity-repack reads is classified"
+        );
+
+        let (mut consumed_graph, _, consumed_carrier) = build_payload_graph(true);
+        let mid = consumed_graph
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == crate::model::BlockId(7))
+            .expect("payload middle block");
+        mid.operations.push(crate::model::SpaceOperation {
+            result: None,
+            kind: crate::model::OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["consume_carrier".into()],
+                },
+                args: vec![consumed_carrier.clone()],
+                result_ty: ValueType::Void,
+            },
+        });
+        assert!(
+            !repack_payload_carrier_vars(&consumed_graph).contains(&consumed_carrier),
+            "any non-repack use must keep the carrier as a real divergence"
+        );
+    }
+
+    #[test]
+    fn collect_divergences_accepts_elided_repack_carrier() {
+        let (graph, _, carrier) = build_payload_graph(true);
+        crate::model::FunctionGraph::set_concretetype_of_inline(&carrier, ConcreteType::GcRef);
+        assert!(
+            collect_divergences(&HashMap::new(), &graph).is_empty(),
+            "an identity arm carrier removed with all its payload reads has no surviving real-path use"
         );
     }
 
