@@ -450,12 +450,13 @@ pub fn capture_active_sym_root_area() -> *const () {
 /// and the operation recording it sit inside one opcode's dispatch, while a
 /// re-entrant `trace_bytecode` can only open between opcodes.
 ///
-/// One copy of the bank stays out of reach: `MIFrame.pre_opcode_registers_r`,
-/// the opcode-start rollback clone, hangs off the per-instruction wrapper
-/// rather than the anchor.  A rollback restores from it, so a `ConstPtr`
-/// carried in a clone taken before a collection is read forward stale — the
-/// same defect this area closes, one level down, and it needs an anchor of its
-/// own to close.
+/// `MIFrame.pre_opcode_registers_r`, the opcode-start rollback clone, hangs off
+/// the per-instruction wrapper rather than the anchor, and so would be out of
+/// this area's reach.  Nothing writes it: every constructor leaves it `None`,
+/// the sole assignment clears it, and each read is an `is_some()` fallback, so
+/// no clone exists to be read forward stale.  A writer restored there carries
+/// the same defect this area closes, one level down, and would need an anchor
+/// of its own.
 ///
 /// # Safety
 /// `data` must come from [`capture_active_sym_root_area`], and the owning
