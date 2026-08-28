@@ -421,7 +421,11 @@ impl ObjectConverter {
             if !unsafe { pyre_object::is_str(name) } {
                 continue;
             }
-            let name = unsafe { pyre_object::w_str_get_value(name) }.to_string();
+            // A lone surrogate names no attribute this scan can reach.
+            let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name) }) else {
+                continue;
+            };
+            let name = name.to_string();
             if let Some(value) = self.optional_field(object, &name)? {
                 self.recurse(|this| this.scan_extent(value, extent))?;
             }
@@ -1476,7 +1480,7 @@ impl ObjectConverter {
             ));
         }
         Ok(ast::Identifier::new(
-            unsafe { pyre_object::w_str_get_value(value) }.to_string(),
+            utf8_only(value)?.to_string(),
             Default::default(),
         ))
     }
@@ -1495,7 +1499,7 @@ impl ObjectConverter {
             ));
         }
         Ok(Some(ast::Identifier::new(
-            unsafe { pyre_object::w_str_get_value(value).to_string() },
+            utf8_only(value)?.to_string(),
             Default::default(),
         )))
     }
@@ -1511,9 +1515,7 @@ impl ObjectConverter {
                 "AST type_comment must be of type str",
             ));
         }
-        Ok(Some(
-            unsafe { pyre_object::w_str_get_value(value).to_string() }.into(),
-        ))
+        Ok(Some(utf8_only(value)?.to_string().into()))
     }
 
     fn identifiers(
@@ -1531,7 +1533,7 @@ impl ObjectConverter {
                     ));
                 }
                 Ok(ast::Identifier::new(
-                    unsafe { pyre_object::w_str_get_value(value).to_string() },
+                    utf8_only(value)?.to_string(),
                     Default::default(),
                 ))
             })
@@ -1966,7 +1968,7 @@ impl ObjectConverter {
                     ));
                 }
                 Ok(ast::Identifier::new(
-                    unsafe { pyre_object::w_str_get_value(value).to_string() },
+                    utf8_only(value)?.to_string(),
                     Default::default(),
                 ))
             })
@@ -2056,11 +2058,7 @@ impl ObjectConverter {
             return Ok(None);
         };
         if unsafe { crate::baseobjspace::isinstance_str_w(value) } {
-            return Ok(Some(
-                unsafe { pyre_object::w_str_get_value(value) }
-                    .to_string()
-                    .into_boxed_str(),
-            ));
+            return Ok(Some(utf8_only(value)?.to_string().into_boxed_str()));
         }
         if unsafe { crate::baseobjspace::isinstance_bytes_w(value) } {
             return Ok(None);
