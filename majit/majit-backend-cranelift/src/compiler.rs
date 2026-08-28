@@ -112,6 +112,7 @@ fn majit_verify_enabled() -> bool {
 
 use crate::asm_memory::{CraneliftArenaHandle, CraneliftArenaMemoryProvider};
 use crate::guard::{BridgeData, JitFrameDeadFrame, drop_bridge_payload};
+use majit_backend::deadframe::ExitDescr;
 
 // `compile.py:665-674` `done_with_this_frame` singletons
 //
@@ -251,16 +252,11 @@ fn attached_descr_ptrs_with_fallbacks(
 fn match_metainterp_finish_descr(
     jf_descr_raw: i64,
     attachments: &CpuDescrAttachments,
-) -> Option<majit_ir::DescrRef> {
+) -> Option<&DescrRef> {
     let ptr = jf_descr_raw as usize;
-    fn check(slot: &Option<majit_ir::DescrRef>, expected: usize) -> Option<majit_ir::DescrRef> {
-        slot.as_ref().and_then(|arc| {
-            if Arc::as_ptr(arc) as *const () as usize == expected {
-                Some(arc.clone())
-            } else {
-                None
-            }
-        })
+    fn check(slot: &Option<majit_ir::DescrRef>, expected: usize) -> Option<&majit_ir::DescrRef> {
+        slot.as_ref()
+            .filter(|arc| Arc::as_ptr(arc) as *const () as usize == expected)
     }
     // The attached descr and nothing beside it. Each of these has a cranelift
     // singleton twin (`DONE_WITH_THIS_FRAME_DESCR_*`,
@@ -813,11 +809,8 @@ fn lookup_loop_target(descr: &majit_ir::DescrRef) -> Option<LoopTargetEntry> {
 
 fn deadframe_layout(frame: &DeadFrame) -> Option<FailDescrLayout> {
     let jf = frame.as_jitframe()?;
-    let descr_ref: DescrRef = jf.fail_descr.clone();
-    let fd = jf
-        .fail_descr
-        .as_fail_descr()
-        .expect("JitFrameDeadFrame.fail_descr always implements FailDescr");
+    let descr_ref: DescrRef = jf.fail_descr.to_arc();
+    let fd = jf.fail_descr.as_fail_descr();
     // Use the descr's structural `fail_index` / `trace_id` to preserve
     // pre-7-Tβ14a behavior — deadframe lookups did not have access to
     // a runtime per-trace position so the descr-internal values flow
@@ -3083,7 +3076,7 @@ fn call_assembler_finish_or_blackhole_deadframe(frame: DeadFrame) -> Option<i64>
     // safely drop after BH completes.
     let (is_finish, fail_descr_arc, fail_arg_types) = {
         let jf = frame.as_jitframe()?;
-        let fail_descr = jf.fail_descr.clone();
+        let fail_descr = jf.fail_descr.to_arc();
         let fd = as_fd(&fail_descr);
         let is_finish = fd.is_finish();
         let fail_arg_types = fd.fail_arg_types().to_vec();
@@ -3186,12 +3179,16 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     // deadframe borrows it: the call site pushed `jf_gcmap` before the call and
     // clears it with `pop_gcmap` on return, and releasing it here would leave
     // the frame's spilled `Ref` slots untraced for the rest of the call.
-    DeadFrame::JitFrame(JitFrameDeadFrame::borrowing(jf_gcref, fail_descr, None))
+    DeadFrame::JitFrame(JitFrameDeadFrame::borrowing(
+        jf_gcref,
+        ExitDescr::owned(fail_descr),
+        None,
+    ))
 }
 
 fn deadframe_from_jitframe(
     jf_gcref: GcRef,
-    fail_descr: DescrRef,
+    fail_descr: ExitDescr,
     heap_owner: Option<FrameHeapOwner>,
 ) -> DeadFrame {
     DeadFrame::JitFrame(JitFrameDeadFrame::new(
@@ -3216,7 +3213,7 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
     let jf = frame
         .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    Ok(as_fd(&jf.fail_descr))
+    Ok(jf.fail_descr.as_fail_descr())
 }
 
 /// Owned-Arc counterpart of [`get_latest_descr_from_deadframe`].
@@ -3232,7 +3229,7 @@ pub fn get_latest_descr_arc_from_deadframe(
     let jf = frame
         .as_jitframe()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    Ok(jf.fail_descr.clone())
+    Ok(jf.fail_descr.to_arc())
 }
 
 pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
@@ -3326,10 +3323,9 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             return wrap_call_assembler_deadframe_with_caller_prefix(frame);
         }
 
-        let fail_descr_arc =
-            direct_descr.unwrap_or_else(|| cur_fail_descrs[fail_index as usize].clone());
-        let fail_descr = &fail_descr_arc;
-        let fail_descr_fd = as_fd(fail_descr);
+        let fail_descr = direct_descr
+            .unwrap_or_else(|| ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone()));
+        let fail_descr_fd = fail_descr.as_fail_descr();
         maybe_increment_fail_count(fail_descr_fd);
         if let Some(bridge) = fail_descr_bridge_ref(fail_descr_fd) {
             // Extracted here rather than beside `fail_index`: the exits that
@@ -3391,7 +3387,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             let mut mat_outputs = outputs.clone();
             let fail_arg_types = fail_descr_fd.fail_arg_types();
             rebuild_state_after_failure_dispatch(
-                fail_descr,
+                &fail_descr.to_arc(),
                 &mut mat_outputs,
                 fail_arg_types,
                 bridge.num_inputs,
@@ -8030,7 +8026,7 @@ struct JitExecResult {
     jf_gcref: GcRef,
     heap_owner: Option<FrameHeapOwner>,
     fail_index: u32,
-    direct_descr: Option<DescrRef>,
+    direct_descr: Option<ExitDescr>,
 }
 
 impl JitExecResult {
@@ -9304,7 +9300,7 @@ impl CraneliftBackend {
             let fail_descr = if let Some(descr) = direct_descr {
                 descr
             } else if (fail_index as usize) < cur_fail_descrs.len() {
-                cur_fail_descrs[fail_index as usize].clone()
+                ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone())
             } else {
                 // Search bridge fail_descrs for nested guard failures.
                 let found = compiled.fail_descrs.iter().find_map(|d| {
@@ -9313,12 +9309,12 @@ impl CraneliftBackend {
                         find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
                     })
                 });
-                found.unwrap_or_else(|| {
+                ExitDescr::owned(found.unwrap_or_else(|| {
                     cur_fail_descrs
                         .last()
                         .cloned()
                         .unwrap_or_else(|| compiled.fail_descrs[0].clone())
-                })
+                }))
             };
             // `compile.py` `_DoneWithThisFrameDescr.final_descr = True` is a
             // class attribute, i.e. a field load after translation. The FINISH
@@ -9333,7 +9329,7 @@ impl CraneliftBackend {
             // between the two returns below has to be re-checked here.
             debug_assert!(
                 fail_index != u32::MAX || {
-                    let fd = as_fd(&fail_descr);
+                    let fd = fail_descr.as_fail_descr();
                     !fd.is_external_jump() && !fd.is_resume_guard() && !fd.is_resume_guard_copied()
                 },
                 "a u32::MAX fail_index must be a final or propagate descr, never a guard"
@@ -9341,7 +9337,7 @@ impl CraneliftBackend {
             if fail_index == u32::MAX {
                 return deadframe_from_jitframe(exec.jf_gcref, fail_descr, exec.heap_owner);
             }
-            let fail_descr_fd = as_fd(&fail_descr);
+            let fail_descr_fd = fail_descr.as_fail_descr();
 
             // llgraph/runner.py Jump exception caught by execute():
             // cross-loop JUMP — switch to the target loop trace identified
@@ -9435,10 +9431,9 @@ impl CraneliftBackend {
             return wrap_call_assembler_deadframe_with_caller_prefix(frame);
         }
 
-        let fail_descr_arc =
-            direct_descr.unwrap_or_else(|| bridge.fail_descrs[fail_index as usize].clone());
-        let fail_descr = &fail_descr_arc;
-        let fail_descr_fd = as_fd(fail_descr);
+        let fail_descr = direct_descr
+            .unwrap_or_else(|| ExitDescr::owned(bridge.fail_descrs[fail_index as usize].clone()));
+        let fail_descr_fd = fail_descr.as_fail_descr();
 
         // RPython parity: FINISH exits in bridges return directly,
         // just like in execute_with_inputs. Without this, the FINISH
@@ -17502,10 +17497,10 @@ impl majit_backend::Backend for CraneliftBackend {
             }
 
             // llmodel.py get_latest_descr.
-            let fail_descr_arc = if let Some(descr) = direct_descr {
+            let fail_descr = if let Some(descr) = direct_descr {
                 descr
             } else if (fail_index as usize) < cur_fail_descrs.len() {
-                cur_fail_descrs[fail_index as usize].clone()
+                ExitDescr::owned(cur_fail_descrs[fail_index as usize].clone())
             } else {
                 let found = compiled.fail_descrs.iter().find_map(|d| {
                     let guard = fail_descr_bridge_ref(as_fd(d));
@@ -17513,16 +17508,15 @@ impl majit_backend::Backend for CraneliftBackend {
                         find_fail_descr_in_fail_descrs(&b.fail_descrs, b.trace_id, fail_index)
                     })
                 });
-                found.unwrap_or_else(|| {
+                ExitDescr::owned(found.unwrap_or_else(|| {
                     cur_fail_descrs
                         .last()
                         .cloned()
                         .unwrap_or_else(|| compiled.fail_descrs[0].clone())
-                })
+                }))
             };
-            let fail_descr = &fail_descr_arc;
 
-            let fail_descr_fd = as_fd(fail_descr);
+            let fail_descr_fd = fail_descr.as_fail_descr();
 
             // llgraph/runner.py:1130-1140 cross-loop JUMP: switch to the
             // target trace identified by the TargetToken stored on the
@@ -17576,7 +17570,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     }
                 }
 
-                let fail_descr_ref: DescrRef = fail_descr_arc.clone();
+                let fail_descr_ref: DescrRef = fail_descr.to_arc();
                 let trace_id = fail_descr_fd.trace_id();
                 return majit_backend::RawExecResult {
                     outputs,
@@ -17590,7 +17584,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                     status: fail_descr_fd.get_status(),
                     guard_value_operand: None,
-                    descr_arc: fail_descr_arc.clone(),
+                    descr_arc: fail_descr.to_arc(),
                 };
             }
 
@@ -17637,7 +17631,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 }
             }
 
-            let fail_descr_ref: DescrRef = fail_descr_arc.clone();
+            let fail_descr_ref: DescrRef = fail_descr.to_arc();
             let trace_id = fail_descr_fd.trace_id();
             return majit_backend::RawExecResult {
                 outputs,
@@ -17651,7 +17645,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                 status: fail_descr_fd.get_status(),
                 guard_value_operand: None,
-                descr_arc: fail_descr_arc.clone(),
+                descr_arc: fail_descr.to_arc(),
             };
         }
     }

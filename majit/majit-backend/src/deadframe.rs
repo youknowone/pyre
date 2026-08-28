@@ -381,6 +381,101 @@ impl JitFrameRoot {
     }
 }
 
+/// The descr a compiled exit names: `jf_descr` as an object.
+///
+/// Owned for a guard exit, whose descr lives in the trace's `FailDescrCell`
+/// and is reached through `recover_fail_descr_cell`. Borrowed for a finish
+/// exit: that descr is one of the six the metainterp attached to the cpu at
+/// `finish_setup` (`compile.py:665 setattr(cpu, name, descr)`), which the
+/// cpu's `CpuDescrCell` keeps and never releases, and which the metainterp
+/// that decodes this deadframe holds an `Arc` of itself. Cloning that `Arc`
+/// into every deadframe and dropping it again was measured at 3.2 ns per
+/// entry on cel's entry probe, on the arm every finished entry takes.
+pub struct ExitDescr {
+    ptr: *const dyn majit_ir::Descr,
+    owned: bool,
+}
+
+// The pointee is an `Arc<dyn Descr>` payload and `Descr: Send + Sync`; the
+// raw pointer only records whether this handle holds a count on it.
+unsafe impl Send for ExitDescr {}
+unsafe impl Sync for ExitDescr {}
+
+impl ExitDescr {
+    /// Hold a strong count on `descr`.
+    pub fn owned(descr: DescrRef) -> Self {
+        ExitDescr {
+            ptr: std::sync::Arc::into_raw(descr),
+            owned: true,
+        }
+    }
+
+    /// Point at `descr` without a count.
+    ///
+    /// # Safety
+    /// `descr` must stay alive for as long as this handle does. The one
+    /// caller borrows a cpu-attached finish descr, whose lifetime is argued
+    /// on the type.
+    pub unsafe fn borrowed(descr: &DescrRef) -> Self {
+        ExitDescr {
+            ptr: std::sync::Arc::as_ptr(descr),
+            owned: false,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> &dyn majit_ir::Descr {
+        // Live by construction: owned handles hold a count, borrowed ones
+        // are covered by `borrowed`'s contract.
+        unsafe { &*self.ptr }
+    }
+
+    #[inline]
+    pub fn as_fail_descr(&self) -> &dyn crate::FailDescr {
+        self.get()
+            .as_fail_descr()
+            .expect("a compiled exit's descr always implements FailDescr")
+    }
+
+    /// A strong `Arc` to the descr, whichever way this handle holds it.
+    pub fn to_arc(&self) -> DescrRef {
+        unsafe {
+            std::sync::Arc::increment_strong_count(self.ptr);
+            std::sync::Arc::from_raw(self.ptr)
+        }
+    }
+}
+
+impl Clone for ExitDescr {
+    fn clone(&self) -> Self {
+        if self.owned {
+            ExitDescr::owned(self.to_arc())
+        } else {
+            ExitDescr {
+                ptr: self.ptr,
+                owned: false,
+            }
+        }
+    }
+}
+
+impl Drop for ExitDescr {
+    fn drop(&mut self) {
+        if self.owned {
+            drop(unsafe { std::sync::Arc::from_raw(self.ptr) });
+        }
+    }
+}
+
+impl std::fmt::Debug for ExitDescr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExitDescr")
+            .field("owned", &self.owned)
+            .field("descr", &self.get())
+            .finish()
+    }
+}
+
 /// The deadframe of a backend whose frames are jitframes.
 pub struct JitFrameDeadFrame {
     /// The JitFrame this deadframe reads through.
@@ -389,7 +484,7 @@ pub struct JitFrameDeadFrame {
     /// (`Arc<dyn Descr>`) so the deadframe carries the same Arc identity
     /// the metainterp stamps onto `op.descr` — matching `frame.jf_descr =
     /// descr` (llmodel.py:270) line-by-line.
-    pub fail_descr: DescrRef,
+    pub fail_descr: ExitDescr,
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
@@ -422,7 +517,7 @@ impl JitFrameDeadFrame {
     /// always handed `None`.
     pub fn new(
         jf_gcref: GcRef,
-        fail_descr: DescrRef,
+        fail_descr: ExitDescr,
         latest_descr: Option<DescrRef>,
         heap_owner: Option<FrameHeapOwner>,
     ) -> Self {
@@ -453,7 +548,7 @@ impl JitFrameDeadFrame {
     /// are still the only reference to their objects.
     pub fn borrowing(
         jf_gcref: GcRef,
-        fail_descr: DescrRef,
+        fail_descr: ExitDescr,
         latest_descr: Option<DescrRef>,
     ) -> Self {
         JitFrameDeadFrame {
