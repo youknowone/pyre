@@ -555,7 +555,7 @@ fn register_error(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return Err(bad_arg("register_error", Some(1), "str", w_errors));
     }
     if !is_callable(w_handler) {
-        return Err(crate::PyError::type_error("argument must be callable"));
+        return Err(crate::PyError::type_error("handler must be callable"));
     }
     let errors = crate::baseobjspace::str_utf8_w(w_errors)?;
     with_codec_state(|state| unsafe {
