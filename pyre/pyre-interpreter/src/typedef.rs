@@ -808,7 +808,18 @@ pub fn init_typeobjects() {
             ),
         ] {
             let w_type = new_typeobject_with_base(name, init, object_type);
-            unsafe { pyre_object::w_type_set_disallow_instantiation(w_type) };
+            unsafe {
+                pyre_object::w_type_set_disallow_instantiation(w_type);
+                // [3.14-spec] `TypeDef.__init__` derives
+                // `acceptable_as_base_class` from `'__new__' in rawdict`, and
+                // typedef.py restates it for `W_LineIterator` outright; none
+                // of the three declares `__new__`, so that rule answers False.
+                // The pinned 3.14 subclasses all three: their `tp_flags` carry
+                // `Py_TPFLAGS_BASETYPE` beside a NULL `tp_new`.  Measured on
+                // 3.14.2 and pinned by
+                // `extra_tests/parity_tests/co_branches_iterator_identity.py`.
+                pyre_object::w_type_set_acceptable_as_base_class(w_type, true);
+            }
             reg.insert(tp, w_type as usize);
         }
 
