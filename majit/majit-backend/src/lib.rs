@@ -1959,41 +1959,47 @@ pub type CpuDescrHandle = Arc<CpuDescrCell>;
 /// cost of the call. A write here publishes a fresh copy and keeps every
 /// earlier one alive, so a reader holds a plain reference and the swap
 /// costs the writer, not the entry.
+///
+/// A published copy is never freed, not even with the cell: a finish exit's
+/// deadframe borrows its descr straight out of the copy (`ExitDescr`), and a
+/// deadframe can outlive the backend and the token through the safe
+/// `Backend::execute_token` API. `'static` is what makes that borrow sound
+/// without a count. What leaks is one small struct of six `Option<Arc>`s per
+/// publication, at most seven per cpu (the initial copy and six setters).
 pub struct CpuDescrCell {
     current: std::sync::atomic::AtomicPtr<CpuDescrAttachments>,
-    /// Every copy ever published, the current one last. Held so a reference
-    /// handed out before an update stays valid; there are at most a handful
-    /// of updates per cpu, so nothing is reclaimed early.
-    published: std::sync::Mutex<Vec<Box<CpuDescrAttachments>>>,
+    /// Serializes writers; the copies themselves are leaked, see the type.
+    publish: std::sync::Mutex<()>,
 }
 
 impl CpuDescrCell {
     pub fn new(attachments: CpuDescrAttachments) -> Self {
-        let first = Box::new(attachments);
-        let ptr = &*first as *const CpuDescrAttachments as *mut CpuDescrAttachments;
+        let first: &'static CpuDescrAttachments = Box::leak(Box::new(attachments));
         CpuDescrCell {
-            current: std::sync::atomic::AtomicPtr::new(ptr),
-            published: std::sync::Mutex::new(vec![first]),
+            current: std::sync::atomic::AtomicPtr::new(
+                first as *const CpuDescrAttachments as *mut CpuDescrAttachments,
+            ),
+            publish: std::sync::Mutex::new(()),
         }
     }
 
     /// The attachments as last published. One acquire load.
     #[inline]
-    pub fn read(&self) -> &CpuDescrAttachments {
-        // The pointee is a `Box` in `published`, which only grows and drops
-        // with `self`, so it outlives this borrow.
+    pub fn read(&self) -> &'static CpuDescrAttachments {
+        // Every pointer ever stored came from `Box::leak`.
         unsafe { &*self.current.load(std::sync::atomic::Ordering::Acquire) }
     }
 
-    /// Publish a copy with `f` applied. Writers serialize on `published`.
+    /// Publish a copy with `f` applied. Writers serialize on `publish`.
     pub fn update(&self, f: impl FnOnce(&mut CpuDescrAttachments)) {
-        let mut published = self.published.lock().unwrap();
+        let _writer = self.publish.lock().unwrap();
         let mut next = Box::new(self.read().clone());
         f(&mut next);
-        let ptr = &*next as *const CpuDescrAttachments as *mut CpuDescrAttachments;
-        published.push(next);
-        self.current
-            .store(ptr, std::sync::atomic::Ordering::Release);
+        let next: &'static CpuDescrAttachments = Box::leak(next);
+        self.current.store(
+            next as *const CpuDescrAttachments as *mut CpuDescrAttachments,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 }
 

@@ -464,11 +464,11 @@ impl JitFrameRoot {
 /// Owned for a guard exit, whose descr lives in the trace's `FailDescrCell`
 /// and is reached through `recover_fail_descr_cell`. Borrowed for a finish
 /// exit: that descr is one of the six the metainterp attached to the cpu at
-/// `finish_setup` (`compile.py:665 setattr(cpu, name, descr)`), which the
-/// cpu's `CpuDescrCell` keeps and never releases, and which the metainterp
-/// that decodes this deadframe holds an `Arc` of itself. Cloning that `Arc`
-/// into every deadframe and dropping it again was measured at 3.2 ns per
-/// entry on cel's entry probe, on the arm every finished entry takes.
+/// `finish_setup` (`compile.py:665 setattr(cpu, name, descr)`), read out of
+/// a `CpuDescrCell` copy, and those copies are `'static` — the cell leaks
+/// every copy it publishes so that this borrow needs no count. Cloning the
+/// `Arc` into every deadframe and dropping it again was measured at 3.2 ns
+/// per entry on cel's entry probe, on the arm every finished entry takes.
 pub struct ExitDescr {
     ptr: *const dyn majit_ir::Descr,
     owned: bool,
@@ -488,13 +488,8 @@ impl ExitDescr {
         }
     }
 
-    /// Point at `descr` without a count.
-    ///
-    /// # Safety
-    /// `descr` must stay alive for as long as this handle does. The one
-    /// caller borrows a cpu-attached finish descr, whose lifetime is argued
-    /// on the type.
-    pub unsafe fn borrowed(descr: &DescrRef) -> Self {
+    /// Point at `descr` without a count. `'static` is the whole argument.
+    pub fn borrowed(descr: &'static DescrRef) -> Self {
         ExitDescr {
             ptr: std::sync::Arc::as_ptr(descr),
             owned: false,
@@ -504,7 +499,7 @@ impl ExitDescr {
     #[inline]
     pub fn get(&self) -> &dyn majit_ir::Descr {
         // Live by construction: owned handles hold a count, borrowed ones
-        // are covered by `borrowed`'s contract.
+        // point into a `'static`.
         unsafe { &*self.ptr }
     }
 

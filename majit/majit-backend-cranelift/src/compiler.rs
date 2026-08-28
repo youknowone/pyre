@@ -251,10 +251,13 @@ fn attached_descr_ptrs_with_fallbacks(
 /// the descr should be resolved against, not consult an ambient slot.
 fn match_metainterp_finish_descr(
     jf_descr_raw: i64,
-    attachments: &CpuDescrAttachments,
+    attachments: &'static CpuDescrAttachments,
 ) -> Option<&DescrRef> {
     let ptr = jf_descr_raw as usize;
-    fn check(slot: &Option<majit_ir::DescrRef>, expected: usize) -> Option<&majit_ir::DescrRef> {
+    fn check(
+        slot: &'static Option<majit_ir::DescrRef>,
+        expected: usize,
+    ) -> Option<&'static majit_ir::DescrRef> {
         slot.as_ref()
             .filter(|arc| Arc::as_ptr(arc) as *const () as usize == expected)
     }
@@ -3297,8 +3300,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     // the read lock is safe: `Backend::set_done_with_this_frame_descr_*`
     // only fires during `MetaInterpStaticData.finish_setup`, long
     // before compiled code runs.
-    let attachments_guard = target.cpu_attachments.read();
-    let attachments: &CpuDescrAttachments = &attachments_guard;
+    let attachments: &'static CpuDescrAttachments = target.cpu_attachments.read();
     loop {
         let exec = run_compiled_code(
             cur_code_ptr,
@@ -3760,14 +3762,19 @@ fn call_assembler_guard_failure_inner(
     // every guard failure.  Setters (`set_done_with_this_frame_descr_*`
     // etc.) only run at `MetaInterpStaticData.finish_setup` so write
     // contention is effectively nil.
-    let attachments_guard;
-    let default_attachments;
-    let attachments: &CpuDescrAttachments = if cpu_handle.is_null() {
-        default_attachments = CpuDescrAttachments::default();
-        &default_attachments
+    /// The attachments a null handle stands for: none.
+    static NO_ATTACHMENTS: CpuDescrAttachments = CpuDescrAttachments {
+        done_with_this_frame_descr_void: None,
+        done_with_this_frame_descr_int: None,
+        done_with_this_frame_descr_ref: None,
+        done_with_this_frame_descr_float: None,
+        exit_frame_with_exception_descr_ref: None,
+        propagate_exception_descr: None,
+    };
+    let attachments: &'static CpuDescrAttachments = if cpu_handle.is_null() {
+        &NO_ATTACHMENTS
     } else {
-        attachments_guard = unsafe { (*cpu_handle).read() };
-        &attachments_guard
+        unsafe { (*cpu_handle).read() }
     };
     // Handle deadframe sentinel (nested CALL_ASSEMBLER propagation).
     if fail_descr_ptr == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
@@ -8073,7 +8080,7 @@ fn run_compiled_code(
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &FrameInputs<'_>,
-    attachments: &CpuDescrAttachments,
+    attachments: &'static CpuDescrAttachments,
     dispatch_key: u32,
 ) -> JitExecResult {
     // No alternate-stack switch here. The compiled prologue's inline
@@ -8099,7 +8106,7 @@ fn run_compiled_code(
 fn resolve_exit_descr(
     jf_descr_raw: i64,
     fail_descrs: &[DescrRef],
-    attachments: &CpuDescrAttachments,
+    attachments: &'static CpuDescrAttachments,
     propagate_descr_ptr: usize,
 ) -> (u32, Option<ExitDescr>) {
     if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
@@ -8126,12 +8133,8 @@ fn resolve_exit_descr(
         // Both are `Arc<DoneWithThisFrameDescrInt>` (no wrapper) so the
         // trait-method dispatch is identical; only
         // the Arc identity differs, and PyPy parity demands they match.
-        // Borrowed: see `ExitDescr`. `attachments` is the cpu's own set, which
-        // outlives every deadframe decoded against it.
-        (
-            u32::MAX,
-            Some(unsafe { ExitDescr::borrowed(metainterp_finish) }),
-        )
+        // Borrowed, see `ExitDescr`: the attached copy is `'static`.
+        (u32::MAX, Some(ExitDescr::borrowed(metainterp_finish)))
     } else {
         // `jf_descr_raw` is the metainterp `AbstractFailDescr` Arc's
         // data pointer.  Resolve via the `fail_descrs` collection.
@@ -8174,7 +8177,7 @@ fn run_compiled_code_inner(
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &FrameInputs<'_>,
-    attachments: &CpuDescrAttachments,
+    attachments: &'static CpuDescrAttachments,
     dispatch_key: u32,
 ) -> JitExecResult {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
@@ -9334,8 +9337,7 @@ impl CraneliftBackend {
         // lock is safe: `Backend::set_done_with_this_frame_descr_*` only
         // fires during `MetaInterpStaticData.finish_setup`, long before
         // compiled code runs.
-        let attachments_guard = compiled.cpu_attachments.read();
-        let attachments: &CpuDescrAttachments = &attachments_guard;
+        let attachments: &'static CpuDescrAttachments = compiled.cpu_attachments.read();
         #[cfg(feature = "__execute-stage-probe")]
         if majit_backend::deadframe::probe_extra_stage()
             == majit_backend::deadframe::ProbeExtraStage::Attach
@@ -9480,7 +9482,7 @@ impl CraneliftBackend {
         bridge: &BridgeData,
         parent_outputs: &[i64],
         parent_types: &[Type],
-        attachments: &CpuDescrAttachments,
+        attachments: &'static CpuDescrAttachments,
     ) -> DeadFrame {
         // The bridge's inputs are the parent guard's fail args.
         let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
@@ -17494,8 +17496,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // 0 only for the initial entry — every external-JUMP re-entry,
         // including the first LABEL, selects its loader (label_block_id + 1).
         let mut cur_dispatch_key: u32 = 0;
-        let attachments_guard = compiled.cpu_attachments.read();
-        let attachments: &CpuDescrAttachments = &attachments_guard;
+        let attachments: &'static CpuDescrAttachments = compiled.cpu_attachments.read();
 
         loop {
             let exec = run_compiled_code(
