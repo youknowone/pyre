@@ -210,7 +210,7 @@ pm1!(sinh);
 pm1!(cosh);
 pm1!(tanh);
 pm1!(asinh);
-pm1!(acosh);
+pm1_edom!(acosh, "expected argument value not less than 1");
 pm1_edom!(atanh, "expected a number between -1 and 1");
 
 // Exponential / logarithmic
@@ -621,13 +621,13 @@ pm1!(cbrt);
 pm1!(exp);
 pm1!(exp2);
 pm1!(expm1);
-pm1!(log1p);
+pm1_edom!(log1p, "expected argument value > -1");
 
 // Gamma / error
 pm1!(erf);
 pm1!(erfc);
 pm1_edom!(gamma, "expected a noninteger or positive integer");
-pm1!(lgamma);
+pm1_edom!(lgamma, "expected a noninteger or positive integer");
 
 // Misc
 pm1!(fabs);
@@ -787,38 +787,17 @@ pub fn trunc(args: &[PyObjectRef]) -> PyResult {
 
 // ── Special signatures ──────────────────────────────────────────────
 
-/// Compute `log(n)` for arbitrarily large integers by bit-shifting off the
-/// top 53 bits into an f64 mantissa and adding `e * SHIFT * log(2)`.
+/// `loghelper(arg, func)` — one operand's logarithm, where `base` spells which
+/// `func` upstream passed: `0.0` for `m_log`, `2.0` for `m_log2` and `10.0`
+/// for `m_log10`.
 ///
-/// PyPy: rpython/rlib/rbigint.py::_loghelper —
-///     x, e = _AsScaledDouble(arg)
-///     return func(x) + e * SHIFT * func(2.0)
-///
-/// Here we pick SHIFT=1 so `e` is the number of bits shifted off.
-fn bigint_log(n: &BigInt, base: f64) -> Result<f64, crate::PyError> {
-    if n.int_le(0) {
-        return Err(crate::PyError::value_error("math domain error"));
-    }
-    n.log(base).map_err(map_rbigint_err)
-}
-
-/// `loghelper` converts *any* integer operand from its payload — a subclass
-/// included, since the check is `PyLong_Check` — and only a non-integer one
-/// reaches the general float coercion.  `log(x, base)` runs both operands
-/// through it, so the base needs the same rule as the argument that
-/// [`log_any`] handles inline; `try_get_double` would consult an overridden
-/// `__float__` here and answer a different logarithm.
-fn log_operand_double(obj: PyObjectRef) -> Result<f64, crate::PyError> {
-    match crate::builtins::int_payload_as_f64(obj) {
-        Some(value) => value,
-        None => try_get_double(obj),
-    }
-}
-
-/// Special-case integer arguments to avoid overflow, and give the domain
-/// error the value-carrying message except for an int argument, whose error
-/// carries no value.
-fn log_any(w_x: PyObjectRef, base: f64) -> PyResult {
+/// An integer operand is read from its payload rather than coerced, so a value
+/// no `float` can hold still has a logarithm, and only a non-integer reaches
+/// the general coercion, where an overridden `__float__` is what answers.  The
+/// two arms also state their refusal differently — an integer can be
+/// arbitrarily large, so its message carries no value — and which spelling a
+/// program sees says which arm read the operand.
+fn loghelper(w_x: PyObjectRef, base: f64) -> Result<f64, crate::PyError> {
     unsafe {
         if pyre_object::is_bool(w_x) || pyre_object::is_int(w_x) || pyre_object::is_long(w_x) {
             let num_owned;
@@ -834,13 +813,20 @@ fn log_any(w_x: PyObjectRef, base: f64) -> PyResult {
             if num.int_le(0) {
                 return Err(crate::PyError::value_error("expected a positive input"));
             }
-            return Ok(floatobject::w_float_new(bigint_log(num, base)?));
+            // `PyLong_AsDouble` first, so a value a `float` can hold takes the
+            // logarithm of that conversion and answers as the float beside it
+            // does.  Only a value that overflows falls back to the scaled
+            // double, whose top bits are all the logarithm can be read from.
+            return match num.tofloat() {
+                Ok(x) => Ok(log_of_double(x, base)),
+                Err(_) => num.log(base).map_err(map_rbigint_err),
+            };
         }
     }
     let x = try_get_double(w_x)?;
     // NaN propagates through log.
     if x.is_nan() {
-        return Ok(floatobject::w_float_new(f64::NAN));
+        return Ok(f64::NAN);
     }
     // Domain error for x <= 0 (but x == +inf is fine).
     if x <= 0.0 {
@@ -849,14 +835,17 @@ fn log_any(w_x: PyObjectRef, base: f64) -> PyResult {
             float_repr(x)
         )));
     }
+    Ok(log_of_double(x, base))
+}
+
+/// The `func` [`loghelper`] was handed, spelled as the base it takes.
+fn log_of_double(x: f64, base: f64) -> f64 {
     if base == 10.0 {
-        Ok(floatobject::w_float_new(x.log10()))
+        x.log10()
     } else if base == 2.0 {
-        Ok(floatobject::w_float_new(x.log2()))
-    } else if base == 0.0 {
-        Ok(floatobject::w_float_new(x.ln()))
+        x.log2()
     } else {
-        Ok(floatobject::w_float_new(x.ln() / base.ln()))
+        x.ln()
     }
 }
 
@@ -889,24 +878,20 @@ pub fn log(args: &[PyObjectRef]) -> PyResult {
             args.len()
         )));
     }
-    let base = if args.len() >= 2 {
-        // The base is validated before the argument, so log(x, base) with a
-        // non-positive base reports the base rather than the argument.
-        let b = log_operand_double(args[1])?;
-        if b <= 0.0 {
-            return Err(crate::PyError::value_error(format!(
-                "expected a positive input, got {}",
-                float_repr(b)
-            )));
-        }
-        if b == 1.0 {
-            return Err(crate::PyError::value_error("math domain error"));
-        }
-        b
-    } else {
-        0.0
+    // `math_log_impl` is two `loghelper` calls and a division.  So the
+    // argument is what a refusal names even when the base is out of the domain
+    // too, a base of 1 leaves a zero denominator rather than a domain error,
+    // and the result is one natural logarithm over another — not the logarithm
+    // taken in that base, which rounds elsewhere.
+    let num = loghelper(args[0], 0.0)?;
+    let Some(base) = args.get(1).copied() else {
+        return Ok(floatobject::w_float_new(num));
     };
-    log_any(args[0], base)
+    let den = loghelper(base, 0.0)?;
+    if den == 0.0 {
+        return Err(crate::PyError::zero_division("division by zero"));
+    }
+    Ok(floatobject::w_float_new(num / den))
 }
 
 pub fn log10(args: &[PyObjectRef]) -> PyResult {
@@ -915,7 +900,7 @@ pub fn log10(args: &[PyObjectRef]) -> PyResult {
             "log10() takes exactly 1 argument",
         ));
     }
-    log_any(args[0], 10.0)
+    Ok(floatobject::w_float_new(loghelper(args[0], 10.0)?))
 }
 
 pub fn log2(args: &[PyObjectRef]) -> PyResult {
@@ -924,7 +909,7 @@ pub fn log2(args: &[PyObjectRef]) -> PyResult {
             "log2() takes exactly 1 argument",
         ));
     }
-    log_any(args[0], 2.0)
+    Ok(floatobject::w_float_new(loghelper(args[0], 2.0)?))
 }
 
 pub fn degrees(args: &[PyObjectRef]) -> PyResult {
