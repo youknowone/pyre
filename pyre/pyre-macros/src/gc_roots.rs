@@ -528,7 +528,7 @@ impl Handler for Rewrite<'_> {
 /// answer.  A single global answer would have a bracket reload a colour its
 /// site never saved.
 mod place {
-    use super::{Block, Count, Expr, Ident, Names, Rewrite, Stmt, Walk};
+    use super::{Block, Count, Expr, Names, Rewrite, Stmt, Walk};
     use std::collections::BTreeSet;
     use syn::visit_mut::VisitMut;
 
