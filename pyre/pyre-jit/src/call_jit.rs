@@ -2476,15 +2476,37 @@ fn leave_resumed_blackhole_frame(
 ///   forces it; that word only names this frame while its scope is the open
 ///   one. A walk that materialised an inlined callee can leave a different vref
 ///   there, and the caller has no other way to find out.
-/// * No force. The guard has already established that `frame_vref` resolves to
-///   this frame, so `leave`'s `frame_vref()` has nothing left to materialize,
-///   and forcing a vref that was finished with the NULL form is exactly what
-///   `force_pyframe_vref` refuses — measured as
+/// * No force OF THIS FRAME'S OWN VREF. The guard has already established that
+///   `frame_vref` resolves to this frame, so `leave`'s `frame_vref()` has
+///   nothing left to materialize, and forcing a vref that was finished with the
+///   NULL form is exactly what `force_pyframe_vref` refuses — measured as
 ///   `InvalidVirtualRef: frame-chain vref forced after its frame died` on
 ///   `exception_escape_inlined_midframe_tb_node` and
 ///   `exception_try_call_inlined_callee_raise`.
-/// * The caller is reached through `vref_referent` rather than `get_f_back`,
-///   which forces, for the same reason.
+///
+/// That measurement scoped only the `frame_vref()` half.  This bullet used to
+/// carry a third one extending it to the caller — "reached through
+/// `vref_referent` rather than `get_f_back`, which forces, for the same
+/// reason" — and the reason does not carry: see below.  Both fixtures named
+/// above pass with the caller force restored.
+///
+/// The caller, then, is reached with the force — `f_back =
+/// frame.f_backref()`, parens included, i.e. [`PyFrame::get_f_back`].  That
+/// force is NOT covered by the argument above: the identity guard establishes
+/// something about `frame_vref`, and nothing about `f_backref`.  Reading the
+/// caller with the non-forcing `vref_referent` answers NULL whenever the caller
+/// is a still-virtual inlined frame, and NULL is then taken for "no caller", so
+/// the caller is neither materialised nor marked escaped.  `force_pyframe_vref`
+/// (`eval.rs`) states the invariant that breaks: a leaving frame that escaped
+/// "marks the caller escaped so its own leave does the same", and the state that
+/// reaches its refusal "requires that propagation to have been skipped".  With
+/// the propagation skipped, `walker_ec_leave`'s unescaped arm records the NULL
+/// form of `VIRTUAL_REF_FINISH`, which leaves the caller's vref at
+/// `virtual_token == TOKEN_NONE` with `forced == NULL` — the invalid state
+/// `virtualref.py` names `InvalidVirtualRef`.  Reading the escaped callee's
+/// `f_back` afterwards then aborts the process, a non-unwinding panic:
+/// measured on a residual callee whose frame escapes into a traceback and which
+/// returns NORMALLY under an inlined caller.
 ///
 /// The `topframeref` restore is idempotent for the portal, whose
 /// `CurrentFrameGuard` writes back the same word from a shadow-stack slot when
@@ -2511,7 +2533,12 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     unsafe {
         (*ec).topframeref = (*frame_ptr).f_backref;
         if (*frame_ptr).escaped() || got_exception {
-            let f_back = pyre_interpreter::executioncontext::vref_referent((*frame_ptr).f_backref);
+            // `f_back = frame.f_backref()` — with the parens, so an inlined
+            // caller that is still virtual is materialised here rather than
+            // read as absent.  The mark is what makes the caller's own leave
+            // record the non-NULL `VIRTUAL_REF_FINISH`; skipping it strands the
+            // caller's vref in the state `force_pyframe_vref` aborts on.
+            let f_back = (*frame_ptr).get_f_back();
             if !f_back.is_null() {
                 (*f_back).mark_as_escaped();
             }
