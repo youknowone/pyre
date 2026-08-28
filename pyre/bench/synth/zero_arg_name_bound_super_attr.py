@@ -1,11 +1,9 @@
 # pyre-check: max-pypy-ratio=2
 # pyre-check: skip-cpython
-# The ceiling is 4 rather than 2 because this ratio is host-dependent and the
-# gate has to hold on the worst host, not the best.  Measured on the same
-# commit: 1.7x on an arm64 mac runner and 1.8x dynasm on a windows runner,
-# but 2.3x dynasm and 2.5x cranelift on an x86_64 ubuntu runner -- two
-# different backends over 2 on the one host, so 2 is not a ceiling this
-# shape holds anywhere but the fastest machines.
+# The ceiling is 2, tighter than the spread this shape showed before the
+# descriptor arms landed: an arm64 mac runner read 1.7x and a windows runner
+# 1.8x dynasm, but an x86_64 ubuntu runner read 2.3x dynasm and 2.5x
+# cranelift -- two different backends over 2 on the one host.
 # The loop folds to one add per iteration on both JITs, so N has to be in
 # the hundreds of millions before pypy's execution time is a measurement
 # rather than a clock tick — and at that size cpython is minutes behind.

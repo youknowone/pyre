@@ -10,8 +10,9 @@
 #
 # The ceiling is 3 rather than 2 because super is no longer what it measures.
 # The identical loop calling a plain `self.plain()` — no super anywhere — reads
-# 2.14x on this machine, and this fixture reads 2.12x: the whole difference
-# between the two is inside the run-to-run spread.  What is left is pyre's
+# the same user CPU time as this one to the centisecond (0.47s against pypy's
+# 0.22s, best of three, both files): the difference between the two is below
+# the measurement.  What is left is pyre's
 # generic `while` scaffolding (a loop-invariant class re-check on the bound, an
 # unused ForceToken, the `ec.w_tracefunc` null check and the eval-breaker
 # poll), and a ceiling of 2 here would gate on that instead of on super.  The
