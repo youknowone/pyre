@@ -219,7 +219,7 @@ fn localeconv_to_dict(c: &LocaleConvData) -> pyre_object::PyObjectRef {
 
 /// POSIX "C" locale `localeconv` defaults for builds without libc; the
 /// char-typed fields default to `CHAR_MAX` (no value provided).
-#[cfg(not(all(unix, feature = "host_env")))]
+#[cfg(not(all(any(unix, windows), feature = "host_env")))]
 fn c_locale_conv() -> LocaleConvData {
     const CHAR_MAX: i64 = 127;
     LocaleConvData {
@@ -427,39 +427,49 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::make_builtin_function_with_arity(
             "localeconv",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
+                #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
                     let lc = rustpython_host_env::locale::localeconv_data();
                     // `_w_copy_grouping` (`interp_locale.py`): every byte
                     // of the C grouping string up to its NUL is one group size
                     // (a `CHAR_MAX` element stays `127`), then a trailing `0`
-                    // is appended to a non-empty list. The bytes come from
-                    // `rlocale::charp2str`, the same read `numeric_formatting`
-                    // groups by, rather than from the host helper, which stops
-                    // at the first `CHAR_MAX` and drops it. The trailing `0` is
+                    // is appended to a non-empty list. The trailing `0` is
                     // this function's own fixup and belongs to the app-level
                     // list, never to the grouping the formatter walks.
-                    let grouping_of = |ptr: *const libc::c_char| -> Vec<i64> {
-                        let mut v: Vec<i64> = super::rlocale::charp2str(ptr)
-                            .into_iter()
-                            .map(i64::from)
-                            .collect();
+                    let grouping_of = |sizes: Vec<u8>| -> Vec<i64> {
+                        let mut v: Vec<i64> = sizes.into_iter().map(i64::from).collect();
                         if !v.is_empty() {
                             v.push(0);
                         }
                         v
                     };
-                    let raw = unsafe { libc::localeconv() };
-                    let (grouping, mon_grouping) = if raw.is_null() {
-                        (Vec::new(), Vec::new())
-                    } else {
-                        unsafe {
-                            (
-                                grouping_of((*raw).grouping),
-                                grouping_of((*raw).mon_grouping),
-                            )
+                    // The bytes come from `rlocale::charp2str`, the same read
+                    // `numeric_formatting` groups by, rather than from the host
+                    // helper, which stops at the first `CHAR_MAX` and drops it.
+                    #[cfg(unix)]
+                    let (grouping, mon_grouping) = {
+                        let raw = unsafe { libc::localeconv() };
+                        if raw.is_null() {
+                            (Vec::new(), Vec::new())
+                        } else {
+                            unsafe {
+                                (
+                                    grouping_of(super::rlocale::charp2str((*raw).grouping)),
+                                    grouping_of(super::rlocale::charp2str((*raw).mon_grouping)),
+                                )
+                            }
                         }
                     };
+                    // `libc` declares neither `lconv` nor `localeconv` for a
+                    // Windows target, so the host helper's read is the only
+                    // one there. Its stop at `CHAR_MAX` costs nothing: of the
+                    // 198 locale names this runtime accepts, every grouping is
+                    // `[3]` or `[3, 2]` and none carries the element.
+                    #[cfg(windows)]
+                    let (grouping, mon_grouping) = (
+                        grouping_of(lc.grouping.iter().map(|&size| size as u8).collect()),
+                        grouping_of(lc.mon_grouping.iter().map(|&size| size as u8).collect()),
+                    );
                     let data = LocaleConvData {
                         decimal_point: lc.decimal_point.clone(),
                         thousands_sep: lc.thousands_sep.clone(),
@@ -482,7 +492,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                     };
                     Ok(localeconv_to_dict(&data))
                 }
-                #[cfg(not(all(unix, feature = "host_env")))]
+                #[cfg(not(all(any(unix, windows), feature = "host_env")))]
                 {
                     Ok(localeconv_to_dict(&c_locale_conv()))
                 }

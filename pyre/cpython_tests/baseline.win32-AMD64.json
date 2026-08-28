@@ -1,6 +1,10 @@
 {
   "host": "win32-AMD64",
   "modules": {
+    "test.test__locale": {
+      "dynasm": "PASS",
+      "reason": "the candidate locales _LocaleTests compares against are installed here, so localeconv() answers with known values and the module reports a result; a host carrying only the C locale reaches skipTest('no suitable locales') in every case and the shared SKIP is what it records"
+    },
     "test.test_eintr": {
       "dynasm": "SKIP",
       "reason": "EINTRTests is skipUnless(os.name == 'posix', 'only supported on Unix'), so every case in the module skips and none is left to report a result"
