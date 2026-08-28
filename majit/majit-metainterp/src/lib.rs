@@ -112,6 +112,14 @@ pub mod box_trace;
 pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
+/// The `indexmap` this crate's public signatures are written against.
+///
+/// [`pyjitpl::MetaInterp::install_liveness_from_build_parts`] takes an
+/// `IndexMap<String, u8>`, so an embedder has to build one. Without the
+/// re-export it would have to name a version-compatible `indexmap` of its own
+/// and would get a type mismatch when the two resolved differently — the
+/// argument is not constructible from outside otherwise.
+pub use indexmap;
 pub use majit_backend::model as cpu;
 pub use majit_ir::Value;
 pub use majit_ir::debug;
