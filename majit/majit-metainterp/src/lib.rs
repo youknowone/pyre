@@ -112,6 +112,14 @@ pub mod box_trace;
 pub(crate) mod call_descr;
 pub(crate) mod compile;
 pub mod counter;
+/// The `indexmap` this crate's public signatures are written against.
+///
+/// [`pyjitpl::MetaInterp::install_liveness_from_build_parts`] takes an
+/// `IndexMap<String, u8>`, so an embedder has to build one. Without the
+/// re-export it would have to name a version-compatible `indexmap` of its own
+/// and would get a type mismatch when the two resolved differently — the
+/// argument is not constructible from outside otherwise.
+pub use indexmap;
 pub use majit_backend::model as cpu;
 pub use majit_ir::Value;
 pub use majit_ir::debug;
@@ -233,24 +241,24 @@ pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_
 /// (`blackhole.py:1432-1483` reads the descr straight out of the constant
 /// pool).  Exported so the descr-identity census can compare it against the
 /// pool-side resolution without re-deriving a second copy of the logic.
-pub use pyjitpl::dispatch::field_descr_ref_from_bh;
+pub use pyjitpl::dispatch::{field_descr_ref_from_bh, symbolic_residual_trace_aborts};
 pub use pyjitpl::{
     BackEdgeAction, BridgeCompileResult, BridgeRetraceResult, ClosureRuntime,
     ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision,
     JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
     MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey, RawCompileResult,
-    StandaloneFrameStack, build_state_field_snapshot, call_int_function, call_ref_function,
-    call_void_function, counters, record_application_traceback_for_recording,
-    record_application_traceback_hook_address, record_discarded_level_traceback_for_recording,
-    record_discarded_level_traceback_hook_address,
+    StandaloneFrameStack, SymbolicFnaddrPathResolver, build_state_field_snapshot,
+    call_int_function, call_ref_function, call_void_function, counters,
+    record_application_traceback_for_recording, record_application_traceback_hook_address,
+    record_discarded_level_traceback_for_recording, record_discarded_level_traceback_hook_address,
     record_inline_application_traceback_for_recording,
     record_inline_application_traceback_hook_address, residual_write_effect_info,
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
     set_record_application_traceback_hook, set_record_discarded_level_traceback_hook,
     set_record_inline_application_traceback_hook, set_resolve_exception_context_hook,
-    trace_jitcode, trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point,
-    trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
+    set_symbolic_fnaddr_path_resolver, trace_jitcode, trace_jitcode_at_resume_framestack,
+    trace_jitcode_from_merge_point, trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
     BridgeVirtualCache, decode_fieldnum, default_bridge_array_descr, emit_pending_field_op,
@@ -1880,6 +1888,12 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     // zero through `load_state_field/di`. A slot that already held a constant
     // loses nothing, so it is not counted.
     "inline_frame_trim_blanked_live_int",
+    // A `confirm_enter_jit` hook was installed, but a hash-only compatibility
+    // door had no structured greens to pass it. The door declines rather than
+    // invoking the callback with a hash disguised as its argument; a nonzero
+    // value identifies compatibility callers that still need typed-key
+    // threading.
+    "confirm_enter_jit_missing_key",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.

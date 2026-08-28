@@ -183,9 +183,9 @@ pub struct JitCodeBuilder {
     /// captured by `jit_merge_point()` immediately before
     /// `write_insn` pushes the opcode.  Propagated to
     /// `JitCodeExecState::jit_merge_point_offset` at `finish()`.
-    /// `None` until `jit_merge_point()` is called; second call asserts
-    /// to mirror RPython's "exactly one jit_merge_point per portal
-    /// jitcode" invariant (`jtransform.py:1690-1712`).
+    /// `None` until `jit_merge_point()` is called; later calls emit their
+    /// markers while leaving this first offset unchanged. The LLBC sibling
+    /// enforces `jtransform.py`'s single-marker portal-graph contract.
     jit_merge_point_offset: Option<usize>,
     /// RPython `jitcode.py` `self.fnaddr = fnaddr`. RPython hands
     /// `fnaddr` to `JitCode.__init__` *before* the assembler fills the
@@ -5774,6 +5774,11 @@ impl JitCodeBuilder {
             // `BhCallDescr::default()` zero, matching the pre-set state
             // RPython's constructor shows when `calldescr=None`.
             calldescr: self.calldescr,
+            // Recorded on the body as well as on `exec` below, so a body that
+            // makes the round trip through serialization still says where its
+            // marker is. The two routes into `JitCodeBody` now carry the same
+            // field, and `JitCode::from_canonical` reads it back.
+            jit_merge_point_offset: self.jit_merge_point_offset,
             code: self.code,
             constants_i: self.constants_i,
             constants_r: self.constants_r.into_iter().map(Into::into).collect(),

@@ -485,9 +485,9 @@ pub struct JitCodeExecState {
     pub call_descr_to_call_target: indexmap::IndexMap<u16, JitCallTarget>,
     /// Bytecode offset of the `BC_JIT_MERGE_POINT(_C)` opcode byte for
     /// the dispatch JitCode emitted by `lower_dispatch_body`.  `None`
-    /// for non-dispatch JitCodes (helpers, sub-arms) — exactly one
-    /// `jit_merge_point` op is allowed per dispatch JitCode and the
-    /// builder asserts that contract on the second call.
+    /// for non-dispatch JitCodes (helpers, sub-arms). The LLBC route
+    /// permits one marker per dispatch body; `JitCodeBuilder` tolerates
+    /// additional markers and retains the first marker's offset.
     ///
     /// Captured by `JitCodeBuilder::jit_merge_point` at the
     /// `self.code.len()` immediately before the opcode byte is pushed,
@@ -577,9 +577,19 @@ impl JitCode {
     /// argcodes through the global `ALL_DESCRS` table and never
     /// populate `exec.descrs`.
     pub fn from_canonical(core: majit_translate::jitcode::JitCode) -> Self {
+        // The offset comes across because the two routes record it at the
+        // same point and a consumer cannot recover it afterwards: an operand
+        // byte may equal the opcode byte, so only the encoder knows which
+        // position is an instruction start. Without this, a body assembled by
+        // `majit-translate` reaches `register_dispatch_jitcode` looking like
+        // one that has no marker at all.
+        let jit_merge_point_offset = core.body().jit_merge_point_offset;
         Self {
             core,
-            exec: JitCodeExecState::default(),
+            exec: JitCodeExecState {
+                jit_merge_point_offset,
+                ..JitCodeExecState::default()
+            },
         }
     }
 
@@ -904,6 +914,37 @@ pub(crate) fn read_u16(code: &[u8], cursor: &mut usize) -> u16 {
 mod tests {
     use super::*;
     use majit_translate::jitcode::{JitCode as BuildJitCode, JitCodeBody as BuildJitCodeBody};
+
+    /// `register_dispatch_jitcode` refuses a portal whose `exec` does not say
+    /// where its marker is, and only the encoder can say: an operand byte may
+    /// equal the opcode byte, so the offset cannot be recovered by scanning.
+    /// Both routes into a body now record it, and this is the crossing where a
+    /// body assembled by `majit-translate` would otherwise arrive looking like
+    /// one that has no marker at all.
+    #[test]
+    fn from_canonical_carries_the_bodys_merge_point_offset() {
+        let core = BuildJitCode::new("portal");
+        core.set_body(BuildJitCodeBody {
+            jit_merge_point_offset: Some(3),
+            ..BuildJitCodeBody::default()
+        });
+        assert_eq!(
+            JitCode::from_canonical(core).exec.jit_merge_point_offset,
+            Some(3)
+        );
+    }
+
+    /// A body with no marker keeps `None`, so "has no merge point" stays
+    /// distinguishable from "has one at offset 0".
+    #[test]
+    fn from_canonical_leaves_a_markerless_body_without_an_offset() {
+        let core = BuildJitCode::new("callee");
+        core.set_body(BuildJitCodeBody::default());
+        assert_eq!(
+            JitCode::from_canonical(core).exec.jit_merge_point_offset,
+            None
+        );
+    }
 
     #[test]
     fn wellknown_bh_insns_stays_canonical_and_avoids_false_call_family_keys() {

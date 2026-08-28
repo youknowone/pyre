@@ -513,6 +513,22 @@ pub struct JitDriverStaticData {
     /// Optional declared operand kinds parallel to `reds`; empty disables the
     /// check for legacy and auto-red drivers.
     pub red_kinds: Vec<majit_ir::Type>,
+    /// RPython: `jd._green_args_spec` (`warmspot.py:663`) — the green operand
+    /// kinds as the *graph* has them, not as a consumer declared them.
+    ///
+    /// Upstream reads them off `greens_v` at the marker; jtransform records
+    /// them here while rewriting the merge point, because that is the only
+    /// place both the marker operands and this record are in scope. Empty
+    /// until that rewrite runs, so a driver whose portal was never transformed
+    /// is distinguishable from one whose portal has no greens.
+    pub green_args_spec: Vec<majit_ir::Type>,
+    /// RPython: `jd.red_args_types` (`warmspot.py:664`) — the red operand
+    /// kinds as the graph has them. Recorded alongside `green_args_spec`.
+    ///
+    /// For an auto-red driver these describe the *detected* reds, so this is
+    /// the only account of them: `reds` holds what was declared, which for
+    /// `reds='auto'` is nothing.
+    pub red_args_types: Vec<majit_ir::Type>,
     /// RPython: `jitdriver.autoreds` — true for `reds='auto'` drivers.
     pub autoreds: bool,
     /// RPython: `jitdriver.numreds` — fixed immediately for explicit reds,
@@ -3336,6 +3352,10 @@ impl CallControl {
             reds,
             green_kinds,
             red_kinds,
+            // Filled by jtransform at the merge-point rewrite; there is no
+            // graph in scope here to read them from.
+            green_args_spec: Vec::new(),
+            red_args_types: Vec::new(),
             autoreds,
             virtualizables,
             red_types,

@@ -532,6 +532,7 @@ impl Assembler {
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
             startpoints: indexmap::IndexSet::new(),
+            jit_merge_point_offset: None,
             alllabels: indexmap::IndexSet::new(),
             resulttypes: indexmap::IndexMap::new(),
         };
@@ -651,6 +652,7 @@ impl Assembler {
             // for hand-built helper jitcodes that bypass the builder
             // (jitcode.py:24 defaults).
             startpoints: Some(state.startpoints),
+            jit_merge_point_offset: state.jit_merge_point_offset,
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
             _ssarepr: Some(ssarepr.clone()),
@@ -2478,6 +2480,17 @@ impl Assembler {
                 reds_r,
                 reds_f,
             } => {
+                // This LLBC route enforces `jtransform.py`'s at-most-one-marker
+                // contract per portal graph. The sibling
+                // `JitCodeBuilder::jit_merge_point` route tolerates later
+                // markers while retaining the first offset; a body reaching
+                // this route twice means two markers were lowered into one
+                // graph and the offset below would name whichever won.
+                assert!(
+                    state.jit_merge_point_offset.is_none(),
+                    "a second jit_merge_point in one assembled body",
+                );
+                state.jit_merge_point_offset = Some(startposition);
                 let jdindex_value = *jitdriver_index as i64;
                 let jdindex_argcode = if (-128..=127).contains(&jdindex_value) {
                     state.code.push(jdindex_value as i8 as u8);
@@ -3299,6 +3312,11 @@ struct AssemblyState {
     label_positions: HashMap<Label, usize>,
     tlabel_fixups: Vec<(Label, usize)>,
     startpoints: indexmap::IndexSet<usize>,
+    /// Where the `jit_merge_point` opcode byte went, for the one body that
+    /// carries the marker. Recorded at the reserved opcode position rather
+    /// than recovered later: an operand byte can equal the opcode byte, so
+    /// only the encoder knows which position is an instruction start.
+    jit_merge_point_offset: Option<usize>,
     /// RPython assembler.py:176: positions in bytecode where TLabel operands
     /// are written. Used by JitCode.follow_jump() for verification.
     alllabels: indexmap::IndexSet<usize>,
@@ -5999,6 +6017,7 @@ mod tests {
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
             startpoints: indexmap::IndexSet::new(),
+            jit_merge_point_offset: None,
             alllabels: indexmap::IndexSet::new(),
             resulttypes: indexmap::IndexMap::new(),
         }
@@ -6373,6 +6392,71 @@ mod tests {
 
         // opname map: `newlist_clear`.
         assert_eq!(op_kind_to_opname(&kind), "newlist_clear");
+    }
+
+    /// The offset has to be recorded where the opcode byte goes, and a
+    /// consumer has to be able to trust it without re-scanning: an operand
+    /// byte may equal the opcode byte, so a scan can land on the wrong
+    /// position. The merge point here is deliberately not the first
+    /// instruction — an offset of 0 is what a recorder that never ran would
+    /// also produce, so a body whose marker sits at 0 cannot tell the two
+    /// apart.
+    #[test]
+    fn a_merge_point_records_the_offset_of_its_own_opcode_byte() {
+        use crate::codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
+        let mut flat = SSARepr {
+            name: "portal".into(),
+            insns: vec![
+                FlatOp::Live {
+                    live_values: vec![],
+                },
+                FlatOp::op(crate::model::SpaceOperation {
+                    result: None,
+                    kind: crate::model::OpKind::JitMergePoint {
+                        jitdriver_index: 0,
+                        greens_i: vec![],
+                        greens_r: vec![],
+                        greens_f: vec![],
+                        reds_i: vec![],
+                        reds_r: vec![],
+                        reds_f: vec![],
+                    },
+                }),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+
+        let offset = body
+            .jit_merge_point_offset
+            .expect("an assembled merge point records where it went");
+        assert_ne!(offset, 0, "the `-live-` prefix precedes the marker");
+        let opcode = body.code[offset];
+        assert!(
+            opcode == BC_JIT_MERGE_POINT || opcode == BC_JIT_MERGE_POINT_C,
+            "offset {offset} holds {opcode}, not a merge-point opcode",
+        );
+    }
+
+    /// Every other jitcode answers `None`, so a consumer reading the field
+    /// can tell "this body has no marker" from "this body has one at 0".
+    #[test]
+    fn a_body_without_a_merge_point_records_no_offset() {
+        let mut flat = SSARepr {
+            name: "callee".into(),
+            insns: vec![FlatOp::Live {
+                live_values: vec![],
+            }],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        let regallocs = empty_regallocs();
+        let mut asm = Assembler::new();
+        let body = asm.assemble(&mut flat, &regallocs);
+        assert_eq!(body.jit_merge_point_offset, None);
     }
 
     #[test]

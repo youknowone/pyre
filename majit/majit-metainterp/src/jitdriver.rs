@@ -883,11 +883,12 @@ where
     });
     use majit_translate::codewriter::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
     let body = &jc.code;
-    // Read the opcode byte directly from the captured offset
-    // (`JitCodeBuilder::jit_merge_point` records `self.code.len()`
-    // immediately before pushing the opcode).  No byte-stream scan —
-    // mirrors RPython `blackhole.py:107-156` argcode-based decode
-    // (operand bytes that happen to equal `BC_JIT_MERGE_POINT(_C)`
+    // Read the opcode byte directly from the captured offset.  Both routes
+    // into a body record it at the position they reserve for the opcode:
+    // `JitCodeBuilder::jit_merge_point` on the proc-macro route, and
+    // `Assembler::encode_op`'s `JitMergePoint` arm on the LLBC one.  No
+    // byte-stream scan — mirrors RPython `blackhole.py:107-156` argcode-based
+    // decode (operand bytes that happen to equal `BC_JIT_MERGE_POINT(_C)`
     // cannot trigger a false-positive payload validation).  Pre-Merge-
     // Point body-local lets and other lowerer-emitted prefix opcodes
     // (`bind_pre_merge_point_stmts` in `jitcode_lower/api.rs`) are
@@ -895,9 +896,11 @@ where
     let merge_offset = jc.exec.jit_merge_point_offset.unwrap_or_else(|| {
         panic!(
             "register_dispatch_jitcode: dispatch JitCode `{}` has no \
-             jit_merge_point_offset — `JitCodeBuilder::jit_merge_point` \
-             must have run during lowering (jitcode_lower.rs dispatch \
-             body emission invariant)",
+             jit_merge_point_offset — the body was assembled without a \
+             `jit_merge_point`, or it came through a route that does not \
+             record the offset (`JitCodeBuilder::jit_merge_point` on the \
+             proc-macro route, `Assembler::encode_op` then \
+             `JitCode::from_canonical` on the LLBC one)",
             jc.name(),
         )
     });
@@ -953,6 +956,61 @@ where
     }
 }
 
+/// The seed's entry for a dispatch JitCode that already names its own index.
+///
+/// Split out so the two numbering authorities read as the two cases they are:
+/// this one checks that the seed really is the table the dispatch came from,
+/// and returns its entry; the caller's copy is dropped.
+fn adopt_seeded_dispatch(
+    registry: &[std::sync::Arc<crate::jitcode::JitCode>],
+    index: usize,
+    dispatch: &crate::jitcode::JitCode,
+) -> std::sync::Arc<crate::jitcode::JitCode> {
+    let seeded = registry.get(index).unwrap_or_else(|| {
+        panic!(
+            "dispatch jitcode {:?} names index {index}, which the registry seed \
+             does not reach — it holds {} entries. A build-time table that \
+             numbers the portal has to hand it over through \
+             `RuntimeDescrTable::jitcodes()`, or the portal is registered \
+             against a list that is not the one its `j` operands index",
+            dispatch.name(),
+            registry.len(),
+        )
+    });
+    assert_eq!(
+        seeded.name(),
+        dispatch.name(),
+        "dispatch jitcode {:?} names index {index}, which the seed fills with \
+         {:?} — two graphs claim one slot, so the `j` operands written against \
+         it resolve to whichever of them the registry happens to hold",
+        dispatch.name(),
+        seeded.name(),
+    );
+    // A build-time shell resolves its `j` operands through the shared pool and
+    // carries no per-jitcode descrs, so there is nothing here for the walk to
+    // reach. A caller that has some is one whose callees were emitted at run
+    // time, and adopting would drop them unnumbered.
+    assert!(
+        dispatch.exec.descrs.is_empty(),
+        "dispatch jitcode {:?} is seeded at index {index} but carries {} \
+         run-time descrs; adopting the seed's entry would leave them out of \
+         the registry",
+        dispatch.name(),
+        dispatch.exec.descrs.len(),
+    );
+    assert_eq!(
+        seeded.exec.jit_merge_point_offset,
+        dispatch.exec.jit_merge_point_offset,
+        "dispatch jitcode {:?} is seeded at index {index} but its merge-point \
+         offset {:?} disagrees with the seed's {:?}; adopting the seed's entry \
+         would install a different body",
+        dispatch.name(),
+        dispatch.exec.jit_merge_point_offset,
+        seeded.exec.jit_merge_point_offset,
+    );
+    std::sync::Arc::clone(seeded)
+}
+
 /// Flatten a dispatch JitCode and everything it can inline-call into the one
 /// flat `all_jitcodes` registry, returning it with the dispatch JitCode's
 /// `Arc`.
@@ -973,6 +1031,39 @@ where
 /// The walk starts at the dispatch JitCode, not at the seed: every seeded entry
 /// is already present, so its callees are too. It is depth-agnostic, so a
 /// nested inline helper stays correctly indexed without a parent-relative walk.
+///
+/// A dispatch JitCode the seed *already holds* is adopted at the index it
+/// names rather than appended. `codewriter.py make_jitcodes` numbers the
+/// portal graph in the same pass as every other graph, and `warmspot.py` reads
+/// it back as `metainterp_sd.jitcodes[portal_jd.index]` — upstream's portal is
+/// a seeded entry. A host that lowers its whole interpreter ahead of time
+/// hands over that shape; only one that mints the dispatch body at run time
+/// (`JitCodeBuilder`, the `#[jit_interp]` route) has an unnumbered portal to
+/// append.
+/// The registry for a dispatch jitcode the seed already numbers, or `None` when
+/// it carries no index and has to be appended instead.
+///
+/// Split out because it reads the dispatch and never takes it: a consumer whose
+/// table is a build artefact holds every body behind an `Arc` and has no owned
+/// copy to give, and the arm it needs is exactly this one.
+fn build_seeded_jitcode_registry(
+    seed: &[std::sync::Arc<crate::jitcode::JitCode>],
+    dispatch: &crate::jitcode::JitCode,
+) -> Option<(
+    Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+    std::sync::Arc<crate::jitcode::JitCode>,
+)> {
+    let index = dispatch.try_index()?;
+    let registry = seed.to_vec();
+    // The seed's own `Arc`, never the caller's copy: `codewriter.py:80
+    // all_jitcodes[jitcode.index] is jitcode` is the identity every `j` operand
+    // at `index` resolves through, and the driver's `mainjitcode` has to be that
+    // same object. Nothing is appended, so the registry is the seed — which the
+    // build-time table already numbered end to end.
+    let seeded = adopt_seeded_dispatch(&registry, index, dispatch);
+    Some((registry, seeded))
+}
+
 fn build_jitcode_registry(
     seed: &[std::sync::Arc<crate::jitcode::JitCode>],
     dispatch: crate::jitcode::JitCode,
@@ -980,6 +1071,9 @@ fn build_jitcode_registry(
     Vec<std::sync::Arc<crate::jitcode::JitCode>>,
     std::sync::Arc<crate::jitcode::JitCode>,
 ) {
+    if let Some(seeded) = build_seeded_jitcode_registry(seed, &dispatch) {
+        return seeded;
+    }
     let mut registry = seed.to_vec();
     let dispatch_position = registry.len();
     dispatch.set_index(dispatch_position);
@@ -2031,6 +2125,46 @@ impl<S: JitState> JitDriver<S> {
         validate_dispatch_jitcode_payload(self, &jitcode);
         let (registry, dispatch_arc) =
             build_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode);
+        self.adopt_dispatch_registry(registry, dispatch_arc);
+    }
+
+    /// Register a dispatch JitCode the build-time table already holds.
+    ///
+    /// Same registration as [`Self::register_dispatch_jitcode`], for the other
+    /// shape of consumer: one whose jitcodes are a build artefact published
+    /// behind `Arc`, with no owned copy to hand over. Without this door such a
+    /// consumer can only reach [`crate::pyjitpl::MetaInterp::install_jitcodes`],
+    /// which publishes the table and nothing else — no `BC_JIT_MERGE_POINT`
+    /// payload cross-check against the declared schema, and neither half of the
+    /// `call.py grab_initial_jitcodes` back-pointer, so `is_main_jitcode` is
+    /// false for the portal and a blackhole chain walks off its bottom.
+    ///
+    /// The jitcode must already name its index, which a build-time table
+    /// assigns to every entry; an unnumbered one has to be appended, and
+    /// appending needs ownership.
+    pub fn register_dispatch_jitcode_shared(
+        &mut self,
+        jitcode: &std::sync::Arc<crate::jitcode::JitCode>,
+    ) {
+        validate_dispatch_jitcode_payload(self, jitcode);
+        let (registry, dispatch_arc) =
+            build_seeded_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "register_dispatch_jitcode_shared: dispatch JitCode {:?} names no index,                          so it is not one the build-time table numbered; a jitcode that has to be                          appended must be passed by value through `register_dispatch_jitcode`",
+                        jitcode.name(),
+                    )
+                });
+        self.adopt_dispatch_registry(registry, dispatch_arc);
+    }
+
+    /// The registration both doors share, once the registry and the portal's
+    /// own `Arc` have been decided.
+    fn adopt_dispatch_registry(
+        &mut self,
+        registry: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
+        dispatch_arc: std::sync::Arc<crate::jitcode::JitCode>,
+    ) {
         // call.py `grab_initial_jitcodes`:
         //
         //     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
@@ -5011,7 +5145,7 @@ impl<S: JitState> JitDriver<S> {
         // `None` rather than an `Abort` outcome keeps the answer the same shape
         // as the "no compiled code at all" case, which is what a tmp-only cell
         // is from this path's point of view.
-        if self.has_runnable_compiled_loop(green_key) {
+        if self.has_confirmed_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -6692,7 +6826,7 @@ impl<S: JitState> JitDriver<S> {
         // the meta the runner below can only return `Abort`, which stops this
         // route from ever reaching `maybe_start_tracing` — i.e. the counter
         // stops ticking and the real loop is never traced.
-        if self.has_runnable_compiled_loop(green_key) {
+        if self.has_confirmed_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -7818,6 +7952,18 @@ impl<S: JitState> JitDriver<S> {
         self.runnable_procedure_token(green_key).is_some()
     }
 
+    /// Runnable-loop predicate for an execution door: the cell/token and
+    /// frontend metadata must exist, then the warm-state entry policy must
+    /// allow the transition.
+    #[inline]
+    fn has_confirmed_runnable_compiled_loop(&self, green_key: u64) -> bool {
+        self.has_runnable_compiled_loop(green_key)
+            && self
+                .meta
+                .warm_state_ref()
+                .confirm_compiled_entry_for_cell_key(green_key)
+    }
+
     /// [`Self::resolve_cell_key`] and [`Self::runnable_procedure_token`] from
     /// one walk of the cell chain.
     ///
@@ -7882,6 +8028,18 @@ impl<S: JitState> JitDriver<S> {
             .filter(|_| self.meta.get_compiled_meta(green_key).is_some())
     }
 
+    /// The back-edge door's whole answer from the warm-state policy that owns
+    /// both trace-start and compiled-entry decisions.
+    #[inline]
+    pub fn maybe_compile_and_run_step(
+        &mut self,
+        green_key: u64,
+        green_key_raw: (usize, usize),
+    ) -> (crate::warmstate::HotResult, u64) {
+        self.meta
+            .maybe_compile_and_run_step(green_key, green_key_raw)
+    }
+
     /// The function-entry door's whole answer, from one walk of the cell chain.
     ///
     /// `MetaInterp::function_entry_step` joins the two pieces of state that live
@@ -7890,9 +8048,17 @@ impl<S: JitState> JitDriver<S> {
     /// read [`crate::warmstate::WarmEnterState::function_entry_step`] performs.
     /// Neither is a chain walk, so that read is the only walk the door pays for.
     ///
-    /// `green_key` must already name one cell; see [`Self::resolve_cell_key`].
-    pub fn function_entry_step(&mut self, green_key: u64) -> FunctionEntryStep {
-        self.meta.function_entry_step(green_key)
+    /// `cell_key` must already name one cell; `green_key_hash` and
+    /// `green_key_raw` reconstruct its structured greens only when the
+    /// optional veto is installed.
+    pub fn function_entry_step(
+        &mut self,
+        cell_key: u64,
+        green_key_hash: u64,
+        green_key_raw: (usize, usize),
+    ) -> FunctionEntryStep {
+        self.meta
+            .function_entry_step(cell_key, green_key_hash, green_key_raw)
     }
 
     /// Turn the raw green-key hash a door arrives with into the key that names
@@ -10962,15 +11128,64 @@ mod jitcode_registry_tests {
     use crate::jitcode::{JitCode, RuntimeBhDescr};
     use std::sync::Arc;
 
+    /// The arm a consumer holding only an `Arc` reaches through
+    /// `register_dispatch_jitcode_shared`.
+    ///
+    /// It has to answer for a dispatch it never takes: the seeded case returns
+    /// the seed's own entry, and the unnumbered case declines rather than
+    /// inventing a position, because appending needs an owned value.
+    #[test]
+    fn the_seeded_registry_arm_reads_a_dispatch_it_does_not_take() {
+        let seed = vec![jitcode("other", Some(0)), jitcode("dispatch", Some(1))];
+        let shared = Arc::clone(&seed[1]);
+
+        let (registry, adopted) = build_seeded_jitcode_registry(&seed, &shared)
+            .expect("a dispatch the seed numbers is adopted from the seed");
+        assert_eq!(registry.len(), seed.len(), "nothing is appended");
+        assert!(
+            Arc::ptr_eq(&adopted, &seed[1]),
+            "the adopted portal is the seed's own entry, which is the identity \
+             every `j` operand at that index resolves through",
+        );
+
+        let unnumbered = jitcode("runtime_built", None);
+        assert!(
+            build_seeded_jitcode_registry(&seed, &unnumbered).is_none(),
+            "a jitcode carrying no index has to be appended, and appending needs ownership",
+        );
+    }
+
     /// A jitcode with a committed body, optionally already numbered the way a
     /// build-time table numbers its entries.
     fn jitcode(name: &str, prenumbered: Option<usize>) -> Arc<JitCode> {
+        Arc::new(jitcode_value(name, prenumbered))
+    }
+
+    /// The same, by value, for handing `build_jitcode_registry` the graph its
+    /// seed already holds.
+    ///
+    /// `JitCode` is deliberately not `Clone` — the runtime half is per-object
+    /// — so the seed's entry and the registered portal are two
+    /// `from_canonical` calls over one canonical body. That is exactly the
+    /// shape an LLBC embedder arrives with.
+    fn jitcode_value(name: &str, prenumbered: Option<usize>) -> JitCode {
+        jitcode_value_with_merge_offset(name, prenumbered, None)
+    }
+
+    fn jitcode_value_with_merge_offset(
+        name: &str,
+        prenumbered: Option<usize>,
+        jit_merge_point_offset: Option<usize>,
+    ) -> JitCode {
         let core = majit_translate::jitcode::JitCode::new(name);
-        core.set_body(Default::default());
+        core.set_body(majit_translate::jitcode::JitCodeBody {
+            jit_merge_point_offset,
+            ..Default::default()
+        });
         if let Some(index) = prenumbered {
             core.set_index(index);
         }
-        Arc::new(JitCode::from_canonical(core))
+        JitCode::from_canonical(core)
     }
 
     /// A dispatch jitcode that inline-calls each of `callees`.
@@ -11092,5 +11307,87 @@ mod jitcode_registry_tests {
     fn an_incomplete_seed_is_reported_before_the_set_once_invariant_trips() {
         let callee = jitcode("build_time_callee", Some(7));
         build_jitcode_registry(&[], dispatch_calling(&[callee]));
+    }
+
+    /// A portal the build-time table already numbered keeps that number.
+    ///
+    /// This is the LLBC shape: one lowering pass writes the portal and its
+    /// callees into a single table, so the portal arrives already seeded.
+    /// Appending it would ask `set_index` to name a second slot for a jitcode
+    /// that already names one, which aborts — every such host reached this
+    /// function and panicked instead of registering.
+    #[test]
+    fn a_seeded_dispatch_jitcode_is_adopted_at_the_index_it_names() {
+        let seed = seed();
+        let portal = jitcode_value("mainloop", Some(0));
+
+        let (registry, dispatch) = build_jitcode_registry(&seed, portal);
+
+        assert_eq!(dispatch.index(), 0, "the portal keeps the seed's number");
+        assert_eq!(registry.len(), seed.len(), "nothing is appended");
+        assert!(
+            std::sync::Arc::ptr_eq(&registry[0], &dispatch),
+            "`all_jitcodes[jitcode.index] is jitcode` — the driver's portal has \
+             to BE the registry entry, not a second object with the same body",
+        );
+        assert_self_indexed(&registry);
+    }
+
+    /// Adoption is keyed on the index the dispatch names, not on it being
+    /// first: a table whose driver names a portal in the middle registers the
+    /// entry at that position and no other.
+    #[test]
+    fn a_seeded_dispatch_is_adopted_wherever_the_table_put_it() {
+        let seed = seed();
+        let (registry, dispatch) = build_jitcode_registry(&seed, jitcode_value("add", Some(2)));
+        assert_eq!(dispatch.index(), 2);
+        assert_eq!(dispatch.name(), "add");
+        assert!(std::sync::Arc::ptr_eq(&registry[2], &dispatch));
+    }
+
+    /// Two graphs claiming one slot is not adoptable: the seed's entry and the
+    /// registered portal would be different bodies under one number, and every
+    /// `j` operand written against it resolves to whichever the registry holds.
+    #[test]
+    #[should_panic(expected = "two graphs claim one slot")]
+    fn a_seeded_slot_holding_another_graph_is_refused() {
+        let seed = seed();
+        build_jitcode_registry(&seed, jitcode_value("portal", Some(1)));
+    }
+
+    /// A name and index are not enough to establish that the registered
+    /// dispatch came from the seed's body: the encoder-owned merge-point
+    /// offset must identify the same bytecode position as well.
+    #[test]
+    #[should_panic(expected = "merge-point offset")]
+    fn a_same_named_seeded_dispatch_with_a_different_body_is_refused() {
+        let seed = vec![Arc::new(jitcode_value_with_merge_offset(
+            "mainloop",
+            Some(0),
+            Some(3),
+        ))];
+        let dispatch = jitcode_value_with_merge_offset("mainloop", Some(0), Some(7));
+        build_jitcode_registry(&seed, dispatch);
+    }
+
+    /// A dispatch numbered past the end of the seed names the method that
+    /// would have supplied the rest of the table.
+    #[test]
+    #[should_panic(expected = "does not reach")]
+    fn a_dispatch_numbered_above_the_seed_names_the_missing_table() {
+        let seed = seed();
+        build_jitcode_registry(&seed, jitcode_value("mainloop", Some(9)));
+    }
+
+    /// Adoption drops the caller's copy, so run-time descrs on it would never
+    /// be numbered. Refuse rather than lose them.
+    #[test]
+    #[should_panic(expected = "run-time descrs")]
+    fn a_seeded_dispatch_carrying_runtime_callees_is_refused() {
+        let seed = seed();
+        let helper = jitcode("helper", None);
+        let mut portal = jitcode_value("mainloop", Some(0));
+        portal.exec.descrs = vec![RuntimeBhDescr::JitCode(helper)];
+        build_jitcode_registry(&seed, portal);
     }
 }

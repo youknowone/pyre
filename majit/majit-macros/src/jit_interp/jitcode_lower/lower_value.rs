@@ -1435,6 +1435,9 @@ impl<'c> Lowerer<'c> {
                     self.inline_liveness_prebuild.push(quote! {
                         __majit_pipeline_liveness_prebuild(__asm);
                     });
+                    let untyped_return = self.inference_failure_tokens(
+                        "pipeline jitcode must end in a typed return opcode",
+                    );
                     self.emit_op(
                         OpMeta::linear(
                             OpKind::InlineCall,
@@ -1444,9 +1447,23 @@ impl<'c> Lowerer<'c> {
                         quote! {
                             use majit_metainterp::jitcode::JitCodeRuntimeExt as _;
                             let __sub_jitcode = __majit_pipeline_jitcode(#pipeline_name);
-                            let (__sub_return_kind, _) = __sub_jitcode
-                                .trailing_return_info()
-                                .expect("pipeline jitcode must end in a typed return opcode");
+                            // The callee is resolved by name at install time,
+                            // so "does it end in a typed return" is not known
+                            // until then. A body that does not is a body the
+                            // parent's INLINE_CALL has no return kind for, and
+                            // `make_jitcodes()` installs only completed
+                            // jitcodes -- so the parent declines rather than
+                            // registering a half-typed body. Under
+                            // `InferenceFailureMode::Panic` the enclosing
+                            // builder has no `None` to return and this stays a
+                            // panic, as every other rejection there does.
+                            let (__sub_return_kind, _) =
+                                match __sub_jitcode.trailing_return_info() {
+                                    Some(__info) => __info,
+                                    None => {
+                                        #untyped_return
+                                    }
+                                };
                             let __sub_idx = __builder.add_sub_jitcode_arc(__sub_jitcode);
                             #inline_call
                         },
