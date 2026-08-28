@@ -789,6 +789,12 @@ pub fn install_builtin_modules() {
         pyre_install_module!(select);
         #[cfg(unix)]
         pyre_install_module!(termios);
+        // `socket.py`'s module body subclasses `_socket.socket`, so a module
+        // that is present without the host layer behind it fails the import
+        // with AttributeError -- and `platform._node`, `uuid` and the rest
+        // reach for `socket` inside `try/except ImportError`, which that is
+        // not.  A target with no socket layer has no `_socket` at all.
+        #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(_socket);
         #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(_ssl);
