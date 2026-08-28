@@ -5514,9 +5514,12 @@ pub struct FunctionGraph {
     /// default_specialize`, for a graph whose ARGUMENT annotation arrived
     /// carrying the flag that the `hint` ExtRegistryEntry in `rlib/jit.py`
     /// mints on `SomeInstance.flags`. The flowspace pipeline ports that on
-    /// `PyGraph::access_directly`; on the LLBC path nothing sets this yet.
-    /// See `front::semantic::SemanticFunction` for what a bridge there would
-    /// have to propagate.
+    /// `PyGraph::access_directly`; the LLBC path has no annotator to carry a
+    /// flag on an annotation, so `front::semantic::propagate_access_directly`
+    /// does the same propagation over the op stream and writes this field.
+    /// Its doc records the two under-approximations that port makes, both
+    /// forced by `policy::look_inside_graph` aborting the build on a flag it
+    /// cannot honour.
     pub access_directly: bool,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default
