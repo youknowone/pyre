@@ -18947,7 +18947,13 @@ fn file_method_flush(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if args.is_empty() {
         return Ok(w_none());
     }
-    file_check_closed(args[0])?;
+    // `fileio.c` states no `flush`, so this stands in for `_IOBase.flush` and
+    // states `iobase.c`'s sentence -- the one ending in a period -- rather than
+    // the raw layer's.  `BufferedReader.flush` hands its call here, so it is
+    // what a closed reader reports too.
+    if file_is_closed(args[0]) {
+        return Err(crate::PyError::value_error("I/O operation on closed file."));
+    }
     if file_get_fd(args[0]).is_some() {
         return Ok(w_none());
     }

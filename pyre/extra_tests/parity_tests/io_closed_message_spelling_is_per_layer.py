@@ -9,8 +9,11 @@
 #
 # parity-tests reason: `_io` carries two literals on purpose -- `textio.c` and
 # `iobase.c` end the sentence with a period and `fileio.c` and `stringio.c` do
-# not -- and which one a program sees says which layer refused it.  A runtime
-# that picks one spelling for all of them answers the wrong layer.
+# not, while `bufferedio.c` names the operation instead -- and which one a
+# program sees says which layer refused it.  A runtime that picks one spelling
+# for all of them answers the wrong layer, and one that answers at all where a
+# layer refuses (a `StringIO` getter, a `BufferedReader` handing its `flush` to
+# the raw stream) names no layer.
 import io
 import os
 
@@ -48,5 +51,24 @@ assert refusal(lambda: string.write("x")) == NO_PERIOD, refusal(lambda: string.w
 
 # `bytesio.c` sides with the period, so the split is not raw-versus-text.
 assert refusal(lambda: byte.write(b"x")) == PERIOD, refusal(lambda: byte.write(b"x"))
+
+# `bufferedio.c` names the operation instead, and only for the classes that
+# carry the full `flush`.  `BufferedReader` carries `simple_flush`, which hands
+# the call to the raw stream, so its refusal is whatever answers there -- and
+# `fileio.c` states no `flush`, so that is `iobase.c`'s sentence.
+reader = io.BufferedReader(io.FileIO(os.open(os.devnull, os.O_RDONLY), "r"))
+writer = io.BufferedWriter(io.FileIO(os.open(os.devnull, os.O_WRONLY), "w"))
+reader.close()
+writer.close()
+assert refusal(reader.flush) == PERIOD, refusal(reader.flush)
+assert refusal(reader.detach) == PERIOD, refusal(reader.detach)
+assert refusal(writer.flush) == "flush of closed file", refusal(writer.flush)
+assert refusal(lambda: reader.read()) == "read of closed file", refusal(reader.read)
+
+# A getter is a refusal too: `_io_StringIO_line_buffering_get_impl` and its
+# `newlines` neighbour both open at `CHECK_CLOSED`, so neither answers with the
+# constant an open `StringIO` would give.
+assert refusal(lambda: string.line_buffering) == NO_PERIOD, "line_buffering answered"
+assert refusal(lambda: string.newlines) == NO_PERIOD, "newlines answered"
 
 print("OK")
