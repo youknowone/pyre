@@ -146,8 +146,40 @@ pub const MOVABLE_GC_MARKERS: &[&str] = &[
     "list_method_",
 ];
 
-fn addresses_movable(markers: &[&str], name: &str) -> bool {
-    markers.iter().any(|m| name.contains(m))
+/// The callees that say a pointer reaching them is addressed as a movable
+/// object, resolved once for the whole scan.
+///
+/// `hops` is how far past the named callee to look.  At 0 only the callee's own
+/// name is read, which is what the `tier 1.5` column has always done -- and a
+/// thin wrapper defeats it: `module_ns_store` is one line forwarding to
+/// `w_dict_setitem_str_no_proxy` and matches no marker itself.  A zero at 0 hops
+/// therefore says the marker was not the immediate callee's name, not that
+/// nothing is addressed as a list or dict.  Each hop admits a caller of
+/// something already in the set.
+pub fn movable_callee_ids(
+    cg: &super::framework::CallGraph,
+    markers: &[&str],
+    hops: u32,
+) -> HashSet<u64> {
+    let mut out: HashSet<u64> = cg
+        .names
+        .iter()
+        .filter(|(_, n)| markers.iter().any(|m| n.contains(m)))
+        .map(|(&id, _)| id)
+        .collect();
+    for _ in 0..hops {
+        let grown: HashSet<u64> = cg
+            .callees
+            .iter()
+            .filter(|(id, cs)| !out.contains(id) && cs.iter().any(|c| out.contains(c)))
+            .map(|(&id, _)| id)
+            .collect();
+        if grown.is_empty() {
+            break;
+        }
+        out.extend(grown);
+    }
+    out
 }
 
 fn ty_id(t: &TyRef) -> Option<u64> {
@@ -375,15 +407,15 @@ fn successors(t: &TermKind) -> Vec<u64> {
 ///
 /// `gc_tys` selects which pointer kind is being judged — [`gc_ptr_type_ids`]
 /// for a managed reference, [`frame_ptr_type_ids`] for the running frame — and
-/// `movable_markers` ranks the findings for that kind ([`MOVABLE_GC_MARKERS`],
-/// or empty where the kind has no such call).
+/// `movable_callees` ranks the findings for that kind
+/// ([`movable_callee_ids`], or empty where the kind has no such call).
 pub fn scan(
     llbc: &majit_charon_reader::Llbc,
     cg: &super::framework::CallGraph,
     reach: &HashSet<u64>,
     push_roots: &HashSet<u64>,
     gc_tys: &HashSet<u64>,
-    movable_markers: &[&str],
+    movable_callees: &HashSet<u64>,
 ) -> (Vec<Finding>, ScanStats) {
     let mut findings = Vec::new();
     let mut stats = ScanStats::default();
@@ -713,11 +745,7 @@ pub fn scan(
             let CallKind::Fun(FunId::Regular { id: cid }) = &r2.kind else {
                 continue;
             };
-            if !cg
-                .names
-                .get(cid)
-                .is_some_and(|n| addresses_movable(movable_markers, n))
-            {
+            if !movable_callees.contains(cid) {
                 continue;
             }
             for a in &c2.args {

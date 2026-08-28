@@ -327,6 +327,19 @@ fn main() {
         // The other direction, and the one that finds defects rather than
         // overhead: a call that can collect, a GC pointer live across it, and
         // no bracket anywhere in the function.
+        // How far past a named callee the movable ranking looks.  0 is the
+        // shipped behaviour and the one the gate's `tier 1.5` invariant was
+        // recorded against; raising it is a measurement, not a new default.
+        let movable_hops: u32 = std::env::var("GC_MOVABLE_HOPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let movable_callees =
+            liveness::movable_callee_ids(&cg, liveness::MOVABLE_GC_MARKERS, movable_hops);
+        println!(
+            "   movable-addressing callees at {movable_hops} hop(s): {}",
+            movable_callees.len()
+        );
         let gc_tys = liveness::gc_ptr_type_ids(&llbc);
         if gc_tys.is_empty() {
             println!("   (no PyObjectRef type id found — liveness scan skipped)");
@@ -339,7 +352,7 @@ fn main() {
             &reach,
             &push_root_ids,
             &gc_tys,
-            liveness::MOVABLE_GC_MARKERS,
+            &movable_callees,
         );
         println!(
             "   liveness scan: {} bodies; {} with a terminator this reader could not parse; \
@@ -427,7 +440,7 @@ fn main() {
             &conservative,
             &push_root_ids,
             &gc_tys,
-            liveness::MOVABLE_GC_MARKERS,
+            &movable_callees,
         );
         let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
             .iter()
@@ -594,10 +607,13 @@ fn main() {
             continue;
         }
         let no_bracket: std::collections::HashSet<u64> = Default::default();
+        // The frame has no list/dict-addressing call to rank by: a stale frame
+        // is read back through `FrameAnchor`, not dereferenced as a container.
+        let no_movable: std::collections::HashSet<u64> = Default::default();
         let (frames, frame_stats) =
-            liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &[]);
+            liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &no_movable);
         let (frames_conservative, _) =
-            liveness::scan(&llbc, &cg, &conservative, &no_bracket, &frame_tys, &[]);
+            liveness::scan(&llbc, &cg, &conservative, &no_bracket, &frame_tys, &no_movable);
         let frame_fns: std::collections::BTreeSet<&str> =
             frames.iter().map(|f| f.func_name.as_str()).collect();
         println!(
