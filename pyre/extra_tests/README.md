@@ -36,13 +36,14 @@ works.  `testutils.py` is the helper module shipped with the snippets
   breadth-first surface coverage.  The pyre-authored ones carry
   `# pyre-check: gate=1`, which is what CI runs.  Runner:
   `pyre/extra_tests/run.py`.
-- `parity_tests/` — pyre-authored scripts reserved for specific PyPy/JIT/GC
-  invariants not already covered by `snippets/` or the vendored CPython suite
-  under `lib-python/3/test/`.  Do not mirror general language, builtin, or
-  stdlib behavior here. Each script must state both the missing CPython-suite
-  coverage and why JIT/GC/PyPy internals require placement here; the runner
-  rejects missing header fields. Each script cites the upstream file:line it guards;
-  passing requires `exit 0` AND the final stdout line being `OK`.  Runner:
+- `parity_tests/` — the small residual set of pyre-authored PyPy/JIT/GC
+  regressions that no existing `snippets/`, `lib-python/3/test`, root
+  `extra_tests/`, or `bench/synth` test exercises. Extend the existing owner
+  instead of adding a parity script whenever one exists; broad language,
+  builtin, stdlib, and JIT-shape sweeps do not belong here. Each remaining
+  script must state both the missing CPython-suite coverage and the internal
+  reason it cannot live in an existing test. The runner rejects missing header
+  fields; passing requires `exit 0` and a final `OK` line. Runner:
   `pyre/extra_tests/parity_tests/run.py`.
 - `pip/` — one stateful end-to-end sequence rather than a corpus: a release
   binary is driven through `-m venv`, `ensurepip`, a wheel install, a PEP 517
