@@ -723,6 +723,12 @@ pub fn install_builtin_modules() {
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_jp);
     #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_hk);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_kr);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_tw);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_multibytecodec);
     // moduledef.py: `applevel_name = os.name` installs the one posix module
     // under `os.name` — `"posix"` on a POSIX host, `"nt"` on Windows, where a

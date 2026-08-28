@@ -1,4 +1,6 @@
-//! PyPy `_multibytecodec`: wrappers for its vendored cjkcodecs engine.
+//! PyPy `_multibytecodec`: Rust codec ports and the remaining vendored engine.
+
+mod cjkcodecs;
 
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
@@ -16,10 +18,6 @@ type CjkWchar = u16;
 type CjkWchar = u32;
 
 unsafe extern "C" {
-    fn pypy_cjkcodec_gb2312() -> *const c_void;
-    fn pypy_cjkcodec_gbk() -> *const c_void;
-    fn pypy_cjkcodec_gb18030() -> *const c_void;
-    fn pypy_cjkcodec_hz() -> *const c_void;
     fn pypy_cjkcodec_shift_jis() -> *const c_void;
     fn pypy_cjkcodec_cp932() -> *const c_void;
     fn pypy_cjkcodec_euc_jp() -> *const c_void;
@@ -27,7 +25,6 @@ unsafe extern "C" {
     fn pypy_cjkcodec_euc_jis_2004() -> *const c_void;
     fn pypy_cjkcodec_euc_jisx0213() -> *const c_void;
     fn pypy_cjkcodec_shift_jisx0213() -> *const c_void;
-
     fn pypy_cjk_dec_new(codec: *const c_void) -> *mut c_void;
     fn pypy_cjk_dec_init(state: *mut c_void, input: *mut i8, len: isize) -> isize;
     fn pypy_cjk_dec_free(state: *mut c_void);
@@ -65,13 +62,9 @@ unsafe extern "C" {
 }
 
 fn codec_ptr(name: &str) -> Option<*const c_void> {
-    // `c_codecs.py`'s complete `_codecs_cn` and `_codecs_jp` getter tables.
+    // `c_codecs.py`'s remaining C-backed `_codecs_jp` getter table.
     let ptr = unsafe {
         match name {
-            "gb2312" => pypy_cjkcodec_gb2312(),
-            "gbk" => pypy_cjkcodec_gbk(),
-            "gb18030" => pypy_cjkcodec_gb18030(),
-            "hz" => pypy_cjkcodec_hz(),
             "shift_jis" => pypy_cjkcodec_shift_jis(),
             "cp932" => pypy_cjkcodec_cp932(),
             "euc_jp" => pypy_cjkcodec_euc_jp(),
@@ -83,6 +76,10 @@ fn codec_ptr(name: &str) -> Option<*const c_void> {
         }
     };
     (!ptr.is_null()).then_some(ptr)
+}
+
+fn codec_supported(name: &str) -> bool {
+    cjkcodecs::Codec::from_name(name).is_some() || codec_ptr(name).is_some()
 }
 
 struct DecState(*mut c_void);
@@ -217,6 +214,103 @@ fn wchars_to_text(units: &[CjkWchar]) -> Wtf8Buf {
     out
 }
 
+fn export_rust_codec_state(state_sink_slot: Option<usize>, state: &[u8; 8]) {
+    let Some(slot) = state_sink_slot else {
+        return;
+    };
+    let sink = pyre_object::gc_roots::shadow_stack_get(slot);
+    let output = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(sink) };
+    if output.len() == state.len() {
+        output.copy_from_slice(state);
+    }
+}
+
+fn decode_rust_codec_with_state(
+    codec: cjkcodecs::Codec,
+    name: &str,
+    input: &[u8],
+    errors: &str,
+    final_input: bool,
+    initial_state: Option<&[u8; 8]>,
+    state_sink: Option<PyObjectRef>,
+) -> Result<(Wtf8Buf, usize, [u8; 8]), crate::PyError> {
+    // These PyPy codec entries are CODEC_STATELESS.  Preserve the opaque state
+    // bytes exactly as the shared engine's setstate/getstate pair does, while
+    // rooting the app-level bytearray across Python error handlers.
+    let roots = pyre_object::gc_roots::push_roots();
+    let state_sink_slot = state_sink.map(|sink| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(sink);
+        slot
+    });
+    let mut state = initial_state.copied().unwrap_or([0; 8]);
+    let input = input.to_vec();
+    let mut output = Wtf8Buf::new();
+    let mut position = 0;
+    while position < input.len() {
+        let result = cjkcodecs::decode_one(codec, &input[position..], &mut state);
+        export_rust_codec_state(state_sink_slot, &state);
+        match result {
+            cjkcodecs::DecodeOne::Char(value, consumed) => {
+                output.push(
+                    CodePoint::from_u32(value)
+                        .expect("PyPy cjkcodecs mapping contains a Unicode code point"),
+                );
+                position += consumed;
+            }
+            cjkcodecs::DecodeOne::Pair(first, second, consumed) => {
+                output.push(CodePoint::from_u32(first).unwrap());
+                output.push(CodePoint::from_u32(second).unwrap());
+                position += consumed;
+            }
+            cjkcodecs::DecodeOne::Skip(consumed) => position += consumed,
+            cjkcodecs::DecodeOne::Incomplete if !final_input => break,
+            result => {
+                let (reason, error_size) = match result {
+                    cjkcodecs::DecodeOne::Incomplete => {
+                        ("incomplete multibyte sequence", input.len() - position)
+                    }
+                    cjkcodecs::DecodeOne::Illegal(size) => ("illegal multibyte sequence", size),
+                    cjkcodecs::DecodeOne::Char(..)
+                    | cjkcodecs::DecodeOne::Pair(..)
+                    | cjkcodecs::DecodeOne::Skip(..) => {
+                        unreachable!()
+                    }
+                };
+                let end = position.saturating_add(error_size).min(input.len());
+                match errors {
+                    "strict" => {
+                        return Err(crate::typedef::unicode_decode_error(
+                            name, &input, position, end, reason,
+                        ));
+                    }
+                    "ignore" => position = end,
+                    "replace" => {
+                        output.push(CodePoint::from_u32(0xfffd).unwrap());
+                        position = end;
+                    }
+                    _ => {
+                        let mut replacement = Wtf8Buf::new();
+                        let new_position =
+                            crate::type_methods::call_registered_multibyte_decode_error_handler(
+                                errors,
+                                name,
+                                &input,
+                                position,
+                                end,
+                                reason,
+                                &mut replacement,
+                            )?;
+                        output.push_wtf8(&replacement);
+                        position = new_position;
+                    }
+                }
+            }
+        }
+    }
+    Ok((output, position, state))
+}
+
 #[cfg(not(windows))]
 fn wchars_to_text(units: &[CjkWchar]) -> Wtf8Buf {
     let mut out = Wtf8Buf::new();
@@ -237,6 +331,17 @@ fn decode_impl_with_state(
     initial_state: Option<&[u8; 8]>,
     state_sink: Option<PyObjectRef>,
 ) -> Result<(Wtf8Buf, usize, [u8; 8]), crate::PyError> {
+    if let Some(codec) = cjkcodecs::Codec::from_name(name) {
+        return decode_rust_codec_with_state(
+            codec,
+            name,
+            input,
+            errors,
+            final_input,
+            initial_state,
+            state_sink,
+        );
+    }
     let roots = pyre_object::gc_roots::push_roots();
     let state_sink_slot = state_sink.map(|sink| {
         let slot = roots.base();
@@ -371,6 +476,121 @@ fn encode_replacement_text(
     Ok((output, next_state))
 }
 
+fn encode_rust_codec_with_state(
+    codec: cjkcodecs::Codec,
+    name: &str,
+    w_input: PyObjectRef,
+    errors: &str,
+    final_input: bool,
+    initial_state: Option<&[u8; 8]>,
+    state_sink: Option<PyObjectRef>,
+) -> Result<(Vec<u8>, usize, [u8; 8]), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let input_slot = roots.base();
+    let _ = roots.pin_root(w_input);
+    let state_sink_slot = state_sink.map(|sink| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(sink);
+        slot
+    });
+    let w_input = roots.get(input_slot);
+    if unsafe { !pyre_object::is_str(w_input) } {
+        return Err(crate::PyError::type_error("encoder argument must be str"));
+    }
+    // Materialize code points before an error handler can run and move the
+    // input object.  PyPy's encoder advances in Py_UNICODE units; pyre strings
+    // expose code-point indexes, matching the observable error spans.
+    let points: Vec<u32> = unsafe { pyre_object::w_str_get_wtf8(w_input) }
+        .code_points()
+        .map(CodePoint::to_u32)
+        .collect();
+    let mut state = initial_state.copied().unwrap_or([0; 8]);
+    let mut output = Vec::new();
+    let mut position = 0;
+    while position < points.len() {
+        let result = cjkcodecs::encode_one(codec, &points[position..], final_input, &mut state);
+        export_rust_codec_state(state_sink_slot, &state);
+        match result {
+            cjkcodecs::EncodeOne::Bytes(bytes, length, consumed) => {
+                output.extend_from_slice(&bytes[..length]);
+                position += consumed;
+            }
+            cjkcodecs::EncodeOne::Incomplete if !final_input => break,
+            result => {
+                let error_size = match result {
+                    cjkcodecs::EncodeOne::Illegal(size) => size,
+                    cjkcodecs::EncodeOne::Incomplete => points.len() - position,
+                    cjkcodecs::EncodeOne::Bytes(..) => unreachable!(),
+                };
+                let end = position.saturating_add(error_size).min(points.len());
+                let (replacement, new_position) = match errors {
+                    "strict" => {
+                        return Err(crate::typedef::unicode_encode_error(
+                            name,
+                            roots.get(input_slot),
+                            position,
+                            end,
+                            "illegal multibyte sequence",
+                        ));
+                    }
+                    "ignore" => (Vec::new(), end),
+                    "replace" => {
+                        let (bytes, next_state) = encode_replacement_text(
+                            name,
+                            w_str_new("?"),
+                            &state,
+                            state_sink_slot.map(pyre_object::gc_roots::shadow_stack_get),
+                        )?;
+                        state = next_state;
+                        export_rust_codec_state(state_sink_slot, &state);
+                        (bytes, end)
+                    }
+                    _ => {
+                        let (replacement, new_position) =
+                            crate::type_methods::call_registered_encode_error_handler(
+                                errors,
+                                name,
+                                roots.get(input_slot),
+                                points.len(),
+                                position,
+                                end,
+                                "illegal multibyte sequence",
+                            )?;
+                        let bytes = match replacement {
+                            crate::type_methods::EncodeReplacement::Bytes(bytes) => bytes,
+                            crate::type_methods::EncodeReplacement::Str(points) => {
+                                let mut text = Wtf8Buf::new();
+                                for point in points {
+                                    text.push(CodePoint::from_u32(point).unwrap());
+                                }
+                                let (bytes, next_state) = encode_replacement_text(
+                                    name,
+                                    w_str_from_wtf8_managed(text),
+                                    &state,
+                                    state_sink_slot.map(pyre_object::gc_roots::shadow_stack_get),
+                                )?;
+                                state = next_state;
+                                export_rust_codec_state(state_sink_slot, &state);
+                                bytes
+                            }
+                        };
+                        (bytes, new_position)
+                    }
+                };
+                output.extend_from_slice(&replacement);
+                position = new_position;
+            }
+        }
+    }
+    if final_input {
+        if let Some((bytes, length)) = cjkcodecs::encode_reset(codec, &mut state) {
+            output.extend_from_slice(&bytes[..length]);
+            export_rust_codec_state(state_sink_slot, &state);
+        }
+    }
+    Ok((output, position, state))
+}
+
 fn encode_impl_with_state(
     name: &str,
     w_input: PyObjectRef,
@@ -379,6 +599,17 @@ fn encode_impl_with_state(
     initial_state: Option<&[u8; 8]>,
     state_sink: Option<PyObjectRef>,
 ) -> Result<(Vec<u8>, usize, [u8; 8]), crate::PyError> {
+    if let Some(codec) = cjkcodecs::Codec::from_name(name) {
+        return encode_rust_codec_with_state(
+            codec,
+            name,
+            w_input,
+            errors,
+            final_input,
+            initial_state,
+            state_sink,
+        );
+    }
     let roots = pyre_object::gc_roots::push_roots();
     let input_slot = roots.base();
     let _ = roots.pin_root(w_input);
@@ -576,7 +807,7 @@ pub(crate) fn getcodec(args: &[PyObjectRef]) -> crate::PyResult {
         return Err(crate::PyError::type_error("getcodec() missing codec name"));
     };
     let name = crate::baseobjspace::text_w(w_name)?;
-    if codec_ptr(name).is_none() {
+    if !codec_supported(name) {
         return Err(crate::PyError::new(
             crate::PyErrorKind::LookupError,
             "no such codec is supported.",

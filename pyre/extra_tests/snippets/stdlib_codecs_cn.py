@@ -42,6 +42,16 @@ for name, text in (
     assert codec.decode(encoded) == (text, len(encoded)), name
 
 
+for name, text, encoded in (
+    ("gb2312", "・", bytes.fromhex("a1a4")),
+    ("gbk", "·—―", bytes.fromhex("a1a4a1aaa844")),
+    ("gb18030", "\x80・€\U00010000😀", bytes.fromhex("813081308139a739a2e3903081309439fc36")),
+):
+    codec = _codecs_cn.getcodec(name)
+    assert codec.encode(text) == (encoded, len(text)), name
+    assert codec.decode(encoded) == (text, len(encoded)), name
+
+
 # PyPy keeps this shift mode on one persistent encodebuf/decodebuf.  The
 # app-level port serializes the same MultibyteCodec_State across calls; the
 # exposed integers follow CPython 3.14's endian-independent codec contract.

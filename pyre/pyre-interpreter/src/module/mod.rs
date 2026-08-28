@@ -26,7 +26,16 @@ pub mod _codecs;
 pub mod _codecs_cn;
 #[allow(non_snake_case)]
 #[cfg(not(target_arch = "wasm32"))]
+pub mod _codecs_hk;
+#[allow(non_snake_case)]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod _codecs_jp;
+#[allow(non_snake_case)]
+#[cfg(not(target_arch = "wasm32"))]
+pub mod _codecs_kr;
+#[allow(non_snake_case)]
+#[cfg(not(target_arch = "wasm32"))]
+pub mod _codecs_tw;
 #[allow(non_snake_case)]
 pub mod _collections;
 #[allow(non_snake_case)]
