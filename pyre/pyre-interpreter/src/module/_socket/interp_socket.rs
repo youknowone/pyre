@@ -1740,7 +1740,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 "if_indextoname",
                 |args| {
                     // PyPy `if_indextoname` receives an unsigned interface
-                    // index through its gateway.  CPython 3.14 exposes the
+                    // index through its gateway.  3.14 exposes the
                     // negative leaf as ValueError (`testInvalidInterfaceIndexToName`),
                     // while PyPy spells it OverflowError; the public 3.14
                     // result governs this conversion, with the same unsigned
@@ -2257,7 +2257,7 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     // `isinstance_w(..., w_int)` branch and passes a decimal
                     // service string to `rsocket.getaddrinfo`.  PyPy 3.11's
                     // `space.int_w` narrows that branch to a machine word, but
-                    // CPython 3.14 `test_getaddrinfo_int_port_overflow`
+                    // 3.14 `test_getaddrinfo_int_port_overflow`
                     // requires an arbitrary-size int to reach libc as text:
                     // [3.14-spec] decimal bigint service ↔ PyPy machine-int
                     // service — observable exception is gaierror/success, never
@@ -2564,7 +2564,7 @@ fn socket_type() -> pyre_object::PyObjectRef {
     static SOCKET_TYPE_OBJ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SOCKET_TYPE_OBJ.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("socket", init_socket_type);
-        // PyPy's `W_Socket.typedef` is a builtin immutable type. CPython
+        // PyPy's `W_Socket.typedef` is a builtin immutable type. 3.14
         // exposes the same immutable public type while constructing it from a
         // module heap spec, so retain HEAPTYPE and set IMMUTABLETYPE as well.
         crate::typedef::mark_cpython_heap_type(tp, true);
@@ -2768,16 +2768,6 @@ enum SocketConnectFailure {
     Errno(i32),
     Timeout(i32),
     Exception(crate::PyError),
-}
-
-#[cfg(any(unix, windows))]
-fn socket_connect_timed(
-    fd: rffi::Socket,
-    storage: &rffi::sockaddr_storage,
-    slen: rffi::SockLen,
-    timeout: f64,
-) -> Result<(), SocketConnectFailure> {
-    socket_connect_wait(fd, storage, slen, timeout)
 }
 
 #[cfg(any(unix, windows))]
@@ -3735,7 +3725,7 @@ fn pack_inet_addr(
 
     if !unsafe { pyre_object::is_tuple(addr) } {
         // [3.14-spec] PyPy's tuple unpacking exposes its generic iterable
-        // error here; CPython 3.14 names the operation and rejected type
+        // error here; 3.14 names the operation and rejected type
         // (`testSendtoErrors`).  Packing still follows PyPy's owner.
         return Err(crate::PyError::type_error(format!(
             "{caller}(): AF_INET address must be tuple, not {}",
@@ -4152,7 +4142,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             let fd = rffi::socket_from_i64(fd);
             // [3.14-spec] PyPy `W_Socket.descr_init` only probes SO_TYPE when
             // `type == -1`, and consequently accepts a regular-file fd when
-            // the caller supplies family/type.  CPython 3.14's public
+            // the caller supplies family/type.  The public 3.14
             // `test_socket_fileno_requires_socket_fd` requires ENOTSOCK for
             // both forms.  No JIT/immutability hint covers `descr_init`, so
             // validate the descriptor once while keeping PyPy's field-owner
@@ -4485,7 +4475,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let (storage, slen) = pack_inet_addr("connect", family, proto, args[1])?;
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 if let Some(timeout) = socket_positive_timeout(obj) {
-                    return match socket_connect_timed(fd, &storage, slen, timeout) {
+                    return match socket_connect_wait(fd, &storage, slen, timeout) {
                         Ok(()) => Ok(pyre_object::w_none()),
                         Err(SocketConnectFailure::Errno(errno)) => Err(socket_io_err_for_operation(
                             obj,
@@ -4542,12 +4532,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let (storage, slen) = pack_inet_addr("connect_ex", family, proto, args[1])?;
                 let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 if let Some(timeout) = socket_positive_timeout(obj) {
-                    return match socket_connect_timed(fd, &storage, slen, timeout) {
+                    return match socket_connect_wait(fd, &storage, slen, timeout) {
                         Ok(()) => Ok(pyre_object::w_int_new(0)),
-                        Err(SocketConnectFailure::Errno(errno)) => {
-                            Ok(pyre_object::w_int_new(errno as i64))
-                        }
-                        Err(SocketConnectFailure::Timeout(errno)) => {
+                        Err(SocketConnectFailure::Errno(errno))
+                        | Err(SocketConnectFailure::Timeout(errno)) => {
                             Ok(pyre_object::w_int_new(errno as i64))
                         }
                         Err(SocketConnectFailure::Exception(error)) => Err(error),
@@ -4621,7 +4609,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             } else {
                 0
             };
-            // CPython's public sendall timeout is one operation-wide deadline;
+            // The public 3.14 sendall timeout is one operation-wide deadline;
             // PyPy's `RSocket.wait_for_data(True)` supplies the writable wait.
             // Compute it once so handled EINTR cannot restart the full period.
             let deadline = socket_positive_timeout(obj).map(|timeout| {
