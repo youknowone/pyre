@@ -2245,6 +2245,10 @@ impl RPythonTyper {
             // function `rlist.rtype_newlist(hop)` (`ll_newlist` +
             // positional `ll_setitem_fast`). No per-Repr dispatch.
             "newlist" => super::rlist::rtype_newlist(hop),
+            // `objectmodel.newlist_hint` ExtRegistry specialization:
+            // allocate resized-list storage from the hint while keeping the
+            // logical length zero and preserving the MemoryError edge.
+            "newlist_hint" => super::rlist::rtype_newlist_hint(hop),
             // rtyper.py — `translate_op_alloc_and_set` calls the
             // free function `rlist.rtype_alloc_and_set(hop)` (`ll_newlist`
             // + `ll_alloc_and_set`). No per-Repr dispatch.

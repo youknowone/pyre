@@ -2186,10 +2186,11 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
         return Err(PyError::new(PyErrorKind::MemoryError, ""));
     }
-    let mut items: Vec<PyObjectRef> = Vec::new();
-    items
-        .try_reserve_exact(cap)
-        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+    // RPython `ll_mul` allocates the result through `ll_newlist(resultlen)`;
+    // the fallible Rust helper is translated as `newlist_hint(cap)`, keeping
+    // both the preallocation and its MemoryError edge without exposing
+    // `Vec::try_reserve_exact` to source translation.
+    let mut items: Vec<PyObjectRef> = crate::builtins::try_pyobject_vec_with_capacity(cap)?;
     for _ in 0..count {
         for i in 0..len {
             if let Some(item) = w_list_getitem(list, i as i64) {

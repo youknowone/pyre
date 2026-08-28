@@ -835,6 +835,21 @@ fn is_vec_ctor_segments(segments: &[String]) -> bool {
         && (segments[2] == "with_capacity" || segments[2] == "new")
 }
 
+/// `pyre_interpreter::builtins::try_pyobject_vec_with_capacity(sizehint)` is
+/// the Rust source spelling of RPython's `objectmodel.newlist_hint(sizehint)`.
+///
+/// The helper is deliberately an opaque source-translation boundary, just as
+/// upstream's function is handled by an ExtRegistryEntry instead of tracing
+/// its Python body.  Its ordinary interpreter body still performs the
+/// fallible Rust reservation; translated callers take this exact path into
+/// `rtype_newlist_hint` and therefore retain both the capacity hint and the
+/// MemoryError edge.
+fn is_try_pyobject_vec_with_capacity_segments(segments: &[String]) -> bool {
+    segments.len() >= 2
+        && segments[segments.len() - 2] == "builtins"
+        && segments[segments.len() - 1] == "try_pyobject_vec_with_capacity"
+}
+
 /// `alloc::vec::from_elem(elem, count)` (Rust MIR `vec![elem; count]`) —
 /// the repeated resizable-list constructor.  Routed in [`translate_op`] to
 /// `newlist(elem)` + `mul(list, count)`, the same `[a] * b` shape that
@@ -2109,6 +2124,21 @@ pub fn translate_op(
                     // dropped — see [`is_vec_ctor_segments`].
                     if is_vec_ctor_segments(segments) {
                         return Ok(vec![FlowspaceOp::new("newlist", vec![], result)]);
+                    }
+                    // `try_pyobject_vec_with_capacity(sizehint)?` is the
+                    // fallible Rust spelling of
+                    // `objectmodel.newlist_hint(sizehint)`. The
+                    // Result-to-exception pass has already made this call's
+                    // result the normal-edge Vec payload, so the synthetic op
+                    // has precisely the upstream one-argument/result shape.
+                    if is_try_pyobject_vec_with_capacity_segments(segments) {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "try_pyobject_vec_with_capacity requires exactly one size hint, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        return Ok(vec![FlowspaceOp::new("newlist_hint", arg_hls, result)]);
                     }
                     // `vec![elem; count]` lowers (in Rust MIR) to a call to
                     // `alloc::vec::from_elem(elem, count)`. Emit the same
@@ -5084,6 +5114,38 @@ mod tests {
         assert_eq!(translated[1].args[0], translated[0].result);
         assert_eq!(translated[1].args[1], count);
         assert_eq!(translated[1].result, result);
+    }
+
+    #[test]
+    fn translate_op_try_pyobject_vec_with_capacity_becomes_newlist_hint() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_newlist_hint_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let hint = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), hint.clone());
+        value_map.insert(vars[1].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_interpreter".into(),
+                        "builtins".into(),
+                        "try_pyobject_vec_with_capacity".into(),
+                    ],
+                },
+                args: vec![vars[0].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("try_pyobject_vec_with_capacity must lower as the newlist_hint intrinsic");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "newlist_hint");
+        assert_eq!(translated[0].args, vec![hint]);
+        assert_eq!(translated[0].result, result);
+        assert!(op_canraise(&op.kind));
     }
 
     /// The frontend cannot see the adapter's expansion: `lower_function`

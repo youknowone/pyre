@@ -453,6 +453,62 @@ pub fn rtype_newlist(hop: &HighLevelOp) -> RTypeResult {
     ))
 }
 
+/// RPython `objectmodel.py`'s `newlist_hint` ExtRegistry specialization and
+/// `lltypesystem/rlist.py:ll_newlist_hint`:
+///
+/// ```python
+/// def specialize_call(self, hop):
+///     v_hint = hop.inputarg(lltype.Signed, 0)
+///     r_list = hop.r_result
+///     hop.exception_is_here()
+///     return hop.gendirectcall(r_list.LIST.ll_newlist_hint, v_hint)
+///
+/// def ll_newlist_hint(LIST, lengthhint):
+///     ll_assert(lengthhint >= 0, "negative list length")
+///     l = malloc(LIST)
+///     l.length = 0
+///     l.items = malloc(LIST.items.TO, lengthhint)
+///     return l
+/// ```
+///
+/// The annotator marks the result resized, so only [`ListRepr`] is valid.
+/// Capacity and logical length intentionally differ: the backing array uses
+/// `lengthhint`, while the list header starts at zero for subsequent append.
+pub fn rtype_newlist_hint(hop: &HighLevelOp) -> RTypeResult {
+    if hop.nb_args() != 1 {
+        return Err(TyperError::message(format!(
+            "rtype_newlist_hint: expected one size hint, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_newlist_hint: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    let r_list = any_r.downcast_ref::<ListRepr>().ok_or_else(|| {
+        TyperError::message("rtype_newlist_hint: hop.r_result is not a resized ListRepr")
+    })?;
+    let v_hint = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 0)?;
+    hop.exception_is_here()?;
+    let ptr_lltype = r_list.lltype.clone();
+    let item_lltype = r_list.item_repr.lowleveltype().clone();
+    let helper = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newlist_hint".to_string(),
+            vec![LowLevelType::Signed],
+            ptr_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_newlist_hint_helper_graph("ll_newlist_hint", ptr.clone(), item.clone())
+            },
+        )?
+    };
+    hop.gendirectcall(&helper, vec![v_hint])
+}
+
 /// Repr-generic body of [`rtype_newlist`], shared by the resized `ListRepr`
 /// and the fixed-size `FixedSizeListRepr`. The `LIST.ll_newlist(n)` +
 /// positional `ll_setitem_fast` shape is identical; only the receiver layout
@@ -3633,6 +3689,28 @@ pub(crate) fn build_ll_newlist_helper_graph(
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
+    build_ll_newlist_helper_graph_inner(name, layout, ptr_lltype, item_lltype, false)
+}
+
+/// Synthesise the resized-list-only `ll_newlist_hint` helper.  Kept separate
+/// from [`build_ll_newlist_helper_graph`] at the public surface because these
+/// are distinct ADT methods upstream and therefore distinct memoized helper
+/// graphs.
+fn build_ll_newlist_hint_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    build_ll_newlist_helper_graph_inner(name, ListLayout::Resized, ptr_lltype, item_lltype, true)
+}
+
+fn build_ll_newlist_helper_graph_inner(
+    name: &str,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    length_is_hint: bool,
+) -> Result<PyGraph, TyperError> {
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
     let length_arg = variable_with_lltype("length", LowLevelType::Signed);
     let startblock = Block::shared(vec![Hlvalue::Variable(length_arg.clone())]);
@@ -3643,6 +3721,31 @@ pub(crate) fn build_ll_newlist_helper_graph(
         Hlvalue::Variable(return_var),
     );
     let array_type = LowLevelType::Array(Box::new(Array::gc(item_lltype.clone())));
+
+    if length_is_hint {
+        // lltypesystem/rlist.py `ll_newlist_hint` begins with
+        // `ll_assert(lengthhint >= 0, "negative list length")`.
+        let nonnegative = variable_with_lltype("nonnegative", LowLevelType::Bool);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_ge",
+            vec![
+                Hlvalue::Variable(length_arg.clone()),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(nonnegative.clone()),
+        ));
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "debug_assert",
+            vec![
+                Hlvalue::Variable(nonnegative),
+                constant_with_lltype(
+                    ConstValue::byte_str("negative list length"),
+                    LowLevelType::Void,
+                ),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    }
 
     let new_lst = match layout {
         ListLayout::Fixed => {
@@ -3696,7 +3799,11 @@ pub(crate) fn build_ll_newlist_helper_graph(
                 vec![
                     Hlvalue::Variable(header.clone()),
                     void_field_const("length"),
-                    Hlvalue::Variable(length_arg),
+                    if length_is_hint {
+                        signed_const(0)
+                    } else {
+                        Hlvalue::Variable(length_arg)
+                    },
                 ],
                 Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
             ));
@@ -7087,7 +7194,7 @@ mod tests {
     use crate::annotator::model::{SomeInteger, SomeList, SomeValue};
     use crate::flowspace::model::Variable;
     use crate::translator::rtyper::pairtype::ReprClassId;
-    use crate::translator::rtyper::rint::{IntegerRepr, signed_repr};
+    use crate::translator::rtyper::rint::{IntegerRepr, signed_repr, unsigned_repr};
     use crate::translator::rtyper::rmodel::rtyper_makerepr;
     use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
 
@@ -7131,6 +7238,99 @@ mod tests {
             matches!(items_ptr.TO, PtrTarget::Array(_)),
             "items must point to a GcArray"
         );
+    }
+
+    #[test]
+    fn ll_newlist_hint_uses_hint_for_storage_but_zero_for_length() {
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let repr = ListRepr::new(&rtyper, r_int).expect("ListRepr::new");
+        let graph = build_ll_newlist_hint_helper_graph(
+            "ll_newlist_hint",
+            repr.lltype.clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build ll_newlist_hint");
+        let block = graph.graph.borrow().startblock.clone();
+        let block = block.borrow();
+        assert!(
+            block
+                .operations
+                .iter()
+                .any(|op| op.opname == "debug_assert"),
+            "ll_newlist_hint must retain upstream's nonnegative assertion"
+        );
+        let malloc_items = block
+            .operations
+            .iter()
+            .find(|op| op.opname == "malloc_varsize")
+            .expect("hint helper allocates the backing array");
+        assert!(
+            matches!(&malloc_items.args[2], Hlvalue::Variable(v) if v.name().starts_with("length")),
+            "backing allocation must use the size hint: {:?}",
+            malloc_items.args
+        );
+        let set_length = block
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "setfield"
+                    && matches!(&op.args[1], Hlvalue::Constant(c) if matches!(&c.value, ConstValue::ByteStr(name) if name == b"length"))
+            })
+            .expect("hint helper initializes the logical length");
+        assert!(
+            matches!(&set_length.args[2], Hlvalue::Constant(c) if c.value == ConstValue::Int(0)),
+            "logical length must start at zero: {:?}",
+            set_length.args
+        );
+    }
+
+    #[test]
+    fn translate_operation_newlist_hint_accepts_rust_usize_and_calls_helper() {
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_item: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_item).expect("ListRepr::new"));
+        let r_hint: Arc<dyn Repr> = unsigned_repr();
+        let hint = Variable::new();
+        hint.set_concretetype(Some(LowLevelType::Unsigned));
+        let hint_h = Hlvalue::Variable(hint);
+        let result = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "newlist_hint",
+            vec![hint_h.clone()],
+            Hlvalue::Variable(result),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(hint_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(true, true)));
+        hop.args_r.borrow_mut().push(Some(r_hint));
+        *hop.r_result.borrow_mut() = Some(r_list);
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("newlist_hint dispatch")
+            .expect("newlist_hint result");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "cast_uint_to_int"),
+            "Rust usize hint must enter upstream's Signed specialization"
+        );
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "direct_call"),
+            "newlist_hint must call ll_newlist_hint"
+        );
+        assert!(ops._called_exception_is_here_or_cannot_occur);
     }
 
     /// `translate_operation("newlist")` routes to [`rtype_newlist`], which

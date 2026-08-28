@@ -11585,6 +11585,19 @@ pub fn try_vec_with_capacity<T>(count: usize) -> Result<Vec<T>, crate::PyError> 
     Ok(out)
 }
 
+/// `objectmodel.newlist_hint` for a `PyObjectRef` item list.
+///
+/// RPython handles `newlist_hint` through an ExtRegistry specialization:
+/// translation does not inspect the helper body, but emits
+/// `LIST.ll_newlist_hint` directly.  Rust generic calls are monomorphized into
+/// their caller before the LLBC front end sees them, so this non-generic seam
+/// carries the equivalent translation boundary. `flowspace_adapter` replaces
+/// the call with `newlist_hint`; generated JitCode never residualizes it.
+#[majit_macros::dont_look_inside]
+pub fn try_pyobject_vec_with_capacity(count: usize) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    try_vec_with_capacity(count)
+}
+
 /// The `Wtf8Buf` counterpart of [`try_vec_with_capacity`], for the str
 /// methods that size their buffer from a caller-supplied `width`.
 pub fn try_wtf8_with_capacity(

@@ -174,6 +174,12 @@ pub enum OpKind {
     NewDict,
     NewTuple,
     NewList,
+    /// `objectmodel.newlist_hint(sizehint)`'s ExtRegistry specialization.
+    /// RPython does not expose this as an ordinary operation.py subclass;
+    /// pyre gives the specialization a synthetic high-level opname so the
+    /// Rust `try_vec_with_capacity` spelling can enter the same annotator and
+    /// rtyper path without translating the Rust allocator body.
+    NewListHint,
     /// `StringBuilder()` / `UnicodeBuilder()` construction.  A pyre
     /// adaptation of the RPython `rlib.rstring` ExtRegistryEntry ctor
     /// (`simple_call` on the builder class → `SomeStringBuilder`,
@@ -205,6 +211,7 @@ pub enum BuiltinException {
     UnicodeDecodeError,
     ZeroDivisionError,
     OverflowError,
+    MemoryError,
     IndexError,
     KeyError,
     StopIteration,
@@ -222,6 +229,7 @@ impl BuiltinException {
             BuiltinException::UnicodeDecodeError => "UnicodeDecodeError",
             BuiltinException::ZeroDivisionError => "ZeroDivisionError",
             BuiltinException::OverflowError => "OverflowError",
+            BuiltinException::MemoryError => "MemoryError",
             BuiltinException::IndexError => "IndexError",
             BuiltinException::KeyError => "KeyError",
             BuiltinException::StopIteration => "StopIteration",
@@ -347,6 +355,7 @@ impl OpKind {
             "newdict" => OpKind::NewDict,
             "newtuple" => OpKind::NewTuple,
             "newlist" => OpKind::NewList,
+            "newlist_hint" => OpKind::NewListHint,
             "newstringbuilder" => OpKind::NewStringBuilder,
             "pow" => OpKind::Pow,
             "iter" => OpKind::Iter,
@@ -454,6 +463,7 @@ impl OpKind {
             OpKind::NewDict => "newdict",
             OpKind::NewTuple => "newtuple",
             OpKind::NewList => "newlist",
+            OpKind::NewListHint => "newlist_hint",
             OpKind::NewStringBuilder => "newstringbuilder",
             OpKind::Pow => "pow",
             OpKind::Iter => "iter",
@@ -577,6 +587,10 @@ impl OpKind {
             | OpKind::SimpleCall
             | OpKind::CallArgs
             | OpKind::Hint => None,
+
+            // Pyre's synthetic spelling of the one-argument
+            // `newlist_hint(sizehint)` ExtRegistry specialization.
+            OpKind::NewListHint => Some(1),
         }
     }
 
@@ -704,6 +718,7 @@ impl OpKind {
             | OpKind::Hint
             | OpKind::NewDict
             | OpKind::NewList
+            | OpKind::NewListHint
             | OpKind::NewStringBuilder
             | OpKind::Iter
             | OpKind::Next
@@ -838,6 +853,7 @@ impl OpKind {
             | OpKind::NewDict
             | OpKind::NewTuple
             | OpKind::NewList
+            | OpKind::NewListHint
             | OpKind::NewStringBuilder
             | OpKind::Pow => Dispatch::None,
         }
@@ -891,6 +907,10 @@ impl OpKind {
             // Explicit HLOperation subclasses with custom canraise.
             OpKind::GetAttr | OpKind::Iter => &[],
             OpKind::Next => &[StopIteration, RuntimeError],
+            // `objectmodel.newlist_hint` specializes through
+            // `hop.exception_is_here()`; allocation failure is the only
+            // exception admitted by the fallible Rust source helper.
+            OpKind::NewListHint => &[MemoryError],
 
             // operation.py:728-731.
             OpKind::GetItem | OpKind::GetItemIdx | OpKind::SetItem | OpKind::DelItem => {
@@ -2432,6 +2452,14 @@ impl HLOperation {
                     // operation.py — NewList.consider.
                     OpKind::NewList => {
                         let list = annotator.bookkeeper.newlist(&args_s, None)?;
+                        Ok(Some(SomeValue::List(list)))
+                    }
+                    // objectmodel.py `Entry.compute_result_annotation`:
+                    // create an empty list and mark it resized.  The size
+                    // hint affects allocation only, not the item annotation.
+                    OpKind::NewListHint => {
+                        let list = annotator.bookkeeper.newlist(&[], None)?;
+                        list.listdef.resize()?;
                         Ok(Some(SomeValue::List(list)))
                     }
                     // `StringBuilder()` construction — the ExtRegistryEntry
