@@ -110,6 +110,28 @@ pub struct PipelineResult {
 pub struct CompiledJitDriver {
     pub portal: CallPath,
     pub main_jitcode_index: usize,
+    /// RPython: `jitdriver.greens` — the green names, in declaration order.
+    #[serde(default)]
+    pub greens: Vec<String>,
+    /// RPython: `jitdriver.reds`. Empty for an auto-red driver, whose reds were
+    /// never declared; `red_args_types` describes them in that case.
+    #[serde(default)]
+    pub reds: Vec<String>,
+    /// RPython: `jd._green_args_spec` (`warmspot.py:663`), parallel to `greens`.
+    #[serde(default)]
+    pub green_args_spec: Vec<majit_ir::Type>,
+    /// RPython: `jd.red_args_types` (`warmspot.py:664`).
+    ///
+    /// Read off the merge-point operands during codewriting, so a consumer
+    /// building the run-time driver takes the kinds the graph actually has
+    /// rather than re-typing the build's declaration. Without this the two
+    /// accounts are independent and nothing makes them agree.
+    #[serde(default)]
+    pub red_args_types: Vec<majit_ir::Type>,
+    /// RPython: `jitdriver.virtualizables` — the red names declared
+    /// virtualizable. Empty is the common non-pyre case.
+    #[serde(default)]
+    pub virtualizables: Vec<String>,
 }
 
 /// Result of running the pipeline on a full program.
@@ -228,6 +250,11 @@ mod tests {
             jit_drivers: vec![CompiledJitDriver {
                 portal: CallPath::from_segments(["eval", "mainloop"]),
                 main_jitcode_index: 0,
+                greens: Vec::new(),
+                reds: Vec::new(),
+                green_args_spec: Vec::new(),
+                red_args_types: Vec::new(),
+                virtualizables: Vec::new(),
             }],
             jitcodes: vec![Arc::new(JitCode::new("consts"))],
             symbolic_fnaddr_paths: Vec::new(),

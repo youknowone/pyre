@@ -5861,6 +5861,25 @@ impl<'a> Transformer<'a> {
                     &green_kinds,
                     &red_kinds,
                 );
+                // warmspot.py:663-664 `jd._green_args_spec` / `jd.red_args_types`
+                // are read off the marker's own operands, not off the
+                // declaration. Record them here for the same reason upstream
+                // does it here: this is where the marker operands exist. A
+                // consumer that builds the run-time driver then works from the
+                // graph's answer instead of re-typing the declaration, which is
+                // what makes the two unable to disagree. For an auto-red driver
+                // these describe the reds `autodetect_jit_markers_redvars` just
+                // found, which nothing else records.
+                let green_args_spec = self.marker_operand_kinds(greens_raw);
+                let red_args_types = self.marker_operand_kinds(reds_raw);
+                {
+                    let jd = self
+                        .callcontrol
+                        .as_deref_mut()?
+                        .jitdriver_sd_from_jitdriver_mut(jitdriver_index)?;
+                    jd.green_args_spec = green_args_spec;
+                    jd.red_args_types = red_args_types;
+                }
                 if autoreds {
                     let jd = self
                         .callcontrol
@@ -11707,6 +11726,74 @@ mod tests {
         assert!(
             ops[5].result.is_none(),
             "jit_merge_point produces no result"
+        );
+    }
+
+    /// `warmspot.py:663-664` reads `jd._green_args_spec` / `jd.red_args_types`
+    /// off the marker's operands. A consumer that builds the run-time driver
+    /// from the build artefact has no graph to read, so the rewrite has to
+    /// leave the answer on the record — and it has to be the graph's answer,
+    /// which is why this driver declares no kinds at all.
+    #[test]
+    fn the_merge_point_rewrite_records_the_graphs_own_operand_kinds() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["test", "portal"]),
+            vec!["pc".into(), "program".into()],
+            vec!["vm".into(), "base".into()],
+            // Undeclared on both axes: whatever comes back was read from the
+            // graph, not echoed from here.
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            cc.jitdrivers_sd()[0].green_args_spec.is_empty()
+                && cc.jitdrivers_sd()[0].red_args_types.is_empty(),
+            "a driver whose portal has not been rewritten yet holds no kinds",
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0));
+
+        let mut graph = crate::model::FunctionGraph::new("mixed_kind_merge_point_fixture");
+        let receiver = graph.alloc_value_var();
+        let pc = graph.alloc_value_var();
+        let program = graph.alloc_value_var();
+        let vm = graph.alloc_value_var();
+        let base = graph.alloc_value_var();
+        // Mixed and deliberately not grouped: an implementation that sorted by
+        // kind, or that reused the greens' kinds for the reds, would still
+        // produce two two-element lists.
+        FunctionGraph::set_concretetype_of_inline(&pc, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&program, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&vm, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+
+        transformer
+            .try_handle_jit_marker(
+                JitMarkerKey::JitMergePoint,
+                &[receiver, pc, program, vm, base],
+                &graph,
+            )
+            .expect("portal_jd + cc + 2 greens + 2 reds satisfies dispatch preconditions");
+
+        let jd = &cc.jitdrivers_sd()[0];
+        assert_eq!(
+            jd.green_args_spec,
+            vec![majit_ir::Type::Int, majit_ir::Type::Ref],
+        );
+        assert_eq!(
+            jd.red_args_types,
+            vec![majit_ir::Type::Ref, majit_ir::Type::Int],
         );
     }
 

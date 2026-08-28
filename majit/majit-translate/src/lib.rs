@@ -2051,6 +2051,14 @@ fn analyze_pipeline_from_module_paths(
                 .as_ref()
                 .expect("configured JIT driver must have a main JitCode")
                 .index(),
+            greens: driver.greens.clone(),
+            reds: driver.reds.clone(),
+            // The graph-derived kinds jtransform recorded at the merge point,
+            // not the declaration on `green_kinds` / `red_kinds`: those are
+            // optional and a driver may leave them empty.
+            green_args_spec: driver.green_args_spec.clone(),
+            red_args_types: driver.red_args_types.clone(),
+            virtualizables: driver.virtualizables.clone(),
         })
         .collect();
     pipeline.jitcodes = jitcodes;

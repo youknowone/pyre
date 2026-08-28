@@ -169,6 +169,11 @@ mod tests {
             jit_drivers: vec![crate::pipeline::CompiledJitDriver {
                 portal: crate::CallPath::from_segments(["engine", "mainloop"]),
                 main_jitcode_index: 0,
+                greens: Vec::new(),
+                reds: Vec::new(),
+                green_args_spec: Vec::new(),
+                red_args_types: Vec::new(),
+                virtualizables: Vec::new(),
             }],
             jitcodes: vec![main_jitcode],
             symbolic_fnaddr_paths: Vec::new(),
