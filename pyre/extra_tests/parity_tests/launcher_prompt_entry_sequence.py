@@ -67,10 +67,13 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "PROMPT REACHED" in out, (out, err)
 
     # A file that will not open is reported by name and the prompt still opens.
+    # `OSError.__str__` renders `filename` with `%R`, so the name arrives quoted
+    # and escaped -- a path holding a backslash is not a substring of its own
+    # report.
     missing = os.path.join(tmp, "not-there.py")
     out, err, code = run(["-i"], {"PYTHONSTARTUP": missing})
     assert "Could not open PYTHONSTARTUP" in err, (out, err)
-    assert missing in err, (out, err)
+    assert repr(missing) in err, (out, err)
     assert "PROMPT REACHED" in out, (out, err)
     assert code == 0, (code, err)
 
