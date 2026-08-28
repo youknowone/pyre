@@ -10648,6 +10648,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled_loops = &self.compiled_loops;
         self.warm_state.function_entry_step(
             green_key,
+            None,
             || compiled_loops.contains_key(&green_key),
             engine_is_tracing,
         )

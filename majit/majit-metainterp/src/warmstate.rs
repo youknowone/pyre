@@ -710,11 +710,15 @@ pub struct WarmEnterState {
     /// `return True` closure when it is absent, which is what `None` means
     /// here; [`Self::confirm_enter_jit`] is that substitution.
     ///
-    /// Upstream passes the hook every green AND red argument
-    /// (`warmspot.py:598` `onlygreens=False`). The green key hash is what both
-    /// veto positions here hold, so that is what a hook is handed; a hook
-    /// needing more state reads it off the interpreter it was declared in.
-    confirm_enter_jit_ptr: Option<fn(u64) -> bool>,
+    /// `warmspot.py make_driverhook_graphs` builds this hook with
+    /// `onlygreens=False`, so upstream passes every portal green and red.
+    /// This layer now supplies the structured [`GreenKey`], not its
+    /// irreversible hash. It still cannot supply reds: they remain owned by
+    /// the interpreter portal (`PyFrame` / execution context in pyre), while
+    /// `WarmEnterState` owns only cells and counters. Exact argument parity
+    /// therefore requires moving the hook boundary to the portal or threading
+    /// an interpreter-defined red-argument carrier into every policy call.
+    confirm_enter_jit_ptr: Option<fn(&GreenKey) -> bool>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -788,8 +792,8 @@ impl WarmEnterState {
     /// `MetaInterp::bound_reached` calls) reaches it after theirs. That makes
     /// this the one position at which the hook fires exactly once per start,
     /// which is what upstream gets by having a single `bound_reached`.
-    fn start_tracing_cell(&mut self, cell_key: u64) -> HotResult {
-        if !self.confirm_enter_jit(cell_key) {
+    fn start_tracing_cell(&mut self, cell_key: u64, green_key: Option<&GreenKey>) -> HotResult {
+        if !self.confirm_enter_jit_if_available(green_key) {
             return HotResult::NotHot;
         }
         self.counter.reset(self.bucket_of(cell_key));
@@ -1035,7 +1039,7 @@ impl WarmEnterState {
                 // finding a live procedure token and `raise
                 // EnterJitAssembler`. A hook that refuses leaves the caller
                 // interpreting rather than entering the machine code.
-                if !self.confirm_enter_jit(cell_key) {
+                if !self.confirm_enter_jit_if_available(None) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1114,7 +1118,7 @@ impl WarmEnterState {
     /// answers `AlreadyTracing` for the trace it was asked to start.
     pub fn maybe_compile(&mut self, cell_key: u64) -> HotResult {
         match self.maybe_compile_decision(cell_key) {
-            HotResult::StartTracing => self.start_tracing_cell(cell_key),
+            HotResult::StartTracing => self.start_tracing_cell(cell_key, None),
             other => other,
         }
     }
@@ -1156,7 +1160,7 @@ impl WarmEnterState {
             if is_compiled {
                 // warmstate.py:501 — see `maybe_compile_decision`, whose
                 // position this is the typed twin of.
-                if !self.confirm_enter_jit(hash) {
+                if !self.confirm_enter_jit(key) {
                     return HotResult::NotHot;
                 }
                 return HotResult::RunCompiled;
@@ -1246,7 +1250,7 @@ impl WarmEnterState {
         let hash = key.get_uhash();
         // `warmstate.py:427` — see `start_tracing_cell`, whose position this
         // is the typed twin of.
-        if !self.confirm_enter_jit(hash) {
+        if !self.confirm_enter_jit(key) {
             return HotResult::NotHot;
         }
         self.counter.reset(hash);
@@ -1346,7 +1350,7 @@ impl WarmEnterState {
             }
         }
 
-        self.start_tracing_cell(cell_key)
+        self.start_tracing_cell(cell_key, None)
     }
 
     /// Typed-key variant of [`Self::force_start_tracing`]: reads the
@@ -2210,7 +2214,7 @@ impl WarmEnterState {
     /// with no frontend meta there is no runnable loop to return early for.
     pub fn should_trace_function_entry(&mut self, cell_key: u64) -> bool {
         matches!(
-            self.function_entry_step(cell_key, || false, false),
+            self.function_entry_step(cell_key, None, || false, false),
             FunctionEntryStep::Proceed
         )
     }
@@ -2240,6 +2244,7 @@ impl WarmEnterState {
     pub fn function_entry_step(
         &mut self,
         cell_key: u64,
+        green_key: Option<&GreenKey>,
         has_compiled_meta: impl FnOnce() -> bool,
         engine_is_tracing: bool,
     ) -> FunctionEntryStep {
@@ -2254,6 +2259,9 @@ impl WarmEnterState {
                 .filter(|token| token.has_compiled_code())
                 && has_compiled_meta()
             {
+                if !self.confirm_enter_jit_if_available(green_key) {
+                    return FunctionEntryStep::NotHot;
+                }
                 return FunctionEntryStep::RunCompiled(token);
             }
             if engine_is_tracing {
@@ -2591,10 +2599,24 @@ impl WarmEnterState {
     /// head of `bound_reached`, which is [`Self::start_tracing_cell`] /
     /// [`Self::start_tracing_cell_for_key`] here, and `warmstate.py:501`
     /// before entering already-compiled machine code.
-    pub fn confirm_enter_jit(&self, green_key: u64) -> bool {
+    #[inline]
+    pub fn confirm_enter_jit(&self, green_key: &GreenKey) -> bool {
         match self.confirm_enter_jit_ptr {
             None => true,
             Some(hook) => hook(green_key),
+        }
+    }
+
+    /// Hash-only compatibility paths cannot reconstruct the greens a hook is
+    /// entitled to inspect. The absent-hook arm stays the same free `true`
+    /// substitution; with a hook installed, such a path declines instead of
+    /// passing a hash disguised as a green tuple.
+    #[inline]
+    fn confirm_enter_jit_if_available(&self, green_key: Option<&GreenKey>) -> bool {
+        match (self.confirm_enter_jit_ptr, green_key) {
+            (None, _) => true,
+            (Some(hook), Some(key)) => hook(key),
+            (Some(_), None) => false,
         }
     }
 
@@ -2604,7 +2626,7 @@ impl WarmEnterState {
     /// Upstream builds the pointer from the `JitDriver` declaration; nothing
     /// below the declaration can know what it said, so an interpreter installs
     /// its own here. `None` restores the no-hook default.
-    pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(u64) -> bool>) {
+    pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&GreenKey) -> bool>) {
         self.confirm_enter_jit_ptr = hook;
     }
 
@@ -5151,11 +5173,11 @@ mod tests {
 
         // Cold, no trace running: the counter gate, unchanged.
         assert!(matches!(
-            ws.function_entry_step(key, || false, false),
+            ws.function_entry_step(key, None, || false, false),
             FunctionEntryStep::NotHot
         ));
         assert!(matches!(
-            ws.function_entry_step(key, || false, false),
+            ws.function_entry_step(key, None, || false, false),
             FunctionEntryStep::Proceed
         ));
 
@@ -5165,11 +5187,11 @@ mod tests {
         attach_alive(&mut ws, key, token);
 
         assert!(matches!(
-            ws.function_entry_step(key, || true, false),
+            ws.function_entry_step(key, None, || true, false),
             FunctionEntryStep::RunCompiled(_)
         ));
         assert!(matches!(
-            ws.function_entry_step(key, || false, false),
+            ws.function_entry_step(key, None, || false, false),
             FunctionEntryStep::NotHot
         ));
     }
@@ -5185,7 +5207,7 @@ mod tests {
 
         for _ in 0..8 {
             assert!(matches!(
-                ws.function_entry_step(key, || false, true),
+                ws.function_entry_step(key, None, || false, true),
                 FunctionEntryStep::Proceed
             ));
         }
@@ -5758,7 +5780,7 @@ mod tests {
     /// the veto is what the answer turns on here.
     #[test]
     fn a_confirm_enter_jit_veto_stops_the_tracing_start() {
-        fn refuse(_green_key: u64) -> bool {
+        fn refuse(_green_key: &GreenKey) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5778,11 +5800,32 @@ mod tests {
         );
     }
 
+    /// The callback receives the typed green tuple itself, not the bucket hash
+    /// that the cell table uses internally.
+    #[test]
+    fn the_confirm_enter_jit_hook_can_inspect_the_greens() {
+        static FIRST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        static SECOND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn refuse(key: &GreenKey) -> bool {
+            FIRST.store(key.values[0], std::sync::atomic::Ordering::Relaxed);
+            SECOND.store(key.values[1], std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+
+        let mut ws = WarmEnterState::new(1);
+        ws.set_confirm_enter_jit(Some(refuse));
+        let key = GreenKey::new(vec![41, 43]);
+
+        assert!(matches!(ws.maybe_compile_with_key(&key), HotResult::NotHot));
+        assert_eq!(FIRST.load(std::sync::atomic::Ordering::Relaxed), 41);
+        assert_eq!(SECOND.load(std::sync::atomic::Ordering::Relaxed), 43);
+    }
+
     /// `warmstate.py:501` — the second veto position, between finding a live
     /// procedure token and `raise EnterJitAssembler`.
     #[test]
     fn a_confirm_enter_jit_veto_stops_entry_into_compiled_code() {
-        fn refuse(_green_key: u64) -> bool {
+        fn refuse(_green_key: &GreenKey) -> bool {
             false
         }
         let mut ws = WarmEnterState::new(3);
@@ -5811,7 +5854,7 @@ mod tests {
     #[test]
     fn the_confirm_enter_jit_hook_fires_once_per_tracing_start() {
         static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        fn allow(_green_key: u64) -> bool {
+        fn allow(_green_key: &GreenKey) -> bool {
             CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             true
         }
@@ -5848,8 +5891,8 @@ mod tests {
     #[test]
     fn no_declared_hook_confirms_every_entry() {
         let ws = WarmEnterState::new(3);
-        assert!(ws.confirm_enter_jit(0));
-        assert!(ws.confirm_enter_jit(u64::MAX));
+        assert!(ws.confirm_enter_jit(&GreenKey::single(0)));
+        assert!(ws.confirm_enter_jit(&GreenKey::single(i64::MAX)));
     }
 
     /// warmstate.py — typed variant of `maybe_compile_and_run`.
