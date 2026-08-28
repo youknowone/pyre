@@ -1702,7 +1702,7 @@ static TOKEN_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
 /// The current value of the process-wide invalidation count.
 #[inline]
 pub fn token_invalidation_generation() -> u64 {
-    TOKEN_INVALIDATIONS.load(Ordering::Relaxed)
+    TOKEN_INVALIDATIONS.load(Ordering::Acquire)
 }
 
 impl LoopInvalidation {
@@ -1712,11 +1712,16 @@ impl LoopInvalidation {
     /// token, and every bridge-generation flag activates its still-unpatched
     /// GUARD_NOT_INVALIDATED sites.
     fn invalidate(&self) {
-        TOKEN_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
         self.invalidated.store(true, Ordering::Release);
         for flag in self.bridge_flags.lock().iter() {
             flag.store(true, Ordering::Release);
         }
+        // After the flags, not before: a reader that keys a cache on the
+        // generation pairs the value it read with the answer it computed, so
+        // the new value must not be observable while the flags still say the
+        // token is live. Read with acquire, this orders the flag stores ahead
+        // of any computation keyed on the new generation.
+        TOKEN_INVALIDATIONS.fetch_add(1, Ordering::Release);
     }
 }
 
