@@ -3771,6 +3771,48 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(lib) =
+        pyre_interpreter::module::_cffi_backend::lib_obj::W_LibObject::from_obj(concrete_obj)
+        && spec_gate(SpecFold::LoadAttrCffiLib, || {
+            let w_dict = lib.dict_w;
+            if w_dict.is_null() || majit_gc::can_move(majit_ir::GcRef(w_dict as usize)) {
+                return Ok(None);
+            }
+            let Some(slot) = crate::state::module_dict_cell_slot_direct(w_dict, name) else {
+                return Ok(None);
+            };
+            let Some(stored) = crate::state::module_dict_cell_value_direct(w_dict, slot) else {
+                return Ok(None);
+            };
+            if stored.is_null()
+                || majit_gc::can_move(majit_ir::GcRef(stored as usize))
+                // `W_LibObject.lib_getattribute` turns this support object into
+                // a live C-memory read; returning the dict cell would expose
+                // the support object itself, and `lib_setattr` does not mutate
+                // the dict version when it writes through the support object.
+                || pyre_interpreter::module::_cffi_backend::cglob::W_GlobSupport::from_obj(stored)
+                    .is_some()
+            {
+                return Ok(None);
+            }
+            // Pin the receiver to THIS Lib so its baked dict address remains
+            // valid.  A constant receiver is already pinned.
+            if !obj.is_constant() {
+                let expected = ctx.trace_ctx.const_ref(concrete_obj as i64);
+                ctx.trace_ctx
+                    .record_guard(OpCode::GuardValue, &[obj, expected], 0);
+                walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+                ctx.trace_ctx.heap_cache_mut().replace_box(obj, expected);
+            }
+            emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false)?;
+            Ok(Some(()))
+        })?
+        .is_some()
+    {
+        return Ok(Some(()));
+    }
+
     let Some((w_type, version_tag, map, storageindex, listindex, unbox_type)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, name)
     }) else {

@@ -56,7 +56,7 @@ pub fn new_lib(
     let ffi_slot = roots.base();
     let _ = roots.pin_root(w_ffi);
     let dict_slot = ffi_slot + 1;
-    let _ = roots.pin_root(pyre_object::dictmultiobject::w_dict_new());
+    let _ = roots.pin_root(pyre_object::dictmultiobject::w_module_dict_new());
     let name_slot = dict_slot + 1;
     let _ = roots.pin_root(pyre_object::w_str_new(libname));
     let obj = W_LibObject::allocate_stable(W_LibObject {
