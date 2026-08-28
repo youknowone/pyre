@@ -185,6 +185,19 @@ pub fn error_is_would_block(code: i32) -> bool {
     code == ws::WSAEWOULDBLOCK
 }
 
+/// `rsocket.py HAVE_SOCK_CLOEXEC` / `HAVE_SOCK_NONBLOCK`: the two creation
+/// flags Linux carries inside `socket()`'s type argument.  A host without them
+/// gets zero, which makes both the mask and the test that read them the
+/// no-ops the `HAVE_*` guards stand for.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const SOCK_CLOEXEC: libc::c_int = libc::SOCK_CLOEXEC;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const SOCK_CLOEXEC: libc::c_int = 0;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const SOCK_NONBLOCK: libc::c_int = libc::SOCK_NONBLOCK;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub const SOCK_NONBLOCK: libc::c_int = 0;
+
 /// The non-blocking `connect` result for which `RSocket._connect` waits for
 /// writability before reading `SO_ERROR`.
 #[cfg(unix)]

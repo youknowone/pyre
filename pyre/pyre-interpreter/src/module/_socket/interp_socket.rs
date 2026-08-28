@@ -2661,14 +2661,20 @@ fn socket_positive_timeout(obj: pyre_object::PyObjectRef) -> Option<f64> {
 /// RPython `RSocket._select`: a positive Python timeout is enforced with poll
 /// before entering every libc socket operation.  Zero skips the wait and the
 /// descriptor itself answers would-block; a negative timeout is blocking.
+///
+/// Answers whether the readiness was waited for, which is the distinction
+/// `_ssl_select` reports as `SOCKET_OPERATION_OK` against its two
+/// nothing-to-wait-for states: a caller that has already been told the
+/// operation would block needs it to tell a raced wakeup from a socket whose
+/// mode owes it a `WANT_READ`.
 #[cfg(any(unix, windows))]
-fn socket_wait_for_data(
+pub(crate) fn socket_wait_for_data(
     obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
     for_writing: bool,
-) -> Result<(), crate::PyError> {
+) -> Result<bool, crate::PyError> {
     let Some(timeout) = socket_positive_timeout(obj) else {
-        return Ok(());
+        return Ok(false);
     };
     // A handled signal restarts the wait, so the deadline is computed once:
     // reusing the full duration on every EINTR would let a steady signal
@@ -2696,7 +2702,7 @@ fn socket_wait_for_data(
             rffi::poll_readable(fd, timeout_ms)
         };
         if ready > 0 {
-            return Ok(());
+            return Ok(true);
         }
         if ready == 0 {
             crate::module::signal::interp_signal::checksignals_now()?;
@@ -2714,7 +2720,7 @@ fn socket_wait_readable(
     obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
 ) -> Result<(), crate::PyError> {
-    socket_wait_for_data(obj, fd, false)
+    socket_wait_for_data(obj, fd, false).map(|_| ())
 }
 
 #[cfg(any(unix, windows))]
@@ -2722,7 +2728,7 @@ fn socket_wait_writable(
     obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
 ) -> Result<(), crate::PyError> {
-    socket_wait_for_data(obj, fd, true)
+    socket_wait_for_data(obj, fd, true).map(|_| ())
 }
 
 /// Writable half of `RSocket.wait_for_data`, bounded by one absolute
@@ -2997,22 +3003,41 @@ fn socket_init_state(
 ) -> Result<(), crate::PyError> {
     socket_set_attr(obj, "_fd", pyre_object::w_int_new(rffi::socket_to_i64(fd)));
     socket_set_attr(obj, "_family", pyre_object::w_int_new(family as i64));
-    socket_set_attr(obj, "_type", pyre_object::w_int_new(ty as i64));
+    // `rsocket.py:RSocket.__init__` clears both creation flags out of the type
+    // it keeps, so that `sock.type == SOCK_STREAM` answers the same on a host
+    // that accepts them inside `socket()`'s type argument as on one that does
+    // not.  Subtracting the bit stands in for `&= ~flag`, which the static
+    // analyzer rejects on a signed `c_int`.
+    let mut stored_type = ty;
+    if stored_type & rffi::SOCK_CLOEXEC != 0 {
+        stored_type -= rffi::SOCK_CLOEXEC;
+    }
+    if stored_type & rffi::SOCK_NONBLOCK != 0 {
+        stored_type -= rffi::SOCK_NONBLOCK;
+    }
+    socket_set_attr(obj, "_type", pyre_object::w_int_new(stored_type as i64));
     socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64));
     // `rsocket.py:RSocket.__init__` calls `settimeout(defaults.timeout)` for
     // every new or wrapped descriptor, and `make_socket` copies that same
     // process-wide value.  Applying it here (not merely reporting it from
     // getdefaulttimeout) is what makes a newly constructed socket inherit the
     // default in both blocking mode and its public `gettimeout()` result.
-    let bits = DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
-    let (native_timeout, stored_timeout) = if bits == SOCKET_TIMEOUT_NONE {
-        (-1.0, pyre_object::w_none())
+    // A `SOCK_NONBLOCK` creation flag is the one exception: it names the mode
+    // the descriptor was opened in, so the timeout it stands for is recorded
+    // without a `settimeout` of its own.
+    if ty & rffi::SOCK_NONBLOCK != 0 {
+        socket_set_attr(obj, "_timeout", pyre_object::floatobject::w_float_new(0.0));
     } else {
-        let timeout = f64::from_bits(bits);
-        (timeout, pyre_object::floatobject::w_float_new(timeout))
-    };
-    socket_set_attr(obj, "_timeout", stored_timeout);
-    socket_apply_timeout(fd, native_timeout)?;
+        let bits = DEFAULT_SOCKET_TIMEOUT.load(std::sync::atomic::Ordering::Relaxed);
+        let (native_timeout, stored_timeout) = if bits == SOCKET_TIMEOUT_NONE {
+            (-1.0, pyre_object::w_none())
+        } else {
+            let timeout = f64::from_bits(bits);
+            (timeout, pyre_object::floatobject::w_float_new(timeout))
+        };
+        socket_set_attr(obj, "_timeout", stored_timeout);
+        socket_apply_timeout(fd, native_timeout)?;
+    }
     // `sock_new` starts this at 0 on every socket object, and only
     // `setsockopt` moves it: `SIO_TCP_SET_ACK_FREQUENCY` has no counterpart to
     // read the live setting back with, so what was written is the answer.
@@ -5840,10 +5865,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
     ) };
 
     // `interp_socket.py settimeout_w` then `rsocket.py:RSocket.
-    // settimeout`: None → blocking (no O_NONBLOCK, no SO_*TIMEO); 0.0 →
-    // non-blocking (O_NONBLOCK on); >0 → blocking + SO_RCVTIMEO +
-    // SO_SNDTIMEO set to the duration; <0 → ValueError "Timeout value
-    // out of range".
+    // settimeout`, which ends in `_setblocking(self.timeout < 0.0)`: None →
+    // blocking; 0.0 and any positive duration alike → O_NONBLOCK on, the
+    // duration being `wait_for_data`'s to enforce rather than the
+    // descriptor's; <0 → ValueError "Timeout value out of range".
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
         ns,
         "settimeout",
