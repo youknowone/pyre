@@ -19,6 +19,7 @@ pub type Bytecode = [u8];
 const OP_NOP: u8 = 0;
 const OP_BUMP: u8 = 1;
 const OP_TOUCH: u8 = 2;
+const OP_READ_LEN: u8 = 3;
 
 /// A carrier whose layout is not flat ints, which is the whole reason
 /// `opaque(T)` exists.
@@ -59,6 +60,7 @@ fn opaque_interp(program: &Bytecode, threshold: u32) -> i64 {
             OP_NOP => {}
             OP_BUMP => state.acc += 1,
             OP_TOUCH => state.storage.names.push("x".to_string()),
+            OP_READ_LEN => state.acc = state.storage.names.len() as i64,
             _ => break,
         }
     }
@@ -167,8 +169,8 @@ fn an_arm_touching_the_carrier_degrades_and_the_rest_installs() {
 /// the int scalar correct.
 #[test]
 fn the_carrier_survives_a_run_that_also_compiles() {
-    let program = [OP_BUMP, OP_TOUCH, OP_BUMP, OP_NOP, OP_BUMP];
-    assert_eq!(opaque_interp(&program, 0), 3);
+    let program = [OP_BUMP, OP_BUMP, OP_TOUCH, OP_READ_LEN, OP_BUMP];
+    assert_eq!(opaque_interp(&program, 0), 2);
 }
 
 /// `codegen_state.rs` excludes a carrier-bearing shape from the generic
