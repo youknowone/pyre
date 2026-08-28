@@ -9050,6 +9050,31 @@ fn exit_frame_handler_needs_unwritten_stack(frame: &PyFrame) -> bool {
     lasti && frame.valuestackdepth < frame.nlocals() + frame.ncells() + depth as usize
 }
 
+/// Whether `PYRE_EXIT_FRAME_DIAG` is set.
+fn exit_frame_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PYRE_EXIT_FRAME_DIAG").is_some())
+}
+
+/// One line per `exit_frame_with_exception` delivery, naming the site and the
+/// verdict [`exit_frame_handler_needs_unwritten_stack`] reached there.
+///
+/// Both sites that deliver such an exception to a frame's own exception table
+/// reach that gate through `screen_exit_frame_delivery`, so the site name is
+/// what tells them apart.  A count of refusals alone cannot say whether
+/// the gate is doing anything -- a run that never delivers and a run whose
+/// deliveries all pass read the same -- so the passes are printed too, which
+/// makes a refusal a share of something.  The eval loop prints the verdict it
+/// does not act on, which is how much delivery traffic bypasses the gate.
+fn report_exit_frame_delivery(site: &str, frame: &PyFrame, refused: bool) {
+    eprintln!(
+        "[exit-frame] site={site} last_instr={} vsd={} floor={} refused={refused}",
+        frame.last_instr,
+        frame.valuestackdepth,
+        frame.nlocals() + frame.ncells(),
+    );
+}
+
 /// Keep a compiled-run exit from giving its own frame a second traceback node.
 ///
 /// `pyopcode.py handle_operation_error` attaches one node per frame per
@@ -9130,7 +9155,11 @@ fn deliver_exit_frame_exception(
     // the dead address into `handle_jitexception`'s own root.
     let mut frame_root = FrameRoot::new(frame);
     let mut handler_instr = frame_root.frame().next_instr();
-    if !screen_exit_frame_delivery(frame_root.frame() as *mut PyFrame, &mut err) {
+    let refused = !screen_exit_frame_delivery(frame_root.frame() as *mut PyFrame, &mut err);
+    if exit_frame_diag_enabled() {
+        report_exit_frame_delivery("deliver", frame_root.frame(), refused);
+    }
+    if refused {
         return Err(err);
     }
     if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
@@ -9672,7 +9701,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // per-opcode `Err` arm below); resume at the handler pc when
                     // caught, otherwise propagate it out as a plain `Done(Err)`.
                     if let LoopResult::ExitFrameWithException(mut err) = loop_result {
-                        if !screen_exit_frame_delivery(f, &mut err) {
+                        let refused = !screen_exit_frame_delivery(f, &mut err);
+                        if exit_frame_diag_enabled() {
+                            report_exit_frame_delivery("eval_loop", unsafe { &*f }, refused);
+                        }
+                        if refused {
                             return LoopResult::Done(Err(err));
                         }
                         if pyre_interpreter::eval::handle_exception(
