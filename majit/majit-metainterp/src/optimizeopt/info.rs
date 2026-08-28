@@ -1327,9 +1327,23 @@ fn force_box_impl(
             for (field_idx, value_ref) in std::mem::take(&mut vinfo.fields) {
                 let value_ref = force_child(&value_ref, ctx);
                 let descr = lookup_field_descr(&cached_fielddescrs, field_idx);
-                let descr = descr.expect(
-                    "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i]",
-                );
+                // The key that failed to resolve is the whole diagnosis, and
+                // the list it was looked up in says which numbering it came
+                // from, so name both rather than only the rule they broke.
+                let descr = descr.unwrap_or_else(|| {
+                    panic!(
+                        "force_box: field_idx must resolve through descr.get_all_fielddescrs()[i] \
+                         (field_idx={field_idx} len={} keys={:?})",
+                        cached_fielddescrs.len(),
+                        cached_fielddescrs
+                            .iter()
+                            .map(|d| d
+                                .as_field_descr()
+                                .map(|f| (f.field_key().to_string(), f.index_in_parent()))
+                                .unwrap_or_else(|| ("?".to_string(), 0)))
+                            .collect::<Vec<_>>(),
+                    )
+                });
                 if w_class_store_is_covered_by_alloc(&vinfo.descr, &descr, &value_ref, ctx) {
                     continue;
                 }

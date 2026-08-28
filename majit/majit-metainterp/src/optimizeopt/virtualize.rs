@@ -838,22 +838,33 @@ impl OptVirtualize {
                         }
                         // PyPy's typeptr never enters `_fields`: its class
                         // identity is metadata on InstancePtrInfo and the GC
-                        // allocation writes the header.  Pyre has a second,
-                        // Python-level class header (`PyObject.w_class`) that
-                        // must obey the same boundary.  Its descriptor carries
-                        // a placeholder positional index because it is absent
-                        // from `SizeDescr::all_fielddescrs`; storing it in
-                        // `fields` aliases the first payload slot.
+                        // allocation writes the header.  Pyre's second,
+                        // Python-level class header (`PyObject.w_class`) is
+                        // not one case but two, and the op's own descr cannot
+                        // tell them apart: the tracer stores through a shared
+                        // header descr whose `index_in_parent` is 0, which on
+                        // `W_LongObject` names the payload at offset 16 and on
+                        // `W_BaseException` happens to name the class word.
                         //
-                        // If NEW_WITH_VTABLE already writes this exact class,
-                        // the store is redundant.  Otherwise leave the op to
-                        // normal emission: `_emit_operation` forces the
-                        // virtual first and then preserves the real header
-                        // write.  A dynamic class takes that conservative arm
-                        // as well.  This mirrors virtualize.py
-                        // `optimize_SETFIELD_GC` while adapting pyre's extra
-                        // header without inventing an RPython-side field slot.
+                        // Ask the layout instead.  `class_word_index_in_parent`
+                        // is the accessor defined against `all_fielddescrs`,
+                        // the list `force_box` reads this vector back through,
+                        // so a slot it hands out is addressable there by
+                        // construction and a layout that keeps its class word
+                        // out of that list answers `None`.
                         if field_descr.is_w_class() {
+                            if let Some(slot) = vinfo
+                                .descr
+                                .as_size_descr()
+                                .and_then(|size| size.class_word_index_in_parent())
+                            {
+                                set_field(&mut vinfo.fields, slot as u32, value_op.clone());
+                                return Some(OptimizationResult::Remove);
+                            }
+                            // No slot to record against.  A store NEW_WITH_VTABLE
+                            // already makes is still redundant; anything else
+                            // goes to normal emission, which forces the virtual
+                            // first and then preserves the real header write.
                             let covered = w_class_value_is_covered_by_alloc(
                                 &vinfo.descr,
                                 &setfield_descr_arc,
@@ -3080,6 +3091,53 @@ mod tests {
         (size, w_class as DescrRef, payload as DescrRef)
     }
 
+    /// The class word of a layout that lists it: `all_fielddescrs` holds it
+    /// behind the payload, so it owns slot 1 the way `W_BaseException` does.
+    #[derive(Debug)]
+    struct TestListedWClassFieldDescr;
+
+    impl Descr for TestListedWClassFieldDescr {
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestListedWClassFieldDescr {
+        fn index_in_parent(&self) -> usize {
+            1
+        }
+        fn offset(&self) -> usize {
+            8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> Type {
+            Type::Ref
+        }
+        fn is_pointer_field(&self) -> bool {
+            true
+        }
+        fn field_name(&self) -> &str {
+            "pyobject::PyObject.w_class"
+        }
+        fn is_w_class(&self) -> bool {
+            true
+        }
+    }
+
+    fn w_class_listed_layout(default_w_class: usize) -> (DescrRef, DescrRef) {
+        let w_class: Arc<dyn FieldDescr> = Arc::new(TestListedWClassFieldDescr);
+        let payload: Arc<dyn FieldDescr> = Arc::new(TestPayloadFieldDescr);
+        let size: DescrRef = Arc::new(TestWClassSizeDescr {
+            w_class: default_w_class as i64,
+            class_word: w_class.clone(),
+            all_fields: vec![payload, w_class.clone()],
+            gc_fields: vec![w_class.clone()],
+        });
+        (size, w_class as DescrRef)
+    }
+
     #[derive(Debug)]
     struct TestFieldDescr {
         idx: u32,
@@ -4351,6 +4409,33 @@ mod tests {
                 .getdescr()
                 .and_then(|descr| descr.as_field_descr().map(|fd| fd.offset())),
             Some(8)
+        );
+    }
+
+    #[test]
+    fn a_listed_class_word_is_recorded_at_its_own_slot_and_stays_virtual() {
+        // The layout lists its class word, so it owns a slot of
+        // `all_fielddescrs` like any other field and the store belongs in
+        // `fields` at that slot -- not at the 0 the shared header descr
+        // carries, which here names the payload.  Forcing instead costs a
+        // guard failure and a bridge per iteration on every layout that raises.
+        let (sd, w_class_fd) = w_class_listed_layout(0xCAFE);
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], sd),
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_resop_operand(Type::Ref, 0),
+                    Operand::const_from_value(Value::Ref(majit_ir::GcRef(0xBEEF))),
+                ],
+                w_class_fd,
+            ),
+        ];
+        assign_positions(&mut ops);
+
+        assert!(
+            run_pass(&ops).is_empty(),
+            "a class word with a slot of its own must not force the virtual"
         );
     }
 
