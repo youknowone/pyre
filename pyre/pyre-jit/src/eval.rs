@@ -8732,21 +8732,6 @@ fn eval_with_jit_inner(
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame_root.frame());
 
-    // A resumed frame reaches the portal already positioned mid-body, so its
-    // payload has to be consumed before the merge point is consulted: the
-    // green key is `(pycode, next_instr)`, and the sent value belongs on the
-    // operand stack at the pc that key names.  This is the last point at
-    // which the frame can still decline, so nothing below may need the
-    // payload again.  A suspended `yield from` delegate that yields finishes
-    // the resumption on its own and this frame never runs.
-    if let Some(resume) = resume {
-        if let Some(delegated) =
-            pyre_interpreter::eval::prepare_frame_resume_for_dispatch(frame_root.frame(), resume)?
-        {
-            return Ok(delegated);
-        }
-    }
-
     // RPython warmspot.py ll_portal_runner:
     //   maybe_compile_and_run(increment_threshold, *args)
     //   return portal_ptr(*args)
@@ -8757,7 +8742,7 @@ fn eval_with_jit_inner(
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    portal_activation_bracketed(&mut frame_root)
+    portal_activation_bracketed(&mut frame_root, resume)
 }
 
 /// `pyframe.py execute_frame`'s hook bracket around [`portal_runner_dispatch`],
@@ -8787,10 +8772,34 @@ fn eval_with_jit_inner(
 /// with — and each hook that raises replaces whatever was pending, in that
 /// order.  `?` on any of the three would flatten the nesting and drop the hooks
 /// after it.
-fn portal_activation_bracketed(frame_root: &mut FrameRoot) -> PyResult {
+///
+/// The resume payload is consumed HERE, inside the bracket, not by the caller
+/// ahead of it.  `execute_frame` runs `self.resume_execute_frame(w_arg_or_err)`
+/// in the inner `try`, after `call_trace`, and a suspended `yield from` /
+/// `await` delegate that yields again ends the activation right there — which is
+/// upstream's `except pyopcode.Yield: w_exitvalue = self.popvalue()`, still
+/// inside both `finally`s.  Consuming it before the bracket made a delegating
+/// resume return without ever running `call_trace`, `return_trace`,
+/// `leaveframe_trace` or the frame-chain leave: measured on an `await` chain
+/// that re-suspends, where a `sys.setprofile` hook saw 2 of the 6 events
+/// CPython, pypy3 and `PYRE_JIT=0` all report.  It also ran the delegate's own
+/// Python — and therefore the delegate's whole call/return pair — ahead of this
+/// frame's `call`, inverting the nesting a pairing profiler accounts on.
+fn portal_activation_bracketed(
+    frame_root: &mut FrameRoot,
+    resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
+) -> PyResult {
     let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
     if ec.is_null() {
         // No execution context is no hook to owe, and no `leave` either.
+        if let Some(resume) = resume
+            && let Some(delegated) = pyre_interpreter::eval::prepare_frame_resume_for_dispatch(
+                frame_root.frame(),
+                resume,
+            )?
+        {
+            return Ok(delegated);
+        }
         return portal_runner_dispatch(frame_root);
     }
     // `w_exitvalue` is `execute_frame`'s own local, not a re-read of the result
@@ -8804,7 +8813,25 @@ fn portal_activation_bracketed(frame_root: &mut FrameRoot) -> PyResult {
     let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
-            let result = portal_runner_dispatch(frame_root);
+            // `self.resume_execute_frame(w_arg_or_err)` and its
+            // `except pyopcode.Yield` arm, in `execute_frame`'s inner `try`: a
+            // resumed frame is positioned mid-body and the sent value belongs
+            // on the operand stack at that pc, so the payload is consumed
+            // before the merge point is consulted.  A delegate that yields
+            // again finishes the resumption itself and this frame never runs —
+            // but it still owes `return_trace` and the leave below, so the
+            // value is assigned rather than returned.
+            let result = match resume {
+                Some(resume) => pyre_interpreter::eval::prepare_frame_resume_for_dispatch(
+                    frame_root.frame(),
+                    resume,
+                )
+                .and_then(|delegated| match delegated {
+                    Some(value) => Ok(value),
+                    None => portal_runner_dispatch(frame_root),
+                }),
+                None => portal_runner_dispatch(frame_root),
+            };
             if let Ok(value) = &result {
                 w_exitvalue = *value;
             }
@@ -9058,6 +9085,24 @@ fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpret
     }
 }
 
+/// Both screens a compiled-run exception exit owes before its own frame's
+/// exception table is consulted.  Returns false when the frame must propagate
+/// instead, in which case `err` is left untouched.
+///
+/// `LoopResult::ExitFrameWithException` has three consumers — the eval loop's
+/// back-edge site, `try_function_entry_jit`'s function-entry site, and
+/// `handle_jitexception` — and they must agree, because a single producer
+/// (`compile_and_run_once`'s `FinishConcrete::Raise`) feeds all three.  The
+/// back-edge one applied only the traceback screen while claiming, in the
+/// comment on its sibling, to perform "the same delivery".
+fn screen_exit_frame_delivery(frame: *mut PyFrame, err: &mut pyre_interpreter::PyError) -> bool {
+    if exit_frame_handler_needs_unwritten_stack(unsafe { &*frame }) {
+        return false;
+    }
+    screen_frame_already_recorded(frame as *const PyFrame, err);
+    true
+}
+
 /// warmspot.py `ExitFrameWithExceptionRef` delivery for a compiled-run
 /// exit that surfaced outside the eval loop (the `handle_jit_outcome` /
 /// compile-once path).  Offer the pending exception to `frame`'s exception
@@ -9085,10 +9130,9 @@ fn deliver_exit_frame_exception(
     // the dead address into `handle_jitexception`'s own root.
     let mut frame_root = FrameRoot::new(frame);
     let mut handler_instr = frame_root.frame().next_instr();
-    if exit_frame_handler_needs_unwritten_stack(frame_root.frame()) {
+    if !screen_exit_frame_delivery(frame_root.frame() as *mut PyFrame, &mut err) {
         return Err(err);
     }
-    screen_frame_already_recorded(frame_root.frame() as *const PyFrame, &mut err);
     if pyre_interpreter::eval::handle_exception(frame_root.frame(), &mut err, &mut handler_instr) {
         frame_root
             .frame()
@@ -9130,7 +9174,13 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 /// exactly the outermost one, which reaches the interpreter's own
 /// `execute_frame` — for every tail from 10 000 iterations up.
 pub(crate) fn portal_activation_result(frame: &mut PyFrame) -> PyResult {
-    enter_portal(frame, portal_activation_bracketed)
+    /// The frames that reach this door were just constructed, so they carry no
+    /// resume payload: `execute_frame`'s `w_arg_or_err` is `None` and the
+    /// bracket runs its body straight through.
+    fn bracketed_without_resume(frame_root: &mut FrameRoot) -> PyResult {
+        portal_activation_bracketed(frame_root, None)
+    }
+    enter_portal(frame, bracketed_without_resume)
 }
 
 /// warmspot.py ll_portal_runner:
@@ -9583,11 +9633,27 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // can_enter_jit is a lowered no-op / merge point; re-seed
                 // conservatively before the next frame reads.
                 let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
-                let green_key = make_green_key(
-                    unsafe { &*f }.pycode,
-                    loop_header_pc,
-                    unsafe { &*f }.get_is_being_profiled(),
-                );
+                let loop_pycode = unsafe { &*f }.pycode;
+                let loop_profiled = unsafe { &*f }.get_is_being_profiled();
+                let green_key_hash = make_green_key(loop_pycode, loop_header_pc, loop_profiled);
+                // The same resolve the function-entry door takes, for the same
+                // reason: `maybe_compile_and_run` and everything it reads
+                // (`has_runnable_compiled_loop`, `runnable_procedure_token`,
+                // `maybe_compile_decision`) answer for whichever cell HEADS a
+                // chained bucket, so a bare hash decides about one cell while
+                // `force_start_tracing_for_key` — which walks the chain — acts
+                // on another.  A loop-header key gets a chained bucket from the
+                // hash-form installers (`disable_noninlinable_function`,
+                // `prepare_trace_segmenting`) and from the inlined-callee
+                // merge point in `jitcode_dispatch`, which mints its callee's
+                // loop header as a raw `make_green_key`.
+                let green_key = driver.resolve_cell_key(green_key_hash, || {
+                    pyre_jit_trace::driver::make_green_key_typed(
+                        loop_pycode,
+                        loop_header_pc,
+                        loop_profiled,
+                    )
+                });
                 if let Some(loop_result) = maybe_compile_and_run(
                     unsafe { &mut *f },
                     green_key,
@@ -9606,7 +9672,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                     // per-opcode `Err` arm below); resume at the handler pc when
                     // caught, otherwise propagate it out as a plain `Done(Err)`.
                     if let LoopResult::ExitFrameWithException(mut err) = loop_result {
-                        screen_frame_already_recorded(f as *const PyFrame, &mut err);
+                        if !screen_exit_frame_delivery(f, &mut err) {
+                            return LoopResult::Done(Err(err));
+                        }
                         if pyre_interpreter::eval::handle_exception(
                             unsafe { &mut *f },
                             &mut err,

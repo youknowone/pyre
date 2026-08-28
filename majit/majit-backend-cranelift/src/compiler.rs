@@ -3601,6 +3601,49 @@ fn load_frame_slot_run(
     vals
 }
 
+/// `_store_and_reset_exception` + `_build_propagate_exception_path`
+/// (x86/assembler.py:328-345): read `JIT_EXC_VALUE` into a temporary, clear
+/// both exception globals, then publish the value into `jf_guard_exc` and
+/// `propagate_exception_descr` into `jf_descr`.
+///
+/// The descr stamp is the load-bearing half.  Without it the returned frame
+/// carries whatever `jf_descr` already held — for a frame `handle_call_assembler`
+/// zeroed, that is 0, which names neither the callee's finish descr nor any
+/// live fail descr, so the classifier upstream of it has nothing to resolve.
+///
+/// The caller owns the `return_`, because the two exits differ in what they
+/// must unwind: an allocation failure runs `_call_footer`'s shadow-stack pop,
+/// while the entry stack check runs before `gen_shadowstack_header` and has no
+/// entry to pop.
+fn emit_propagate_exception_stores(
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    jf_ptr: cranelift_codegen::ir::Value,
+    propagate_exception_descr_ptr: usize,
+) {
+    let zero = builder.ins().iconst(cl_types::I64, 0);
+    let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+    let exc_val = builder
+        .ins()
+        .load(cl_types::I64, MemFlagsData::trusted(), exc_val_addr, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), zero, exc_val_addr, 0);
+    let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), exc_val, jf_ptr, JF_GUARD_EXC_OFS);
+    let descr_val = builder
+        .ins()
+        .iconst(ptr_type, propagate_exception_descr_ptr as i64);
+    builder
+        .ins()
+        .store(MemFlagsData::trusted(), descr_val, jf_ptr, JF_DESCR_OFS);
+}
+
 /// x86/assembler.py `genop_discard_check_memory_error` /
 /// aarch64/assembler.rs `emit_propagate_memory_error_if_null`: branch to the
 /// `propagate_exception_descr` exit when `ptr_val` is NULL.  The metainterp
@@ -3636,30 +3679,9 @@ fn emit_memory_error_check(
             .ins()
             .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
     } else {
-        // _store_and_reset_exception (assembler.py:1826-1843): read
-        // JIT_EXC_VALUE → tmp, clear both globals.
-        let exc_val_addr = builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
-        let exc_val = builder
-            .ins()
-            .load(cl_types::I64, MemFlagsData::trusted(), exc_val_addr, 0);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, exc_val_addr, 0);
-        let exc_type_addr = builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), zero, exc_type_addr, 0);
         // assembler.py:336-340 — MOV [jf_guard_exc], tmp; MOV [jf_descr], descr.
         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), exc_val, cur_jf, JF_GUARD_EXC_OFS);
-        let descr_val = builder
-            .ins()
-            .iconst(ptr_type, propagate_exception_descr_ptr as i64);
-        builder
-            .ins()
-            .store(MemFlagsData::trusted(), descr_val, cur_jf, JF_DESCR_OFS);
+        emit_propagate_exception_stores(builder, ptr_type, cur_jf, propagate_exception_descr_ptr);
         emit_call_footer_shadowstack(builder, ptr_type);
         builder.ins().return_(&[cur_jf]);
     }
@@ -9807,6 +9829,26 @@ impl CraneliftBackend {
 
         builder.switch_to_block(stack_overflow_block);
         builder.seal_block(stack_overflow_block);
+        // `_build_stack_check_slowpath` (x86/assembler.py:1080) ends its
+        // overflow arm by jumping to `propagate_exception_path`, so the frame
+        // it returns already names `propagate_exception_descr`.  The dynasm
+        // prologue ports that stamp; this one returned the frame with
+        // `jf_descr` untouched, i.e. the 0 `handle_call_assembler` wrote into
+        // every callee frame.  On the trace-entry door that is masked, because
+        // the pending-exception drain runs before the outcome is classified at
+        // all; a CALL_ASSEMBLER caller has no such drain and resolves the 0 as
+        // a descr.  Publish what the other backend publishes.
+        //
+        // No `_call_footer` shadow-stack pop here: `gen_shadowstack_header`
+        // runs after this check, so nothing has been pushed yet.
+        if propagate_exception_descr_ptr != 0 {
+            emit_propagate_exception_stores(
+                &mut builder,
+                ptr_type,
+                initial_jf_ptr,
+                propagate_exception_descr_ptr,
+            );
+        }
         builder.ins().return_(&[initial_jf_ptr]);
 
         builder.switch_to_block(stack_check_continue);
