@@ -12393,6 +12393,12 @@ fn invalid_assignment_target(
 /// generator expression and for a parenthesized tuple already covers the
 /// parentheses those two forms own, so both answer false here, which is what
 /// the `!(list|tuple|genexp|...)` guard wants.
+fn parenthesized_expr(source: &str, expr: &rustpython_compiler::ast::Expr) -> bool {
+    source
+        .get(..expr.range().start().to_usize())
+        .is_some_and(|before| before.trim_end().ends_with('('))
+}
+
 /// The starred element of a target that `expressions` cannot parse, if it has
 /// one.  A display keeps its own brackets and unpacks inside them, so only an
 /// unparenthesized tuple hands its elements to the expression grammar one by
@@ -12409,12 +12415,6 @@ fn first_starred_target(
             .find(|element| matches!(element, Expr::Starred(_))),
         _ => None,
     }
-}
-
-fn parenthesized_expr(source: &str, expr: &rustpython_compiler::ast::Expr) -> bool {
-    source
-        .get(..expr.range().start().to_usize())
-        .is_some_and(|before| before.trim_end().ends_with('('))
 }
 
 /// Whether the target reaches `python.gram:invalid_named_expression`'s third
