@@ -828,6 +828,15 @@ pub(crate) fn fbw_bridge_iter_journal_push(
     });
 }
 
+/// Record list-iterator state before a bridge walk mutates it.
+pub(crate) fn fbw_bridge_list_iter_journal_push(
+    iter: pyre_object::PyObjectRef,
+    pre_seq: pyre_object::PyObjectRef,
+    pre_index: i64,
+) {
+    fbw_bridge_cursor_journal_push(BridgeIterKind::List, iter, pre_seq, pre_index);
+}
+
 /// Record tuple-iterator state before a bridge walk mutates it.
 pub(crate) fn fbw_bridge_tuple_iter_journal_push(
     iter: pyre_object::PyObjectRef,

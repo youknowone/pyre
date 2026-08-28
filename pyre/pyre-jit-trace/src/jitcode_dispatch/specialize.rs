@@ -18065,6 +18065,294 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
     Ok(Some(tuple_op))
 }
 
+/// Walker-native FOR_ITER over a `list_iterator`, the cursor `GET_ITER` mints
+/// for `for x in <list>`.  Without it every iteration keeps the opaque
+/// `for_iter_next` residual: `W_FastListIterObject.descr_next` bottoms out in
+/// `w_list_getitem`, which takes the striped list lock and re-dispatches the
+/// storage strategy per item.
+///
+/// The emitted shape is the subscript fold's element load driven by the
+/// iterator's own cursor: `guard_class list_iterator` + `getfield(seq)` +
+/// `guard_class LIST` + exact-`w_class` guard + `guard_value(strategy)` +
+/// `getfield(index)`, a non-negative and an in-bounds guard, then the
+/// strategy-specific load -- the items-block `Ref` for object storage, a raw
+/// typed-array read plus `wrapint` / `wrapfloat` for int/float storage, or the
+/// items-block payload plus `AsciiListStrategy.wrap` for ascii storage -- and
+/// finally `SetfieldGc(index + 1)`.
+///
+/// The non-negative guard is not redundant with the bounds guard: the
+/// `__setstate__` exhausted sentinel is a NEGATIVE cursor that `descr_next`
+/// answers with a bare `StopIteration` and NO sequence clear, so both arms
+/// establish the sign before acting on the cursor.
+///
+/// A cleared sequence, that negative sentinel, a list subclass (which may
+/// override `__getitem__`), and an empty-strategy list all fall through to the
+/// generic residual.
+fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    iter_op: OpRef,
+    iter_obj: pyre_object::PyObjectRef,
+) -> Result<Option<OpRef>, DispatchError> {
+    let (seq_obj, index) = unsafe {
+        (
+            pyre_object::iterobject::w_list_iter_seq(iter_obj),
+            pyre_object::iterobject::w_list_iter_index(iter_obj),
+        )
+    };
+    if seq_obj.is_null() || index < 0 {
+        return Ok(None);
+    }
+    // Same operand gate as the subscript fold: an exact list whose storage has
+    // a concrete element shape.
+    let (sid, concrete_len) = unsafe {
+        if !pyre_object::is_exact_list(seq_obj) {
+            return Ok(None);
+        }
+        let sid = if pyre_object::w_list_uses_int_storage(seq_obj) {
+            pyre_object::listobject::ListStrategy::Integer as i64
+        } else if pyre_object::w_list_uses_float_storage(seq_obj) {
+            pyre_object::listobject::ListStrategy::Float as i64
+        } else if pyre_object::w_list_uses_object_storage(seq_obj) {
+            pyre_object::listobject::ListStrategy::Object as i64
+        } else if pyre_object::listobject::w_list_uses_ascii_storage(seq_obj) {
+            pyre_object::listobject::ListStrategy::Ascii as i64
+        } else {
+            return Ok(None);
+        };
+        (sid, pyre_object::w_list_len(seq_obj))
+    };
+    let concrete_continues = (index as usize) < concrete_len;
+
+    // Read the raw scalar before anything can allocate: the authentic boxed
+    // item is taken at the end of the emission (the `w_list_getitem` below
+    // can move the heap), but the typed arms need the element's value to
+    // stamp the raw load's concrete.
+    let raw_elem = unsafe {
+        match (concrete_continues, sid) {
+            (true, 1) => pyre_object::listobject::w_list_int_items_raw(seq_obj)
+                .map(|(items, _)| Value::Int(*items.add(index as usize))),
+            (true, 2) => pyre_object::listobject::w_list_float_items_raw(seq_obj)
+                .map(|(items, _)| Value::Float(*items.add(index as usize))),
+            _ => None,
+        }
+    };
+    if concrete_continues && matches!(sid, 1 | 2) && raw_elem.is_none() {
+        return Ok(None);
+    }
+
+    // A new consume attempt completes the prior in-flight iteration before
+    // this irreversible concrete advance, matching the residual executor.
+    let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
+        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
+    fbw_foriter_inflight_mark_attempt(body);
+
+    let list_iter_type_addr =
+        &pyre_object::iterobject::LIST_ITER_TYPE as *const pyre_object::PyType as i64;
+    walker_guard_class(ctx, op_pc, iter_op, list_iter_type_addr)?;
+
+    let seq_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::list_iter_seq_descr(),
+    );
+    ctx.trace_ctx
+        .set_opref_concrete(seq_op, Value::Ref(majit_ir::GcRef(seq_obj as usize)));
+    // The exhaustion arm below clears the sequence, so a re-entry carrying an
+    // already-exhausted cursor reaches here with a NULL `seq` -- which
+    // `GuardClass` would dereference.  Establish non-nullness first; the
+    // optimizer fuses the pair into `GuardNonnullClass`.
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[seq_op])?;
+    let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const pyre_object::PyType as i64;
+    walker_guard_class(ctx, op_pc, seq_op, list_type_addr)?;
+    walker_guard_exact_w_class(
+        ctx,
+        op_pc,
+        seq_op,
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
+    )?;
+
+    let strategy = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        seq_op,
+        crate::descr::list_strategy_descr(),
+    );
+    let sid_const = ctx.trace_ctx.const_int(sid);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(strategy, sid_const);
+
+    let index_op = crate::state::opimpl_getfield_gc_i(
+        ctx.trace_ctx,
+        iter_op,
+        crate::descr::list_iter_index_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(index_op, Value::Int(index));
+
+    // Object storage keeps the inline `length` field; the typed storages read
+    // their own items-array length field.
+    let len_descr = match sid {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
+        _ => crate::descr::list_ascii_items_len_descr(),
+    };
+    let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, seq_op, len_descr);
+
+    let zero = ctx.trace_ctx.const_int(0);
+
+    if !concrete_continues {
+        // Exhausted arrival: present the exhaustion edge exactly as the
+        // residual does -- clear the sequence so a retained iterator reports
+        // itself exhausted, then hand back the NULL Ref the codewriter's
+        // trailing GuardNonnull consumes as the loop exit.
+        //
+        // This arm keeps the two bounds tests apart, because the residual
+        // treats their two failures differently: past the end it clears the
+        // sequence, while the negative sentinel keeps it.
+        let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[index_op, zero]);
+        ctx.trace_ctx.set_opref_concrete(nonneg, Value::Int(1));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
+        let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[index_op, lenbox]);
+        ctx.trace_ctx.set_opref_concrete(in_bounds, Value::Int(0));
+        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[in_bounds])?;
+        let null_ref = ctx.trace_ctx.const_ref(0);
+        let seq_descr = crate::descr::list_iter_seq_descr();
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetfieldGc,
+            &[iter_op, null_ref],
+            seq_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setfield_cached(iter_op, seq_descr.index(), null_ref);
+        if ctx.trace_ctx.is_bridge_trace {
+            fbw_bridge_list_iter_journal_push(iter_obj, seq_obj, index);
+        }
+        unsafe { pyre_object::iterobject::w_list_iter_set_seq(iter_obj, pyre_object::PY_NULL) };
+        let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
+        ctx.trace_ctx
+            .set_opref_concrete(null_item, Value::Ref(majit_ir::GcRef(0)));
+        return Ok(Some(null_item));
+    }
+
+    // `0 <= index < len` as one test: the length field is a `usize`, so an
+    // unsigned compare rejects the negative `__setstate__` sentinel by the
+    // same branch that rejects an index past the end.  The continue arm wants
+    // exactly that combined answer, and one guard here is one guard per
+    // iteration of every `for` over a list.
+    let in_bounds = ctx.trace_ctx.record_op(OpCode::UintLt, &[index_op, lenbox]);
+    ctx.trace_ctx.set_opref_concrete(in_bounds, Value::Int(1));
+    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
+
+    // Element load, one arm per storage strategy -- the same shapes
+    // `try_walker_specialize_subscr` emits for `seq[index]`.
+    let item = match sid {
+        0 => {
+            let items_block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                seq_op,
+                crate::descr::list_items_descr(),
+            );
+            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, items_block, index_op)
+        }
+        1 => {
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                seq_op,
+                crate::descr::list_int_items_block_descr(),
+            );
+            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, index_op);
+            let elem = raw_elem.expect("int storage read its raw element");
+            ctx.trace_ctx.set_opref_concrete(raw, elem);
+            let Value::Int(elem) = elem else {
+                unreachable!("int storage stamps an Int")
+            };
+            walker_box_int(ctx, op_pc, raw, elem)?
+        }
+        2 => {
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                seq_op,
+                crate::descr::list_float_items_block_descr(),
+            );
+            let raw = crate::state::trace_float_block_getitem_value(ctx.trace_ctx, block, index_op);
+            ctx.trace_ctx
+                .set_opref_concrete(raw, raw_elem.expect("float storage read its raw element"));
+            crate::state::wrapfloat(ctx.trace_ctx, raw)
+        }
+        // `AsciiListStrategy.getitem` + `wrap`: the erased block yields the
+        // shared immutable payload, and `w_str_from_storage` allocates the
+        // header around it.  Recorded NON-elidable for the same reason the
+        // subscript fold records it so: two reads of the same element hand
+        // back two distinct wrappers, and sharing one would answer `is`
+        // differently from the interpreter that recorded the trace.
+        _ => {
+            let block = crate::state::opimpl_getfield_gc_r(
+                ctx.trace_ctx,
+                seq_op,
+                crate::descr::list_ascii_items_block_descr(),
+            );
+            let storage =
+                crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, index_op);
+            let wrap: extern "C" fn(i64) -> i64 =
+                pyre_object::unicodeobject::__majit_call_target_w_str_from_storage;
+            ctx.trace_ctx.call_ref_typed_with_effect(
+                wrap as *const (),
+                &[storage],
+                &[majit_ir::Type::Ref],
+                majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
+            )
+        }
+    };
+
+    let one = ctx.trace_ctx.const_int(1);
+    let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[index_op, one]);
+    ctx.trace_ctx
+        .set_opref_concrete(next_index, Value::Int(index + 1));
+    let index_descr = crate::descr::list_iter_index_descr();
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetfieldGc,
+        &[iter_op, next_index],
+        index_descr.clone(),
+    );
+    ctx.trace_ctx
+        .heapcache_setfield_cached(iter_op, index_descr.index(), next_index);
+
+    // The authentic boxed item comes from the same `w_list_getitem` the
+    // residual calls.  It allocates for the typed strategies, so every raw
+    // pointer used afterwards is re-derived from its (GC-forwarded) opref.
+    let Some(concrete_item) = (unsafe { pyre_object::w_list_getitem(seq_obj, index) }) else {
+        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
+    };
+    ctx.trace_ctx.set_opref_concrete(
+        item,
+        match sid {
+            1 => box_int_concrete(
+                match raw_elem {
+                    Some(Value::Int(v)) => v,
+                    _ => unreachable!("int storage stamps an Int"),
+                },
+                concrete_item as i64,
+            ),
+            _ => Value::Ref(majit_ir::GcRef(concrete_item as usize)),
+        },
+    );
+
+    let iter_obj = walker_concrete_ref_object(ctx, iter_op)
+        .expect("list iterator concrete survived the item allocation");
+    if ctx.trace_ctx.is_bridge_trace {
+        let seq_obj = unsafe { pyre_object::iterobject::w_list_iter_seq(iter_obj) };
+        fbw_bridge_list_iter_journal_push(iter_obj, seq_obj, index);
+    }
+    unsafe { pyre_object::iterobject::w_list_iter_set_index(iter_obj, index + 1) };
+    fbw_foriter_inflight_capture(concrete_item, body);
+    ctx.vstack_last_ref = item;
+    Ok(Some(item))
+}
+
 pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -18091,6 +18379,11 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     if unsafe { pyre_object::functional::is_zip(iter_obj) } {
         return spec_gate(SpecFold::ZipTwoTupleIters, || {
             try_walker_specialize_zip_two_tuple_iters(ctx, op_pc, iter_op, iter_obj)
+        });
+    }
+    if unsafe { pyre_object::is_list_iter(iter_obj) } {
+        return spec_gate(SpecFold::ForIterList, || {
+            try_walker_specialize_for_iter_list(ctx, op_pc, iter_op, iter_obj)
         });
     }
     let (concrete_current, concrete_remaining, concrete_step) = unsafe {

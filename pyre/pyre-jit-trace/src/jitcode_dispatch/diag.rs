@@ -440,6 +440,7 @@ spec_folds! {
     SubscrStr            => ("subscr_str",               "specialize",    "subscr"),
     BuiltinDivmodLongInt => ("builtin_divmod_long_int",  "specialize",    "builtin_divmod"),
     ZipTwoTupleIters     => ("zip_two_tuple_iters",      "specialize",    "for_iter_next"),
+    ForIterList          => ("for_iter_list",            "specialize",    "for_iter_next"),
     InstanceNext         => ("instance_next",            "residual_call", "-"),
     FrameLasti           => ("frame_lasti",              "specialize",    "load_attr"),
     LoadDeref            => ("load_deref",               "residual_call", "-"),

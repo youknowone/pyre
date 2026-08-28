@@ -1673,6 +1673,37 @@ static TUPLE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     )
 });
 
+/// PyPy `iterobject.py W_FastListIterObject` fields.
+static LIST_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_object::iterobject::W_ListIterObject>(),
+        <pyre_object::iterobject::W_ListIterObject as pyre_object::lltype::GcType>::type_id(),
+        &pyre_object::iterobject::LIST_ITER_TYPE as *const _ as usize,
+        &[
+            (
+                "seq",
+                std::mem::offset_of!(pyre_object::iterobject::W_ListIterObject, seq),
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "index",
+                std::mem::offset_of!(pyre_object::iterobject::W_ListIterObject, index),
+                std::mem::size_of::<i64>(),
+                Type::Int,
+                true,
+                false,
+                false,
+            ),
+        ],
+        "W_ListIterObject",
+        "iterobject::W_ListIterObject",
+    )
+});
+
 /// PyPy `functional.py W_Zip` fields.
 static W_ZIP_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
@@ -3328,6 +3359,16 @@ pub fn seq_iter_index_descr() -> DescrRef {
     field_descr_from_group(&SEQ_ITER_DESCR_GROUP, 1)
 }
 
+/// `iterobject.py W_FastListIterObject.w_seq`.
+pub fn list_iter_seq_descr() -> DescrRef {
+    field_descr_from_group(&LIST_ITER_DESCR_GROUP, 0)
+}
+
+/// `iterobject.py W_FastListIterObject.index`.
+pub fn list_iter_index_descr() -> DescrRef {
+    field_descr_from_group(&LIST_ITER_DESCR_GROUP, 1)
+}
+
 /// Field descriptor for `W_TupleIterObject.seq`.
 pub fn tuple_iter_seq_descr() -> DescrRef {
     field_descr_from_group(&TUPLE_ITER_DESCR_GROUP, 0)
@@ -4796,6 +4837,11 @@ pub fn tuple_iter_size_descr() -> DescrRef {
     TUPLE_ITER_DESCR_GROUP.size_descr.clone()
 }
 
+/// Size descriptor for `iterobject.py W_FastListIterObject`.
+pub fn list_iter_size_descr() -> DescrRef {
+    LIST_ITER_DESCR_GROUP.size_descr.clone()
+}
+
 /// Size descriptor for `functional.py W_Zip`.
 pub fn w_zip_size_descr() -> DescrRef {
     W_ZIP_DESCR_GROUP.size_descr.clone()
@@ -6027,6 +6073,7 @@ mod tests {
             ("W_LongObject", w_long_size_descr()),
             ("W_TupleObject", w_tuple_size_descr()),
             ("W_TupleIter", tuple_iter_size_descr()),
+            ("W_ListIter", list_iter_size_descr()),
             ("W_ZipObject", w_zip_size_descr()),
             ("SpecialisedTupleII", specialised_tuple_ii_size_descr()),
             ("SpecialisedTupleFF", specialised_tuple_ff_size_descr()),
@@ -7177,6 +7224,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("iterobject::W_TupleIterObject", || {
         LazyLock::force(&TUPLE_ITER_DESCR_GROUP);
+    }),
+    ("iterobject::W_ListIterObject", || {
+        LazyLock::force(&LIST_ITER_DESCR_GROUP);
     }),
     ("function::Function", || {
         LazyLock::force(&FUNCTION_DESCR_GROUP);

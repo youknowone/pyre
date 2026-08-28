@@ -11,7 +11,12 @@ def set_trace_limit(n):
         pypyjit.set_param("trace_limit=%d,threshold=1,function_threshold=1" % n)
 
 
-set_trace_limit(40)
+# The limit has to leave room for the loop header before the body's first
+# store: `for e in items` records the list cursor and its element load
+# directly (~20 operations), where the opaque `for_iter_next` residual it
+# replaced was one.  At 40 the walk reached its ceiling inside the header and
+# never saw the `STORE_ATTR` this fixture is about.
+set_trace_limit(60)
 
 errs = list(map(lambda i: OSError(1, str(i)), range(20000)))
 
