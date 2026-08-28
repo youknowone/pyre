@@ -98,6 +98,24 @@ three-freevar shape clean, so it is not merely which guard happened to fail.
 
 n must clear the trace threshold: 1000 passes, 1500 and up fail.
 
+## It is not confined to a closure built inside the loop
+
+Two shapes an ordinary program would write fail the same way, both at i=1042:
+
+    a factory's closure, built once outside the loop and called in it
+        def make(a, b):
+            def add(): return (a, b)
+            return add
+        -> (<class 'cell'>, 3)          slot 0 = the class, slot 1 = a's value
+
+    a two-name lambda
+        g = lambda: (lo, hi)            # co_freevars ('hi', 'lo')
+        -> (5, <class 'cell'>)          lo read hi's value, hi read the class
+
+Read against `co_freevars` order both are the same shift as above: slot 0
+takes the `cell` class and slot k takes what slot k-1 held.  So decorators,
+callbacks and factory-made closures over two names are all in range.
+
 `PYRE_FBW_MULTIFRAME_DEPTH` 1, 2, 3 and 7 all reproduce, and so do
 `PYRE_FBW_MULTIFRAME` 0 and 1, so unlike gh#1444 this is not the multi-frame
 adopt path -- it is the ordinary resume encoding.  gh#1311 is the same family
