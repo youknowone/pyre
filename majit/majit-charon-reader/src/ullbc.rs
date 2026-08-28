@@ -517,10 +517,7 @@ pub struct Local {
 #[derive(Debug, Deserialize)]
 pub struct BasicBlock {
     pub statements: Vec<Statement>,
-    /// Raw terminator. Project to [`TermKind`] via [`BasicBlock::term`]
-    /// so a parse error on a single terminator does not poison the
-    /// whole function.
-    pub terminator: Value,
+    pub terminator: Terminator,
 }
 
 impl BasicBlock {
@@ -528,13 +525,22 @@ impl BasicBlock {
     /// Returns the raw JSON in the error if a variant is unknown so
     /// callers can decide whether to fail-loud or fall back.
     pub fn term(&self) -> Result<TermKind, String> {
-        let kind = self
-            .terminator
-            .as_object()
-            .and_then(|m| m.get("kind"))
-            .ok_or_else(|| "terminator has no 'kind'".to_string())?;
+        let kind = &self.terminator.kind;
         serde_json::from_value(kind.clone()).map_err(|e| format!("{e}; raw kind: {kind}"))
     }
+}
+
+/// A block's terminator, carrying its own span the way a [`Statement`]
+/// does.  A call is a terminator rather than a statement, so the block's
+/// last statement stands on a different line -- usually one that runs
+/// after the call rather than at it.
+#[derive(Debug, Deserialize)]
+pub struct Terminator {
+    /// Raw terminator-kind JSON. Project to [`TermKind`] via
+    /// [`BasicBlock::term`] so a parse error on a single terminator does
+    /// not poison the whole function.
+    pub kind: Value,
+    pub span: Span,
 }
 
 #[derive(Debug, Deserialize)]

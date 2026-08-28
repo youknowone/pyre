@@ -23,7 +23,7 @@ fn main() {
                 }
             }
             if let Err(e) = bb.term() {
-                let raw = bb.terminator.get("kind").cloned().unwrap_or_default();
+                let raw = bb.terminator.kind.clone();
                 let outer = outer_key(&raw);
                 let key = format!("[term:{outer}] {}", msg(&e));
                 *errors.entry(key.clone()).or_default() += 1;
