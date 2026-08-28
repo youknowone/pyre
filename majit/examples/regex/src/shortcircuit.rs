@@ -1258,8 +1258,7 @@ mod tests {
             // would let this column drift while four documents keep quoting
             // the numbers it used to have.
             assert_eq!(
-                mk_guards,
-                want.masking_guards,
+                mk_guards, want.masking_guards,
                 "{nodes} nodes: the masking body has {mk_guards} guards \
                  against the {} recorded. This column is quoted in this \
                  module's doc, `jit_interp.rs`, `regex.rs` and \
