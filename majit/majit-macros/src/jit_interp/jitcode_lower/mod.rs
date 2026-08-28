@@ -44,7 +44,7 @@ mod reexports {
         is_supported_float_type, is_supported_int_cast, is_supported_ref_type, is_word_width_int,
         jit_arg_kind_tokens, opcode_for_assign_binop, opcode_for_assign_binop_f, opcode_for_binop,
         opcode_for_binop_f, opcode_for_compare_f, stmt_has_loop_control, typed_call_arg_tokens,
-        word_result_addr_for_kind, word_result_addr_tokens,
+        word_result_addr_for_kind, word_result_addr_tokens, word_void_addr_tokens,
     };
     pub(super) use super::liveness::{
         annotate_live_markers_with_liveness, compute_per_marker_liveness, get_liveness_info,
@@ -3240,7 +3240,9 @@ mod tests {
     }
 
     /// A ref result is a pointer and a void result is never read, so neither
-    /// has anything to widen and both register the callee's own address.
+    /// has anything to widen. The ref arm therefore registers the callee's own
+    /// address; the void arm goes through the void registration, whose target
+    /// is still that same address wherever a pointer already fills a word.
     #[test]
     fn non_int_result_calls_register_the_callee_address() {
         let call = parse_call("helper(1)");
@@ -3262,7 +3264,8 @@ mod tests {
             .expect("residual void call should lower");
         let statements = &lowerer.statements;
         let body = quote! { #(#statements)* }.to_string();
-        assert!(body.contains("add_fn_ptr (helper as * const ())"));
+        assert!(body.contains("add_word_abi_fn_ptr_void"), "{body}");
+        assert!(body.contains("helper as * const ()"), "{body}");
         assert!(!body.contains("into_call_word"));
     }
 

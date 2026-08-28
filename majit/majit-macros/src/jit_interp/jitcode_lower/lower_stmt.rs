@@ -1473,6 +1473,10 @@ impl<'c> Lowerer<'c> {
         let func = &call.func;
         let arg_kinds: Vec<BindingKind> = arg_bindings.iter().map(|b| b.kind).collect();
         let word_result_addr = word_result_addr_tokens(func, &arg_kinds);
+        // A void residual is recorded with a `()` result, so its target is
+        // spelled words-in-nothing-out rather than through the result-widening
+        // shim above.
+        let word_void_addr = word_void_addr_tokens(func, &arg_kinds);
         // jtransform.py:467-471 / 480-482: `-live-` follows the call, it does
         // not precede it.  Decide here whether the explicit arm below needs a
         // trailing marker; the inferred arm emits its own runtime-conditional
@@ -1522,7 +1526,7 @@ impl<'c> Lowerer<'c> {
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
                                 let __typed_args = #typed_args;
                                 #call_stmt
                             },
@@ -1534,7 +1538,7 @@ impl<'c> Lowerer<'c> {
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
                                 let __typed_args = #typed_args;
                                 #call_stmt
                             },

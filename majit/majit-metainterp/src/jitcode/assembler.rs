@@ -5454,6 +5454,16 @@ impl JitCodeBuilder {
         self.add_fn_ptr(ptr)
     }
 
+    /// [`Self::add_word_abi_fn_ptr`] for a target that returns nothing.
+    ///
+    /// Vouches for the parameters alone. A void call is recorded with a `()`
+    /// result, so the whole signature is words-in and nothing out, and there is
+    /// no result register for the target to have widened.
+    pub fn add_word_abi_fn_ptr_void(&mut self, ptr: *const ()) -> u16 {
+        vouch_word_abi_call_target(ptr);
+        self.add_fn_ptr(ptr)
+    }
+
     /// [`Self::add_word_abi_fn_ptr`] carrying an
     /// [`crate::call_descr::EffectInfoSlot`] classification.
     pub fn add_word_abi_fn_ptr_with_slot(
