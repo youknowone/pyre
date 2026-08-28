@@ -120,28 +120,34 @@ pub(crate) fn scalar_residual_for_method(
 ) -> Option<(Vec<String>, ScalarResult)> {
     // NEW-DEVIATION, with a convergence path.  Upstream reads
     // `_jit_look_inside_` in exactly one place — `JitPolicy.look_inside_graph`
-    // (`rpython/jit/codewriter/policy.py:48-58`) — to decide trace-vs-call.
-    // It never changes which operations a graph CONTAINS: `_AsDouble`'s
-    // flowgraph holds the same `direct_call(rbigint.bit_length)` whether or
-    // not it is opaque (`rpython/rlib/jit.py:133-140`).  Branching the emitted
-    // callee on the hint, as below, has no upstream counterpart.
+    // (`rpython/jit/codewriter/policy.py`) — to decide trace-vs-call.  It never
+    // changes which operations a graph CONTAINS: `rbigint._AsDouble`'s
+    // flowgraph holds the same `direct_call(rbigint.bit_length)` whether or not
+    // `jit.dont_look_inside` (`rpython/rlib/jit.py`) marked it opaque.
+    // Branching the emitted callee on the hint, as below, has no upstream
+    // counterpart.
     //
-    // Why it is here: `rbigint.py:_AsDouble` is itself `@jit.dont_look_inside`,
-    // but GraphAnalyzer still walks its untranslated graph to compute effects.
-    // Retargeting its `bit_length` to the interpreter-facing residual wrapper
-    // adds `jit_publish_exception(PyError(...).to_exc_object())` and its GC
-    // write barrier to a source graph where upstream carries only the ordinary
-    // OverflowError control-flow edge.  That false write makes an enclosing
-    // elidable bigint helper fail `getcalldescr` with EF_RANDOM_EFFECTS.
+    // Why it is here, measured: `bit_length` / `bit_count` are the only scalar
+    // queries whose Rust signature is `Result<i64, RBigIntError>` — the
+    // value-encoded `ovfcheck` idiom, since both are `@jit.elidable` and raise
+    // OverflowError (`rpython/rlib/rbigint.py`).  This mapper's residual
+    // returns a bare Signed word, so the retarget ERASES that `Result`, while
+    // the caller's `?` diamond survives untouched: with the gate lifted,
+    // `_AsDouble` holds `jit_bigint_bit_length -> Int` still feeding
+    // `Try::branch` / `from_residual`, i.e. a `__discriminant` read on an
+    // integer.  `pyre_interpreter::typedef::long_bit_length` records the same
+    // erasure from the caller's side and works around it with its own
+    // `dont_look_inside` boundary.  The defect is a MISCOMPILE, not merely the
+    // wrapper's effect classification.
     //
-    // The defect is therefore the WRAPPER's effect, not the caller's hint.
-    // Converging means one of: (a) give the residual wrapper the uniform
-    // `front::result_exc` exception ABI so an OverflowError travels on the
-    // exception link instead of a heap publish — the shape
-    // `exceptiontransform.py` gives every raising graph; or (b) declare the
-    // publish's `EffectInfo` so it is not EF_RANDOM_EFFECTS.  Either lets one
-    // lowering serve both callers and this parameter goes away.  Until then
-    // the gate stays, because the alternative is a miscompiled effect set.
+    // Converging is `simplify.transform_ovfcheck`'s move, which
+    // [`crate::front::checked_arith`] already performs for the
+    // `checked_*` + `Option` spelling of the same idiom: rewrite the caller's
+    // diamond into an `OverflowError` exception edge — normal exit to the `Ok`
+    // arm carrying the bare word, raising exit to the `Err` arm — and do it
+    // atomically with the retarget, so a shape the rewrite declines keeps the
+    // unerased `bit_length` call and no hint is consulted anywhere.  Until that
+    // lands the gate stays, because the alternative is a miscompiled graph.
     if inside_dont_look_inside && matches!(leaf, "bit_length" | "bit_count") {
         return None;
     }

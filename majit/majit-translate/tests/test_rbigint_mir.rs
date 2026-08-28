@@ -58,6 +58,13 @@ fn load_rbigint_llbcs() -> Option<Vec<Llbc>> {
     ])
 }
 
+/// `_AsDouble` consumes `bit_length()` with `?`, so the `Result<i64,
+/// RBigIntError>` it returns is destructured by a live `Try::branch` /
+/// `from_residual` diamond.  The scalar residual returns a bare Signed word,
+/// which erases that `Result`: retargeting here leaves the diamond reading
+/// `__discriminant` off an integer.  This asserts the erasure does not happen
+/// — it fails as soon as `scalar_residual_for_method`'s gate stops declining,
+/// with `jit_bigint_bit_length` appearing beside the surviving `branch`.
 #[test]
 fn as_double_effect_graph_keeps_upstream_bit_length_call() {
     let Some(llbcs) = load_rbigint_llbcs() else {
