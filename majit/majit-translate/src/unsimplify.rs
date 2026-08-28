@@ -2,9 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::codewriter::type_state::ConcreteType;
+use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
 use crate::flowspace::model::Variable;
-use crate::model::{BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation};
+use crate::model::{BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation};
 
 /// Best available spelling for one variable: the `Input`-op source name if
 /// the graph carries one, else the `Variable` name prefix, else its identity.
@@ -96,6 +96,62 @@ fn producing_op(graph: &FunctionGraph, var: &Variable) -> Option<String> {
     None
 }
 
+enum IncomingSource<'a> {
+    Value(&'a Variable),
+    Other(&'a LinkArg),
+    Missing,
+}
+
+/// One hop from a block inputarg to the values supplied by predecessor links.
+fn incoming_sources<'a>(
+    graph: &'a FunctionGraph,
+    var: &Variable,
+) -> Option<Vec<IncomingSource<'a>>> {
+    let (block, position) = graph.blocks.iter().find_map(|block| {
+        block
+            .inputargs
+            .iter()
+            .position(|arg| arg.id() == var.id())
+            .map(|position| (block.id, position))
+    })?;
+    Some(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|pred| pred.exits.iter().filter(move |link| link.target == block))
+            .map(|link| match link.args.get(position) {
+                Some(LinkArg::Value(source)) => IncomingSource::Value(source),
+                Some(other) => IncomingSource::Other(other),
+                None => IncomingSource::Missing,
+            })
+            .collect(),
+    )
+}
+
+#[derive(Default)]
+struct OriginSummary {
+    origins: Vec<String>,
+    shared_predecessors: usize,
+}
+
+impl OriginSummary {
+    fn resolved(origin: String) -> Self {
+        Self {
+            origins: vec![origin],
+            shared_predecessors: 0,
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        for origin in other.origins {
+            if !self.origins.contains(&origin) {
+                self.origins.push(origin);
+            }
+        }
+        self.shared_predecessors += other.shared_predecessors;
+    }
+}
+
 /// Resolve a value back to the operation that actually produces it, walking
 /// through block inputargs for as long as the value is only being forwarded.
 ///
@@ -105,39 +161,66 @@ fn producing_op(graph: &FunctionGraph, var: &Variable) -> Option<String> {
 /// takes the incoming link argument in the same position; distinct origins are
 /// reported side by side because a block with several predecessors genuinely
 /// has several.
-fn origin_of(graph: &FunctionGraph, var: &Variable, seen: &mut HashSet<u64>, depth: usize) -> String {
-    if let Some(site) = producing_op(graph, var) {
-        return site;
-    }
-    if depth == 0 || !seen.insert(var.id()) {
+fn origin_of(
+    graph: &FunctionGraph,
+    var: &Variable,
+    seen: &mut HashSet<u64>,
+    depth: usize,
+) -> String {
+    let summary = origin_summary(graph, var, seen, depth);
+    if summary.origins.is_empty() {
         return format!("id={}", var.id());
     }
-    for block in &graph.blocks {
-        let Some(position) = block.inputargs.iter().position(|arg| arg.id() == var.id()) else {
-            continue;
+    let mut origins = summary.origins.join(" | ");
+    if summary.shared_predecessors != 0 {
+        let description = if summary.origins.len() == 1 {
+            "that origin"
+        } else {
+            "those origins"
         };
-        let mut origins: Vec<String> = Vec::new();
-        for pred in &graph.blocks {
-            for link in &pred.exits {
-                if link.target != block.id {
-                    continue;
-                }
-                let origin = match link.args.get(position) {
-                    Some(LinkArg::Value(source)) => origin_of(graph, source, seen, depth - 1),
-                    Some(other) => format!("{other:?}"),
-                    None => "<link arity mismatch>".to_string(),
-                };
-                if !origins.contains(&origin) {
-                    origins.push(origin);
-                }
-            }
-        }
-        if !origins.is_empty() {
-            return origins.join(" | ");
-        }
-        break;
+        origins.push_str(&format!(
+            " (+{} predecessors sharing {description})",
+            summary.shared_predecessors
+        ));
     }
-    format!("id={}", var.id())
+    origins
+}
+
+fn origin_summary(
+    graph: &FunctionGraph,
+    var: &Variable,
+    seen: &mut HashSet<u64>,
+    depth: usize,
+) -> OriginSummary {
+    if let Some(site) = producing_op(graph, var) {
+        return OriginSummary::resolved(site);
+    }
+    if depth == 0 {
+        return OriginSummary::resolved(format!("id={}", var.id()));
+    }
+    if !seen.insert(var.id()) {
+        return OriginSummary {
+            origins: Vec::new(),
+            shared_predecessors: 1,
+        };
+    }
+    let Some(incoming) = incoming_sources(graph, var) else {
+        return OriginSummary::resolved(format!("id={}", var.id()));
+    };
+    let mut summary = OriginSummary::default();
+    for source in incoming {
+        let origin = match source {
+            IncomingSource::Value(source) => origin_summary(graph, source, seen, depth - 1),
+            IncomingSource::Other(other) => OriginSummary::resolved(format!("{other:?}")),
+            IncomingSource::Missing => OriginSummary::resolved("<link arity mismatch>".to_string()),
+        };
+        summary.extend(origin);
+    }
+    if summary.origins.is_empty() && summary.shared_predecessors == 0 {
+        OriginSummary::resolved(format!("id={}", var.id()))
+    } else {
+        summary
+    }
 }
 
 /// Every use of a variable at or after the split point, keyed by
@@ -177,6 +260,82 @@ fn use_sites(
         Some(ExitSwitch::LastException) | None => {}
     }
     uses
+}
+
+fn jit_merge_point_receiver(op: &SpaceOperation) -> Option<&Variable> {
+    let OpKind::Call { target, args, .. } = &op.kind else {
+        return None;
+    };
+    let receiver_root = target.receiver_root()?;
+    let driver_roots = [receiver_root.to_string()];
+    (jit_marker_key_from_target(target, &driver_roots) == Some(JitMarkerKey::JitMergePoint))
+        .then(|| args.first())
+        .flatten()
+}
+
+fn origin_producer(graph: &FunctionGraph, var: &Variable) -> Option<SpaceOperation> {
+    let mut current = var.clone();
+    let mut seen = HashSet::new();
+    for _ in 0..ORIGIN_WALK_DEPTH {
+        if !seen.insert(current.id()) {
+            return None;
+        }
+        if let Some(op) = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| {
+                op.result
+                    .as_ref()
+                    .is_some_and(|result| result.id() == current.id())
+            })
+        {
+            return Some(op.clone());
+        }
+
+        let mut incoming = incoming_sources(graph, &current)?.into_iter();
+        let Some(IncomingSource::Value(source)) = incoming.next() else {
+            return None;
+        };
+        let source = source.clone();
+        if incoming
+            .any(|arg| !matches!(arg, IncomingSource::Value(other) if other.id() == source.id()))
+        {
+            return None;
+        }
+        current = source;
+    }
+    None
+}
+
+/// RPython `split_block` recreates a Void marker receiver with `same_as`, and
+/// `remove_same_as` later substitutes the constant. Before rtyping, mirror that
+/// rematerialisation by copying only the constant producer used for operand 0;
+/// this is the driver constant from `ExtEnterLeaveMarker.specialize_call`.
+fn rematerializable_marker_receiver_producer(
+    graph: &FunctionGraph,
+    var: &Variable,
+) -> Option<SpaceOperation> {
+    let producer = origin_producer(graph, var)?;
+    if !crate::inline::op_variable_refs(&producer.kind).is_empty() {
+        return None;
+    }
+    let can_copy = match &producer.kind {
+        OpKind::ConstInt(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstSymbolic { .. }
+        | OpKind::ConstFloat(_)
+        | OpKind::ConstStr(_)
+        | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::ConstNone
+        | OpKind::ConstRefAddr(_) => true,
+        OpKind::Call { args, .. } => args.is_empty(),
+        _ => false,
+    };
+    can_copy.then_some(producer)
 }
 
 /// `translator/unsimplify.py split_block` for the rich model graph.
@@ -313,10 +472,40 @@ pub(crate) fn split_block(
             "unsimplify.py split_block _forcelink requires index == 0"
         );
         let linkargs = forcelink.to_vec();
-        let missing: Vec<&Variable> = varmap_order
+        let mut missing: Vec<&Variable> = varmap_order
             .iter()
             .filter(|var| !linkargs.contains(var))
             .collect();
+        // `_forcelink` requires index 0, and `split_before_jit_merge_point` splits at
+        // the marker found with configured roots. Only `moved_source[0]` can qualify;
+        // using its own root satisfies the classifier's root check by construction.
+        let marker_receiver_id = moved_source
+            .first()
+            .and_then(jit_merge_point_receiver)
+            .map(Variable::id);
+        let mut rematerialized_ids = Vec::new();
+        let mut rematerialized_ops = Vec::new();
+        for var in &missing {
+            if marker_receiver_id != Some(var.id()) {
+                continue;
+            }
+            let Some(producer) = rematerializable_marker_receiver_producer(graph, var) else {
+                continue;
+            };
+            let result = varmap
+                .get(*var)
+                .cloned()
+                .expect("split_block: missing Variable has no fresh mapping");
+            // The moved operations already use this fresh varmap result, so
+            // making it the copied producer's result performs the substitution.
+            rematerialized_ids.push(var.id());
+            rematerialized_ops.push(SpaceOperation {
+                result: Some(result),
+                kind: producer.kind,
+            });
+        }
+        missing.retain(|var| !rematerialized_ids.contains(&var.id()));
+        moved_operations.splice(0..0, rematerialized_ops);
         if !missing.is_empty() {
             let uses = use_sites(
                 &moved_source,
@@ -347,18 +536,6 @@ pub(crate) fn split_block(
                 })
                 .collect();
             let names: Vec<String> = missing.iter().map(|var| var_label(graph, var)).collect();
-            // The Void `same_as` re-creation arm is unported because the rich
-            // model has no `same_as` counterpart. A Void `kind=` below is the
-            // signal to port that operation before allowing the split.
-            assert!(
-                !missing
-                    .iter()
-                    .any(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Void),
-                "unsimplify.py split_block recreates Void _forcelink survivors with `same_as`; \
-                 the rich model has no `same_as` counterpart to port it onto.\n\
-                 Offending variables:\n{}",
-                offenders.join("\n"),
-            );
             panic!(
                 "The variable {} was not explicitly listed in _forcelink.  \
                  This issue can be caused by a jitdriver.jit_merge_point() where some variable \
@@ -529,6 +706,113 @@ mod tests {
             vec![LinkArg::Value(b), LinkArg::Value(a)]
         );
         assert_eq!(graph.block(new).inputargs.len(), 2);
+    }
+
+    #[test]
+    fn split_with_forcelink_rematerializes_nullary_marker_receiver() {
+        let receiver = Variable::named("pypyjitdriver");
+        let marker_result = Variable::named("marker_result");
+        let producer_kind = OpKind::Call {
+            target: crate::model::CallTarget::function_path(["pyre_jit", "eval", "pypyjitdriver"]),
+            args: vec![],
+            result_ty: ValueType::Ref(Some("PyPyJitDriver".into())),
+        };
+        let marker_kind = OpKind::Call {
+            target: crate::model::CallTarget::method(
+                "jit_merge_point",
+                Some("PyPyJitDriver".into()),
+            ),
+            args: vec![receiver.clone()],
+            result_ty: ValueType::Void,
+        };
+        let mut graph = graph_with_ops(
+            vec![],
+            vec![
+                SpaceOperation {
+                    result: Some(receiver.clone()),
+                    kind: producer_kind.clone(),
+                },
+                SpaceOperation {
+                    result: Some(marker_result.clone()),
+                    kind: marker_kind,
+                },
+            ],
+            marker_result,
+        );
+        let old = graph.startblock;
+        let portal = split_block(&mut graph, old, 1, None);
+        let portal_receiver = jit_merge_point_receiver(&graph.block(portal).operations[0])
+            .expect("split portal must start with the marker receiver")
+            .clone();
+
+        let new = split_block(&mut graph, portal, 0, Some(&[]));
+
+        assert!(graph.block(portal).exits[0].args.is_empty());
+        assert!(graph.block(new).inputargs.is_empty());
+        assert_eq!(graph.block(new).operations[0].kind, producer_kind);
+        let rematerialized = graph.block(new).operations[0]
+            .result
+            .as_ref()
+            .expect("copied producer must have a result");
+        assert_ne!(rematerialized.id(), receiver.id());
+        assert_ne!(rematerialized.id(), portal_receiver.id());
+        let OpKind::Call { args, .. } = &graph.block(new).operations[1].kind else {
+            panic!("moved marker must remain a Call")
+        };
+        assert_eq!(args, &[rematerialized.clone()]);
+    }
+
+    #[test]
+    fn split_with_forcelink_does_not_rematerialize_marker_at_index_one() {
+        let receiver = Variable::named("pypyjitdriver");
+        let filler = Variable::named("filler");
+        let marker_result = Variable::named("marker_result");
+        let mut graph = graph_with_ops(
+            vec![],
+            vec![
+                SpaceOperation {
+                    result: Some(receiver.clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::function_path([
+                            "pyre_jit",
+                            "eval",
+                            "pypyjitdriver",
+                        ]),
+                        args: vec![],
+                        result_ty: ValueType::Ref(Some("PyPyJitDriver".into())),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(filler),
+                    kind: OpKind::ConstNone,
+                },
+                SpaceOperation {
+                    result: Some(marker_result.clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::method(
+                            "jit_merge_point",
+                            Some("PyPyJitDriver".into()),
+                        ),
+                        args: vec![receiver],
+                        result_ty: ValueType::Void,
+                    },
+                },
+            ],
+            marker_result,
+        );
+        let old = graph.startblock;
+        let portal = split_block(&mut graph, old, 1, None);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            split_block(&mut graph, portal, 0, Some(&[]))
+        }))
+        .expect_err("a marker receiver used only by operation 1 must remain an offender");
+        let message = panic
+            .downcast_ref::<String>()
+            .expect("split_block panics with a formatted String");
+
+        assert!(message.contains("pypyjitdriver"), "{message}");
+        assert!(message.contains("op 1 `call jit_merge_point`"), "{message}");
     }
 
     #[test]
