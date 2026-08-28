@@ -2789,6 +2789,9 @@ impl WarmEnterState {
     /// admissible substitute.
     #[inline]
     pub(crate) fn confirm_compiled_entry_for_cell_key(&self, cell_key: u64) -> bool {
+        if self.confirm_enter_jit_ptr.is_none() {
+            return true;
+        }
         let green_key = self
             .cell_by_key(cell_key)
             .and_then(|cell| cell.comparekey.as_ref());

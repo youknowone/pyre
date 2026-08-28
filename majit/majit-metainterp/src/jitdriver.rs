@@ -5852,6 +5852,16 @@ impl<S: JitState> JitDriver<S> {
             carried_procedure_token.or_else(|| self.meta.entry_procedure_token(green_key))
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
         {
+            // warmstate.py `WarmEnterState.make_entry_point` /
+            // `maybe_compile_and_run`: the confirmation veto sits between
+            // finding the procedure token and `EnterJitAssembler`.
+            if !self
+                .meta
+                .warm_state_ref()
+                .confirm_compiled_entry_for_cell_key(green_key)
+            {
+                return None;
+            }
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             // Resolved here with the descriptor and carried to both ends of
             // the run; see `sync_before` for why it is not asked for twice.
@@ -9038,6 +9048,7 @@ mod tests {
     use super::*;
     use crate::resume::ReconstructedFrame;
     use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
+    use std::sync::Arc;
 
     // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
     // a non-null `bh.virtualizable_info`. A state-field machine (no `vable_token`)
@@ -9249,6 +9260,132 @@ mod tests {
         fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
             true
         }
+    }
+
+    fn compiled_structured_back_edge_fixture() -> (
+        JitDriver<TypedRestoreState>,
+        u64,
+        GreenKey,
+        TypedRestoreState,
+    ) {
+        let code = 0x7100usize;
+        let pc = 19usize;
+        let key = GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let hash = key.get_uhash();
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let live = [Value::Int(1)];
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(hash, (code, pc), None, None, &live),
+            BackEdgeAction::StartedTracing,
+        ));
+        {
+            let ctx = driver
+                .meta
+                .trace_ctx()
+                .expect("trace starts at threshold 1");
+            let i0 = OpRef::input_arg_int(0);
+            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
+            ctx.set_fail_args(guard, &[i0]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(driver.has_compiled_loop(hash));
+        let state = TypedRestoreState {
+            live_values: vec![1],
+            ..Default::default()
+        };
+        (driver, hash, key, state)
+    }
+
+    /// `warmstate.py maybe_compile_and_run` consults `confirm_enter_jit`
+    /// after finding a procedure token and before raising
+    /// `EnterJitAssembler`; the structured back-edge door owes the same veto.
+    #[test]
+    fn a_confirm_enter_jit_veto_stops_the_structured_back_edge_compiled_door() {
+        static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn refuse(_key: &GreenKey) -> bool {
+            CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+
+        CONFIRMS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (mut driver, hash, key, mut state) = compiled_structured_back_edge_fixture();
+        let compiled_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_entries = Arc::clone(&compiled_entries);
+        driver.set_on_compiled_entry(move |_, _| {
+            counted_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        driver
+            .meta
+            .warm_state_mut()
+            .set_confirm_enter_jit(Some(refuse));
+        let mut pre_ran = false;
+
+        let outcome = driver.back_edge_structured(
+            hash,
+            || key.clone(),
+            19,
+            &mut state,
+            &(),
+            || pre_ran = true,
+        );
+
+        assert_eq!(outcome, None);
+        assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!pre_ran, "a veto returns before the compiled-entry pre-run");
+        assert_eq!(
+            compiled_entries.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the rejected structured back edge must not enter compiled code",
+        );
+    }
+
+    /// The positive control distinguishes a working confirmation gate from a
+    /// door that never reaches compiled code at all.
+    #[test]
+    fn a_permissive_confirm_enter_jit_preserves_the_structured_back_edge_compiled_door() {
+        static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_key: &GreenKey) -> bool {
+            CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CONFIRMS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (mut driver, hash, key, mut state) = compiled_structured_back_edge_fixture();
+        let compiled_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_entries = Arc::clone(&compiled_entries);
+        driver.set_on_compiled_entry(move |_, _| {
+            counted_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        driver
+            .meta
+            .warm_state_mut()
+            .set_confirm_enter_jit(Some(allow));
+        let mut pre_ran = false;
+
+        let outcome = driver.back_edge_structured(
+            hash,
+            || key.clone(),
+            19,
+            &mut state,
+            &(),
+            || pre_ran = true,
+        );
+
+        assert!(outcome.is_some(), "the permissive door executes the loop");
+        assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(pre_ran, "the permissive door reaches the compiled pre-run");
+        assert_eq!(
+            compiled_entries.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the permissive structured back edge must enter compiled code",
+        );
     }
 
     #[test]
