@@ -1017,6 +1017,37 @@ fn run_python_impl(source: &str) -> String {
     let main_module = pyre_object::module::w_module_new_aliasing_dict("__main__", canonical);
     pyre_interpreter::importing::set_sys_module("__main__", main_module);
 
+    let script_path = SCRIPT_PATH.with(|p| p.borrow().clone());
+
+    // `__main__.__file__` — `pymain_run_file` publishes the script's own path
+    // in the module it runs it as, and `unittest`'s discovery, `inspect` and
+    // traceback rendering all read it back off `__main__`.
+    if let Some(path) = script_path.as_deref() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(canonical);
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new("__file__"));
+        let w_path = pyre_object::w_str_new(path);
+        let _ = pyre_interpreter::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(globals_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            w_path,
+        );
+    }
+
+    // `sys.argv[0]` is the script, as `pymain_run_file` sets it, and `''` when
+    // the guest was handed source with no name -- which is what `Py_Initialize`
+    // leaves behind and what `unittest.main()` reads for its program name.  An
+    // empty `sys.argv` is not a shape any launcher produces.
+    //
+    // Last before `sys` is built: the list this hands over is held in a plain
+    // cell until then, and nothing roots it while it waits there, so the fewer
+    // allocations in between the better.
+    pyre_interpreter::importing::set_sys_argv(&[std::ffi::OsString::from(
+        script_path.unwrap_or_default(),
+    )]);
+
     // Create `sys` before user code runs, as `run_script_path` does. Nothing on
     // this entry point imports it otherwise, and the interpreter reads it
     // directly for its own work: `_warnings.show_warning` writes through
