@@ -867,14 +867,6 @@ crate::py_module! {
                 "sem_unlink",
                 crate::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1),
             );
-
-            crate::module_ns_store(
-                ns,
-                "SEM_VALUE_MAX",
-                sem_value_max,
-            );
-            crate::module_ns_store(ns, "RECURSIVE_MUTEX", w_int_new(RECURSIVE_MUTEX));
-            crate::module_ns_store(ns, "SEMAPHORE", w_int_new(SEMAPHORE));
         }
         #[cfg(all(windows, feature = "host_env"))]
         {

@@ -561,8 +561,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         }),
     );
     // nl_langinfo() reads the active-locale codeset/DB; stubbed under sandbox,
-    // so the real body is compiled out.
-    #[cfg(not(feature = "sandbox"))]
+    // so the real body is compiled out.  `moduledef.py` publishes the name
+    // only where the host has langinfo, which is the condition its `nl_item`
+    // constants are registered under above.
+    #[cfg(all(
+        not(feature = "sandbox"),
+        unix,
+        not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+    ))]
     crate::module_ns_store(
         ns,
         "nl_langinfo",
@@ -728,7 +734,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
             Err(crate::host_seam::stub("this locale function"))
         }
-        for name in ["setlocale", "localeconv", "nl_langinfo"] {
+        // `nl_langinfo` is stubbed only where the unsandboxed build has it
+        // to stub.
+        #[cfg(all(
+            unix,
+            not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+        ))]
+        let stubbed: &[&str] = &["setlocale", "localeconv", "nl_langinfo"];
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "ios", target_os = "android", target_os = "redox"))
+        )))]
+        let stubbed: &[&str] = &["setlocale", "localeconv"];
+        for &name in stubbed {
             crate::module_ns_store(
                 ns,
                 name,
