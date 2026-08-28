@@ -4597,7 +4597,7 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    let Some(binding) = super_attr_binding(w_descr, class_mode) else {
+    let Some(binding) = super_attr_binding(w_descr, concrete_self, class_mode) else {
         return Ok(None);
     };
 
@@ -4652,6 +4652,7 @@ enum SuperAttrBinding {
 /// `space.get(w_descr, descr_obj, objtype)` runs no Python.
 fn super_attr_binding(
     w_descr: pyre_object::PyObjectRef,
+    concrete_self: pyre_object::PyObjectRef,
     class_mode: bool,
 ) -> Option<SuperAttrBinding> {
     let descr_ob_type = unsafe { (*w_descr).ob_type };
@@ -4700,6 +4701,23 @@ fn super_attr_binding(
             slot_pin: Some(crate::descr::classmethod_w_function_quasi_descr()),
         });
     }
+    // `get`'s slot-wrapper arm, which class mode never reaches: there the
+    // descriptor comes back unchanged.  Its instance check is a precondition of
+    // the binding rather than part of it, so it is settled here against the
+    // receiver whose class the emitted guards pin; a receiver it rejects
+    // declines and raises in the interpreter.
+    if !class_mode
+        && unsafe {
+            pyre_interpreter::baseobjspace::super_attr_slot_wrapper_binds(w_descr, concrete_self)
+        }
+    {
+        return Some(SuperAttrBinding::Method {
+            w_function: w_descr,
+            header: super_attr_method_header(w_descr)?,
+            bind_to_class: false,
+            slot_pin: None,
+        });
+    }
     if unsafe {
         pyre_interpreter::baseobjspace::super_attr_returns_descr_unchanged(w_descr, class_mode)
     } {
@@ -4711,29 +4729,35 @@ fn super_attr_binding(
     None
 }
 
-/// The two words that separate the `Method` `get` builds for the two
-/// descriptor typedefs `super_attr_fast_path` admits.
+/// The two words that separate the `Method` `get` builds for the descriptor
+/// typedefs the `super` fold binds.
 ///
 /// A `function` binds through `w_method_new`, which leaves `w_module` null and
-/// lets the allocation's own header stand.  A `method_descriptor` takes `get`'s
-/// first arm and binds through `builtin_bound_method_new`, which is that same
-/// call followed by two stores: the Python-visible class becomes
-/// `builtin_function_or_method` and `w_module` becomes `None`.  The payload is
-/// identical, so one emission serves both once these two are chosen.
+/// lets the allocation's own header stand.  The other two arms bind through
+/// `restamped_bound_method_new`, which is that same call followed by two
+/// stores: the Python-visible class becomes `builtin_function_or_method` for a
+/// `method_descriptor` and `method-wrapper` for a slot wrapper, and `w_module`
+/// becomes `None`.  The payload is identical in all three, so one emission
+/// serves them once these two words are chosen.
 ///
-/// `None` when the `builtin_function_or_method` type object is not registered,
-/// which is resolved here — before the caller emits anything — so the decline
-/// leaves the trace untouched.
+/// `None` when the chosen type object is not registered, which is resolved
+/// here — before the caller emits anything — so the decline leaves the trace
+/// untouched.
 fn super_attr_method_header(
     w_descr: pyre_object::PyObjectRef,
 ) -> Option<(bool, pyre_object::PyObjectRef)> {
-    let binds_as_builtin = unsafe { pyre_interpreter::is_method_descriptor(w_descr) };
-    let header = if binds_as_builtin {
-        pyre_interpreter::typedef::gettypeobject(&pyre_interpreter::BUILTIN_FUNCTION_TYPE)
+    let restamped_class = if unsafe { pyre_interpreter::is_method_descriptor(w_descr) } {
+        Some(&pyre_interpreter::BUILTIN_FUNCTION_TYPE)
+    } else if unsafe { pyre_interpreter::is_slot_wrapper(w_descr) } {
+        Some(&pyre_interpreter::METHOD_WRAPPER_TYPE)
     } else {
-        pyre_object::get_instantiate(&pyre_object::function::METHOD_TYPE)
+        None
     };
-    (!header.is_null()).then_some((binds_as_builtin, header))
+    let header = match restamped_class {
+        Some(ty) => pyre_interpreter::typedef::gettypeobject(ty),
+        None => pyre_object::get_instantiate(&pyre_object::function::METHOD_TYPE),
+    };
+    (!header.is_null()).then_some((restamped_class.is_some(), header))
 }
 
 /// The body `super(cls, self).name` compiles to, once
@@ -4799,7 +4823,7 @@ fn walker_emit_super_attr_result<Sym: WalkSym>(
     // NewWithVtable's size descr).  [`super_attr_method_header`] has already
     // picked the header class, and its flag says whether the two extra stores
     // `builtin_bound_method_new` performs are owed on top.
-    let (binds_as_builtin, header_w_class_obj) = method_header;
+    let (restamps_header, header_w_class_obj) = method_header;
     let func_const = ctx.trace_ctx.const_ref(w_function as i64);
     let header_w_class = ctx.trace_ctx.const_ref(header_w_class_obj as i64);
     let bound_self = if bind_to_class {
@@ -4814,9 +4838,10 @@ fn walker_emit_super_attr_result<Sym: WalkSym>(
         objtype_const,
         header_w_class,
     );
-    if binds_as_builtin {
+    if restamps_header {
         // `w_method_new` leaves `w_module` null and a virtual reads an
-        // unwritten field as null, so only this arm owes the slot a store.
+        // unwritten field as null, so only the restamping arms owe the slot a
+        // store.
         let module_descr = crate::descr::method_w_module_descr();
         let module_index = module_descr.index();
         let none_const = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
@@ -4828,7 +4853,7 @@ fn walker_emit_super_attr_result<Sym: WalkSym>(
         ctx.trace_ctx
             .heapcache_setfield_cached(method_op, module_index, none_const);
     }
-    // The physical layout is `Method` either way: `builtin_bound_method_new`
+    // The physical layout is `Method` either way: `restamped_bound_method_new`
     // restamps the Python-visible `w_class`, not `ob_type`.
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
     ctx.trace_ctx
@@ -4842,8 +4867,13 @@ fn walker_emit_super_attr_result<Sym: WalkSym>(
     } else {
         concrete_self
     };
-    let bound = if binds_as_builtin {
-        pyre_interpreter::builtin_bound_method_new(w_function, concrete_bound_self, objtype)
+    let bound = if restamps_header {
+        pyre_interpreter::restamped_bound_method_new(
+            w_function,
+            concrete_bound_self,
+            objtype,
+            header_w_class_obj,
+        )
     } else {
         pyre_object::w_method_new(w_function, concrete_bound_self, objtype)
     };
@@ -4992,7 +5022,7 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
     }) else {
         return Ok(None);
     };
-    let Some(binding) = super_attr_binding(w_descr, class_mode) else {
+    let Some(binding) = super_attr_binding(w_descr, concrete_self, class_mode) else {
         return Ok(None);
     };
 

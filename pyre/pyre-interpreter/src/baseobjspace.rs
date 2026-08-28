@@ -10844,6 +10844,24 @@ pub unsafe fn super_attr_returns_descr_unchanged(w_descr: PyObjectRef, class_mod
     lookup_in_type_where(descr_type.as_ptr(), "__get__").is_none()
 }
 
+/// Whether `get`'s slot-wrapper arm binds `w_descr` to `obj` instead of
+/// raising.
+///
+/// That arm runs `slot_wrapper_check_instance` before `method_wrapper_new`,
+/// and the check is a subtype test over the descriptor's `w_objclass` — no
+/// Python.  The `super` fold settles it at recording time and declines the
+/// receivers it rejects, leaving the raise to the interpreter, which is the
+/// same split the fold already uses for the lookup itself.
+///
+/// # Safety
+/// `w_descr` and `obj` must be valid object pointers.
+pub unsafe fn super_attr_slot_wrapper_binds(w_descr: PyObjectRef, obj: PyObjectRef) -> bool {
+    unsafe {
+        crate::is_slot_wrapper(w_descr)
+            && crate::typedef::slot_wrapper_check_instance(w_descr, obj).is_ok()
+    }
+}
+
 /// descroperation.py `object_getattribute(space)` — the canonical
 /// `object.__getattribute__` descriptor used as the identity anchor for
 /// the `uses_object_getattribute` fast path.  Returns true iff `w_descr`

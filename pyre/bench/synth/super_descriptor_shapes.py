@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=name_bound_loop,property_loop,class_receiver_loop,name_bound_class_receiver_loop,explicit_class_receiver_loop,method_descriptor_loop
+# pyre-check: selfcheck-compiles=name_bound_loop,slot_wrapper_loop,property_loop,class_receiver_loop,name_bound_class_receiver_loop,explicit_class_receiver_loop,method_descriptor_loop
 # Correctness and compilation coverage for the descriptor shapes selected by
 # `W_Super.getattribute`.  PyPy traces the unrolled MRO suffix walk and then the
 # ordinary descriptor protocol; pyre's fused LOAD_SUPER_ATTR and name-bound
@@ -40,6 +40,17 @@ class Child(Base):
             total += su.k + su.sm(1) + su.cm() + su.prop
         if captured() is not self:
             return -1
+        return total
+
+    def slot_wrapper_loop(self, n):
+        # `object.__init__` is a slot wrapper, so `get` takes the arm that
+        # binds through `method_wrapper_new`: the same `Method` payload the
+        # method-descriptor arm builds, restamped `method-wrapper` instead of
+        # `builtin_function_or_method`.
+        total = 0
+        for _ in range(n):
+            super().__init__()
+            total += 1
         return total
 
     def property_loop(self, n):
@@ -84,6 +95,24 @@ class ListChild(list):
         return total
 
 
+class Sneaky(Base):
+    # A slot wrapper this class does not own.  Binding it to a `Sneaky` fails
+    # the owner subtype test that runs before the binding, so the fold has to
+    # decline and leave the raise to the interpreter.
+    __init__ = list.__init__
+
+
+class SneakyChild(Sneaky):
+    def reject_loop(self, n):
+        rejected = 0
+        for _ in range(n):
+            try:
+                super().__init__()
+            except TypeError:
+                rejected += 1
+        return rejected
+
+
 class Override(super):
     def __getattribute__(self, name):
         if name == "k":
@@ -106,16 +135,27 @@ def main():
     child = Child()
     checks = (
         ("name-bound descriptors + cellvar self", child.name_bound_loop(N), 19 * N),
+        ("slot wrapper", child.slot_wrapper_loop(N), N),
         ("fused property", child.property_loop(N), 7 * N),
         ("class receiver", Child.class_receiver_loop(N), 12 * N),
         ("name-bound class receiver", Child.name_bound_class_receiver_loop(N), 3 * N),
         ("explicit class receiver", Child.explicit_class_receiver_loop(N), 3 * N),
         ("method descriptor", ListChild().method_descriptor_loop(N), 5 * N),
+        ("rejected slot wrapper", object.__new__(SneakyChild).reject_loop(N), N),
     )
     for label, got, want in checks:
         if got != want:
             print("FAIL", label, got, want)
             return 1
+
+    bound_init = super(Child, child).__init__
+    # pypy3 is 3.11 and answers `method` here; 3.14 restamps the binding.
+    if type(bound_init).__name__ != "method-wrapper":
+        print("FAIL slot wrapper public class", type(bound_init).__name__)
+        return 1
+    if bound_init.__self__ is not child:
+        print("FAIL slot wrapper receiver")
+        return 1
 
     proxy = Override(Child, child)
     if proxy.k != 99:
