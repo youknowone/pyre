@@ -19504,7 +19504,30 @@ impl MetaInterpStaticData {
     /// caller does not need to set them.
     pub fn register_jitdriver_sd(
         &mut self,
+        jd: crate::jitdriver::JitDriverStaticData,
+        cpu: &mut dyn majit_backend::Backend,
+    ) -> usize {
+        self.register_jitdriver_sd_at(jd, None, cpu)
+    }
+
+    /// Install a descriptor at an index already assigned by the codewriter.
+    /// Slots before it are retained as vacant shells until their own seeded
+    /// portals are registered. This is the incremental equivalent of
+    /// `pyjitpl.py MetaInterpStaticData.finish_setup` taking the codewriter's
+    /// complete `callcontrol.jitdrivers_sd` list with its existing indices.
+    pub(crate) fn preinstall_jitdriver_sd(
+        &mut self,
+        jd: crate::jitdriver::JitDriverStaticData,
+        index: usize,
+        cpu: &mut dyn majit_backend::Backend,
+    ) -> usize {
+        self.register_jitdriver_sd_at(jd, Some(index), cpu)
+    }
+
+    fn register_jitdriver_sd_at(
+        &mut self,
         mut jd: crate::jitdriver::JitDriverStaticData,
+        preinstalled_index: Option<usize>,
         cpu: &mut dyn majit_backend::Backend,
     ) -> usize {
         // `ensure_default_driver_sd` exists only so translation-time metadata
@@ -19518,14 +19541,29 @@ impl MetaInterpStaticData {
             && self.jitdrivers_sd[0].portal_runner_adr == 0
             && self.jitdrivers_sd[0].num_greens() == 0
             && self.jitdrivers_sd[0].reds().is_empty();
-        if replace_default {
+        let idx = preinstalled_index.unwrap_or_else(|| {
+            if replace_default {
+                0
+            } else {
+                self.jitdrivers_sd.len()
+            }
+        });
+        while self.jitdrivers_sd.len() < idx {
+            self.jitdrivers_sd
+                .push(crate::jitdriver::JitDriverStaticData::new(vec![], vec![]));
+        }
+        let replace_slot = idx < self.jitdrivers_sd.len();
+        if replace_slot {
             // The shell and `jd` are two Rust phases of the one RPython
-            // JitDriverStaticData object.  Setup may already have attached
-            // virtualizable metadata to the shell before CallControl stamps
-            // its index; replacing the storage must retain those attributes.
-            // Structural fields (greens/reds/runner/result type) come from the
-            // real descriptor, while optional setup products move forward.
-            let shell = &self.jitdrivers_sd[0];
+            // JitDriverStaticData object. Setup may already have attached
+            // optional metadata before CallControl stamps the slot; replacing
+            // the storage retains those products while structural fields come
+            // from the real descriptor.
+            let shell = &self.jitdrivers_sd[idx];
+            assert!(
+                shell.index.is_none(),
+                "jitdriver_sd slot {idx} is already occupied by a registered descriptor",
+            );
             if jd.virtualizable_info.is_none() {
                 jd.virtualizable_info = shell.virtualizable_info.clone();
             }
@@ -19542,14 +19580,9 @@ impl MetaInterpStaticData {
                 jd.frame_value_count_fn = shell.frame_value_count_fn;
             }
         }
-        let idx = if replace_default {
-            0
-        } else {
-            self.jitdrivers_sd.len()
-        };
         jd.index = Some(idx); // call.py:46-47 `jd.index = idx`
-        if replace_default {
-            self.jitdrivers_sd[0] = jd;
+        if replace_slot {
+            self.jitdrivers_sd[idx] = jd;
         } else {
             self.jitdrivers_sd.push(jd);
         }

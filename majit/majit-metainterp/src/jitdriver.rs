@@ -2176,7 +2176,11 @@ impl<S: JitState> JitDriver<S> {
         // install pipeline runs `ensure_descriptor_registered` before reaching
         // here, so it is assigned. Fall back to the single-portal slot 0 only
         // when a consumer skipped that step.
-        self.ensure_descriptor_registered();
+        if let Some(seed_index) = dispatch_arc.jitdriver_sd() {
+            self.ensure_descriptor_registered_at(seed_index);
+        } else {
+            self.ensure_descriptor_registered();
+        }
         let portal_jd_index = self.index().unwrap_or(0);
         // The back-pointer is what makes this jitcode a *portal* jitcode to
         // every reader of `JitCode::jitdriver_sd`: `pyjitpl.py:2451
@@ -2463,14 +2467,29 @@ impl<S: JitState> JitDriver<S> {
     /// stub — pyre-only fail-soft, since PyPy's `jitdrivers_sd` list
     /// would never contain such an entry.
     pub fn ensure_descriptor_registered(&mut self) {
+        self.ensure_descriptor_registered_with_index(None);
+    }
+
+    fn ensure_descriptor_registered_at(&mut self, index: usize) {
+        self.ensure_descriptor_registered_with_index(Some(index));
+    }
+
+    fn ensure_descriptor_registered_with_index(&mut self, preinstalled_index: Option<usize>) {
         if self.index().is_some() {
+            if let Some(index) = preinstalled_index {
+                assert_eq!(
+                    self.index(),
+                    Some(index),
+                    "registered driver descriptor index disagrees with its seeded portal",
+                );
+            }
             return;
         }
         let jd = self
             .descriptor
             .take()
             .unwrap_or_else(|| JitDriverStaticData::new(vec![], vec![]));
-        let _ = self.register_descriptor(jd);
+        let _ = self.register_descriptor_with_index(jd, preinstalled_index);
     }
 
     /// Register `jd` with the embedded `MetaInterpStaticData` and stamp the
@@ -2484,6 +2503,14 @@ impl<S: JitState> JitDriver<S> {
     /// `jd.index` into `BC_JIT_MERGE_POINT` / `BC_LOOP_HEADER` payloads —
     /// see `jtransform.py:1704, :1716`).
     pub fn register_descriptor(&mut self, jd: JitDriverStaticData) -> usize {
+        self.register_descriptor_with_index(jd, None)
+    }
+
+    fn register_descriptor_with_index(
+        &mut self,
+        jd: JitDriverStaticData,
+        preinstalled_index: Option<usize>,
+    ) -> usize {
         let crate::pyjitpl::MetaInterp {
             staticdata,
             backend,
@@ -2491,7 +2518,10 @@ impl<S: JitState> JitDriver<S> {
         } = &mut self.meta;
         let sd_mut = std::sync::Arc::get_mut(staticdata)
             .expect("MetaInterpStaticData must be uniquely owned at register_descriptor time");
-        let idx = sd_mut.register_jitdriver_sd(jd, backend);
+        let idx = match preinstalled_index {
+            Some(index) => sd_mut.preinstall_jitdriver_sd(jd, index, backend),
+            None => sd_mut.register_jitdriver_sd(jd, backend),
+        };
         // Mirror onto self.descriptor so JitDriver::index() returns Some(idx)
         // — A.3.1a's accessor reads through descriptor, not the
         // staticdata Vec, so the stamped clone must live on the driver too.
@@ -11128,6 +11158,37 @@ mod jitcode_registry_tests {
     use crate::jitcode::{JitCode, RuntimeBhDescr};
     use std::sync::Arc;
 
+    #[derive(Default)]
+    struct RegistryState;
+
+    impl JitState for RegistryState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
     /// The arm a consumer holding only an `Arc` reaches through
     /// `register_dispatch_jitcode_shared`.
     ///
@@ -11159,6 +11220,27 @@ mod jitcode_registry_tests {
     /// build-time table numbers its entries.
     fn jitcode(name: &str, prenumbered: Option<usize>) -> Arc<JitCode> {
         Arc::new(jitcode_value(name, prenumbered))
+    }
+
+    fn seeded_portal(name: &str, index: usize, jitdriver_sd: usize) -> Arc<JitCode> {
+        let core = majit_translate::jitcode::JitCode::new(name);
+        core.set_body(majit_translate::jitcode::JitCodeBody {
+            code: vec![
+                majit_translate::codewriter::insns::BC_JIT_MERGE_POINT,
+                jitdriver_sd as u8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            jit_merge_point_offset: Some(0),
+            ..Default::default()
+        });
+        core.set_index(index);
+        core.set_jitdriver_sd(jitdriver_sd);
+        Arc::new(JitCode::from_canonical(core))
     }
 
     /// The same, by value, for handing `build_jitcode_registry` the graph its
@@ -11343,6 +11425,29 @@ mod jitcode_registry_tests {
         assert_eq!(dispatch.index(), 2);
         assert_eq!(dispatch.name(), "add");
         assert!(std::sync::Arc::ptr_eq(&registry[2], &dispatch));
+    }
+
+    /// A build-time portal retains the driver slot the codewriter recorded on
+    /// it. The second prepass driver is the first non-coincidental case: a
+    /// fresh run-time staticdata table would otherwise allocate slot 0 and try
+    /// to overwrite the seed's set-once `jitdriver_sd == 1` relationship.
+    #[test]
+    fn a_seeded_second_driver_registers_at_its_build_time_descriptor_index() {
+        let first = jitcode("first_portal", Some(0));
+        let second = seeded_portal("second_portal", 1, 1);
+        let seed = vec![first, Arc::clone(&second)];
+        let mut driver = JitDriver::<RegistryState>::new(2);
+        driver.declare_schema(Vec::new(), Vec::new());
+
+        driver.adopt_dispatch_registry(seed, Arc::clone(&second));
+
+        assert_eq!(driver.index(), Some(1));
+        assert!(Arc::ptr_eq(
+            driver
+                .dispatch_jitcode()
+                .expect("registration installs the seeded portal"),
+            &second,
+        ));
     }
 
     /// Two graphs claiming one slot is not adoptable: the seed's entry and the
