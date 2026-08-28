@@ -743,6 +743,27 @@ def build_one_test_extension(binary: Path, name: str, source: Path,
     return ""
 
 
+def reap(proc: "subprocess.Popen") -> None:
+    """End a timed-out module and everything it started.
+
+    `Popen.kill` reaches the child alone.  A module that spawned
+    `multiprocessing` workers leaves them alive holding the very stdout and
+    stderr this runner reads, and on Windows a spawned worker holds them the
+    same way under CPython as under pyre — measured both ways.  The drain that
+    collects the partial output then never sees EOF, so a run that meant to
+    record one TIMEOUT stops instead, for as long as the orphans live.
+    `taskkill /T` walks the tree while the child still parents it.
+
+    POSIX fills the exception's buffers before raising and needs the child
+    reaped and nothing read, which is what `subprocess.run` does there too.
+    """
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True)
+    proc.kill()
+    (proc.communicate if sys.platform == "win32" else proc.wait)()
+
+
 def run_module(binary: Path, module: str, mode: str, timeout: int,
                env: dict) -> tuple[str, str]:
     # Run in a throwaway cwd so a test writing into '.' never touches the
@@ -814,23 +835,32 @@ def run_module(binary: Path, module: str, mode: str, timeout: int,
             if module_env is env:
                 module_env = env.copy()
             module_env.setdefault("PYTHONREGRTEST_UNICODE_GUARD", "æ")
-        try:
-            proc = subprocess.run(
-                cmd, cwd=cwd, env=module_env, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as expired:
-            # A bare "timeout 120s" says only that the module is slow, never
-            # which case it stopped in — and unittest's progress dots, the one
-            # record of how far it got, were being thrown away here. `text=True`
-            # decodes what `communicate()` returns; the timeout path raises with
-            # the raw chunks it had joined, which is bytes on POSIX and str on
-            # Windows, so both spellings have to be accepted.
-            partial = expired.stderr or ""
-            if isinstance(partial, bytes):
-                partial = partial.decode("utf-8", "replace")
-            return "TIMEOUT", f"timeout {timeout}s {last_stderr_line(partial)}"[:300]
-    return classify(proc.returncode, proc.stdout or "", proc.stderr or "")
+        # `subprocess.run(timeout=)` cannot be used here: its own recovery
+        # drains the pipes after killing the child alone, and `reap` documents
+        # why that never returns for a module holding spawned workers.
+        # `with`, as `subprocess.run` has: one module of the four hundred
+        # leaking its two pipe handles is one the run cannot afford.
+        with subprocess.Popen(
+            cmd, cwd=cwd, env=module_env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        ) as proc:
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as expired:
+                # A bare "timeout 120s" says only that the module is slow,
+                # never which case it stopped in — and unittest's progress
+                # dots, the one record of how far it got, were being thrown
+                # away here. `text=True` decodes what `communicate()` returns;
+                # the timeout path raises with the raw chunks it had joined,
+                # which is bytes on POSIX and str on Windows, so both
+                # spellings have to be accepted.
+                partial = expired.stderr or ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", "replace")
+                reap(proc)
+                return "TIMEOUT", f"timeout {timeout}s {last_stderr_line(partial)}"[:300]
+    return classify(proc.returncode, out or "", err or "")
 
 
 # ── baseline ─────────────────────────────────────────────────────────
