@@ -998,6 +998,16 @@ fn adopt_seeded_dispatch(
         dispatch.name(),
         dispatch.exec.descrs.len(),
     );
+    assert_eq!(
+        seeded.exec.jit_merge_point_offset,
+        dispatch.exec.jit_merge_point_offset,
+        "dispatch jitcode {:?} is seeded at index {index} but its merge-point \
+         offset {:?} disagrees with the seed's {:?}; adopting the seed's entry \
+         would install a different body",
+        dispatch.name(),
+        dispatch.exec.jit_merge_point_offset,
+        seeded.exec.jit_merge_point_offset,
+    );
     std::sync::Arc::clone(seeded)
 }
 
@@ -11179,8 +11189,19 @@ mod jitcode_registry_tests {
     /// `from_canonical` calls over one canonical body. That is exactly the
     /// shape an LLBC embedder arrives with.
     fn jitcode_value(name: &str, prenumbered: Option<usize>) -> JitCode {
+        jitcode_value_with_merge_offset(name, prenumbered, None)
+    }
+
+    fn jitcode_value_with_merge_offset(
+        name: &str,
+        prenumbered: Option<usize>,
+        jit_merge_point_offset: Option<usize>,
+    ) -> JitCode {
         let core = majit_translate::jitcode::JitCode::new(name);
-        core.set_body(Default::default());
+        core.set_body(majit_translate::jitcode::JitCodeBody {
+            jit_merge_point_offset,
+            ..Default::default()
+        });
         if let Some(index) = prenumbered {
             core.set_index(index);
         }
@@ -11352,6 +11373,21 @@ mod jitcode_registry_tests {
     fn a_seeded_slot_holding_another_graph_is_refused() {
         let seed = seed();
         build_jitcode_registry(&seed, jitcode_value("portal", Some(1)));
+    }
+
+    /// A name and index are not enough to establish that the registered
+    /// dispatch came from the seed's body: the encoder-owned merge-point
+    /// offset must identify the same bytecode position as well.
+    #[test]
+    #[should_panic(expected = "merge-point offset")]
+    fn a_same_named_seeded_dispatch_with_a_different_body_is_refused() {
+        let seed = vec![Arc::new(jitcode_value_with_merge_offset(
+            "mainloop",
+            Some(0),
+            Some(3),
+        ))];
+        let dispatch = jitcode_value_with_merge_offset("mainloop", Some(0), Some(7));
+        build_jitcode_registry(&seed, dispatch);
     }
 
     /// A dispatch numbered past the end of the seed names the method that
