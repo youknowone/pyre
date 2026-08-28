@@ -592,6 +592,16 @@ fn decode_mapping(mapping: Mapping, input: &[u8], width: usize) -> DecodeOne {
             };
         }
         Mapping::JisX0213_2000_2 => {
+            // PyPy `_codecs_iso2022.c::jisx0213_2000_2_decoder` expands
+            // `EMULATE_JISX0213_2000_DECODE_PLANE2` and then, deliberately
+            // without `else`, runs the 2004 table lookup.  Thus row 0x7d,
+            // cell 0x3b is first assigned U+9B1D and then overwritten by the
+            // table's U+9B1C.  The EUC/Shift-JIS decoders put `else` there and
+            // must keep U+9B1D, so preserve the ISO-only ordering here.
+            let table = decode_jisx0213_plane2(c1, c2, false, width);
+            if !matches!(table, DecodeOne::Illegal(_)) {
+                return table;
+            }
             return match decode_jisx0213_plane2(c1, c2, true, width) {
                 DecodeOne::Illegal(_) => DecodeOne::Illegal(width),
                 decoded => decoded,
@@ -759,6 +769,10 @@ mod tests {
         assert_eq!(decode(Codec::Iso2022Jp, b"\x1bXabcZ"), "\x1bXabcZ");
         assert_eq!(decode(Codec::Iso2022Jp2004, b"\x1b$(Q\x22\x32\x1b(B"), "~");
         assert_eq!(decode(Codec::Iso2022Jp3, b"\x1b$(O\x22\x32\x1b(B"), "~");
+        assert_eq!(
+            decode(Codec::Iso2022Jp3, b"\x1b$(P\x7d\x3b\x1b(B"),
+            "\u{9b1c}"
+        );
         assert!(encode(Codec::Iso2022Jp2004, "か\0").ends_with(&[0]));
         assert!(encode(Codec::Iso2022Jp3, "か\0").ends_with(&[0]));
     }

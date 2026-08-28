@@ -407,9 +407,7 @@ pub(super) fn encode_jisx0213_code(
             }
             return Ok((code, 1));
         }
-        if let Some(code) = try_map_encode(&JISXCOMMON_ENCMAP, &JISXCOMMON_ENCMAP_DATA, c)
-            && code & 0x8000 == 0
-        {
+        if let Some(code) = try_map_encode(&JISXCOMMON_ENCMAP, &JISXCOMMON_ENCMAP_DATA, c) {
             return Ok((code, 1));
         }
         Err(EncodeOne::Illegal(1))
@@ -459,7 +457,7 @@ pub(super) fn decode_jisx0213_plane1(
     compat_fullwidth_tilde: bool,
 ) -> DecodeOne {
     if config_2000 && emulate_2000_plane1(c1, c2) {
-        return illegal_decode_lead();
+        return DecodeOne::Illegal(consumed);
     }
     if compat_fullwidth_reverse_solidus && c1 == 0x21 && c2 == 0x40 {
         return DecodeOne::Char(0xff3c, consumed);
@@ -603,7 +601,7 @@ pub(super) fn decode_shift_jis_2004(input: &[u8], config_2000: bool) -> DecodeOn
     let c2 = (if trail < 0x5e { trail } else { trail - 0x5e }) + 0x21;
     if c1 < 0x5e {
         c1 += 0x21;
-        return decode_jisx0213_plane1(c1, c2, config_2000, 2, false, true);
+        return decode_jisx0213_plane1(c1, c2, config_2000, 2, false, false);
     }
     c1 = if c1 >= 0x67 {
         c1 + 0x07
@@ -702,6 +700,17 @@ mod tests {
         }
         assert_eq!(decode(Codec::ShiftJis2004, b"\x81\x5f"), "\\");
         assert_eq!(decode(Codec::ShiftJisX0213, b"\x81\x5f"), "\\");
+        // PyPy `_codecs_jp.c::shift_jis_2004_decoder` consults
+        // `jisx0208` before the JIS X 0213 tables and therefore keeps the
+        // ASCII tilde mapping at row 0x22, cell 0x32.
+        assert_eq!(decode(Codec::ShiftJis2004, b"\x81\xb0"), "~");
+        assert_eq!(decode(Codec::ShiftJisX0213, b"\x81\xb0"), "~");
+        // `_codecs_jp.c::euc_jis_2004_encoder` accepts the codeset-2 bit
+        // from `jisxcommon`; only `shift_jis_2004_encoder` rejects it.
+        assert!(matches!(
+            encode_one(Codec::EucJis2004, &[0x010a], true, &mut [0; 8]),
+            EncodeOne::Bytes(bytes, 3, 1) if bytes[..3] == [0x8f, 0xaa, 0xaf]
+        ));
     }
 
     #[test]
@@ -717,6 +726,19 @@ mod tests {
         assert!(matches!(
             encode_one(Codec::ShiftJisX0213, &[0x9b1d], true, &mut [0; 8]),
             EncodeOne::Bytes(bytes, 2, 1) if bytes[..2] == [0xfc, 0x5a]
+        ));
+        assert_eq!(decode(Codec::EucJisX0213, b"\x8f\xfd\xbb"), "\u{9b1d}");
+        assert_eq!(decode(Codec::ShiftJisX0213, b"\xfc\x5a"), "\u{9b1d}");
+        // `EMULATE_JISX0213_2000_DECODE_PLANE1` returns the complete
+        // malformed sequence width.  Ordinary final map misses retain the
+        // one-byte error span selected by `illegal_decode_lead`.
+        assert!(matches!(
+            decode_one(Codec::EucJisX0213, b"\xae\xa1", &mut [0; 8]),
+            DecodeOne::Illegal(2)
+        ));
+        assert!(matches!(
+            decode_one(Codec::ShiftJisX0213, b"\x87\x9f", &mut [0; 8]),
+            DecodeOne::Illegal(2)
         ));
     }
 
