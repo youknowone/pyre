@@ -1603,6 +1603,17 @@ enum TemplateItem {
 /// literal `str`/`bytes` runs interleaved with integer group references — into
 /// the [`TemplateItem`] stream `expand_into` consumes.
 fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, crate::PyError> {
+    // `parse_template` is reached by name through `re._parser`, so what comes
+    // back is whatever the program left there. `w_list_len` reads the list
+    // header without checking, which a tuple answers with a wild length.
+    // `_sre.template`'s own argument check is where this is refused upstream,
+    // and its wording is what a program that reaches here sees.
+    if !unsafe { pyre_object::is_list(w_result) } {
+        return Err(crate::PyError::type_error(format!(
+            "template() argument 2 must be list, not {}",
+            crate::baseobjspace::object_functionstr_type_name(w_result)
+        )));
+    }
     let n = unsafe { pyre_object::w_list_len(w_result) };
     let mut items: Vec<TemplateItem> = Vec::with_capacity(n);
     for i in 0..n {
