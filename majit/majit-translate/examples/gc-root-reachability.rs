@@ -15,8 +15,33 @@ use majit_translate::memory::gctransform::{framework, liveness};
 
 const PYTHON_DISPATCH_SEEDS_REF: &[&str] = framework::PYTHON_DISPATCH_SEEDS;
 
+/// Write one artefact's rows out, truncating the file on the first artefact
+/// of the run and appending for every one after it.
+///
+/// The scan takes a list of artefacts and each has its own rows, so a plain
+/// write leaves only the last artefact's -- and leaves it looking complete.
+/// `opened` is what tells the first artefact from the rest.
+fn write_rows(
+    path: &str,
+    rows: &str,
+    opened: &mut std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    if opened.insert(path.to_string()) {
+        opts.write(true).create(true).truncate(true);
+    } else {
+        opts.append(true).create(true);
+    }
+    opts.open(path)?.write_all(rows.as_bytes())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A run that says it wrote and did not must not exit 0: the file it
+    // named is what a consumer reads, and an absent one reads as no findings.
+    let mut write_failed = false;
+    let mut opened: std::collections::HashSet<String> = Default::default();
     if args.is_empty() {
         eprintln!("usage: gc-root-reachability <file.ullbc>...");
         std::process::exit(2);
@@ -412,10 +437,14 @@ fn main() {
         // pin, and writing it asserts that x's kind never moves; the `movable`
         // column is that assertion checked.
         let by_pin: std::collections::BTreeMap<&str, usize> =
-            stats.stale_pin_reads.iter().fold(Default::default(), |mut m, r| {
-                *m.entry(r.pin_name.rsplit("::").next().unwrap_or("?")).or_default() += 1;
-                m
-            });
+            stats
+                .stale_pin_reads
+                .iter()
+                .fold(Default::default(), |mut m, r| {
+                    *m.entry(r.pin_name.rsplit("::").next().unwrap_or("?"))
+                        .or_default() += 1;
+                    m
+                });
         println!(
             "   pins whose argument the body still reads afterwards: {} ({} reading a local \
              later addressed as a list/dict)",
@@ -455,12 +484,15 @@ fn main() {
                 out.push_str(&row.to_string());
                 out.push('\n');
             }
-            match std::fs::write(&path, out) {
+            match write_rows(&path, &out, &mut opened) {
                 Ok(()) => println!(
                     "       wrote {} stale-pin read(s) to {path}",
                     stats.stale_pin_reads.len()
                 ),
-                Err(e) => println!("       FAILED to write {path}: {e}"),
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
             }
         }
         if let Ok(path) = std::env::var("GC_SHORT_BRACKETS_JSON") {
@@ -477,12 +509,15 @@ fn main() {
                 out.push_str(&row.to_string());
                 out.push('\n');
             }
-            match std::fs::write(&path, out) {
+            match write_rows(&path, &out, &mut opened) {
                 Ok(()) => println!(
                     "       wrote {} short bracket(s) to {path}",
                     stats.short_brackets.len()
                 ),
-                Err(e) => println!("       FAILED to write {path}: {e}"),
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
             }
         }
         // The resolved graph is an *under*-approximation of what collects: a
@@ -563,12 +598,15 @@ fn main() {
                 out.push_str(&row.to_string());
                 out.push('\n');
             }
-            match std::fs::write(&path, out) {
+            match write_rows(&path, &out, &mut opened) {
                 Ok(()) => println!("       wrote {} finding(s) to {path}", found.len()),
                 // A report that says it wrote and did not is worse than one
                 // that fails, so this is loud even though the scan itself
-                // succeeded.
-                Err(e) => println!("       FAILED to write {path}: {e}"),
+                // succeeded, and the run's exit status carries it too.
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
             }
         }
         // Tier 1: the callee is *itself* a dispatch seed, so "this call runs
@@ -669,8 +707,14 @@ fn main() {
         let no_movable: std::collections::HashSet<u64> = Default::default();
         let (frames, frame_stats) =
             liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &no_movable);
-        let (frames_conservative, _) =
-            liveness::scan(&llbc, &cg, &conservative, &no_bracket, &frame_tys, &no_movable);
+        let (frames_conservative, _) = liveness::scan(
+            &llbc,
+            &cg,
+            &conservative,
+            &no_bracket,
+            &frame_tys,
+            &no_movable,
+        );
         let frame_fns: std::collections::BTreeSet<&str> =
             frames.iter().map(|f| f.func_name.as_str()).collect();
         println!(
@@ -736,5 +780,8 @@ fn main() {
                 );
             }
         }
+    }
+    if write_failed {
+        std::process::exit(1);
     }
 }

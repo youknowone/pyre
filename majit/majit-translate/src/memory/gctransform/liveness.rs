@@ -402,7 +402,9 @@ fn chase_pinned(l: u64, defs: &HashMap<u64, PinSrc>, out: &mut HashSet<u64>, dep
 /// `publish_roots` is `pin_roots` without the normalize half, and pins just
 /// the same.
 fn is_pin_fn(name: &str) -> bool {
-    name.ends_with("::pin_root") || name.ends_with("::pin_roots") || name.ends_with("::publish_roots")
+    name.ends_with("::pin_root")
+        || name.ends_with("::pin_roots")
+        || name.ends_with("::publish_roots")
 }
 
 fn successors(t: &TermKind) -> Vec<u64> {
@@ -570,7 +572,9 @@ pub fn scan(
                 let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
                     continue;
                 };
-                let Some(d) = bare_local(&place) else { continue };
+                let Some(d) = bare_local(&place) else {
+                    continue;
+                };
                 if !defined.insert(d) {
                     defs.remove(&d);
                     continue;
@@ -610,7 +614,9 @@ pub fn scan(
             let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
                 continue;
             };
-            let Some(name) = cg.names.get(id) else { continue };
+            let Some(name) = cg.names.get(id) else {
+                continue;
+            };
             if name.ends_with("gc_roots::enter_roots_frame") {
                 // The coloured form reserves slots and stores the roots into
                 // them afterwards, so there is no argument to read a set off.
@@ -895,8 +901,7 @@ pub fn scan(
                     stats.withheld_contents_opaque += 1;
                     continue;
                 }
-                let held: HashSet<u64> =
-                    pinned_in[b].difference(&stmt_kills[b]).copied().collect();
+                let held: HashSet<u64> = pinned_in[b].difference(&stmt_kills[b]).copied().collect();
                 let mut missing: Vec<String> = after
                     .iter()
                     .filter(|l| !held.contains(l))
