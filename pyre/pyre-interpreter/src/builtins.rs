@@ -7308,6 +7308,12 @@ fn errno_is_eshutdown(_e: i32) -> bool {
     false
 }
 
+/// The descriptor table `posix` keeps on the wasm target.  File objects reach
+/// it through the same helpers `os.read`/`os.lseek` do, so a number
+/// `os.open` returned is a number `io.open(fd)` can read from.
+#[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+use crate::module::posix::interp_posix_wasm as wasm_fd;
+
 /// darwin/BSD numeric errnos for wasm32, which has no libc errno constants.
 /// Kept in sync with the `errno` module's host_env-off fallback so the errno →
 /// OSError-subclass remap selects the subclass a given `errno.X` value implies.
@@ -7332,6 +7338,11 @@ pub(crate) mod wasm_errno {
     pub const EPERM: i32 = 1;
     pub const ESRCH: i32 = 3;
     pub const ETIMEDOUT: i32 = 60;
+    pub const EBADF: i32 = 9;
+    pub const EINVAL: i32 = 22;
+    pub const EMFILE: i32 = 24;
+    pub const ESPIPE: i32 = 29;
+    pub const EROFS: i32 = 30;
 
     /// The message `strerror` reports for one of the values above.
     ///
@@ -7361,6 +7372,11 @@ pub(crate) mod wasm_errno {
             ECONNRESET => "Connection reset by peer",
             ETIMEDOUT => "Operation timed out",
             ECONNREFUSED => "Connection refused",
+            EBADF => "Bad file descriptor",
+            EINVAL => "Invalid argument",
+            EMFILE => "Too many open files",
+            ESPIPE => "Illegal seek",
+            EROFS => "Read-only file system",
             _ => return None,
         })
     }
@@ -17017,7 +17033,11 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                         .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                     return Ok(w_int_new(pos as i64));
                 }
-                #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+                #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+                {
+                    return Ok(w_int_new(wasm_fd::fd_lseek(fd, offset, whence)?));
+                }
+                #[cfg(not(feature = "host_env"))]
                 {
                     let _ = (fd, offset, whence);
                     return Err(crate::PyError::not_implemented(
@@ -17062,7 +17082,13 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
                             .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
                         return Ok(w_int_new(pos as i64));
                     }
-                    #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+                    #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+                    {
+                        // A zero-offset current-relative seek reports the
+                        // position without moving it.
+                        return Ok(w_int_new(wasm_fd::fd_lseek(fd, 0, 1)?));
+                    }
+                    #[cfg(not(feature = "host_env"))]
                     {
                         let _ = fd;
                     }
@@ -17804,7 +17830,11 @@ fn fileio_method_readinto(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 }
             }
         }
-        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        {
+            return Ok(w_int_new(wasm_fd::fd_read_into(fd, target)? as i64));
+        }
+        #[cfg(not(feature = "host_env"))]
         {
             let _ = (fd, target);
             return Err(crate::PyError::not_implemented(
@@ -17981,7 +18011,11 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 crate::host_seam::ops::lseek(fd, 0, libc::SEEK_CUR).is_ok()
             }
         }
-        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        {
+            wasm_fd::fd_lseek(fd, 0, 1).is_ok()
+        }
+        #[cfg(not(feature = "host_env"))]
         {
             let _ = fd;
             false
@@ -18318,7 +18352,11 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 },
             };
         }
-        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        {
+            return fd_bytes_to_obj(args[0], wasm_fd::fd_take(fd, n)?);
+        }
+        #[cfg(not(feature = "host_env"))]
         {
             let _ = (fd, n);
             return Err(crate::PyError::not_implemented(
@@ -18390,7 +18428,21 @@ fn file_method_readline(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
             }
             return fd_bytes_to_obj(args[0], out);
         }
-        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        {
+            // The table can un-read, so the line is taken whole and the
+            // position wound back to just past its newline.
+            let start = wasm_fd::fd_lseek(fd, 0, 1)?;
+            let rest = wasm_fd::fd_take(fd, max)?;
+            let end = rest
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|i| i + 1)
+                .unwrap_or(rest.len());
+            wasm_fd::fd_lseek(fd, start + end as i64, 0)?;
+            return fd_bytes_to_obj(args[0], rest[..end].to_vec());
+        }
+        #[cfg(not(feature = "host_env"))]
         {
             let _ = fd;
             return Err(crate::PyError::not_implemented(
@@ -18566,7 +18618,12 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 .map_err(|e| crate::host_seam::seam_os_err(e, ""))?;
             return Ok(w_int_new(n));
         }
-        #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        {
+            let _ = bytes;
+            return Err(wasm_fd::fd_refuse_write(fd));
+        }
+        #[cfg(not(feature = "host_env"))]
         {
             let _ = (fd, bytes);
             return Err(crate::PyError::not_implemented(
@@ -18680,7 +18737,11 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             {
                 crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
             }
-            #[cfg(any(not(feature = "host_env"), target_arch = "wasm32"))]
+            #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+            {
+                wasm_fd::fd_close(fd)
+            }
+            #[cfg(not(feature = "host_env"))]
             {
                 let _ = fd;
                 Ok(())
@@ -18847,7 +18908,12 @@ fn fileio_validate_fd(fd: i32, w_name: PyObjectRef) -> Result<FileioStatAtOpen, 
 }
 
 #[cfg(not(any(unix, all(windows, feature = "host_env", not(feature = "sandbox")))))]
-fn fileio_validate_fd(_fd: i32, _w_name: PyObjectRef) -> Result<FileioStatAtOpen, crate::PyError> {
+fn fileio_validate_fd(fd: i32, w_name: PyObjectRef) -> Result<FileioStatAtOpen, crate::PyError> {
+    #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+    if wasm_fd::fd_is_dir(fd)? {
+        return Err(crate::PyError::os_error_syscall(wasm_errno::EISDIR, w_name));
+    }
+    let _ = (fd, w_name);
     Ok(())
 }
 
@@ -19621,7 +19687,7 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
         if writing || mode.contains('+') {
             return Err(crate::PyError::os_error_syscall(
-                wasm_errno::ENOTSUP,
+                wasm_errno::EROFS,
                 resolved_path.w_path(),
             ));
         }

@@ -8,8 +8,17 @@
 //!
 //! The list is what `os.py`'s module body needs to run — `environ`,
 //! `_have_functions`, `stat` and `cpu_count` — plus `lstat`, `listdir`,
-//! `fspath` and `stat_result`, and the three calls the stdlib reaches for
+//! `fspath`, `scandir` and `stat_result`, and the three calls the stdlib reaches for
 //! that the embedder can still answer: `getcwd`, `getcwdb` and `urandom`.
+//! On top of that sits a descriptor half — `open`, `close`, `read`, `lseek`,
+//! `fstat` — over a table this module keeps itself.  The seam answers a whole
+//! path at a time, so a descriptor is the bytes a path resolved to plus a
+//! position; the numbers are the guest's own and name nothing on the other
+//! side of the host ABI.  The seam is a read-only mount, so every entry point
+//! that would change it (`open` for write, `unlink`, `rmdir`) is published and
+//! answers `EROFS`, which is what a read-only filesystem answers — a different
+//! statement from the call not existing.
+//!
 //! Everything else `os` normally re-exports stays absent, so `os._exists`
 //! answers False for it and `os` builds the same fallbacks it builds on a
 //! platform whose C library lacks the call.
@@ -73,18 +82,7 @@ fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate
     if let Some(v) = crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
         crate::baseobjspace::is_true(v)?;
     }
-    let path = seam_path(&resolved.as_bytes);
-    let (mode, size) = if crate::importing::source_is_dir(&path) {
-        (S_IFDIR | 0o555, 0)
-    } else {
-        match crate::importing::source_file_size(&path) {
-            Ok(size) => (S_IFREG | 0o444, size as i64),
-            // The seam reports why it could not answer, and the path object the
-            // caller passed is what names the failure.
-            Err(e) => return Err(seam_error(&e, resolved.w_path())),
-        }
-    };
-    Ok(make_stat_result(mode, size))
+    stat_resolved(&resolved)
 }
 
 /// The seam takes a `&Path`, and on this target an `OsStr` is the byte string
@@ -167,6 +165,592 @@ fn listdir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(pyre_object::w_list_new(items.take()))
 }
 
+/// One `stat_result` for a path the caller has already resolved, so that
+/// `stat`, `lstat` and `DirEntry.stat` report one file the same way.
+fn stat_resolved(
+    resolved: &crate::gateway::FsEncodedPath,
+) -> Result<PyObjectRef, crate::PyError> {
+    let path = seam_path(&resolved.as_bytes);
+    let (mode, size) = if crate::importing::source_is_dir(&path) {
+        (S_IFDIR | 0o555, 0)
+    } else {
+        match crate::importing::source_file_size(&path) {
+            Ok(size) => (S_IFREG | 0o444, size as i64),
+            // The seam reports why it could not answer, and the path object the
+            // caller passed is what names the failure.
+            Err(e) => return Err(seam_error(&e, resolved.w_path())),
+        }
+    };
+    Ok(make_stat_result(mode, size))
+}
+
+/// `join_path_filename` — the directory and the entry name with one separator
+/// between them.  An empty directory leaves the name alone, which is what
+/// `scandir("")` would otherwise turn into an absolute path.
+fn join_entry_path(dir_bytes: &[u8], name: &[u8]) -> Vec<u8> {
+    if dir_bytes.is_empty() {
+        return name.to_vec();
+    }
+    let mut joined = dir_bytes.to_vec();
+    if !joined.ends_with(b"/") {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(name);
+    joined
+}
+
+/// The path a `DirEntry` was built for, back in the form the seam takes.
+///
+/// It is read off the entry rather than kept beside it: `path` is the entry's
+/// own public attribute, so one spelling answers both the caller and the seam.
+fn entry_path(self_obj: PyObjectRef) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
+    crate::gateway::fsencode_path_w(crate::baseobjspace::getattr_str(self_obj, "path")?)
+}
+
+/// The receiver of a `DirEntry` method, with `follow_symlinks` accepted and
+/// without effect for the same reason `lstat` answers what `stat` answers.
+fn entry_self(
+    args: &[PyObjectRef],
+    name: &'static str,
+    follow: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let allowed: &[&str] = if follow { &["follow_symlinks"] } else { &[] };
+    crate::builtins::kwarg_reject_unknown(kwargs, allowed, name)?;
+    if let Some(v) = crate::builtins::kwarg_get(kwargs, "follow_symlinks") {
+        crate::baseobjspace::is_true(v)?;
+    }
+    pos.first()
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error(format!("{name}() requires self")))
+}
+
+/// `posix.DirEntry` — the record `scandir` yields for one name.
+///
+/// The seam reports a name, whether it is a directory, and a byte length, so
+/// that is what an entry can answer.  It keeps its name and its path and asks
+/// the seam again for the rest, which is the same on-demand `stat` the entry
+/// performs anywhere its `readdir` did not carry a type.  `is_symlink` is
+/// false for every entry, not as a claim that nothing is a link but because a
+/// name and what it resolves to are the only two things this seam separates.
+fn dir_entry_type() -> PyObjectRef {
+    static DIR_ENTRY_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DIR_ENTRY_TYPE.get_or_init(|| {
+        let tp = crate::typedef::make_builtin_type("posix.DirEntry", init_dir_entry_type);
+        crate::typedef::mark_cpython_heap_type(tp, false);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
+}
+
+fn init_dir_entry_type(ns: PyObjectRef) {
+    let method = |name: &'static str, f: crate::gateway::BuiltinCodeFn| unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            name,
+            crate::make_builtin_function(name, f),
+        );
+    };
+    method("is_dir", |args| {
+        let resolved = entry_path(entry_self(args, "is_dir", true)?)?;
+        Ok(pyre_object::w_bool_from(crate::importing::source_is_dir(
+            &seam_path(&resolved.as_bytes),
+        )))
+    });
+    method("is_file", |args| {
+        let resolved = entry_path(entry_self(args, "is_file", true)?)?;
+        let path = seam_path(&resolved.as_bytes);
+        Ok(pyre_object::w_bool_from(
+            !crate::importing::source_is_dir(&path)
+                && crate::importing::source_file_size(&path).is_ok(),
+        ))
+    });
+    method("is_symlink", |args| {
+        entry_self(args, "is_symlink", false)?;
+        Ok(pyre_object::w_bool_from(false))
+    });
+    method("is_junction", |args| {
+        entry_self(args, "is_junction", false)?;
+        Ok(pyre_object::w_bool_from(false))
+    });
+    method("stat", |args| {
+        stat_resolved(&entry_path(entry_self(args, "stat", true)?)?)
+    });
+    // No inode number reaches the guest, so every entry reports the zero
+    // `st_ino` its `stat_result` carries: one file has one identity either way.
+    method("inode", |args| {
+        entry_self(args, "inode", false)?;
+        Ok(pyre_object::w_int_new(0))
+    });
+    method("__fspath__", |args| {
+        crate::baseobjspace::getattr_str(entry_self(args, "__fspath__", false)?, "path")
+    });
+    method("__repr__", |args| {
+        let name = crate::baseobjspace::getattr_str(entry_self(args, "__repr__", false)?, "name")?;
+        Ok(pyre_object::w_str_from_wtf8_managed(
+            crate::display::wtf8_format!("<DirEntry ", unsafe {
+                crate::display::py_repr_wtf8(name)?
+            }, ">"),
+        ))
+    });
+}
+
+/// The entry for one name inside the directory `scandir` was called on.
+fn new_dir_entry(bytes_mode: bool, dir_bytes: &[u8], name: &[u8]) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let entry_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(dir_entry_type()));
+    // Each value is built before the receiver is read back, because building
+    // it allocates and the allocation may move the entry.
+    let store = |field: &str, value: PyObjectRef| {
+        crate::baseobjspace::setdictvalue_native(
+            pyre_object::gc_roots::shadow_stack_get(entry_slot),
+            field,
+            value,
+        );
+    };
+    store("name", super::fs_name_obj(bytes_mode, name));
+    store(
+        "path",
+        super::fs_name_obj(bytes_mode, &join_entry_path(dir_bytes, name)),
+    );
+    pyre_object::gc_roots::shadow_stack_get(entry_slot)
+}
+
+/// `posix.ScandirIterator` — the iterator `scandir` returns, and the context
+/// manager `os.walk` enters.
+///
+/// The seam answers a whole directory at a time, so the entries exist before
+/// the first `__next__`; what the iterator holds is the position in them.
+/// `close` drops that, which is what makes an exhausted or closed iterator
+/// report the end rather than the directory again.
+fn scandir_iterator_type() -> PyObjectRef {
+    static SCANDIR_ITERATOR_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SCANDIR_ITERATOR_TYPE.get_or_init(|| {
+        let tp =
+            crate::typedef::make_builtin_type("posix.ScandirIterator", init_scandir_iterator_type);
+        crate::typedef::mark_cpython_heap_type(tp, false);
+        unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
+        tp as usize
+    }) as PyObjectRef
+}
+
+/// The iterator's own position, or `None` once it has been closed.
+const SCANDIR_POSITION: &str = "__scandir_iter__";
+
+fn init_scandir_iterator_type(ns: PyObjectRef) {
+    let method = |name: &'static str, f: crate::gateway::BuiltinCodeFn| unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            name,
+            crate::make_builtin_function(name, f),
+        );
+    };
+    let close = |args: &[PyObjectRef]| -> Result<PyObjectRef, crate::PyError> {
+        crate::baseobjspace::setdictvalue_native(args[0], SCANDIR_POSITION, pyre_object::w_none());
+        Ok(pyre_object::w_none())
+    };
+    method("__iter__", |args| Ok(args[0]));
+    method("__next__", |args| {
+        let position = crate::baseobjspace::getattr_str(args[0], SCANDIR_POSITION)?;
+        if unsafe { is_none(position) } {
+            return Err(crate::PyError::stop_iteration());
+        }
+        crate::baseobjspace::next(position)
+    });
+    method("__enter__", |args| Ok(args[0]));
+    method("__exit__", close);
+    method("close", close);
+}
+
+/// `posix.scandir(path=".")` — the entries the seam reports, as the records
+/// `os.walk`, `glob` and `shutil` read them through.
+///
+/// The omitted argument is the `"."` the signature names, and its entries
+/// carry the `./name` paths that spelling joins to.  A `bytes` path asks for
+/// `bytes` names, as it does for `listdir`.  `fd` is not one of the types the
+/// argument accepts: the seam takes a name, so a descriptor names no directory
+/// on the other side of it.
+fn scandir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["path"], "scandir")?;
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "scandir() takes at most 1 argument ({} given)",
+            pos.len()
+        )));
+    }
+    let w_path = crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", "scandir", 1)?
+        .unwrap_or(pyre_object::w_none());
+    let resolved = crate::gateway::fsencode_path_or_fd_nullable_w(w_path, "scandir", false)?;
+    let bytes_mode = unsafe { resolved.is_bytes() };
+    // An omitted path is the directory `listdir` reads for the same argument,
+    // and the prefix its entries are named relative to.
+    let dir_bytes: &[u8] = if resolved.as_bytes.is_empty() && unsafe { is_none(w_path) } {
+        b"."
+    } else {
+        &resolved.as_bytes
+    };
+    let names = crate::importing::source_list_dir(&seam_path(&resolved.as_bytes))
+        .map_err(|e| seam_error(&e, resolved.w_path()))?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut items = pyre_object::gc_roots::RootedItems::new();
+    for name in &names {
+        items.push(new_dir_entry(bytes_mode, dir_bytes, name));
+    }
+    let entries_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_list_new(items.take()));
+    let iterator_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_instance_new(scandir_iterator_type()));
+    let position =
+        crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(entries_slot))?;
+    crate::baseobjspace::setdictvalue_native(
+        pyre_object::gc_roots::shadow_stack_get(iterator_slot),
+        SCANDIR_POSITION,
+        position,
+    );
+    Ok(pyre_object::gc_roots::shadow_stack_get(iterator_slot))
+}
+
+/// `O_*` — the darwin/BSD numbering the guest's `errno` table already
+/// follows, so a flag and the errno a call refuses it with are drawn from one
+/// platform rather than two.
+mod oflag {
+    pub const RDONLY: i64 = 0x0000;
+    pub const WRONLY: i64 = 0x0001;
+    pub const RDWR: i64 = 0x0002;
+    pub const ACCMODE: i64 = 0x0003;
+    pub const NONBLOCK: i64 = 0x0004;
+    pub const APPEND: i64 = 0x0008;
+    pub const SYNC: i64 = 0x0080;
+    pub const NOFOLLOW: i64 = 0x0100;
+    pub const CREAT: i64 = 0x0200;
+    pub const TRUNC: i64 = 0x0400;
+    pub const EXCL: i64 = 0x0800;
+    pub const DIRECTORY: i64 = 0x0010_0000;
+    pub const CLOEXEC: i64 = 0x0100_0000;
+}
+
+/// An open descriptor: the bytes the path resolved to, and how far the guest
+/// has read them.
+///
+/// A directory carries no bytes.  It is opened so that `O_DIRECTORY` can mean
+/// what it means, and reading it is `EISDIR` — the same two answers a
+/// directory descriptor gives anywhere else.
+struct OpenFile {
+    data: Vec<u8>,
+    pos: u64,
+    is_dir: bool,
+}
+
+/// The standard streams hold 0, 1 and 2, so a descriptor this table hands out
+/// starts above them.
+const FIRST_FD: i32 = 3;
+/// The table is the whole descriptor space on this target, so it is what runs
+/// out: past this, `open` reports `EMFILE` rather than growing without bound.
+const MAX_OPEN_FILES: i32 = 4096;
+
+static OPEN_FILES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<i32, OpenFile>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+/// Take the lowest free number, which is the number `open` is required to
+/// return.
+fn insert_open_file(file: OpenFile) -> Result<i32, crate::PyError> {
+    let mut table = OPEN_FILES.lock().unwrap();
+    let fd = (FIRST_FD..FIRST_FD + MAX_OPEN_FILES)
+        .find(|n| !table.contains_key(n))
+        .ok_or_else(|| {
+            crate::PyError::os_error_syscall(
+                crate::builtins::wasm_errno::EMFILE,
+                pyre_object::w_none(),
+            )
+        })?;
+    table.insert(fd, file);
+    Ok(fd)
+}
+
+/// Run `f` over the descriptor numbered `fd`, or report the number as one no
+/// descriptor is open on.
+fn with_raw_fd<R>(
+    fd: i32,
+    f: impl FnOnce(&mut OpenFile) -> Result<R, crate::PyError>,
+) -> Result<R, crate::PyError> {
+    let mut table = OPEN_FILES.lock().unwrap();
+    let Some(file) = table.get_mut(&fd) else {
+        return Err(crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::EBADF,
+            pyre_object::w_none(),
+        ));
+    };
+    f(file)
+}
+
+/// [`with_raw_fd`] where the descriptor arrives as a Python argument.
+fn with_open_file<R>(
+    w_fd: PyObjectRef,
+    f: impl FnOnce(&mut OpenFile) -> Result<R, crate::PyError>,
+) -> Result<R, crate::PyError> {
+    with_raw_fd(crate::baseobjspace::c_int_w(w_fd)?, f)
+}
+
+/// Take up to `n` bytes from the descriptor's position, which advances by what
+/// was taken.  `None` takes everything left, which is what a sizeless `read()`
+/// asks for.
+///
+/// The `_io` layer reaches its descriptors through here too, so a number
+/// `posix.open` returned is a number `io.open(fd)` can read.
+pub(crate) fn fd_take(fd: i32, n: Option<usize>) -> Result<Vec<u8>, crate::PyError> {
+    with_raw_fd(fd, |file| {
+        if file.is_dir {
+            return Err(crate::PyError::os_error_syscall(
+                crate::builtins::wasm_errno::EISDIR,
+                pyre_object::w_none(),
+            ));
+        }
+        let start = (file.pos as usize).min(file.data.len());
+        let end = match n {
+            Some(n) => start.saturating_add(n).min(file.data.len()),
+            None => file.data.len(),
+        };
+        file.pos = end as u64;
+        Ok(file.data[start..end].to_vec())
+    })
+}
+
+/// [`fd_take`] into a caller's buffer, reporting how much of it was filled.
+pub(crate) fn fd_read_into(fd: i32, target: &mut [u8]) -> Result<usize, crate::PyError> {
+    let data = fd_take(fd, Some(target.len()))?;
+    target[..data.len()].copy_from_slice(&data);
+    Ok(data.len())
+}
+
+/// Move the descriptor's position and report where it landed.
+pub(crate) fn fd_lseek(fd: i32, offset: i64, whence: i32) -> Result<i64, crate::PyError> {
+    with_raw_fd(fd, |file| {
+        let base = match whence {
+            0 => 0,
+            1 => file.pos as i64,
+            2 => file.data.len() as i64,
+            _ => {
+                return Err(crate::PyError::os_error_with_errno(
+                    crate::builtins::wasm_errno::EINVAL,
+                    "lseek: unknown whence",
+                ));
+            }
+        };
+        let Some(pos) = base.checked_add(offset).filter(|p| *p >= 0) else {
+            return Err(crate::PyError::os_error_with_errno(
+                crate::builtins::wasm_errno::EINVAL,
+                "lseek: position out of range",
+            ));
+        };
+        file.pos = pos as u64;
+        Ok(pos)
+    })
+}
+
+/// Whether the descriptor is open on a directory, which is the one fact a
+/// stream needs before it adopts a number: `EISDIR` is what `io.open(fd)` owes
+/// a caller who hands it one.
+pub(crate) fn fd_is_dir(fd: i32) -> Result<bool, crate::PyError> {
+    with_raw_fd(fd, |file| Ok(file.is_dir))
+}
+
+/// Drop the descriptor and the bytes it held.
+pub(crate) fn fd_close(fd: i32) -> Result<(), crate::PyError> {
+    if OPEN_FILES.lock().unwrap().remove(&fd).is_none() {
+        return Err(crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::EBADF,
+            pyre_object::w_none(),
+        ));
+    }
+    Ok(())
+}
+
+/// The answer a write to an open descriptor gets: the seam has no writing
+/// half, so the mount is read-only rather than the descriptor unusable.
+pub(crate) fn fd_refuse_write(fd: i32) -> crate::PyError {
+    match with_raw_fd(fd, |_| Ok(())) {
+        Ok(()) => crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::EROFS,
+            pyre_object::w_none(),
+        ),
+        Err(e) => e,
+    }
+}
+
+/// The path argument of a one-path entry point, with `dir_fd` refused the way
+/// `stat` refuses it: the seam takes a name and nothing else.
+fn path_arg(
+    args: &[PyObjectRef],
+    name: &'static str,
+) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["path", "dir_fd"], name)?;
+    if pos.len() > 1 {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() takes at most 1 positional argument ({} given)",
+            pos.len()
+        )));
+    }
+    let Some(w_path) = crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", name, 1)? else {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() missing required argument 'path' (pos 1)"
+        )));
+    };
+    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, name, false)?;
+    if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
+        return Err(crate::PyError::not_implemented(
+            "dir_fd unavailable on this platform",
+        ));
+    }
+    Ok(resolved)
+}
+
+/// `posix.open(path, flags, mode=0o777, *, dir_fd=None)` — a descriptor over
+/// the bytes the seam reports for `path`.
+///
+/// The whole file is read here rather than at the first `read`: the seam has
+/// no way to resume a path part-way, so the descriptor is the only place the
+/// bytes can live.  `mode` is accepted and unused — it describes a file that
+/// is about to be created, and this seam creates none.
+fn open_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["path", "flags", "mode", "dir_fd"], "open")?;
+    if pos.len() > 3 {
+        return Err(crate::PyError::type_error(format!(
+            "open() takes at most 3 positional arguments ({} given)",
+            pos.len()
+        )));
+    }
+    let Some(w_path) = crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", "open", 3)? else {
+        return Err(crate::PyError::type_error(
+            "open() missing required argument 'path' (pos 1)",
+        ));
+    };
+    let Some(w_flags) = crate::builtins::bind_pos_or_kw(pos, kwargs, 1, "flags", "open", 3)? else {
+        return Err(crate::PyError::type_error(
+            "open() missing required argument 'flags' (pos 2)",
+        ));
+    };
+    let _ = crate::builtins::bind_pos_or_kw(pos, kwargs, 2, "mode", "open", 3)?;
+    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, "open", false)?;
+    if crate::builtins::kwarg_get(kwargs, "dir_fd").is_some_and(|v| !unsafe { is_none(v) }) {
+        return Err(crate::PyError::not_implemented(
+            "dir_fd unavailable on this platform",
+        ));
+    }
+    let flags = crate::baseobjspace::int_w(w_flags)?;
+    // Every bit that asks to change the mount, refused where the file is
+    // named rather than at the write that would discover it.
+    if flags & oflag::ACCMODE != oflag::RDONLY
+        || flags & (oflag::CREAT | oflag::TRUNC | oflag::APPEND | oflag::EXCL) != 0
+    {
+        return Err(crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::EROFS,
+            resolved.w_path(),
+        ));
+    }
+    let path = seam_path(&resolved.as_bytes);
+    let is_dir = crate::importing::source_is_dir(&path);
+    if flags & oflag::DIRECTORY != 0 && !is_dir {
+        return Err(crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::ENOTDIR,
+            resolved.w_path(),
+        ));
+    }
+    let data = if is_dir {
+        Vec::new()
+    } else {
+        crate::importing::read_source_bytes(&path)
+            .map_err(|e| seam_error(&e, resolved.w_path()))?
+    };
+    let fd = insert_open_file(OpenFile {
+        data,
+        pos: 0,
+        is_dir,
+    })?;
+    Ok(pyre_object::w_int_new(fd as i64))
+}
+
+/// `posix.close(fd)` — drop the descriptor and the bytes it held.
+fn close_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    fd_close(crate::baseobjspace::c_int_w(args[0])?)?;
+    Ok(pyre_object::w_none())
+}
+
+/// `posix.read(fd, length)` — up to `length` bytes from the position, which
+/// advances by what was returned.  A short answer at the end is the end.
+fn read_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let n_signed = crate::baseobjspace::int_w(args[1])?;
+    // A negative size would wrap to a huge `usize` (and allocation);
+    // os.read rejects it with EINVAL, matching the host read(2).
+    if n_signed < 0 {
+        return Err(crate::PyError::os_error_with_errno(
+            crate::builtins::wasm_errno::EINVAL,
+            "read: negative size",
+        ));
+    }
+    let fd = crate::baseobjspace::c_int_w(args[0])?;
+    let data = fd_take(fd, Some(n_signed as usize))?;
+    Ok(pyre_object::w_bytes_from_bytes(&data))
+}
+
+/// `posix.lseek(fd, position, whence)` — the new position.
+///
+/// A position past the end is a position, not an error: it reads as empty and
+/// is what `SEEK_END` with a positive offset names.
+fn lseek_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let fd = crate::baseobjspace::c_int_w(args[0])?;
+    let offset = crate::baseobjspace::int_w(args[1])?;
+    let whence = crate::baseobjspace::int_w(args[2])?;
+    Ok(pyre_object::w_int_new(fd_lseek(
+        fd,
+        offset,
+        i32::try_from(whence).unwrap_or(i32::MAX),
+    )?))
+}
+
+/// `posix.fstat(fd)` — the same two facts `stat` reports, taken from the
+/// descriptor rather than from a name.
+fn fstat_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    with_open_file(args[0], |file| {
+        Ok(if file.is_dir {
+            make_stat_result(S_IFDIR | 0o555, 0)
+        } else {
+            make_stat_result(S_IFREG | 0o444, file.data.len() as i64)
+        })
+    })
+}
+
+/// `posix.readlink(path, *, dir_fd=None)` — the seam resolves a name and does
+/// not report whether it went through a link, so no path it answers for is a
+/// symbolic link.  `EINVAL` is what `readlink` answers for one that is not.
+fn readlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let resolved = path_arg(args, "readlink")?;
+    let path = seam_path(&resolved.as_bytes);
+    if !crate::importing::source_is_dir(&path)
+        && let Err(e) = crate::importing::source_file_size(&path)
+    {
+        return Err(seam_error(&e, resolved.w_path()));
+    }
+    Err(crate::PyError::os_error_syscall(
+        crate::builtins::wasm_errno::EINVAL,
+        resolved.w_path(),
+    ))
+}
+
+/// `posix.unlink(path, *, dir_fd=None)` / `posix.rmdir(path, *, dir_fd=None)`
+/// — the entry points a read-only mount publishes and refuses.
+fn refuse_write(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef, crate::PyError> {
+    let resolved = path_arg(args, name)?;
+    Err(crate::PyError::os_error_syscall(
+        crate::builtins::wasm_errno::EROFS,
+        resolved.w_path(),
+    ))
+}
+
 pub fn register_module(ns: PyObjectRef) {
     // `os._createenviron` reads this dict directly and wraps it, so `os.environ`
     // is a live view of it.  The guest is started with no environment — the
@@ -196,6 +780,15 @@ pub fn register_module(ns: PyObjectRef) {
         "listdir",
         crate::make_builtin_function("listdir", listdir),
     );
+    crate::module_ns_store(
+        ns,
+        "scandir",
+        crate::make_builtin_function("scandir", scandir),
+    );
+    // `os.walk` catches `OSError` from the iterator and `shutil` calls
+    // `isinstance(entry, os.DirEntry)`, so both the type and the entries it
+    // stamps are published.
+    crate::module_ns_store(ns, "DirEntry", dir_entry_type());
     // `_bootstrap_external` reads `_os.fspath`, not `os.fspath`, so the
     // pure-Python fallback `os.py` installs when `posix` lacks it does not
     // stand in for the import machinery.  The protocol itself touches no
@@ -248,6 +841,79 @@ pub fn register_module(ns: PyObjectRef) {
         "urandom",
         crate::make_builtin_function_with_arity("urandom", urandom, 1),
     );
+    // ── the descriptor half ──
+    crate::module_ns_store(
+        ns,
+        "open",
+        crate::make_builtin_function("open", open_file),
+    );
+    crate::module_ns_store(
+        ns,
+        "close",
+        crate::make_builtin_function_with_arity("close", close_file, 1),
+    );
+    crate::module_ns_store(
+        ns,
+        "read",
+        crate::make_builtin_function_with_arity("read", read_file, 2),
+    );
+    crate::module_ns_store(
+        ns,
+        "lseek",
+        crate::make_builtin_function_with_arity("lseek", lseek_file, 3),
+    );
+    crate::module_ns_store(
+        ns,
+        "fstat",
+        crate::make_builtin_function_with_arity("fstat", fstat_file, 1),
+    );
+    crate::module_ns_store(
+        ns,
+        "readlink",
+        crate::make_builtin_function("readlink", readlink),
+    );
+    crate::module_ns_store(
+        ns,
+        "unlink",
+        crate::make_builtin_function("unlink", |args| refuse_write(args, "unlink")),
+    );
+    // `os.remove` is the same call under its other name on every platform.
+    crate::module_ns_store(
+        ns,
+        "remove",
+        crate::make_builtin_function("remove", |args| refuse_write(args, "remove")),
+    );
+    crate::module_ns_store(
+        ns,
+        "rmdir",
+        crate::make_builtin_function("rmdir", |args| refuse_write(args, "rmdir")),
+    );
+    // ── the constants those entry points are called with ──
+    let constants: &[(&str, i64)] = &[
+        ("O_RDONLY", oflag::RDONLY),
+        ("O_WRONLY", oflag::WRONLY),
+        ("O_RDWR", oflag::RDWR),
+        ("O_ACCMODE", oflag::ACCMODE),
+        ("O_NONBLOCK", oflag::NONBLOCK),
+        ("O_APPEND", oflag::APPEND),
+        ("O_SYNC", oflag::SYNC),
+        ("O_NOFOLLOW", oflag::NOFOLLOW),
+        ("O_CREAT", oflag::CREAT),
+        ("O_TRUNC", oflag::TRUNC),
+        ("O_EXCL", oflag::EXCL),
+        ("O_DIRECTORY", oflag::DIRECTORY),
+        ("O_CLOEXEC", oflag::CLOEXEC),
+        ("F_OK", 0),
+        ("X_OK", 1),
+        ("W_OK", 2),
+        ("R_OK", 4),
+        ("SEEK_SET", 0),
+        ("SEEK_CUR", 1),
+        ("SEEK_END", 2),
+    ];
+    for (name, value) in constants {
+        crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+    }
 }
 
 /// The embedder's working directory, or nothing when it reports none.
