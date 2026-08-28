@@ -189,16 +189,16 @@ pub trait JitPolicy {
         // and synthesizes the `SemanticFunction` around it — a field on
         // the front end's own record never travels here. The flowspace
         // pipeline writes the flag through `description.rs
-        // default_specialize`; on the LLBC path nothing sets it yet, and
-        // `FunctionGraph::access_directly` records what a bridge there
-        // would have to propagate.
+        // default_specialize`; the LLBC path writes it through
+        // `front::semantic::propagate_access_directly`, which walks the op
+        // stream because there is no annotator to carry a flag on an
+        // annotation.
         //
         // This is the first of upstream's two gates on the flag. The
         // second, `warmspot.py check_access_directly_sanity`, walks
         // everything reachable from the entry point and asserts that no
         // graph outside the JIT graph set is `access_directly`; it has no
-        // port here, and would answer vacuously until something sets the
-        // flag on the production path.
+        // port here.
         if see_function && !res && func.graph.access_directly {
             panic!(
                 "access_directly on a function which we don't see: {}",

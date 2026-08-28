@@ -394,6 +394,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "majit_metainterp.jit.hint_fresh_virtualizable",
         jit_hint_fresh_virtualizable,
     );
+    analyzer_for(
+        &mut reg,
+        "majit_metainterp.jit.hint_no_access_directly",
+        jit_hint_no_access_directly,
+    );
     // `rlib/debug.py` — the assertion half of `check_not_access_directly`.
     analyzer_for(
         &mut reg,
@@ -1700,6 +1705,41 @@ fn hint_virtualizable_flags(args_s: &[Option<SomeValue>], fresh_virtualizable: b
         inst.can_be_none,
         flags,
     ))
+}
+
+/// RPython `rlib/jit.py`, same entry, for the `access_directly=False`
+/// spelling — the `else` arm.
+///
+/// ```python
+/// assert s_access_directly.const == False or virtualizable is None
+/// if 'access_directly' in s_x.flags or 'fresh_virtualizable' in s_x.flags:
+///     flags = s_x.flags.copy()
+///     ...  # delete both
+/// ```
+///
+/// It strips unconditionally, where the `True` spelling strips only when the
+/// class does not declare `_virtualizable_`. `executioncontext.py` spells it
+/// at both points where a frame is handed to arbitrary Python.
+fn jit_hint_no_access_directly(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    let Some(Some(s_x)) = args_s.first() else {
+        return Ok(s_impossible_value());
+    };
+    let s_x = super::model::not_const(s_x);
+    let SomeValue::Instance(inst) = &s_x else {
+        return Ok(s_x);
+    };
+    let mut flags = inst.flags.clone();
+    flags.remove("access_directly");
+    flags.remove("fresh_virtualizable");
+    Ok(SomeValue::Instance(super::model::SomeInstance::new(
+        inst.classdef.clone(),
+        inst.can_be_none,
+        flags,
+    )))
 }
 
 /// RPython `rlib/debug.py` — the `check_not_access_directly`

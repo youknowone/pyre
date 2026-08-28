@@ -214,6 +214,9 @@ pub fn app_profile_call(
     event: &str,
     w_arg: PyObjectRef,
 ) -> Result<(), crate::PyError> {
+    // executioncontext.py — `frame = jit.hint(frame, access_directly=False)`:
+    // from here on, frame is just a normal w_object.
+    let frame = majit_metainterp::jit::hint_no_access_directly(frame);
     let frame_obj = wrap_trace_frame(frame);
     let w_event = pyre_object::w_str_new(event);
     crate::call::call_function_impl_result(w_callable, &[frame_obj, w_event, w_arg]).map(|_| ())
@@ -1460,6 +1463,10 @@ impl ExecutionContext {
                     }
                     d.f_lineno = lineno;
                 }
+                // executioncontext.py — `frame = jit.hint(frame,
+                // access_directly=False)`: from here on, frame is just a
+                // normal w_object.
+                let frame = majit_metainterp::jit::hint_no_access_directly(frame);
                 // executioncontext.py:382-385 space.call_function(w_callback, frame, w_event, w_arg)
                 let frame_obj = wrap_trace_frame(frame);
                 let w_event = pyre_object::w_str_new(event);

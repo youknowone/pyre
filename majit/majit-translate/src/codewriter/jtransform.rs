@@ -1090,8 +1090,11 @@ impl<'a> Transformer<'a> {
     /// per block.  See `rewrite_op_hint`'s `FreshVirtualizable` arm for
     /// why upstream does not have that constraint.
     ///
-    /// No pyre source calls the hint today, so this arm is not the one
-    /// that fires: the reachable path is the structural sibling below,
+    /// The two frame constructors call the hint (`pyre-interpreter`
+    /// `pyframe.rs` `PyFrame::new` and `createframe_obj`, mirroring
+    /// `pyframe.py:99`), but neither is the caller this arm answers for:
+    /// both hint a frame they hold by value, so the reachable path there
+    /// is the structural sibling below,
     /// `FieldDescriptor::base_is_local_aggregate`, which recovers the
     /// same fact from the access reaching a container that was never
     /// dereferenced.  Keep this arm anyway — the two are not the same
@@ -2833,7 +2836,9 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         match hint_kind {
-            crate::hints::HintKind::AccessDirectly | crate::hints::HintKind::FreshVirtualizable => {
+            crate::hints::HintKind::AccessDirectly
+            | crate::hints::HintKind::NoAccessDirectly
+            | crate::hints::HintKind::FreshVirtualizable => {
                 // `jtransform.py:655-656 if hints.get('fresh_virtualizable')
                 // or hints.get('access_directly'): return` — both are
                 // consumed without emitting an operation.

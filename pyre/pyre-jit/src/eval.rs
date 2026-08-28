@@ -6100,6 +6100,8 @@ impl __extend__ {
         next_instr: usize,
         _ec: *const PyExecutionContext,
     ) -> PyResult {
+        // interp_jit.py `dispatch` — `self = hint(self, access_directly=True)`.
+        let frame = majit_metainterp::jit::hint_access_directly(frame);
         majit_gc::gc_sync::safepoint_poll();
         frame.set_last_instr_from_next_instr(next_instr);
         // interp_jit.py dispatch: the while-True loop runs until

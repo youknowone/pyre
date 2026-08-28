@@ -5517,9 +5517,15 @@ pub struct FunctionGraph {
     /// `PyGraph::access_directly`; the LLBC path has no annotator to carry a
     /// flag on an annotation, so `front::semantic::propagate_access_directly`
     /// does the same propagation over the op stream and writes this field.
-    /// Its doc records the two under-approximations that port makes, both
-    /// forced by `policy::look_inside_graph` aborting the build on a flag it
-    /// cannot honour.
+    /// That port is narrower than upstream in three named ways, recorded on
+    /// its own doc: a callee reached through both flagged and unflagged calls
+    /// stays unflagged, because one graph per function cannot carry both
+    /// access modes and `policy::look_inside_graph` aborts on a flag it
+    /// cannot honour; the alias closure follows only `Link`s and the
+    /// representation casts; and a value is taken for a virtualizable
+    /// instance only when the lowered graph records a class root the
+    /// consumer declared through `virtualizable_decl`. A `false` here
+    /// therefore does not mean the value never reached the graph.
     pub access_directly: bool,
     /// Per-function effect attributes RPython reads off `graph.func`
     /// (`func.oopspec`, `_gctransformer_hint_cannot_collect_`, …). Default

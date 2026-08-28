@@ -17,6 +17,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HintKind {
     AccessDirectly,
+    /// `rlib/jit.py hint(x, access_directly=False)`.  Not a no-op: the
+    /// entry deletes `access_directly` and `fresh_virtualizable` from the
+    /// annotation's flags, so the value stops being treated as a
+    /// virtualizable from here on.
+    NoAccessDirectly,
     FreshVirtualizable,
     ForceVirtualizable,
     /// `rlib/jit.py promote(x)` / `hint(x, promote=True)`.  Rewrite
@@ -68,6 +73,7 @@ where
 {
     match segments.into_iter().last().unwrap_or_default() {
         "hint_access_directly" => Some(HintKind::AccessDirectly),
+        "hint_no_access_directly" => Some(HintKind::NoAccessDirectly),
         "hint_fresh_virtualizable" => Some(HintKind::FreshVirtualizable),
         "hint_force_virtualizable" => Some(HintKind::ForceVirtualizable),
         "hint_promote" => Some(HintKind::Promote),

@@ -103,6 +103,7 @@ mod parse;
 )]
 pub mod pipeline;
 mod runtime_names;
+pub mod virtualizable_decl;
 // `translator/` is the RPython-orthodox port home — see
 // `translator/mod.rs` for the contract.  Currently hosts
 // `translator/rtyper/{rclass.rs, rpbc.rs}`, the `rpython/rtyper/` 1:1
