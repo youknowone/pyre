@@ -33,8 +33,8 @@ pub(super) fn charp2str(ptr: *const libc::c_char) -> Vec<u8> {
 /// separator and grouping string of the current locale, as the bytes
 /// `localeconv()` reports them.
 ///
-/// Off unix, without `host_env`, and under sandbox the C locale's values stand
-/// in.  Upstream declares `localeconv` `sandboxsafe=True` (`rlocale.py`,
+/// Without `host_env` and under sandbox the C locale's values stand in.
+/// Upstream declares `localeconv` `sandboxsafe=True` (`rlocale.py`,
 /// `:180-182`) and reads the host locale even there; pyre compiles the call out
 /// instead, because the sandbox build replaces `_locale`'s host entry points
 /// with raising stubs and `format()` must not acquire a raising path.
@@ -52,5 +52,19 @@ pub(crate) fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             };
         }
     }
+    // `libc` declares neither `lconv` nor `localeconv` for a Windows target,
+    // so the host helper's already-read copy answers there.  It stops the
+    // grouping at a `CHAR_MAX` element, which no locale name this runtime
+    // accepts carries.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    {
+        let conv = rustpython_host_env::locale::localeconv_data();
+        return (
+            conv.decimal_point,
+            conv.thousands_sep,
+            conv.grouping.iter().map(|&size| size as u8).collect(),
+        );
+    }
+    #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
     (b".".to_vec(), Vec::new(), Vec::new())
 }

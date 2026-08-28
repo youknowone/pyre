@@ -1,6 +1,10 @@
 {
   "host": "win32-AMD64",
   "modules": {
+    "test.test__locale": {
+      "dynasm": "PASS",
+      "reason": "the candidate locales _LocaleTests compares against are installed here, so localeconv() answers with known values and the module reports a result; a host carrying only the C locale reaches skipTest('no suitable locales') in every case and the shared SKIP is what it records"
+    },
     "test.test_eintr": {
       "dynasm": "SKIP",
       "reason": "EINTRTests is skipUnless(os.name == 'posix', 'only supported on Unix'), so every case in the module skips and none is left to report a result"
@@ -15,7 +19,7 @@
     },
     "test.test_mmap": {
       "dynasm": "FAIL",
-      "reason": "MmapTests.setUp's os.unlink(TESTFN) raises PermissionError WinError 32 once a preceding case leaves the mapping's file open: finalization is not refcount-prompt and Windows refuses to unlink an open file. 40 of the 51 cases error on that one line; POSIX unlinks an open file and passes"
+      "reason": "MmapTests.setUp's os.unlink(TESTFN) raises PermissionError WinError 32 once a preceding case drops a mapping without closing it, and every later case inherits the lock. mmap_new_object allocates through the stable allocator, which is born into the old generation, so the lightweight destructor that closes the handles runs only at a major collection: of 200 dropped mappings, minor collections release 0 and gc.collect() releases 200, where PyPy on this host releases all 200 at the minor. POSIX never shows it, unlink succeeding on an open file"
     },
     "test.test_msvcrt": {
       "dynasm": "PASS",
@@ -24,10 +28,6 @@
     "test.test_startfile": {
       "dynasm": "PASS",
       "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for os.startfile"
-    },
-    "test.test_venv": {
-      "dynasm": "FAIL",
-      "reason": "EnvBuilder.setup_python's nt branch copies venvlaunchert.exe / venvwlaunchert.exe out of venv/scripts/nt, which holds only activate.bat and deactivate.bat, so Scripts/<exe> is never produced and every case that looks for it fails. The POSIX branch copies the interpreter itself"
     },
     "test.test_winapi": {
       "dynasm": "PASS",
