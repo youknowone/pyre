@@ -6407,6 +6407,24 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
+    // `isinstance(x, C)` for a class whose metaclass is exactly `type`: the
+    // answer is `issubtype`'s elidable MRO test on two promoted types
+    // (typeobject.py), so pin both and bake it instead of leaving the opaque
+    // `bh_call_fn(isinstance_builtin, NULL, x, C)` residual.  Read-only like
+    // the `len` fold, so no sub-walk restriction; a tuple or union classinfo, a
+    // custom `__instancecheck__`, and an unversioned type fall through to the
+    // generic residual (SAFE).
+    if ctx.is_authoritative_executor
+        && dst_bank == 'r'
+        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && spec_gate(SpecFold::BuiltinIsinstance, || {
+            try_walker_specialize_builtin_isinstance(ctx, code, op, &r_args, dst)
+        })?
+        .is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // A class statement's body store is hidden inside this residual; ask its
     // `jit_force_quasi_immutable` question before anything applies the call, so
     // the abort resumes the interpreter at this opcode with the class not yet

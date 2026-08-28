@@ -9577,6 +9577,147 @@ pub(crate) fn try_walker_specialize_builtin_len<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `isinstance(x, C)` for an ordinary class `C` — the trace shape of
+/// `typeobject.py` `issubtype`:
+///
+/// ```text
+/// def issubtype(self, w_type):
+///     promote(self); promote(w_type)
+///     if we_are_jitted():
+///         version_tag1 = self.version_tag()
+///         version_tag2 = w_type.version_tag()
+///         if version_tag1 is not None and version_tag2 is not None:
+///             return _pure_issubtype(self, w_type, version_tag1, version_tag2)
+///     return _issubtype(self, w_type)
+/// ```
+///
+/// Both types are promoted and the elidable result is keyed on BOTH version
+/// tags, so this pins both: the receiver's class through `guard_class` plus the
+/// exact-`w_class` guard, `C` through a `guard_value`, and each type's
+/// `_version_tag?` through one quasi-immutable marker rather than a load and a
+/// `guard_value` per read. [`pyre_interpreter::mutated`] recursively
+/// invalidates subclasses, so the receiver's watcher also covers a base class
+/// changing its dict or its bases. What remains is a green answer.
+///
+/// A metaclass other than exactly `type` runs its own `__instancecheck__` —
+/// `ABCMeta` among them, whose `register` changes the answer without touching
+/// either pinned class — and declines here. So do a tuple or union classinfo,
+/// which are not types at all, and a type with no version tag to watch.
+///
+/// `abstract_isinstance_w` additionally reads `w_inst.__class__` on a MISS
+/// (`abstractinst.py`), which a `@property def __class__` turns into user code.
+/// [`pyre_interpreter::baseobjspace::isinstance_miss_class_lookup_is_pure`] is
+/// the memoized proof that the receiver's type inherits both
+/// `object.__getattribute__` and the canonical `object.__class__` descriptor;
+/// a miss without it declines. `dispatch_residual_call_iRd_kind`'s replay-safe
+/// classification already admits this exact shape under the same three
+/// predicates; the version-tag markers are what let the answer be baked rather
+/// than re-derived.
+///
+/// Read-only, so no sub-walk restriction: it cannot raise and introduces no
+/// side effect a resume would repeat.
+pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    // Plain `bh_call_fn(callable, PY_NULL, obj, classinfo)` shape only.
+    if r_args.len() != 4 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(obj),
+        ConcreteValue::Ref(classinfo),
+    ) = (
+        arg_concretes[0],
+        arg_concretes[1],
+        arg_concretes[2],
+        arg_concretes[3],
+    )
+    else {
+        return Ok(None);
+    };
+    if concrete_callable.is_null()
+        || !null_or_self.is_null()
+        || obj.is_null()
+        || classinfo.is_null()
+    {
+        return Ok(None);
+    }
+    if !pyre_interpreter::builtins::is_builtin_isinstance_function(concrete_callable) {
+        return Ok(None);
+    }
+    // The class the answer comes from has to be the one the guards pin, so read
+    // it out of the slot `walker_guard_exact_w_class` compares and require
+    // `typedef::type` to agree: an exception instance's `ExcKind` tag names a
+    // class the slot does not, and the MRO walked at record time would then
+    // belong to a class no guard holds.
+    let w_class = unsafe { (*obj).w_class };
+    if w_class.is_null()
+        || pyre_interpreter::typedef::r#type(obj)
+            .is_none_or(|actual| !std::ptr::eq(actual.as_ptr(), w_class))
+    {
+        return Ok(None);
+    }
+    let metaclass_is_type = pyre_interpreter::typedef::r#type(classinfo)
+        .is_some_and(|meta| std::ptr::eq(meta.as_ptr(), pyre_interpreter::typedef::w_type()));
+    if !metaclass_is_type {
+        return Ok(None);
+    }
+    let answer = unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, classinfo) };
+    if !answer
+        && !unsafe { pyre_interpreter::baseobjspace::isinstance_miss_class_lookup_is_pure(w_class) }
+    {
+        return Ok(None);
+    }
+    // Both markers need a live tag to attach to; a type that carries none has
+    // no channel through which a later mutation reaches this trace.
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) } == 0
+        || unsafe { pyre_object::typeobject::w_type_get_version_tag(classinfo) } == 0
+    {
+        return Ok(None);
+    }
+
+    // --- emit the specialized IR (walker-native) ---
+    let callable_op = r_args[0];
+    if !callable_op.is_constant() {
+        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(callable_op, expected);
+    }
+    let classinfo_op = r_args[3];
+    let classinfo_const = ctx.trace_ctx.const_ref(classinfo as i64);
+    if !classinfo_op.is_constant() {
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardValue, &[classinfo_op, classinfo_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(classinfo_op, classinfo_const);
+    }
+    let obj_op = r_args[2];
+    walker_guard_class(ctx, op.pc, obj_op, unsafe { (*obj).ob_type } as i64)?;
+    walker_guard_exact_w_class(ctx, op.pc, obj_op, w_class)?;
+    let w_class_const = ctx.trace_ctx.const_ref(w_class as i64);
+    walker_pin_type_version_tag(ctx, op.pc, w_class_const)?;
+    walker_pin_type_version_tag(ctx, op.pc, classinfo_const)?;
+
+    let result = ctx
+        .trace_ctx
+        .const_ref(pyre_object::boolobject::w_bool_from(answer) as i64);
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
+    Ok(Some(()))
+}
+
 /// Fold plain `getattr(type, name)` when
 /// [`pyre_interpreter::type_attr_value_fast_path`] proves that
 /// `typeobject.py` `getattribute` returns the class-MRO value unchanged.  The exact
