@@ -152,6 +152,16 @@ fn complete_argtypes(
     Ok(fvarargs)
 }
 
+/// How much of the exchange buffer an ordinary signature needs.  Anything
+/// larger falls back to the heap.
+const STACK_EXCHANGE_SIZE: usize = 256;
+
+/// The stack half of the exchange buffer.  `malloc` hands back memory aligned
+/// for any type; a bare `[u8; N]` is only byte-aligned, and the buffer holds
+/// `double`, `long double` and pointers, so the alignment is spelled out here.
+#[repr(C, align(16))]
+struct ExchangeBuf([u8; STACK_EXCHANGE_SIZE]);
+
 /// `W_CTypeFunc._call` — fill the exchange buffer, call, read the result out.
 fn do_call(
     fargs: &[PyObjectRef],
@@ -170,7 +180,14 @@ fn do_call(
         let _ = roots.pin_root(w_arg);
     }
     let size = unsafe { exchange_size(cif) };
-    let buffer = cdataobj::raw_alloc(size as i64, false)?;
+    let mut stack_buffer = std::mem::MaybeUninit::<ExchangeBuf>::uninit();
+    let mut heap_buffer = std::ptr::null_mut();
+    let buffer = if size <= STACK_EXCHANGE_SIZE {
+        stack_buffer.as_mut_ptr().cast::<u8>()
+    } else {
+        heap_buffer = cdataobj::raw_alloc(size as i64, false)?;
+        heap_buffer
+    };
     let mut mustfree_max_plus_1 = 0usize;
     let called = (|| -> Result<PyObjectRef, PyError> {
         for i in 0..args_w.len() {
@@ -203,7 +220,9 @@ fn do_call(
             unsafe { libc::free(raw.cast::<libc::c_void>()) };
         }
     }
-    unsafe { libc::free(buffer.cast::<libc::c_void>()) };
+    if !heap_buffer.is_null() {
+        unsafe { libc::free(heap_buffer.cast::<libc::c_void>()) };
+    }
     called
 }
 
