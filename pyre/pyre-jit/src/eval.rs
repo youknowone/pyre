@@ -875,6 +875,16 @@ unsafe fn queue_simplequeue_destructor(obj_addr: usize) {
     };
 }
 
+/// Frees the block a `newp`-owned cdata malloc'd; a cdata that only borrows
+/// someone else's memory frees nothing.
+unsafe fn cffi_cdata_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_cffi_backend::cdataobj::w_cdata_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -4095,6 +4105,25 @@ fn build_gc() -> Box<MiniMarkGC> {
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     ] {
         register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+    }
+
+    // `_cffi_backend`'s three object types.  A ctype and the array iterator
+    // hold ordinary traced fields; a cdata additionally owns the block that
+    // `newp` malloc'd for it, which its sweep destructor frees.  All three are
+    // unconditional, so they register ahead of the target-gated tail.
+    for descriptor in [
+        <pyre_interpreter::module::_cffi_backend::ctypeobj::W_CType
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        <pyre_interpreter::module::_cffi_backend::ctypearray::W_CDataIter
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    ] {
+        register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+    }
+    {
+        let descr = <pyre_interpreter::module::_cffi_backend::cdataobj::W_CData
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+        gc.types.set_destructor(tid, cffi_cdata_destructor);
     }
 
     // Register `posix.DirEntry`'s four inline GC edges and

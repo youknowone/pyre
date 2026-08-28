@@ -9,4 +9,12 @@
 
 crate::pyre_module_init!(interp_cffi_backend);
 
+pub mod cdataobj;
+pub mod ctypearray;
+pub mod ctypeobj;
+pub mod ctypeprim;
+pub mod ctypeptr;
+pub mod func;
+pub mod misc;
+pub mod newtype;
 pub mod parse_c_type;

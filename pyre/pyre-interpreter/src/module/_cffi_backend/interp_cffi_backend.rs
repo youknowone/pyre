@@ -19,12 +19,62 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
 
     register_rtld_constants(ns);
 
+    // `moduledef.py interpleveldefs` — the fixed-arity entry points first.
+    for (name, f, arity) in [
+        (
+            "new_primitive_type",
+            super::func::new_primitive_type as crate::gateway::BuiltinCodeFn,
+            1u16,
+        ),
+        ("new_pointer_type", super::func::new_pointer_type, 1),
+        ("new_array_type", super::func::new_array_type, 2),
+        ("new_void_type", super::func::new_void_type, 0),
+        ("cast", super::func::cast, 2),
+        ("typeof", super::func::typeof_, 1),
+        ("sizeof", super::func::sizeof, 1),
+        ("alignof", super::func::alignof, 1),
+        ("getcname", super::func::getcname, 2),
+        ("unpack", super::func::unpack, 2),
+        ("memmove", super::func::memmove, 3),
+        ("release", super::func::release, 1),
+        ("_get_types", super::func::get_types, 0),
+        ("_get_common_types", get_common_types, 1),
+    ] {
+        crate::module_ns_store(
+            ns,
+            name,
+            crate::gateway::with_module(
+                MODULE,
+                crate::make_module_builtin_function_with_arity(name, f, arity),
+            ),
+        );
+    }
+    // `newp(ctype, init=None)`, `string(cdata, maxlen=-1)`,
+    // `typeoffsetof(ctype, field_or_index, following=0)` and
+    // `rawaddressof(ctype, cdata, offset=0)` all carry a default.
+    for (name, f) in [
+        ("newp", super::func::newp as crate::gateway::BuiltinCodeFn),
+        ("string", super::func::string),
+        ("typeoffsetof", super::func::typeoffsetof),
+        ("rawaddressof", super::func::rawaddressof),
+    ] {
+        crate::module_ns_store(
+            ns,
+            name,
+            crate::gateway::with_module(MODULE, crate::make_module_builtin_function(name, f)),
+        );
+    }
+    // The types `moduledef.py` publishes.
+    crate::module_ns_store(ns, "CType", super::ctypeobj::ctype_type());
+    crate::module_ns_store(ns, "_CDataBase", super::cdataobj::cdata_type());
     crate::module_ns_store(
         ns,
-        "_get_common_types",
-        crate::make_builtin_function_with_arity("_get_common_types", get_common_types, 1),
+        "__CData_iterator",
+        super::ctypearray::cdata_iter_type(),
     );
 }
+
+const MODULE: &str = "_cffi_backend";
 
 /// `clibffi.FFI_DEFAULT_ABI`.
 #[cfg(all(

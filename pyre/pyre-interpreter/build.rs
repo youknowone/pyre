@@ -78,10 +78,18 @@ fn main() {
     // translation unit rather than re-spell the grammar
     // (`pypy/module/_cffi_backend/parse_c_type.py`'s ECI).  `commontypes.c` is
     // `#include`d by `parse_c_type.c` and is not a unit of its own.
+    // `longdouble.c` joins it because `long double`'s width and representation
+    // are the C compiler's to know, exactly as `misc.py` reaches for C to
+    // answer `pypy__is_nonnull_longdouble`.
     if std::env::var_os("CARGO_FEATURE_SANDBOX").is_none() && !target.starts_with("wasm32-") {
         let cffi_root = Path::new("src/module/_cffi_backend");
-        let cffi_source = "src/module/_cffi_backend/src/parse_c_type.c";
-        println!("cargo:rerun-if-changed={cffi_source}");
+        let cffi_sources = [
+            "src/module/_cffi_backend/src/parse_c_type.c",
+            "src/module/_cffi_backend/src/longdouble.c",
+        ];
+        for source in cffi_sources {
+            println!("cargo:rerun-if-changed={source}");
+        }
         for header in [
             "src/precommondefs.h",
             "src/parse_c_type.h",
@@ -93,7 +101,7 @@ fn main() {
             );
         }
         cc::Build::new()
-            .file(cffi_source)
+            .files(cffi_sources)
             .include(cffi_root)
             .warnings(false)
             .compile("pyre_cffi_parse_c_type");
