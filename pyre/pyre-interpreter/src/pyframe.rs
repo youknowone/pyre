@@ -5471,7 +5471,7 @@ impl PyFrame {
             crate::w_code_frame_stores_global(_roots.get(root_base), _roots.get(root_base + 1))
         };
 
-        let mut frame = PyFrame {
+        let frame = PyFrame {
             ob_header: frame_ob_header(),
             pycode: _roots.get(root_base) as *const (),
             locals_cells_stack_w,
@@ -5487,6 +5487,15 @@ impl PyFrame {
             f_backref: std::ptr::null_mut(),
             w_builtin: _roots.get(root_base + 3),
         };
+        // pyframe.py `__init__` opens with `self = hint(self,
+        // access_directly=True, fresh_virtualizable=True)`, and `pycode.py
+        // funcrun` re-establishes the same pair on the frame it just built
+        // before binding the arguments and calling `init_cells`.  This
+        // constructor is both halves fused, so one pair covers them.  The
+        // hint precedes the globals store, as `__init__` does.
+        let mut frame = majit_metainterp::jit::hint_fresh_virtualizable(
+            majit_metainterp::jit::hint_access_directly(frame),
+        );
         if frame_stores_global {
             frame.set_w_globals(_roots.get(root_base + 1));
         }
@@ -5795,7 +5804,7 @@ pub fn createframe_obj(
     ));
     let locals_cells_stack_w =
         unsafe { alloc_frame_locals_array(size, PY_NULL, FrameLocalsArrayAllocation::OldGenGc) };
-    let mut frame = FrameBox::new(PyFrame {
+    let frame = FrameBox::new(PyFrame {
         ob_header: frame_ob_header(),
         pycode: _roots.get(root_base) as *const (),
         locals_cells_stack_w,
@@ -5811,6 +5820,13 @@ pub fn createframe_obj(
         f_backref: std::ptr::null_mut(),
         w_builtin: _roots.get(root_base + 2),
     });
+    // pyframe.py `__init__` — `self = hint(self, access_directly=True,
+    // fresh_virtualizable=True)`.  Upstream spells the two kwargs on one
+    // `hint()`; pyre dispatches one helper per kwarg, and both precede the
+    // globals store as `__init__` does.
+    let mut frame = majit_metainterp::jit::hint_fresh_virtualizable(
+        majit_metainterp::jit::hint_access_directly(frame),
+    );
     if frame_stores_global {
         frame.set_w_globals(_roots.get(root_base + 1));
     }
