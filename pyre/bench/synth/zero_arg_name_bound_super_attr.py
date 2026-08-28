@@ -1,9 +1,12 @@
-# pyre-check: max-pypy-ratio=2
+# pyre-check: max-pypy-ratio=4
 # pyre-check: skip-cpython
-# The ceiling is 2, tighter than the spread this shape showed before the
-# descriptor arms landed: an arm64 mac runner read 1.7x and a windows runner
-# 1.8x dynasm, but an x86_64 ubuntu runner read 2.3x dynasm and 2.5x
-# cranelift -- two different backends over 2 on the one host.
+# pyre-check: spec-folds=bare_super_virtual,load_attr_on_super
+# `spec-folds` is the invariant here: those two folds fire or the fixture
+# fails, on every host and backend.  The ratio is a backstop sized to the
+# slowest reading -- 3.0x under cranelift on x86_64 ubuntu against 1.9x under
+# dynasm on that same runner, where the whole macro suite shows the same
+# backend spread with no super in it.  See `name_bound_super_attr.py` for the
+# measurement.
 # The loop folds to one add per iteration on both JITs, so N has to be in
 # the hundreds of millions before pypy's execution time is a measurement
 # rather than a clock tick — and at that size cpython is minutes behind.

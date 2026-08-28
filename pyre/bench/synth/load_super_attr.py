@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
+# pyre-check: spec-folds=load_super_attr,super_attr_unwrap
 # The loop folds to one add per iteration on both JITs, so N has to be in
 # the hundreds of millions before pypy's execution time is a measurement
 # rather than a clock tick — and at that size cpython is minutes behind.
@@ -8,11 +9,12 @@
 # gate (`eval.rs for_iter_body_op_is_jit_safe`), so a regression in that gate
 # cannot hide here.  `zero_arg_super_attr.py` is the `for` twin.
 #
-# The ceiling is 3 rather than 2 because super is no longer what it measures.
-# The identical loop calling a plain `self.plain()` — no super anywhere — reads
-# the same user CPU time as this one to the centisecond (0.47s against pypy's
-# 0.22s, best of three, both files): the difference between the two is below
-# the measurement.  What is left is pyre's
+# `spec-folds` is the invariant here: those two folds fire or the fixture
+# fails, on every host and backend.  The ratio is 3 rather than 2 because super
+# is no longer what it measures — the identical loop calling a plain
+# `self.plain()`, no super anywhere, reads the same user CPU time as this one
+# to the centisecond (0.47s against pypy's 0.22s, best of three, both files).
+# What is left is pyre's
 # generic `while` scaffolding (a loop-invariant class re-check on the bound, an
 # unused ForceToken, the `ec.w_tracefunc` null check and the eval-breaker
 # poll), and a ceiling of 2 here would gate on that instead of on super.  The
