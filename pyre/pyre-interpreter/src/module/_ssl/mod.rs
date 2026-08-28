@@ -2119,6 +2119,11 @@ mod ssl_socket_methods {
                             break data;
                         }
                         PumpExit::NeedsConfig => {
+                            // The events the acceptor observed belong to the
+                            // context that was current while it read them, so
+                            // they are delivered before the callback below is
+                            // given the chance to choose another one.
+                            settle_received_tls(self)?;
                             unsafe { configure_accepted_server(self as *mut W_SSLSocket) }?
                         }
                         PumpExit::Interrupted => {
