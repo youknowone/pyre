@@ -3936,10 +3936,14 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     let term = unsafe { (*terminator).as_terminator() as *const _ };
     walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
 
-    // `_prim_direct_read` (mapdict.py): read the raw longlong from the
-    // shared list through a non-forcing, non-elidable residual.  Both indices
-    // are green constants pinned by the map guard; keeping boxing in the trace
-    // lets an immediate integer consumer virtualize it away.
+    // `_prim_direct_read` (mapdict.py) as the three loads it is: the
+    // instance's storage block, the slot holding this attribute's raw list,
+    // and the item.  Both coordinates are green constants the map guard pins,
+    // so the two leading loads are loop-invariant over any stretch that cannot
+    // force and the heap cache folds them away; keeping the boxing in the
+    // trace lets an immediate numeric consumer virtualize that too.  A
+    // residual reading the same three words instead would take the receiver as
+    // a `Ref` argument, which forces an instance the trace allocated.
     let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
     let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
     let live = unsafe {
@@ -3949,33 +3953,15 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             listindex,
         )
     };
+    let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
+        crate::descr::mapdict_storage_descr(concrete_obj)
+    });
+    let slot =
+        crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, storageindex_const);
     let boxed = match unbox_type {
         pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
-            // A trace-allocated receiver reads inline so the heap cache folds
-            // the chain and the instance stays virtual (a residual Ref arg
-            // would force it); an escaped receiver keeps the residual.
-            let raw = if ctx.trace_ctx.heap_cache().is_unescaped(obj) {
-                let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
-                    crate::descr::mapdict_storage_descr(concrete_obj)
-                });
-                let slot = crate::state::trace_mapdict_storage_getitem(
-                    ctx.trace_ctx,
-                    block,
-                    storageindex_const,
-                );
-                crate::state::trace_int_block_getitem_value(ctx.trace_ctx, slot, listindex_const)
-            } else {
-                crate::helpers::emit_trace_call_int_typed(
-                    ctx.trace_ctx,
-                    crate::helpers::jit_mapdict_unboxed_read_raw as *const (),
-                    &[obj, storageindex_const, listindex_const],
-                    &[
-                        majit_ir::Type::Ref,
-                        majit_ir::Type::Int,
-                        majit_ir::Type::Int,
-                    ],
-                )
-            };
+            let raw =
+                crate::state::trace_int_block_getitem_value(ctx.trace_ctx, slot, listindex_const);
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Int(live));
             let boxed = walker_box_int(ctx, op_pc, raw, live)?;
@@ -3992,16 +3978,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             boxed
         }
         pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
-            let raw = crate::helpers::emit_trace_call_float_typed(
-                ctx.trace_ctx,
-                crate::helpers::jit_mapdict_unboxed_read_f as *const (),
-                &[obj, storageindex_const, listindex_const],
-                &[
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Int,
-                    majit_ir::Type::Int,
-                ],
-            );
+            let raw =
+                crate::state::trace_float_block_getitem_value(ctx.trace_ctx, slot, listindex_const);
             let live_f = f64::from_bits(live as u64);
             ctx.trace_ctx
                 .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
@@ -5582,7 +5560,19 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
         unsafe { pyre_interpreter::objspace::std::mapdict::mark_attr_ever_mutated(attr) };
         let storageindex_const = ctx.trace_ctx.const_int(storageindex as i64);
         let listindex_const = ctx.trace_ctx.const_int(listindex as i64);
-        let (helper_fn, raw, value_type) = match unbox_type {
+        // A same-type update writes ONE raw slot.  The map-transition fold
+        // above needs `is_unescaped` because it publishes `map` and `storage`
+        // as an unlocked pair a concurrent mutator could tear; this write
+        // publishes neither, so it holds for an escaped receiver too.
+        // Recording it as `setarrayitem_gc` rather than a residual also puts
+        // it in the same heap cache the unboxed read uses, so a read of the
+        // slot the trace just wrote answers from the trace.
+        let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, obj, unsafe {
+            crate::descr::mapdict_storage_descr(concrete_obj)
+        });
+        let slot =
+            crate::state::trace_mapdict_storage_getitem(ctx.trace_ctx, block, storageindex_const);
+        let raw_live = match unbox_type {
             pyre_interpreter::objspace::std::mapdict::UnboxType::Int => {
                 let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
                 let raw = walker_unbox_int(ctx, op_pc, value, int_type_addr)?;
@@ -5594,11 +5584,13 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     value,
                     walker_numeric_builtin_class(concrete_value),
                 )?;
-                (
-                    crate::helpers::jit_mapdict_unboxed_write_raw as *const (),
+                crate::state::trace_int_block_setitem_value(
+                    ctx.trace_ctx,
+                    slot,
+                    listindex_const,
                     raw,
-                    majit_ir::Type::Int,
-                )
+                );
+                unsafe { pyre_object::w_int_get_value(concrete_value) }
             }
             pyre_interpreter::objspace::std::mapdict::UnboxType::Float => {
                 let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
@@ -5615,48 +5607,27 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Float(live_f));
                 walker_guard_float_not_nan(ctx, op_pc, raw)?;
-                (
-                    crate::helpers::jit_mapdict_unboxed_write_f as *const (),
+                crate::state::trace_float_block_setitem_value(
+                    ctx.trace_ctx,
+                    slot,
+                    listindex_const,
                     raw,
-                    majit_ir::Type::Float,
-                )
+                );
+                live_f.to_bits() as i64
             }
         };
-        let helper = ctx.trace_ctx.const_int(helper_fn as usize as i64);
-
-        // `original_effect` is the generic setattr residual's
-        // `EF_RANDOM_EFFECTS`, whose six raw sets and six bitstrings are
-        // all `None` (`effectinfo.py:149-155`). Cloning it and lowering
-        // only `extraeffect` would build the "non-random + raw=None"
-        // shape `effectinfo.py:149-162` asserts against, and
-        // `check_write_descr_field` would then unwrap a `None`
-        // bitstring. Build the downgraded effect from scratch so the
-        // sets match the extraeffect: the raw slot write cannot raise,
-        // and it touches no field or array descr the heap cache holds
-        // (the storage is reached only through this helper pair, never
-        // through `getfield_gc` / `getarrayitem_gc`).
-        let mut effect = majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::CannotRaise,
-            majit_ir::OopSpecIndex::None,
-        );
-        effect.runtime_helper = majit_ir::RuntimeHelperKind::StoreAttr;
-        let descr = majit_metainterp::make_call_descr_with_effect(
-            &[
-                majit_ir::Type::Ref,
-                majit_ir::Type::Int,
-                majit_ir::Type::Int,
-                value_type,
-            ],
-            majit_ir::Type::Void,
-            effect,
-        );
-        // ABI order follows the write helpers: receiver and the two guarded green
-        // coordinates, then the raw symbolic value in its own bank.  No box is
-        // materialized for this write.
-        return Ok(Some(WalkerStoreAttrSpecialization::Residual(
-            descr,
-            vec![helper, obj, storageindex_const, listindex_const, raw],
-        )));
+        // The walk is the authoritative execution path, so apply the write
+        // now (`_direct_write`'s same-type arm, mapdict.py); the ops above
+        // reproduce it in compiled code.
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::write_unboxed_storage_raw(
+                concrete_obj,
+                storageindex,
+                listindex,
+                raw_live,
+            )
+        };
+        return Ok(Some(WalkerStoreAttrSpecialization::Direct));
     }
 
     if let Some((slot, kind, w_type, version_tag, _stored)) = unsafe {
@@ -9939,12 +9910,22 @@ fn walker_emit_range_length<Sym: WalkSym>(
     let Some(diff) = record_int_ovf_guarded(ctx, op_pc, OpCode::IntSubOvf, span, one)? else {
         return Ok(None);
     };
-    let quotient = ctx
-        .trace_ctx
-        .record_op(OpCode::IntFloorDiv, &[diff, positive_step]);
-    ctx.trace_ctx.set_opref_concrete(
-        quotient,
-        majit_ir::Value::Int((normalized_stop - normalized_start - 1) / normalized_step),
+    // `//` through the same `ll_int_py_div` pure call the `BINARY_OP` integer
+    // fold emits.  `OpCode::IntFloorDiv` would be the direct spelling, but the
+    // dynasm backend carries a regalloc arm for it and no assembler arm on
+    // either architecture, so it lowers to nothing and the destination keeps
+    // an operand: this quotient came back as its own dividend for a positive
+    // step and as the divisor for a negative one.  Both operands are
+    // non-negative here (`positive_step` is guarded above and `diff` follows
+    // the ordering guard), where floor and truncation agree, so the two
+    // spellings compute the same value.
+    let (quotient, _) = walker_emit_int_py_div_or_mod(
+        ctx,
+        diff,
+        positive_step,
+        normalized_stop - normalized_start - 1,
+        normalized_step,
+        true,
     );
     let Some(length) = record_int_ovf_guarded(ctx, op_pc, OpCode::IntAddOvf, quotient, one)? else {
         return Ok(None);
@@ -9996,7 +9977,6 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         UserIndex(IndexInlineCandidate),
     }
     let mut plans = Vec::with_capacity(r_args.len() - 2);
-    let mut has_user_index = false;
     for (&arg_op, concrete) in r_args[2..].iter().zip(&arg_concretes[2..]) {
         let ConcreteValue::Ref(arg_obj) = *concrete else {
             return Ok(None);
@@ -10007,7 +9987,6 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
                 concrete: arg_obj,
             });
         } else if let Some(candidate) = prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-            has_user_index = true;
             plans.push(BoundPlan::UserIndex(candidate));
         } else {
             return Ok(None);
@@ -10137,15 +10116,25 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
         [start, stop, step] => (*start, *stop, *step),
         _ => unreachable!("range arity gate admitted an invalid argument count"),
     };
-    // Trace-constant bounds retain the existing zero-op length.  A bound
-    // produced by the user `_index` call follows PyPy's traced
-    // `compute_range_length` body above, so its live value feeds all four
+    // Trace-constant bounds retain the existing zero-op length.  Every live
+    // bound -- a local read, a loop-carried box, the box a user `__index__`
+    // returned -- follows `compute_range_length`, so its value feeds all four
     // virtual fields instead of being paired with a stale record-time length.
-    // Other variable-bound sources keep the residual, preserving the existing
-    // admission boundary for recursive and alternating-range shapes.
+    // Where the bound came from is not a property the emitted arithmetic
+    // depends on: it reads the three raw ints and guards the step's sign and
+    // the start/stop ordering it recorded, which is what a live bound needs
+    // whether an `__index__` produced it or a `LOAD_FAST` did.
+    //
+    // A range whose emptiness alternates across iterations fails the ordering
+    // guard and takes a bridge, which is the cost this branch carries and the
+    // reason the shape used to be left to the residual.  The residual is not
+    // cheaper: `range(n)` for a local `n` records a `MayForce` call that
+    // allocates the range for real, forces the virtualizable, and re-reads the
+    // four fields through class guards -- 10006 instructions an iteration in a
+    // hot loop, against 24 for the same loop under pypy.
     let length = if start.is_constant() && stop.is_constant() && step.is_constant() {
         ctx.trace_ctx.const_int(concrete_length)
-    } else if has_user_index {
+    } else {
         let Some(length) = walker_emit_range_length(
             ctx,
             op.pc,
@@ -10160,8 +10149,6 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
             return walker_range_decline(ctx, pre_emit_pos);
         };
         length
-    } else {
-        return walker_range_decline(ctx, pre_emit_pos);
     };
 
     let new = ctx.trace_ctx.record_op_with_descr(

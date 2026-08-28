@@ -1,27 +1,30 @@
 # Hot read of an unboxed FLOAT attribute. mapdict keeps a float-valued
-# attribute in raw storage, so `self.x` in a loop leaves exactly one residual:
-# `jit_mapdict_unboxed_read_f`, whose recorded descr is `[Ref, Int, Int] ->
-# Float`. On wasm that is a MIXED signature -- `(i64, i64, i64) -> f64` -- and
-# the backend's arity-keyed `call_indirect` family only covers uniform word
-# shapes, so before the callee was vouched every iteration crossed out to the
-# host `jit_call` trampoline: 398958 crossings for 400000 iterations, 100% of
-# them this one callee.
+# attribute in raw storage, and `self.x` in a loop now reads it as the three
+# loads it is -- the instance's storage block, the slot holding the
+# attribute's raw list, and the item -- so the loop leaves NO residual. Its
+# optimized body is 14 ops against the 25 (six of them calls) it carried while
+# the read went through `jit_mapdict_unboxed_read_f`.
 #
-# The int-valued twin below is the control that makes the attribution
-# unambiguous: it is the same loop over the same class shape, its residual is
-# the `(i64, i64, i64) -> i64` sibling, and it crosses ZERO times because a
-# uniform word signature already lowers in-module. Native dynasm shows no
-# float-vs-int gap at all, so anything left here is the crossing and not the
-# read.
+# That helper is why this file exists, and the reason is now historical. Its
+# recorded descr was `[Ref, Int, Int] -> Float`, which on wasm is a MIXED
+# signature -- `(i64, i64, i64) -> f64`. The backend's arity-keyed
+# `call_indirect` family covers only uniform word shapes, so before the callee
+# was vouched in `eval.rs`'s faithful-residual list every iteration crossed out
+# to the host `jit_call` trampoline: 398958 crossings for 400000 iterations,
+# 100% of them this one callee. The int-valued twin below was the control that
+# made the attribution unambiguous -- same loop, same class shape, a
+# `(i64, i64, i64) -> i64` sibling that a uniform word signature already lowers
+# in-module, and ZERO crossings.
+#
+# Neither loop reaches a residual any more, so NEITHER gates that vouch. The
+# entries stay named in `eval.rs` for as long as the helpers do; what this file
+# still measures is the read and store themselves against pypy.
 #
 # No `max-wasm-ratio` header: that directive is an ALLOWANCE carved out of
 # `WASM_MAX_DYNASM_RATIO`, and this fixture wants the default rather than an
-# exemption from it. The default is what holds the change in place -- the read
-# measures 1.2x dynasm now, and losing the vouch puts a host trampoline back on
-# every iteration at roughly 168 ns each, which is 34x the int-attribute twin
-# and far past 4.0. The fixture is sized so dynasm's execution-only time clears
-# FLOOR_GATE_MIN_BASELINE_S; below that the gate declines to judge and the
-# fixture would gate nothing.
+# exemption from it. The fixture is sized so dynasm's execution-only time
+# clears FLOOR_GATE_MIN_BASELINE_S; below that the gate declines to judge and
+# the fixture would gate nothing.
 #
 # The remaining legs pin the shapes the unboxed read must NOT be asked to
 # answer, each written so a wrong answer is a wrong value rather than a silent
