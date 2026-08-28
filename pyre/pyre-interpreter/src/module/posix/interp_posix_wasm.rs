@@ -192,6 +192,14 @@ fn make_stat_result(mode: i64, size: i64) -> PyObjectRef {
     crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
 }
 
+/// `os.terminal_size` structseq — `(columns, lines)`.
+fn terminal_size_seq_type() -> PyObjectRef {
+    static TERMINAL_SIZE_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TERMINAL_SIZE_SEQ_TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]) as usize
+    }) as PyObjectRef
+}
+
 /// `posix.listdir(path=None)` — the entry names the seam reports, in its
 /// order.
 ///
@@ -925,6 +933,11 @@ pub fn register_module(ns: PyObjectRef) {
     // no call here takes a directory or a descriptor argument.
     crate::module_ns_store(ns, "_have_functions", pyre_object::w_list_new(vec![]));
     crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
+    // `posixmodule_exec` publishes this type on every platform, and only the
+    // `get_terminal_size` that fills one is guarded: `shutil.get_terminal_size`
+    // catches the AttributeError from the missing call and builds its fallback
+    // out of the type, so a target with neither raises from the handler.
+    crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
     // `follow_symlinks` and `dir_fd` are keyword-only, so neither entry point
     // can take the fixed-arity carrier that rejects keywords.
     crate::module_ns_store(
@@ -966,6 +979,24 @@ pub fn register_module(ns: PyObjectRef) {
         ns,
         "unsetenv",
         crate::make_builtin_function_with_arity("unsetenv", unsetenv, 1),
+    );
+    // One wasm instance, one process, and it is not one the embedder named.
+    crate::module_ns_store(
+        ns,
+        "getpid",
+        crate::make_builtin_function_with_arity("getpid", |_args| Ok(pyre_object::w_int_new(1)), 0),
+    );
+    // No terminal is reachable through the seam, so no descriptor is one.  The
+    // answer is False rather than an error for the same reason it is on every
+    // other platform: `isatty` reports, it does not validate.
+    crate::module_ns_store(
+        ns,
+        "isatty",
+        crate::make_builtin_function_with_arity(
+            "isatty",
+            |_args| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
     );
     // `os.walk` catches `OSError` from the iterator and `shutil` calls
     // `isinstance(entry, os.DirEntry)`, so both the type and the entries it
