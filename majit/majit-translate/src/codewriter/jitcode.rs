@@ -511,11 +511,24 @@ impl JitCode {
         }
     }
 
-    /// Set `jitdriver_sd` once. Panics on second call.
+    /// Set `jitdriver_sd` once. As with [`JitCode::set_index`], re-setting the
+    /// same relationship is a no-op: the build process records it and the run
+    /// process legitimately re-establishes that identical relationship.
+    /// Panics when a second call names a different driver.
     pub fn set_jitdriver_sd(&self, idx: usize) {
-        self.jitdriver_sd
-            .set(idx)
-            .expect("JitCode jitdriver_sd already set");
+        match self.jitdriver_sd.set(idx) {
+            Ok(()) => {}
+            Err(_) => {
+                let existing = *self
+                    .jitdriver_sd
+                    .get()
+                    .expect("OnceLock::set returned Err but get() is empty");
+                assert_eq!(
+                    existing, idx,
+                    "JitCode jitdriver_sd already set to {existing}, cannot reassign to {idx}",
+                );
+            }
+        }
     }
 
     /// Replace `jitdriver_sd` (or clear it).  Requires `&mut self` so it
@@ -2465,6 +2478,22 @@ mod tests {
             all_fielddescrs: Vec::new(),
             is_gc_managed: true,
         }
+    }
+
+    #[test]
+    fn jitdriver_sd_reestablishes_only_the_same_relationship() {
+        let jitcode = JitCode::new("portal");
+        jitcode.set_jitdriver_sd(7);
+        jitcode.set_jitdriver_sd(7);
+        assert_eq!(jitcode.jitdriver_sd(), Some(7));
+
+        let different =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jitcode.set_jitdriver_sd(8)));
+        assert!(
+            different.is_err(),
+            "a portal cannot move to a different driver"
+        );
+        assert_eq!(jitcode.jitdriver_sd(), Some(7));
     }
 
     #[test]

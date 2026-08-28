@@ -241,7 +241,7 @@ pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_
 /// (`blackhole.py:1432-1483` reads the descr straight out of the constant
 /// pool).  Exported so the descr-identity census can compare it against the
 /// pool-side resolution without re-deriving a second copy of the logic.
-pub use pyjitpl::dispatch::field_descr_ref_from_bh;
+pub use pyjitpl::dispatch::{field_descr_ref_from_bh, symbolic_residual_trace_aborts};
 pub use pyjitpl::{
     BackEdgeAction, BridgeCompileResult, BridgeRetraceResult, ClosureRuntime,
     ClosureRuntimeWithResolver, CompileOutcome, CompiledExitLayout, CompiledTerminalExitLayout,

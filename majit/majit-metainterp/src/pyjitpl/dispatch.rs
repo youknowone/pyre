@@ -1127,27 +1127,42 @@ pub struct ClosureRuntime<FLabel> {
     label_at: FLabel,
 }
 
-/// Refuse a residual call whose target is still a `symbolic_fnaddr_for_path`
-/// placeholder.
+/// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
+/// placeholder, once per distinct target.
 ///
 /// A placeholder means the host never bound that callee's path, so the address
 /// is a hash of the path rather than code. Jumping to it faults somewhere with
 /// no trace of which callee was missing, and answering 0 (the null-target arm
 /// below) would quietly substitute a wrong result. `blackhole.rs` already
 /// declines the same shape on its own residual-call handlers; this is the
-/// tracing side of that check.
-fn reject_symbolic_residual_call_target(func: usize, arg_classes: &str) -> ! {
-    // Aborts rather than panics: the unwind would cross the metainterp frames the
-    // trace is being recorded through, and the report is already complete here.
-    // A symbolic target is a host configuration error, not a runtime condition.
-    eprintln!(
-        "residual call target {func:#x} is a symbolic path hash, not a code address \
-         (arg classes {arg_classes:?}). The host did not bind this callee's path — add \
-         it to the fnaddr bindings passed to \
-         `EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`, and look the hash up \
-         in the host's symbolic-path table to see which path it names."
-    );
-    std::process::abort();
+/// tracing side of that check. Every caller returns [`TraceAction::Abort`]
+/// before making the call, so discarding the recording needs no rollback.
+static SYMBOLIC_RESIDUAL_TRACE_ABORTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of tracing instructions precisely declined because their concrete
+/// residual-call target was still a symbolic path hash.
+pub fn symbolic_residual_trace_aborts() -> u64 {
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn report_symbolic_residual_call_target(func: usize, arg_classes: &str) {
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static REPORTED: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<usize>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let first_report = REPORTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(func);
+    if first_report {
+        eprintln!(
+            "residual call target {func:#x} is a symbolic path hash, not a code address \
+             (arg classes {arg_classes:?}). The host did not bind this callee's path — add \
+             it to the fnaddr bindings passed to \
+             `EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`, and look the hash up \
+             in the host's symbolic-path table to see which path it names."
+        );
+    }
 }
 
 impl<FLabel> ClosureRuntime<FLabel> {
@@ -7284,10 +7299,11 @@ where
                 if effectinfo.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace {
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -7382,10 +7398,11 @@ where
                     //    `extern "C" fn(...) -> i64` and reads garbage from
                     //    rax/x0).
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -7604,10 +7621,11 @@ where
                     // int destination register, and abort on exception.
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -7681,10 +7699,11 @@ where
                     // return) — RPython `executor.execute_varargs` →
                     // `cpu.bh_call_i`.
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     let concrete = if concrete_ptr.is_null() {
                         0
@@ -7899,10 +7918,11 @@ where
                     // branch for the full citation.
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -7972,10 +7992,11 @@ where
                         None
                     };
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     let concrete = if concrete_ptr.is_null() {
                         0
@@ -8152,10 +8173,11 @@ where
                     // branch for the full citation.
                     self.clear_exception();
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     if !concrete_ptr.is_null() {
                         unsafe {
@@ -8214,10 +8236,11 @@ where
                         None
                     };
                     if majit_translate::codewriter::call::is_symbolic_fnaddr(concrete_ptr as i64) {
-                        reject_symbolic_residual_call_target(
+                        report_symbolic_residual_call_target(
                             concrete_ptr as usize,
                             &calldescr.arg_classes,
                         );
+                        return TraceAction::Abort;
                     }
                     let concrete = if concrete_ptr.is_null() {
                         0.0f64
