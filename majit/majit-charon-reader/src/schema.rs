@@ -40,7 +40,7 @@ pub struct Translated {
     /// trait-associated-type resolution.
     ///
     /// Every other top-level surface Charon emits (`ordered_decls`,
-    /// `files`, `options`, `target_information`, `item_names`,
+    /// `options`, `target_information`, `item_names`,
     /// `assoc_item_names`, `short_names`, …) is intentionally not
     /// modelled: serde skips unknown fields without allocating, which
     /// both keeps the loader resilient to Charon's release-to-release
@@ -49,4 +49,26 @@ pub struct Translated {
     /// the entire `translated` object into an in-memory `Content` tree).
     #[serde(default)]
     pub trait_impls: Vec<Value>,
+    /// Source files, indexed by the `file_id` every
+    /// [`crate::ullbc::SpanData`] carries.  Without it a span names a
+    /// line in a file nothing can name.
+    ///
+    /// Each entry also carries the file's entire `contents`; that field
+    /// is deliberately unmodelled, so serde walks past it without
+    /// allocating.  The array was already being walked as an unknown
+    /// field, so what this adds is the `id` and `name` of each entry and
+    /// nothing else.
+    #[serde(default)]
+    pub files: Vec<SourceFile>,
+}
+
+/// One row of [`Translated::files`].
+#[derive(Debug, Deserialize)]
+pub struct SourceFile {
+    pub id: u64,
+    /// Charon's `FileName`, a single-variant object (`{"Local": path}`,
+    /// `{"Virtual": path}`, …).  Held raw and projected by
+    /// [`crate::Llbc::file_path`] so a variant this crate has never seen
+    /// loads rather than failing the whole artefact.
+    pub name: Value,
 }

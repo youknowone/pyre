@@ -242,6 +242,28 @@ impl Llbc {
             .as_ref()
     }
 
+    /// The source path a [`crate::ullbc::SpanData`]'s `file_id` names.
+    ///
+    /// Charon writes the table in id order, so the id is tried as an
+    /// index first; the scan behind it is what keeps a table that ever
+    /// stops being dense from silently returning a neighbouring file's
+    /// path.
+    pub fn file_path(&self, file_id: u64) -> Option<&str> {
+        let files = &self.file.translated.files;
+        let row = match files.get(file_id as usize) {
+            Some(row) if row.id == file_id => row,
+            _ => files.iter().find(|row| row.id == file_id)?,
+        };
+        // `FileName` is a single-variant object; the variant names the
+        // provenance and the payload is the path either way.
+        row.name
+            .as_object()?
+            .values()
+            .next()?
+            .as_str()
+            .or_else(|| row.name.as_str())
+    }
+
     /// Look up a `TraitDecl` by its Charon `def_id`.
     pub fn trait_by_id(&self, def_id: u64) -> Option<&TraitDecl> {
         self.file
@@ -407,5 +429,58 @@ impl std::error::Error for SchemaError {
             SchemaError::Parse(e) => Some(e),
             SchemaError::Decode(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn llbc(files: &str) -> Llbc {
+        let doc = format!(
+            r#"{{"charon_version":"t","has_errors":false,
+                "translated":{{"crate_name":"c","fun_decls":[],"files":{files}}}}}"#
+        );
+        Llbc::from_slice(doc.as_bytes()).expect("fixture parses")
+    }
+
+    #[test]
+    fn a_file_id_names_the_source_path_its_span_was_written_against() {
+        let l = llbc(
+            r#"[{"id":0,"name":{"Local":"a/lib.rs"},"contents":"fn a() {}"},
+                         {"id":1,"name":{"Local":"a/mod.rs"},"contents":"fn b() {}"}]"#,
+        );
+        assert_eq!(l.file_path(0), Some("a/lib.rs"));
+        assert_eq!(l.file_path(1), Some("a/mod.rs"));
+        assert_eq!(l.file_path(2), None);
+    }
+
+    #[test]
+    fn a_table_that_is_not_dense_is_searched_rather_than_indexed() {
+        // Position 0 holds id 7, so indexing by id would answer with a
+        // neighbour's path -- the one wrong answer worth a scan.
+        let l = llbc(
+            r#"[{"id":7,"name":{"Local":"seven.rs"}},
+                         {"id":3,"name":{"Local":"three.rs"}}]"#,
+        );
+        assert_eq!(l.file_path(7), Some("seven.rs"));
+        assert_eq!(l.file_path(3), Some("three.rs"));
+        assert_eq!(l.file_path(0), None);
+    }
+
+    #[test]
+    fn an_unknown_filename_variant_still_yields_its_path() {
+        // Charon may rename the provenance variant; the payload is the
+        // path whatever the variant is called.
+        let l = llbc(r#"[{"id":0,"name":{"Virtual":"v.rs"}}]"#);
+        assert_eq!(l.file_path(0), Some("v.rs"));
+    }
+
+    #[test]
+    fn an_artefact_without_a_files_table_answers_nothing_rather_than_failing() {
+        let doc = r#"{"charon_version":"t","has_errors":false,
+                      "translated":{"crate_name":"c","fun_decls":[]}}"#;
+        let l = Llbc::from_slice(doc.as_bytes()).expect("loads without a files table");
+        assert_eq!(l.file_path(0), None);
     }
 }
