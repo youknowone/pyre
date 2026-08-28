@@ -1686,6 +1686,13 @@ unsafe impl Sync for JitCellToken {}
 /// a foreign thread's slot. That is what the guard's own thread-pinning
 /// enforces, and it is the rule for the enum as a whole — the erased variant
 /// states no weaker one, so its payload carries no `Send` bound either.
+///
+/// **A [`DeadFrame::JitFrame`] is heap-confined as well**: it must not outlive
+/// the collector its frame was allocated from. The deadframe IS the jitframe,
+/// so every accessor dereferences that memory and the drop writes `jf_gcmap`
+/// back into it; once the collector is gone the address names a freed arena.
+/// The rule is the ordering and not a liveness test on the drop, because a test
+/// there would only move the fault to the first read.
 pub enum DeadFrame {
     /// `llmodel.py:328` — the deadframe IS the jitframe the run returned,
     /// held in a GC root slot because the collector may move it.

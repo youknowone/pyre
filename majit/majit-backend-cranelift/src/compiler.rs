@@ -25855,8 +25855,17 @@ mod tests {
         held.clear();
     }
 
+    /// The deadframe goes before the backend, and dropping it there is what
+    /// nulls the frame's `jf_gcmap`.
+    ///
+    /// The order is the contract, not a preference: the deadframe IS the
+    /// jitframe, so this write — like every accessor on it — goes into the
+    /// collector's heap, and a deadframe dropped after the backend that owns
+    /// that heap writes into a freed arena. The test used to assert the
+    /// opposite order was safe, from when a deadframe copied its values out and
+    /// held no address into the heap at all.
     #[test]
-    fn test_deadframe_drop_after_backend_drop_is_safe() {
+    fn test_deadframe_drop_nulls_the_frames_gcmap_before_the_backend_goes() {
         let mut gc = MiniMarkGC::with_config(GcConfig {
             nursery_size: 160,
             large_object_threshold: 1024,
@@ -25881,8 +25890,19 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
-        drop(backend);
+        let jf = frame
+            .as_jitframe()
+            .expect("cranelift deadframes are JitFrameDeadFrame")
+            .jf_gcref();
         drop(frame);
+        // Nothing allocates between the release and this read, so the frame is
+        // still where the root last named it.
+        let gcmap = unsafe { *((jf.0 + JF_GCMAP_OFS as usize) as *const usize) };
+        assert_eq!(
+            gcmap, 0,
+            "a released deadframe must leave no map for a later collection to custom-trace it through"
+        );
+        drop(backend);
     }
 
     #[test]

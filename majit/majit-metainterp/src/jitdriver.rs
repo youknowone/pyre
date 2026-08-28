@@ -1681,7 +1681,13 @@ pub struct JitDriver<S: JitState> {
     /// entry finds this slot empty and starts from fresh ones. Nesting
     /// therefore costs what it costs today and never aliases; only the
     /// outermost entry's buffers survive to be reused.
-    entry_scratch: EntryScratch,
+    ///
+    /// Held behind a pointer because the hand-out and the hand-back are moves:
+    /// the struct is five `Vec` headers, so an inline slot moved a hundred and
+    /// twenty bytes out of this field and the same back into it on every entry,
+    /// for buffers whose contents never move at all. `None` is the window
+    /// between the two, which is what a nested entry finds.
+    entry_scratch: Option<Box<EntryScratch>>,
 }
 
 /// Per-entry scratch owned by [`JitDriver`]; see [`JitDriver::entry_scratch`].
@@ -1869,7 +1875,7 @@ impl<S: JitState> JitDriver<S> {
             portal_runner: None,
             portal_jd_index: None,
             state_field_fvc: None,
-            entry_scratch: EntryScratch::default(),
+            entry_scratch: Some(Box::default()),
             #[expect(
                 clippy::arc_with_non_send_sync,
                 reason = "Arc preserves shared JitCode/descriptor identity across compiled artifacts; the non-Send translator payload is confined to the single-threaded build phase and is never transferred between threads"
@@ -5781,7 +5787,10 @@ impl<S: JitState> JitDriver<S> {
                 .exit_layout
                 .take()
                 .expect("a guard exit carries its exit layout");
-            let raw_values = result.values.clone();
+            // Projected here rather than carried on the result: only this arm
+            // and the detailed run below read machine words, and building the
+            // list on every entry charged the finish exit for both.
+            let raw_values = crate::compile::raw_exit_values(&result.typed_values);
             let descr_arc = std::sync::Arc::clone(&result.descr_arc);
             let guard_value_operand = result.guard_value_operand;
             // blackhole.py `_prepare_resume_from_failure(deadframe)`:
@@ -6617,8 +6626,12 @@ impl<S: JitState> JitDriver<S> {
     /// The buffers arrive with their previous contents dropped and their
     /// capacity kept. `vable_arrays` keeps its outer elements so the inner
     /// buffers survive too — see `JitState::export_virtualizable_boxes_into`.
-    fn take_entry_scratch(&mut self) -> EntryScratch {
-        let mut scratch = std::mem::take(&mut self.entry_scratch);
+    ///
+    /// A nested entry finds the slot empty and builds its own set, which is the
+    /// `unwrap_or_default` arm; the allocation it costs is the price of nesting
+    /// and not of the ordinary entry, which finds the box the last one returned.
+    fn take_entry_scratch(&mut self) -> Box<EntryScratch> {
+        let mut scratch = self.entry_scratch.take().unwrap_or_default();
         scratch.live_values.clear();
         scratch.raw.clear();
         scratch.types.clear();
@@ -6630,8 +6643,8 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Return the buffers [`Self::take_entry_scratch`] handed out.
-    fn entry_scratch_out(&mut self, scratch: EntryScratch) {
-        self.entry_scratch = scratch;
+    fn entry_scratch_out(&mut self, scratch: Box<EntryScratch>) {
+        self.entry_scratch = Some(scratch);
     }
 
     /// The driver's static data, resolved once and then shared.
@@ -7369,10 +7382,11 @@ impl<S: JitState> JitDriver<S> {
         // The pointer travels; the layout behind it is opened past the finish
         // arm below, which is the one that carries none.
         let exit_layout = result.exit_layout.take();
+        // Projected first: the take below is what leaves `typed_values` empty.
+        let raw_values = crate::compile::raw_exit_values(&result.typed_values).into_vec();
         // Taken, not copied: every field this arm needs is read out here and
-        // `result` is dropped just below, so neither buffer has a reader left.
+        // `result` is dropped just below, so the buffer has no reader left.
         let typed_values = std::mem::take(&mut result.typed_values).into_vec();
-        let raw_values = std::mem::take(&mut result.values).into_vec();
         let guard_value_operand = result.guard_value_operand;
         // llmodel.py grab_exc_value: the pending exception captured at
         // guard failure travels with the GuardFailure outcome so the
@@ -7593,6 +7607,38 @@ impl<S: JitState> JitDriver<S> {
     #[inline]
     pub fn has_runnable_compiled_loop(&self, green_key: u64) -> bool {
         self.runnable_procedure_token(green_key).is_some()
+    }
+
+    /// [`Self::resolve_cell_key`] and [`Self::runnable_procedure_token`] from
+    /// one walk of the cell chain.
+    ///
+    /// The two together are what a door holding a raw bucket hash asks: which
+    /// cell do my greens own, and does that cell have code to enter. Asked
+    /// separately they walk the chain twice for the same cell — see
+    /// [`MetaInterp::resolved_entry_procedure_token`]. The answer is identical
+    /// to resolving first and then asking; this only stops paying for the
+    /// second walk.
+    ///
+    /// The resolved key travels back with the token because a caller that goes
+    /// on to run needs it, and because the `compiled_loops` half of the
+    /// predicate is keyed by it.
+    ///
+    /// The `compiled_loops` half is asked FIRST, as the gate the token read
+    /// sits behind. Both conjuncts are pure reads of the same key, so the order
+    /// does not change the answer, but their costs are not alike: the frontend
+    /// half is one hash probe, and the token read is a `Weak::upgrade` and the
+    /// `Arc` drop that answers it, one atomic each. A key with no compiled
+    /// entry — which is every key a door declines on — now stops at the probe.
+    #[inline]
+    pub fn resolved_runnable_procedure_token(
+        &self,
+        green_key_hash: u64,
+        make_green_key: impl FnOnce() -> GreenKey,
+    ) -> (u64, Option<std::sync::Arc<majit_backend::JitCellToken>>) {
+        self.meta
+            .resolved_entry_procedure_token(green_key_hash, make_green_key, |cell_key| {
+                self.meta.get_compiled_meta(cell_key).is_some()
+            })
     }
 
     /// The token [`Self::has_runnable_compiled_loop`] says yes about, handed
@@ -9967,7 +10013,7 @@ mod tests {
             .meta
             .run_compiled_detailed(green_key, &[0])
             .expect("guard should fail");
-        let fail_values = failure.values.clone();
+        let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
         let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
         drop(failure);
 

@@ -2904,6 +2904,74 @@ impl WarmEnterState {
         }
     }
 
+    /// [`Self::resolve_cell_key`] and [`Self::get_procedure_token`] answered
+    /// from ONE walk of the bucket.
+    ///
+    /// A door that resolves a hash and then reads the resolved key's token
+    /// walked the same chain twice for the same cell: `cell_keys_at` finds the
+    /// cell and returns only its key, and `cell_by_key` then walks back to it.
+    /// The single-candidate case — the one a door is in whenever the bucket
+    /// holds exactly this key's cell — has the cell in hand at the moment the
+    /// count reaches one, so the token is read there.
+    ///
+    /// The other two cases are the second walk, unchanged. On a miss the key a
+    /// later install would take is `hash`, but `hash` may itself be a minted
+    /// key filed under a different bucket, so the token read has to go through
+    /// [`Self::get_procedure_token`], which maps it. On an ambiguous bucket the
+    /// greens are what settle it, exactly as [`Self::resolve_cell_key`] says.
+    /// `gate` runs on the resolved key, BEFORE the token is read.
+    ///
+    /// Reading a token is a `Weak::upgrade` and the `Arc` drop that answers it
+    /// — one atomic each. A caller whose real question is a conjunction of that
+    /// read and something cheaper about the same key wants the cheap half
+    /// first, and cannot have it while the resolve and the read are one step:
+    /// the cheap half needs the resolved key, which only the walk produces.
+    ///
+    /// The resolve is unaffected — the key comes back whatever `gate` answers,
+    /// and a refused gate reports no token, which is what the conjunction was
+    /// going to conclude anyway. A caller with no second conjunct passes a gate
+    /// that always accepts.
+    pub fn resolved_cell_procedure_token(
+        &self,
+        hash: u64,
+        make_key: impl FnOnce() -> GreenKey,
+        gate: impl FnOnce(u64) -> bool,
+    ) -> (u64, Option<Arc<JitCellToken>>) {
+        let mut count = 0usize;
+        let mut found: Option<(&BaseJitCell, u64)> = None;
+        let mut cell = self.lookup_chain(hash);
+        while let Some(c) = cell {
+            if let Some(cell_key) = c.cell_key
+                && self.bucket_of(cell_key) == hash
+            {
+                count += 1;
+                if found.is_none() {
+                    found = Some((c, cell_key));
+                }
+            }
+            cell = c.next.as_deref();
+        }
+        match (count, found) {
+            (1, Some((cell, cell_key))) => (
+                cell_key,
+                gate(cell_key).then(|| cell.get_procedure_token()).flatten(),
+            ),
+            (0, _) => (
+                hash,
+                gate(hash).then(|| self.get_procedure_token(hash)).flatten(),
+            ),
+            _ => {
+                let cell_key = self.cell_key_for(&make_key()).unwrap_or(hash);
+                (
+                    cell_key,
+                    gate(cell_key)
+                        .then(|| self.get_procedure_token(cell_key))
+                        .flatten(),
+                )
+            }
+        }
+    }
+
     /// The key of the one cell `hash` owns, if it owns exactly one.
     ///
     /// The entry path's allocation-free half. One candidate means the walk
