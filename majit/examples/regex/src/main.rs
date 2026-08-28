@@ -26,10 +26,16 @@
 //! could not measure — the post's own 2010 figures — is printed under a heading
 //! that says so, and no ratio above it is computed from any of it.
 
+#[cfg(feature = "alloc-census")]
+pub mod alloc_census;
 pub mod interp;
 pub mod jit_interp;
 pub mod regex;
 pub mod shortcircuit;
+
+#[cfg(feature = "alloc-census")]
+#[global_allocator]
+static ALLOC: alloc_census::Counting = alloc_census::Counting;
 
 use regex::{NodeRec, bench_regex, bench_regex_left, count, depth, lower, nonmatching, vectors};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -126,6 +132,11 @@ struct Row {
     /// Loops the JIT compiled across the timed runs. 0 for a row that never
     /// enters the JIT.
     compiles: usize,
+    /// What the timed runs allocated. Deterministic where `rates` is not, so
+    /// this is the half of the row that grades a per-deopt cost change on a
+    /// machine under load. See [`alloc_census`].
+    #[cfg(feature = "alloc-census")]
+    alloc: alloc_census::Census,
 }
 
 impl Row {
@@ -178,6 +189,8 @@ fn bench(
         "{name}: the benchmark input is supposed NOT to match"
     );
     let before = counter.map_or(0, |c| c.load(Ordering::Relaxed));
+    #[cfg(feature = "alloc-census")]
+    let alloc_before = alloc_census::read();
     let mut rates = Vec::with_capacity(REPEATS);
     for _ in 0..REPEATS {
         let t0 = Instant::now();
@@ -186,12 +199,16 @@ fn bench(
         assert!(!hit, "{name}: the benchmark input is supposed NOT to match");
         rates.push(rate(s.len(), secs));
     }
+    #[cfg(feature = "alloc-census")]
+    let alloc = alloc_before.since(alloc_census::read());
     let compiles = counter.map_or(0, |c| c.load(Ordering::Relaxed) - before);
     rates.sort_by(f64::total_cmp);
     Row {
         name,
         rates,
         compiles,
+        #[cfg(feature = "alloc-census")]
+        alloc,
     }
 }
 
@@ -314,6 +331,12 @@ fn main() {
                 commas(row.min()),
                 commas(row.max()),
                 compiled,
+            );
+            #[cfg(feature = "alloc-census")]
+            println!(
+                "    {:<32}  {}",
+                "",
+                row.alloc.per_char(len, REPEATS)
             );
         }
         sweep.push((len, rows));

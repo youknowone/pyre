@@ -319,6 +319,67 @@ variance. The median is the row above; the low round is what a contended
 compile does to it. Every majit portal in the tree builds its driver per call,
 so this is a majit convention rather than something this example chose.
 
+### Grading a change when the machine will not hold still
+
+The tables above were taken on a quiet machine. On a busy one this row cannot
+be timed at all: an interleaved A/B of two binaries built from the same tree
+minutes apart read a **4.9x spread between rounds on the same arm**, which
+swallows any change worth making. Repeats do not help — the noise is in the
+machine, not in the sample.
+
+`--features alloc-census` swaps in a counting `#[global_allocator]` and prints,
+under every timed row, what that row allocated per input character. That number
+does not depend on the machine: the same binary over the same input allocates
+the same bytes every time. It is also the right unit for this particular gap,
+because the costs in question **are** allocation — a jitframe `alloc_zeroed`ed
+and freed per guard failure, blackhole frames boxed per resume, position tables
+sized by a monotonic counter.
+
+```sh
+cargo run -p regex --release --no-default-features --features dynasm,alloc-census
+```
+
+It is off by default because a `#[global_allocator]` is process-wide, so its
+counters would otherwise sit inside the timed rows this file reports.
+
+What it says about the three rows, at 1,048,576 characters:
+
+| per input character | allocs | bytes | of which zeroed |
+|---|---:|---:|---:|
+| Rust interp, no JIT | 0.0 | 0 | 0 |
+| majit `&`/`\|` — `jit_interp.rs` | 0.0 | 4 | 0.1 |
+| majit `and`/`or` — `shortcircuit.rs` | **54.0** | **6,948** | 633.8 |
+
+The masking row allocates four bytes per character and the plain matcher none.
+The branching row calls `malloc` **fifty-four times per input character**. That
+is the 4.1x against RPython's own `--opt=jit`, in a unit that can be measured
+while the machine is doing something else — every character deopts, and majit's
+deopt round trip is built out of allocations that upstream takes from a nursery
+bump pointer.
+
+#### The first one it caught
+
+`OpTypeIndex`'s two position arrays were `vec![NO_POS; max_raw + 1]` indexed by
+the bare `OpRef` raw. Raws come from a monotonic counter and a bridge mints its
+own at `[parent_high_water..)`, so the array was sized by everything the trace
+family had compiled so far. Instrumented at the 500th build: 187 entries
+spanning 282 raws, in 17,332 slots.
+
+The allocation census shows it as a per-character cost that **grows with the
+input**, which a per-character cost cannot legitimately do:
+
+| `and`/`or` row, bytes per character | 4,096 | 65,536 | 1,048,576 |
+|---|---:|---:|---:|
+| before | 11,687 | 9,750 | **19,559** |
+| after | 11,604 | 8,661 | **6,948** |
+
+`allocs/char` and `frees/char` are unchanged to one decimal place (54.0 and
+51.9 at 1M on both) — the same vectors are still allocated, they are simply
+sized by the trace instead of by the family. Before the fix the row's
+per-character allocation doubles between 65,536 and 1,048,576 characters; after
+it, it falls, which is what a per-character cost does. Wall clock could not
+resolve the change on the machine of the day; this did.
+
 ### The majit-only ratio
 
 The post's headline ratio is also measured on the majit side alone, in one
