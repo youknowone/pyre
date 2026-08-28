@@ -1409,6 +1409,91 @@ impl<T: ?Sized> CallResultWord for *mut T {
     }
 }
 
+/// Narrows a machine word back to the parameter type a registered call target
+/// declares.
+///
+/// The inverse of [`CallResultWord`], and owed for the same reason at the other
+/// end of the call. A compiled call passes every non-float argument as the word
+/// a trace register holds, so the shim standing in for the target has to be
+/// spelled in words to be the thing that call names. Where a pointer is as wide
+/// as a word that is invisible: `usize` and `&T` arrive in a whole register
+/// already, and a shim spelled with them is the same function. Where a pointer
+/// is narrower — a 32-bit address in a 64-bit register — it is not, and the
+/// mismatch is a type error at the call rather than a slow path, so the shim
+/// takes words and narrows here.
+///
+/// A parameter type that is not one of the types below has to implement this
+/// before the target can be registered. A struct passed by value cannot: it is
+/// not a word, and no narrowing recovers one.
+pub trait CallArgWord {
+    /// Reconstitute this parameter from the word a compiled call passes for it.
+    ///
+    /// # Safety
+    ///
+    /// `word` must be what the call holds for this parameter. For a reference
+    /// or a raw pointer that means an address of the right type which stays
+    /// live for the call, exactly as the caller of the target itself owes.
+    unsafe fn from_call_word(word: i64) -> Self;
+}
+
+macro_rules! impl_call_arg_word_int {
+    ($($ty:ty),*) => {
+        $(
+            impl CallArgWord for $ty {
+                #[inline(always)]
+                unsafe fn from_call_word(word: i64) -> Self {
+                    word as $ty
+                }
+            }
+        )*
+    };
+}
+
+// `as $ty` per type, the exact inverse of the widening `into_call_word` did:
+// a narrower type keeps the low bits the widening preserved, and the
+// word-width types are the identity.
+impl_call_arg_word_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
+
+impl CallArgWord for bool {
+    #[inline(always)]
+    unsafe fn from_call_word(word: i64) -> Self {
+        // `into_call_word` produces 0 or 1, but a target may be reached with a
+        // word another producer widened, so read the whole word rather than
+        // its low bit.
+        word != 0
+    }
+}
+
+// Only sized pointees: a word carries one address, and a fat pointer's
+// metadata is not in it.
+impl<T> CallArgWord for *const T {
+    #[inline(always)]
+    unsafe fn from_call_word(word: i64) -> Self {
+        word as usize as *const T
+    }
+}
+
+impl<T> CallArgWord for *mut T {
+    #[inline(always)]
+    unsafe fn from_call_word(word: i64) -> Self {
+        word as usize as *mut T
+    }
+}
+
+impl<T> CallArgWord for &T {
+    #[inline(always)]
+    unsafe fn from_call_word(word: i64) -> Self {
+        unsafe { &*(word as usize as *const T) }
+    }
+}
+
+impl<T> CallArgWord for &mut T {
+    #[inline(always)]
+    unsafe fn from_call_word(word: i64) -> Self {
+        unsafe { &mut *(word as usize as *mut T) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

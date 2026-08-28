@@ -585,7 +585,7 @@ impl<'c> Lowerer<'c> {
                 } else {
                     __concrete_target
                 };
-                let __fn_idx = __builder.add_call_target_with_save_err(
+                let __fn_idx = __builder.add_word_abi_call_target_with_save_err(
                     __trace_target,
                     __concrete_target,
                     #slot_expr,
@@ -596,9 +596,20 @@ impl<'c> Lowerer<'c> {
             // An int-result target is registered through its widening shim;
             // see `word_result_addr_tokens`.  A void- or ref-result target has
             // no narrow return to widen and registers its own address.
-            let target_addr = word_result_addr.unwrap_or_else(|| quote! { #func as *const () });
-            quote! {
-                let __fn_idx = __builder.add_fn_ptr_with_slot(#target_addr, #slot_expr);
+            //
+            // Only the shim is word-spelled, so only the shim is registered as
+            // such: the helper's own address is whatever its Rust signature
+            // says, and a `usize` or `&T` parameter there is narrower than the
+            // word a compiled call passes.
+            match word_result_addr {
+                Some(shim_addr) => quote! {
+                    let __fn_idx =
+                        __builder.add_word_abi_fn_ptr_with_slot(#shim_addr, #slot_expr);
+                },
+                None => quote! {
+                    let __fn_idx =
+                        __builder.add_fn_ptr_with_slot(#func as *const (), #slot_expr);
+                },
             }
         }
     }

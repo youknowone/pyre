@@ -7,10 +7,16 @@
 /// native embedder (wasmi / wasmtime) supplies. On native targets,
 /// compile_loop succeeds but execute_token requires a wasm host
 /// (unreachable natively).
+///
+/// Which binding a build has is a feature, not a target OS: `host-import` is
+/// satisfied by an embedder, and an embedder is exactly what a WASI command
+/// runs under. So the split below is wasm32 against native, and a wasm32 build
+/// with no binding selected keeps `glue`'s stubs rather than being routed to
+/// the native arm.
 pub mod codegen;
 pub mod failguard;
 
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 mod glue;
 
 use std::cell::RefCell;
@@ -326,8 +332,9 @@ pub struct TraceEntryCensusStorage {
 }
 
 /// Arm trace-entry instrumentation before the guest starts compiling traces.
-/// Native runs select the same facility with `MAJIT_TRACE_ENTRY_CENSUS`; wasm
-/// has no environment, so its host calls this function through pyre-wasm.
+/// `MAJIT_TRACE_ENTRY_CENSUS` selects the same facility wherever the guest has
+/// an environment to read it from; a guest that has none is armed by its host
+/// through this function instead.
 pub fn trace_entry_census_enable() {
     TRACE_ENTRY_CENSUS_FORCED.store(true, Ordering::Relaxed);
 }
@@ -336,15 +343,12 @@ fn trace_entry_census_enabled() -> bool {
     if TRACE_ENTRY_CENSUS_FORCED.load(Ordering::Relaxed) {
         return true;
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("MAJIT_TRACE_ENTRY_CENSUS").is_some())
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        false
-    }
+    // Read on every target. Whether a wasm guest has an environment is a
+    // property of its embedder, not of the architecture: one launched as a
+    // WASI command inherits the variables its host passes it, and one with no
+    // environment reads an absent variable rather than failing to compile.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MAJIT_TRACE_ENTRY_CENSUS").is_some())
 }
 
 /// Allocate the one counter array that an armed physical trace module uses.
@@ -476,19 +480,19 @@ pub fn bridge_diag(i: usize) -> u64 {
 }
 
 /// Number of JIT trace entries made from the guest.
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 pub fn jit_execute_count() -> u64 {
     glue::jit_execute_count()
 }
 
 /// Number of host modules materialized after the lazy-install gate.
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 pub fn jit_compile_count() -> u64 {
     glue::jit_compile_count()
 }
 
 /// Number of materializations served by the byte-identical module cache.
-#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+#[cfg(target_arch = "wasm32")]
 pub fn jit_compile_cache_hits() -> u64 {
     glue::jit_compile_cache_hits()
 }
@@ -1169,13 +1173,41 @@ fn ca_inline_params(frame_bytes: u32) -> Option<codegen::CaInlineParams> {
     })?
 }
 
+/// Whether the host entry runs a trace on a `JitFrame` it pushed onto the
+/// jitframe shadow stack.
+///
+/// `execute_token` allocates that frame only once a `JitFrame` type id has been
+/// registered; with none it runs the trace on a plain host buffer, which no
+/// collection moves and which the shadow stack never describes. Every frame
+/// reload a trace body emits answers out of that shadow stack, so an embedder
+/// that registered no type id must get no reloads at all — a reload there would
+/// replace the running frame pointer with whatever root happens to sit on top.
+fn host_entry_frame_is_jitframe() -> bool {
+    wasm_jitframe_tid() != 0
+}
+
 /// Address of the active jitframe shadow-stack top cell for ordinary trace
 /// body reloads. This does not depend on nursery fast-path eligibility: the
-/// reload is valid whenever a GC is active at compilation time.
+/// reload is valid whenever a GC is active at compilation time *and* the host
+/// entry runs its traces on a pushed `JitFrame`.
 fn jf_top_addr() -> Option<u32> {
+    if !host_entry_frame_is_jitframe() {
+        return None;
+    }
     with_wasm_active_gc(|_| majit_gc::shadow_stack::get_root_stack_top_addr())
         .and_then(|addr| u32::try_from(addr).ok())
         .filter(|&addr| addr != 0)
+}
+
+/// Table slot of the frame-reload helper, or `0` when the running frame is not
+/// one the shadow stack describes. Zero reaches codegen as "this trace needs no
+/// reload", which is what a frame the host never pushed — and never moves —
+/// requires.
+fn body_reload_fn_ptr() -> i64 {
+    if !host_entry_frame_is_jitframe() {
+        return 0;
+    }
+    wasm_jit_ca_reload_frame as *const () as usize as i64
 }
 
 /// `majit_gc::CollectGenerationFn` installed by `register_active_hooks`. Drives
@@ -2037,13 +2069,112 @@ pub fn set_faithful_residual_call_addrs(addrs: &[i64]) {
 }
 
 thread_local! {
+    /// Per thread, and that is the whole process wherever the set is consulted for
+    /// real: every registration a shipped build makes is compiled only for wasm32,
+    /// and a module instance there is one thread.
+    ///
+    /// Two properties keep a wider store from being owed anyway. A lookup that
+    /// misses is answered by the reflecting host trampoline, so a registration on
+    /// one thread and a question on another costs a round trip and never a wrong
+    /// signature -- the direction that traps is a spurious *hit*, which per-thread
+    /// storage cannot manufacture. And a caller replacing the whole list leaves
+    /// every other thread's alone, so two of them may run at once.
     static FAITHFUL_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
         RefCell::new(std::collections::HashSet::new());
 }
 
-/// Whether `addr` was vouched for by [`set_faithful_residual_call_addrs`].
+/// Vouch for one more callee, leaving the rest of the set alone.
+///
+/// [`set_faithful_residual_call_addrs`] is the embedder's whole list, declared
+/// once. This is for a producer that mints word-spelled call targets as it
+/// goes: the address does not exist until the target is built, so it cannot be
+/// in a list written ahead of time, and the producer that built it is the one
+/// that knows how it is spelled.
+pub fn vouch_residual_call_addr(addr: i64) {
+    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| {
+        set.borrow_mut().insert(addr);
+    });
+}
+
+/// Whether `addr` was vouched for by [`set_faithful_residual_call_addrs`] or
+/// [`vouch_residual_call_addr`].
 pub(crate) fn residual_call_descr_is_faithful(addr: i64) -> bool {
     FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&addr))
+}
+
+/// [`vouch_residual_call_addr`] for a target whose *result* is a word too, so
+/// its whole wasm signature is the uniform `(i64…) -> i64`.
+///
+/// The parameter half is what a compiled call needs to know; this is the half
+/// [`direct_word_abi_call`] needs, because a caller reaching a target through
+/// a raw address has no descr telling it whether the callee returns anything.
+/// A void target vouched here would be called as if it returned a word, which
+/// is the same type error the vouching exists to avoid.
+pub fn vouch_residual_call_addr_returning_word(addr: i64) {
+    vouch_residual_call_addr(addr);
+    WORD_RESULT_RESIDUAL_CALL_ADDRS.with(|set| {
+        set.borrow_mut().insert(addr);
+    });
+}
+
+thread_local! {
+    /// Per thread for the reasons [`FAITHFUL_RESIDUAL_CALL_ADDRS`] is, and it is
+    /// read on the thread that wrote it for one more: the producer minting a
+    /// word-spelled target and the guest call reaching that target are the same
+    /// thread by construction, since the target's address is a table index in the
+    /// instance that minted it.
+    static WORD_RESULT_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Call a residual target from inside the guest, when its whole signature is
+/// the uniform `(i64…) -> i64` and this backend was told so.
+///
+/// The recording and blackhole paths reach a target through a raw address and
+/// no descr, and wasm32 `call_indirect` type-checks the callee: transmuting
+/// that address to the signature the residual call carries traps unless the
+/// callee really is spelled that way. So those paths hand the call to a host
+/// that reflects the callee's declared type first — a guest→host→guest round
+/// trip per call. For a target vouched by
+/// [`vouch_residual_call_addr_returning_word`] the transmute is exactly right
+/// and the round trip buys nothing.
+///
+/// `None` means the caller still owes the reflecting path: the address was not
+/// vouched for, or its arity is past what a residual call can carry.
+#[cfg(target_arch = "wasm32")]
+pub fn direct_word_abi_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
+    if !WORD_RESULT_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&(func_ptr as i64))) {
+        return None;
+    }
+    // One arm per arity: the transmuted type has to name the parameters, and
+    // wasm has no variadic call. `MAX_CALL_ARGS` bounds what a residual call
+    // can carry, so an arity past the arms below cannot arrive here.
+    macro_rules! arms {
+        ($( [$($arg:ident),*] ),* $(,)?) => {
+            match args {
+                $(
+                    [$($arg),*] => {
+                        let f: extern "C" fn($(arms!(@i64 $arg)),*) -> i64 =
+                            unsafe { std::mem::transmute(func_ptr) };
+                        Some(f($(*$arg),*))
+                    }
+                )*
+                _ => None,
+            }
+        };
+        (@i64 $arg:ident) => { i64 };
+    }
+    arms![
+        [],
+        [a0],
+        [a0, a1],
+        [a0, a1, a2],
+        [a0, a1, a2, a3],
+        [a0, a1, a2, a3, a4],
+        [a0, a1, a2, a3, a4, a5],
+        [a0, a1, a2, a3, a4, a5, a6],
+        [a0, a1, a2, a3, a4, a5, a6, a7],
+    ]
 }
 
 /// Configure the dormant terminal-decline regression hook.
@@ -2323,7 +2454,7 @@ impl WasmBackend {
             return;
         };
         let _ = (cells_base, slot);
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if cells_base != 0 {
             let cell = (cells_base as usize + source_fail_index as usize * 4) as *mut u32;
             unsafe { core::ptr::write(cell, slot) };
@@ -2396,7 +2527,7 @@ impl WasmBackend {
             .bridge_slots
             .borrow_mut()
             .remove(&source_fail_index);
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if source_cells_base != 0 {
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
             unsafe { core::ptr::write(cell, 0) };
@@ -2427,7 +2558,7 @@ impl WasmBackend {
                         .bridge_slots
                         .borrow_mut()
                         .insert(source_fail_index, slot);
-                    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                    #[cfg(target_arch = "wasm32")]
                     if source_cells_base != 0 {
                         let cell = (source_cells_base as usize + source_fail_index as usize * 4)
                             as *mut u32;
@@ -2507,13 +2638,13 @@ impl WasmBackend {
             })
             .collect();
 
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if glue::replace_module(old_handle, &wasm_bytes) != old_handle {
             return Err(BackendError::Unsupported(
                 "wasm host rejected the re-emitted trace module".into(),
             ));
         }
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = wasm_bytes;
             return Err(BackendError::Unsupported(
@@ -2542,7 +2673,7 @@ impl WasmBackend {
                 *start += guard_growth;
             }
         }
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if new_cells_base != 0 {
             for (&fail_index, &bridge_slot) in compiled.bridge_slots.borrow().iter() {
                 let cell = (new_cells_base as usize + fail_index as usize * 4) as *mut u32;
@@ -2565,7 +2696,7 @@ impl WasmBackend {
                 // them has lost its dispatch entry. Unreplayed, that guard
                 // deopts to the tracer on every failure and retraces a bridge
                 // it can never reach.
-                #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                #[cfg(target_arch = "wasm32")]
                 if new_cells_base != 0 {
                     for (&(trace_id, fail_index), &bridge_slot) in
                         compiled.chained_bridge_slots.borrow().iter()
@@ -3406,7 +3537,7 @@ impl majit_backend::Backend for WasmBackend {
             frame,
             ca: ca_targets.as_ref().map_or_else(
                 || codegen::CaParams {
-                    ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                    ca_reload_fn_ptr: body_reload_fn_ptr(),
                     jf_top_addr: jf_top_addr(),
                     ..codegen::CaParams::default()
                 },
@@ -3482,13 +3613,13 @@ impl majit_backend::Backend for WasmBackend {
 
         // Instantiate via the host binding on wasm32, or store bytes for
         // testing on native (no wasm host available).
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         let func_handle = if defer_host_compile {
             0
         } else {
             glue::compile_module_cached(&wasm_bytes)
         };
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         let func_handle = 0u32; // Placeholder — no wasm host available
 
         // `jit_compile_wasm` returns 0 when the host runtime rejects the emitted
@@ -3499,7 +3630,7 @@ impl majit_backend::Backend for WasmBackend {
         // a trace), leaving `frame[0]` unwritten and resolving a wrong exit descr.
         // Decline the compile so the metainterp keeps the interpreter fallback —
         // a backend capability limit, reported like any other unsupported shape.
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if !defer_host_compile && func_handle == 0 {
             diag_bump(26);
             return Err(BackendError::Unsupported(
@@ -4209,7 +4340,7 @@ impl majit_backend::Backend for WasmBackend {
             }
         } else {
             codegen::CaParams {
-                ca_reload_fn_ptr: wasm_jit_ca_reload_frame as *const () as usize as i64,
+                ca_reload_fn_ptr: body_reload_fn_ptr(),
                 jf_top_addr: jf_top_addr(),
                 ..codegen::CaParams::default()
             }
@@ -4300,15 +4431,15 @@ impl majit_backend::Backend for WasmBackend {
         // descrs and flip the source guard's cell. Order matters: the descrs
         // must be resolvable (appended) before the cell makes the guard dispatch
         // into the bridge.
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         let bridge_slot = glue::compile_module(&wasm_bytes);
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         let bridge_slot = 0u32;
         // A 0 handle means the host rejected the bridge module (see the
         // `compile_loop` decline). Flipping the source guard's cell to dispatch
         // into slot 0 would tail-call a non-trace; decline instead so the guard
         // keeps its host round-trip (correct, unaccelerated).
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if bridge_slot == 0 {
             return Err(BackendError::Unsupported(
                 "wasm host rejected the compiled bridge module (oversized function body \
@@ -4430,7 +4561,7 @@ impl majit_backend::Backend for WasmBackend {
         } else {
             diag_bump(28);
         }
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         if source_cells_base != 0 && bridge_slot != 0 {
             let cell = (source_cells_base as usize + source_fail_index as usize * 4) as *mut u32;
             if unsafe { core::ptr::read(cell) } != 0 {
@@ -4461,7 +4592,7 @@ impl majit_backend::Backend for WasmBackend {
                 }
             }
         }
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = (source_cells_base, bridge_slot);
 
         let code_size = wasm_bytes.len();
@@ -4673,7 +4804,7 @@ impl majit_backend::Backend for WasmBackend {
             .expect("no compiled code")
             .downcast_ref::<CompiledWasmLoop>()
             .expect("not CompiledWasmLoop");
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         let func_handle = compiled
             .materialize_func_handle()
             .expect("wasm backend failed to materialize a runnable trace");
@@ -4682,12 +4813,12 @@ impl majit_backend::Backend for WasmBackend {
         // call area. Chained bridges share these exact offsets; only CA callee
         // frames use the smaller homes prefix (`ca_frame_bytes`).
         let frame_size = (compiled.frame.frame_bytes as usize).div_ceil(8);
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = (frame_size, args);
             panic!("wasm backend execute_token requires a wasm host");
         }
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+        #[cfg(target_arch = "wasm32")]
         {
             // The pending-exception cell is global, unlike the native
             // per-jitframe `jf_guard_exc`. A residual raise on a blackhole
@@ -4780,43 +4911,81 @@ impl majit_backend::Backend for WasmBackend {
                 return DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value));
             }
 
-            // Legacy host-Vec frame path (default, PYRE_WASM_CA off): fail_index
-            // at frame[0], inputs/outputs at frame[1 + i], surviving Ref homes
-            // manually rooted across the trace. A home slot only ever holds null
-            // (entry init) or a valid GcRef (store-on-def), so forwarding is
-            // safe. The path to
-            // `wasm_gc_remove_root` is straight-line and the wasm32 build is
-            // `panic=abort`, so `glue::execute` cannot unwind and leak roots.
-            let mut frame = vec![0i64; frame_size];
+            // Host-buffer frame path, for an embedder that registered no
+            // `JitFrame` type id: fail_index at item[0], inputs/outputs at
+            // item[1 + i], surviving Ref homes rooted across the trace. A home
+            // slot only ever holds null (entry init) or a valid GcRef
+            // (store-on-def), so forwarding is safe. No collection moves this
+            // buffer, which is what `host_entry_frame_is_jitframe` reports to
+            // codegen so the body emits no frame reload. The release below is
+            // straight-line and the wasm32 build is `panic=abort`, so
+            // `glue::execute` cannot unwind and leak roots.
+            //
+            // The buffer carries a `JitFrame` header all the same, and is
+            // published on the jitframe shadow stack for the span of the call.
+            // Rooting the homes with the active GC reaches only *that*
+            // collector. A frontend keeping a heap of its own reads the shadow
+            // stack instead -- it is the one publication point a collector that
+            // is not this one can consult -- so without the frame on it a home
+            // holding one of that heap's objects is invisible: the collector
+            // moves the object, the home keeps the address it had, and the
+            // trace resumes on a pointer into free space. The two walks forward
+            // the same slots, which a forwarding collector does idempotently:
+            // the second visit reads an address the first already took out of
+            // from-space.
+            let sign = std::mem::size_of::<isize>();
+            let depth = frame_size * 8 / sign;
+            let alloc_size = majit_backend::jitframe::JitFrame::alloc_size(depth);
+            // An `i64` element type for the alignment a `JitFrame` needs and
+            // for the zero fill `JitFrame::init` requires.
+            let mut backing = vec![0i64; alloc_size.div_ceil(8)];
+            let jf = backing.as_mut_ptr() as *mut majit_backend::jitframe::JitFrame;
+            unsafe { majit_backend::jitframe::JitFrame::init(jf, std::ptr::null(), depth) };
+            // Held until the outputs are read, which is what `jf_gcmap` points
+            // at for as long as the frame is on the shadow stack.
+            let gcmap = build_home_gcmap(compiled.frame);
+            unsafe { (*jf).jf_gcmap = gcmap.as_ptr() as *const u8 };
+            let items = (jf as usize + majit_backend::jitframe::FIRST_ITEM_OFFSET) as *mut i64;
             for (i, arg) in args.iter().enumerate() {
-                frame[1 + i] = match arg {
+                let v = match arg {
                     Value::Int(v) => *v,
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Ref(r) => r.0 as i64,
                     Value::Void => 0,
                 };
+                unsafe { *items.add(1 + i) = v };
             }
-            let frame_ptr = frame.as_mut_ptr() as usize as u32;
             let home_base = compiled.frame.home_slot_base as usize / 8;
             for h in 0..compiled.frame.home_slots {
-                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 unsafe { wasm_gc_add_root(slot) };
             }
+            majit_gc::shadow_stack::register_libc_jitframe(jf as usize);
+            let saved = majit_gc::shadow_stack::push_jf(GcRef(jf as usize));
             {
                 let _bh_phase = majit_gc::BhProbePhase::enter("compiled");
-                glue::execute(func_handle, frame_ptr);
+                glue::execute(func_handle, items as usize as u32);
             }
+            majit_gc::shadow_stack::pop_jf_to(saved);
+            majit_gc::shadow_stack::unregister_libc_jitframe(jf as usize);
+            // Nothing reads the frame's interior through the gcmap any more,
+            // and the gcmap is about to go out of scope.
+            unsafe { (*jf).jf_gcmap = std::ptr::null() };
             for h in 0..compiled.frame.home_slots {
-                let slot = unsafe { frame.as_mut_ptr().add(home_base + h) } as *mut GcRef;
+                let slot = unsafe { items.add(home_base + h) } as *mut GcRef;
                 wasm_gc_remove_root(slot);
             }
             let exc_value = jit_exc_take();
-            let fail_index = frame[0] as u32;
+            let fail_index = unsafe { *items } as u32;
             // Global fail-index space (see the CA-path resolution above).
             let fail_descr =
                 global_fail_descr(fail_index).expect("invalid fail_index from compiled wasm");
             let num_outputs = exit_slot_count(&fail_descr);
-            let raw_values: Vec<i64> = (0..num_outputs).map(|i| frame[1 + i]).collect();
+            let raw_values: Vec<i64> = (0..num_outputs)
+                .map(|i| unsafe { *items.add(1 + i) })
+                .collect();
+            drop(gcmap);
+            drop(backing);
             DeadFrame::Boxed(WasmFrameData::boxed(raw_values, fail_descr, exc_value))
         }
     }
@@ -4943,7 +5112,7 @@ impl majit_backend::Backend for WasmBackend {
                     .expect("published CALL_ASSEMBLER target has a live compiled loop")
             };
             let handle = new_loop.materialize_func_handle()?;
-            #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+            #[cfg(target_arch = "wasm32")]
             if handle == 0 {
                 return Err(BackendError::Unsupported(format!(
                     "call-assembler redirect to token {} could not materialize wasm code",

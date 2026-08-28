@@ -50,8 +50,8 @@ pub use resoperation::{
     Op, OpCode, OpRc, OpRef, RdVirtualInfo, VectorizationInfo, VirtualFieldsInfo, format_trace,
 };
 pub use value::{
-    CallResultWord, Const, FAILARGS_LIMIT, GREEN_UHASH_MULT, GREEN_UHASH_SEED, GcRef, GreenAsI64,
-    GreenKey, GreenType, InputArg, InputArgRc, JitDriverVar, RefReleaseFn, RefRetainFn,
+    CallArgWord, CallResultWord, Const, FAILARGS_LIMIT, GREEN_UHASH_MULT, GREEN_UHASH_SEED, GcRef,
+    GreenAsI64, GreenKey, GreenType, InputArg, InputArgRc, JitDriverVar, RefReleaseFn, RefRetainFn,
     RetainedGreens, SharedConstPool, StrEqFn, StrHashFn, Type, Value, VarKind, green_type_to_ir,
     green_uhash_step, make_str_slot, pypyjit_greenkey, pypyjit_greenkey_uhash, set_ref_resolver,
     set_str_resolver, set_unicode_resolver,
