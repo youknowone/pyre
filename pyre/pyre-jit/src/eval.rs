@@ -9890,10 +9890,7 @@ fn maybe_compile_and_run(
             has_token,
         );
     }
-    if driver.has_runnable_compiled_loop(green_key) {
-        return execute_assembler(frame, green_key, loop_header_pc, driver, info, env);
-    }
-    // `WarmEnterState::maybe_compile_decision` is the port of warmstate.py's
+    // `WarmEnterState::maybe_compile_decision_with_key` is the port of warmstate.py's
     // complete JitCell decision: token lookup, DONT_TRACE_HERE retry,
     // dead-token cleanup, and counter tick. Keeping that policy in one symbol
     // prevents the eval entry point from assigning different semantics to its
@@ -9907,12 +9904,8 @@ fn maybe_compile_and_run(
     // read this door's own mark and decline with `AlreadyTracing`, so the
     // trace this door just decided on never starts and the counter it reset
     // never re-arms the location.
-    match driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .maybe_compile_decision(green_key)
-    {
-        majit_metainterp::warmstate::HotResult::StartTracing => {
+    match driver.maybe_compile_and_run_step(green_key, (frame.pycode as usize, loop_header_pc)) {
+        (majit_metainterp::warmstate::HotResult::StartTracing, _) => {
             if driver
                 .meta_interp()
                 .is_tracing_key((frame.pycode as usize, loop_header_pc))
@@ -9921,10 +9914,10 @@ fn maybe_compile_and_run(
             }
             bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
-        majit_metainterp::warmstate::HotResult::RunCompiled => {
-            execute_assembler(frame, green_key, loop_header_pc, driver, info, env)
+        (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
+            execute_assembler(frame, compiled_key, loop_header_pc, driver, info, env)
         }
-        majit_metainterp::warmstate::HotResult::NotHot => {
+        (majit_metainterp::warmstate::HotResult::NotHot, _) => {
             if driver
                 .meta_interp_mut()
                 .warm_state_mut()
@@ -9934,7 +9927,7 @@ fn maybe_compile_and_run(
             }
             None
         }
-        majit_metainterp::warmstate::HotResult::AlreadyTracing => None,
+        (majit_metainterp::warmstate::HotResult::AlreadyTracing, _) => None,
     }
 }
 
@@ -11347,7 +11340,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // `has_runnable_compiled_loop`, the counter gate, then
     // `has_runnable_compiled_loop` again to decide the run -- walked it three
     // times to learn one thing, on every call that refused.
-    let step = driver.function_entry_step(green_key);
+    let step = driver.function_entry_step(green_key, green_key_hash, (code_ptr as usize, entry_pc));
     if matches!(step, FunctionEntryStep::NotHot) {
         return None;
     }

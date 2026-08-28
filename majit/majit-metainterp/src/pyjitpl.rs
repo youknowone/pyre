@@ -10635,6 +10635,42 @@ impl<M: Clone> MetaInterp<M> {
         self.compiled_loops.get(&green_key).map(|e| &e.meta)
     }
 
+    /// The back-edge door's whole answer, including the frontend half of
+    /// pyre's runnable-loop predicate, from the warm state's typed policy.
+    pub fn maybe_compile_and_run_step(
+        &mut self,
+        green_key: u64,
+        green_key_raw: (usize, usize),
+    ) -> (crate::warmstate::HotResult, u64) {
+        let compiled_loops = &self.compiled_loops;
+        let warm_state = &mut self.warm_state;
+        if !warm_state.has_confirm_enter_jit() {
+            let step = warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
+                compiled_loops.contains_key(&cell_key)
+            });
+            return (step, green_key);
+        }
+        match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            let step = warm_state.maybe_compile_decision_with_key(key, |cell_key| {
+                compiled_loops.contains_key(&cell_key)
+            });
+            let resolved_key = if matches!(step, crate::warmstate::HotResult::RunCompiled) {
+                warm_state.cell_key_for(key).unwrap_or(green_key)
+            } else {
+                green_key
+            };
+            (step, resolved_key)
+        }) {
+            Some(step) => step,
+            None => (
+                warm_state.maybe_compile_decision_with_meta(green_key, |cell_key| {
+                    compiled_loops.contains_key(&cell_key)
+                }),
+                green_key,
+            ),
+        }
+    }
+
     /// The function-entry door's whole answer, from one walk of the cell chain
     /// — see [`crate::warmstate::WarmEnterState::function_entry_step`].
     ///
@@ -10642,16 +10678,42 @@ impl<M: Clone> MetaInterp<M> {
     /// joins are separate FIELDS of this struct: `compiled_loops`, borrowed
     /// into the closure, and `warm_state`, borrowed mutably by the step. The
     /// closure is what keeps the map out of the cold path, where the cell holds
-    /// no token and there is nothing for the map to confirm.
-    pub fn function_entry_step(&mut self, green_key: u64) -> crate::warmstate::FunctionEntryStep {
+    /// no token and there is nothing for the map to confirm. The raw hash and
+    /// `(code, pc)` pair reconstruct a structured key only when the optional
+    /// veto is installed; the default path keeps its previous cost.
+    pub fn function_entry_step(
+        &mut self,
+        cell_key: u64,
+        green_key_hash: u64,
+        green_key_raw: (usize, usize),
+    ) -> crate::warmstate::FunctionEntryStep {
         let engine_is_tracing = self.is_tracing();
         let compiled_loops = &self.compiled_loops;
-        self.warm_state.function_entry_step(
-            green_key,
-            None,
-            || compiled_loops.contains_key(&green_key),
-            engine_is_tracing,
-        )
+        let warm_state = &mut self.warm_state;
+        if !warm_state.has_confirm_enter_jit() {
+            return warm_state.function_entry_step(
+                cell_key,
+                None,
+                || compiled_loops.contains_key(&cell_key),
+                engine_is_tracing,
+            );
+        }
+        match Self::with_typed_decision_key(green_key_hash, green_key_raw, |key| {
+            warm_state.function_entry_step(
+                cell_key,
+                Some(key),
+                || compiled_loops.contains_key(&cell_key),
+                engine_is_tracing,
+            )
+        }) {
+            Some(step) => step,
+            None => warm_state.function_entry_step(
+                cell_key,
+                None,
+                || compiled_loops.contains_key(&cell_key),
+                engine_is_tracing,
+            ),
+        }
     }
 
     /// Record the loop-header bytecode pc for a compiled-loop green key, so a
@@ -26520,6 +26582,56 @@ mod loop_side_table_tests {
             loop_header_pc: None,
             next_global_opref: 0,
         }
+    }
+
+    fn rejecting_confirm_enter_jit(_key: &majit_ir::GreenKey) -> bool {
+        false
+    }
+
+    fn meta_with_runnable_portal_cell()
+    -> (MetaInterp<()>, majit_ir::GreenKey, u64, u64, (usize, usize)) {
+        let mut meta = MetaInterp::<()>::new(1);
+        let raw = (0x1234usize, 17usize);
+        let key = majit_ir::GreenKey::with_types(
+            vec![raw.1 as i64, 0, raw.0 as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let hash = key.get_uhash();
+        let token = Arc::new(JitCellToken::new(1));
+        token.set_compiled(Box::new(()));
+        meta.warm_state.memory_manager.keep_loop_alive(&token);
+        meta.warm_state
+            .attach_procedure_to_interp_for_key(&key, token);
+        let cell_key = meta
+            .warm_state
+            .cell_key_for(&key)
+            .expect("the typed cell has a resolved key");
+        meta.compiled_loops.insert(cell_key, compiled_entry(1));
+        (meta, key, hash, cell_key, raw)
+    }
+
+    #[test]
+    fn the_back_edge_policy_keeps_interpreting_when_the_entry_hook_refuses() {
+        let (mut meta, _key, hash, _cell_key, raw) = meta_with_runnable_portal_cell();
+        meta.warm_state
+            .set_confirm_enter_jit(Some(rejecting_confirm_enter_jit));
+
+        assert!(matches!(
+            meta.maybe_compile_and_run_step(hash, raw),
+            (crate::warmstate::HotResult::NotHot, _),
+        ));
+    }
+
+    #[test]
+    fn the_function_entry_policy_keeps_interpreting_when_the_entry_hook_refuses() {
+        let (mut meta, _key, hash, cell_key, raw) = meta_with_runnable_portal_cell();
+        meta.warm_state
+            .set_confirm_enter_jit(Some(rejecting_confirm_enter_jit));
+
+        assert!(matches!(
+            meta.function_entry_step(cell_key, hash, raw),
+            crate::warmstate::FunctionEntryStep::NotHot,
+        ));
     }
 
     /// Register a loop at `green_key` with both side tables populated.

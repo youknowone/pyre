@@ -1025,7 +1025,11 @@ impl WarmEnterState {
     /// So the arm stays narrow until one green key owns one cell. `mc_diag`
     /// slots 80/81 (`abort_ceiling_banned` / `abort_ceiling_refused`) are the
     /// standing measure of what the narrowing costs.
-    pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
+    pub(crate) fn maybe_compile_decision_with_meta(
+        &mut self,
+        cell_key: u64,
+        has_compiled_meta: impl FnOnce(u64) -> bool,
+    ) -> HotResult {
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.cell_by_key(cell_key) {
             let has_procedure_token = cell.get_procedure_token().is_some();
@@ -1034,7 +1038,7 @@ impl WarmEnterState {
             let flags = cell.flags;
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
             let abort_count = cell.abort_count;
-            if is_compiled {
+            if is_compiled && has_compiled_meta(cell_key) {
                 // warmstate.py:501 — the second veto position, between
                 // finding a live procedure token and `raise
                 // EnterJitAssembler`. A hook that refuses leaves the caller
@@ -1105,6 +1109,12 @@ impl WarmEnterState {
         HotResult::StartTracing
     }
 
+    /// Compatibility form for callers whose compiled-loop metadata is wholly
+    /// represented by the warm cell itself.
+    pub fn maybe_compile_decision(&mut self, cell_key: u64) -> HotResult {
+        self.maybe_compile_decision_with_meta(cell_key, |_| true)
+    }
+
     /// [`Self::maybe_compile_decision`] followed by the mark that
     /// `warmstate.py:441` makes once the decision is taken:
     /// `cell.flags |= JC_TRACING | JC_TRACING_OCCURRED`, immediately before
@@ -1148,6 +1158,21 @@ impl WarmEnterState {
     /// the production cutover from the hash entry points is the separate
     /// typed-greenkey threading work.
     pub fn maybe_compile_with_key(&mut self, key: &GreenKey) -> HotResult {
+        match self.maybe_compile_decision_with_key(key, |_| true) {
+            HotResult::StartTracing => self.start_tracing_cell_for_key(key),
+            other => other,
+        }
+    }
+
+    /// The typed cell-policy decision without marking a tracing start.
+    /// `has_compiled_meta` supplies the frontend half of pyre's runnable-loop
+    /// predicate; keeping it inside this decision prevents an entry door from
+    /// bypassing the compiled-code veto with an earlier fast path.
+    pub fn maybe_compile_decision_with_key(
+        &mut self,
+        key: &GreenKey,
+        has_compiled_meta: impl FnOnce(u64) -> bool,
+    ) -> HotResult {
         let hash = key.get_uhash();
         let mut cleanup_dead_token_cell = false;
         if let Some(cell) = self.lookup_chain_with_key(key) {
@@ -1158,12 +1183,17 @@ impl WarmEnterState {
             let has_seen_a_procedure_token = cell.has_seen_a_procedure_token();
             let abort_count = cell.abort_count;
             if is_compiled {
-                // warmstate.py:501 — see `maybe_compile_decision`, whose
-                // position this is the typed twin of.
-                if !self.confirm_enter_jit(key) {
-                    return HotResult::NotHot;
+                let cell_key = cell
+                    .cell_key
+                    .expect("a cell in the typed chain has an assigned cell key");
+                if has_compiled_meta(cell_key) {
+                    // warmstate.py:501 — see `maybe_compile_decision`, whose
+                    // position this is the typed twin of.
+                    if !self.confirm_enter_jit(key) {
+                        return HotResult::NotHot;
+                    }
+                    return HotResult::RunCompiled;
                 }
-                return HotResult::RunCompiled;
             }
             if is_tracing {
                 return HotResult::AlreadyTracing;
@@ -1196,7 +1226,7 @@ impl WarmEnterState {
                 return HotResult::NotHot;
             }
             if self.should_start_dont_trace_here_trace(hash, flags, has_seen_a_procedure_token) {
-                return self.start_tracing_cell_for_key(key);
+                return HotResult::StartTracing;
             }
             // A JC_DONT_TRACE_HERE cell declines here, except when its token
             // is dead — that entry belongs to the cleanup path above.
@@ -1219,7 +1249,7 @@ impl WarmEnterState {
             return HotResult::NotHot;
         }
 
-        self.start_tracing_cell_for_key(key)
+        HotResult::StartTracing
     }
 
     /// Mutable chain-walk variant of [`Self::lookup_chain_with_key`].
@@ -1334,6 +1364,9 @@ impl WarmEnterState {
     pub fn force_start_tracing(&mut self, cell_key: u64) -> HotResult {
         if let Some(cell) = self.cell_by_key(cell_key) {
             if cell.is_compiled() {
+                if !self.confirm_enter_jit_if_available(None) {
+                    return HotResult::NotHot;
+                }
                 return HotResult::RunCompiled;
             }
             if cell.is_tracing() {
@@ -1361,6 +1394,9 @@ impl WarmEnterState {
     pub fn force_start_tracing_for_key(&mut self, key: &GreenKey) -> HotResult {
         if let Some(cell) = self.lookup_chain_with_key(key) {
             if cell.is_compiled() {
+                if !self.confirm_enter_jit(key) {
+                    return HotResult::NotHot;
+                }
                 return HotResult::RunCompiled;
             }
             if cell.is_tracing() {
@@ -2620,6 +2656,18 @@ impl WarmEnterState {
         }
     }
 
+    /// Consult the compiled-entry veto for a resolved cell key. Typed cells
+    /// carry the structured greens needed by the callback; legacy hash-only
+    /// cells decline when a hook is installed because their hash is not an
+    /// admissible substitute.
+    #[inline]
+    pub(crate) fn confirm_compiled_entry_for_cell_key(&self, cell_key: u64) -> bool {
+        let green_key = self
+            .cell_by_key(cell_key)
+            .and_then(|cell| cell.comparekey.as_ref());
+        self.confirm_enter_jit_if_available(green_key)
+    }
+
     /// `warmspot.py:596-598` `make_driverhook_graphs` —
     /// `jd._confirm_enter_jit_ptr = self._make_hook_graph(...)`.
     ///
@@ -2628,6 +2676,14 @@ impl WarmEnterState {
     /// its own here. `None` restores the no-hook default.
     pub fn set_confirm_enter_jit(&mut self, hook: Option<fn(&GreenKey) -> bool>) {
         self.confirm_enter_jit_ptr = hook;
+    }
+
+    /// Whether an interpreter installed the optional entry veto. Entry doors
+    /// use this to avoid constructing a structured key for the default
+    /// always-allow case.
+    #[inline]
+    pub fn has_confirm_enter_jit(&self) -> bool {
+        self.confirm_enter_jit_ptr.is_some()
     }
 
     /// warmstate.py: get_location(greenkey)
@@ -5842,6 +5898,35 @@ mod tests {
             "a refusal at :501 leaves the caller interpreting rather than \
              entering the machine code",
         );
+        assert!(
+            matches!(ws.force_start_tracing_for_key(&key), HotResult::NotHot),
+            "the force-start door must not turn an already-compiled cell into \
+             an unchecked compiled entry",
+        );
+    }
+
+    /// The function-entry policy owns the compiled-code door too; returning
+    /// `NotHot` is the caller's instruction to keep interpreting the frame.
+    #[test]
+    fn a_confirm_enter_jit_veto_stops_the_function_entry_door() {
+        fn refuse(_green_key: &GreenKey) -> bool {
+            false
+        }
+        let mut ws = WarmEnterState::new(3);
+        let key = GreenKey::new(vec![25, 27]);
+        let token = token_with_compiled_code(&mut ws);
+        let _token = attach_alive_for_key(&mut ws, &key, token);
+        let cell_key = ws.cell_key_for(&key).expect("fixture installed the cell");
+
+        assert!(matches!(
+            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            FunctionEntryStep::RunCompiled(_),
+        ));
+        ws.set_confirm_enter_jit(Some(refuse));
+        assert!(matches!(
+            ws.function_entry_step(cell_key, Some(&key), || true, false),
+            FunctionEntryStep::NotHot,
+        ));
     }
 
     /// The hook fires once per tracing start, not once per decision.

@@ -5142,7 +5142,7 @@ impl<S: JitState> JitDriver<S> {
         // `None` rather than an `Abort` outcome keeps the answer the same shape
         // as the "no compiled code at all" case, which is what a tmp-only cell
         // is from this path's point of view.
-        if self.has_runnable_compiled_loop(green_key) {
+        if self.has_confirmed_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -6823,7 +6823,7 @@ impl<S: JitState> JitDriver<S> {
         // the meta the runner below can only return `Abort`, which stops this
         // route from ever reaching `maybe_start_tracing` — i.e. the counter
         // stops ticking and the real loop is never traced.
-        if self.has_runnable_compiled_loop(green_key) {
+        if self.has_confirmed_runnable_compiled_loop(green_key) {
             return Some(self.run_compiled_detailed_keyed_with_dispatch_key(
                 green_key,
                 state,
@@ -8008,6 +8008,18 @@ impl<S: JitState> JitDriver<S> {
         self.runnable_procedure_token(green_key).is_some()
     }
 
+    /// Runnable-loop predicate for an execution door: the cell/token and
+    /// frontend metadata must exist, then the warm-state entry policy must
+    /// allow the transition.
+    #[inline]
+    fn has_confirmed_runnable_compiled_loop(&self, green_key: u64) -> bool {
+        self.has_runnable_compiled_loop(green_key)
+            && self
+                .meta
+                .warm_state_ref()
+                .confirm_compiled_entry_for_cell_key(green_key)
+    }
+
     /// [`Self::resolve_cell_key`] and [`Self::runnable_procedure_token`] from
     /// one walk of the cell chain.
     ///
@@ -8072,6 +8084,18 @@ impl<S: JitState> JitDriver<S> {
             .filter(|_| self.meta.get_compiled_meta(green_key).is_some())
     }
 
+    /// The back-edge door's whole answer from the warm-state policy that owns
+    /// both trace-start and compiled-entry decisions.
+    #[inline]
+    pub fn maybe_compile_and_run_step(
+        &mut self,
+        green_key: u64,
+        green_key_raw: (usize, usize),
+    ) -> (crate::warmstate::HotResult, u64) {
+        self.meta
+            .maybe_compile_and_run_step(green_key, green_key_raw)
+    }
+
     /// The function-entry door's whole answer, from one walk of the cell chain.
     ///
     /// `MetaInterp::function_entry_step` joins the two pieces of state that live
@@ -8080,9 +8104,17 @@ impl<S: JitState> JitDriver<S> {
     /// read [`crate::warmstate::WarmEnterState::function_entry_step`] performs.
     /// Neither is a chain walk, so that read is the only walk the door pays for.
     ///
-    /// `green_key` must already name one cell; see [`Self::resolve_cell_key`].
-    pub fn function_entry_step(&mut self, green_key: u64) -> FunctionEntryStep {
-        self.meta.function_entry_step(green_key)
+    /// `cell_key` must already name one cell; `green_key_hash` and
+    /// `green_key_raw` reconstruct its structured greens only when the
+    /// optional veto is installed.
+    pub fn function_entry_step(
+        &mut self,
+        cell_key: u64,
+        green_key_hash: u64,
+        green_key_raw: (usize, usize),
+    ) -> FunctionEntryStep {
+        self.meta
+            .function_entry_step(cell_key, green_key_hash, green_key_raw)
     }
 
     /// Turn the raw green-key hash a door arrives with into the key that names
