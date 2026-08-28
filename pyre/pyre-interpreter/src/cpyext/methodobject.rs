@@ -664,12 +664,27 @@ pub struct CPyCMethodObject {
 /// somewhere unclaimed.
 const _: () = {
     assert!(std::mem::offset_of!(CPyCFunctionObject, ob_base) == 0);
-    assert!(std::mem::offset_of!(CPyCFunctionObject, m_ml) == 24);
-    assert!(std::mem::offset_of!(CPyCFunctionObject, m_self) == 32);
-    assert!(std::mem::offset_of!(CPyCFunctionObject, m_module) == 40);
-    assert!(std::mem::offset_of!(CPyCFunctionObject, m_weakreflist) == 48);
-    assert!(std::mem::offset_of!(CPyCFunctionObject, vectorcall) == 56);
-    assert!(std::mem::offset_of!(CPyCMethodObject, mm_class) == 64);
+    assert!(std::mem::offset_of!(CPyCFunctionObject, m_ml) == size_of::<CPyObject>());
+    assert!(
+        std::mem::offset_of!(CPyCFunctionObject, m_self)
+            == size_of::<CPyObject>() + size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPyCFunctionObject, m_module)
+            == size_of::<CPyObject>() + 2 * size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPyCFunctionObject, m_weakreflist)
+            == size_of::<CPyObject>() + 3 * size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPyCFunctionObject, vectorcall)
+            == size_of::<CPyObject>() + 4 * size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPyCMethodObject, mm_class)
+            == size_of::<CPyObject>() + 5 * size_of::<usize>()
+    );
 };
 
 /// A carrier type that has been built, and null before it has.

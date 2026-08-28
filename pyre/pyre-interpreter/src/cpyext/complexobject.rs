@@ -26,7 +26,7 @@ pub struct CPyComplexObject {
 
 const _: () = {
     assert!(std::mem::offset_of!(CPyComplexObject, ob_base) == 0);
-    assert!(std::mem::offset_of!(CPyComplexObject, cval) == 3 * size_of::<usize>());
+    assert!(std::mem::offset_of!(CPyComplexObject, cval) == size_of::<CPyObject>());
     assert!(std::mem::offset_of!(CPyComplex, imag) == size_of::<c_double>());
 };
 

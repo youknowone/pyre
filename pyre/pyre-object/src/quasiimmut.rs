@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 /// `quasiimmut.py QuasiImmut` — the loops that baked one quasi-immutable
 /// field's value as a constant, and must be revoked when it changes.
 ///
-/// The flag stands in for upstream's `looptoken` + `cpu.invalidate_loop`: the
-/// backend already routes `GUARD_NOT_INVALIDATED` through a per-artifact
-/// `AtomicBool`, so setting it is what `looptoken.invalidated = True` buys.
+/// Like upstream, the registry holds the owning loop token, not a particular
+/// loop/bridge machine-code fragment.  Invalidating the token both removes it
+/// from warm entry and activates every still-unpatched
+/// `GUARD_NOT_INVALIDATED` generation owned by that token.
 ///
 /// Upstream reaches an instance twice — `QuasiImmutDescr.__init__` binds it
 /// while recording (`pyjitpl.py:1081`) and `compile.py:204-207` registers the
@@ -41,7 +42,7 @@ pub struct QuasiImmut {
 struct LoopTokens {
     /// `quasiimmut.py:61-63` — weak so a retired loop drops out instead of
     /// being kept alive by the object whose field it read.
-    looptokens_wrefs: Vec<std::sync::Weak<AtomicBool>>,
+    looptokens_wrefs: Vec<std::sync::Weak<dyn majit_ir::QuasiImmutLoopToken>>,
     /// `quasiimmut.py compress_limit = 30`.
     compress_limit: usize,
 }
@@ -53,8 +54,8 @@ impl LoopTokens {
     /// unbounded list.
     ///
     /// Upstream's note that already-invalidated tokens must be kept applies
-    /// here too: the flag stays live while its artifact does, and re-flipping
-    /// an already-set flag is what keeps a multiply-invalidated loop revoked.
+    /// here too: a repeated invalidation must reach the same token again so
+    /// the backend can activate guards compiled since the previous call.
     fn compress(&mut self) {
         self.looptokens_wrefs.retain(|w| w.strong_count() > 0);
         self.compress_limit = (self.looptokens_wrefs.len() + 15) * 2;
@@ -95,16 +96,16 @@ impl QuasiImmut {
     /// its `GUARD_NOT_INVALIDATED` has to fail on the first entry, since the
     /// value it baked is the pre-mutation one and no later sweep will reach a
     /// list this instance has already emptied.
-    pub fn register_loop_token(&self, flag: &Arc<AtomicBool>) {
+    pub fn register_loop_token(&self, token: &Arc<dyn majit_ir::QuasiImmutLoopToken>) {
         let mut tokens = self.tokens.lock();
         if self.unlinked.load(Ordering::Acquire) {
-            flag.store(true, Ordering::Release);
+            token.invalidate_for_quasi_immut();
             return;
         }
         if tokens.looptokens_wrefs.len() > tokens.compress_limit {
             tokens.compress();
         }
-        tokens.looptokens_wrefs.push(Arc::downgrade(flag));
+        tokens.looptokens_wrefs.push(Arc::downgrade(token));
     }
 
     /// `quasiimmut.py invalidate` — every loop recorded here becomes
@@ -128,8 +129,8 @@ impl QuasiImmut {
             std::mem::take(&mut tokens.looptokens_wrefs)
         };
         for wref in wrefs {
-            if let Some(flag) = wref.upgrade() {
-                flag.store(true, Ordering::Release);
+            if let Some(token) = wref.upgrade() {
+                token.invalidate_for_quasi_immut();
             }
         }
     }
@@ -290,6 +291,28 @@ pub unsafe fn sweep_quasi_immut_field(field: *const QuasiImmutField) {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TestLoopToken {
+    invalidated: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl majit_ir::QuasiImmutLoopToken for TestLoopToken {
+    fn invalidate_for_quasi_immut(&self) {
+        self.invalidated.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_loop_token(
+    invalidated: &Arc<AtomicBool>,
+) -> Arc<dyn majit_ir::QuasiImmutLoopToken> {
+    Arc::new(TestLoopToken {
+        invalidated: invalidated.clone(),
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -300,9 +323,11 @@ mod tests {
         let qi = QuasiImmut::new();
         let live = Arc::new(AtomicBool::new(false));
         let dead = Arc::new(AtomicBool::new(false));
-        qi.register_loop_token(&live);
-        qi.register_loop_token(&dead);
-        drop(dead);
+        let live_token = test_loop_token(&live);
+        let dead_token = test_loop_token(&dead);
+        qi.register_loop_token(&live_token);
+        qi.register_loop_token(&dead_token);
+        drop(dead_token);
 
         qi.invalidate();
         assert!(live.load(Ordering::Acquire), "a live loop must be revoked");
@@ -328,7 +353,8 @@ mod tests {
             // Each "recompile" drops its artifact immediately, so every
             // registered weak ref is already dead by the next round.
             let flag = Arc::new(AtomicBool::new(false));
-            qi.register_loop_token(&flag);
+            let token = test_loop_token(&flag);
+            qi.register_loop_token(&token);
         }
         assert!(
             qi.len() <= qi.compress_limit() + 1,
@@ -349,7 +375,10 @@ mod tests {
         assert!(!field.is_installed());
 
         let flag = Arc::new(AtomicBool::new(false));
-        field.get_current_qmut_instance().register_loop_token(&flag);
+        let token = test_loop_token(&flag);
+        field
+            .get_current_qmut_instance()
+            .register_loop_token(&token);
         assert!(field.is_installed());
 
         field.invalidate();
@@ -363,9 +392,10 @@ mod tests {
         field.invalidate();
 
         let flag2 = Arc::new(AtomicBool::new(false));
+        let token2 = test_loop_token(&flag2);
         field
             .get_current_qmut_instance()
-            .register_loop_token(&flag2);
+            .register_loop_token(&token2);
         assert!(field.is_installed());
         field.invalidate();
         assert!(flag2.load(Ordering::Acquire));
@@ -393,7 +423,8 @@ mod tests {
         // Registering on the swept instance cannot be silently lost: the loop
         // folded a pre-mutation value, so it is born invalid.
         let flag = Arc::new(AtomicBool::new(false));
-        recorded.register_loop_token(&flag);
+        let token = test_loop_token(&flag);
+        recorded.register_loop_token(&token);
         assert!(flag.load(Ordering::Acquire));
         assert_eq!(recorded.len(), 0, "a swept list must not grow again");
     }
@@ -427,7 +458,8 @@ mod tests {
         // and the registration is recorded rather than born-invalid.
         assert!(recorded.is_current());
         let flag = Arc::new(AtomicBool::new(false));
-        recorded.register_loop_token(&flag);
+        let token = test_loop_token(&flag);
+        recorded.register_loop_token(&token);
         assert!(!flag.load(Ordering::Acquire));
         assert_eq!(recorded.len(), 1);
     }
@@ -454,8 +486,11 @@ mod tests {
                 let stop = &stop;
                 scope.spawn(move || {
                     let flag = Arc::new(AtomicBool::new(false));
+                    let token = test_loop_token(&flag);
                     while !stop.load(Ordering::Relaxed) {
-                        field.get_current_qmut_instance().register_loop_token(&flag);
+                        field
+                            .get_current_qmut_instance()
+                            .register_loop_token(&token);
                     }
                 });
             }

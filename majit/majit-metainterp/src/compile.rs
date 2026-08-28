@@ -1703,9 +1703,10 @@ pub(crate) fn infer_terminal_exit_layout<T: AsRef<majit_ir::Op>>(
         .iter()
         .map(|opref| {
             // `OpRef::NONE` represents a null-ref placeholder per
-            // `fail_arg_type`; preserve `Type::Ref` so the gcmap and
-            // `decode_values_with_layout` see the same null-Ref typing the
-            // rest of the resume path uses.
+            // `fail_arg_type`; preserve `Type::Ref` so every consumer of this
+            // layout sees the same null-Ref typing the rest of the resume
+            // path uses. The gcmap is not one of them: `compute_gcmap` drops
+            // a `None` failarg before it reads the type at all.
             if opref.is_none() {
                 return Type::Ref;
             }
@@ -1767,49 +1768,6 @@ pub(crate) fn build_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
         }
     }
     layouts
-}
-
-#[allow(dead_code)]
-pub(crate) fn terminal_exit_layout_for_trace(
-    trace: &CompiledTrace,
-    owning_key: u64,
-    trace_id: u64,
-    op_index: usize,
-) -> Option<CompiledExitLayout> {
-    if let Some(layout) = trace.terminal_exit_layouts.get(&op_index) {
-        return Some(layout.public(
-            owning_key,
-            trace_id,
-            find_fail_index_for_exit_op(&trace.ops, op_index).unwrap_or(u32::MAX),
-        ));
-    }
-    if let Some(fail_index) = find_fail_index_for_exit_op(&trace.ops, op_index)
-        && let Some(layout) = trace.exit_layouts.get(&fail_index)
-    {
-        return Some(layout.public(owning_key, trace_id, fail_index));
-    }
-    infer_terminal_exit_layout(&trace.inputargs, &trace.ops, owning_key, trace_id, op_index)
-}
-
-#[allow(dead_code)]
-pub(crate) fn decode_values_with_layout(
-    raw_values: &[i64],
-    layout: &CompiledExitLayout,
-) -> Vec<Value> {
-    layout
-        .exit_types
-        .iter()
-        .enumerate()
-        .map(|(index, tp)| {
-            let raw = raw_values.get(index).copied().unwrap_or(0);
-            match tp {
-                Type::Int => Value::Int(raw),
-                Type::Ref => Value::Ref(GcRef(raw as usize)),
-                Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                Type::Void => Value::Void,
-            }
-        })
-        .collect()
 }
 
 pub(crate) fn normalize_closing_jump_args(

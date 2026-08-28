@@ -447,6 +447,93 @@ fn fresh_trace_ctx() -> TraceCtx {
     TraceCtx::for_test_types(&[Type::Ref])
 }
 
+/// The `ec` recovery every unseeded portal red falls back on
+/// (`seed_execution_context_for_walk`, `MIFrame::ensure_execution_context`,
+/// `setup_reconstructed_callee_frame`) must survive as a call in the trace.
+/// It takes no arguments, so an elidable descr would make the pure pass fold
+/// it to the recording thread's ExecutionContext, and every later thread
+/// entering the compiled trace would read that thread's exception state.
+#[test]
+fn execution_context_recovery_records_a_non_elidable_call() {
+    let mut tc = fresh_trace_ctx();
+    let ops_before = tc.num_ops();
+    let ec = crate::helpers::emit_current_execution_context(&mut tc, "ExecutionContext::Test");
+
+    assert_eq!(
+        tc.num_ops(),
+        ops_before + 1,
+        "the recovery must record exactly the call",
+    );
+    let call_op = tc.ops().last().expect("recorded op");
+    assert_eq!(call_op.opcode, majit_ir::OpCode::CallR);
+    assert_eq!(
+        call_op.getarglist().len(),
+        1,
+        "arglist is the funcptr alone: `getexecutioncontext()` takes no arguments",
+    );
+    assert_eq!(
+        ec.inline_const_to_value(),
+        None,
+        "a folded constant would bake the recording thread's context",
+    );
+    let descr = call_op.getdescr().expect("calldescr");
+    let call_descr = descr.as_call_descr().expect("call descr");
+    assert!(!call_descr.get_extra_info().check_is_elidable());
+    assert!(!call_descr.get_extra_info().check_can_raise(false));
+}
+
+/// The globals guard reads a frame's namespace override with a plain
+/// `GETFIELD_GC_R` on the live `debugdata` box, so the descr it uses has to
+/// name `FrameDebugData.w_globals` and has to stay mutable: `pyframe.py
+/// set_w_globals` rebinds the field after the object exists, and an immutable
+/// descr would let the read fold back to the recording frame's namespace —
+/// which is the pin the guard exists to break.
+#[test]
+fn frame_debug_data_w_globals_descr_reads_the_mutable_override_field() {
+    let descr = crate::descr::frame_debug_data_w_globals_descr();
+    let field = descr
+        .as_field_descr()
+        .expect("w_globals resolves to a FieldDescr");
+    assert_eq!(
+        field.offset(),
+        pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET,
+    );
+    assert!(
+        !field.is_immutable(),
+        "an immutable descr would fold the read back to the recorded namespace",
+    );
+}
+
+/// `FRAME_DEBUG_DATA_DESCR_GROUP`'s accessors name their field by POSITION,
+/// so a field added ahead of one of them re-points it at its neighbour and
+/// nothing fails to compile. Assert the offset each accessor resolves to
+/// against the layout constant, which is the only channel that disagrees.
+#[test]
+fn frame_debug_data_accessors_resolve_to_their_own_offsets() {
+    for (name, descr, offset) in [
+        (
+            "w_globals",
+            crate::descr::frame_debug_data_w_globals_descr(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET,
+        ),
+        (
+            "w_locals",
+            crate::descr::frame_debug_data_w_locals_descr(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET,
+        ),
+        (
+            "w_extra_locals",
+            crate::descr::frame_debug_data_w_extra_locals_descr(),
+            pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET,
+        ),
+    ] {
+        let field = descr
+            .as_field_descr()
+            .unwrap_or_else(|| panic!("{name} resolves to a FieldDescr"));
+        assert_eq!(field.offset(), offset, "{name} reads the wrong group index");
+    }
+}
+
 #[test]
 fn builtin_wrapper_heapcache_uses_item_not_length_descr() {
     let wrapper = named_jitcode("__majit_wrap_random").expect("random builtin wrapper jitcode");
@@ -643,15 +730,33 @@ fn done_descr_ref_for_tests() -> DescrRef {
 
 #[test]
 fn inline_caller_frame_distinguishes_try_block_catch_marker_decline() {
+    let insns = crate::jitcode_runtime::insns_opname_to_byte();
+    let catch_exception = insns["catch_exception/L"];
+    let void_return = insns["void_return/"];
+
     // No after-residual catch resume → not a try-block CALL → accept.
     assert_eq!(
         decline_inline_caller_frame_for_catch_marker(None, &[], true),
         Ok(()),
     );
-    // A try-block CALL with no resolvable catch (empty jitcode) cannot prove its
-    // handler rejoins a loop → decline.
+    // A marker with no `catch_exception` at the resume position names no
+    // handler, so there is no cell for a handler cleanup to clear → accept.
+    // `after_residual_call_resume_for_jitcode_pc` answers through a
+    // predecessor tier, so this is the CALL that carries no marker of its own.
     assert_eq!(
         decline_inline_caller_frame_for_catch_marker(Some(42), &[], true),
+        Ok(()),
+    );
+    // A callee with no free variables cannot read a caller cell at all.
+    let handler_returns = [catch_exception, 3, 0, void_return];
+    assert_eq!(
+        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, false),
+        Ok(()),
+    );
+    // A closure callee at a CALL whose `catch_exception` routes to a handler
+    // that returns out of the frame rather than rejoining a loop → decline.
+    assert_eq!(
+        decline_inline_caller_frame_for_catch_marker(Some(0), &handler_returns, true),
         Err(InlineCallerFrameDecline::TryBlockCatchMarker),
     );
 }

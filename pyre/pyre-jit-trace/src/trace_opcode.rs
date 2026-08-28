@@ -175,19 +175,14 @@ pub(crate) extern "C" fn normalize_raise_varargs_jit(
     exc_obj: i64,
     cause_obj: i64,
 ) -> i64 {
-    let frame_ptr = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
+    let _frame_ptr = frame_ptr as *const pyre_interpreter::pyframe::PyFrame;
     let exc = exc_obj as pyre_object::PyObjectRef;
     let raw_cause = cause_obj as pyre_object::PyObjectRef;
 
     // pyopcode.py:704-722 — cause and exc normalization both run against
-    // `self.space`/`frame.execution_context`. Pin the caller's frame
-    // context for the whole body so the cause-class-call and the
-    // exc-class-call observe the same namespace / thread state.
-    let frame_ctx = if frame_ptr.is_null() {
-        std::ptr::null()
-    } else {
-        unsafe { (*frame_ptr).execution_context }
-    };
+    // `self.space.getexecutioncontext()`: execution context belongs to the
+    // current activation/thread, independently of the frame object.
+    let frame_ctx = pyre_interpreter::call::getexecutioncontext();
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !frame_ctx.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
@@ -1012,24 +1007,25 @@ impl MIFrame {
         unsafe { &mut *self.sym }
     }
 
-    pub(crate) fn frame(&self) -> OpRef {
-        self.sym().frame
-    }
-
     /// `pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']` requires
     /// every CALL_ASSEMBLER red-args list and JUMP-args list to carry ec.
-    /// Normal trace setup seeds `sym.execution_context`; this recovery keeps
-    /// adapter paths from passing OpRef::NONE as the ec red.
+    /// Trace and bridge setup seed `sym.execution_context` from the portal's
+    /// second red. Adapter paths must preserve that red rather than deriving
+    /// it from the virtualizable frame.
+    ///
+    /// A bridge resumed at a guard whose resume data named no value at the
+    /// red's color arrives with none, and there is no second live source to
+    /// read it back from — `ec` is a red, not a `PyFrame` field. Recover it
+    /// the way the interpreter does, by asking the thread
+    /// ([`crate::helpers::emit_current_execution_context`]), and keep the
+    /// result so the rest of the frame reuses one read.
     pub(crate) fn ensure_execution_context(&mut self, ctx: &mut TraceCtx) -> OpRef {
         let ec = self.sym().execution_context;
         if !ec.is_none() {
             return ec;
         }
-        let recovered = ctx.record_op_with_descr(
-            majit_ir::OpCode::GetfieldGcR,
-            &[self.frame()],
-            crate::descr::pyframe_execution_context_descr(),
-        );
+        let recovered =
+            crate::helpers::emit_current_execution_context(ctx, "ExecutionContext::MIFrame");
         self.sym_mut().execution_context = recovered;
         recovered
     }
@@ -1850,7 +1846,7 @@ impl MIFrame {
             s.vable_last_instr = last_instr_op;
             s.vable_pycode = pycode_op;
             s.vable_valuestackdepth = vsd_op;
-            s.vable_w_globals = w_globals_op;
+            s.frame_w_globals = w_globals_op;
             s.owns_virtualizable_shadow()
         };
         // pyjitpl.py `_opimpl_setfield_vable` parity:
@@ -1872,12 +1868,6 @@ impl MIFrame {
                 "debugdata",
                 debugdata_op,
                 Value::Ref(GcRef(debugdata)),
-            );
-            mirror_vable_static_to_boxes(
-                ctx,
-                "w_globals",
-                w_globals_op,
-                Value::Ref(GcRef(ns_ptr as usize)),
             );
         }
     }
@@ -2271,7 +2261,6 @@ impl MIFrame {
             code,
             stack_depth,
             debugdata,
-            namespace,
             nlocals,
             locals,
             stack,
@@ -2354,7 +2343,6 @@ impl MIFrame {
                 ctx.virtualizable_box_at(2)
                     .unwrap_or(s.vable_valuestackdepth),
                 s.vable_debugdata,
-                s.vable_w_globals,
                 nlocals,
                 locals_vec,
                 stack_vec,
@@ -2365,7 +2353,7 @@ impl MIFrame {
         let mut args = vec![frame];
         // NUM_EXTRA_REDS == 1 (crate const-assert): `reds = ['frame', 'ec']`.
         args.push(execution_context);
-        args.extend_from_slice(&[next_instr, code, stack_depth, debugdata, namespace]);
+        args.extend_from_slice(&[next_instr, code, stack_depth, debugdata]);
         for (idx, value) in locals.into_iter().enumerate() {
             let target_type = inputarg_types
                 .get(num_scalars + idx)
@@ -2549,7 +2537,6 @@ impl MIFrame {
                             2 => s.vable_pycode = new_opref,
                             3 => s.vable_valuestackdepth = new_opref,
                             4 => s.vable_debugdata = new_opref,
-                            5 => s.vable_w_globals = new_opref,
                             _ => {}
                         },
                     }
@@ -2727,7 +2714,7 @@ impl MIFrame {
     /// pyjitpl.py capture_resumedata: build fail_args for CURRENT
     /// top frame. Returns the scalar header plus active_boxes —
     /// `[frame, (ec)?, last_instr, pycode, valuestackdepth, debugdata,
-    /// w_globals, active_boxes...]` — matching
+    /// active_boxes...]` — matching
     /// `interp_jit.py PyFrame._virtualizable_` /
     /// `virtualizable_spec.rs::PYFRAME_VABLE_FIELDS` line-by-line.
     /// `NUM_EXTRA_REDS` controls whether the ec slot
@@ -2755,7 +2742,6 @@ impl MIFrame {
             s.vable_pycode,
             s.vable_valuestackdepth,
             s.vable_debugdata,
-            s.vable_w_globals,
         ]);
         fa.extend_from_slice(&active_boxes);
         fa
@@ -3715,6 +3701,7 @@ mod tests {
         // so their bank-indexed setup is unchanged.
         sym.nlocals = 2;
         sym.valuestackdepth = 2;
+        sym.execution_context = OpRef::input_arg_ref(0);
         sym.registers_i = vec![OpRef::NONE, OpRef::NONE, int_box];
         sym.registers_r = vec![OpRef::NONE, ref_box];
         sym.registers_f = vec![OpRef::NONE, OpRef::NONE, OpRef::NONE, float_box];
@@ -3807,6 +3794,7 @@ mod tests {
         sym.jitcode = inner_jc_ptr;
         sym.nlocals = 2;
         sym.valuestackdepth = 3;
+        sym.execution_context = OpRef::input_arg_ref(0);
         // Semantic mirror: local0 is at slot 0, while stack depth 0 is at
         // semantic slot 2. Liveness color 0 belongs to the live stack slot,
         // reusing dead local0's color.

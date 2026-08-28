@@ -116,8 +116,8 @@ pub struct CPyStopIterationObject {
 /// `pyre/pyrex/tests/fixtures/cpyext_stopiteration.c` carries the C half.
 const _: () = {
     assert!(std::mem::offset_of!(CPyStopIterationObject, ob_base) == 0);
-    assert!(std::mem::offset_of!(CPyStopIterationObject, value) == 3 * size_of::<usize>());
-    assert!(size_of::<CPyStopIterationObject>() == 4 * size_of::<usize>());
+    assert!(std::mem::offset_of!(CPyStopIterationObject, value) == size_of::<CPyObject>());
+    assert!(size_of::<CPyStopIterationObject>() == size_of::<CPyObject>() + size_of::<usize>());
 };
 
 type BlockSet = super::address_table::HeldSet;

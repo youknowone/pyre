@@ -9,7 +9,10 @@ pub const PYFRAME_VABLE_OWNER_ROOT: &str = "PyFrame";
 ///
 /// This table is the scalar subset of
 /// `pypy/module/pypyjit/interp_jit.py`'s `_virtualizable_` list,
-/// in declaration order. `PyFrame.lastblock` is deliberately absent:
+/// in declaration order. RPython's `InstanceRepr._parse_field_list` skips
+/// names with no concrete field; after `PyCode.frame_stores_global` removed
+/// `PyFrame.w_globals` in upstream commit `bcd8653e5ec`, that stale list entry
+/// therefore produces no virtualizable scalar. `PyFrame.lastblock` is deliberately absent:
 /// the frame model tracked by this tree has no block stack. Unwind uses
 /// the `co_exceptiontable` lookup at
 /// `pypy/interpreter/pyopcode.py lookup_exceptiontable`, and pyre's
@@ -23,7 +26,6 @@ pub const PYFRAME_VABLE_FIELDS: &[(&str, usize)] = &[
     ("pycode", 1),          // interp_jit.py:25 pycode
     ("valuestackdepth", 2), // interp_jit.py:26 valuestackdepth
     ("debugdata", 3),       // interp_jit.py:28 debugdata
-    ("w_globals", 4),       // interp_jit.py:29 w_globals
 ];
 
 /// Virtualizable array fields in canonical index order.

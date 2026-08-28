@@ -2300,6 +2300,13 @@ impl TraceCtx {
         self.recorder.num_ops()
     }
 
+    /// Monotonic counterpart to [`Self::num_ops`].  `history.cut` can restore
+    /// the current length, but cannot make a body walk that already ran into a
+    /// setup-time abort again.
+    pub fn recorded_ops_total(&self) -> usize {
+        self.recorder.recorded_ops_total()
+    }
+
     /// Diagnostic: dump every recorded op (result OpRef = pos, opcode, args)
     /// to stderr.  Used by the P2 carrier investigation to inspect the
     /// def-use of the fused (callee continuation + root) bridge trace —

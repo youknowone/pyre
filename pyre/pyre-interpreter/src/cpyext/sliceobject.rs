@@ -30,10 +30,15 @@ pub struct CPySliceObject {
 /// somewhere unclaimed.
 const _: () = {
     assert!(std::mem::offset_of!(CPySliceObject, ob_base) == 0);
-    assert!(std::mem::offset_of!(CPySliceObject, start) == 24);
-    assert!(std::mem::offset_of!(CPySliceObject, stop) == 32);
-    assert!(std::mem::offset_of!(CPySliceObject, step) == 40);
-    assert!(size_of::<CPySliceObject>() == 48);
+    assert!(std::mem::offset_of!(CPySliceObject, start) == size_of::<CPyObject>());
+    assert!(
+        std::mem::offset_of!(CPySliceObject, stop) == size_of::<CPyObject>() + size_of::<usize>()
+    );
+    assert!(
+        std::mem::offset_of!(CPySliceObject, step)
+            == size_of::<CPyObject>() + 2 * size_of::<usize>()
+    );
+    assert!(size_of::<CPySliceObject>() == size_of::<CPyObject>() + 3 * size_of::<usize>());
 };
 
 /// The interpreter's slice type, or null before it is built.

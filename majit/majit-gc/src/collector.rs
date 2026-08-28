@@ -1932,7 +1932,11 @@ impl MiniMarkGC {
             let type_id = unsafe { (*header_of(pinned_obj)).type_id() };
             let payload_size = self.size_for_typeid(pinned_obj, type_id, "pinned_barriers");
             let object_size = Self::nursery_allocation_size(GcHeader::SIZE + payload_size);
-            let next_free = pinned_header + object_size;
+            // `size_for_typeid` decodes the pinned object's extent from its
+            // header. A decode that overstates it would push free past the
+            // barrier we are about to publish, and `Nursery::alloc` would then
+            // hand out bytes beyond the gap. The barrier is the hard bound.
+            let next_free = (pinned_header + object_size).min(next_top);
             unsafe {
                 // Set the wider bound first so Nursery's pointer invariant is
                 // maintained while free crosses the old (pinned) top.
@@ -2911,10 +2915,9 @@ impl MiniMarkGC {
         self.nursery_surviving_size = 0;
         // `IncrementalMiniMarkGC._minor_collection`: pinning does not keep an
         // object alive. Rebuild the AddressStack and count from traced edges.
-        // pyre currently walks the complete root stacks on every minor, so the
-        // saved stopper decision is conservatively unused; keep the state with
-        // the collector, where upstream owns it.
-        let _any_pinned_object_from_earlier = self.any_pinned_object_kept;
+        // The flag sampled here is the previous minor's, which
+        // `collect_roots_in_nursery` turns into `use_jit_frame_stoppers`.
+        let any_pinned_object_from_earlier = self.any_pinned_object_kept;
         self.surviving_pinned_objects.clear();
         self.pinned_objects_in_nursery = 0;
         self.any_pinned_object_kept = false;
@@ -3065,9 +3068,18 @@ impl MiniMarkGC {
         // a minor collection (incminimark.py:339-344
         // `old_objects_pointing_to_young`); restored to the conservative
         // Major default right after.
-        crate::shadow_stack::set_extra_root_walk_kind(
-            crate::shadow_stack::ExtraRootWalkKind::Minor,
-        );
+        //
+        // `collect_roots_in_nursery` computes
+        // `use_jit_frame_stoppers = not any_pinned_object_from_earlier` and
+        // passes it as `is_minor`: a pinned object created before the previous
+        // minor is still in the nursery and was never promoted, so the skip
+        // would drop the only edge reaching it. Announce a full walk instead.
+        let extra_root_walk_kind = if any_pinned_object_from_earlier {
+            crate::shadow_stack::ExtraRootWalkKind::Major
+        } else {
+            crate::shadow_stack::ExtraRootWalkKind::Minor
+        };
+        crate::shadow_stack::set_extra_root_walk_kind(extra_root_walk_kind);
         let mut visit_extra_area = |gcref: &mut GcRef| {
             self.drag_out_root(gcref);
         };
@@ -13195,6 +13207,56 @@ cache size\t: 8192 kB\n";
         assert!(gc.nursery_barriers.is_empty());
         assert!(gc.old_objects_pointing_to_pinned.is_empty());
         gc.roots.clear();
+    }
+
+    /// `collect_roots_in_nursery` computes
+    /// `use_jit_frame_stoppers = not any_pinned_object_from_earlier` and passes
+    /// it to `walk_roots` as `is_minor`. A pin that survived the previous minor
+    /// was never promoted and still sits at its nursery address, so the walkers
+    /// that skip a clean area on a minor have to be told to walk everything.
+    #[test]
+    fn a_surviving_pin_makes_the_next_minor_announce_a_full_extra_root_walk() {
+        // The walker registry has no removal and every test binary thread
+        // shares it, so record on the collecting thread only.
+        thread_local! {
+            static SEEN: std::cell::RefCell<Vec<crate::shadow_stack::ExtraRootWalkKind>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        fn record(_visit: &mut dyn FnMut(&mut GcRef)) {
+            SEEN.with(|seen| {
+                seen.borrow_mut()
+                    .push(crate::shadow_stack::extra_root_walk_kind())
+            });
+        }
+
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        crate::shadow_stack::register_extra_root_walker(record);
+        SEEN.with(|seen| seen.borrow_mut().clear());
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let mut obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.pin(obj));
+        unsafe { gc.roots.add(&mut obj) };
+
+        // Nothing was pinned before this one, so the first minor still
+        // announces the skip; it discovers the pin and leaves it in place.
+        gc.do_collect_nursery();
+        assert!(gc.is_pinned(obj));
+
+        // The pin now predates the previous minor: it is "from earlier".
+        gc.do_collect_nursery();
+        assert!(gc.is_pinned(obj));
+
+        gc.roots.clear();
+        assert_eq!(
+            SEEN.with(|seen| seen.borrow().clone()),
+            vec![
+                crate::shadow_stack::ExtraRootWalkKind::Minor,
+                crate::shadow_stack::ExtraRootWalkKind::Major,
+            ]
+        );
     }
 
     /// The sibling above only ever discovers the parent *after* the list is

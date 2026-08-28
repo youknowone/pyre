@@ -32,16 +32,6 @@ pub const PYFRAME_DEBUGDATA_OFFSET: usize = std::mem::offset_of!(PyFrame, debugd
 /// Byte offset of `lastblock` in `PyFrame`.
 pub const PYFRAME_LASTBLOCK_OFFSET: usize = std::mem::offset_of!(PyFrame, lastblock);
 
-/// Byte offset of `execution_context` in `PyFrame`.
-///
-/// Read/written by `PyreJitState::ec_as_usize` / `set_ec` to mirror the
-/// non-vable red inputarg `ec` from `interp_jit.py:67 reds = ['frame',
-/// 'ec']`. RPython keeps `ec` outside the vable; pyre's PyFrame happens
-/// to carry it inline, so `ec_as_usize` derefs the heap field to read
-/// the live ec pointer at JIT entry / extract_live time.
-pub const PYFRAME_EXECUTION_CONTEXT_OFFSET: usize =
-    std::mem::offset_of!(PyFrame, execution_context);
-
 /// Byte offset of `f_generator_nowref` in `PyFrame`.
 pub const PYFRAME_F_GENERATOR_NOWREF_OFFSET: usize =
     std::mem::offset_of!(PyFrame, f_generator_nowref);
@@ -60,13 +50,6 @@ pub const PYFRAME_F_BACKREF_OFFSET: usize = std::mem::offset_of!(PyFrame, f_back
 /// collection between guard exit and re-entry doesn't leave a dangling
 /// pointer.
 pub const PYFRAME_W_BUILTIN_OFFSET: usize = std::mem::offset_of!(PyFrame, w_builtin);
-
-/// Byte offset of `w_globals` in `PyFrame`.
-///
-/// Canonical globals dict object for `frame.w_globals`. The slot is a GCREF
-/// and must be visible to the descr / nursery GC walkers so the dict survives
-/// across minor collections.
-pub const PYFRAME_W_GLOBALS_OFFSET: usize = std::mem::offset_of!(PyFrame, w_globals);
 
 // Backward-compat aliases used by JIT descriptor helpers.
 pub const PYFRAME_STACK_DEPTH_OFFSET: usize = PYFRAME_VALUESTACKDEPTH_OFFSET;
@@ -95,7 +78,6 @@ const _: () = {
     );
     assert!(PYFRAME_F_BACKREF_OFFSET == pyre_interpreter::pyframe::PYFRAME_F_BACKREF_OFFSET);
     assert!(PYFRAME_W_BUILTIN_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_BUILTIN_OFFSET);
-    assert!(PYFRAME_W_GLOBALS_OFFSET == pyre_interpreter::pyframe::PYFRAME_W_GLOBALS_OFFSET);
 };
 
 /// virtualizable.py `clear_vable_ptr` — C-ABI helper behind the `COND_CALL`

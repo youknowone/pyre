@@ -1628,10 +1628,11 @@ pub struct JitDriver<S: JitState> {
     /// traces from an exception guard (GUARD_EXCEPTION / GUARD_NO_EXCEPTION).
     /// The caller should emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start.
     pub last_bridge_is_exception_guard: bool,
-    /// Recorded op count after bridge setup prologue materialization and
-    /// before the bridge body walk starts. Used to distinguish deterministic
-    /// setup aborts from transient mid-trace aborts.
-    bridge_body_start_op_count: Option<usize>,
+    /// `(current, monotonic)` recorded-op counts after bridge setup prologue
+    /// materialization and before the bridge body walk starts. Used to
+    /// distinguish deterministic setup aborts from transient mid-trace aborts
+    /// even when `history.cut` rewinds the current count to the setup position.
+    bridge_body_start_op_counts: Option<(usize, usize)>,
     /// Whether this session's bridge attempt was declined, or had no target to
     /// close against -- the session PHASE, as distinct from the resumekey CLASS
     /// that `MetaInterp::bridge_info` carries.
@@ -1928,7 +1929,7 @@ impl<S: JitState> JitDriver<S> {
             bridge_entered_at_guard_resume: false,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
-            bridge_body_start_op_count: None,
+            bridge_body_start_op_counts: None,
             bridge_attempt_declined: false,
             entry_points: Vec::new(),
             is_recursive: false,
@@ -4514,12 +4515,14 @@ impl<S: JitState> JitDriver<S> {
                     // permanently decline the source guard.
                     && self.meta.partial_trace().is_none()
                     && self.meta.tracing.as_ref().is_some_and(|ctx| {
-                        let Some(start_ops) = self.bridge_body_start_op_count else {
+                        let Some((start_ops, start_total)) = self.bridge_body_start_op_counts else {
                             return false;
                         };
                         let current_ops = ctx.num_ops();
-                        current_ops == start_ops
+                        let current_total = ctx.recorded_ops_total();
+                        (current_ops == start_ops && current_total == start_total)
                             || (current_ops == start_ops + 1
+                                && current_total == start_total + 1
                                 && ctx
                                     .ops()
                                     .get(start_ops)
@@ -4688,7 +4691,7 @@ impl<S: JitState> JitDriver<S> {
                         self.meta.aborted_tracing(reason_int);
                     }
                     self.sym = None;
-                    self.bridge_body_start_op_count = None;
+                    self.bridge_body_start_op_counts = None;
                     self.bridge_attempt_declined = false;
                     self.meta.clear_trace_session();
                 }
@@ -4729,7 +4732,7 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.abort_trace(!is_bridge);
                     self.sym = None;
                     // The session ends here, so the latch must not outlive it. The
-                    // sibling `bridge_body_start_op_count` is cleared on the
+                    // sibling `bridge_body_start_op_counts` is cleared on the
                     // Abort/Decline arm and in `clear_tracing_session_state` but
                     // not here, which is why this arm needs its own reset rather
                     // than a shared teardown.
@@ -4764,7 +4767,7 @@ impl<S: JitState> JitDriver<S> {
     #[inline(never)]
     fn clear_tracing_session_state(&mut self) {
         self.sym = None;
-        self.bridge_body_start_op_count = None;
+        self.bridge_body_start_op_counts = None;
         self.bridge_attempt_declined = false;
         self.meta.clear_trace_session();
     }
@@ -7737,65 +7740,6 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
-    #[allow(dead_code)]
-    fn decode_descriptor_values(
-        descriptor: Option<&JitDriverStaticData>,
-        raw_values: &[i64],
-    ) -> Option<Vec<Value>> {
-        let descriptor = descriptor?;
-        let reds = descriptor.reds();
-        if reds.len() != raw_values.len() {
-            return None;
-        }
-        Some(
-            reds.iter()
-                .zip(raw_values.iter().copied())
-                .map(|(var, raw)| match var.tp {
-                    Type::Int => Value::Int(raw),
-                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                    Type::Void => Value::Void,
-                })
-                .collect(),
-        )
-    }
-
-    #[allow(dead_code)]
-    fn decode_exit_layout_values(raw_values: &[i64], layout: &CompiledExitLayout) -> Vec<Value> {
-        layout
-            .exit_types
-            .iter()
-            .enumerate()
-            .map(|(index, tp)| {
-                let raw = raw_values.get(index).copied().unwrap_or(0);
-                match tp {
-                    Type::Int => Value::Int(raw),
-                    Type::Ref => Value::Ref(majit_ir::GcRef(raw as usize)),
-                    Type::Float => Value::Float(f64::from_bits(raw as u64)),
-                    Type::Void => Value::Void,
-                }
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    fn resume_layout_with_descriptor_slot_types(
-        descriptor: Option<&JitDriverStaticData>,
-        resume_layout: &ResumeLayoutSummary,
-    ) -> Option<ResumeLayoutSummary> {
-        let descriptor = descriptor?;
-        let red_types: Vec<Type> = descriptor.reds().iter().map(|var| var.tp).collect();
-        let last = resume_layout.frame_layouts.last()?;
-        if last.slot_types.is_some() || last.slot_layouts.len() != red_types.len() {
-            return None;
-        }
-        let mut patched = resume_layout.clone();
-        if let Some(last) = patched.frame_layouts.last_mut() {
-            last.slot_types = Some(red_types);
-        }
-        Some(patched)
-    }
-
     /// Invalidate a compiled loop, forcing fallback to interpretation.
     pub fn invalidate_loop(&mut self, green_key: u64) {
         self.meta.invalidate_loop(green_key);
@@ -7996,15 +7940,15 @@ impl<S: JitState> JitDriver<S> {
         self.meta.last_compiled_key()
     }
 
-    /// Flag read by `GUARD_NOT_INVALIDATED` in the last successful artifact.
-    pub fn last_compiled_artifact_invalidation_flag(
+    /// Owning loop token of the last successful loop/bridge artifact.
+    pub fn last_compiled_artifact_token(
         &self,
-    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        self.meta.last_compiled_artifact_invalidation_flag()
+    ) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+        self.meta.last_compiled_artifact_token()
     }
 
-    pub fn clear_last_compiled_artifact_invalidation_flag(&mut self) {
-        self.meta.clear_last_compiled_artifact_invalidation_flag();
+    pub fn clear_last_compiled_artifact_token(&mut self) {
+        self.meta.clear_last_compiled_artifact_token();
     }
 
     /// warmstate.py:437-444 starting cell's green_key (the cell on which
@@ -8425,7 +8369,7 @@ impl<S: JitState> JitDriver<S> {
         // Same reason as the primary trace entry: the bridge compile decodes
         // frame value counts through the per-thread store, so aim it here.
         self.republish_state_field_fvc();
-        self.bridge_body_start_op_count = None;
+        self.bridge_body_start_op_counts = None;
         self.bridge_attempt_declined = false;
         // compile.py `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
@@ -8829,7 +8773,11 @@ impl<S: JitState> JitDriver<S> {
                 ctx.synchronize_virtualizable_after_guard_failure();
             }
         }
-        self.bridge_body_start_op_count = self.meta.tracing.as_ref().map(|ctx| ctx.num_ops());
+        self.bridge_body_start_op_counts = self
+            .meta
+            .tracing
+            .as_ref()
+            .map(|ctx| (ctx.num_ops(), ctx.recorded_ops_total()));
         self.meta.begin_trace_session(trace_meta);
         // resume.py:1047-1055 parity:
         //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,

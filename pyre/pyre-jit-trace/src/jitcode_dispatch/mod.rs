@@ -495,7 +495,7 @@ impl CalleeLocalsShadow {
 /// One inlined-callee level of the walk's framestack.
 pub struct InlineFrame {
     /// Callee `w_code`, used by the recursion-depth scan. Once the same code
-    /// reaches [`FBW_MAX_INLINE_RECURSION`], the call folds to a residual
+    /// reaches the live `max_unroll_recursion`, the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
     pub w_code: usize,
     /// Paused levels sitting between this callee and the next one out,
@@ -1461,8 +1461,7 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
 /// Compile-time-constant frame fields of an inlined callee.
 #[derive(Clone, Copy)]
 pub struct InlineCalleeConsts {
-    /// `frame.w_globals` object (`VABLE_NAMESPACE_FIELD_IDX` = 4): the
-    /// callee function's `__globals__` as a `PyObjectRef`.
+    /// The callee function's `__globals__` as a `PyObjectRef`.
     w_globals: usize,
     /// `frame.pycode` (`VABLE_CODE_FIELD_IDX` = 1): the callee's `W_Code`
     /// pointer.
@@ -5065,15 +5064,113 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     if let Some(consts) = ctx.inline_callee_consts {
         return Ok(consts.w_globals == expected_globals as usize);
     }
-    let Some(w_globals_op) = ctx
-        .trace_ctx
-        .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
-    else {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
         return Ok(false);
-    };
+    }
+    let w_globals_op = unsafe { (&*sym_ptr).frame_w_globals() };
+    if w_globals_op.is_none() {
+        return Ok(false);
+    }
     let expected = ctx.trace_ctx.const_ref(expected_globals as i64);
     if w_globals_op.is_constant() {
-        return Ok(ctx.trace_ctx.const_value(w_globals_op) == Some(expected_globals as i64));
+        if ctx.trace_ctx.const_value(w_globals_op) != Some(expected_globals as i64) {
+            return Ok(false);
+        }
+        // The constant is the RECORDING frame's namespace, published from
+        // `pycode.w_globals`, which is green because `pycode.py
+        // frame_stores_global` keeps the FIRST namespace a code object runs
+        // under.  It therefore cannot tell that frame apart from one running
+        // the same code object under a second `exec(code, ns)`: that frame
+        // carries its own namespace in `debugdata` and still enters this loop
+        // under the same `(code, pc)` warm key.  AGENTS.md "One red frame per
+        // frame" — read the live red frame instead of trusting the anchor.
+        //
+        // `pyframe.py get_w_globals` is `debugdata.w_globals` when the frame
+        // carries a payload and `promote(pycode).w_globals` when it does not,
+        // so emit that shape.  `debugdata` is a virtualizable field, so the
+        // read answers from `virtualizable_boxes` and records no op — the same
+        // route `fast2locals`' fold takes for the neighbouring `w_locals`.
+        let Some((debugdata_op, majit_ir::Value::Ref(recorded))) = ctx
+            .trace_ctx
+            .virtualizable_entry_at(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+        else {
+            return Ok(false);
+        };
+        if recorded == majit_ir::GcRef::NO_CONCRETE {
+            // "no recorded word" is not "recorded a null word", and it is also
+            // not an address to read a payload out of.
+            return Ok(false);
+        }
+        // `createframe_obj` allocates the payload only when
+        // `frame_stores_global` reports the frame's namespace differs from the
+        // published one, so the recorded direction is what separates the two
+        // arms — and each is pinned so a frame on the other one side-exits.
+        let present = recorded.as_usize() != 0;
+        if present {
+            // Read the override through the SHADOW's payload, which is what the
+            // emitted `getfield_gc_r` reads, and decline before emitting
+            // anything if it is not the namespace this fold answers with.  A
+            // tracing shadow hands out a clone of the payload around the same
+            // fields, so the value is the invariant to check — never the
+            // holder's address.
+            let shadow = recorded.as_usize() as *const pyre_interpreter::pyframe::FrameDebugData;
+            if unsafe { (*shadow).w_globals } != expected_globals {
+                return Ok(false);
+            }
+        }
+        // `pyjitpl.py _establish_nullity`: a box's nullity is immutable, so a
+        // guard the trace already carries answers for every later fold site.
+        // Every LOAD_GLOBAL in the frame reaches here, and a trace that
+        // re-records the same guard per site spends its `trace_limit` on ops
+        // the optimizer then removes.
+        let known = ctx
+            .trace_ctx
+            .heap_cache()
+            .is_nullity_known(debugdata_op, |op| {
+                op.inline_const_to_value().and_then(|v| match v {
+                    majit_ir::Value::Int(n) => Some(n),
+                    majit_ir::Value::Ref(gc) => Some(gc.0 as i64),
+                    _ => None,
+                })
+            });
+        if known != Some(present) {
+            let opcode = if present {
+                OpCode::GuardNonnull
+            } else {
+                OpCode::GuardIsnull
+            };
+            walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, &[debugdata_op])?;
+            ctx.trace_ctx
+                .heap_cache_mut()
+                .nullity_now_known(debugdata_op, present);
+        }
+        if !present {
+            // No payload, so the namespace IS `pycode.w_globals` — the constant
+            // already compared above.
+            return Ok(true);
+        }
+        // The payload's `w_globals` is the authority, and it is a mutable
+        // field, so the read stays a real load off the live frame's payload.
+        // The payload address itself is per-frame — every call allocates one —
+        // so only the value it holds can be guarded.
+        let live = crate::state::opimpl_getfield_gc_r(
+            ctx.trace_ctx,
+            debugdata_op,
+            crate::descr::frame_debug_data_w_globals_descr(),
+        );
+        if !live.is_constant() {
+            walker_emit_fold_guard_with_snapshot(
+                ctx,
+                op_pc,
+                OpCode::GuardValue,
+                &[live, expected],
+            )?;
+            // The guard proved the read; hand the heapcache the constant so the
+            // next fold site reads it back instead of guarding again.
+            ctx.trace_ctx.heap_cache_mut().replace_box(live, expected);
+        }
+        return Ok(true);
     }
     // pypy/objspace/std/celldict.py `elidable_promote('0,1,2')` promotes
     // `w_dict`; mirror that by pinning the runtime frame's w_globals identity.
@@ -5091,21 +5188,15 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
 
 fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
-    ei: &majit_ir::EffectInfo,
-    allboxes: &mut [OpRef],
+    runtime_helper: majit_ir::RuntimeHelperKind,
+    r_args: &mut [OpRef],
 ) {
-    if ei.runtime_helper != majit_ir::RuntimeHelperKind::LoadGlobal {
+    if runtime_helper != majit_ir::RuntimeHelperKind::LoadGlobal {
         return;
     }
-    let Some(ns_box) = allboxes.get_mut(1) else {
+    let Some(ns_box) = r_args.first_mut() else {
         return;
     };
-    let Some(Value::Ref(majit_ir::GcRef(ns_ptr))) = ctx.trace_ctx.box_value(*ns_box) else {
-        return;
-    };
-    if !majit_gc::can_move(majit_ir::GcRef(ns_ptr)) {
-        return;
-    }
 
     // `pyframe.py:128-132 LOAD_GLOBAL` asks the current MIFrame for
     // `self.get_w_globals()`.  An inline sub-walk therefore has to source the
@@ -5126,9 +5217,22 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
             .filter(|frame| !frame.is_none())
         else {
             // The old single-frame inline path has no callee red to read.  Do
-            // not borrow the root frame: the residual's unbound callee-frame
-            // argument will decline this trace instead of compiling the wrong
-            // namespace.
+            // not borrow the root frame — that collapses caller and callee
+            // identity — but the callee's OWN `__globals__` is recorded right
+            // here, and `try_walker_load_global_cell_fold`'s builtins leg is
+            // written for exactly this case (`frame_ptr == 0`, deriving the
+            // builtin module from the namespace's `__builtins__` cell).  Naming
+            // it directly is what lets that leg run; leaving the codewriter's
+            // null placeholder standing declines the fold and then aborts the
+            // trace on the residual's unbound callee-frame argument.
+            //
+            // Immovable only, matching `guard_current_frame_globals_identity`,
+            // where both fold legs end: a movable namespace declines there
+            // anyway, so substituting one would buy nothing and bake a pointer
+            // the GC may forward into the surviving residual.
+            if consts.w_globals != 0 && !majit_gc::can_move(majit_ir::GcRef(consts.w_globals)) {
+                *ns_box = ctx.trace_ctx.const_ref(consts.w_globals as i64);
+            }
             return;
         };
         let w_globals = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame);
@@ -5141,10 +5245,12 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
         return;
     }
 
-    if let Some(w_globals_op) = ctx
-        .trace_ctx
-        .virtualizable_box_at(VABLE_NAMESPACE_FIELD_IDX)
-    {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return;
+    }
+    let w_globals_op = unsafe { (&*sym_ptr).frame_w_globals() };
+    if !w_globals_op.is_none() {
         *ns_box = w_globals_op;
     }
 }
@@ -5885,17 +5991,23 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                         active.push(m);
                         continue;
                     }
-                    // The mirror did not supply this operand-stack slot, so the
-                    // decoded edge-move recovery below is the only other
-                    // per-slot source.  Without an entry for this color the
-                    // fallback reads the resume merge color out of the guard-pc
-                    // register file, where it is unwritten at the guard point or
-                    // reused by the regalloc — the #424 staleness the per-slot
-                    // mirror was introduced to replace.  The kept-stack gate
-                    // admits a valid mirror on the stated grounds that this
-                    // recovery covers such a slot; report the case where that is
-                    // false so the caller declines rather than encode the stale
-                    // read.
+                    // The mirror did not supply this operand-stack slot.  Two
+                    // other per-slot sources remain, and only the absence of
+                    // BOTH is a hole: the decoded edge-move recovery
+                    // (`kept_recovered`, tested below) and the virtualizable
+                    // shadow, which the resolution further down already treats
+                    // as authoritative for a slot the guard pc's color map does
+                    // not claim (`shadow_is_real` → `vbox`).  Where neither
+                    // answers, the fallback reads the resume merge color out of
+                    // the guard-pc register file, unwritten at the guard point
+                    // or reused by the regalloc — the #424 staleness the
+                    // per-slot mirror replaced; report that case so the caller
+                    // declines rather than encode the stale read.  Declining
+                    // where the shadow does answer is not free: the capture
+                    // point sits after a residual has run, so it lands as a
+                    // `fbw_rolled_back_with_effects` double-apply
+                    // (`raise_reg_unbound_jitstress`, mirror at depth 1 against
+                    // a guard resuming at depth 3).
                     //
                     // Restricted to a NONE hole, where there is demonstrably no
                     // source at all.  A NULL const-ptr is NOT declined, and that
@@ -5929,12 +6041,33 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                     // refuses to source either.  The register file draws that
                     // distinction, and upstream keeps the NULL: PyPy's MIFrame
                     // registers preserve CONST_NULL in snapshots.
+                    //
+                    // The shadow is the other source the resolution below
+                    // already consults: for an operand-stack slot the guard
+                    // pc's color map does not claim, it reads
+                    // `virtualizable_box_at(NUM_VABLE_SCALARS + sem)`.  A hole
+                    // that arm resolves must not be reported either, or the
+                    // decline lands as `fbw_rolled_back_with_effects` at a
+                    // capture point a residual has already run past — on
+                    // `raise_reg_unbound_jitstress` the walk mirror stands at
+                    // depth 1 while the branch guard resumes at depth 3, and
+                    // both kept slots read NONE from the mirror and a live
+                    // `RefOp` from the shadow.
                     if m == OpRef::NONE
                         && !kept_recovered.contains_key(&idx)
                         && guard_owned_slot != Some(sem)
                     {
-                        if let Some(first) = unrecovered_kept.as_deref_mut() {
-                            first.get_or_insert(idx);
+                        let shadow_sources_slot = trace_ctx
+                            .virtualizable_box_at(crate::virtualizable_gen::NUM_VABLE_SCALARS + sem)
+                            .is_some_and(|b| {
+                                b != OpRef::NONE
+                                    && !opref_is_null_const_ptr(b)
+                                    && b.ty() == Some(majit_ir::Type::Ref)
+                            });
+                        if !shadow_sources_slot {
+                            if let Some(first) = unrecovered_kept.as_deref_mut() {
+                                first.get_or_insert(idx);
+                            }
                         }
                     }
                 }
@@ -5985,40 +6118,7 @@ fn collect_outer_active_boxes<Sym: WalkSym>(
                 .filter(|&v| v != OpRef::NONE && !opref_is_null_const_ptr(v));
             let red_field = if color as u16 == portal_frame_reg {
                 sym.frame()
-            } else if !sym.execution_context().is_none() {
-                // EC red already seeded on this snapshot path.
-                sym.execution_context()
-            } else if !sym.frame().is_none() {
-                // Adapter / inline-caller snapshot path leaves
-                // `sym.execution_context` unseeded (`OpRef::NONE`).  This is the
-                // pre-guard inline-parent-frame collection (the paused caller's
-                // active boxes are built BEFORE the callee sub-walk records its
-                // guards), so recording the recovery getfield here is
-                // well-ordered. Recover the EC from the frame the same way the
-                // `MIFrame::ensure_execution_context` does
-                // (trace_opcode.rs): record `getfield
-                // frame.execution_context` and route that OpRef through as the
-                // portal EC red, so the resume snapshot never pushes NONE for
-                // `interp_jit.py reds = ['frame', 'ec']`.  A NONE EC escapes
-                // as a null execution-context pointer and SIGSEGVs (rc=139) or
-                // trips the Ref-bank NONE guard (rc=101).
-                //
-                // The post-guard snapshot-capture path
-                // (`walker_capture_snapshot_for_last_guard`) reaches this fn with
-                // the outer full-body `sym`, whose EC is eagerly recovered at
-                // walk entry (`seed_execution_context_for_walk`) — so on that
-                // path `sym.execution_context` is already real above and this
-                // branch (which would record AFTER the guard, a use-before-def)
-                // is not taken.
-                trace_ctx.record_op_with_descr(
-                    OpCode::GetfieldGcR,
-                    &[sym.frame()],
-                    crate::descr::pyframe_execution_context_descr(),
-                )
             } else {
-                // Neither EC nor frame is recoverable: keep the raw NONE so the
-                // downstream Ref-bank NONE guard surfaces the unrecoverable case
-                // instead of silently masking it.
                 sym.execution_context()
             };
             live_reg
@@ -6277,9 +6377,12 @@ pub(crate) enum GuardStampTarget {
     GuardFromEnd(usize),
 }
 
-/// `rlib/jit.py` `max_unroll_recursion` default (= warmstate
-/// `DEFAULT_MAX_UNROLL_RECURSION`).
-const FBW_MAX_INLINE_RECURSION: usize = 7;
+/// Fallback for `rlib/jit.py` `max_unroll_recursion` when a skeleton walk has
+/// no live driver/warmstate to consult. Production must read the parameter
+/// from warmstate: `pypyjit.set_param(max_unroll_recursion=...)` updates it at
+/// runtime, and `_opimpl_recursive_call` (`pyjitpl.py`) compares against that
+/// live memory-manager value rather than the default.
+const FBW_DEFAULT_MAX_INLINE_RECURSION: usize = 7;
 
 /// Upper bound on the parameter count the self-recursive `CALL_ASSEMBLER` fold
 /// accepts. Accumulator/linear recursion is low-arity; the cap keeps a
@@ -8108,12 +8211,8 @@ fn walker_concrete_ref_object<Sym: WalkSym>(
     }
 }
 
-/// Resolve the walker's execution-context OpRef from the outer
-/// portal `sym.frame` (via [`fbw_mode.snapshot_sym`]), recovering it off
-/// the frame with `GetfieldGcR(frame, execution_context)` when
-/// `sym.execution_context` is unseeded.  Mirrors the inline-frame EC
-/// recovery (jitcode_dispatch.rs `try_walker_inline_self_recursive`) and
-/// `MIFrame::ensure_execution_context` (`trace_opcode.rs`).
+/// Resolve the walker's execution-context OpRef from the outer portal's
+/// separately carried second red (`interp_jit.py reds = ['frame', 'ec']`).
 ///
 /// `None` outside a production full-body walk (no materialized portal sym)
 /// or when the portal frame OpRef is unset — the PUSH_EXC_INFO / POP_EXCEPT
@@ -8126,41 +8225,28 @@ fn walker_ensure_execution_context<Sym: WalkSym>(
         return None;
     }
     let sym = unsafe { &*sym_ptr };
-    if !sym.execution_context().is_none() {
-        return Some(sym.execution_context());
-    }
-    let frame = sym.frame();
-    if frame.is_none() {
-        return None;
-    }
-    let ec = ctx.trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[frame],
-        crate::descr::pyframe_execution_context_descr(),
-    );
-    Some(ec)
+    (!sym.execution_context().is_none()).then(|| sym.execution_context())
 }
 
-/// Eagerly recover the portal EC red before the full-body walk records its
-/// first guard, caching it into `sym.execution_context`.
+/// Recover the portal EC red before the full-body walk records its first guard.
 ///
 /// The portal `[frame, ec]` reds (`interp_jit.py reds = ['frame', 'ec']`)
 /// are force-alived in every `-live-` op's R-bank, so every guard's resume
-/// snapshot lists the EC color.  Loop / function-entry syms seed
-/// `sym.execution_context = InputArgRef(1)` at `create_sym`, but a
-/// bridge-from-guard sym whose ec color collides with a real frame slot is
-/// left `OpRef::NONE` by `setup_bridge_sym` (state.rs), which defers
-/// the recovery to `ensure_execution_context`.
+/// snapshot lists the dedicated EC color. Loop/function-entry syms seed
+/// `InputArgRef(1)` and bridge setup decodes the failing guard's corresponding
+/// inputarg into the same field — except where the guard's resume data named
+/// no value at that color, which leaves the sym with none.
 ///
 /// The walker's snapshot-capture path
 /// (`walker_capture_snapshot_for_last_guard` → `collect_outer_active_boxes`)
-/// runs AFTER the guard, so recording the recovery there would place the
-/// getfield after the guard that references it (a use-before-def; the resume
-/// position would also stamp onto the getfield rather than the guard, leaving
+/// runs AFTER the guard, so recording the recovery there would place the read
+/// after the guard that references it (a use-before-def; the resume
+/// position would also stamp onto the read rather than the guard, leaving
 /// the guard with `resume_pos = -1`).  Recover here instead — at walk entry,
 /// before any opcode is dispatched and thus before any guard. When the EC is
-/// already seeded, or the frame
-/// itself is unset, this is a no-op.
+/// already seeded, or the frame itself is unset, this is a no-op: a frameless
+/// sym's first `ec` consumer goes through `MIFrame::ensure_execution_context`,
+/// which records the same read at an ordinary dispatch position.
 pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
     sym: &mut Sym,
     trace_ctx: &mut TraceCtx,
@@ -8168,11 +8254,8 @@ pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
     if !sym.execution_context().is_none() || sym.frame().is_none() {
         return;
     }
-    let ec = trace_ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[sym.frame()],
-        crate::descr::pyframe_execution_context_descr(),
-    );
+    let ec =
+        crate::helpers::emit_current_execution_context(trace_ctx, "ExecutionContext::WalkEntry");
     sym.set_execution_context(ec);
 }
 
@@ -10778,9 +10861,10 @@ pub(crate) fn ec_hook_installed() -> bool {
 /// on cpython 3.14.6, on pypy3 7.3.22 and for a callee left residual.
 ///
 /// `w_tracefunc` is an ExecutionContext field rather than a frame one, so the
-/// read goes through the portal frame's `execution_context`.  Both reads are
-/// registered with the heapcache, so a run of merge points with no intervening
-/// call collapses to one pair, and both are loop-invariant.
+/// read goes through the portal's own `ec` red (`interp_jit.py reds =
+/// ['frame', 'ec']`) rather than a frame field.  The read is registered with
+/// the heapcache, so a run of merge points with no intervening call collapses
+/// to one, and it is loop-invariant.
 ///
 /// A trace recorded while the slot is ALREADY non-NULL records nothing: there
 /// is no fold to validate, and `try_walker_inline_resolved_user_call_inner`
@@ -10802,26 +10886,8 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     if ec.is_null() || !unsafe { (*ec).w_tracefunc }.is_null() {
         return Ok(());
     }
-    let Some(frame_box) = ctx.trace_ctx.standard_virtualizable_box() else {
+    let Some(ec_box) = walker_ensure_execution_context(ctx) else {
         return Ok(());
-    };
-    let ec_descr = crate::descr::pyframe_execution_context_descr();
-    let ec_descr_index = ec_descr.index();
-    let ec_box = match ctx
-        .trace_ctx
-        .heapcache_getfield_cached(frame_box, ec_descr_index)
-    {
-        Some(cached) => cached,
-        None => {
-            let read =
-                ctx.trace_ctx
-                    .record_op_with_descr(OpCode::GetfieldGcR, &[frame_box], ec_descr);
-            ctx.trace_ctx
-                .heapcache_getfield_now_known(frame_box, ec_descr_index, read);
-            ctx.trace_ctx
-                .set_opref_concrete(read, Value::Ref(majit_ir::GcRef(ec as usize)));
-            read
-        }
     };
     let descr = crate::descr::ec_w_tracefunc_descr();
     let descr_index = descr.index();

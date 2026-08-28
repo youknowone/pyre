@@ -11344,15 +11344,13 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         }
     }
     if !inline_level {
-        // `ec = space.getexecutioncontext()` — recovered off the portal frame,
-        // the same route `walker_ec_enter` takes (`inline_call.rs`).
-        let ec_op = ctx.trace_ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[vable_op],
-            crate::descr::pyframe_execution_context_descr(),
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(ec_op, majit_ir::Value::Ref(majit_ir::GcRef(ec as usize)));
+        // `ec = space.getexecutioncontext()` is the portal's second red,
+        // carried independently of the virtualizable frame.
+        let Some(ec_op) = walker_ensure_execution_context(ctx) else {
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_emit_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        };
         // `f = ec.gettopframe_nohidden()` followed by
         // `_do_jit_force_virtual`'s standard-box identity guard.
         let topframeref_op = ctx.trace_ctx.record_op_with_descr(

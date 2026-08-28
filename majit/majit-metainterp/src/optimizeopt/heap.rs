@@ -4705,8 +4705,7 @@ mod tests {
     }
 
     /// Same shape as `test_getfield_read_after_read`, but through a descr that
-    /// owns a parent SizeDescr and sits at a non-zero slot — the production
-    /// shape (`PyFrame.execution_context` is `index_in_parent: 7`). The
+    /// owns a parent SizeDescr and sits at a non-zero slot. The
     /// parentless `TestDescr` used by the sibling test takes
     /// `field_slot_index`'s `Descr::index()` fallback, so it never exercises
     /// the `index_in_parent` slot that `ensure_ptr_info_arg0` sizes the
@@ -4811,10 +4810,9 @@ mod tests {
     /// it instead of upgrading, so the write is dropped and every later read of
     /// the same field misses.
     ///
-    /// `inline_helper` traces exactly this: six `getfield_gc_r(p0,
-    /// PyFrame.execution_context)` off one frame, none folded, which keeps the
-    /// frame push/pop `topframeref` stores from cancelling and forces the
-    /// virtual `VRef` that `NewWithVtable`/`ForceToken` then materialise.
+    /// Inline-frame helpers exercise the same general shape for ordinary heap
+    /// fields read from a virtualizable receiver; those reads must still fold
+    /// exactly as they do on a plain `InstancePtrInfo` receiver.
     #[test]
     fn getfield_off_a_virtualizable_receiver_is_still_cached() {
         use crate::optimizeopt::info::{PtrInfo, VirtualizableFieldState};

@@ -864,8 +864,8 @@ fn try_commit_midbody_abort_inner(
     if cf_addr == 0 {
         return Err(MidBodyDecline::BeforeRun("no live caller frame"));
     }
-    let ec = unsafe { (*(cf_addr as *const pyre_interpreter::PyFrame)).execution_context }
-        as *mut pyre_interpreter::PyExecutionContext;
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
         return Err(MidBodyDecline::BeforeRun("null execution context"));
     }
@@ -1845,7 +1845,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         recipe,
         root_ec,
         root_ec_box,
-        root_frame_box,
         Vec::new(),
     ) else {
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
@@ -2283,7 +2282,6 @@ fn drive_middle_frame_and_thread<Sym: WalkSym>(
         middle,
         root_ec,
         root_ec_box,
-        root_frame_box,
         Vec::new(),
     ) else {
         crate::jitcode_dispatch::census_record("P2Drain::MiddleSetupFailed");
@@ -3321,10 +3319,8 @@ fn try_adopt_multi_frame_blackhole(
     drop(locals_undo);
     drop(image_ref_roots);
     drop(root_stack);
-    let ec = unsafe {
-        (*(cf_addr as *mut pyre_interpreter::PyFrame)).execution_context
-            as *mut pyre_interpreter::PyExecutionContext
-    };
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     // Rooted for the whole drive: once the tracer stores a `JitVirtualRef` in
     // the chain the displaced value is a nursery object, and a collection
     // inside the drive would leave the restore below writing back a pre-move
@@ -5862,7 +5858,7 @@ fn loop_inlines_abort_permanent_callee(
     // the walk mutates anything.
     unsafe {
         let cf = &*(cf_addr as *const pyre_interpreter::pyframe::PyFrame);
-        let root_globals = cf.w_globals;
+        let root_globals = cf.get_w_globals();
         if root_globals.is_null() {
             return None;
         }
@@ -6852,9 +6848,10 @@ pub mod fbw_diag {
     /// the same Box the parent trace did.  `BRIDGE_EC_MISSING` is the fallback:
     /// a skeleton jitcode has no portal red colors (`u16::MAX`) and a resumed
     /// register can be empty, and either way `sym.execution_context` stays
-    /// `NONE`, so the first consumer re-derives it with a `GetfieldGcR` off the
-    /// frame.  That re-derivation is sound but is not the live red, and nothing
-    /// else distinguishes the two.
+    /// `NONE`, so the first consumer re-derives it by asking the thread
+    /// (`MIFrame::ensure_execution_context`).  That re-derivation is sound but
+    /// costs a residual call the live red does not, and nothing else
+    /// distinguishes the two.
     pub const BRIDGE_EC_FROM_PORTAL_RED: usize = 17;
     pub const BRIDGE_EC_MISSING: usize = 18;
 

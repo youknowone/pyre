@@ -3684,6 +3684,20 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// `history.py JitCellToken` as seen by `quasiimmut.py QuasiImmut`.
+///
+/// A quasi-immutable dependency belongs to the owning loop token, never to
+/// one machine-code fragment.  `QuasiImmut.invalidate` marks that token
+/// invalid and asks the CPU to activate every still-unpatched
+/// `GUARD_NOT_INVALIDATED` in the loop and its bridges.  Keeping this as a
+/// trait avoids making the interpreter object model depend on a backend
+/// implementation while preserving the upstream ownership shape.
+pub trait QuasiImmutLoopToken: Send + Sync + std::fmt::Debug {
+    /// `quasiimmut.py QuasiImmut.invalidate` —
+    /// `looptoken.invalidated = True; cpu.invalidate_loop(looptoken)`.
+    fn invalidate_for_quasi_immut(&self);
+}
+
 /// `quasiimmut.py QuasiImmut` seen from the JIT side — one object
 /// gathering the loops that folded a single quasi-immutable field.
 ///
@@ -3698,7 +3712,7 @@ pub trait QuasiImmutHandle: Send + Sync + std::fmt::Debug {
 
     /// `quasiimmut.py register_loop_token`, reached from
     /// `compile.py:204-207`.
-    fn register_loop_token(&self, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>);
+    fn register_loop_token(&self, token: &std::sync::Arc<dyn QuasiImmutLoopToken>);
 
     /// Identity of the instance behind the handle.
     ///

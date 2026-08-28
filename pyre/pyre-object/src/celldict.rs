@@ -1406,7 +1406,8 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut strategy = ModuleDictStrategy::new();
         let flag = Arc::new(AtomicBool::new(false));
-        strategy.current_version_qmut().register_loop_token(&flag);
+        let token = crate::quasiimmut::test_loop_token(&flag);
+        strategy.current_version_qmut().register_loop_token(&token);
         // Before a structural change the watching loop is still valid.
         assert!(!flag.load(Ordering::Acquire));
         // `mutated()` reassigns `version` and must invalidate the loop.
@@ -1420,9 +1421,10 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         let mut strategy = ModuleDictStrategy::new();
         let flag = Arc::new(AtomicBool::new(false));
-        strategy.current_version_qmut().register_loop_token(&flag);
+        let token = crate::quasiimmut::test_loop_token(&flag);
+        strategy.current_version_qmut().register_loop_token(&token);
         // Drop the only strong ref: the weak watcher can no longer upgrade.
-        drop(flag);
+        drop(token);
         // notify (via mutated) must not panic, and `_invalidate_now` unlinks
         // the instance whether or not any flag could still be upgraded.
         strategy.mutated();

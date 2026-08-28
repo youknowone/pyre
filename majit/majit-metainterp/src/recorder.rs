@@ -217,6 +217,12 @@ pub struct Trace {
     /// opencoder.py parity: count of box-yielding positions
     /// (inputargs + non-void ops).
     box_count: u32,
+    /// Monotonic count of operations appended during this recording session.
+    /// Unlike `ops.len()`, this is not rewound by [`Self::cut`].  The bridge
+    /// driver uses it to distinguish an abort before the body walk from a
+    /// body abort whose speculative operations were cut back to the setup
+    /// position (`history.cut` in `pyjitpl.py`).
+    recorded_ops_total: usize,
 }
 
 impl Trace {
@@ -232,6 +238,7 @@ impl Trace {
             op_count: 0,
             guard_count: 0,
             box_count: 0,
+            recorded_ops_total: 0,
         }
     }
 
@@ -360,6 +367,7 @@ impl Trace {
         let op = Op::new(opcode, &self.box_args(args));
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
+        self.recorded_ops_total += 1;
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -380,6 +388,7 @@ impl Trace {
         let op = Op::with_descr(opcode, &self.box_args(args), descr);
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
+        self.recorded_ops_total += 1;
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -409,6 +418,7 @@ impl Trace {
         };
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
+        self.recorded_ops_total += 1;
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -436,6 +446,7 @@ impl Trace {
         op.pos.set(opref);
         op.setfailargs(self.box_args(fail_args).iter().cloned().collect());
         self.ops.push(OpRc::new(op));
+        self.recorded_ops_total += 1;
         self.op_count += 1;
         if opcode.result_type() != Type::Void {
             self.box_count += 1;
@@ -590,6 +601,7 @@ impl Trace {
         };
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
+        self.recorded_ops_total += 1;
         self.op_count += 1;
         if OpCode::Jump.result_type() != Type::Void {
             self.box_count += 1;
@@ -603,6 +615,7 @@ impl Trace {
         let op = Op::with_descr(OpCode::Finish, &self.box_args(finish_args), descr);
         op.pos.set(opref);
         self.ops.push(OpRc::new(op));
+        self.recorded_ops_total += 1;
         self.op_count += 1;
         if OpCode::Finish.result_type() != Type::Void {
             self.box_count += 1;
@@ -667,6 +680,12 @@ impl Trace {
     /// `MetaInterp.blackhole_if_trace_too_long` (pyjitpl.py).
     pub fn num_ops(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Number of operations ever appended to this recorder, including
+    /// speculative operations subsequently discarded by [`Self::cut`].
+    pub fn recorded_ops_total(&self) -> usize {
+        self.recorded_ops_total
     }
 
     /// Number of input arguments registered.
@@ -849,6 +868,7 @@ mod tests {
         assert_eq!(rec.num_ops(), 2);
         rec.cut(saved);
         assert_eq!(rec.num_ops(), 0);
+        assert_eq!(rec.recorded_ops_total(), 2);
         assert_eq!(rec.num_inputargs(), 1);
     }
 

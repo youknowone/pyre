@@ -777,6 +777,7 @@ fn build_object_descr_group_with_def_path(
         &[],
         &[],
         "",
+        false,
     )
 }
 
@@ -804,6 +805,32 @@ fn build_object_descr_group_keyed_only(
         &[],
         &[],
         cache_key_name,
+        false,
+    )
+}
+
+/// `build_object_descr_group_with_def_path` for a struct the JIT never
+/// allocates and whose pointer may not carry a `GcHeader`.  `headerless` is
+/// what keeps `StructPtrInfo::make_guards` from certifying a runtime type id
+/// off `ref - GcHeader::SIZE`; the `NEW` rewrite shape the flag also selects is
+/// out of reach with no `NEW` to rewrite.
+fn build_headerless_object_descr_group_with_def_path(
+    obj_size: usize,
+    fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
+    simple_name: &str,
+    def_path: &str,
+) -> PyreObjectDescrGroup {
+    build_object_descr_group_with_extra_gc_edges(
+        obj_size,
+        0,
+        0,
+        fields,
+        simple_name,
+        def_path,
+        &[],
+        &[],
+        "",
+        true,
     )
 }
 
@@ -826,6 +853,7 @@ fn build_object_descr_group_with_field_indices(
         &[],
         field_indices,
         "",
+        false,
     )
 }
 
@@ -846,6 +874,7 @@ fn build_object_descr_group_with_extra_gc_edges(
     extra_gc_edges: &[Arc<dyn FieldDescr>],
     field_indices: &[u32],
     cache_key_name: &str,
+    headerless: bool,
 ) -> PyreObjectDescrGroup {
     // `cache_key_name` names the `gc_cache._cache_size` STRUCT identity for a
     // group that publishes under neither name registry.  Zero is the
@@ -908,7 +937,7 @@ fn build_object_descr_group_with_extra_gc_edges(
         cache_key,
         vtable,
         true,
-        false,
+        headerless,
         &specs,
         &gc_edges,
     );
@@ -2602,22 +2631,25 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
 
 /// The `[capacity][items…]` header shared by every list/tuple backing block.
 ///
-/// The `0` type id is load-bearing, not a slot waiting to be filled:
+/// Headerless, and both halves of that are load-bearing.
 /// `items_block_capacity_descr()` is the capacity read for all three list
-/// strategies, and their blocks carry three different runtime tids
-/// (`GC_INT_ARRAY_GC_TYPE_ID`, `GC_FLOAT_ARRAY_GC_TYPE_ID`,
-/// `PY_OBJECT_ARRAY_GC_TYPE_ID` — see the three arms of
-/// `helpers::emit_promote_empty_list_inline`). One descr fronting three tids
-/// can name none of them, so `StructPtrInfo::make_guards` (`optimizeopt/info.rs`)
-/// declines the short-preamble entry rather than pin a layout that holds for
-/// one strategy and not the other two; `unroll_free_retry_rescued` counts the
-/// unrolled attempt that costs. Stamping any single tid here makes the guard
-/// false for the other two block kinds.
+/// strategies, whose blocks carry three different runtime tids
+/// (`GC_INT_ARRAY_GC_TYPE_ID`,
+/// `GC_FLOAT_ARRAY_GC_TYPE_ID`, `PY_OBJECT_ARRAY_GC_TYPE_ID` — see the three
+/// arms of `helpers::emit_promote_empty_list_inline`), so one descr fronting
+/// them can name none; and `alloc_items_block`, the `PYRE_GC_ITEMSBLOCK=0` and
+/// no-hook fallback, hands back a `std::alloc` block with no `GcHeader` at all.
+/// Either way the loaded pointer must never reach `GUARD_GC_TYPE`, which reads
+/// at `ref - GcHeader::SIZE`.
+///
+/// Leaving the type id at 0 does not express that on its own: the flag
+/// `StructPtrInfo::make_guards` (`optimizeopt/info.rs`) consults is
+/// `headerless`, and an unstamped gc-managed descr is one a second producer for
+/// this key can have a collector identity stamped onto
+/// (`GcCache::register_unresolved_struct_tids`).
 static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    build_headerless_object_descr_group_with_def_path(
         pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
-        0,
-        0,
         &[(
             "capacity",
             pyre_object::object_array::ITEMS_BLOCK_LEN_OFFSET,
@@ -2633,16 +2665,20 @@ static ITEMS_BLOCK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|
 });
 
 // The RPython `tuple2` returned by `rbigint.divmod` / `int_divmod`
-// (rbigint.py:1002/1050). Not a PyObject — no vtable and no allocation type id,
-// because the trace never NEWs one: it arrives as an elidable's result and is
-// only read. Both fields are `Type::Ref`, which is what puts them in
-// `gc_fielddescrs`, and both are immutable, so the two reads CSE the way
-// upstream's pair of `getfield_gc_r` off one `call_pure_r` does.
+// (`rbigint.py` `divmod` / `int_divmod`). Not a PyObject — no vtable, and the
+// trace never NEWs one: it arrives as an elidable's result and is only read.
+//
+// Headerless, because `alloc_rbigint_pair_nursery_collecting` and
+// `alloc_rbigint_pair_no_collect` both end in `malloc_raw` when the collector
+// has no tid for the pair or the nursery cannot satisfy the request, so a
+// loaded pointer may have no `GcHeader` for `GUARD_GC_TYPE` to read.
+//
+// Both fields are `Type::Ref`, which is what puts them in `gc_fielddescrs`, and
+// both are immutable, so the two reads CSE the way upstream's pair of
+// `getfield_gc_r` off one `call_pure_r` does.
 static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    build_headerless_object_descr_group_with_def_path(
         pyre_object::longobject::BIGINT_PAIR_SIZE,
-        0,
-        0,
         &[
             (
                 "item0",
@@ -2668,19 +2704,35 @@ static RBIGINT_PAIR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     )
 });
 
-// `pyframe.py FrameDebugData.w_locals` — the frame's own locals mapping,
-// reached as `self.getorcreatedebug().w_locals` at the head of `fast2locals`
-// (pyframe.py:555-557).  Not a PyObject — no vtable and no allocation type id,
-// because the trace never NEWs one: it arrives as the `debugdata`
-// virtualizable field and is only read.  The field is MUTABLE (`setdictscope`
-// and `fast2locals`' lazy materialisation both rebind it), so the read must
-// not be treated as always-pure.
+// `pyframe.py FrameDebugData` — the payload behind `self.getorcreatedebug()`,
+// holding the frame's own locals mapping (read at the head of `fast2locals`)
+// and the rare per-frame globals override (read by `get_w_globals`).  Not a
+// PyObject — no vtable, and the trace never NEWs one: it arrives as the
+// `debugdata` virtualizable field and is only read.
+//
+// Headerless, because `getorcreate_debug_data` falls back to `malloc_raw`
+// whenever the owning frame is not collector-owned, so a loaded pointer may
+// have no `GcHeader` to read.  A headered declaration has
+// `StructPtrInfo::make_guards` certify the loaded pointer against a type id
+// the GcCache mints from the structural key, which names nothing in the
+// collector's type table and so fails on every check.
+//
+// Both fields are MUTABLE — `setdictscope` and `fast2locals`' lazy
+// materialisation rebind `w_locals`, `set_w_globals` rebinds `w_globals` — so
+// neither read may be treated as always-pure.
 static FRAME_DEBUG_DATA_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_object_descr_group_with_def_path(
+    build_headerless_object_descr_group_with_def_path(
         pyre_interpreter::pyframe::FRAME_DEBUG_DATA_SIZE,
-        0,
-        0,
         &[
+            (
+                "w_globals",
+                pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET,
+                std::mem::size_of::<usize>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
             (
                 "w_locals",
                 pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET,
@@ -2837,17 +2889,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            // `pyframe.py self.w_globals` — the slot the inline
-            // new-PyFrame helper populates from the function's globals dict.
-            (
-                "PyFrame.w_globals",
-                crate::frame_layout::PYFRAME_W_GLOBALS_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
             (
                 "PyFrame.debugdata",
                 crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
@@ -2860,19 +2901,6 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.lastblock",
                 crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
-                8,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            // Inline PyFrame 생성 시 새 frame 의
-            // execution_context 슬롯에 caller 의 ec 를 SetfieldGc 로 쓰기 위해
-            // 필요. RPython parity 는 interp_jit.py:67 reds=[frame, ec] 의 ec
-            // 슬롯과 동등 — pyre 는 ec 를 PyFrame 헤더에 inline 저장.
-            (
-                "PyFrame.execution_context",
-                crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET,
                 8,
                 Type::Ref,
                 false,
@@ -2931,7 +2959,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "PyFrame.failed_attr_cleanup",
                 crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET,
-                std::mem::size_of::<usize>(),
+                std::mem::size_of::<u8>(),
                 Type::Int,
                 false,
                 false,
@@ -2943,6 +2971,7 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         std::slice::from_ref(&PYFRAME_VABLE_TOKEN_FIELD_DESCR),
         &[],
         "",
+        false,
     )
 });
 
@@ -4489,10 +4518,29 @@ pub fn rbigint_pair_item1_descr() -> DescrRef {
     field_descr_from_group(&RBIGINT_PAIR_DESCR_GROUP, 1)
 }
 
+/// Address a `FrameDebugData` field by its byte offset rather than by its
+/// position in the group's list: a field added at the head re-points every
+/// later index, and the reader that keeps a stale one then guards a
+/// neighbouring slot instead of its own.
+fn frame_debug_data_field_descr_at(offset: usize) -> DescrRef {
+    let index = FRAME_DEBUG_DATA_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == offset)
+        .expect("FrameDebugData descr group has no field at requested offset");
+    field_descr_from_group(&*FRAME_DEBUG_DATA_DESCR_GROUP, index)
+}
+
 /// `FrameDebugData.w_locals` — the mapping `getorcreatedebug().w_locals`
 /// reads at the head of `fast2locals` (pyframe.py).
 pub fn frame_debug_data_w_locals_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 0)
+    frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_LOCALS_OFFSET)
+}
+
+/// Rare per-frame globals override installed when one PyCode is executed in
+/// a namespace other than its first-seen globals.
+pub fn frame_debug_data_w_globals_descr() -> DescrRef {
+    frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_GLOBALS_OFFSET)
 }
 
 /// `FrameDebugData.w_extra_locals` — the dict `framelocalsproxy_setitem`
@@ -4501,7 +4549,9 @@ pub fn frame_debug_data_w_locals_descr() -> DescrRef {
 /// `locals()` / `vars()` / `dir()` hand back, so a fold that rebuilds that
 /// mapping from fastlocals alone has to see it.
 pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 1)
+    frame_debug_data_field_descr_at(
+        pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_EXTRA_LOCALS_OFFSET,
+    )
 }
 
 /// `FrameDebugData.w_f_trace` — the frame's own trace function, the slot
@@ -4511,7 +4561,7 @@ pub fn frame_debug_data_w_extra_locals_descr() -> DescrRef {
 /// block, which is the state every frame is in once a trace function has been
 /// called on it.
 pub fn frame_debug_data_w_f_trace_descr() -> DescrRef {
-    field_descr_from_group(&FRAME_DEBUG_DATA_DESCR_GROUP, 2)
+    frame_debug_data_field_descr_at(pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_F_TRACE_OFFSET)
 }
 
 /// `len(bytes)` returns the byte count.  `bytesobject.py` reads it as
@@ -4565,7 +4615,8 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
                  field_size: usize,
                  field_type: Type,
                  flag: ArrayFlag,
-                 is_immutable: bool| SimpleFieldDescrSpec {
+                 is_immutable: bool,
+                 is_quasi_immutable: bool| SimpleFieldDescrSpec {
         index: stable_field_index(offset, field_size, field_type, flag == ArrayFlag::Signed),
         field_key: field_key.to_string(),
         name: field_key.to_string(),
@@ -4573,7 +4624,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
         field_size,
         field_type,
         is_immutable,
-        is_quasi_immutable: false,
+        is_quasi_immutable,
         flag,
         virtualizable: false,
         // The group lists only the four read-only payload fields; the
@@ -4592,6 +4643,19 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             Type::Int,
             ArrayFlag::Unsigned,
             false,
+            false,
+        ),
+        // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
+        // first execution and then promoted. A shared-code frame using a
+        // different namespace keeps its override on FrameDebugData instead.
+        field(
+            "w_globals",
+            pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
+            std::mem::size_of::<pyre_object::PyObjectRef>(),
+            Type::Ref,
+            ArrayFlag::Pointer,
+            false,
+            true,
         ),
         // The slot is written once, by `box_code_object_with_firstlineno`,
         // onto the object `box_code_object` has just boxed out of a fresh
@@ -4604,6 +4668,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             Type::Int,
             ArrayFlag::Signed,
             true,
+            false,
         ),
         field(
             "hidden_applevel",
@@ -4611,6 +4676,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<bool>(),
             Type::Int,
             ArrayFlag::Unsigned,
+            false,
             false,
         ),
         // `co_name` is absent from `_immutable_fields_`, and this slot is
@@ -4622,6 +4688,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<pyre_object::PyObjectRef>(),
             Type::Ref,
             ArrayFlag::Pointer,
+            false,
             false,
         ),
     ];
@@ -4640,28 +4707,41 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
     )
 });
 
+fn pycode_field_descr_at(offset: usize) -> DescrRef {
+    let index = PYCODE_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == offset)
+        .expect("PyCode descr group has no field at requested offset");
+    field_descr_from_group(&*PYCODE_DESCR_GROUP, index)
+}
+
 pub fn pycode_code_ptr_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 0)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_PTR_OFFSET)
+}
+
+pub fn pycode_w_globals_descr() -> DescrRef {
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET)
 }
 
 /// `PyCode.w_name` — the realized `co_name` string.  `w_code_name_obj` builds
 /// it on first demand and retains it, so the slot IS the getter's value once
 /// it is non-null; a null slot declines to the residual, which realizes it.
 pub fn pycode_w_name_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 3)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_NAME_OFFSET)
 }
 
 /// `PyCode.co_firstlineno_raw` — a signed 32-bit slot, because 3.14's
 /// `CodeType` constructor accepts zero and negative first lines that
 /// `CodeObject.first_line_number` cannot hold.
 pub fn pycode_co_firstlineno_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 1)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_CO_FIRSTLINENO_RAW_OFFSET)
 }
 
 /// `PyCode.hidden_applevel` — the frame-hidden flag read by
 /// `PyFrame.hide()`.
 pub fn pycode_hidden_applevel_descr() -> DescrRef {
-    field_descr_from_group(&*PYCODE_DESCR_GROUP, 2)
+    pycode_field_descr_at(pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET)
 }
 
 /// Size descriptor for W_IntObject allocation via NewWithVtable.
@@ -5555,39 +5635,22 @@ pub fn pyframe_code_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 3)
 }
 
-/// R3.3b prep: canonical `PyFrame.w_globals` slot
-/// (PYFRAME_W_GLOBALS_OFFSET).  Used by
-/// `emit_new_pyframe_inline_self_recursive` to populate the
-/// W_DictObject sibling so trace-time chases observe a non-null
-/// PyObjectRef.  `PyFrame.w_globals` is the single globals slot;
-/// the raw dict-storage accessor has been retired.
-pub fn pyframe_w_globals_obj_descr() -> DescrRef {
+/// rewrite.py `handle_call_assembler` scalar field read for the
+/// `debugdata` slot of the virtualizable expansion (Phase D-1 prereq).
+pub fn pyframe_debugdata_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
 }
 
-/// rewrite.py handle_call_assembler scalar field read for the
-/// `debugdata` slot of the virtualizable expansion (Phase D-1 prereq).
-pub fn pyframe_debugdata_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
-}
-
-/// PyFrame.execution_context FieldDescr.
-/// inline PyFrame 생성 시 caller 의 ec 를 새 frame 으로 SetfieldGc 하기 위해.
-/// 호출 사이트는 `helpers.rs::emit_new_pyframe_inline*`.
-pub fn pyframe_execution_context_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
-}
-
 pub fn pyframe_f_generator_nowref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
 }
 
 pub fn pyframe_w_yielding_from_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 9)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 7)
 }
 
 pub fn pyframe_f_backref_descr() -> DescrRef {
-    field_descr_from_group(&PYFRAME_DESCR_GROUP, 10)
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 8)
 }
 
 /// `PyFrame.flags` — the byte carrying `FLAG_ESCAPED`.  Read-or-written by the
@@ -5602,9 +5665,98 @@ pub fn pyframe_flags_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
 }
 
+/// `PyFrame.failed_attr_cleanup` — the byte carrying the failed-attribute
+/// finalizer state.  Its "run the deferred cleanup at the next opcode" value is
+/// `u8::MAX`, so a `NewWithVtable` that leaves the slot holding recycled
+/// nursery bytes can read as an armed request.  Located by offset, like
+/// [`pyframe_flags_descr`], so appending another field cannot repoint it.
+pub fn pyframe_failed_attr_cleanup_descr() -> DescrRef {
+    let index = PYFRAME_DESCR_GROUP
+        .field_descrs
+        .iter()
+        .position(|d| d.offset() == crate::frame_layout::PYFRAME_FAILED_ATTR_CLEANUP_OFFSET)
+        .expect("PyFrame descr group has no failed_attr_cleanup field");
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A JIT-built inline callee frame is a `NewWithVtable` over recycled
+    /// nursery bytes: `Nursery::reset` leaves them as they were
+    /// (`malloc_zero_filled = False`) and the GC rewriter's `clear_gc_fields`
+    /// initialises only the GC-reference slots.  Every non-`Type::Ref` field of
+    /// `PyFrame` therefore owes the emitter an explicit store, and one added to
+    /// the group without it is born holding whatever the previous tenant of
+    /// those bytes left.  `failed_attr_cleanup` was that field: the value it
+    /// reads as "run the deferred cleanup before the next opcode" is `u8::MAX`,
+    /// so a recycled `0xff` made every dispatch on the frame run a full
+    /// non-moving old-gen collection.
+    #[test]
+    fn inline_frame_emitters_store_every_scalar_pyframe_field() {
+        fn setfield_offsets(
+            emit: impl FnOnce(&mut majit_metainterp::TraceCtx) -> Option<majit_ir::OpRef>,
+        ) -> std::collections::BTreeSet<usize> {
+            let mut ctx = majit_metainterp::TraceCtx::for_test(0);
+            emit(&mut ctx).expect("the emitter declines only on a namespace mismatch");
+            ctx.into_recorder()
+                .ops()
+                .iter()
+                .filter(|op| op.opcode == majit_ir::OpCode::SetfieldGc)
+                .filter_map(|op| {
+                    let descr = op.descr.borrow();
+                    descr.as_ref()?.as_field_descr().map(FieldDescr::offset)
+                })
+                .collect()
+        }
+
+        let scalars: Vec<(&str, usize)> = PYFRAME_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .filter(|d| d.field_type() != Type::Ref)
+            .map(|d| (d.field_name(), d.offset()))
+            .collect();
+        // `valuestackdepth`, `last_instr`, `flags`, `failed_attr_cleanup`: a
+        // census that found fewer is reading the wrong group.
+        assert!(scalars.len() >= 4, "scalar field census is vacuous");
+
+        let with_params = setfield_offsets(|ctx| {
+            let pycode = ctx.const_ref(0);
+            let w_globals = ctx.const_ref(0);
+            crate::helpers::emit_new_pyframe_inline_with_params(
+                ctx,
+                &[],
+                &[],
+                0,
+                1,
+                0,
+                pycode,
+                w_globals,
+            )
+        });
+        let self_recursive = setfield_offsets(|ctx| {
+            let arg_box = ctx.const_ref(0);
+            let pycode = ctx.const_ref(0);
+            let w_globals = ctx.const_ref(0);
+            crate::helpers::emit_new_pyframe_inline_self_recursive(
+                ctx, arg_box, 1, 0, pycode, w_globals,
+            )
+        });
+
+        for (emitter, stored) in [
+            ("emit_new_pyframe_inline_with_params", &with_params),
+            ("emit_new_pyframe_inline_self_recursive", &self_recursive),
+        ] {
+            for (name, offset) in &scalars {
+                assert!(
+                    stored.contains(offset),
+                    "{emitter} stores no {name} (offset {offset}), so the field is \
+                     born holding recycled nursery bytes",
+                );
+            }
+        }
+    }
 
     /// Every group that stays out of both name registries still needs a
     /// `gc_cache._cache_size` STRUCT identity.  Sharing the no-identity key
@@ -5640,6 +5792,36 @@ mod tests {
         assert_ne!(
             sentinel,
             Some(pyre_interpreter::pytraceback::PYTRACEBACK_GC_TYPE_ID)
+        );
+    }
+
+    /// A gc-managed declaration that leaves `type_id` at 0 does not thereby opt
+    /// out of `GUARD_GC_TYPE`. `StructPtrInfo::make_guards`
+    /// (`optimizeopt/info.rs`) emits one for any gc-managed, non-headerless
+    /// descr, and it takes the id from whatever the `GcCache` slot for the key
+    /// holds by then — a second producer's collector identity, which the
+    /// runtime header can never match. `headerless` is the flag that declines
+    /// the guard, so a struct that cannot name its runtime tid has to say so.
+    #[test]
+    fn a_gc_managed_group_that_names_no_type_id_declares_itself_headerless() {
+        for (_, force) in DECLARED_GROUPS {
+            force();
+        }
+        let gc = majit_ir::descr::gc_cache().lock().unwrap();
+        let unstamped: Vec<&str> = DECLARED_GROUPS
+            .iter()
+            .filter(|(def_path, _)| {
+                let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
+                gc._cache_size
+                    .get(&key)
+                    .and_then(|descr| descr.as_size_descr())
+                    .is_some_and(|sd| sd.is_gc_managed() && !sd.headerless() && sd.type_id() == 0)
+            })
+            .map(|(def_path, _)| *def_path)
+            .collect();
+        assert!(
+            unstamped.is_empty(),
+            "gc-managed groups with no type id and no headerless declaration: {unstamped:?}",
         );
     }
 
@@ -5727,13 +5909,23 @@ mod tests {
                 true,
             ),
             (
+                pycode_w_globals_descr(),
+                "w_globals",
+                pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                2,
+                false,
+            ),
+            (
                 pycode_hidden_applevel_descr(),
                 "hidden_applevel",
                 pyre_interpreter::pycode::CODE_HIDDEN_APPLEVEL_OFFSET,
                 std::mem::size_of::<bool>(),
                 Type::Int,
                 false,
-                2,
+                3,
                 false,
             ),
             (
@@ -5743,7 +5935,7 @@ mod tests {
                 std::mem::size_of::<pyre_object::PyObjectRef>(),
                 Type::Ref,
                 false,
-                3,
+                4,
                 false,
             ),
         ];
@@ -5758,7 +5950,7 @@ mod tests {
             assert_eq!(field.field_type(), field_type);
             assert_eq!(field.is_field_signed(), signed);
             assert_eq!(descr.is_always_pure(), always_pure, "{name}");
-            assert!(!descr.is_quasi_immutable());
+            assert_eq!(descr.is_quasi_immutable(), name == "w_globals");
             assert_eq!(field.index_in_parent(), index_in_parent);
             let parent = field
                 .get_parent_descr()
@@ -5781,7 +5973,7 @@ mod tests {
         assert_eq!(size.type_id(), pyre_interpreter::pycode::W_CODE_GC_TYPE_ID);
         assert!(size.is_gc_managed());
         assert!(!size.headerless());
-        assert_eq!(size.all_fielddescrs().len(), 4);
+        assert_eq!(size.all_fielddescrs().len(), 5);
     }
 
     #[test]

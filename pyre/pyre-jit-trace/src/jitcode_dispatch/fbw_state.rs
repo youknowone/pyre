@@ -118,6 +118,45 @@ pub(crate) fn fbw_inline_recursion_count<Sym: WalkSym>(
         .count()
 }
 
+/// Total inline-stack bound for a callee after its same-greenkey recursion
+/// count has already been checked against the live `max_unroll_recursion`.
+///
+/// PyPy `_opimpl_recursive_call` has no second, total-framestack depth gate:
+/// once a recursive portal is admitted, `memory_manager.max_unroll_recursion`
+/// is the sole value-returning recursion bound.  FBW's generic multiframe cap
+/// is a local cost valve for non-recursive call chains and must not silently
+/// turn an upstream value of 7 into an effective 6 when an ambient inline
+/// frame is present.  Raising chains retain their separate depth-two safety
+/// bound because their carrier unwind crosses suspended frames.
+pub(crate) fn fbw_effective_multiframe_depth(
+    contains_raise: bool,
+    inline_recursion_count: usize,
+) -> usize {
+    if contains_raise {
+        2
+    } else if inline_recursion_count != 0 {
+        usize::MAX
+    } else {
+        fbw_max_multiframe_depth()
+    }
+}
+
+#[cfg(test)]
+mod recursion_depth_policy_tests {
+    use super::*;
+
+    #[test]
+    fn value_returning_recursion_is_bounded_only_by_max_unroll_recursion() {
+        assert_eq!(fbw_effective_multiframe_depth(false, 1), usize::MAX);
+        assert_eq!(fbw_effective_multiframe_depth(false, 7), usize::MAX);
+    }
+
+    #[test]
+    fn raising_recursion_keeps_the_carrier_unwind_safety_bound() {
+        assert_eq!(fbw_effective_multiframe_depth(true, 1), 2);
+    }
+}
+
 /// The innermost inline level's strict-fold frame register (`u16::MAX` when
 /// inactive / no inline level).
 pub(crate) fn fbw_strict_fold_frame_reg<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> u16 {
@@ -2250,15 +2289,18 @@ pub(crate) fn fbw_decline_inline_callee<Sym: WalkSym>(
         // callee's cell (`warmstate.py` `WarmEnterState.disable_noninlinable_function`).  The recursion-bound deny
         // in `inline_call.rs` already calls it for the callee it names;
         // this one names a callee the same way and had no reason not to.
+        // Pass the typed key so the verdict lands on the same
+        // comparekey-bearing cell consulted at the next call.
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
+            let key = crate::driver::make_green_key_typed(
+                callee_code_key as *const (),
+                0,
+                is_being_profiled,
+            );
             driver
                 .meta_interp_mut()
                 .warm_state_mut()
-                .disable_noninlinable_function(crate::driver::make_green_key(
-                    callee_code_key as *const (),
-                    0,
-                    is_being_profiled,
-                ));
+                .disable_noninlinable_function_for_key(&key);
         }
     }
     // The flush this latch feeds resumes the OUTERMOST caller at the CALL
@@ -3410,6 +3452,7 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     | majit_ir::RuntimeHelperKind::LoadGlobal
                     | majit_ir::RuntimeHelperKind::LoadImport
                     | majit_ir::RuntimeHelperKind::LoadImportLocals
+                    | majit_ir::RuntimeHelperKind::LoadImportGlobals
                     | majit_ir::RuntimeHelperKind::BoxInt
                     | majit_ir::RuntimeHelperKind::NewtupleFromArray
                     | majit_ir::RuntimeHelperKind::NewlistFromArray

@@ -83,21 +83,11 @@ pub(crate) fn carrier_ec_leave<Sym: WalkSym>(
     if concrete_frame == 0 || concrete_ec.is_null() {
         return;
     }
-    // `frame.execution_context`, the same read `walker_ec_enter`'s counterpart
-    // performs at the inlined-call push.
-    let callee_ec = ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[root_sym.frame()],
-        crate::descr::pyframe_execution_context_descr(),
-    );
-    // Every `GetfieldGcR` the enter/leave pair records carries its concrete
-    // value (`history.py *FrontendOp(pos, value)`); without it
-    // `concrete_of_opref` reports this result symbolic on the residual-call
-    // and snapshot paths.  The value is the same EC the leave below acts on.
-    ctx.set_opref_concrete(
-        callee_ec,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_ec as usize)),
-    );
+    // All inlined frames share the portal's separately carried EC red.
+    let callee_ec = root_sym.execution_context();
+    if callee_ec.is_none() {
+        return;
+    }
     super::inline_call::walker_ec_leave(
         ctx,
         callee_frame,
@@ -172,9 +162,8 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // `fbw_mode.snapshot_sym` is non-null on every default-JIT run.
     // Recover the portal EC red off `sym.frame` before the first opcode is
     // dispatched (thus before any guard is recorded), caching it into
-    // `sym.execution_context`.  A bridge-from-guard sym whose ec color collides
-    // with a real frame slot is left `OpRef::NONE` by `setup_bridge_sym`, which
-    // defers recovery to `ensure_execution_context`.  The walker's
+    // `sym.execution_context`. Bridge setup decodes the dedicated portal EC
+    // color into this field before the walk begins. The walker's
     // snapshot-capture path runs `collect_outer_active_boxes` AFTER the guard,
     // so recovering there would record the getfield after the guard that
     // references it (use-before-def).  Seed here — the trait's pre-guard
@@ -952,7 +941,6 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         recipe,
         root_ec,
         root_ec_box,
-        root_frame_box,
         Vec::new(),
     )?;
     let frame_box = pending.sym.frame();

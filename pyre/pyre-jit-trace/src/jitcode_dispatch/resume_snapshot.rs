@@ -913,17 +913,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             } else {
                 stack_sync
             };
-            // A branch guard (`scope.branch_guard_jitcode_pc`, consumed by the
-            // stack overlay above for the #124 kept-stack source recovery) keys
-            // the encoder liveness window on the guard's own jitcode pc — the
-            // resume `py_pc` is a not-taken merge point whose live colors the
-            // walk has not written.
-            // #124 Approach B (M2): carry the guard's raw JitCode byte offset
-            // as the resume coordinate ONLY for branch guards — they supply
-            // their own pc in `GuardCaptureScope::branch_guard_jitcode_pc`, the
-            // kept-stack-across-branch precision `setposition(jitcode,
-            // miframe.pc)` preserves and the lossy `py_pc → jitcode`
-            // resume-translation collapses.
+            // A kept-stack branch guard supplies its own jitcode pc in
+            // `scope.branch_guard_jitcode_pc` solely as a VALUE-SOURCE
+            // coordinate for the stack overlay above.  It must not become the
+            // frame's resume coordinate.  RPython's
+            // `MetaInterp.capture_resumedata` temporarily sets `MIFrame.pc` to
+            // `resumepc` before `get_list_of_active_boxes` and restores the
+            // tracing pc afterwards: the saved frame therefore resumes at the
+            // not-taken arm (`op_pc` here), while its already-populated
+            // register bank still supplies values produced before the branch.
+            // Keep those two coordinates distinct here as well.
             //
             // Every other guard (guard_value / guard_class / guard_no_exception,
             // the `after_residual_call` family) resumes at a `py_pc` whose
@@ -940,11 +939,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // decodable `-live-` startpoint by construction — the runtime
                 // resolved it to reach this walk.
                 carried as i32
-            } else if let Some(guard_jc_pc) = scope.branch_guard_jitcode_pc {
-                // The kept-stack branch guard's own `op.pc` (walker
-                // `MIFrame.pc`) — the ONE carried word not sourced from the
-                // resume-translation.
-                guard_jc_pc as i32
             } else if !after_residual_call
                 && matches!(
                     ctx.trace_ctx.last_guard_opcode(),
@@ -958,11 +952,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             {
                 // #366: carry the `-live-` marker offset, NOT the raw guard
                 // `op_pc`. Reached only on the
-                // default-scope path (`scope.branch_guard_jitcode_pc.is_none()`): the
-                // specialization guards (`GuardValue`/`GuardClass`) and the
-                // depth-0 branch guards (`GuardTrue`/`GuardFalse`, kept-stack
-                // depth>0 branches take the first arm carrying `op.pc`).  For
-                // every guard here the codewrite-time twin resolves the
+                // specialization guards (`GuardValue`/`GuardClass`) and all
+                // branch guards (`GuardTrue`/`GuardFalse`). For every guard
+                // here the codewrite-time twin resolves the
                 // `-live-` marker, keeping the
                 // encoder reg-bank window and decoder liveness symmetric.  It is
                 // a valid startpoint (`can_decode_live_vars` holds).
@@ -1223,10 +1215,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     ),
                 }
             };
-            // A branch guard whose kept operand-stack slot has neither a mirror
-            // box nor an edge-move entry has no per-slot source; the gate that
-            // admitted this guard assumed the recovery covered it, so decline
-            // rather than encode the stale merge-color read.
+            // A branch guard whose kept operand-stack slot has no mirror box, no
+            // edge-move entry and no live shadow entry has no per-slot source;
+            // the gate that admitted this guard assumed a recovery covered it,
+            // so decline rather than encode the stale merge-color read.
             //
             // `get_list_of_active_boxes` (`pyjitpl.py`) has no such case:
             // it reads `self.registers_r[index]`, and the register bank IS the
@@ -1425,11 +1417,19 @@ pub(crate) fn decline_inline_caller_frame_for_catch_marker(
     // `resume_pos` is the CALL's post-call `live/`; the `catch_exception/L` for
     // the enclosing try sits right after it (`finishframe_exception` lookahead),
     // so read the handler target forward from there.
-    let rejoins = crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos)
-        .is_some_and(|catch_target| {
-            crate::jitcode_dispatch::exc_handler_rejoins_loop(caller_jitcode, catch_target)
-        });
-    if rejoins {
+    //
+    // `after_residual_call_resume_for_jitcode_pc` answers through a
+    // predecessor tier as well as an exact one, so a `Some` is not on its own
+    // proof that THIS call sits in a try-block: a call that carries no marker
+    // of its own resolves to the nearest preceding one.  The `catch_exception`
+    // lookahead is what settles it, and when it finds nothing there is no
+    // handler to rewrite a caller cell and nothing to decline for.
+    let Some(catch_target) =
+        crate::jitcode_dispatch::try_catch_exception_at(caller_jitcode, resume_pos)
+    else {
+        return Ok(());
+    };
+    if crate::jitcode_dispatch::exc_handler_rejoins_loop(caller_jitcode, catch_target) {
         return Ok(());
     }
     Err(InlineCallerFrameDecline::TryBlockCatchMarker)
@@ -2789,17 +2789,18 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     if !callee_pjc.is_populated() || callee_pjc.code_ptr.is_null() {
         return Err(DispatchError::callee_inline_unsupported(callee_op_pc));
     }
-    // Mirror of the single-frame path: the callee (top) frame carries a branch
-    // guard's supplied pc (`GuardCaptureScope::branch_guard_jitcode_pc`)
-    // unchanged. For other guards, the callee payload supplies the
-    // resume-marker twin:
+    // Mirror of the single-frame path: the callee (top) frame always carries
+    // the resume-marker twin for its requested resume coordinate.  A branch
+    // guard's supplied pc (`GuardCaptureScope::branch_guard_jitcode_pc`) is a
+    // value-source coordinate only; carrying it here would re-run
+    // `goto_if_not` without its popped condition register. For guards, the
+    // callee payload supplies the resume-marker twin:
     // after-residual guards use the fallthrough twin and retain the sentinel
     // on a miss, while plain guards retain the raw `callee_op_pc` on a miss.
     // Computed before box collection so encoder liveness and decoder resume
     // use the same coordinate.
-    let callee_jitcode_pc: i32 = match scope.branch_guard_jitcode_pc {
-        Some(g) => g as i32,
-        None if after_residual_call => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
+    let callee_jitcode_pc: i32 = match after_residual_call {
+        true => after_residual_guard_marker(&callee_pjc, callee_op_pc, None)
             .or_else(|| {
                 // Fallback only, for the same reason as the single-frame path:
                 // the sticky cursor names this frame's op only while no other
@@ -2824,7 +2825,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
         // The single-frame path can substitute the anchor because it re-reads
         // the owning frame's vable shadow at the carried coordinate; the callee
         // sub-walk owns no shadow to re-read.
-        None => callee_pjc
+        false => callee_pjc
             .resume_marker_for_jitcode_pc(callee_op_pc)
             .map(|m| m as i32)
             .unwrap_or(callee_op_pc as i32),
@@ -2849,21 +2850,19 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             // non-branch captures, its marker construction already applies
             // the same trivia (and, after a residual call, semantic
             // fallthrough) transform as the diagnostic inversion above.
-            let (site, native_marker) = match scope.branch_guard_jitcode_pc {
-                Some(_) => ("mf_callee_inversion_branch_external", None),
-                None if after_residual_call => (
+            let (site, native_marker) = match after_residual_call {
+                true => (
                     "mf_callee_inversion_after_residual",
                     callee_pjc.after_residual_marker_for_jitcode_pc(callee_op_pc),
                 ),
-                None => (
+                false => (
                     "mf_callee_inversion_plain",
                     callee_pjc.resume_marker_for_jitcode_pc(callee_op_pc),
                 ),
             };
             pcmap_recipe_resultcolor_audit_probe(site, "fire");
-            let verdict = match (scope.branch_guard_jitcode_pc, native_marker) {
-                (Some(_), _) => "branch_external",
-                (None, Some(marker)) => {
+            let verdict = match native_marker {
+                Some(marker) => {
                     let native_py = crate::py_coord::containing_py_pc_for_jitcode_pc(
                         &callee_pjc.metadata,
                         marker,
@@ -2874,7 +2873,7 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
                         "di"
                     }
                 }
-                (None, None) => "native_miss",
+                None => "native_miss",
             };
             pcmap_recipe_resultcolor_audit_probe(site, verdict);
         }

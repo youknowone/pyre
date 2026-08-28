@@ -2851,6 +2851,7 @@ dependencies = [
  "indexmap",
  "linkme",
  "majit-gc",
+ "majit-ir",
  "majit-macros",
  "majit-rlib",
  "num-traits",

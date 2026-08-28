@@ -766,12 +766,7 @@ fn load_readonly_buffer(slot: usize) -> Result<(), PyError> {
 
 /// The `memoryview` builtin type via the live execution context.
 fn memoryview_type() -> Result<PyObjectRef, PyError> {
-    let frame = crate::eval::CURRENT_FRAME.with(|f| f.get());
-    let ec = if frame.is_null() {
-        std::ptr::null()
-    } else {
-        unsafe { (*frame).execution_context }
-    };
+    let ec = crate::call::getexecutioncontext();
     if ec.is_null() {
         return Err(unpickling_error("memoryview type unavailable"));
     }

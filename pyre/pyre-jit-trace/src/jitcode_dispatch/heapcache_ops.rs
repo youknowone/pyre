@@ -687,6 +687,5 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
 }
 
 /// `virtualizable_gen.rs` pyre PyFrame static-field order
-/// `[last_instr, pycode, valuestackdepth, debugdata, w_globals]`.
+/// `[last_instr, pycode, valuestackdepth, debugdata]`.
 pub(crate) const VABLE_CODE_FIELD_IDX: usize = 1;
-pub(crate) const VABLE_NAMESPACE_FIELD_IDX: usize = 4;

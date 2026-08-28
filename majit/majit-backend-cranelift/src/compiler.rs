@@ -16347,19 +16347,23 @@ fn collect_guards(
         //     also contain Const (handled by regalloc.py:1192-1193 in the same
         //     loop). majit groups external JUMP with FINISH for fail_args
         //     bookkeeping; treat their gcmap the same way.
-        // `compute_gcmap` skips the hole a virtual leaves (`if arg is None:
-        // continue`), marks every remaining REF failarg, and narrows nothing
-        // else. No hole reaches this map: `spill_guard_fail_args` resolves
-        // every fail arg through `resolve_opref`, which refuses `OpRef::NONE`
-        // rather than substituting a zero, so a guard carrying one fails to
-        // compile before a gcmap exists. A force token is REF too
-        // (`FORCE_TOKEN/0/r` returns the jitframe, a moving GC object), so its
-        // slot is marked like any other.
+        // `compute_gcmap` opens with `if arg is None: continue`, then marks
+        // every remaining REF failarg and narrows nothing else. The skip is
+        // load-bearing here rather than vacuous: a virtual leaves a hole in
+        // fail_args, and both `infer_fail_arg_types` and
+        // `resolve_fail_arg_types` type that hole `Ref` (a virtual object is a
+        // GCREF), so the type test on its own would mark a slot that owns no
+        // root. A force token is REF too (`FORCE_TOKEN/0/r` returns the
+        // jitframe, a moving GC object), so its slot is marked like any other.
         let failarg_ref_slots = {
             let mut slots = Vec::new();
             for (i, tp) in fail_arg_types.iter().enumerate() {
                 if *tp == Type::Ref {
                     let arg_ref = fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
+                    // `assembler.py compute_gcmap` `if arg is None: continue`.
+                    if arg_ref.is_none() {
+                        continue;
+                    }
                     // regalloc.py:1206 — guard fail_args must never be Const.
                     // history.py/268/314 inline-Const carries the value on
                     // the OpRef itself; legacy idx-Const lives in `constants`.

@@ -366,7 +366,10 @@ unsafe fn visit_callee_frame_roots(frame: *mut PyFrame, visitor: &mut dyn FnMut(
     }
     visitor(unsafe { &mut *(&mut frame.f_generator_nowref as *mut PyObjectRef as *mut GcRef) });
     visitor(unsafe { &mut *(&mut frame.w_yielding_from as *mut PyObjectRef as *mut GcRef) });
-    visitor(unsafe { &mut *(&mut frame.w_globals as *mut PyObjectRef as *mut GcRef) });
+    if !frame.debugdata.is_null() {
+        let data = unsafe { &mut *frame.debugdata };
+        visitor(unsafe { &mut *(&mut data.w_globals as *mut PyObjectRef as *mut GcRef) });
+    }
 }
 
 /// Extra GC root walker for the callee frames a JIT call is running.
@@ -1099,7 +1102,37 @@ fn run_frame_through_portal(frame_ptr: i64) -> i64 {
         "CALL_ASSEMBLER arg 0 must be the callee PyFrame"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    let result = crate::eval::portal_runner(frame);
+    // `ll_portal_runner` is an activation entry: it charges recursion,
+    // installs the frame, and consults function-entry warmstate, and that last
+    // step can run the very compiled function whose call arrived here.  When
+    // the frame handed over is the one this thread is already running, that is
+    // a second activation of one frame, and the compiled body reaching this
+    // call again opens a third: the nesting grows until the stack check
+    // raises, leaving the frame's `next_instr` past operands no activation
+    // pushed.  `warmspot.py handle_jitexception` draws the same distinction
+    // when it calls `portal_ptr` instead of `ll_portal_runner`; resume the
+    // body of the activation that already exists.
+    //
+    // `CURRENT_FRAME` is the test, not the `topframeref` chain: the trace
+    // records `ExecutionContext.enter` for the callee frame it builds, so a
+    // legitimately fresh callee IS the chain's top by the time it gets here,
+    // while only an interpreter or portal activation installs `CURRENT_FRAME`.
+    let already_running = std::ptr::eq(
+        pyre_interpreter::eval::current_frame(),
+        frame as *mut PyFrame,
+    );
+    let outcome = if already_running {
+        crate::eval::portal_body_result(frame)
+    } else {
+        crate::eval::portal_activation_result(frame)
+    };
+    let result = match outcome {
+        Ok(r) => r,
+        Err(mut err) => {
+            store_jit_exception(err.to_exc_object() as i64);
+            pyre_object::PY_NULL
+        }
+    };
 
     // warmspot.py:449 result_type=REF: always boxed Ref
     result as i64
@@ -1175,12 +1208,10 @@ pub extern "C" fn assembler_call_helper(jitframe_ptr: i64, _virtualizable_ref: i
 fn resolve_field_offset(owner: &str, field_name: &str) -> usize {
     use pyre_interpreter::pyframe::PyFrame;
     match field_name {
-        "execution_context" => std::mem::offset_of!(PyFrame, execution_context),
         "code" | "pycode" => std::mem::offset_of!(PyFrame, pycode),
         "locals_cells_stack_w" => std::mem::offset_of!(PyFrame, locals_cells_stack_w),
         "valuestackdepth" => std::mem::offset_of!(PyFrame, valuestackdepth),
         "next_instr" | "f_lasti" | "last_instr" => std::mem::offset_of!(PyFrame, last_instr),
-        "namespace" | "w_globals" => std::mem::offset_of!(PyFrame, w_globals),
         "vable_token" => std::mem::offset_of!(PyFrame, vable_token),
         // #171 codewriter descr-bridge (blackhole side): the dotted nested
         // `int_items.{len,block}` leaves `_handle_list_call`
@@ -1272,18 +1303,17 @@ pub extern "C" fn bh_portal_runner_c(
     }
     let frame = unsafe { &mut *frame_ptr };
     // warmspot.py:976 calls `portal_ptr(*args)`; it does not copy the green
-    // `pycode` back onto the red frame.  The frame was constructed for this
-    // activation and already owns its pycode / execution context (the same
-    // frame-only contract as `ll_portal_runner_shim` above).  In particular,
+    // `pycode` back onto the red frame. The frame owns its pycode while `ec`
+    // is the independent second red for this activation. In particular,
     // a stale CRN green must never collapse this frame onto another code
     // object's identity.
     if majit_metainterp::majit_log_enabled()
-        && ((!pycode.is_null() && frame.pycode != pycode as *const ())
-            || (!ec.is_null() && frame.execution_context != ec))
+        && !pycode.is_null()
+        && frame.pycode != pycode as *const ()
     {
         eprintln!(
-            "[blackhole-resume] CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p} frame_ec={:p}",
-            frame.pycode, frame.execution_context,
+            "[blackhole-resume] CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p}",
+            frame.pycode,
         );
     }
     frame.set_last_instr_from_next_instr(next_instr as usize);
@@ -1291,7 +1321,13 @@ pub extern "C" fn bh_portal_runner_c(
     // frame it hands over is entering its body for the first time and owes
     // `execute_frame`'s hook bracket.  The CRN arms below resume a frame whose
     // activation already began and take the unbracketed entry instead.
-    match crate::eval::portal_activation_result(frame) {
+    let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+    if !ec.is_null() {
+        pyre_interpreter::call::set_last_exec_ctx(ec);
+    }
+    let result = crate::eval::portal_activation_result(frame);
+    pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+    match result {
         Ok(result) => result as i64,
         Err(mut err) => {
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE
@@ -1651,8 +1687,8 @@ pub extern "C" fn jit_force_recursive_call_raw_1(
 /// the callee's code/globals from a function object on every call. The caller
 /// frame already carries the exact recursive target:
 /// - `caller.pycode` is the callee code object
-/// - `caller.w_globals` is the module globals
-/// - `caller.execution_context` is the shared execution context
+/// - `caller.get_w_globals()` resolves its code-global/common namespace
+/// - the current activation supplies the shared execution context
 ///
 /// Trace-time recursive CALL_ASSEMBLER handles the optimized path. The
 /// concrete helper should mirror RPython's force_fn behavior: execute the
@@ -2455,7 +2491,8 @@ fn leave_resumed_blackhole_frame(
 /// it drops: `install_current_frame` seeds `f_backref` from the `topframeref`
 /// it displaces, so the two agree by construction.
 fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
-    let ec = unsafe { (*frame_ptr).execution_context as *mut pyre_interpreter::PyExecutionContext };
+    let ec =
+        pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
     if ec.is_null() {
         return;
     }
@@ -3312,15 +3349,15 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             // The red frame is the activation identity.  PyPy forwards the
             // CRN arguments to `portal_ptr` without mutating that frame; pyre's
             // frame-only portal entry likewise reads the pycode / execution
-            // context already stored on the callee frame.  Do not overwrite
-            // them from a possibly stale green snapshot.
+            // context is the separate red argument. Do not overwrite pycode
+            // from a possibly stale green snapshot.
             if majit_metainterp::majit_log_enabled()
-                && ((!pycode.is_null() && frame.pycode != pycode as *const ())
-                    || (!ec.is_null() && frame.execution_context != ec))
+                && !pycode.is_null()
+                && frame.pycode != pycode as *const ()
             {
                 eprintln!(
-                    "[blackhole-resume] CALL_ASSEMBLER CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p} frame_ec={:p}",
-                    frame.pycode, frame.execution_context,
+                    "[blackhole-resume] CALL_ASSEMBLER CRN/frame identity mismatch: green_pycode={pycode:p} frame_pycode={:p} red_ec={ec:p}",
+                    frame.pycode,
                 );
             }
             frame.set_last_instr_from_next_instr(next_instr);
@@ -3330,7 +3367,13 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             // at its peak stack use.  Re-derive the depth from the resume pc —
             // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
             crate::eval::correct_resume_vsd(frame, next_instr);
-            match crate::eval::portal_body_result(frame) {
+            let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
+            if !ec.is_null() {
+                pyre_interpreter::call::set_last_exec_ctx(ec);
+            }
+            let result = crate::eval::portal_body_result(frame);
+            pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
+            match result {
                 Ok(result) => Some(result as i64),
                 Err(mut err) => {
                     let exc_obj = err.to_exc_object();
@@ -3517,7 +3560,7 @@ pub fn trace_and_compile_from_bridge(
 
     {
         let (driver, _) = crate::eval::driver_pair();
-        driver.clear_last_compiled_artifact_invalidation_flag();
+        driver.clear_last_compiled_artifact_token();
     }
 
     use crate::eval::build_jit_state;
@@ -4719,18 +4762,22 @@ fn fill_positional_defaults_for_jit_call<'a>(
 }
 
 fn create_callee_frame_impl_1_boxed(
-    caller_frame: i64,
+    _caller_frame: i64,
     callable: PyObjectRef,
     boxed_arg: PyObjectRef,
 ) -> i64 {
     let w_code = unsafe { pyre_interpreter::getcode(callable) };
-    let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let w_globals = unsafe { function_get_globals_obj(callable) };
     let one_arg = [boxed_arg];
     let args = fill_positional_defaults_for_jit_call(callable, w_code, &one_arg);
     let args = args.as_ref();
 
-    alloc_callee_frame(w_code, args, w_globals, caller.execution_context) as i64
+    alloc_callee_frame(
+        w_code,
+        args,
+        w_globals,
+        pyre_interpreter::call::getexecutioncontext(),
+    ) as i64
 }
 
 fn create_self_recursive_callee_frame_impl_1_boxed(
@@ -4739,8 +4786,8 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
 ) -> i64 {
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
-    let w_globals = caller.w_globals;
-    let execution_context = caller.execution_context;
+    let w_globals = caller.get_w_globals();
+    let execution_context = pyre_interpreter::call::getexecutioncontext();
 
     // Read before the call: `alloc_callee_frame` resolves `__builtins__`, which
     // can run a user `__getitem__` and so collect.  What this line reports is
@@ -4757,9 +4804,12 @@ fn create_self_recursive_callee_frame_impl_1_boxed(
     frame_ptr as i64
 }
 
-fn create_callee_frame_impl(caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
-    let caller = unsafe { &*(caller_frame as *const PyFrame) };
-    create_callee_frame_in_ctx(caller.execution_context, callable as PyObjectRef, args)
+fn create_callee_frame_impl(_caller_frame: i64, callable: i64, args: &[PyObjectRef]) -> i64 {
+    create_callee_frame_in_ctx(
+        pyre_interpreter::call::getexecutioncontext(),
+        callable as PyObjectRef,
+        args,
+    )
 }
 
 /// [`create_callee_frame_impl`] with the execution context passed directly.
@@ -4827,8 +4877,8 @@ pub extern "C" fn jit_create_self_recursive_callee_frame_1_raw_int(
 ) -> i64 {
     let caller = unsafe { &*(caller_frame as *const PyFrame) };
     let func_code = caller.pycode;
-    let w_globals = caller.w_globals;
-    let execution_context = caller.execution_context;
+    let w_globals = caller.get_w_globals();
+    let execution_context = pyre_interpreter::call::getexecutioncontext();
 
     let boxed = pyre_object::intobject::w_int_new(raw_int_arg);
 
@@ -6622,6 +6672,23 @@ pub extern "C" fn bh_load_import_locals_fn(frame_ptr: i64) -> i64 {
     pyre_interpreter::importing::import_locals(frame) as i64
 }
 
+/// IMPORT_NAME's globals argument — `pyopcode.py`'s `self.get_w_globals()`.
+///
+/// `w_globals` stopped being a `PyFrame` field, so the namespace is no longer
+/// readable as a virtualizable slot: `get_w_globals` answers from
+/// `debugdata.w_globals` when the frame carries a payload and from
+/// `promote(pycode).w_globals` when it does not. Asking the live frame is what
+/// keeps an inlined callee on its own namespace.
+pub extern "C" fn bh_load_import_globals_fn(frame_ptr: i64) -> i64 {
+    assert!(
+        frame_ptr != 0,
+        "bh_load_import_globals_fn requires a non-null PyFrame; every IMPORT_NAME \
+         emit site must thread portal_frame_reg as its ref operand"
+    );
+    let frame = unsafe { &*(frame_ptr as *mut PyFrame) };
+    frame.get_w_globals() as i64
+}
+
 /// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.
 /// pyopcode.py DELETE_GLOBAL deletes directly from `w_globals`.
 pub extern "C" fn bh_delete_global_fn(frame_ptr: i64, w_name: i64) -> i64 {
@@ -6672,8 +6739,8 @@ pub extern "C" fn bh_box_int_fn(value: i64) -> i64 {
 /// `(frame: Ref, exc: Ref, cause: Ref) → Ref`.  The frame pointer is
 /// emitted explicitly by `Instruction::RaiseVarargs` (codewriter.rs)
 /// via `portal_frame_reg`, mirroring `bh_load_global_fn`'s frame-as-arg
-/// ABI.  `pyopcode.py RAISE_VARARGS` runs inside an opcode
-/// dispatch where `frame` and `frame.execution_context` are always
+/// ABI. `pyopcode.py RAISE_VARARGS` runs inside an opcode
+/// dispatch where `frame` and the current execution context are always
 /// valid, so `frame_ptr == 0` here signals a wiring bug — fail fast
 /// at entry rather than degrade silently to a `RuntimeError`.
 pub extern "C" fn bh_normalize_raise_varargs_with_frame(
@@ -6692,10 +6759,10 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
     let raw_cause = cause as PyObjectRef;
 
     // pyopcode.py:704-722 — cause and exc normalization share
-    // `self.space` / `frame.execution_context`. Pin the caller frame's
-    // execution_context for the whole body so the cause-class-call and
-    // exc-class-call observe the same namespace.
-    let frame_ctx = unsafe { (*parent_frame_ptr).execution_context };
+    // `self.space.getexecutioncontext()`. Pin the current activation for the
+    // whole body so the cause-class-call and exc-class-call observe the same
+    // thread state.
+    let frame_ctx = pyre_interpreter::call::getexecutioncontext();
     let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
     if !frame_ctx.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(frame_ctx);
@@ -6734,9 +6801,8 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
         if pyre_object::is_exception(exc) {
             exc
         } else if pyre_interpreter::baseobjspace::exception_is_valid_obj_as_class_w(exc) {
-            // pyopcode.py — `space.call_function(w_type)` does
-            // not depend on `frame.execution_context`; if the field is
-            // null on a valid frame the class-call still proceeds.
+            // pyopcode.py RAISE_VARARGS — `space.call_function(w_type)` does
+            // not depend on frame-owned context state.
             //
             // It runs the exception's `__init__`.  `exc` is still unrooted and
             // the cause normalized above is a fresh nursery object, so both

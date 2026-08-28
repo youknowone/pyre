@@ -1056,10 +1056,38 @@ def _first_stderr_line(stderr):
     return f"  {reason}"
 
 
-# Characters of a Rust panic's message body to keep. Wide enough for the
-# collector's longest `GC BUG` diagnostic, whose trailing fields are the ones
-# that attribute a crash nobody can reproduce on demand.
+# Width of the panic MESSAGE kept next to the `panicked at file:line:col:`
+# location. The collector's marking-bug report is the widest one pyre emits:
+# it names the holder, the child, both generations, whether the holder is in
+# the remembered set, and formats two `[usize; 8]` word dumps.
 PANIC_BODY_CHARS = 2000
+
+
+def _panic_message_body(lines):
+    """The panic message following a `panicked at file:line:col:` line.
+
+    Rust's default hook writes the location line, then the message, then a
+    `note:` / `stack backtrace:` trailer, so the message is everything in
+    between. It is not one line: `{:#x?}` is alternate debug, which puts every
+    element of an array on its own line, so a report carrying a word dump
+    spans ~20 of them. Joining them is what keeps `holder_in_remembered`,
+    `child_gen` and `child_vtable_type_id` — the fields that separate a stale
+    remembered-set entry from a mis-declared GC offset — in a CI log, which is
+    the only place a crash that does not reproduce locally is ever observed.
+    """
+    body = []
+    used = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("note:", "stack backtrace:")):
+            break
+        body.append(stripped[: PANIC_BODY_CHARS - used])
+        used += len(body[-1])
+        if used >= PANIC_BODY_CHARS:
+            break
+    return " ".join(body)
 
 
 def _jit_panic_reason(stderr):
@@ -1080,28 +1108,23 @@ def _jit_panic_reason(stderr):
         for idx, line in enumerate(lines):
             if "panicked" in line:
                 reason = f"rust panic: {line.strip()[:80]}"
-                # Rust's default hook prints the panic MESSAGE on the line(s)
-                # after 'panicked at file:line:col:'. That body carries the
-                # actionable detail (e.g. a GC 'invalid type_id ... site=...'
-                # diagnostic); the location line alone is not enough to triage
-                # a flaky crash from CI logs, so append the first message line.
-                #
-                # The width has to reach the last field the GC prints. At 200
-                # the varsize-length diagnostic was cut mid-`nursery_start`,
-                # dropping both `forwarded=` and `site=` — the two fields that
-                # name which path reached the object — and leaving a CI-only
-                # crash with no way to attribute it. At 400 the two
-                # `invalid type_id` diagnostics, which reach about 800
-                # characters once their eight-word holder and child dumps are
-                # in, are cut inside the first dump, and at 1200 the major
-                # collector's own is cut at `site=` — dropping both
-                # generations, the remembered-set membership and the enclosing
-                # container.
-                for follow in lines[idx + 1 :]:
-                    follow = follow.strip()
-                    if follow:
-                        reason += f" | {follow[:PANIC_BODY_CHARS]}"
-                        break
+                # The location line alone is not enough to triage a flaky
+                # crash from CI logs, and no excerpt width is enough either.
+                # At 200 the varsize-length diagnostic was cut
+                # mid-`nursery_start`, dropping both `forwarded=` and
+                # `site=` — the two fields that name which path reached the
+                # object. At 400 the two `invalid type_id` diagnostics,
+                # about 800 characters once their eight-word holder and
+                # child dumps are in, were cut inside the first dump. At
+                # 1200 the major collector's own was cut at `site=`,
+                # dropping both generations, the remembered-set membership
+                # and the enclosing container. Those dumps are `{:#x?}`
+                # arrays, which print one element per line, so a first-line
+                # excerpt truncates them at any width; keep the whole
+                # message body instead.
+                body = _panic_message_body(lines[idx + 1 :])
+                if body:
+                    reason += f" | {body}"
                 return reason
         return "rust panic"
     for line in stderr.splitlines():

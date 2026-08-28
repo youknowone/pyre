@@ -7,12 +7,17 @@
 /* The C half of the layout `cpyext/frameobject.rs` holds from the other side.
    Each offset is pinned in both, so a field added to one alone stops
    compiling rather than writing somewhere unclaimed. */
-_Static_assert(offsetof(PyFrameObject, f_code) == 24, "f_code moved");
-_Static_assert(offsetof(PyFrameObject, f_globals) == 32, "f_globals moved");
-_Static_assert(offsetof(PyFrameObject, f_locals) == 40, "f_locals moved");
-_Static_assert(offsetof(PyFrameObject, f_lineno) == 48, "f_lineno moved");
-_Static_assert(offsetof(PyFrameObject, f_back) == 56, "f_back moved");
-_Static_assert(sizeof(PyFrameObject) == 64, "the frame block changed size");
+_Static_assert(offsetof(PyFrameObject, f_code) == sizeof(PyObject), "f_code moved");
+_Static_assert(offsetof(PyFrameObject, f_globals) == sizeof(PyObject) + sizeof(void *),
+               "f_globals moved");
+_Static_assert(offsetof(PyFrameObject, f_locals) == sizeof(PyObject) + 2 * sizeof(void *),
+               "f_locals moved");
+_Static_assert(offsetof(PyFrameObject, f_lineno) == sizeof(PyObject) + 3 * sizeof(void *),
+               "f_lineno moved");
+_Static_assert(offsetof(PyFrameObject, f_back) == sizeof(PyObject) + 4 * sizeof(void *),
+               "f_back moved");
+_Static_assert(sizeof(PyFrameObject) == sizeof(PyObject) + 5 * sizeof(void *),
+               "the frame block changed size");
 
 /* `__Pyx_AddTraceback` verbatim: a code object for a source location this
    runtime never compiled, a frame over it, the line written into the frame,

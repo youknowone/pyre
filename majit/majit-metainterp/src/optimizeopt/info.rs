@@ -34,6 +34,13 @@ fn lookup_field_descr(field_descrs: &[DescrRef], field_idx: u32) -> Option<Descr
 /// structural `cache_key` still resolves to the dense tid through the same GC
 /// cache the backends use (`BhDescr::resolve_gc_tid`).
 ///
+/// That recovery answers for the id the JIT's own allocations write. It is the
+/// same id the runtime header holds only while the JIT is what allocates the
+/// struct: a struct the host allocates under an id of its own resolves here to
+/// the cache's, and the guard then fails on every object. A descr for such a
+/// struct has to say so with `headerless`, which is checked before this is
+/// called, rather than by leaving its `type_id` at 0.
+///
 /// A poisoned cache lock degrades to "unresolved", which declines; it must not
 /// abort.
 pub(crate) fn resolve_gc_tid(

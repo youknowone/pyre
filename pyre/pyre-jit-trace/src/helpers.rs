@@ -188,6 +188,41 @@ pub extern "C" fn jit_init_kwdefaults_dict(dict: i64) -> i64 {
     }
 }
 
+/// `objspace.py space.getexecutioncontext()` as a residual callee: the
+/// running thread's ExecutionContext, read out of its thread-local slot.
+///
+/// `call::getexecutioncontext` cannot be the callee directly, for the reason
+/// `jit_force_vref` records above: its pointer return is `i32` on wasm32,
+/// where the residual-call ABI is `(i64×n) -> i64`.
+pub extern "C" fn jit_getexecutioncontext() -> i64 {
+    pyre_interpreter::call::getexecutioncontext() as usize as i64
+}
+
+/// Emit the [`jit_getexecutioncontext`] residual for a trace that holds no
+/// `ec`. `interp_jit.py PyPyJitDriver.reds = ['frame', 'ec']` makes the
+/// context a red the `-live-` markers force-keep at every guard, but a guard
+/// whose resume data named no value at the red's color resumes without one,
+/// and `PyFrame` carries no `execution_context` field to fall back on.
+///
+/// The call must stay non-elidable. A nullary elidable call has all its
+/// arguments constant by construction, so the pure pass would fold it to the
+/// recording thread's ExecutionContext and every other thread entering the
+/// compiled trace would read that thread's exception state.
+///
+/// `site` names the caller in the decline census, which is what separates the
+/// three recoveries: the live red costs no call and these do.
+pub(crate) fn emit_current_execution_context(ctx: &mut TraceCtx, site: &'static str) -> OpRef {
+    crate::jitcode_dispatch::census_record(site);
+    ctx.call_typed_with_effect(
+        OpCode::CallR,
+        jit_getexecutioncontext as *const (),
+        &[],
+        &[],
+        Type::Ref,
+        majit_metainterp::cannot_raise_effect_info(),
+    )
+}
+
 pub extern "C" fn jit_dict_exact_unicode_lookup_or_null(dict: i64, key: i64) -> i64 {
     unsafe {
         jit_dict_exact_lookup_or_null(
@@ -1487,7 +1522,7 @@ pub fn emit_box_float_inline(
 ///    so `handle_new` skips the vtable setfield (rewrite.py:925-933
 ///    `gen_new_with_vtable` early-out for `vtable == 0`).
 /// 5. `SetfieldGc` ops for the constructor-visible fields. The non-zero
-///    fields (`execution_context`, `pycode`, `w_globals`,
+///    fields (`pycode`,
 ///    `locals_cells_stack_w`, `valuestackdepth`, `last_instr=-1`) mirror
 ///    `new_for_call_with_closure`; the nullable GC fields
 ///    (`f_generator_nowref`, `w_yielding_from`, `f_backref`) are written
@@ -1513,6 +1548,14 @@ pub fn emit_box_float_inline(
 /// would have written; the class-level GC-pointer defaults listed at the end
 /// of the body are cleared by the GC rewriter, exactly as they are initialized
 /// in a frame the interpreter builds.
+///
+/// `None` when `w_globals` is not the namespace this frame would answer with:
+/// the emitted frame carries no `debugdata`, so `get_w_globals` on it reads the
+/// code object's published namespace (`pyframe.py get_w_globals`), and a callee
+/// running under a different dictionary needs the override
+/// `createframe_obj` allocates. Callers already decline a global-storing callee
+/// (`pycode.py frame_stores_global`) before they get here; this is the frame
+/// shape's own statement of what it can represent.
 pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
@@ -1522,12 +1565,14 @@ pub fn emit_new_pyframe_inline_with_params(
     valuestackdepth: usize,
     pycode: OpRef,
     w_globals: OpRef,
-    ec: OpRef,
-) -> OpRef {
+) -> Option<OpRef> {
+    if !inline_frame_answers_this_namespace(ctx, pycode, w_globals) {
+        return None;
+    }
     use crate::descr::{
-        pyframe_code_descr, pyframe_execution_context_descr, pyframe_flags_descr,
+        pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
         pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr,
+        pyframe_stack_depth_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1586,24 +1631,10 @@ pub fn emit_new_pyframe_inline_with_params(
     let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());
     ctx.heap_cache_mut().new_object(new_frame);
 
-    let ec_descr = pyframe_execution_context_descr();
-    let ec_idx = ec_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
-    ctx.heapcache_setfield_cached(new_frame, ec_idx, ec);
-
     let code_descr = pyframe_code_descr();
     let code_idx = code_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
     ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
-
-    let globals_obj_descr = pyframe_w_globals_obj_descr();
-    let globals_obj_idx = globals_obj_descr.index();
-    ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_frame, w_globals],
-        globals_obj_descr,
-    );
-    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals);
 
     let locals_descr = pyframe_locals_cells_stack_descr();
     let locals_idx = locals_descr.index();
@@ -1630,6 +1661,15 @@ pub fn emit_new_pyframe_inline_with_params(
     // seed TraceCtx's concrete sanity cache with the constructor-time zero;
     // a later mark_as_escaped read must observe the carrier's current byte.
 
+    // `failed_attr_cleanup` is the second byte beside `flags` and is not a GC
+    // reference, so `clear_gc_fields` does not reach it. incminimark's
+    // `malloc_zero_filled = False` leaves the `NewWithVtable` block holding
+    // recycled nursery bytes, and the byte's "run the deferred cleanup before
+    // the next opcode" value is `u8::MAX` — a recycled `0xff` makes every
+    // dispatch on this frame run a full non-moving old-gen collection.
+    let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
+
     // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
@@ -1642,9 +1682,35 @@ pub fn emit_new_pyframe_inline_with_params(
     // nothing and every reader goes through `get_builtin`, which answers
     // `space.builtin` for an unset slot.
 
-    new_frame
+    Some(new_frame)
 }
 
+/// Whether a `debugdata`-less frame for `pycode` answers `w_globals` from
+/// `get_w_globals`, i.e. whether the code object has published that very
+/// dictionary as its first namespace (`pycode.py frame_stores_global`).
+///
+/// Both operands are trace-time constants at every emission site. A namespace
+/// that is not constant, or a code object whose slot is still unpublished,
+/// leaves the question unanswered rather than answered `false`: the emission
+/// sites establish the invariant themselves, and this check is here to stop a
+/// later one that does not, not to close a shape that already works.
+fn inline_frame_answers_this_namespace(ctx: &TraceCtx, pycode: OpRef, w_globals: OpRef) -> bool {
+    let (Some(majit_ir::Value::Ref(code)), Some(majit_ir::Value::Ref(globals))) =
+        (ctx.box_value(pycode), ctx.box_value(w_globals))
+    else {
+        return true;
+    };
+    if code.as_usize() == 0 || globals.as_usize() == 0 {
+        return true;
+    }
+    let published = unsafe {
+        pyre_interpreter::w_code_get_w_globals(code.as_usize() as pyre_object::PyObjectRef)
+    };
+    published.is_null() || published as usize == globals.as_usize()
+}
+
+/// `None` on the same namespace disagreement as
+/// [`emit_new_pyframe_inline_with_params`], whose doc states the rule.
 pub fn emit_new_pyframe_inline_self_recursive(
     ctx: &mut TraceCtx,
     arg_box: OpRef,
@@ -1652,12 +1718,14 @@ pub fn emit_new_pyframe_inline_self_recursive(
     valuestackdepth: usize,
     pycode: OpRef,
     w_globals: OpRef,
-    ec: OpRef,
-) -> OpRef {
+) -> Option<OpRef> {
+    if !inline_frame_answers_this_namespace(ctx, pycode, w_globals) {
+        return None;
+    }
     use crate::descr::{
-        pyframe_code_descr, pyframe_execution_context_descr, pyframe_flags_descr,
+        pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
         pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
-        pyframe_stack_depth_descr, pyframe_w_globals_obj_descr,
+        pyframe_stack_depth_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1699,26 +1767,11 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // the explicit assignments inside `new_for_call_with_closure`.
     // Order matches the field declaration so the optimizer's lazy-set
     // replace logic groups them together.
-    let ec_descr = pyframe_execution_context_descr();
-    let ec_idx = ec_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, ec], ec_descr);
-    ctx.heapcache_setfield_cached(new_frame, ec_idx, ec);
-
     // `pycode` arrives as a trace-time Ref Const (the bound `PyCode`).
     let code_descr = pyframe_code_descr();
     let code_idx = code_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, pycode], code_descr);
     ctx.heapcache_setfield_cached(new_frame, code_idx, pycode);
-
-    // pyframe.py:49 `self.w_globals = w_globals` — store the canonical dict.
-    let globals_obj_descr = pyframe_w_globals_obj_descr();
-    let globals_obj_idx = globals_obj_descr.index();
-    ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[new_frame, w_globals],
-        globals_obj_descr,
-    );
-    ctx.heapcache_setfield_cached(new_frame, globals_obj_idx, w_globals);
 
     // `locals_array` is a fresh `NewArrayClear` op result.  PyPy's
     // executor-while-trace model would have `Box.value` carry the
@@ -1752,6 +1805,15 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // materialization, but its constructor-time value is not the concrete
     // carrier's necessarily later record-time state.
 
+    // `failed_attr_cleanup` is the second byte beside `flags` and is not a GC
+    // reference, so `clear_gc_fields` does not reach it. incminimark's
+    // `malloc_zero_filled = False` leaves the `NewWithVtable` block holding
+    // recycled nursery bytes, and the byte's "run the deferred cleanup before
+    // the next opcode" value is `u8::MAX` — a recycled `0xff` makes every
+    // dispatch on this frame run a full non-moving old-gen collection.
+    let failed_attr_descr = pyframe_failed_attr_cleanup_descr();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], failed_attr_descr);
+
     // pyframe.py `f_generator_nowref`/`w_yielding_from`/`f_backref`
     // are class-level defaults (None/None/vref_None), never assigned in the
     // frame constructor. The trace of frame construction therefore emits no
@@ -1764,7 +1826,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     // nothing and every reader goes through `get_builtin`, which answers
     // `space.builtin` for an unset slot.
 
-    new_frame
+    Some(new_frame)
 }
 
 // ── Elidable canary helper ──────────────────────────────────────────
