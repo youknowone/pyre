@@ -9912,8 +9912,6 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // eagerly here scanned the whole bytecode and built a successor map for
     // every frame entry to produce a set no one read.  Compute it lazily at
     // the first back-edge instead (kept per graph on `CallControl`).
-    let env = PyreEnv;
-    let (driver, info) = driver_pair();
     // interp_jit.py:66 — next_instr, pycode are greens (managed by jit_merge_point).
     // No explicit promote needed; the JitDriver green-key mechanism handles this.
 
@@ -10225,6 +10223,11 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 // can_enter_jit is a lowered no-op / merge point; re-seed
                 // conservatively before the next frame reads.
                 let f: *mut PyFrame = frame_root.frame() as *mut PyFrame;
+                // Compute these after the merge point: the portal split requires every
+                // live-across value to be a declared green or red. Upstream bakes the
+                // driver into the enter function and reaches the space through `self.space`.
+                let env = PyreEnv;
+                let (driver, info) = driver_pair();
                 let loop_pycode = unsafe { &*f }.pycode;
                 let loop_profiled = unsafe { &*f }.get_is_being_profiled();
                 let green_key_hash = make_green_key(loop_pycode, loop_header_pc, loop_profiled);
