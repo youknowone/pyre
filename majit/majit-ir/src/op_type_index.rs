@@ -273,4 +273,3 @@ impl<'a, T: AsRef<Op>> OpTypeIndex<'a, T> {
         Some(self.inputargs[idx].tp)
     }
 }
-

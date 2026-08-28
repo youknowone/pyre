@@ -333,11 +333,7 @@ fn main() {
                 compiled,
             );
             #[cfg(feature = "alloc-census")]
-            println!(
-                "    {:<32}  {}",
-                "",
-                row.alloc.per_char(len, REPEATS)
-            );
+            println!("    {:<32}  {}", "", row.alloc.per_char(len, REPEATS));
         }
         sweep.push((len, rows));
     }

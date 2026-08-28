@@ -579,9 +579,7 @@ pub(crate) fn lower_typed_constants_to_const_pool(
 /// and keeps no table at all. The membership tests below run once per constant
 /// and once per considered op, both bounded by the trace, so hashing is the
 /// cheaper half of the trade.
-fn live_runtime_positions<'a>(
-    ops: impl IntoIterator<Item = &'a Op>,
-) -> rustc_hash::FxHashSet<u32> {
+fn live_runtime_positions<'a>(ops: impl IntoIterator<Item = &'a Op>) -> rustc_hash::FxHashSet<u32> {
     let mut live_positions = rustc_hash::FxHashSet::default();
     for op in ops {
         let pos = op.pos.get();
