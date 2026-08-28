@@ -201,7 +201,14 @@ pub fn preprocess_object_to_object(
     } else {
         source
     };
-    module_to_object(module, source, mode, ast_module, &converter.carried_ignores)
+    module_to_object(
+        module,
+        source,
+        mode,
+        ast_module,
+        &converter.carried_ignores,
+        false,
+    )
 }
 
 struct ObjectConverter {
@@ -706,7 +713,7 @@ impl ObjectConverter {
                     let clause_test = self.req_expr(nested, "test", "If")?;
                     let clause_body = self.body(nested, "body", "If")?;
                     elif_else_clauses.push(ast::ElifElseClause {
-                        range,
+                        range: self.location(nested, "If")?,
                         node_index: Default::default(),
                         test: Some(*clause_test),
                         body: clause_body,
@@ -2125,7 +2132,7 @@ pub fn parse_to_object_with_opts(
         0,
         crate::call::take_last_exec_ctx(),
     )?;
-    module_to_object(module, source, mode, ast_module, &collected.ignores)
+    module_to_object(module, source, mode, ast_module, &collected.ignores, true)
 }
 
 fn module_to_object(
@@ -2134,6 +2141,7 @@ fn module_to_object(
     mode: crate::compile::Mode,
     module_object: PyObjectRef,
     ignores: &[super::type_comments::TypeComment],
+    parser_locations: bool,
 ) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let ast_module = Rooted(pyre_object::gc_roots::shadow_stack_len());
@@ -2142,6 +2150,7 @@ fn module_to_object(
         source,
         source_file: SourceFileBuilder::new("<unknown>", source).finish(),
         ast_module,
+        parser_locations,
     };
     let root = match module {
         ast::Mod::Expression(module) => converter.node(
@@ -2215,6 +2224,10 @@ struct Converter<'a> {
     /// a `SourceFile` to slice it by range.
     source_file: SourceFile,
     ast_module: Rooted,
+    /// Ruff parser nodes include a few tokens that public PyPy/CPython AST
+    /// locations exclude.  ObjectConverter inputs already carry public
+    /// locations and must never receive those parser-only adaptations again.
+    parser_locations: bool,
 }
 
 impl Converter<'_> {
@@ -2307,6 +2320,47 @@ impl Converter<'_> {
         )
     }
 
+    /// PyPy `BaseParser.set_decorators` attaches decorators while preserving
+    /// the raw FunctionDef/ClassDef `target.location()`.  Ruff instead starts
+    /// the statement range at the first `@`, so recover the first code token
+    /// after the final decorator for the public node's location.
+    fn definition_range(
+        &self,
+        statement: ruff_text_size::TextRange,
+        decorators: &[ast::Decorator],
+    ) -> (u32, u32) {
+        let (start, end) = range(statement);
+        if !self.parser_locations {
+            return (start, end);
+        }
+        let Some(last) = decorators.last() else {
+            return (start, end);
+        };
+        let after_decorator = last.range.end().to_u32();
+        if start > after_decorator {
+            // ObjectConverter already received the public def/class location.
+            return (start, end);
+        }
+        let bytes = self.source.as_bytes();
+        let mut offset = after_decorator as usize;
+        let limit = (end as usize).min(bytes.len());
+        while offset < limit {
+            while offset < limit && matches!(bytes[offset], b' ' | b'\t' | b'\x0c' | b'\n') {
+                offset += 1;
+            }
+            if offset < limit && bytes[offset] == b'#' {
+                while offset < limit && bytes[offset] != b'\n' {
+                    offset += 1;
+                }
+                continue;
+            }
+            if offset < limit {
+                return (offset as u32, end);
+            }
+        }
+        (start, end)
+    }
+
     fn stmt_list(&self, stmts: &[ast::Stmt]) -> RootedResult {
         stmts
             .iter()
@@ -2348,7 +2402,7 @@ impl Converter<'_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.node(
                     name,
-                    Some(range(node.range)),
+                    Some(self.definition_range(node.range, &node.decorator_list)),
                     &[
                         ("name", self.string(node.name.as_str())),
                         ("args", self.parameters(&node.parameters)?),
@@ -2389,7 +2443,7 @@ impl Converter<'_> {
                 };
                 self.node(
                     "ClassDef",
-                    Some(range(node.range)),
+                    Some(self.definition_range(node.range, &node.decorator_list)),
                     &[
                         ("name", self.string(node.name.as_str())),
                         ("bases", bases),
@@ -2495,9 +2549,17 @@ impl Converter<'_> {
                 for clause in node.elif_else_clauses.iter().rev() {
                     let body = self.stmt_list(&clause.body)?;
                     if let Some(test) = clause.test.as_ref() {
+                        // PyPy PEG `elif_stmt` is recursive, so its LOCATIONS
+                        // end at the tail of the whole elif/else chain.
+                        let (start, clause_end) = range(clause.range);
+                        let end = if self.parser_locations {
+                            node.range.end().to_u32()
+                        } else {
+                            clause_end
+                        };
                         orelse = vec![self.node(
                             "If",
-                            Some(range(clause.range)),
+                            Some((start, end)),
                             &[
                                 ("test", self.expr(test)?),
                                 ("body", body),
@@ -3475,17 +3537,17 @@ impl Converter<'_> {
         let posonlyargs = p
             .posonlyargs
             .iter()
-            .map(|p| self.parameter(&p.parameter))
+            .map(|p| self.parameter(&p.parameter, 0))
             .collect::<Result<Vec<_>, _>>()?;
         let args = p
             .args
             .iter()
-            .map(|p| self.parameter(&p.parameter))
+            .map(|p| self.parameter(&p.parameter, 0))
             .collect::<Result<Vec<_>, _>>()?;
         let kwonlyargs = p
             .kwonlyargs
             .iter()
-            .map(|p| self.parameter(&p.parameter))
+            .map(|p| self.parameter(&p.parameter, 0))
             .collect::<Result<Vec<_>, _>>()?;
         let mut defaults = Vec::new();
         defaults.extend(
@@ -3515,23 +3577,38 @@ impl Converter<'_> {
                 ("args", self.list(args)),
                 (
                     "vararg",
-                    self.optional(p.vararg.as_deref().map(|v| self.parameter(v)).transpose()?),
+                    self.optional(
+                        p.vararg
+                            .as_deref()
+                            .map(|v| self.parameter(v, 1))
+                            .transpose()?,
+                    ),
                 ),
                 ("kwonlyargs", self.list(kwonlyargs)),
                 ("kw_defaults", self.list(kw_defaults)),
                 (
                     "kwarg",
-                    self.optional(p.kwarg.as_deref().map(|v| self.parameter(v)).transpose()?),
+                    self.optional(
+                        p.kwarg
+                            .as_deref()
+                            .map(|v| self.parameter(v, 2))
+                            .transpose()?,
+                    ),
                 ),
                 ("defaults", self.list(defaults)),
             ],
         )
     }
 
-    fn parameter(&self, p: &ast::Parameter) -> RootedResult {
+    fn parameter(&self, p: &ast::Parameter, star_width: u32) -> RootedResult {
+        let (start, end) = range(p.range);
+        // PyPy PEG `star_etc`/`kwds` build `ast.arg` from `param_no_default`,
+        // after consuming `*` or `**`; Ruff includes those tokens in range.
+        let star_width = if self.parser_locations { star_width } else { 0 };
+        let start = start.saturating_add(star_width).min(end);
         self.node(
             "arg",
-            Some(range(p.range)),
+            Some((start, end)),
             &[
                 ("arg", self.string(p.name.as_str())),
                 (
