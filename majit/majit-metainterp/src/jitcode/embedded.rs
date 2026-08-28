@@ -137,14 +137,12 @@ impl EmbeddedJitCodeTable {
                     {
                         core.fnaddr = *runtime;
                     }
-                    if core.try_body().is_some() {
-                        for constant in &mut core.body_mut().constants_i {
-                            if let Some((_, runtime)) = replacements
-                                .iter()
-                                .find(|(symbolic, _)| symbolic == constant)
-                            {
-                                *constant = *runtime;
-                            }
+                    for constant in &mut core.body_mut().constants_i {
+                        if let Some((_, runtime)) = replacements
+                            .iter()
+                            .find(|(symbolic, _)| symbolic == constant)
+                        {
+                            *constant = *runtime;
                         }
                     }
                     Arc::new(JitCode::from_canonical(core))

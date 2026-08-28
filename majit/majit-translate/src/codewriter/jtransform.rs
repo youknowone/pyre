@@ -160,9 +160,9 @@ pub struct GraphTransformConfig {
     ///
     /// Named here the way [`Self::jitdriver_receiver_roots`] names the
     /// driver. [`Default`] is pyre's helper, so a pipeline that does not name
-    /// one keeps pyre's behaviour. An empty name declines the rewrite, which
-    /// is what a host with no such helper wants: a call to a symbol it cannot
-    /// bind is a trace-ender, not a lowering.
+    /// one keeps pyre's behaviour. An empty name emits an explicit abort
+    /// before the original operation, which is what a host with no such helper
+    /// wants: the operation is a trace-ender, not a lowering.
     #[serde(default = "default_str_concat_helper")]
     pub str_concat_helper: String,
     /// The host's own `str(i)` helper, called for a `str` over an Int operand.
@@ -1473,6 +1473,45 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let configured_helper = match &op.kind {
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "str" && self.get_value_kind_var(operand) == 'i' => {
+                Some(self.config.int_str_helper.as_str())
+            }
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "add"
+                && self.get_value_kind_var(lhs) == 'r'
+                && self.get_value_kind_var(rhs) == 'r' =>
+            {
+                Some(self.config.str_concat_helper.as_str())
+            }
+            _ => None,
+        };
+        if configured_helper.is_some_and(str::is_empty) {
+            // The empty-name contract is a host refusal, not permission to
+            // leave a handler-less integer opname in the JitCode. Put the
+            // abort first so tracing and blackhole execution both refuse
+            // before reaching the original operation.
+            return RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::HostHelperRefused,
+                        },
+                    },
+                },
+                op.clone(),
+            ]);
+        }
+
         match &op.kind {
             // ── rewrite_op_hint ──
             //
@@ -8939,14 +8978,9 @@ mod tests {
         );
     }
 
-    /// An unnamed helper declines the rewrite.
-    ///
-    /// The alternative is worse than not lowering: a residual call to a symbol
-    /// the host cannot bind keeps the build's sentinel address, so a trace
-    /// that reaches it declines there. Leaving the op alone at least keeps the
-    /// failure at the op that has no lowering.
+    /// An unnamed helper emits the host-refusal abort before the original op.
     #[test]
-    fn an_unnamed_int_str_helper_leaves_the_op_alone() {
+    fn an_unnamed_int_str_helper_aborts_before_the_original_op() {
         let (graph, _n_var) = int_str_graph();
         let config = GraphTransformConfig {
             int_str_helper: String::new(),
@@ -8960,11 +8994,19 @@ mod tests {
             "no helper is named, so nothing is called: {ops:?}",
         );
         assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::UnaryOp { op: name, .. } if name == "str"
-            )),
-            "the op survives for whatever lowers it next: {ops:?}",
+            matches!(
+                &ops[1].kind,
+                OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::HostHelperRefused,
+                    },
+                }
+            ),
+            "the host refusal must be explicit: {ops:?}",
+        );
+        assert!(
+            matches!(&ops[2].kind, OpKind::UnaryOp { op: name, .. } if name == "str"),
+            "the original op stays residual after the abort: {ops:?}",
         );
     }
 
@@ -9032,10 +9074,10 @@ mod tests {
         );
     }
 
-    /// An unnamed concat helper declines the rewrite, matching the integer
-    /// helper's empty-name contract.
+    /// An unnamed concat helper emits the same host-refusal abort as the
+    /// integer helper.
     #[test]
-    fn an_unnamed_str_concat_helper_leaves_the_op_alone() {
+    fn an_unnamed_str_concat_helper_aborts_before_the_original_op() {
         let graph = str_concat_graph();
         let config = GraphTransformConfig {
             str_concat_helper: String::new(),
@@ -9049,11 +9091,19 @@ mod tests {
             "no helper is named, so nothing is called: {ops:?}",
         );
         assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::BinOp { op: name, .. } if name == "add"
-            )),
-            "the op survives for whatever lowers it next: {ops:?}",
+            matches!(
+                &ops[2].kind,
+                OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::HostHelperRefused,
+                    },
+                }
+            ),
+            "the host refusal must be explicit: {ops:?}",
+        );
+        assert!(
+            matches!(&ops[3].kind, OpKind::BinOp { op: name, .. } if name == "add"),
+            "the original op stays residual after the abort: {ops:?}",
         );
     }
 

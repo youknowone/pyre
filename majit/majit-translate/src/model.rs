@@ -192,6 +192,12 @@ pub enum UnsupportedExprKind {
     /// Classified separately from `OtherExpr` so the producer site is
     /// distinguishable from the catch-all in dual-gate diagnostics.
     Closure,
+    /// Not a `syn::Expr` variant: the embedding host explicitly declined to
+    /// name a helper required to lower an otherwise recognized operation.
+    /// It is carried in this family because `OpKind::Abort` accepts an
+    /// `UnknownKind`, whose only structured reason payload is
+    /// `UnsupportedExpr`.
+    HostHelperRefused,
     OtherExpr,
 }
 

@@ -7397,6 +7397,165 @@ fn unsupported_opname_surfaces_typed_error() {
     assert_eq!(err, DispatchError::UnsupportedOpname { pc: 0, key: opname },);
 }
 
+#[test]
+fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
+    use majit_translate::codewriter::{call::CallControl, codewriter::CodeWriter};
+    use majit_translate::{
+        CallPath, ConcreteType, FunctionGraph, GraphTransformConfig, OpKind, ValueType,
+    };
+
+    let mut graph = FunctionGraph::new("empty_str_concat_helper");
+    let lhs = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "lhs".into(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    let rhs = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "rhs".into(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    let result = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::BinOp {
+                op: "add".into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    graph.set_return(graph.startblock, Some(result.clone()));
+    FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+    FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::GcRef);
+    FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+
+    let config = GraphTransformConfig {
+        str_concat_helper: String::new(),
+        ..Default::default()
+    };
+    let path = CallPath::from_segments(["empty_str_concat_helper"]);
+    let mut callcontrol = CallControl::new();
+    callcontrol.register_function_graph(path.clone(), graph);
+    let jitcode = callcontrol.get_jitcode(&path);
+    let mut codewriter = CodeWriter::new();
+    codewriter.drain_pending_graphs(&mut callcontrol, &config);
+    let body = jitcode
+        .try_body()
+        .expect("the public codewriter pipeline commits the concat graph");
+
+    let original_opname = "int_add/rr>r";
+    let original_byte = *codewriter
+        .assembler
+        .insns()
+        .get(original_opname)
+        .expect("the original Ref + Ref add remains after the refusal marker");
+    let original_pc = body
+        .code
+        .iter()
+        .enumerate()
+        .find_map(|(pc, candidate)| {
+            (*candidate == original_byte && jitcode.is_valid_startpoint(pc)).then_some(pc)
+        })
+        .expect("assembled body contains the Ref + Ref add byte");
+    let abort_byte = *codewriter
+        .assembler
+        .insns()
+        .get("abort/")
+        .expect("the empty helper emits the explicit abort opname");
+    let abort_pc = body
+        .code
+        .iter()
+        .enumerate()
+        .find_map(|(pc, candidate)| {
+            (*candidate == abort_byte && jitcode.is_valid_startpoint(pc)).then_some(pc)
+        })
+        .expect("assembled body contains the explicit abort byte");
+    assert!(
+        abort_pc < original_pc,
+        "the refusal must be reached before the handler-less original op",
+    );
+    let decoded = crate::jitcode_runtime::DecodedOp {
+        key: "abort/",
+        opname: "abort",
+        argcodes: "",
+        pc: abort_pc,
+        next_pc: abort_pc + 1,
+    };
+
+    let mut trace_ctx = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut registers_r = vec![OpRef::NONE; body.c_num_regs_r as usize];
+    let mut concrete_registers_r = vec![ConcreteValue::Null; body.c_num_regs_r as usize];
+    let mut walk_ctx = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut registers_r,
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut concrete_registers_r,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut trace_ctx,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let trace_error = super::handle(&decoded, &body.code, &mut walk_ctx)
+        .expect_err("the walker stops at the explicit refusal marker");
+    assert_eq!(
+        trace_error,
+        DispatchError::AbortMarkerReached { pc: abort_pc },
+    );
+
+    let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+    builder.setup_insns(codewriter.assembler.insns());
+    majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+    assert_eq!(builder.unwired_opnames(), vec![original_opname]);
+    let mut bh = builder.acquire_interp();
+    assert!(
+        matches!(
+            builder.dispatch_loop(&mut bh, &body.code, abort_pc),
+            Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+        ),
+        "the blackhole exits at the refusal marker before the unwired add",
+    );
+    assert!(bh.aborted);
+}
+
 /// `ptr_nonzero/r>i` records `PtrNe(box, CONST_NULL)` into the
 /// int dst.  RPython parity: `pyjitpl.py opimpl_ptr_nonzero`
 /// returns `self.execute(rop.PTR_NE, box, CONST_NULL)`.

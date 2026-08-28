@@ -5509,6 +5509,34 @@ mod tests {
         }
 
         #[test]
+        fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
+            let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
+            for (opname, byte) in majit_translate::insns::wellknown_bh_insns()
+                .into_iter()
+                .chain(majit_translate::insns::extension_insns())
+            {
+                insns.insert(opname.to_string(), byte);
+            }
+
+            let mut builder = BlackholeInterpBuilder::new();
+            builder.setup_insns(&insns);
+            super::wire_bhimpl_handlers(&mut builder);
+            let mut unwired: Vec<String> = builder
+                .unwired_opnames()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            unwired.sort();
+
+            assert_eq!(
+                unwired,
+                Vec::<String>::new(),
+                "the canonical and extension opname tables must not acquire a handler gap; \
+                 fix the emitting kind shape instead of wiring a non-orthodox alias",
+            );
+        }
+
+        #[test]
         fn inline_builder_wires_float_cmp_and_raw_load_f() {
             // A dispatch arm materializing a float comparison as an int
             // (`(a >= b) as i64`) emits `float_ge/ff>i` and siblings, and
