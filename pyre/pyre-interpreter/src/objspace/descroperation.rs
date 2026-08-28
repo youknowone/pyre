@@ -3463,8 +3463,8 @@ pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         // sequences.  A sequence subclass that overrides `__mul__`/`__rmul__`
         // must reach its override first — `LM([1]) * 2` is `LM.__mul__`, not a
         // list repetition — the same gate the concat branches of `add` apply.
-        const MUL_SPECIALS: &[&str] = &["__mul__", "__rmul__"];
-        if (seq_repeat_override(a, MUL_SPECIALS) || seq_repeat_override(b, MUL_SPECIALS))
+        if (seq_repeat_override(a, &["__mul__", "__rmul__"])
+            || seq_repeat_override(b, &["__mul__", "__rmul__"]))
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {
