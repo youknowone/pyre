@@ -7153,7 +7153,7 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
         let is_being_profiled = i64::from(unsafe { &*f }.get_is_being_profiled());
         let pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
         let live_frame = f;
-        let ec = unsafe { &*f }.execution_context;
+        let ec = pyre_interpreter::call::getexecutioncontext();
         eprintln!(
             "[jd0-mt] greens next_instr={} is_being_profiled={} pycode=0x{:x}",
             next_instr, is_being_profiled, pycode as usize,
