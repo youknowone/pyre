@@ -4,10 +4,14 @@
 //! interp_socket submodule carries the W_Socket class implementation
 //! plus address conversion / IDNA / error mapping helpers, and
 //! rsocket_rffi carries the host socket layer both platforms reach it
-//! through.  It exists only where such a layer does: a target that is
-//! neither POSIX nor Windows has no `_socket` module at all, which is the
-//! absence `socket.py` and its callers are written against.
+//! through.  A target with no such layer still carries the module: what it
+//! lacks it lacks entry point by entry point, the way a build whose C library
+//! has the headers but not the calls lacks them, and `interp_socket_wasm`
+//! publishes the part that is left -- the type `socket.py` subclasses and the
+//! numbers it reads.
 
+#[cfg(not(any(unix, windows)))]
+mod interp_socket_wasm;
 #[cfg(any(unix, windows))]
 pub(crate) mod rsocket_rffi;
 
