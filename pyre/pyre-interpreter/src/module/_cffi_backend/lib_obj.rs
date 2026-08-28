@@ -567,6 +567,7 @@ pub fn lib_type() -> PyObjectRef {
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(tp);
             pyre_object::w_type_set_acceptable_as_base_class(tp, false);
+            pyre_object::w_type_set_dispatch_own_getattribute(tp);
         }
         tp as usize
     }) as PyObjectRef

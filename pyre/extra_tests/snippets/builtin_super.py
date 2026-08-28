@@ -18,6 +18,24 @@ assert superB.__self_class__ is None
 assert superB.__self__ is None
 
 
+# A missing attribute on a super proxy stays on the proxy's dedicated lookup
+# path. Dispatching super.__getattribute__ through the generic builtin slot
+# path re-enters the same lookup until the native stack overflows.
+class _MissingBase:
+    pass
+
+
+class _MissingDerived(_MissingBase):
+    def missing_from_super(self):
+        try:
+            return super().nope
+        except AttributeError as exc:
+            return str(exc)
+
+
+assert _MissingDerived().missing_from_super() == "'super' object has no attribute 'nope'"
+
+
 # CPython 3.14 LOAD_SUPER_ATTR calls the value loaded from the `super`
 # global. Bit 1 of the opcode chooses the zero- or two-argument call shape;
 # exercise both repeatedly so the generated JIT residual keeps that contract.

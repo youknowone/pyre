@@ -315,6 +315,12 @@ pub struct W_TypeObject {
     /// `Py_tp_vectorcall`; never inherited by a subclass (the default is
     /// `false`), which is the field's own rule.
     pub flag_has_vectorcall: std::sync::atomic::AtomicBool,
+    /// Interpreter-only opt-in for a builtin type whose own explicit
+    /// `__getattribute__` entry must be dispatched through the object space.
+    /// Heap-type owners are admitted structurally; builtin types default to
+    /// `false` and set this once after construction when their TypeDef needs
+    /// the same dispatch.
+    pub flag_dispatch_own_getattribute: std::sync::atomic::AtomicBool,
     /// typeobject.py/216 `flag_abstract?` — set from the
     /// `__abstractmethods__` setattr hook; gates `object.__new__`.
     pub flag_abstract: std::sync::atomic::AtomicBool,
@@ -551,6 +557,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // slot wrapper); only builtin disallow-types flip this.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_has_vectorcall: std::sync::atomic::AtomicBool::new(false),
+        flag_dispatch_own_getattribute: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
@@ -680,6 +687,7 @@ pub fn w_type_new_builtin(
         // `w_type_set_disallow_instantiation`.
         flag_disallow_instantiation: std::sync::atomic::AtomicBool::new(false),
         flag_has_vectorcall: std::sync::atomic::AtomicBool::new(false),
+        flag_dispatch_own_getattribute: std::sync::atomic::AtomicBool::new(false),
         flag_abstract: std::sync::atomic::AtomicBool::new(false),
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
@@ -818,6 +826,36 @@ pub unsafe fn w_type_set_has_vectorcall(w_type: PyObjectRef) {
     }
     let t = &*(w_type as *const W_TypeObject);
     t.flag_has_vectorcall
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a builtin `w_type` opts its own explicit `__getattribute__` entry
+/// into object-space slot dispatch. Heap-type owners do not need this marker.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_dispatches_own_getattribute(w_type: PyObjectRef) -> bool {
+    if w_type.is_null() || !is_type(w_type) {
+        return false;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_dispatch_own_getattribute
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Opt a builtin `w_type` into dispatching its own explicit
+/// `__getattribute__` entry through the object space. Called once at typedef
+/// registration for builtin types whose attribute protocol lives in that
+/// entry rather than an earlier object-space shim.
+///
+/// # Safety
+/// `w_type` must be a valid PyObjectRef pointing at a `W_TypeObject`.
+pub unsafe fn w_type_set_dispatch_own_getattribute(w_type: PyObjectRef) {
+    if w_type.is_null() || !is_type(w_type) {
+        return;
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_dispatch_own_getattribute
         .store(true, std::sync::atomic::Ordering::Release);
 }
 
@@ -2171,6 +2209,16 @@ mod tests {
             assert_eq!(w_type_get_layout_ptr(w_base), layout);
             assert!(!w_type_get_acceptable_as_base_class(w_child));
             assert!(!w_type_get_acceptable_as_base_class(w_base));
+        }
+    }
+
+    #[test]
+    fn dispatch_own_getattribute_is_a_default_off_opt_in() {
+        let w_type = w_type_new("DispatchOwnGetattribute", PY_NULL, std::ptr::null_mut());
+        unsafe {
+            assert!(!w_type_dispatches_own_getattribute(w_type));
+            w_type_set_dispatch_own_getattribute(w_type);
+            assert!(w_type_dispatches_own_getattribute(w_type));
         }
     }
 
