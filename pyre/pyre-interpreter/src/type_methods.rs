@@ -2859,9 +2859,9 @@ fn format_spec_err(
         E::ExclusiveFormat(c1, c2) => {
             crate::PyError::value_error(format!("Cannot specify both '{c1}' and '{c2}'."))
         }
-        E::UnknownFormatCode(c, _) if integer && c == 'z' => {
-            crate::PyError::value_error("Negative zero coercion (z) not allowed")
-        }
+        E::UnknownFormatCode(c, _) if integer && c == 'z' => crate::PyError::value_error(
+            "Negative zero coercion (z) not allowed in integer format specifier",
+        ),
         E::UnknownFormatCode(c, _) => crate::PyError::value_error(format!(
             "Unknown format code '{}' for object of type '{type_name}'",
             unknown_code_display(c)
@@ -3095,9 +3095,10 @@ fn format_with_spec(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyE
             if p.no_neg_zero && matches!(p.ty, '\0' | 'b' | 'c' | 'd' | 'o' | 'x' | 'X' | 'n') {
                 // pypy/objspace/std/newformat.py format_int_or_long:
                 // `z` is meaningful only after conversion to a floating
-                // presentation type.
+                // presentation type.  The sentence names the specifier it was
+                // read out of, the way the string arm below names its own.
                 return Err(crate::PyError::value_error(
-                    "Negative zero coercion (z) not allowed",
+                    "Negative zero coercion (z) not allowed in integer format specifier",
                 ));
             }
             if spec.ends_with("c") && parsed.is_ok() {

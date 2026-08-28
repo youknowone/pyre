@@ -2047,10 +2047,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |args| {
                 let s = args[0];
                 if !unsafe { pyre_object::is_exact_type(s, &pyre_object::STR_TYPE) } {
-                    return Err(crate::PyError::type_error(format!(
-                        "can't intern {}",
-                        crate::type_methods::arg_type_name(s)
-                    )));
+                    // The clinic converter takes a `unicode`, so anything that
+                    // is not a `str` at all is refused by the argument and
+                    // never reaches `sys_intern_impl`; only a `str` subclass
+                    // does, and that is the refusal the body itself states.
+                    let name = crate::type_methods::arg_type_name(s);
+                    let message = if unsafe { is_str(s) } {
+                        format!("can't intern {name}")
+                    } else {
+                        format!("intern() argument must be str, not {name}")
+                    };
+                    return Err(crate::PyError::type_error(message));
                 }
                 Ok(unsafe { pyre_object::unicodeobject::intern_exact_str(s) })
             },
