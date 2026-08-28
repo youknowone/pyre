@@ -1,7 +1,117 @@
 use super::*;
 use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
-use majit_metainterp::{VableArrayStore, make_fail_descr};
+use majit_metainterp::{JitCodeSym, TraceAction, VableArrayStore, make_fail_descr};
+
+static STATIC_REFUSAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn count_static_refusal_prefix() {
+    STATIC_REFUSAL_PREFIX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+struct StaticRefusalSym;
+
+impl JitCodeSym for StaticRefusalSym {
+    fn total_slots(&self) -> usize {
+        0
+    }
+
+    fn loop_header_pc(&self) -> usize {
+        0
+    }
+
+    fn fail_args(&self) -> Option<Vec<OpRef>> {
+        Some(Vec::new())
+    }
+}
+
+/// The generated dispatch loop re-runs its source arm when a trace start
+/// returns no handoff. The static refusal must therefore happen before the
+/// bound prefix call: the arm itself then performs that side effect once.
+#[test]
+fn unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect() {
+    let before = STATIC_REFUSAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut builder = majit_metainterp::JitCodeBuilder::new();
+    let bound = builder.add_fn_ptr(count_static_refusal_prefix as *const ());
+    builder.residual_call_void_canonical_via_target_with_effect_info(
+        bound,
+        &[],
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        "unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect",
+    ]);
+    let unbound = builder.add_fn_ptr(symbolic as usize as *const ());
+    builder.residual_call_void_canonical_via_target_with_effect_info(
+        unbound,
+        &[],
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    builder.void_return();
+    let jitcode = builder.finish();
+
+    let scan = jitcode.reachable_symbolic_residuals();
+    assert_eq!(scan.visited_jitcodes, 1);
+    assert_eq!(scan.targets, vec![symbolic]);
+
+    let mut ctx = TraceCtx::for_test_types(&[]);
+    let action =
+        majit_metainterp::trace_jitcode(&mut ctx, &mut StaticRefusalSym, &jitcode, 0, |_pc| 0);
+    assert!(matches!(action, TraceAction::Abort));
+    assert_eq!(
+        STATIC_REFUSAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "the reachable-set refusal must run before the bound residual prefix",
+    );
+
+    // `None` from the generated merge wrapper falls through to this source-arm
+    // execution. It is the only execution of the prefix after the preflight.
+    count_static_refusal_prefix();
+    assert_eq!(
+        STATIC_REFUSAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        before + 1,
+        "the source arm must apply the observable side effect exactly once",
+    );
+}
+
+/// Pyre's runtime fnaddr patch must leave the portal closure free of symbolic
+/// residual targets. Keep the visited count and cold-scan duration visible so
+/// this trace-start gate has a measured cost on the table it protects.
+#[test]
+fn portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let portal = crate::jitcode_runtime::portal_jitcode()
+        .expect("the build-time table registers the eval portal");
+    let portal = majit_metainterp::JitCode::from_canonical((*portal).clone());
+
+    let started = std::time::Instant::now();
+    let scan = portal.reachable_symbolic_residuals();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "[symbolic-residual-scan] visited={} elapsed_ns={} unbound={}",
+        scan.visited_jitcodes,
+        elapsed.as_nanos(),
+        scan.targets.len(),
+    );
+
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "jit_fnaddr bindings must resolve every portal-reachable residual",
+    );
+}
 
 #[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
