@@ -490,13 +490,36 @@ impl<'a> MirGraphLookup<'a> {
 ///   and unflagged callers keep the original. One graph per function cannot
 ///   split, so a parameter is flagged only when EVERY resolved call site
 ///   passes a hinted value there.
-/// * **No alias closure.** Only a variable the hint itself produced, or a
-///   parameter that arrives flagged, counts as hinted. A hinted value copied
-///   through an intervening op is not followed.
+/// * **Alias closure follows links and representation casts only.** A
+///   variable the hint produced, a parameter that arrives flagged, whatever
+///   a `Link` binds one of those to in a successor block, and whatever a
+///   `__cast_pointer` / `__cast_instance_intrinsic` marker derives from one
+///   counts as hinted; nothing else does. Links are followed because
+///   `annotator.py` propagates the annotation along them; the two markers
+///   because `jtransform` rewrites them to `same_as`, so each is the one
+///   variable an RPython flow graph would have had. A hinted value that
+///   reaches a callee through anything else — a wrapper struct, an
+///   accessor, a `Vec` — is not followed. `Rvalue::Use` needs no rule: the
+///   front end reuses the operand's `Variable` rather than emitting a copy.
 ///
-/// A callee whose path does not resolve to a lowered function is skipped
-/// entirely — it can neither be flagged nor veto a flag, since there is no
-/// graph for the gate to read.
+/// A callee that does not resolve to a lowered function is skipped entirely
+/// — it can neither be flagged nor veto a flag, since there is no graph for
+/// the gate to read. A `FunctionPath` resolves by crate-stripped path; a
+/// `Method` resolves by its stamped path when it has one and otherwise by
+/// the `(receiver root, method leaf)` pair, and an ambiguous pair is treated
+/// as unresolved.
+///
+/// On the interpreter's own graph the first under-approximation is the one
+/// that binds, and it binds everywhere. `eval::dispatch` is the clearest
+/// case: the seed reaches `handle_jitexception`'s argument, that callee
+/// resolves, and it is still not flagged, because `handle_jitexception` is
+/// also reached from callers holding no hinted frame. Nearly every callee a
+/// hinted frame reaches is reached that way too, so the flag lands on no
+/// graph at all until pyre can specialize a second one. That leans the safe
+/// way — `policy::look_inside_graph` aborts on a flag it cannot honour, and
+/// the suppression the flag would buy (dropping a `jit_force_virtualizable`)
+/// has no injector on this path yet — but it means the gate is quiet by
+/// absence, not by agreement, and a census is the only way to tell which.
 pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
     use std::collections::HashMap;
 
@@ -513,6 +536,25 @@ pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
         .enumerate()
         .map(|(i, f)| (path_of(f), i))
         .collect();
+
+    // A method call target names the receiver's type root and the method,
+    // not a path, so it cannot be looked up in `index`. `call.rs
+    // target_to_path` reaches the same graph through
+    // `CallPath::for_impl_method(impl_type, name)`; here the same pair is
+    // the key. `None` marks a pair more than one lowered function answers
+    // to — an ambiguous callee is skipped exactly like an unresolvable one,
+    // since flagging the wrong graph would arm the gate against a function
+    // the hint never reached.
+    let mut method_index: HashMap<(String, String), Option<usize>> = HashMap::new();
+    for (i, func) in functions.iter().enumerate() {
+        let Some(root) = &func.self_ty_root else {
+            continue;
+        };
+        method_index
+            .entry((root.clone(), leaf_of(&func.name)))
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(i));
+    }
 
     // Per function, the parameter positions that arrive carrying the flag.
     let mut flagged_params: Vec<Vec<usize>> = vec![Vec::new(); functions.len()];
@@ -532,7 +574,7 @@ pub(crate) fn propagate_access_directly(functions: &mut [SemanticFunction]) {
                     let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
                         continue;
                     };
-                    let Some(callee) = resolve_callee(target, &index) else {
+                    let Some(callee) = resolve_callee(target, &index, &method_index) else {
                         continue;
                     };
                     for (pos, arg) in args.iter().enumerate() {
@@ -619,26 +661,140 @@ fn access_directly_seeds(
             }
         }
     }
+    // A hinted value reaches its callee through the front end's
+    // representation casts, which are `same_as` once lowered; follow them on
+    // both sets so a cast neither loses a flag nor smuggles a killed one
+    // past the `access_directly=False` spelling.
+    close_over_aliases(func, &mut seeds);
+    close_over_aliases(func, &mut killed);
     seeds.retain(|seed| !killed.iter().any(|dead| dead == seed));
     seeds
+}
+
+/// The leaf segment of a lowered function's name.
+///
+/// `front::mir` spells an impl method's name with its `<Impl>::` qualifier,
+/// while a `CallTarget::Method` carries the bare method name beside the
+/// receiver root, so the two meet at the leaf.
+fn leaf_of(name: &str) -> String {
+    match name.rsplit_once("::") {
+        Some((_, leaf)) => leaf.to_string(),
+        None => name.to_string(),
+    }
 }
 
 /// The lowered function a call target names, if it is one.
 ///
 /// A call spells its target with the declaration's full `name_path`, while a
 /// `SemanticFunction` is keyed on the crate-stripped path, so the two are
-/// compared after stripping.
+/// compared after stripping. A method target carries no path at all and is
+/// resolved through the receiver-root pair instead.
 fn resolve_callee(
     target: &crate::model::CallTarget,
     index: &std::collections::HashMap<String, usize>,
+    method_index: &std::collections::HashMap<(String, String), Option<usize>>,
 ) -> Option<usize> {
-    let crate::model::CallTarget::FunctionPath { segments } = target else {
-        return None;
-    };
-    let joined = segments.join("::");
-    index
-        .get(crate::front::mir::strip_crate_prefix(&joined).as_str())
-        .copied()
+    match target {
+        crate::model::CallTarget::FunctionPath { segments } => {
+            let joined = segments.join("::");
+            index
+                .get(crate::front::mir::strip_crate_prefix(&joined).as_str())
+                .copied()
+        }
+        crate::model::CallTarget::Method {
+            name,
+            receiver_root,
+            resolved_path,
+        } => {
+            // `stamp_classdef_hints_on_graph` stamps the resolved path when
+            // the receiver's classdef is known; it is the same key
+            // `call.rs target_to_path` hands `function_graphs`, so prefer it.
+            if let Some(path) = resolved_path
+                && let Some(&i) =
+                    index.get(crate::front::mir::strip_crate_prefix(&path.to_string()).as_str())
+            {
+                return Some(i);
+            }
+            let root = receiver_root.as_ref()?;
+            *method_index.get(&(root.clone(), leaf_of(name)))?
+        }
+        _ => None,
+    }
+}
+
+/// Whether a call is one of `front::mir`'s representation-cast markers.
+///
+/// `jtransform.rs rewrite_op_cast_pointer` rewrites both to `same_as`
+/// (jtransform.py:254-257), so the result is the operand under a different
+/// static type — the one variable an RPython flow graph would have had.
+fn is_representation_cast(segments: &[String]) -> bool {
+    matches!(
+        segments.first().map(String::as_str),
+        Some("__cast_pointer") | Some(crate::runtime_names::shims::CAST_INSTANCE)
+    )
+}
+
+/// Extend `vars` with every value that aliases one already in it, to a
+/// fixpoint: across a representation cast, and across a `Link` into the
+/// `inputarg` it binds.
+///
+/// The link half is what upstream gets for free. `annotator.py` propagates an
+/// annotation along a `Link` into the target block's `inputargs`, so a value
+/// that crosses a block boundary keeps its `SomeInstance.flags`. Pyre's
+/// front end mints a fresh `Variable` for each `inputarg`, exactly as
+/// `flowspace/model.py` does, so without this the flag dies at the first
+/// branch — and every hint site in the interpreter has one between the hint
+/// and the calls that consume the frame.
+fn close_over_aliases(func: &SemanticFunction, vars: &mut Vec<crate::flowspace::model::Variable>) {
+    loop {
+        let mut grew = false;
+        let mut admit =
+            |v: &crate::flowspace::model::Variable,
+             vars: &mut Vec<crate::flowspace::model::Variable>| {
+                if !vars.iter().any(|seen| seen == v) {
+                    vars.push(v.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+        for block in &func.graph.blocks {
+            for op in &block.operations {
+                let crate::model::OpKind::Call { target, args, .. } = &op.kind else {
+                    continue;
+                };
+                let crate::model::CallTarget::FunctionPath { segments } = target else {
+                    continue;
+                };
+                if !is_representation_cast(segments) {
+                    continue;
+                }
+                let (Some(src), Some(result)) = (args.first(), op.result.as_ref()) else {
+                    continue;
+                };
+                if vars.iter().any(|v| v == src) {
+                    grew |= admit(result, vars);
+                }
+            }
+            for link in &block.exits {
+                let target = func.graph.block(link.target);
+                for (pos, arg) in link.args.iter().enumerate() {
+                    let Some(arg) = arg.as_variable() else {
+                        continue;
+                    };
+                    let Some(inputarg) = target.inputargs.get(pos) else {
+                        continue;
+                    };
+                    if vars.iter().any(|v| v == arg) {
+                        grew |= admit(inputarg, vars);
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -711,6 +867,69 @@ mod tests {
         f
     }
 
+    /// An inherent-impl method, spelled the way `front::mir` spells one:
+    /// the `<Impl>::` qualifier in the name and the receiver type in
+    /// `self_ty_root`.
+    fn impl_method_qualified(root: &str, name: &str) -> SemanticFunction {
+        let mut f = free_fn(&format!("<Impl>::{name}"));
+        f.self_ty_root = Some(root.to_string());
+        f
+    }
+
+    /// A caller that hints its first parameter, optionally routes the hinted
+    /// value through a representation cast, and calls one method on it.
+    fn caller_hinting_into_method(
+        name: &str,
+        through_cast: bool,
+        receiver_root: &str,
+        method: &str,
+    ) -> SemanticFunction {
+        use crate::flowspace::model::Variable;
+        use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+
+        let mut f = free_fn(name);
+        let start = f.graph.startblock;
+        let param = Variable::named("frame");
+        f.graph.block_mut(start).inputargs = vec![param.clone()];
+        let hinted = Variable::named("hinted");
+        f.graph.block_mut(start).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Hint {
+                value: param.clone(),
+                kind: crate::hints::HintKind::AccessDirectly,
+            },
+        });
+        let passed = if through_cast {
+            let cast = Variable::named("cast");
+            f.graph.block_mut(start).operations.push(SpaceOperation {
+                result: Some(cast.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__cast_pointer".to_string(), receiver_root.to_string()],
+                    },
+                    args: vec![hinted],
+                    result_ty: ValueType::Ref(Some(receiver_root.to_string())),
+                },
+            });
+            cast
+        } else {
+            hinted
+        };
+        f.graph.block_mut(start).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::Method {
+                    name: method.to_string(),
+                    receiver_root: Some(receiver_root.to_string()),
+                    resolved_path: None,
+                },
+                args: vec![passed],
+                result_ty: ValueType::Void,
+            },
+        });
+        f
+    }
+
     fn flags(functions: &[SemanticFunction]) -> Vec<(String, bool)> {
         functions
             .iter()
@@ -764,6 +983,117 @@ mod tests {
                 .map(|(n, _)| n)
                 .collect::<Vec<_>>(),
             vec!["handle_bytecode".to_string(), "execute".to_string()]
+        );
+    }
+
+    /// A method call carries no path, so resolving it by the receiver root is
+    /// the only way the flag reaches the callee at all: every consumer of a
+    /// hinted `PyFrame` in the interpreter is spelled `frame.method(..)`.
+    #[test]
+    fn a_method_callee_resolves_through_the_receiver_root() {
+        let mut fns = vec![
+            caller_hinting_into_method(
+                "createframe_obj",
+                false,
+                "PyFrame",
+                "initialize_frame_scopes",
+            ),
+            impl_method_qualified("PyFrame", "initialize_frame_scopes"),
+        ];
+        propagate_access_directly(&mut fns);
+        assert!(!fns[0].graph.access_directly);
+        assert!(
+            fns[1].graph.access_directly,
+            "a method call must reach its callee through the receiver root"
+        );
+    }
+
+    /// Two lowered functions answering to one `(receiver root, leaf)` pair
+    /// cannot be told apart, and flagging the wrong one would arm the gate
+    /// against a graph the hint never reached. Treat the pair as unresolved.
+    #[test]
+    fn an_ambiguous_receiver_pair_flags_neither() {
+        let mut fns = vec![
+            caller_hinting_into_method("caller", false, "PyFrame", "run"),
+            impl_method_qualified("PyFrame", "run"),
+            impl_method_qualified("PyFrame", "run"),
+        ];
+        propagate_access_directly(&mut fns);
+        assert!(!fns[1].graph.access_directly);
+        assert!(!fns[2].graph.access_directly);
+    }
+
+    /// The front end mints a fresh `Variable` for every block `inputarg`, so
+    /// a hinted value that crosses one branch is a different variable on the
+    /// far side. `annotator.py` carries the annotation along the `Link`; this
+    /// pass has to carry the seed the same way, or every interpreter hint
+    /// dies before reaching the calls that consume the frame.
+    #[test]
+    fn a_link_carries_the_flag_into_the_successor_block() {
+        use crate::flowspace::model::Variable;
+        use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+
+        let mut caller = free_fn("dispatch");
+        let start = caller.graph.startblock;
+        let param = Variable::named("frame");
+        caller.graph.block_mut(start).inputargs = vec![param.clone()];
+        let hinted = Variable::named("hinted");
+        caller
+            .graph
+            .block_mut(start)
+            .operations
+            .push(SpaceOperation {
+                result: Some(hinted.clone()),
+                kind: OpKind::Hint {
+                    value: param,
+                    kind: crate::hints::HintKind::AccessDirectly,
+                },
+            });
+        // The successor's inputarg is a DIFFERENT Variable, as the front end
+        // mints it.
+        let carried = Variable::named("carried");
+        let body = caller.graph.create_block();
+        caller.graph.block_mut(body).inputargs = vec![carried.clone()];
+        caller
+            .graph
+            .block_mut(body)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::Method {
+                        name: "handle_bytecode".to_string(),
+                        receiver_root: Some("PyFrame".to_string()),
+                        resolved_path: None,
+                    },
+                    args: vec![carried],
+                    result_ty: ValueType::Void,
+                },
+            });
+        caller.graph.set_goto(start, body, vec![hinted]);
+
+        let mut fns = vec![caller, impl_method_qualified("PyFrame", "handle_bytecode")];
+        propagate_access_directly(&mut fns);
+        assert!(
+            fns[1].graph.access_directly,
+            "a Link must carry the flag into the successor's inputarg"
+        );
+    }
+
+    /// The front end retypes a hinted pointer through a `__cast_pointer`
+    /// marker before it reaches the callee. `jtransform` rewrites that marker
+    /// to `same_as`, so the flag has to survive it — otherwise every hint in
+    /// the interpreter dies one op after it is spelled.
+    #[test]
+    fn a_representation_cast_carries_the_flag_to_the_callee() {
+        let mut fns = vec![
+            caller_hinting_into_method("app_profile_call", true, "PyFrame", "getclass"),
+            impl_method_qualified("PyFrame", "getclass"),
+        ];
+        propagate_access_directly(&mut fns);
+        assert!(
+            fns[1].graph.access_directly,
+            "a representation cast must not lose the flag"
         );
     }
 
