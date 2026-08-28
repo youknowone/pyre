@@ -1102,15 +1102,16 @@ fn encode_dict(
     let mut items_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(items);
     if crate::baseobjspace::is_true(encoder_attr(self_obj, "sort_keys")?)? {
-        let builtins = crate::importing::get_sys_module("builtins")
-            .ok_or_else(|| PyError::runtime_error("builtins module is unavailable"))?;
-        let sorted = crate::baseobjspace::getattr_str(builtins, "sorted")?;
-        let sorted_items = crate::call::call_function_impl_result(
-            sorted,
-            &[gc_roots::shadow_stack_get(items_slot)],
-        )?;
+        // `encoder_listencode_dict` builds the list itself and sorts it in
+        // place with `PyList_Sort`.  Naming `builtins.sorted` instead resolves
+        // through the running `sys.modules`, which a program is entitled to
+        // block -- and then a plain `json.dumps(d, sort_keys=True)` fails on a
+        // module it never asked for.
+        let items_list =
+            crate::builtins::builtin_list_ctor(&[gc_roots::shadow_stack_get(items_slot)])?;
         items_slot = gc_roots::shadow_stack_len();
-        let _ = gc_roots::pin_root(sorted_items);
+        let _ = gc_roots::pin_root(items_list);
+        crate::builtins::sort_list_in_place(items_slot, None, false)?;
     }
     let iter = crate::baseobjspace::iter(gc_roots::shadow_stack_get(items_slot))?;
     let iter_slot = gc_roots::shadow_stack_len();
@@ -1229,17 +1230,7 @@ fn make_encoder_impl(
     let skipkeys = pyre_object::w_bool_from(crate::baseobjspace::is_true(skipkeys)?);
     let allow_nan = pyre_object::w_bool_from(crate::baseobjspace::is_true(allow_nan)?);
 
-    let module = crate::importing::get_sys_module("_json")
-        .ok_or_else(|| PyError::runtime_error("_json module is unavailable"))?;
-    let ascii = crate::baseobjspace::getattr_str(module, "encode_basestring_ascii")?;
-    let unicode = crate::baseobjspace::getattr_str(module, "encode_basestring")?;
-    let fast_mode = if encoder == ascii {
-        0
-    } else if encoder == unicode {
-        1
-    } else {
-        2
-    };
+    let fast_mode = fast_encode_mode(encoder);
 
     let _roots = gc_roots::push_roots();
     let slot = gc_roots::shadow_stack_len();
@@ -1303,6 +1294,57 @@ fn make_scanner_impl(context: PyObjectRef) -> PyResult {
     }))
 }
 
+/// The two `BuiltinCodeFn`s behind `_json.encode_basestring_ascii` and
+/// `_json.encode_basestring`, in that order, or `0` before the module has been
+/// built once.
+///
+/// `encoder_new` recognizes its own escaper with `PyCFunction_GetFunction`, a
+/// pointer it holds without asking anything where the module is.  Naming the
+/// module instead resolves through the running `sys.modules`, which a program
+/// is entitled to block -- and then a plain `json.dumps(d)` fails on a module
+/// it never asked for.  A pointer is also stable where an object is not: a
+/// re-imported `_json` mints fresh function objects, and an encoder built
+/// against the previous ones is still the same escaper.
+static FAST_ENCODE_FNS: [std::sync::atomic::AtomicUsize; 2] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// `encoder_new`'s `s->fast_encode`: `0` for the ASCII escaper, `1` for the
+/// non-ASCII one, `2` for anything else, which is called as an ordinary
+/// callable.
+fn fast_encode_mode(encoder: PyObjectRef) -> i64 {
+    let Some(code_fn) = (unsafe { crate::jit_builtin_folds::builtin_code_fn_of(encoder) }) else {
+        return 2;
+    };
+    let found = code_fn as usize;
+    for (mode, cell) in FAST_ENCODE_FNS.iter().enumerate() {
+        let known = cell.load(std::sync::atomic::Ordering::Acquire);
+        if known != 0 && known == found {
+            return mode as i64;
+        }
+    }
+    2
+}
+
+/// Record the escapers `init` just stored, so `make_encoder` can recognize
+/// them by pointer.  The pointers are process constants, so a re-import writes
+/// back what is already there.
+fn publish_fast_encode_fns(ns: PyObjectRef) {
+    for (name, cell) in ["encode_basestring_ascii", "encode_basestring"]
+        .iter()
+        .zip(FAST_ENCODE_FNS.iter())
+    {
+        let Some(func) = (unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(ns, name) })
+        else {
+            continue;
+        };
+        if let Some(code_fn) = unsafe { crate::jit_builtin_folds::builtin_code_fn_of(func) } {
+            cell.store(code_fn as usize, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 crate::py_module! {
     "_json",
     inline_functions: {
@@ -1341,5 +1383,8 @@ crate::py_module! {
             make_encoder_impl(markers, default, encoder, indent, key_separator,
                 item_separator, sort_keys, skipkeys, allow_nan)
         }
+    },
+    extra_init: |ns| {
+        publish_fast_encode_fns(ns);
     }
 }

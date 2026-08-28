@@ -1406,6 +1406,9 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
         // first `_ast` import without a dirty bit, and the only owner of the
         // classes between one `_ast` module dict and the next.
         crate::module::_ast::moduledef::walk_ast_state_gc(&mut fwd);
+        // `_csvstate.dialects` is published on the first `_csv` import and
+        // fills with young dialect objects afterwards, so it belongs here too.
+        crate::module::_csv::walk_csv_state_gc(&mut fwd);
     }
     let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
         == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
