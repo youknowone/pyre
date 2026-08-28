@@ -3263,6 +3263,7 @@ thread_local! {
 static SYS_NO_SITE: AtomicBool = AtomicBool::new(false);
 static SYS_QUIET: AtomicBool = AtomicBool::new(false);
 static SYS_INSPECT: AtomicBool = AtomicBool::new(false);
+static SYS_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 static SYS_NO_USER_SITE: AtomicBool = AtomicBool::new(false);
 static SYS_IGNORE_ENVIRONMENT: AtomicBool = AtomicBool::new(false);
 static SYS_ISOLATED: AtomicBool = AtomicBool::new(false);
@@ -3310,6 +3311,7 @@ pub fn no_site_flag() -> bool {
 pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_QUIET.store(flags.quiet, Ordering::Relaxed);
     SYS_INSPECT.store(flags.inspect, Ordering::Relaxed);
+    SYS_INTERACTIVE.store(flags.interactive, Ordering::Relaxed);
     SYS_NO_USER_SITE.store(flags.no_user_site, Ordering::Relaxed);
     SYS_IGNORE_ENVIRONMENT.store(flags.ignore_environment, Ordering::Relaxed);
     SYS_ISOLATED.store(flags.isolated, Ordering::Relaxed);
@@ -3408,11 +3410,18 @@ pub fn quiet_flag() -> bool {
     SYS_QUIET.load(Ordering::Relaxed)
 }
 
-/// `-i`, which `make_flags` reports as both `inspect` and `interactive`, folded
-/// with `PYTHONINSPECT`. The variable sets only `inspect`, so a run that owes
-/// the flag to the environment still reports `interactive` as false.
+/// `-i` folded with PYTHONINSPECT, reported as `sys.flags.inspect`.
 pub fn inspect_flag() -> bool {
     SYS_INSPECT.load(Ordering::Relaxed)
+}
+
+/// `-i` alone, reported as `sys.flags.interactive`.
+///
+/// The variable sets only `inspect`, so a run that owes the flag to the
+/// environment reports `interactive` as false -- and needs a terminal on stdin
+/// before `stdin_is_interactive` will open a prompt for it.
+pub fn interactive_flag() -> bool {
+    SYS_INTERACTIVE.load(Ordering::Relaxed)
 }
 
 pub fn no_user_site_flag() -> bool {

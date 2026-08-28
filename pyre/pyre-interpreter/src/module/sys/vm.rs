@@ -1720,7 +1720,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 w_int_new(i64::from(crate::importing::debug_flag() != 0)),
                 // `-i` sets both.
                 w_int_new(i64::from(crate::importing::inspect_flag())),
-                w_int_new(i64::from(crate::importing::inspect_flag())),
+                w_int_new(i64::from(crate::importing::interactive_flag())),
                 w_int_new(crate::importing::optimize_level()),
                 w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())),
                 w_int_new(i64::from(crate::importing::no_user_site_flag())),

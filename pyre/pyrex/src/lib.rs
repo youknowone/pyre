@@ -203,7 +203,10 @@ fn parse_args(
                 print!("{}", usage(binary_name));
                 std::process::exit(0);
             }
-            Short('i') => flags.inspect = true,
+            Short('i') => {
+                flags.inspect = true;
+                flags.interactive = true;
+            }
             // app_main.py `cmdline_options['E']` / `X_option`.
             Short('E') => flags.ignore_environment = true,
             // app_main.py `isolated_option`: -I implies -E, -s and -P.
@@ -495,11 +498,14 @@ fn sys_path_cwd() -> std::path::PathBuf {
     }
 }
 
-/// `interactive or sys.stdin.isatty()` — a stdin run drives the prompt when fd
-/// 0 is a terminal or `-i` was given, and executes stdin as a script
-/// otherwise.
-fn stdin_is_interactive(inspect: bool) -> bool {
-    if inspect {
+/// `stdin_is_interactive` — a stdin run drives the prompt when fd 0 is a
+/// terminal or `-i` was given, and executes stdin as a script otherwise.
+///
+/// The argument is `config->interactive`, which only `-i` sets.  PYTHONINSPECT
+/// does not reach it, so a run that owes the flag to the environment still
+/// needs the terminal.
+fn stdin_is_interactive(interactive: bool) -> bool {
+    if interactive {
         return true;
     }
     #[cfg(feature = "sandbox")]
@@ -512,6 +518,41 @@ fn stdin_is_interactive(inspect: bool) -> bool {
     #[cfg(not(feature = "sandbox"))]
     {
         std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
+}
+
+/// `pymain_repl`'s three tests for the prompt that opens over a program that
+/// has just finished.
+///
+/// PYTHONINSPECT is read here rather than taken from the option block, because
+/// upstream checks it "at the end, to give programs the opportunity to set it
+/// from Python" -- and `os.environ` writes reach `putenv`, so a program that
+/// sets the name during its own run is asking for this prompt.  `-i` is the
+/// only spelling that opens one over a stdin that is not a terminal.
+///
+/// `run_code` is `config_run_code`: the prompt that follows `-c`, `-m` or a
+/// script.  Stdin read as a program is not one of them, and neither the option
+/// nor the variable gives it a prompt afterwards.
+fn prompt_requested(run_code: bool) -> bool {
+    if !run_code {
+        return false;
+    }
+    // The startup guard already refused every prompt this build can be asked
+    // for, and it could still say why.  Reaching one from here would be past
+    // that refusal, so the answer is no.
+    #[cfg(feature = "sandbox")]
+    {
+        return false;
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        if importing::interactive_flag() {
+            return true;
+        }
+        let inspect = importing::inspect_flag()
+            || (!importing::ignore_environment_flag()
+                && std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty()));
+        inspect && stdin_is_interactive(false)
     }
 }
 
@@ -749,7 +790,7 @@ fn real_main(binary_name: &str) {
         }
     };
     let LaunchFlags {
-        inspect,
+        interactive,
         quiet,
         no_site,
         ..
@@ -766,7 +807,7 @@ fn real_main(binary_name: &str) {
     // builds; a piped stdin program reads through the seam and is fine.
     #[cfg(feature = "sandbox")]
     if !is_interact
-        && (inspect || (matches!(mode, RunMode::Stdin { .. }) && stdin_is_interactive(false)))
+        && (flags.inspect || (matches!(mode, RunMode::Stdin { .. }) && stdin_is_interactive(false)))
     {
         eprintln!("{binary_name}: interactive mode is unavailable in the sandbox");
         std::process::exit(2);
@@ -830,8 +871,8 @@ fn real_main(binary_name: &str) {
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let cmd = dedent_command(&cmd);
-            let session = run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site, inspect);
-            if inspect {
+            let session = run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site, true);
+            if session.is_some() {
                 repl::run_repl(true, no_site, session);
             }
         }
@@ -843,8 +884,8 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from(&module)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            let session = run_module(&module, no_site, inspect);
-            if inspect {
+            let session = run_module(&module, no_site, true);
+            if session.is_some() {
                 repl::run_repl(true, no_site, session);
             }
         }
@@ -856,8 +897,8 @@ fn real_main(binary_name: &str) {
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let compile_path = script_compile_path(&path);
-            let session = run_script_path(&path, &compile_path, no_site, binary_name, inspect);
-            if inspect {
+            let session = run_script_path(&path, &compile_path, no_site, binary_name, true);
+            if session.is_some() {
                 repl::run_repl(true, no_site, session);
             }
         }
@@ -872,7 +913,7 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from(argv0)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            if stdin_is_interactive(inspect) {
+            if stdin_is_interactive(interactive) {
                 // A tty (or `-i`) prints the banner unless `-q` and drops into
                 // the prompt.
                 repl::run_repl(quiet, no_site, None);
@@ -2011,7 +2052,7 @@ fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
 
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
-fn run_module(module: &str, no_site: bool, inspect: bool) -> Option<MainSession> {
+fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession> {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
 
@@ -2037,6 +2078,7 @@ fn run_module(module: &str, no_site: bool, inspect: bool) -> Option<MainSession>
         Ok(())
     })();
 
+    let inspect = prompt_requested(run_code);
     if let Err(e) = result {
         // `_run_module_as_main` ends the same run as a script does, so its
         // failure takes the same exit, and `-i` opens the prompt over it the
@@ -2355,7 +2397,7 @@ fn eval_source_in_main(
     canonical: pyre_object::PyObjectRef,
     main_module: pyre_object::PyObjectRef,
     no_site: bool,
-    inspect: bool,
+    run_code: bool,
 ) -> Option<MainSession> {
     let ec_ptr = Rc::as_ptr(&execution_context);
     // The frame below takes the context by value; the prompt needs it too.
@@ -2450,7 +2492,7 @@ fn eval_source_in_main(
             }
             // The source never ran, but the interpreter it would have run in is
             // up, and that is what `-i` asked to be left at.
-            if inspect {
+            if prompt_requested(run_code) {
                 return finish_or_inspect(true, session_context, canonical, main_module);
             }
             end_after_startup_failure(canonical, ec_ptr, 1);
@@ -2462,7 +2504,7 @@ fn eval_source_in_main(
         Ok(frame) => frame,
         Err(e) => {
             pyre_interpreter::eprint_exception(&e, true);
-            if inspect {
+            if prompt_requested(run_code) {
                 return finish_or_inspect(true, session_context, canonical, main_module);
             }
             end_after_startup_failure(canonical, ec_ptr, 1);
@@ -2495,13 +2537,21 @@ fn eval_source_in_main(
         );
     }
 
-    match eval_with_jit(&mut frame, None) {
+    let failure = match eval_with_jit(&mut frame, None) {
         Ok(result) => {
             if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
                 println!("{}", PyDisplay(result));
             }
+            None
         }
-        Err(e) => report_or_end_on_main_error(e, inspect, canonical, ec_ptr),
+        Err(e) => Some(e),
+    };
+    // Asked once the program is done, because the program is one of the things
+    // that answers it -- `os.environ["PYTHONINSPECT"] = "1"` is a request for
+    // the prompt below.
+    let inspect = prompt_requested(run_code);
+    if let Some(e) = failure {
+        report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
     }
     finish_or_inspect(inspect, session_context, canonical, main_module)
 }
@@ -2544,7 +2594,7 @@ fn run_script_path(
     filename: &str,
     no_site: bool,
     binary_name: &str,
-    inspect: bool,
+    run_code: bool,
 ) -> Option<MainSession> {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
@@ -2573,6 +2623,7 @@ fn run_script_path(
             // the package's own loader when it runs `__main__` below.
             seed_main_loader(canonical, None, ec_ptr);
             import_site(no_site, canonical, ec_ptr);
+            let inspect = prompt_requested(run_code);
             if let Err(e) = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false) {
                 report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
             }
@@ -2590,10 +2641,11 @@ fn run_script_path(
                 canonical,
                 main_module,
                 no_site,
-                inspect,
+                run_code,
             )
         }
         Err(e) => {
+            let inspect = prompt_requested(run_code);
             report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
             finish_or_inspect(inspect, execution_context, canonical, main_module)
         }
@@ -2605,7 +2657,7 @@ fn run_source(
     mode: Mode,
     filename: &str,
     no_site: bool,
-    inspect: bool,
+    run_code: bool,
 ) -> Option<MainSession> {
     // `config_run_filename_abspath` absolutizes the run filename before the
     // module is compiled, so `co_filename` — and with it every `File "…"` line
@@ -2639,7 +2691,7 @@ fn run_source(
         canonical,
         main_module,
         no_site,
-        inspect,
+        run_code,
     )
 }
 
