@@ -14218,20 +14218,17 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // own `opts` has been moved into by then.
         let retry_opts = opts.clone();
         let result = if source_is_ast {
-            // An already materialised AST under plain `PyCF_ONLY_AST` is
-            // handed straight back, so `compile(tree, ..., PyCF_ONLY_AST) is
-            // tree`.  Re-converting it would hand out a copy instead.
-            if syntax_check_only {
-                Ok(source)
-            } else {
-                crate::module::_ast::convert::preprocess_object_to_object(
-                    source,
-                    "",
-                    mode,
-                    opts,
-                    syntax_check_only,
-                )
-            }
+            // [3.14-spec] CPython `_PyAST_obj2mod` validates the root for the
+            // requested mode and `_PyAST_mod2obj` publishes a fresh tree even
+            // for plain ONLY_AST.  PyPy `compile_to_ast` returns its input
+            // object unchanged; the observable 3.14 copy/TypeError wins here.
+            crate::module::_ast::convert::preprocess_object_to_object(
+                source,
+                "",
+                mode,
+                opts,
+                syntax_check_only,
+            )
         } else {
             crate::module::_ast::convert::parse_to_object_with_opts(
                 source_str

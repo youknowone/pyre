@@ -63,7 +63,11 @@ formatted = assign.value.values[0]
 assert formatted.value.id == "value"
 assert formatted.conversion == ord("r")
 assert formatted.format_spec.values[0].value == ">10"
-assert compile(tree, "<ast>", "exec", ast.PyCF_ONLY_AST) is tree
+roundtripped = compile(tree, "<ast>", "exec", ast.PyCF_ONLY_AST)
+assert roundtripped is not tree
+assert ast.dump(roundtripped, include_attributes=True) == ast.dump(
+    tree, include_attributes=True
+)
 
 tree = ast.parse(
     'match value:\n'
