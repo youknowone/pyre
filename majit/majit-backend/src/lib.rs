@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
@@ -1688,6 +1688,23 @@ pub struct LoopInvalidation {
     bridge_flags: Arc<parking_lot::Mutex<Vec<Arc<AtomicBool>>>>,
 }
 
+/// How many loop invalidations this process has performed, over every
+/// backend and every driver.
+///
+/// One input of `MetaInterp::runnable_generation`: an invalidated token is
+/// one `get_procedure_token` stops returning, so a reader caching a
+/// runnable-or-not answer across calls has to learn of it. Invalidation
+/// funnels through [`LoopInvalidation::invalidate`], which is where the count
+/// moves, and it moves from whichever thread performs the invalidation, so it
+/// lives here as a process-wide atomic rather than on a driver.
+static TOKEN_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The current value of the process-wide invalidation count.
+#[inline]
+pub fn token_invalidation_generation() -> u64 {
+    TOKEN_INVALIDATIONS.load(Ordering::Relaxed)
+}
+
 impl LoopInvalidation {
     /// quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
     /// followed by `cpu.invalidate_loop(looptoken)`.  Both projections happen
@@ -1695,6 +1712,7 @@ impl LoopInvalidation {
     /// token, and every bridge-generation flag activates its still-unpatched
     /// GUARD_NOT_INVALIDATED sites.
     fn invalidate(&self) {
+        TOKEN_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
         self.invalidated.store(true, Ordering::Release);
         for flag in self.bridge_flags.lock().iter() {
             flag.store(true, Ordering::Release);

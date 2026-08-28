@@ -1610,6 +1610,9 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
     pub(crate) compiled_loops: indexmap::IndexMap<u64, CompiledEntry<M>>,
+    /// Bumped by every insertion into and removal from `compiled_loops`, in
+    /// this file's non-test code. One input of [`Self::runnable_generation`].
+    compiled_loops_generation: u64,
     /// warmstate.py `JitCell.get_jit_cell_at_key` analog for the
     /// merge-point green vocabulary: the header greens (`(ints, refs,
     /// floats)`) each compiled loop was traced under, keyed by its green key.
@@ -3429,6 +3432,7 @@ impl<M: Clone> MetaInterp<M> {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
             compiled_loops: indexmap::IndexMap::new(),
+            compiled_loops_generation: 0,
             loop_header_greens: indexmap::IndexMap::new(),
             cut_compiled_keys: indexmap::IndexSet::new(),
             speculative_cut_owned_key: None,
@@ -7911,6 +7915,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 token.set_retraced_count(unroll_opt.retraced_count);
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -8149,6 +8154,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
     ) -> Option<(CompiledEntry<M>, CarriedFields)> {
+        self.note_compiled_loops_changed();
         let old_entry = self.compiled_loops.swap_remove(&green_key)?;
         let carried = old_entry.carried_fields();
         Some((old_entry, carried))
@@ -9291,6 +9297,7 @@ impl<M: Clone> MetaInterp<M> {
                 };
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 token.set_retraced_count(unroll_opt.retraced_count);
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -10232,6 +10239,7 @@ impl<M: Clone> MetaInterp<M> {
                         token.record_target_token(target_token.as_jump_target_descr());
                     }
                     let front_entry_index = Self::front_entry_index_for(&ft);
+                    self.note_compiled_loops_changed();
                     self.compiled_loops.insert(
                         green_key,
                         CompiledEntry {
@@ -10618,6 +10626,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let front_target_tokens = vec![target_token];
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -10721,6 +10730,41 @@ impl<M: Clone> MetaInterp<M> {
                 green_key,
             ),
         }
+    }
+
+    fn note_compiled_loops_changed(&mut self) {
+        self.compiled_loops_generation = self.compiled_loops_generation.wrapping_add(1);
+    }
+
+    /// A number that moves whenever [`Self::resolved_entry_procedure_token`]
+    /// may answer differently for some key than it did, and stays put while
+    /// it cannot.
+    ///
+    /// The answer is a conjunction of four things a caller can watch: the cell
+    /// chain and the tokens attached to it (`WarmEnterState::cell_generation`),
+    /// the `compiled_loops` map (`compiled_loops_generation`), the strong
+    /// handles the memory manager holds — the last of which going is what
+    /// stops a cell's weak reference from upgrading — and the invalidation
+    /// flag on any token, which is set from whichever thread performs it. The
+    /// four counters are summed, so a change in any one moves the whole.
+    ///
+    /// Only "may": running a loop, tracing one that does not finish, and
+    /// ticking a counter all leave it alone, and an eviction that touched no
+    /// cell of interest still moves it. A caller keying a cache on it
+    /// re-derives on a move and reads the cache on a hold, and both are the
+    /// answer the four reads would give.
+    ///
+    /// No upstream counterpart: `warmstate.py` walks the cell on every ask.
+    /// A driver whose portal asks about several sibling loops on every call
+    /// pays one walk per sibling per call for an answer that changes only at
+    /// the events above, which is what this exists to let it skip.
+    #[inline]
+    pub fn runnable_generation(&self) -> u64 {
+        self.warm_state
+            .cell_generation()
+            .wrapping_add(self.compiled_loops_generation)
+            .wrapping_add(self.warm_state.memory_manager.eviction_generation())
+            .wrapping_add(majit_backend::token_invalidation_generation())
     }
 
     /// The function-entry door's whole answer, from one walk of the cell chain
@@ -11778,6 +11822,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     pub fn remove_compiled_loop(&mut self, green_key: u64) {
+        self.note_compiled_loops_changed();
         self.compiled_loops.swap_remove(&green_key);
         self.pending_preamble_tokens.swap_remove(&green_key);
         self.forget_loop_side_tables(green_key);
@@ -11793,6 +11838,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|(green_key, _)| *green_key)
             .collect();
         for green_key in stale {
+            self.note_compiled_loops_changed();
             self.compiled_loops.swap_remove(&green_key);
             self.forget_loop_side_tables(green_key);
         }
@@ -11902,6 +11948,7 @@ impl<M: Clone> MetaInterp<M> {
                 // including every previous-token predecessor on the
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
+                self.note_compiled_loops_changed();
                 self.compiled_loops.swap_remove(&gk);
                 self.forget_loop_side_tables(gk);
                 if crate::debug::have_debug_prints() {
@@ -12555,6 +12602,7 @@ impl<M: Clone> MetaInterp<M> {
     /// is left alone: it is keyed by green key but holds tokens for a
     /// recompile that has not happened yet, not for the loops being dropped.
     pub fn clear_compiled_loops(&mut self) {
+        self.note_compiled_loops_changed();
         self.compiled_loops.clear();
         self.loop_header_greens.clear();
         self.cut_compiled_keys.clear();
@@ -13520,6 +13568,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_loop`. The count read at the top of this function is
                 // the one `unroll.py optimize_bridge` charges, and it stays on the
                 // token it was read from.
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     original_green_key,
                     CompiledEntry {
@@ -26784,6 +26833,46 @@ mod loop_side_table_tests {
 
         assert!(!has_side_tables(&meta, 7));
         assert!(has_side_tables(&meta, 8));
+    }
+
+    #[test]
+    fn the_runnable_generation_moves_at_every_event_that_can_change_an_answer() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let start = meta.runnable_generation();
+
+        // Reads leave it alone.
+        assert!(meta.get_compiled_meta(7).is_none());
+        assert_eq!(meta.runnable_generation(), start);
+
+        // A loop leaving the map, both ways. (The fixture insert above writes
+        // the map directly; a loop ENTERING it through `compile_loop` is
+        // `jitdriver::tests::compiling_a_loop_moves_the_runnable_generation`.)
+        record_loop(&mut meta, 7, 100);
+        let after_insert = meta.runnable_generation();
+        meta.remove_compiled_loop(7);
+        let after_remove = meta.runnable_generation();
+        assert_ne!(after_remove, after_insert);
+        record_loop(&mut meta, 8, 101);
+        let before_clear = meta.runnable_generation();
+        meta.clear_compiled_loops();
+        assert_ne!(meta.runnable_generation(), before_clear);
+
+        // A token invalidated anywhere, including one this driver never held.
+        let before_invalidate = meta.runnable_generation();
+        JitCellToken::new(4242).invalidate();
+        assert_ne!(meta.runnable_generation(), before_invalidate);
+
+        // A cell attached through the warm state.
+        let before_attach = meta.runnable_generation();
+        let number = meta.warm_state.alloc_token_number();
+        meta.warm_state
+            .attach_procedure_to_interp(9, JitCellToken::new(number));
+        assert_ne!(meta.runnable_generation(), before_attach);
+
+        // The memory manager letting every loop go.
+        let before_release = meta.runnable_generation();
+        meta.warm_state.memory_manager.release_all_loops();
+        assert_ne!(meta.runnable_generation(), before_release);
     }
 
     #[test]
