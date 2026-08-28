@@ -1236,6 +1236,114 @@ mod tests {
         assert_eq!(shadow_stack_len(), before, "the frame guard still pops it");
     }
 
+    /// A chain of guard arms that leave the function takes one frame per arm,
+    /// so the path that reaches no bracket reserves nothing and the path that
+    /// reaches one reserves only its own. This is the placement the
+    /// hand-written brackets use: `push_roots()` inside the arm, not ahead of
+    /// the chain that selects it.
+    #[test]
+    fn each_diverging_guard_arm_takes_its_own_frame() {
+        #[pyre_macros::gc_roots]
+        fn dispatch(mut a: PyObjectRef, which: u8) -> usize {
+            if which == 1 {
+                return crate::with_roots!(a => shadow_stack_len());
+            }
+            if which == 2 {
+                return crate::with_roots!(a => shadow_stack_len());
+            }
+            shadow_stack_len()
+        }
+        let before = shadow_stack_len();
+        assert_eq!(dispatch(dummy(0x10), 0), before, "no arm taken, no frame");
+        assert_eq!(
+            dispatch(dummy(0x10), 1),
+            before + 1,
+            "one colour, one frame"
+        );
+        assert_eq!(
+            dispatch(dummy(0x10), 2),
+            before + 1,
+            "the second arm does not stack a frame the first arm opened"
+        );
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// `move_pushes_earlier`: a root the body never rebinds is saved once, in
+    /// the prologue ahead of the loop, and each bracket reads the slot rather
+    /// than re-saving the local. That is what the hand-written brackets do
+    /// when they call `shadow_stack_get(slot)` at every use, and it is why a
+    /// value the collector forwarded mid-loop is the one the body sees: the
+    /// slot is the live word, the local is a copy of an older one.
+    #[test]
+    fn a_hoisted_root_is_saved_once_and_every_bracket_reads_the_slot() {
+        #[pyre_macros::gc_roots]
+        fn walk(mut a: PyObjectRef, n: usize) -> Vec<PyObjectRef> {
+            let mut seen = Vec::new();
+            for i in 0..n {
+                if i == 1 {
+                    // Forward the root the way a moving collector's walker
+                    // does, leaving the local naming the old address.
+                    shadow_stack_set(shadow_stack_len() - 1, dummy(0x2222));
+                }
+                seen.push(crate::with_roots!(a => a));
+            }
+            seen
+        }
+        let before = shadow_stack_len();
+        assert_eq!(
+            walk(dummy(0x10), 3),
+            vec![dummy(0x10), dummy(0x2222), dummy(0x2222)],
+            "a re-saved local would have clobbered the forwarded slot"
+        );
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// A `let` root bound once and never reassigned hoists like a parameter:
+    /// the union-classinfo walk binds its argument tuple that way, and the
+    /// hand-written bracket pins it once ahead of the loop.
+    #[test]
+    fn a_let_bound_root_hoists_when_it_is_bound_once() {
+        #[pyre_macros::gc_roots]
+        fn walk(seed: PyObjectRef, n: usize) -> Vec<PyObjectRef> {
+            let mut args = seed;
+            let mut seen = Vec::new();
+            for i in 0..n {
+                if i == 1 {
+                    shadow_stack_set(shadow_stack_len() - 1, dummy(0x3333));
+                }
+                seen.push(crate::with_roots!(args => args));
+            }
+            seen
+        }
+        let before = shadow_stack_len();
+        assert_eq!(
+            walk(dummy(0x10), 3),
+            vec![dummy(0x10), dummy(0x3333), dummy(0x3333)]
+        );
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// The other direction: a root the body assigns is not constant between
+    /// the prologue and the bracket, so its save may not be hoisted. Reading
+    /// the slot there would answer with the value the parameter used to hold.
+    #[test]
+    fn a_reassigned_root_keeps_its_per_bracket_save() {
+        #[pyre_macros::gc_roots]
+        fn reassign(mut a: PyObjectRef, b: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
+            let first = crate::with_roots!(a => a);
+            a = b;
+            let second = crate::with_roots!(a => a);
+            (first, second)
+        }
+        let before = shadow_stack_len();
+        assert_eq!(
+            reassign(dummy(0x10), dummy(0x20)),
+            (dummy(0x10), dummy(0x20)),
+            "the second bracket must publish the new binding, not reload the old"
+        );
+        assert_eq!(shadow_stack_len(), before);
+    }
+
     /// `add_enter_leave_roots_frame`: the enter goes as late as possible, so a
     /// call that never reaches a bracket never reserves a colour. A frame at
     /// the top of the body would charge the fast path for the slow path's

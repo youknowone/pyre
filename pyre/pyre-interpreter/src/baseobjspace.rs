@@ -889,7 +889,8 @@ pub(crate) unsafe fn p_recursive_issubclass_w(
 /// candidate set, mints a jitcode, and the walker unrolls the walk instead of
 /// leaving the call an opaque residual.
 #[majit_macros::unroll_safe]
-pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+#[pyre_macros::gc_roots]
+pub fn isinstance(mut obj: PyObjectRef, mut classinfo: PyObjectRef) -> Result<bool, PyError> {
     // Nested tuple / union classinfo recurses in native Rust with no
     // Python frame push, so guard the C stack here or a deep classinfo
     // blows it before any frame-level check fires.
@@ -905,17 +906,12 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         if is_tuple(classinfo) {
             // The recursive `isinstance` re-enters Python (`__instancecheck__`)
             // and may collect; `obj` and the classinfo tuple are raw locals, so
-            // pin them on the shadow stack across the walk.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let info_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(classinfo);
-            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(info_slot));
+            // bracket them across the walk.
+            let n = pyre_object::with_roots!(obj, classinfo => w_tuple_len(classinfo));
             for i in 0..n {
                 if let Some(c) =
-                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(info_slot), i as i64)
-                    && isinstance(pyre_object::gc_roots::shadow_stack_get(obj_slot), c)?
+                    pyre_object::with_roots!(obj, classinfo => w_tuple_getitem(classinfo, i as i64))
+                    && pyre_object::with_roots!(obj, classinfo => isinstance(obj, c))?
                 {
                     return Ok(true);
                 }
@@ -924,17 +920,12 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
         }
         // PEP 604 `X | Y` union recursion — lib_pypy/_pypy_generic_alias.py.
         if pyre_object::is_union(classinfo) {
-            let union_args = pyre_object::w_union_get_args(classinfo);
-            let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(obj);
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(union_args);
-            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
+            let mut union_args = pyre_object::w_union_get_args(classinfo);
+            let n = pyre_object::with_roots!(obj, union_args => w_tuple_len(union_args));
             for i in 0..n {
-                if let Some(c) =
-                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(args_slot), i as i64)
-                    && isinstance(pyre_object::gc_roots::shadow_stack_get(obj_slot), c)?
+                if let Some(c) = pyre_object::with_roots!(
+                    obj, union_args => w_tuple_getitem(union_args, i as i64)
+                ) && pyre_object::with_roots!(obj, union_args => isinstance(obj, c))?
                 {
                     return Ok(true);
                 }
@@ -981,7 +972,8 @@ pub fn isinstance(obj: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyEr
 /// candidate set, mints a jitcode, and the walker unrolls the walk instead of
 /// leaving the call an opaque residual.
 #[majit_macros::unroll_safe]
-pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, PyError> {
+#[pyre_macros::gc_roots]
+pub fn issubclass(mut derived: PyObjectRef, mut classinfo: PyObjectRef) -> Result<bool, PyError> {
     // Nested tuple / union classinfo recurses in native Rust with no
     // Python frame push, so guard the C stack here or a deep classinfo
     // blows it before any frame-level check fires.
@@ -990,18 +982,12 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
         // abstractinst.py:181-187 — tuple recursion.
         if is_tuple(classinfo) {
             // The recursive `issubclass` re-enters Python (`__subclasscheck__`)
-            // and may collect; `derived` and the classinfo tuple are raw locals,
-            // so pin them on the shadow stack across the walk.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let derived_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(derived);
-            let info_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(classinfo);
-            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(info_slot));
+            // and may collect; `derived` and the classinfo tuple are raw
+            // locals, so bracket them across the walk.
+            let n = pyre_object::with_roots!(derived, classinfo => w_tuple_len(classinfo));
             for i in 0..n {
-                if let Some(c) =
-                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(info_slot), i as i64)
-                    && issubclass(pyre_object::gc_roots::shadow_stack_get(derived_slot), c)?
+                if let Some(c) = pyre_object::with_roots!(derived, classinfo => w_tuple_getitem(classinfo, i as i64))
+                    && pyre_object::with_roots!(derived, classinfo => issubclass(derived, c))?
                 {
                     return Ok(true);
                 }
@@ -1009,17 +995,12 @@ pub fn issubclass(derived: PyObjectRef, classinfo: PyObjectRef) -> Result<bool, 
             return Ok(false);
         }
         if pyre_object::is_union(classinfo) {
-            let union_args = pyre_object::w_union_get_args(classinfo);
-            let _roots = pyre_object::gc_roots::push_roots();
-            let derived_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(derived);
-            let args_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(union_args);
-            let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(args_slot));
+            let mut union_args = pyre_object::w_union_get_args(classinfo);
+            let n = pyre_object::with_roots!(derived, union_args => w_tuple_len(union_args));
             for i in 0..n {
-                if let Some(c) =
-                    w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(args_slot), i as i64)
-                    && issubclass(pyre_object::gc_roots::shadow_stack_get(derived_slot), c)?
+                if let Some(c) = pyre_object::with_roots!(
+                    derived, union_args => w_tuple_getitem(union_args, i as i64)
+                ) && pyre_object::with_roots!(derived, union_args => issubclass(derived, c))?
                 {
                     return Ok(true);
                 }
