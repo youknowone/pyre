@@ -673,10 +673,16 @@ pub(super) fn opcode_for_assign_binop_f(op: &BinOp) -> Option<Ident> {
 /// not readable as an `i64` unless the callee is known to fill it. Registering
 /// a shim rather than the callee itself makes that true of every target.
 ///
-/// The shim's parameter types come from `func` itself: the annotation supplies
-/// the `extern`-free `fn` shape and the call in the body resolves each hole, so
-/// no argument type has to be spelled here. `arity` counts the receiver for a
-/// method path.
+/// The shim's parameters are the machine words a compiled call passes, not the
+/// types `func` declares: a non-float argument goes in spelled `i64` and is
+/// narrowed at the boundary by [`majit_ir::CallArgWord`], whose target type
+/// inference reads off `func`'s own signature. Where a pointer is as wide as a
+/// word that spelling is the same function it always was; where it is narrower
+/// it is the difference between a call and a type error, since a `usize` or a
+/// `&T` parameter is then not the word the call holds. A float argument keeps
+/// its hole: it rides a float register, and a word is not what the call passes
+/// for it. `arg_kinds` is one entry per parameter, the receiver of a method
+/// path included.
 ///
 /// `extern`-free is also all this can be. A non-capturing closure coerces to
 /// `fn(..)` and not to `extern "C" fn(..)`, and an `extern "C"` fn item has to
@@ -687,13 +693,32 @@ pub(super) fn opcode_for_assign_binop_f(op: &BinOp) -> Option<Ident> {
 /// `extern "C" fn(..) -> i64` call-target wrapper and register that. A
 /// `calls = { .. }` entry naming a function that carries no such attribute has
 /// no wrapper to reach for.
-pub(super) fn word_result_addr_tokens(func: &impl ToTokens, arity: usize) -> TokenStream {
-    let params: Vec<Ident> = (0..arity).map(|i| format_ident!("__majit_a{i}")).collect();
-    let holes: Vec<TokenStream> = (0..arity).map(|_| quote! { _ }).collect();
+pub(super) fn word_result_addr_tokens(
+    func: &impl ToTokens,
+    arg_kinds: &[BindingKind],
+) -> TokenStream {
+    let params: Vec<Ident> = (0..arg_kinds.len())
+        .map(|i| format_ident!("__majit_a{i}"))
+        .collect();
+    let holes: Vec<TokenStream> = arg_kinds
+        .iter()
+        .map(|kind| match kind {
+            BindingKind::Float => quote! { _ },
+            _ => quote! { i64 },
+        })
+        .collect();
+    let args: Vec<TokenStream> = arg_kinds
+        .iter()
+        .zip(&params)
+        .map(|(kind, param)| match kind {
+            BindingKind::Float => quote! { #param },
+            _ => quote! { unsafe { majit_ir::CallArgWord::from_call_word(#param) } },
+        })
+        .collect();
     quote! {
         {
             let __majit_word_shim: fn(#(#holes),*) -> i64 = |#(#params),*| {
-                majit_ir::CallResultWord::into_call_word(#func(#(#params),*))
+                majit_ir::CallResultWord::into_call_word(#func(#(#args),*))
             };
             __majit_word_shim as *const ()
         }
@@ -706,7 +731,7 @@ pub(super) fn word_result_addr_tokens(func: &impl ToTokens, arity: usize) -> Tok
 pub(super) fn word_result_addr_for_kind(
     kind: BindingKind,
     func: &impl ToTokens,
-    arity: usize,
+    arg_kinds: &[BindingKind],
 ) -> Option<TokenStream> {
-    matches!(kind, BindingKind::Int).then(|| word_result_addr_tokens(func, arity))
+    matches!(kind, BindingKind::Int).then(|| word_result_addr_tokens(func, arg_kinds))
 }

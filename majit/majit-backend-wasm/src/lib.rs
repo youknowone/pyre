@@ -2069,13 +2069,112 @@ pub fn set_faithful_residual_call_addrs(addrs: &[i64]) {
 }
 
 thread_local! {
+    /// Per thread, and that is the whole process wherever the set is consulted for
+    /// real: every registration a shipped build makes is compiled only for wasm32,
+    /// and a module instance there is one thread.
+    ///
+    /// Two properties keep a wider store from being owed anyway. A lookup that
+    /// misses is answered by the reflecting host trampoline, so a registration on
+    /// one thread and a question on another costs a round trip and never a wrong
+    /// signature -- the direction that traps is a spurious *hit*, which per-thread
+    /// storage cannot manufacture. And a caller replacing the whole list leaves
+    /// every other thread's alone, so two of them may run at once.
     static FAITHFUL_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
         RefCell::new(std::collections::HashSet::new());
 }
 
-/// Whether `addr` was vouched for by [`set_faithful_residual_call_addrs`].
+/// Vouch for one more callee, leaving the rest of the set alone.
+///
+/// [`set_faithful_residual_call_addrs`] is the embedder's whole list, declared
+/// once. This is for a producer that mints word-spelled call targets as it
+/// goes: the address does not exist until the target is built, so it cannot be
+/// in a list written ahead of time, and the producer that built it is the one
+/// that knows how it is spelled.
+pub fn vouch_residual_call_addr(addr: i64) {
+    FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| {
+        set.borrow_mut().insert(addr);
+    });
+}
+
+/// Whether `addr` was vouched for by [`set_faithful_residual_call_addrs`] or
+/// [`vouch_residual_call_addr`].
 pub(crate) fn residual_call_descr_is_faithful(addr: i64) -> bool {
     FAITHFUL_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&addr))
+}
+
+/// [`vouch_residual_call_addr`] for a target whose *result* is a word too, so
+/// its whole wasm signature is the uniform `(i64…) -> i64`.
+///
+/// The parameter half is what a compiled call needs to know; this is the half
+/// [`direct_word_abi_call`] needs, because a caller reaching a target through
+/// a raw address has no descr telling it whether the callee returns anything.
+/// A void target vouched here would be called as if it returned a word, which
+/// is the same type error the vouching exists to avoid.
+pub fn vouch_residual_call_addr_returning_word(addr: i64) {
+    vouch_residual_call_addr(addr);
+    WORD_RESULT_RESIDUAL_CALL_ADDRS.with(|set| {
+        set.borrow_mut().insert(addr);
+    });
+}
+
+thread_local! {
+    /// Per thread for the reasons [`FAITHFUL_RESIDUAL_CALL_ADDRS`] is, and it is
+    /// read on the thread that wrote it for one more: the producer minting a
+    /// word-spelled target and the guest call reaching that target are the same
+    /// thread by construction, since the target's address is a table index in the
+    /// instance that minted it.
+    static WORD_RESULT_RESIDUAL_CALL_ADDRS: RefCell<std::collections::HashSet<i64>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// Call a residual target from inside the guest, when its whole signature is
+/// the uniform `(i64…) -> i64` and this backend was told so.
+///
+/// The recording and blackhole paths reach a target through a raw address and
+/// no descr, and wasm32 `call_indirect` type-checks the callee: transmuting
+/// that address to the signature the residual call carries traps unless the
+/// callee really is spelled that way. So those paths hand the call to a host
+/// that reflects the callee's declared type first — a guest→host→guest round
+/// trip per call. For a target vouched by
+/// [`vouch_residual_call_addr_returning_word`] the transmute is exactly right
+/// and the round trip buys nothing.
+///
+/// `None` means the caller still owes the reflecting path: the address was not
+/// vouched for, or its arity is past what a residual call can carry.
+#[cfg(target_arch = "wasm32")]
+pub fn direct_word_abi_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
+    if !WORD_RESULT_RESIDUAL_CALL_ADDRS.with(|set| set.borrow().contains(&(func_ptr as i64))) {
+        return None;
+    }
+    // One arm per arity: the transmuted type has to name the parameters, and
+    // wasm has no variadic call. `MAX_CALL_ARGS` bounds what a residual call
+    // can carry, so an arity past the arms below cannot arrive here.
+    macro_rules! arms {
+        ($( [$($arg:ident),*] ),* $(,)?) => {
+            match args {
+                $(
+                    [$($arg),*] => {
+                        let f: extern "C" fn($(arms!(@i64 $arg)),*) -> i64 =
+                            unsafe { std::mem::transmute(func_ptr) };
+                        Some(f($(*$arg),*))
+                    }
+                )*
+                _ => None,
+            }
+        };
+        (@i64 $arg:ident) => { i64 };
+    }
+    arms![
+        [],
+        [a0],
+        [a0, a1],
+        [a0, a1, a2],
+        [a0, a1, a2, a3],
+        [a0, a1, a2, a3, a4],
+        [a0, a1, a2, a3, a4, a5],
+        [a0, a1, a2, a3, a4, a5, a6],
+        [a0, a1, a2, a3, a4, a5, a6, a7],
+    ]
 }
 
 /// Configure the dormant terminal-decline regression hook.

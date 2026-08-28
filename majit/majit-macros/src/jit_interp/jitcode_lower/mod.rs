@@ -2560,7 +2560,7 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect::<String>();
-        assert!(tokens.contains("add_fn_ptr_with_slot"));
+        assert!(tokens.contains("add_word_abi_fn_ptr_with_slot"));
         assert!(tokens.contains("ElidableCanRaise"));
     }
 
@@ -3198,6 +3198,47 @@ mod tests {
         assert!(!body.contains("add_fn_ptr (helper as * const ())"));
     }
 
+    /// The shim stands in for the callee at the compiled call, so it has to
+    /// have the signature that call emits: words in as well as a word out.
+    /// Leaving a parameter at the callee's own type is invisible where a
+    /// pointer is a word wide and a type error where it is not, so assert the
+    /// spelling rather than the target it happens to run on.
+    #[test]
+    fn the_widening_shim_takes_its_arguments_as_words() {
+        let call = parse_call("helper(1)");
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualInt);
+        lowerer
+            .lower_call_value(&call)
+            .expect("residual int call should lower");
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(
+            body.contains("fn (i64) -> i64"),
+            "the one-argument shim is spelled in words: {body}"
+        );
+        assert!(
+            body.contains("from_call_word"),
+            "and narrows each word to what the callee declares: {body}"
+        );
+    }
+
+    /// Registering it as word-spelled is the other half: a backend whose word
+    /// is wider than its pointer reflects over every target it was not told
+    /// about, and the shim is exactly the target it can be told about.
+    #[test]
+    fn the_widening_shim_registers_as_word_spelled() {
+        let call = parse_call("helper(1)");
+        let mut lowerer =
+            lowerer_with_call_policy("helper", crate::jit_interp::CallPolicyKind::ResidualInt);
+        lowerer
+            .lower_call_value(&call)
+            .expect("residual int call should lower");
+        let statements = &lowerer.statements;
+        let body = quote! { #(#statements)* }.to_string();
+        assert!(body.contains("add_word_abi_fn_ptr"), "{body}");
+    }
+
     /// A ref result is a pointer and a void result is never read, so neither
     /// has anything to widen and both register the callee's own address.
     #[test]
@@ -3225,8 +3266,8 @@ mod tests {
         assert!(!body.contains("into_call_word"));
     }
 
-    /// `record_known_result!` registers through `add_fn_ptr_with_slot`, which
-    /// takes the same shim for an int result.
+    /// `record_known_result!` registers through `add_word_abi_fn_ptr_with_slot`,
+    /// which takes the same shim for an int result.
     #[test]
     fn record_known_result_int_registers_the_widening_shim() {
         let mut lowerer =

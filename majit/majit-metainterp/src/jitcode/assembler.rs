@@ -282,6 +282,30 @@ enum ConstKind {
     Float,
 }
 
+/// Tell a backend that cannot read a callee's spelling off its address that
+/// this one's parameters are machine words. A backend whose word and pointer
+/// are the same width has nothing to record: every target is callable through
+/// the call's own type there.
+#[cfg(target_arch = "wasm32")]
+fn vouch_word_abi_call_target(ptr: *const ()) {
+    majit_backend_wasm::vouch_residual_call_addr(ptr as usize as i64);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn vouch_word_abi_call_target(_ptr: *const ()) {}
+
+/// [`vouch_word_abi_call_target`] for a target whose result is a word as well,
+/// so its whole signature is the uniform one a residual call carries. The
+/// widening shim a producer registers is always that: it returns the machine
+/// word the trace reads the result out of, which is what makes it a shim.
+#[cfg(target_arch = "wasm32")]
+fn vouch_word_abi_call_target_returning_word(ptr: *const ()) {
+    majit_backend_wasm::vouch_residual_call_addr_returning_word(ptr as usize as i64);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn vouch_word_abi_call_target_returning_word(_ptr: *const ()) {}
+
 impl JitCodeBuilder {
     pub fn new() -> Self {
         Self::default()
@@ -5411,6 +5435,36 @@ impl JitCodeBuilder {
         self.add_call_target(ptr, ptr)
     }
 
+    /// [`Self::add_fn_ptr`] for a target the producer knows is spelled in
+    /// machine words: every parameter, and the result, is the word a compiled
+    /// call passes for it.
+    ///
+    /// A backend whose word is wider than its pointer cannot read that off the
+    /// address. A helper spelled `usize` or `&T` declares a type narrower than
+    /// the one the call names, so calling it through the call's own type is a
+    /// type error rather than a slow path, and such a backend has to reflect
+    /// the callee's declared type before calling it. Recording the targets
+    /// that are word-spelled is what lets it call those directly and reflect
+    /// only over the rest.
+    ///
+    /// The address is minted here, by the producer that built the target, so a
+    /// list written ahead of time cannot name it.
+    pub fn add_word_abi_fn_ptr(&mut self, ptr: *const ()) -> u16 {
+        vouch_word_abi_call_target_returning_word(ptr);
+        self.add_fn_ptr(ptr)
+    }
+
+    /// [`Self::add_word_abi_fn_ptr`] carrying an
+    /// [`crate::call_descr::EffectInfoSlot`] classification.
+    pub fn add_word_abi_fn_ptr_with_slot(
+        &mut self,
+        ptr: *const (),
+        slot: crate::call_descr::EffectInfoSlot,
+    ) -> u16 {
+        vouch_word_abi_call_target_returning_word(ptr);
+        self.add_fn_ptr_with_slot(ptr, slot)
+    }
+
     /// `add_fn_ptr` variant carrying a per-callee
     /// [`crate::call_descr::EffectInfoSlot`] classification
     /// (`call.py getcalldescr`'s `extraeffect` selection).
@@ -5484,6 +5538,21 @@ impl JitCodeBuilder {
             }
         }
         self.push_descr_entry(RuntimeBhDescr::Call(Box::new(target)))
+    }
+
+    /// [`Self::add_call_target_with_save_err`] for a pair of targets the
+    /// producer knows are spelled in machine words; see
+    /// [`Self::add_word_abi_fn_ptr`] for what that buys.
+    pub fn add_word_abi_call_target_with_save_err(
+        &mut self,
+        trace_ptr: *const (),
+        concrete_ptr: *const (),
+        slot: crate::call_descr::EffectInfoSlot,
+        save_err: i32,
+    ) -> u16 {
+        vouch_word_abi_call_target(trace_ptr);
+        vouch_word_abi_call_target(concrete_ptr);
+        self.add_call_target_with_save_err(trace_ptr, concrete_ptr, slot, save_err)
     }
 
     pub fn add_call_assembler_target_number(
