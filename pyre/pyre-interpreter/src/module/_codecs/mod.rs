@@ -971,7 +971,7 @@ fn decode_with_name(
 fn decode_input_bytes(w_obj: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let sp = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_obj);
+    let w_obj = pyre_object::gc_roots::pin_root(w_obj);
     // The acquisition may run `__buffer__`, so the object naming the failure is
     // read back from the shadow stack rather than from the argument.
     let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(w_obj)? else {
