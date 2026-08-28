@@ -907,6 +907,16 @@ unsafe fn cffi_ffi_destructor(obj_addr: usize) {
     };
 }
 
+/// `W_DlOpenLibObject._finalize_` — closes an ABI library nothing names.
+#[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+unsafe fn cffi_lib_destructor(obj_addr: usize) {
+    unsafe {
+        pyre_interpreter::module::_cffi_backend::lib_obj::w_lib_dealloc(
+            obj_addr as pyre_object::PyObjectRef,
+        )
+    };
+}
+
 #[cfg(all(windows, not(feature = "sandbox")))]
 unsafe fn overlapped_destructor(obj_addr: usize) {
     unsafe {
@@ -4322,7 +4332,7 @@ fn build_gc() -> Box<MiniMarkGC> {
         <pyre_interpreter::module::_io::W_WindowsConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its ten
+    // `_cffi_backend` is absent on wasm32 and under `sandbox`, so its thirteen
     // object types register at the end of the rclass census where the sandbox
     // hierarchy filter can remove one contiguous trailing slice.  A ctype,
     // the array iterator, struct field, allocator, MiniBuffer and offset
@@ -4391,6 +4401,20 @@ fn build_gc() -> Box<MiniMarkGC> {
             <pyre_interpreter::module::_cffi_backend::realize_c_type::W_RawFuncType
                 as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
         );
+        {
+            let descr = <pyre_interpreter::module::_cffi_backend::lib_obj::W_LibObject
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+            let tid = register_pyre_class(&mut gc, &mut pytype_to_tid, descr);
+            gc.types.set_destructor(tid, cffi_lib_destructor);
+        }
+        for descriptor in [
+            <pyre_interpreter::module::_cffi_backend::cglob::W_GlobSupport
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+            <pyre_interpreter::module::_cffi_backend::wrapper::W_FunctionWrapper
+                as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+        ] {
+            register_pyre_class(&mut gc, &mut pytype_to_tid, descriptor);
+        }
     }
     // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates
     // beside its holder. Like W_DequeBlock it is GC-managed without being an

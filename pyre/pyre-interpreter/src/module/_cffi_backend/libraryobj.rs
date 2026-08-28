@@ -97,16 +97,16 @@ pub unsafe fn w_library_dealloc(obj: PyObjectRef) {
 }
 
 #[cfg(all(feature = "host_env", any(unix, windows)))]
-fn drop_library(handle: usize) {
+pub(crate) fn drop_library(handle: usize) {
     rustpython_host_env::ctypes::drop_library(handle);
 }
 
 #[cfg(not(all(feature = "host_env", any(unix, windows))))]
-fn drop_library(_handle: usize) {}
+pub(crate) fn drop_library(_handle: usize) {}
 
 /// `rdynload.dlsym`, split the way the host loader splits it: a function
 /// address and a data address are looked up differently on Windows.
-fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usize> {
+pub(crate) fn dlsym(handle: usize, name: &str, is_function: bool) -> Option<usize> {
     #[cfg(all(feature = "host_env", any(unix, windows)))]
     {
         let symbol = name.as_bytes();

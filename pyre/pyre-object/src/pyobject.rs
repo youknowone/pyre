@@ -736,7 +736,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // Its append-only vtable id follows both Windows overlapped owners.
     #[cfg(windows)]
     (193, Some(0)),
-    // `_cffi_backend` is absent on wasm32 and in sandbox builds.  Its ten
+    // `_cffi_backend` is absent on wasm32 and in sandbox builds.  Its thirteen
     // hierarchy slots sit at the tail because the interpreter's sandbox
     // filter can only remove a contiguous trailing slice.
     // `_cffi_backend`'s ctype, cdata, and array-iterator payloads precede the
@@ -760,12 +760,19 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // `_cffi_backend._OffsetInBytes` is the internal pointer-call carrier.
     #[cfg(not(target_arch = "wasm32"))]
     (CFFI_HIERARCHY_FIRST_TYPE_ID + 7, Some(0)),
-    // The FFI context owner and the internal raw-function carrier are the
-    // final two CFFI payloads.
+    // The FFI context owner and the internal raw-function carrier follow.
     #[cfg(not(target_arch = "wasm32"))]
     (CFFI_HIERARCHY_FIRST_TYPE_ID + 8, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
     (CFFI_HIERARCHY_FIRST_TYPE_ID + 9, Some(0)),
+    // Generated libraries, global-variable carriers, and API-function wrappers
+    // close the target-gated tail.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 10, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 11, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 12, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

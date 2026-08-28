@@ -216,6 +216,18 @@ pub fn pointer_newp(
     w_init: PyObjectRef,
     w_allocator: PyObjectRef,
 ) -> Result<PyObjectRef, PyError> {
+    pointer_newp_with_allocator(
+        w_ctype,
+        w_init,
+        super::allocator::W_Allocator::from_obj(w_allocator),
+    )
+}
+
+pub(crate) fn pointer_newp_with_allocator(
+    w_ctype: PyObjectRef,
+    w_init: PyObjectRef,
+    mut allocator: Option<&mut super::allocator::W_Allocator>,
+) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     let item = item_of(ct)?;
     let w_item = ct.ctitem;
@@ -248,12 +260,8 @@ pub fn pointer_newp(
             }
             varsize_length = datasize;
         }
-        let w_structobj = super::allocator::allocate(
-            super::allocator::W_Allocator::from_obj(w_allocator),
-            datasize,
-            w_item,
-            varsize_length,
-        )?;
+        let w_structobj =
+            super::allocator::allocate(allocator.as_deref_mut(), datasize, w_item, varsize_length)?;
         let struct_slot = cdata_slot;
         let _ = roots.pin_root(w_structobj);
         let ptr = cdataobj::cdata_arg(roots.get(struct_slot))?.ptr;
@@ -273,12 +281,7 @@ pub fn pointer_newp(
         // Room for the null character `newp` always adds.
         datasize *= 2;
     }
-    let w_cdata = super::allocator::allocate(
-        super::allocator::W_Allocator::from_obj(w_allocator),
-        datasize,
-        w_ctype,
-        -1,
-    )?;
+    let w_cdata = super::allocator::allocate(allocator.as_deref_mut(), datasize, w_ctype, -1)?;
     let _ = roots.pin_root(w_cdata);
     let w_init = roots.get(init_slot);
     if !unsafe { pyre_object::pyobject::is_none(w_init) } {

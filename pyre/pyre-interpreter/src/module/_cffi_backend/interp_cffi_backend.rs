@@ -93,6 +93,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     crate::module_ns_store(ns, "__FFIAllocator", super::allocator::allocator_type());
     crate::module_ns_store(ns, "buffer", super::cbuffer::buffer_type());
     crate::module_ns_store(ns, "FFI", super::ffi_obj::ffi_type_object());
+    crate::module_ns_store(ns, "Lib", super::lib_obj::lib_type());
+    crate::module_ns_store(ns, "__FFIGlobSupport", super::cglob::glob_type());
+    crate::module_ns_store(
+        ns,
+        "__FFIFunctionWrapper",
+        super::wrapper::function_wrapper_type(),
+    );
 
     #[cfg(windows)]
     crate::module_ns_store(
@@ -139,7 +146,7 @@ pub fn default_abi() -> u32 {
 
 /// `moduledef.get_dict_rtld_constants` — the names `rdynload` found, with
 /// the four cffi always needs defaulted to 0 where the platform lacks them.
-fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
+pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
     #[cfg(unix)]
     let found: &[(&str, i64)] = &[
         ("RTLD_LAZY", libc::RTLD_LAZY as i64),
