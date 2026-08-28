@@ -95,6 +95,39 @@ pub struct ScanStats {
     pub withheld_bracket_short_movable: usize,
     /// The [`ScanStats::withheld_bracket_short`] calls, named.
     pub short_brackets: Vec<ShortBracket>,
+    /// Pins whose argument local is still read after the pin normalised the
+    /// slot.  Not a missing root -- a stale word.  See [`StalePinRead`].
+    pub pin_arg_read_after: usize,
+    /// Of those, the ones reading a local this body later addresses as a
+    /// `list` or `dict`, where the stale word is dereferenced.
+    pub pin_arg_read_after_movable: usize,
+    /// The [`Self::pin_arg_read_after`] pins, named.
+    pub stale_pin_reads: Vec<StalePinRead>,
+}
+
+/// A pin whose argument the body goes on to read.
+///
+/// `pin_root` returns the word its slot holds *after* the publish, because the
+/// publish is a safepoint: a foreign collection can forward the value between
+/// the caller's copy and the query, leaving the caller's local pointing at a
+/// forwarding stub.  Reading the returned word is the fix; `let _ =` opts out
+/// and thereby asserts the kind never moves, which is what
+/// [`Self::movable`] checks.  `getitem_tuple` states the assertion in prose --
+/// "a tuple never moves, so the root is for liveness alone and the address in
+/// hand stays correct".
+pub struct StalePinRead {
+    pub func_name: String,
+    pub file: String,
+    pub line: u64,
+    /// Which pin was called.  `with_roots!` expands to `pin_roots` and runs its
+    /// body before reading the slots back, so it shows this shape by
+    /// construction; a hand-written `let _ = pin_root(x)` does not.
+    pub pin_name: String,
+    /// The locals handed to the pin and still read afterwards.
+    pub locals: Vec<String>,
+    /// Of those, the ones this body later addresses as a `list` or `dict`,
+    /// which is where a stale word is dereferenced rather than merely carried.
+    pub movable: Vec<String>,
 }
 
 /// A bracketed call whose bracket does not pin everything live across it.
@@ -560,6 +593,13 @@ pub fn scan(
         let mut opaque_contents = unparsed_terms || unparsed_stmts;
         let mut saw_pin_call = false;
         let mut term_pins: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+        // The locals a pin was *handed*, as distinct from the word it hands
+        // back.  `pin_root` returns the normalized word because the publish is
+        // itself a safepoint -- a foreign collection can forward the value
+        // between the caller's copy and the query -- so a body that goes on
+        // reading the local it passed in is reading a possible forwarding stub.
+        let mut term_pin_args: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+        let mut term_pin_names: Vec<String> = vec![String::new(); n];
         for b in 0..n {
             let Some(TermKind::Call { call, .. }) = &terms[b] else {
                 continue;
@@ -603,9 +643,14 @@ pub fn scan(
             // body uses afterwards is a *different* one from the local passed
             // in, and pinning only the argument would read the rebound name as
             // unrooted.
+            let mut args_only = pinned.clone();
             if let Some(d) = bare_local(&call.dest) {
                 pinned.insert(d);
+                args_only.remove(&d);
             }
+            args_only.retain(|l| gc_locals.contains_key(l));
+            term_pin_args[b] = args_only;
+            term_pin_names[b] = name.clone();
             pinned.retain(|l| gc_locals.contains_key(l));
             if pinned.is_empty() {
                 // A pin that named nothing we could resolve is a pin we do not
@@ -751,6 +796,62 @@ pub fn scan(
             for a in &c2.args {
                 use_operand(a, &mut movable_args);
             }
+        }
+
+        // Every pin whose argument the body goes on to read.  Independent of
+        // the bracket question above: this is not a missing root but a stale
+        // *word*, and the pin call is itself where the forwarding could have
+        // happened.  `#[must_use]` on `pin_root` puts the choice in the open --
+        // use the returned word, or write `let _ =` and thereby claim the kind
+        // never moves.  That claim is what this checks.
+        for b in 0..n {
+            if term_pin_args[b].is_empty() {
+                continue;
+            }
+            let Some(TermKind::Call {
+                target, on_unwind, ..
+            }) = &terms[b]
+            else {
+                continue;
+            };
+            let mut after: HashSet<u64> = HashSet::new();
+            for s in [*target, *on_unwind] {
+                if let Some(sl) = live_in.get(s as usize) {
+                    after.extend(sl.iter().copied());
+                }
+            }
+            let still: Vec<u64> = term_pin_args[b]
+                .iter()
+                .filter(|l| after.contains(l))
+                .copied()
+                .collect();
+            if still.is_empty() {
+                continue;
+            }
+            stats.pin_arg_read_after += 1;
+            let mut movable: Vec<String> = still
+                .iter()
+                .filter(|l| movable_args.contains(l))
+                .map(|l| gc_locals[l].clone())
+                .collect();
+            if !movable.is_empty() {
+                stats.pin_arg_read_after_movable += 1;
+            }
+            let mut locals: Vec<String> = still.iter().map(|l| gc_locals[l].clone()).collect();
+            locals.sort();
+            movable.sort();
+            let at = body.body[b]
+                .statements
+                .last()
+                .map_or(&fd.item_meta.span.data, |s| &s.span.data);
+            stats.stale_pin_reads.push(StalePinRead {
+                func_name: fd.item_meta.name_path(),
+                file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
+                line: at.beg.line,
+                pin_name: term_pin_names[b].clone(),
+                locals,
+                movable,
+            });
         }
 
         // Now re-walk, and at every collecting Call read the live-after set.

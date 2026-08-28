@@ -406,6 +406,63 @@ fn main() {
                 stats.short_brackets.len() - 20
             );
         }
+        // Item 11 of the GC advisory: a site that pins and then goes on using
+        // the local it passed in, rather than the word the pin handed back.
+        // `let _ = pin_root(x)` is the sanctioned spelling for a liveness-only
+        // pin, and writing it asserts that x's kind never moves; the `movable`
+        // column is that assertion checked.
+        let by_pin: std::collections::BTreeMap<&str, usize> =
+            stats.stale_pin_reads.iter().fold(Default::default(), |mut m, r| {
+                *m.entry(r.pin_name.rsplit("::").next().unwrap_or("?")).or_default() += 1;
+                m
+            });
+        println!(
+            "   pins whose argument the body still reads afterwards: {} ({} reading a local \
+             later addressed as a list/dict)",
+            stats.pin_arg_read_after, stats.pin_arg_read_after_movable
+        );
+        println!(
+            "       by pin: {}",
+            by_pin
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for r in stats
+            .stale_pin_reads
+            .iter()
+            .filter(|r| !r.movable.is_empty())
+            .take(20)
+        {
+            println!(
+                "           STALE-PIN {}:{} {} [{}]  movable [{}]  via {}",
+                r.file,
+                r.line,
+                r.func_name,
+                r.locals.join(", "),
+                r.movable.join(", "),
+                r.pin_name.rsplit("::").next().unwrap_or("?")
+            );
+        }
+        if let Ok(path) = std::env::var("GC_STALE_PIN_JSON") {
+            let mut out = String::new();
+            for r in &stats.stale_pin_reads {
+                let row = serde_json::json!({
+                    "file": r.file, "line": r.line, "func": r.func_name,
+                    "pin": r.pin_name, "locals": r.locals, "movable": r.movable,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match std::fs::write(&path, out) {
+                Ok(()) => println!(
+                    "       wrote {} stale-pin read(s) to {path}",
+                    stats.stale_pin_reads.len()
+                ),
+                Err(e) => println!("       FAILED to write {path}: {e}"),
+            }
+        }
         if let Ok(path) = std::env::var("GC_SHORT_BRACKETS_JSON") {
             let mut out = String::new();
             for sb in &stats.short_brackets {
