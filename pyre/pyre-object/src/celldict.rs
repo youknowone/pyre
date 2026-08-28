@@ -1414,6 +1414,12 @@ pub unsafe fn remove_cell(w_dict: PyObjectRef, name: &str) {
     ) {
         return;
     }
+    // The body runs only under `isinstance(strategy, ModuleDictStrategy)`.
+    // Past `switch_to_object_strategy` the erased slots hold the object
+    // strategy and an `ObjectDictStorage`, and no cell is left to unwrap.
+    if crate::dictmultiobject::w_module_dict_is_object_strategy(w_dict) {
+        return;
+    }
     let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);
     let storage = crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict);
     let Some(w_value) = strategy.getitem_str(storage, name) else {
