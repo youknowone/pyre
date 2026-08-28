@@ -3,9 +3,9 @@
 //!
 //! Upstream reads the answer straight off the flow graph with
 //! `hop.livevars_after_op()`, then brackets the operation with
-//! `push_roots` / `pop_roots`.  pyre's interpreter is compiled by rustc, so
-//! there is no flow graph to rewrite; this pass computes the same live set over
-//! the ULLBC body and reports the operations where the bracket is *missing*.
+//! `push_roots` / `pop_roots`. Until the framework marker-insertion handlers
+//! are ported, this audit computes the same live set over the ULLBC body and
+//! reports the operations where the existing source bracket is *missing*.
 //!
 //! # One deliberate divergence from upstream
 //!

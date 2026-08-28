@@ -307,6 +307,41 @@ impl CBuilder {
             db.get(ll_func);
         }
 
+        // `LowLevelDatabase.complete` (`database.py`) finishes by calling
+        // `gctransformer.inline_helpers_and_postprocess(self.all_graphs())`.
+        // The local DB does not yet own its gctransformer (its node factory is
+        // still incomplete), so keep the call immediately adjacent to
+        // `complete()` and run it over the translator's complete graph set.
+        // This is a graph-wide translation stage; application functions carry
+        // no per-function rooting attribute.
+        if matches!(
+            &db.gcpolicy.policy_class,
+            GcPolicyClass::FrameworkShadowStack
+        ) {
+            let c_gcdata = crate::flowspace::model::Hlvalue::Constant(
+                crate::flowspace::model::Constant::with_concretetype(
+                    crate::flowspace::model::ConstValue::HostObject(
+                        crate::flowspace::model::HostObject::new_opaque(
+                            "rpython.memory.gctransform.framework.GCData",
+                        ),
+                    ),
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                ),
+            );
+            let transformer =
+                crate::memory::gctransform::shadowstack::ShadowStackFrameworkGCTransformer::new(
+                    c_gcdata,
+                );
+            let graphs = self.translator.graphs.borrow().clone();
+            transformer
+                .inline_helpers_and_postprocess(&graphs)
+                .map_err(|err| TaskError {
+                    message: format!(
+                        "ShadowStackFrameworkGCTransformer.inline_helpers_and_postprocess: {err}"
+                    ),
+                })?;
+        }
+
         db.complete()?;
         self.collect_compilation_info(&db);
         Ok(db)
