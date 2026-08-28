@@ -462,6 +462,9 @@ pub(crate) fn fbw_store_journal_reset() {
     // clears the per-entry body-effect signal so a prior walk's committed
     // mutation cannot block this walk's delivery.
     FBW_FORITER_INFLIGHT.with(|c| c.borrow_mut().clear());
+    // ...and with them the census key a take parked for a deliver site that
+    // never reported, so the next walk's outcome cannot land on that row.
+    FORITER_INFLIGHT_PENDING.with(|slot| slot.set(None));
     // Drop any inline-built-exception OpRef keys a
     // prior aborted walk recorded, so they cannot match a same-numbered
     // OpRef minted by this walk's recorder.
@@ -1096,6 +1099,61 @@ fn inflight_take_index(len: usize, mut matching: impl Iterator<Item = usize>) ->
     }
 }
 
+/// The census key for one stash entry.  The live frame the legacy delivery
+/// site passes is the portal frame, but an inline sub-walk's consumed item
+/// belongs to its own JitCode, so an entry that names one is keyed by THAT
+/// code; a legacy Python-pc entry, and an unresolvable identity (a negative
+/// index), fall back to the live frame's.  The resolution borrows the
+/// metainterp state, so callers must ask only while the census is collecting.
+fn inflight_census_key(
+    fallback_code_ptr: usize,
+    body: InflightForiterBody,
+) -> Option<(usize, usize)> {
+    let body_pc = inflight_foriter_body_pc(body)?;
+    let code_ptr = match body {
+        InflightForiterBody::Jit { jitcode_index, .. } => {
+            crate::state::raw_code_for_jitcode_index(jitcode_index)
+                .map_or(fallback_code_ptr, |code| code as usize)
+        }
+        _ => fallback_code_ptr,
+    };
+    Some((code_ptr, body_pc))
+}
+
+thread_local! {
+    /// The census key of the entry [`fbw_foriter_inflight_take`] last handed
+    /// out.  The take is the only place that can resolve that key, but only
+    /// the deliver site knows whether the push happened, so the key waits here
+    /// for whichever of [`fbw_foriter_report_delivered`] /
+    /// [`fbw_foriter_report_refused_header`] reports.  It holds no object
+    /// reference, so it is not a GC root area the way the stash itself is.
+    static FORITER_INFLIGHT_PENDING: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn census_report_pending(outcome: super::ForiterInflightOutcome) {
+    if !super::foriter_inflight_census_enabled() {
+        return;
+    }
+    if let Some((code_ptr, body_pc)) = FORITER_INFLIGHT_PENDING.with(|slot| slot.take()) {
+        super::census_record_foriter_inflight(code_ptr, body_pc, outcome);
+    }
+}
+
+/// Report that the item the take handed out was pushed and the frame
+/// repositioned to its body pc — the one outcome that costs no iteration.
+pub fn fbw_foriter_report_delivered() {
+    census_report_pending(super::ForiterInflightOutcome::Delivered);
+}
+
+/// Report that the take's item was dropped after all, because the live frame
+/// was not parked at the header its body pc names.  That is one lost iteration,
+/// so it bumps the gated tally as well as the census column.
+pub fn fbw_foriter_report_refused_header() {
+    crate::trace::fbw_diag::record_foriter_item_dropped();
+    census_report_pending(super::ForiterInflightOutcome::RefusedHeader);
+}
+
 pub fn fbw_foriter_inflight_take(
     fallback_code_ptr: usize,
     frame: usize,
@@ -1118,9 +1176,10 @@ pub fn fbw_foriter_inflight_take(
     // delivers the deliverable one; the entries that no frame can accept keep
     // the single-slot drop.
     //
-    let stash = FBW_FORITER_INFLIGHT.with(|c| {
+    let census_on = super::foriter_inflight_census_enabled();
+    let (stash, dropped) = FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
-        let at = inflight_take_index(
+        let Some(at) = inflight_take_index(
             stack.len(),
             stack
                 .iter()
@@ -1129,37 +1188,59 @@ pub fn fbw_foriter_inflight_take(
                     foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
                 })
                 .map(|(at, _)| at),
-        )?;
+        ) else {
+            return (None, Vec::new());
+        };
         let picked = stack.remove(at);
+        // Everything still standing is about to be destroyed by the clear, and
+        // each one is an iteration whose consumed item nothing will hand back.
+        // Name them before they go: a census that reports only what the take
+        // RETURNED cannot see this column at all.
+        let dropped = if census_on {
+            stack.iter().map(|entry| entry.body).collect()
+        } else {
+            Vec::new()
+        };
         stack.clear();
-        Some(picked)
+        (Some(picked), dropped)
     });
     let stash = stash?;
     let body_effect = stash.body_effect_since_consume;
     let Some(body_pc) = inflight_foriter_body_pc(stash.body) else {
+        // The entry is already out of the stash and its coordinate cannot be
+        // resolved to a Python body pc, so nothing downstream can push it: the
+        // iteration it belongs to is lost the same way the two refusals below
+        // lose one.
+        crate::trace::fbw_diag::record_foriter_item_dropped();
         return None;
     };
-    // The live frame passed by the legacy delivery site is the portal frame,
-    // but an inline sub-walk's consumed item belongs to its own JitCode. Keep
-    // that per-frame code identity for the census; a legacy Python-pc entry,
-    // and an unresolvable identity (a negative index), fall back to the live
-    // frame's code. The resolution borrows the metainterp state, so it runs
-    // only while the census that consumes the key is collecting.
-    let code_ptr = match stash.body {
-        InflightForiterBody::Jit { jitcode_index, .. }
-            if super::foriter_inflight_census_enabled() =>
-        {
-            crate::state::raw_code_for_jitcode_index(jitcode_index)
-                .map_or(fallback_code_ptr, |code| code as usize)
+    for body in dropped {
+        if let Some((code_ptr, dropped_pc)) = inflight_census_key(fallback_code_ptr, body) {
+            super::census_record_foriter_inflight(
+                code_ptr,
+                dropped_pc,
+                super::ForiterInflightOutcome::DroppedUnmatched,
+            );
         }
-        _ => fallback_code_ptr,
+    }
+    let key = if census_on {
+        inflight_census_key(fallback_code_ptr, stash.body)
+    } else {
+        None
     };
     let store_len = fbw_store_journal_len();
     let append_len = FBW_LIST_EFFECT_JOURNAL.with(|j| j.borrow().len());
     let cell_store_len = FBW_CELL_STORE_JOURNAL.with(|j| j.borrow().len());
     let unjournaled = fbw_has_unjournaled_effect();
     if body_effect || store_len != 0 || append_len != 0 || cell_store_len != 0 {
-        census_record_foriter_inflight(code_ptr, body_pc, false);
+        crate::trace::fbw_diag::record_foriter_item_dropped();
+        if let Some((code_ptr, body_pc)) = key {
+            super::census_record_foriter_inflight(
+                code_ptr,
+                body_pc,
+                super::ForiterInflightOutcome::RefusedEffect,
+            );
+        }
         if fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] deliver REFUSED (body effect committed since consume) body_pc={} \
@@ -1171,7 +1252,10 @@ pub fn fbw_foriter_inflight_take(
         }
         return None;
     }
-    census_record_foriter_inflight(code_ptr, body_pc, true);
+    // NOT recorded as delivered here: the deliver site still refuses on its
+    // header check, and counting the take as a delivery is what let a refusal
+    // read as a success. Park the key for whichever of the two reports runs.
+    FORITER_INFLIGHT_PENDING.with(|slot| slot.set(key));
     if fbw_debug_abort_enabled() {
         eprintln!(
             "[fbw-foriter] deliver item=0x{:x} body_pc={} store_journal_len={store_len} \
@@ -1185,6 +1269,134 @@ pub fn fbw_foriter_inflight_take(
 #[cfg(test)]
 mod foriter_delivery_tests {
     use super::*;
+
+    /// The census columns, for a test that just drove one outcome.  Reading
+    /// them is why `foriter_inflight_census_enabled` is unconditionally true
+    /// under `cfg(test)`: no corpus fixture reaches a refusal, so these are
+    /// the only place the refusal columns are ever non-zero.
+    fn row(body_pc: usize) -> super::super::ForiterInflightCensusCounts {
+        super::super::census_foriter_inflight_row(0, body_pc)
+    }
+
+    fn reset() {
+        fbw_store_journal_reset();
+        super::super::census_foriter_inflight_reset();
+    }
+
+    /// The gated `fbw_foriter_item_dropped` tally.  It is one process-wide
+    /// atomic while the census columns are thread-local, so a test asserts the
+    /// DIRECTION of its own bump rather than an absolute value — another test
+    /// on another thread may bump it in between.  What is being proven here is
+    /// the wiring: the census column and the tally move on the same line.
+    fn dropped_tally() -> u64 {
+        crate::trace::fbw_diag::get(crate::trace::fbw_diag::FORITER_ITEM_DROPPED)
+    }
+
+    /// A take that hands an item out has NOT delivered it: the deliver site
+    /// still refuses on its header check.  Counting the take as the delivery
+    /// is what made a refusal read as a success.
+    #[test]
+    fn the_take_alone_records_no_outcome() {
+        reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+
+        let r = row(34);
+        assert_eq!(
+            (
+                r.delivered,
+                r.refused_effect,
+                r.refused_header,
+                r.dropped_unmatched
+            ),
+            (0, 0, 0, 0),
+            "the take is not an outcome"
+        );
+        reset();
+    }
+
+    #[test]
+    fn a_push_at_the_header_is_the_only_delivery() {
+        reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+
+        fbw_foriter_report_delivered();
+
+        assert_eq!(row(34).delivered, 1);
+        assert_eq!(row(34).refused_header, 0);
+        reset();
+    }
+
+    /// The conflation this census was fixed for: the deliver site refuses when
+    /// the live frame is parked somewhere else, and that refusal used to be
+    /// indistinguishable from a delivery.
+    #[test]
+    fn a_header_refusal_is_not_a_delivery() {
+        reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+
+        let before = dropped_tally();
+        fbw_foriter_report_refused_header();
+
+        assert_eq!(row(34).refused_header, 1);
+        assert_eq!(row(34).delivered, 0, "a refusal must not read as a success");
+        assert!(
+            dropped_tally() > before,
+            "a header refusal loses the iteration and must reach the gated tally"
+        );
+        reset();
+    }
+
+    /// R1 gets its own column, because it is the only refusal that is about an
+    /// effect: the other two are about where the frame is parked.
+    #[test]
+    fn an_r1_refusal_is_its_own_column() {
+        reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(item, InflightForiterBody::Py(34));
+        fbw_mark_foriter_body_effect_since_consume();
+
+        let before = dropped_tally();
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), None);
+
+        let r = row(34);
+        assert_eq!((r.refused_effect, r.refused_header, r.delivered), (1, 0, 0));
+        assert!(
+            dropped_tally() > before,
+            "the R1 refusal loses the iteration and must reach the gated tally"
+        );
+        reset();
+    }
+
+    /// The take clears every entry it did not pick, and each one is an
+    /// iteration whose consumed item nothing will hand back.  A census that
+    /// reports only what the take RETURNED cannot see them at all, so they are
+    /// named before the clear.
+    #[test]
+    fn the_entries_the_clear_destroys_are_named() {
+        reset();
+        let outer = 1usize as pyre_object::PyObjectRef;
+        let inner = 2usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(outer, InflightForiterBody::Py(6));
+        fbw_foriter_inflight_capture(inner, InflightForiterBody::Py(35));
+
+        // Parked at the OUTER header, so the inner entry is the one destroyed.
+        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
+
+        assert_eq!(row(35).dropped_unmatched, 1, "the inner entry is gone");
+        assert_eq!(
+            row(6).dropped_unmatched,
+            0,
+            "the taken entry is not dropped"
+        );
+        reset();
+    }
 
     #[test]
     fn recorded_but_unexecuted_residual_keeps_consumed_item_for_replay() {

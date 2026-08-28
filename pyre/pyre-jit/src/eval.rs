@@ -9700,6 +9700,7 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
         )
     };
     if !at_loop_header {
+        pyre_jit_trace::jitcode_dispatch::fbw_foriter_report_refused_header();
         if pyre_jit_trace::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!(
                 "[fbw-foriter] deliver REFUSED (live frame not at the loop header for \
@@ -9720,6 +9721,7 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     // `last_instr` are Python bytecode coordinates, matching `body_pc`
     // (the FOR_ITER `orgpc + 1`).
     frame.set_last_instr_from_next_instr(body_pc);
+    pyre_jit_trace::jitcode_dispatch::fbw_foriter_report_delivered();
     true
 }
 

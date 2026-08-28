@@ -867,7 +867,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             // copy reads the wrong words and prints them as a walk outcome
             // instead of failing. Named rather than spelled inline so the
             // mirror is something a test can compare.
-            const RING_BASE: u32 = 19;
+            const RING_BASE: u32 = 20;
             const RING_ENTRIES: u32 = 24;
             const RING_STRIDE: u32 = 5;
             const NAME_SLOTS: u32 = 4;
@@ -1189,17 +1189,19 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
         // divided because check.py folds every `[jit-stats]` line into one flat
         // `key -> value` map and reads each value as an integer.
         //
-        // Four of these are gated: slot 1 (`ROLLED_BACK_WITH_EFFECTS`, walks
+        // Five of these are gated: slot 1 (`ROLLED_BACK_WITH_EFFECTS`, walks
         // that ended uncommitted after a residual had already run an
         // irreversible effect), slot 11 (`STORE_JOURNAL_ROLLBACK_FAILED`, the
         // store restores the rollback could not perform — the one journaled
-        // effect the walk-end subtraction must not silently absorb) and the two
-        // adoption tallies. They carry the same keys the native backends print,
+        // effect the walk-end subtraction must not silently absorb), slot 19
+        // (`FORITER_ITEM_DROPPED`, a consumed FOR_ITER item no leg handed back,
+        // which costs the caller a whole iteration) and the two adoption
+        // tallies. They carry the same keys the native backends print,
         // because `_jit_stats_change` compares by name and a name only one
         // backend emits gates nothing on the others; and they must not resolve
         // to 0 when the export is absent, which reads as healthy. Hence the one
         // lookup feeding the refusal below, and hence this line — not the
-        // counter line — being where those four keys are emitted now.
+        // counter line — being where those five keys are emitted now.
         // The value array is built FROM the label array below, so a label
         // added without a slot (or the reverse) is impossible to write rather
         // than a `zip` that silently drops the tail.
@@ -1223,6 +1225,7 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
             "gate_declined_function_entry",
             "bridge_ec_from_portal_red",
             "bridge_ec_missing",
+            "fbw_foriter_item_dropped",
         ];
         let fbw_slots = match instance
             .get_typed_func::<u32, u64>(&mut store, "pyre_fbw_diag")

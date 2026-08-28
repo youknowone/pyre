@@ -3972,6 +3972,25 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     ctx.fbw_mode.inline_subwalk = true;
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
+    // The control for `[fbw-mergepoint-in-helper]` in `mod.rs`: that probe answers
+    // 0, and this line is what says the 0 describes the arm rather than a helper
+    // walk that never happens.  Over the 491 synthetic fixtures this one fires
+    // on `pickle_ctor_args` alone, for `__majit_wrap_load`.  One line per helper
+    // jitcode, not per walk, so the pair stays readable next to the rest of what
+    // this knob prints.
+    if fbw_debug_abort_enabled() {
+        thread_local! {
+            static SEEN: std::cell::RefCell<std::collections::HashSet<usize>> =
+                std::cell::RefCell::new(std::collections::HashSet::new());
+        }
+        if SEEN.with(|seen| seen.borrow_mut().insert(jitcode.index())) {
+            eprintln!(
+                "[fbw-helper-walk-enter] jitcode_index={} name={}",
+                jitcode.index(),
+                jitcode.name
+            );
+        }
+    }
     // `transparent_helper_subwalk` is set by `run_sub_jitcode_walk` on the
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
