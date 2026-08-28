@@ -18035,6 +18035,14 @@ fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
 
 /// The raw file descriptor for an fd-backed file object (`open(fd, ...)`),
 /// or `None` for an in-memory (path-backed) wrapper.
+/// The descriptor a file object reads and writes through, or `None` when it
+/// has none and its contents live in `__file_data__` instead.
+///
+/// A negative value is the "no descriptor" sentinel `W_FileIO` carries: it is
+/// what `fileio_new` publishes before `__init__` runs, and what stays in place
+/// when the open resolves to a buffer rather than to a descriptor.  Reporting
+/// it as a descriptor would send every read, seek and close down the fd path
+/// with nothing to call.
 fn file_get_fd(self_obj: PyObjectRef) -> Option<i32> {
     crate::baseobjspace::getattr_str(self_obj, "__file_fd__")
         .ok()
@@ -18045,6 +18053,7 @@ fn file_get_fd(self_obj: PyObjectRef) -> Option<i32> {
                 None
             }
         })
+        .filter(|fd| *fd >= 0)
 }
 
 fn file_is_binary(self_obj: PyObjectRef) -> bool {
