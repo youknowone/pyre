@@ -149,6 +149,28 @@ pub struct GraphTransformConfig {
     /// pyre's behaviour.
     #[serde(default = "default_jitdriver_receiver_roots")]
     pub jitdriver_receiver_roots: Vec<String>,
+    /// The host's own `s1 + s2` helper, called for an `add` over two Ref
+    /// operands.
+    ///
+    /// RPython lowers `s1 + s2` during rtyping (`rstr.py ll_strconcat`), so
+    /// the blackhole never sees a bare `int_add` over two strings and there is
+    /// no wired opcode for one. This layer therefore rewrites the op to a
+    /// residual call — but the callee is the *host's*: the graph knows the
+    /// shape of the operation, not whose string type it operates on.
+    ///
+    /// Named here the way [`Self::jitdriver_receiver_roots`] names the
+    /// driver. [`Default`] is pyre's helper, so a pipeline that does not name
+    /// one keeps pyre's behaviour. An empty name declines the rewrite, which
+    /// is what a host with no such helper wants: a call to a symbol it cannot
+    /// bind is a trace-ender, not a lowering.
+    #[serde(default = "default_str_concat_helper")]
+    pub str_concat_helper: String,
+    /// The host's own `str(i)` helper, called for a `str` over an Int operand.
+    ///
+    /// Same contract as [`Self::str_concat_helper`]; upstream's counterpart is
+    /// `rstr.py ll_int2dec` via `rint.py rtype_str`.
+    #[serde(default = "default_int_str_helper")]
+    pub int_str_helper: String,
 }
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
@@ -158,6 +180,17 @@ fn default_jitdriver_receiver_roots() -> Vec<String> {
         .iter()
         .map(|s| (*s).to_string())
         .collect()
+}
+
+/// The [`GraphTransformConfig::str_concat_helper`] default: pyre's own, in
+/// `pyre_object::unicodeobject`, whose address `jit_fnaddr.rs` binds.
+fn default_str_concat_helper() -> String {
+    "jit_str_concat".to_string()
+}
+
+/// The [`GraphTransformConfig::int_str_helper`] default, on the same terms.
+fn default_int_str_helper() -> String {
+    "jit_int_str".to_string()
 }
 
 impl Default for GraphTransformConfig {
@@ -170,6 +203,8 @@ impl Default for GraphTransformConfig {
             call_effects: Vec::new(),
             struct_storage: Vec::new(),
             jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
+            str_concat_helper: default_str_concat_helper(),
+            int_str_helper: default_int_str_helper(),
         }
     }
 }
@@ -1689,8 +1724,11 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
-            } if unop_name == "str" && self.get_value_kind_var(operand) == 'i' => {
-                let target = CallTarget::function_path(["jit_int_str"]);
+            } if unop_name == "str"
+                && self.get_value_kind_var(operand) == 'i'
+                && !self.config.int_str_helper.is_empty() =>
+            {
+                let target = CallTarget::function_path([self.config.int_str_helper.as_str()]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 let mut ops = vec![funcptr_op];
                 ops.push(SpaceOperation {
@@ -2057,9 +2095,10 @@ impl<'a> Transformer<'a> {
                 ..
             } if binop_name == "add"
                 && self.get_value_kind_var(lhs) == 'r'
-                && self.get_value_kind_var(rhs) == 'r' =>
+                && self.get_value_kind_var(rhs) == 'r'
+                && !self.config.str_concat_helper.is_empty() =>
             {
-                let target = CallTarget::function_path(["jit_str_concat"]);
+                let target = CallTarget::function_path([self.config.str_concat_helper.as_str()]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 let mut ops = vec![funcptr_op];
                 ops.push(SpaceOperation {
@@ -8817,6 +8856,92 @@ mod tests {
             other => panic!("expected CallResidual, got {other:?}"),
         }
         assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    /// `str(int)` over an Int operand, as one graph, for the two tests below.
+    fn int_str_graph() -> (FunctionGraph, crate::flowspace::model::Variable) {
+        let mut graph = FunctionGraph::new("int_str");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "str".into(),
+                    operand: n_var.clone(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        (graph, n_var)
+    }
+
+    /// The callee is the host's, not this layer's: a pipeline that names its
+    /// own render helper gets a call to that one.
+    ///
+    /// Upstream needs no such setting because rtyping happens inside the
+    /// interpreter's own translation, so `rstr.py ll_int2dec` is already the
+    /// host's function. A Rust front end reads MIR that has no such helper in
+    /// it, so the name has to come from the embedding pipeline.
+    #[test]
+    fn a_named_int_str_helper_is_the_call_target() {
+        let (graph, _n_var) = int_str_graph();
+        let config = GraphTransformConfig {
+            int_str_helper: "grain_render_int".to_string(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 4, "Input + fnptr + call + Live");
+        let expected = crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path([
+            "grain_render_int",
+        ]));
+        assert!(
+            matches!(&ops[1].kind, OpKind::ConstInt(fnaddr) if *fnaddr == expected),
+            "the fnptr names the configured helper, not this layer's default",
+        );
+    }
+
+    /// An unnamed helper declines the rewrite.
+    ///
+    /// The alternative is worse than not lowering: a residual call to a symbol
+    /// the host cannot bind keeps the build's sentinel address, so a trace
+    /// that reaches it declines there. Leaving the op alone at least keeps the
+    /// failure at the op that has no lowering.
+    #[test]
+    fn an_unnamed_int_str_helper_leaves_the_op_alone() {
+        let (graph, _n_var) = int_str_graph();
+        let config = GraphTransformConfig {
+            int_str_helper: String::new(),
+            ..Default::default()
+        };
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "no helper is named, so nothing is called: {ops:?}",
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op: name, .. } if name == "str"
+            )),
+            "the op survives for whatever lowers it next: {ops:?}",
+        );
     }
 
     #[test]
