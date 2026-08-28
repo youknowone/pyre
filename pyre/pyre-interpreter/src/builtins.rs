@@ -19844,9 +19844,11 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 let _ = binary;
                 // The bytes the caller spelled, not a re-decoded copy of them:
                 // a name `listdir` reported is a name `open` can be called
-                // with again, whatever bytes it spells.
-                let seam_path = crate::gateway::os_string_from_fs_bytes(path_bytes);
-                match crate::importing::read_source_bytes(std::path::Path::new(&seam_path)) {
+                // with again, whatever bytes it spells.  Resolved the way
+                // `posix` resolves one, so `open` and `os.open` answer for the
+                // same file after a `chdir`.
+                let seam_path = wasm_fd::seam_path(path_bytes);
+                match crate::importing::read_source_bytes(&seam_path) {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         return Err(crate::PyError::os_error_syscall(

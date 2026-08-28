@@ -85,12 +85,73 @@ fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate
     stat_resolved(&resolved)
 }
 
+/// The guest's working directory, once something has changed it.
+///
+/// The seam resolves a relative name against the embedder's directory, which is
+/// what `getcwd` reports until `chdir` runs.  After that the guest owns the
+/// answer, and a relative path is joined here before it crosses -- the same
+/// place `getcwd` reads, so the two never disagree.
+static WORKING_DIRECTORY: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// The directory a relative path is resolved against, as bytes.
+fn cwd_bytes() -> Vec<u8> {
+    if let Some(directory) = WORKING_DIRECTORY.lock().unwrap().clone() {
+        return directory;
+    }
+    crate::importing::source_cwd().unwrap_or_default()
+}
+
+/// `path` as the seam should see it: an absolute name unchanged, a relative one
+/// joined to the working directory.
+///
+/// An empty name stays empty so that the seam reports `ENOENT` for it, which is
+/// what `open("")` owes its caller rather than the working directory's contents.
+fn resolve_against_cwd(path: &[u8]) -> Vec<u8> {
+    if path.is_empty() || path.starts_with(b"/") {
+        return path.to_vec();
+    }
+    let mut resolved = cwd_bytes();
+    if resolved.is_empty() {
+        return path.to_vec();
+    }
+    if !resolved.ends_with(b"/") {
+        resolved.push(b'/');
+    }
+    resolved.extend_from_slice(path);
+    resolved
+}
+
+/// `posix.chdir(path)` — the directory later relative paths resolve against.
+///
+/// `fchdir` is what a descriptor argument would need, and the seam has no
+/// directory descriptor to offer it, so a name is the only spelling accepted.
+fn chdir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let resolved = path_arg(args, "chdir")?;
+    let target = resolve_against_cwd(&resolved.as_bytes);
+    let path: std::path::PathBuf = crate::gateway::os_string_from_fs_bytes(&target).into();
+    if !crate::importing::source_is_dir(&path) {
+        // The two answers a failed `chdir` gives: the name is not there, or it
+        // is there and is not a directory.
+        let errno = match crate::importing::source_file_size(&path) {
+            Ok(_) => crate::builtins::wasm_errno::ENOTDIR,
+            Err(e) => crate::builtins::wasm_errno::seam_errno(&e),
+        };
+        return Err(crate::PyError::os_error_syscall(errno, resolved.w_path()));
+    }
+    *WORKING_DIRECTORY.lock().unwrap() = Some(target);
+    Ok(pyre_object::w_none())
+}
+
 /// The seam takes a `&Path`, and on this target an `OsStr` is the byte string
 /// itself, so the filesystem bytes cross it whole rather than through a text
 /// spelling that a name without one would not survive: an entry `listdir`
 /// reported is an entry `stat` can be called with again.
-fn seam_path(bytes: &[u8]) -> std::path::PathBuf {
-    crate::gateway::os_string_from_fs_bytes(bytes).into()
+///
+/// This is the one place a relative name becomes an absolute one, so every
+/// entry point that takes a path resolves it against the same directory
+/// `getcwd` reports.
+pub(crate) fn seam_path(bytes: &[u8]) -> std::path::PathBuf {
+    crate::gateway::os_string_from_fs_bytes(&resolve_against_cwd(bytes)).into()
 }
 
 /// The seam's `io::Error` as the OSError it stands for, named by the path
@@ -785,6 +846,7 @@ pub fn register_module(ns: PyObjectRef) {
         "scandir",
         crate::make_builtin_function("scandir", scandir),
     );
+    crate::module_ns_store(ns, "chdir", crate::make_builtin_function("chdir", chdir));
     // `os.walk` catches `OSError` from the iterator and `shutil` calls
     // `isinstance(entry, os.DirEntry)`, so both the type and the entries it
     // stamps are published.
@@ -914,11 +976,6 @@ pub fn register_module(ns: PyObjectRef) {
     for (name, value) in constants {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
-}
-
-/// The embedder's working directory, or nothing when it reports none.
-fn cwd_bytes() -> Vec<u8> {
-    crate::importing::source_cwd().unwrap_or_default()
 }
 
 /// `posix.urandom(n)` — the same entry point the syscall arm publishes, over
