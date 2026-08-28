@@ -2887,6 +2887,11 @@ pub trait Backend: Send {
     fn clear_stored_exception(&self) {}
 
     /// Read the FailDescr from the last guard failure.
+    ///
+    /// The same object `get_latest_descr_arc` hands out, borrowed from the
+    /// frame instead of shared: a reader that only needs the descr's fields
+    /// for as long as it holds the frame takes this and pays no reference
+    /// count.
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
 
     /// Owned Arc counterpart of `get_latest_descr`.

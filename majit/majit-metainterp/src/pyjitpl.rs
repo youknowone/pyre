@@ -11276,7 +11276,7 @@ impl<M: Clone> MetaInterp<M> {
             meta,
             fail_index,
             trace_id,
-            descr_arc,
+            descr_arc: (!is_finish).then_some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
             exit_layout: exit_layout.map(Box::new),
@@ -11438,10 +11438,11 @@ impl<M: Clone> MetaInterp<M> {
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
-        let descr_arc = self.backend.get_latest_descr_arc(&frame);
-        let descr: &dyn majit_ir::FailDescr = descr_arc
-            .as_fail_descr()
-            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
+        // Borrowed off the frame, not shared: a final descr is read here and
+        // returned, so the entry that runs one compiled body to completion
+        // pays no reference count for it. The guard arm below takes the
+        // shared hold, since that is the arm whose result outlives the frame.
+        let descr: &dyn majit_ir::FailDescr = self.backend.get_latest_descr(&frame);
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -11466,10 +11467,7 @@ impl<M: Clone> MetaInterp<M> {
         {
             count_execute_stage_passes(ExecuteStage::Decode, stage_repeats.decode);
             for _ in 0..stage_repeats.decode {
-                let repeat_descr = self.backend.get_latest_descr_arc(&frame);
-                let repeat_fail = repeat_descr
-                    .as_fail_descr()
-                    .expect("get_latest_descr_arc returned a non-FailDescr Descr");
+                let repeat_fail = self.backend.get_latest_descr(&frame);
                 let repeat_types: &[Type] = repeat_fail.fail_arg_types();
                 let decoded = Self::decode_exit_slots(&self.backend, &frame, repeat_types);
                 std::hint::black_box((
@@ -11510,7 +11508,7 @@ impl<M: Clone> MetaInterp<M> {
                 meta,
                 fail_index,
                 trace_id,
-                descr_arc,
+                descr_arc: None,
                 is_finish,
                 is_exit_frame_with_exception,
                 exit_layout: None,
@@ -11525,6 +11523,15 @@ impl<M: Clone> MetaInterp<M> {
             };
         }
 
+        // The shared hold, taken only here: the result of a guard exit carries
+        // the descr past this frame's life to the bridge and blackhole readers.
+        // The borrow above ends with the rebinding, which is what lets the
+        // counter tick below take `self` mutably.
+        let descr_arc = self.backend.get_latest_descr_arc(&frame);
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
+        let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
@@ -11535,9 +11542,7 @@ impl<M: Clone> MetaInterp<M> {
         // in handle_fail → must_compile (compile.py).
         // must_compile handles tick.
         if Self::should_record_guard_failure(is_finish, fail_index) {
-            let back_edge_poll = descr_arc
-                .as_fail_descr()
-                .is_some_and(|fd| fd.is_back_edge_poll());
+            let back_edge_poll = descr.is_back_edge_poll();
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
@@ -11601,7 +11606,7 @@ impl<M: Clone> MetaInterp<M> {
             meta,
             fail_index,
             trace_id,
-            descr_arc,
+            descr_arc: Some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
             exit_layout: Some(Box::new(exit_layout)),

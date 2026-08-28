@@ -273,7 +273,12 @@ pub struct CompileResult<M> {
     /// currently has split metainterp/backend descr objects, so this is
     /// the runtime descr carrying the same `rd_loop_token_clt` /
     /// `fail_index_per_trace` identity used for bridge routing.
-    pub descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
+    ///
+    /// Carried for a guard exit only. Every reader of it is a bridge or
+    /// blackhole consumer, and a final descr resumes nothing, so the finish
+    /// arm reads the descr off the frame by reference and never takes the
+    /// shared hold on it.
+    pub descr_arc: Option<std::sync::Arc<dyn majit_ir::Descr>>,
     pub is_finish: bool,
     /// compile.py ExitFrameWithExceptionDescrRef parity:
     /// true when the FINISH descriptor was

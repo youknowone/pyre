@@ -6187,7 +6187,10 @@ impl<S: JitState> JitDriver<S> {
             // and the detailed run below read machine words, and building the
             // list on every entry charged the finish exit for both.
             let raw_values = crate::compile::raw_exit_values(&result.typed_values);
-            let descr_arc = std::sync::Arc::clone(&result.descr_arc);
+            let descr_arc = result
+                .descr_arc
+                .take()
+                .expect("a guard exit carries its descr");
             let guard_value_operand = result.guard_value_operand;
             // blackhole.py `_prepare_resume_from_failure(deadframe)`:
             // the pending exception grabbed at guard failure
@@ -7780,7 +7783,8 @@ impl<S: JitState> JitDriver<S> {
         let exit_meta = result.meta.clone();
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
-        let descr_arc = std::sync::Arc::clone(&result.descr_arc);
+        // Carried past the finish arm below, which is the one that has none.
+        let descr_arc = result.descr_arc.take();
         // The pointer travels; the layout behind it is opened past the finish
         // arm below, which is the one that carries none.
         let exit_layout = result.exit_layout.take();
@@ -7808,6 +7812,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
+        let descr_arc = descr_arc.expect("a guard exit carries its descr");
         // Normal loop back-edge JUMP, not a guard failure.
         if fail_index == u32::MAX {
             state.restore_values(&exit_meta, &typed_values);
@@ -10370,7 +10375,10 @@ mod tests {
             .run_compiled_detailed(green_key, &[0])
             .expect("guard should fail");
         let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
-        let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
+        let descr_arc = failure
+            .descr_arc
+            .clone()
+            .expect("a guard exit carries its descr");
         drop(failure);
 
         let started = driver.start_bridge_tracing(
