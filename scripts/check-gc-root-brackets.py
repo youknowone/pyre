@@ -5,14 +5,21 @@
 `framework.py` brackets every operation that can reach the collector,
 `shadowstack.py` emits the `gc_push_roots` / `gc_pop_roots` pair, and
 `expand_pop_roots` turns the pop into one `gc_restore_root` per variable.
-pyre's interpreter is compiled by rustc, so the bracket is written by hand and
-this gate is what stops it being taken on trust -- see the module docs on
-`majit-translate/src/memory/gctransform/mod.rs` for why the insertion half is
-out of reach for this pipeline.
+The graph-wide `shadowcolor` stage is now automatic as well.  Until the
+framework transformer's marker-insertion handlers are ported, native
+interpreter paths retain their existing `push_roots` brackets and this gate
+stops those brackets being taken on trust.  See the module docs on
+`majit-translate/src/memory/gctransform/mod.rs` for that current port boundary.
 
 Two of the reported numbers are invariants at zero and are held there.  The
 rest are a backlog: they are ratcheted, so a change may pay them down but not
 add to them.
+
+The ratchet is read against the base the baseline was taken on.  The backlog
+counts every unbracketed call in the artefact, not this branch's share of
+them, so a base that has moved brings code the baseline never saw into the
+same number a regression would land in.  A rise measured over a moved base is
+therefore reported and not failed; the invariants are held either way.
 
 Run the analysis and compare:
 
@@ -96,8 +103,20 @@ def merge_base() -> str:
     for base in ("origin/main", "upstream/main"):
         proc = subprocess.run(["git", "merge-base", base, "HEAD"], cwd=ROOT,
                               capture_output=True, encoding="utf-8")
-        if proc.returncode == 0:
+        if proc.returncode == 0 and proc.stdout.strip():
             return proc.stdout.strip()
+    # A pull-request checkout holds no `main` ref at all: the action fetches
+    # `refs/pull/N/merge` and nothing else, so every `merge-base` above fails
+    # and the base reads as unknown -- which is precisely the run that most
+    # needs it, since that merge commit carries whatever `main` gained since
+    # the baseline.  Its first parent *is* the base tip, and naming it needs
+    # only the commit object already in hand.
+    proc = subprocess.run(["git", "rev-list", "--parents", "-n", "1", "HEAD"],
+                          cwd=ROOT, capture_output=True, encoding="utf-8")
+    if proc.returncode == 0:
+        parts = proc.stdout.split()
+        if len(parts) == 3:
+            return parts[1]
     return ""
 
 
@@ -192,7 +211,15 @@ def main() -> int:
             f" paying it down."
         )
 
+    # A rise measured over a base the baseline never saw is not this branch's
+    # to answer for: the backlog counts every unbracketed call in the artefact,
+    # so interpreter code merged into the base since lands in it whole.  A pull
+    # request is measured on its merge commit, so this is the ordinary case for
+    # any branch whose base has moved, and failing it there accuses the branch
+    # of a rise it did not cause.  The invariants are still held: those are
+    # zero for the whole artefact whoever wrote the code.
     bad = []
+    unattributed = []
     del got["base"]
     for k in INVARIANT_ZERO:
         if got[k] != 0:
@@ -202,10 +229,11 @@ def main() -> int:
                        f"a backlog entry.")
     for k in RATCHET:
         if k in want and got[k] > want[k]:
-            bad.append(f"{k} rose {want[k]} -> {got[k]}. Bracket the new call "
-                       f"with `pyre_object::with_roots!`, or pay the baseline "
-                       f"down and rerun with --update if the rise is real and "
-                       f"intended.")
+            rise = (f"{k} rose {want[k]} -> {got[k]}. Bracket the new call "
+                    f"with `pyre_object::with_roots!`, or pay the baseline "
+                    f"down and rerun with --update if the rise is real and "
+                    f"intended.")
+            (unattributed if rebased else bad).append(rise)
     if "unmatched_seeds" in want and got["unmatched_seeds"] != want["unmatched_seeds"]:
         bad.append(
             f"the unmatched seed set changed: {want['unmatched_seeds']} -> "
@@ -219,6 +247,13 @@ def main() -> int:
         for b in bad:
             print(f"  - {b}")
         return 1
+    if unattributed:
+        print("\nWARN — a raised backlog this run cannot attribute:")
+        for u in unattributed:
+            print(f"  - {u}")
+        print("  Rebase onto the recorded base and rerun to attribute these, "
+              "or rebaseline from a run that sits on it.")
+        return 0
     print("\nOK — invariants at zero, backlog not raised.")
     return 0
 
