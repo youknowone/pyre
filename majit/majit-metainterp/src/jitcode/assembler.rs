@@ -202,6 +202,20 @@ pub struct JitCodeBuilder {
     /// (`call.py:167-169` constructs `JitCode(name, fnaddr, calldescr)`
     /// before `assembler.assemble`).
     calldescr: majit_translate::jitcode::BhCallDescr,
+    /// Set by [`Self::start_instr`] when the body emits an opcode whose answer
+    /// comes from the blackhole's own context rather than from memory, so
+    /// `finish()` can drop a staged native entry rather than let
+    /// `bhimpl_inline_call_*` read a stale heap.
+    ///
+    /// There is no upstream counterpart because upstream has no such opcode in
+    /// a callee: `bhimpl_inline_call_*` (`blackhole.py:1278-1319`) calls
+    /// `jitcode.fnaddr` unconditionally, and RPython reaches the
+    /// virtualizable's fields through `virtualizable_boxes`, which only the
+    /// portal frame carries. pyre's `#[jit_interp]` state-field and vable
+    /// bytecodes read the interpreter's registers, so a body carrying one is
+    /// not the same program as the Rust function it was lowered from — see
+    /// [`Self::native_entry_denied`] for the list.
+    native_entry_blocked: bool,
     /// Whether `num_regs_{i,r,f}` have been frozen at the regalloc-
     /// final value. While set, `touch_reg`/`touch_ref_reg`/
     /// `touch_float_reg` skip the `max` update so subsequent operand
@@ -294,6 +308,30 @@ impl JitCodeBuilder {
     /// `JitCode(name, fnaddr, calldescr)` constructor order.
     pub fn set_calldescr(&mut self, calldescr: majit_translate::jitcode::BhCallDescr) {
         self.calldescr = calldescr;
+    }
+
+    /// Stage the pair `call.py:167-169` passes to `JitCode(name, fnaddr,
+    /// calldescr)` for a jitcode whose source function survives compilation as
+    /// a callable entry point.
+    ///
+    /// This is what makes `bhimpl_inline_call_*` (`blackhole.py:1278-1319`)
+    /// reachable.  Those handlers do not interpret the callee: they run
+    /// `cpu.bh_call_X(adr2int(jitcode.fnaddr), args_i, args_r, args_f,
+    /// jitcode.calldescr)`, so the whole callee subtree executes as compiled
+    /// code in one call.  A jitcode with no entry — a `match`-arm fragment,
+    /// which is a shape upstream does not have — leaves `fnaddr` at 0 and the
+    /// blackhole falls back to executing its bytes.
+    ///
+    /// `arg_classes` is in source parameter order, one char per parameter, and
+    /// must name the ABI of `fnaddr` itself: `collect_call_args` walks it to
+    /// place the per-kind argument lists back into declaration positions.
+    pub fn set_native_entry(&mut self, fnaddr: i64, arg_classes: &str, result_type: char) {
+        self.fnaddr = fnaddr;
+        self.calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+            arg_classes.to_string(),
+            result_type,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
     }
 
     /// Whether `abort()` was called on this builder.
@@ -5694,7 +5732,25 @@ impl JitCodeBuilder {
         // writes `fnaddr` at construction time before the assembler fills
         // the body. Stage it on the builder via `set_fnaddr` and stamp it
         // here so callers do not need a post-`set_body` mutation.
-        jc.fnaddr = self.fnaddr;
+        // A body that reads the interpreter's own context is not the function
+        // it was lowered from, and neither is one whose callee is such a body:
+        // running this jitcode natively runs that callee's Rust source too.
+        // `descrs` holds the sub-jitcodes this body can enter, and each was
+        // finished before this one, so their verdicts are already in.
+        //
+        // A `Weak` that does not upgrade is this jitcode's own back edge —
+        // `Arc::new_cyclic` has not published it yet — and its verdict is the
+        // one being computed here, so it is not a separate refusal.
+        let callee_blocked = self.descrs.iter().any(|descr| {
+            descr
+                .as_jitcode_owned()
+                .is_some_and(|callee| callee.fnaddr == 0)
+        });
+        jc.fnaddr = if self.native_entry_blocked || callee_blocked {
+            0
+        } else {
+            self.fnaddr
+        };
         jc.set_body(body);
         jc.exec = super::JitCodeExecState {
             descrs: self.descrs,
@@ -5771,9 +5827,79 @@ impl JitCodeBuilder {
     /// `JitCode.get_live_vars_info` (RPython `jitcode.py`) can
     /// fire its non-translated `assert pc in self._startpoints` check.
     fn start_instr(&mut self, opcode: u8) {
+        self.native_entry_blocked |= Self::native_entry_denied(opcode);
         self.flush_pending_resulttype();
         self.startpoints.insert(self.code.len());
         self.push_u8(opcode);
+    }
+
+    /// Whether this opcode makes the body something other than the function it
+    /// was lowered from, so a native entry for it would answer differently.
+    ///
+    /// The list is exactly the opcodes a native entry would get WRONG — either
+    /// because the operand lives in the blackhole rather than in the heap, or
+    /// because the opcode carries an obligation beyond the value it returns:
+    ///
+    /// * the `#[jit_interp]` state fields, which live in the interpreter's
+    ///   register banks between merge points and reach memory only at a
+    ///   writeback, so a native call would read the pre-writeback value;
+    /// * the virtualizable getters/setters, which carry an obligation the
+    ///   function they were lowered from does not: every one of them begins
+    ///   `fielddescr.get_vinfo().clear_vable_token(vable)`
+    ///   (`blackhole.py:1374-1386 bhimpl_getarrayitem_vable_*`, mirrored by
+    ///   `vable_clear_token_and_get_vinfo`), and `clear_vable_token`
+    ///   (`virtualizable.py:218-222`) FORCES a virtualizable that still holds
+    ///   a token. Both blackholes then read the heap, so the field value would
+    ///   agree — it is the forcing that a native entry would skip, leaving the
+    ///   token standing. (Serving them out of `virtualizable_boxes` is the
+    ///   METAINTERP's behaviour, `pyjitpl.py:1167-1245
+    ///   opimpl_getfield_vable_*`, not the blackhole's.);
+    /// * `jit_merge_point` and `call_assembler`/`recursive_call`, which do not
+    ///   return to the caller but raise a JitException the C-level call in
+    ///   `bhimpl_inline_call_*` propagates and a Rust return value cannot; and
+    /// * `loop_header`, which is a tracing hook, not a computation.
+    ///
+    /// Everything else — arithmetic, control flow, `getfield`/`setfield` on
+    /// real objects, residual calls, nested inline calls — computes the same
+    /// answer either way, because the heap is the heap. That is the whole
+    /// premise of `bhimpl_inline_call_*`.
+    const fn native_entry_denied(opcode: u8) -> bool {
+        use majit_translate::insns as i;
+        matches!(
+            opcode,
+            i::BC_LOAD_STATE_FIELD
+                | i::BC_STORE_STATE_FIELD
+                | i::BC_LOAD_STATE_FIELD_REF
+                | i::BC_STORE_STATE_FIELD_REF
+                | i::BC_LOAD_STATE_FIELD_FLOAT
+                | i::BC_STORE_STATE_FIELD_FLOAT
+                | i::BC_GETFIELD_VABLE_I
+                | i::BC_GETFIELD_VABLE_R
+                | i::BC_GETFIELD_VABLE_F
+                | i::BC_SETFIELD_VABLE_I
+                | i::BC_SETFIELD_VABLE_R
+                | i::BC_SETFIELD_VABLE_F
+                | i::BC_GETARRAYITEM_VABLE_I
+                | i::BC_GETARRAYITEM_VABLE_R
+                | i::BC_GETARRAYITEM_VABLE_F
+                | i::BC_SETARRAYITEM_VABLE_I
+                | i::BC_SETARRAYITEM_VABLE_R
+                | i::BC_SETARRAYITEM_VABLE_F
+                | i::BC_ARRAYLEN_VABLE
+                | i::BC_ARRAYBASE_VABLE
+                | i::BC_HINT_FORCE_VIRTUALIZABLE
+                | i::BC_JIT_MERGE_POINT
+                | i::BC_JIT_MERGE_POINT_C
+                | i::BC_CALL_ASSEMBLER_INT
+                | i::BC_CALL_ASSEMBLER_REF
+                | i::BC_CALL_ASSEMBLER_FLOAT
+                | i::BC_CALL_ASSEMBLER_VOID
+                | i::BC_RECURSIVE_CALL_INT
+                | i::BC_RECURSIVE_CALL_REF
+                | i::BC_RECURSIVE_CALL_FLOAT
+                | i::BC_RECURSIVE_CALL_VOID
+                | i::BC_LOOP_HEADER
+        )
     }
 
     /// RPython `assembler.py:217-219`:
@@ -6604,6 +6730,59 @@ mod tests {
                 .and_then(|resulttypes| resulttypes.get(&pc).copied()),
             Some(kind)
         );
+    }
+
+    /// `inline_call_ending_at` has to answer with exactly the operands the
+    /// emitter wrote, for every argument count and every return bank.
+    ///
+    /// It is the only reader of a `BC_INLINE_CALL`'s operands that does not
+    /// start at the instruction — a frame rebuilt from resume data knows only
+    /// where the instruction ENDED — so nothing else would catch it drifting
+    /// from the encoder. Both directions are graded: the slots it recovers,
+    /// and that it declines a position that is not the far side of one.
+    #[test]
+    fn inline_call_ending_at_recovers_what_the_emitter_wrote() {
+        use crate::jitcode::JitArgKind;
+
+        let args: [&[(u16, u16)]; 3] = [&[], &[(1, 0)], &[(1, 0), (2, 1), (3, 2)]];
+        for args_r in args {
+            for (bank, emit) in [
+                (Some(JitArgKind::Int), 0usize),
+                (Some(JitArgKind::Ref), 1),
+                (None, 2),
+            ] {
+                let mut builder = JitCodeBuilder::new();
+                // A leading instruction, so the call never starts at 0 and a
+                // decoder that ignored the opcode byte could not accidentally
+                // be right.
+                builder.int_guard_value(4);
+                let start = builder.current_pos();
+                match emit {
+                    0 => builder.inline_call_r_i(7, args_r, Some(9)),
+                    1 => builder.inline_call_r_r(7, args_r, Some(9)),
+                    _ => builder.inline_call_r_v(7, args_r, None),
+                }
+                let end = builder.current_pos();
+                let jitcode = builder.finish();
+
+                let site = jitcode
+                    .inline_call_ending_at(end)
+                    .expect("the call ends here, so it must decode");
+                assert_eq!(site.sub_idx, 7, "sub-JitCode index");
+                assert_eq!(
+                    site.result_slot(),
+                    bank.map(|kind| (kind, 9usize)),
+                    "return slot for {args_r:?} args, bank {bank:?}",
+                );
+                // The width formula the search solves for.
+                assert_eq!(end - start, 8 + 3 * args_r.len(), "encoded width");
+                // A position one byte off is not the far side of this call,
+                // and answering there would be a wrong frame rebuild rather
+                // than a decline.
+                assert_eq!(jitcode.inline_call_ending_at(end - 1), None);
+                assert_eq!(jitcode.inline_call_ending_at(start), None);
+            }
+        }
     }
 
     fn assert_no_resulttype_after(emit: impl FnOnce(&mut JitCodeBuilder)) {

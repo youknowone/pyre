@@ -3054,8 +3054,8 @@ impl Optimizer {
         // pushes a fresh resop operand slot for every visited op
         // BEFORE the optimizer pipeline decides whether to emit. Two
         // categories of slot escape the `new_operations` carry above
-        // and need explicit handling so `Forwarded::Op(Weak<Op>)`
-        // upgrades stay live after Phase 1 context drop:
+        // and need explicit handling so retrace sees the same
+        // `Forwarded::Op(_)` chain targets Phase 1 installed:
         //
         //   - Unbound orphan: the pipeline folded/dropped the op so
         //     `ctx.emit` never ran. Synthesize a `SameAs` stand-in
@@ -3068,8 +3068,8 @@ impl Optimizer {
         //
         // In both cases the stand-in OpRc must travel into
         // `phase1_emit_ops` (and from there into
-        // `ExportedState.partial_trace_operations`) so retrace's
-        // `Weak<Op>` upgrade succeeds.
+        // `ExportedState.partial_trace_operations`) so retrace reads it as
+        // part of the partial trace.
         // `live_synthetics` is the incrementally-maintained set of synthetic
         // stand-ins (mint_synthetic_resop / bind_input_resops) whose position
         // was never superseded by an `emit` — the box-bound-to-synthetic

@@ -207,8 +207,16 @@ pub struct CompiledExitLayout {
     /// the vectors these hold, and off the steady path by construction. A
     /// FINISH or JUMP exit stores two null words and allocates nothing, so the
     /// per-entry allocation count is unchanged.
-    pub recovery_layout: Option<Box<ExitRecoveryLayout>>,
-    pub resume_layout: Option<Box<ResumeLayoutSummary>>,
+    ///
+    /// `Arc`, not `Box`, because both halves are decided once when the trace
+    /// is compiled and then only read: every guard failure asks
+    /// `StoredExitLayout::public` for them again, and through a `Box` that
+    /// question deep-copied both frame vectors per deopt. The few places that
+    /// still edit one — the backend merge in this file — take
+    /// `Arc::make_mut`, which is free while the trace-side handle is the only
+    /// one.
+    pub recovery_layout: Option<std::sync::Arc<ExitRecoveryLayout>>,
+    pub resume_layout: Option<std::sync::Arc<ResumeLayoutSummary>>,
     /// compile.py `ResumeGuardDescr` storage handle — shared
     /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
     pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
@@ -1208,8 +1216,8 @@ pub(crate) fn build_guard_metadata<T: AsRef<majit_ir::Op>>(
             fail_index,
             StoredExitLayout {
                 source_op_index: Some(op_idx),
-                recovery_layout,
-                resume_layout,
+                recovery_layout: recovery_layout.map(std::sync::Arc::new),
+                resume_layout: resume_layout.map(std::sync::Arc::new),
                 storage,
                 descr: op.getdescr(),
                 op_arg_types_for_jump: None,
@@ -1277,7 +1285,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                 .entry(layout.fail_index)
                 .or_insert_with(|| StoredExitLayout {
                     source_op_index: layout.source_op_index,
-                    recovery_layout: layout.recovery_layout.clone(),
+                    recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
                     resume_layout: None,
                     storage: storage_from_backend.clone(),
                     descr: descr_from_op.clone(),
@@ -1301,7 +1309,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
         // from the backend; backend frames the frontend layout lacks are
         // appended so no recovery frame is dropped.
         if let Some(ref backend_recovery) = layout.recovery_layout {
-            if let Some(ref mut existing) = entry.recovery_layout {
+            if let Some(existing) = entry.recovery_layout.as_mut().map(std::sync::Arc::make_mut) {
                 for (i, source) in backend_recovery.frames.iter().enumerate() {
                     if let Some(target) = existing.frames.get_mut(i) {
                         if target.header_pc.is_none() {
@@ -1315,7 +1323,7 @@ pub(crate) fn merge_backend_exit_layouts<T: AsRef<majit_ir::Op>>(
                     }
                 }
             } else {
-                entry.recovery_layout = layout.recovery_layout.clone();
+                entry.recovery_layout = layout.recovery_layout.clone().map(std::sync::Arc::new);
             }
         }
         if entry.storage.is_none() {
@@ -1397,7 +1405,7 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
         .map(crate::resume::resume_frame_layout_from_exit_frame_layout)
         .collect();
 
-    if let Some(ref mut resume_layout) = entry.resume_layout {
+    if let Some(resume_layout) = entry.resume_layout.as_mut().map(std::sync::Arc::make_mut) {
         // Merge slot types from frame_stack into existing frame_layouts.
         let shared = resume_layout.frame_layouts.len().min(frame_layouts.len());
         for offset in 0..shared {
@@ -1447,7 +1455,7 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
         }
     } else {
         // No existing resume layout; create one from the frame_stack.
-        entry.resume_layout = Some(ResumeLayoutSummary {
+        entry.resume_layout = Some(std::sync::Arc::new(ResumeLayoutSummary {
             num_frames: frame_layouts.len(),
             frame_pcs: frame_layouts.iter().map(|f| f.pc).collect(),
             frame_slot_counts: frame_layouts.iter().map(|f| f.slot_layouts.len()).collect(),
@@ -1458,7 +1466,7 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
             pending_field_count: 0,
             pending_field_layouts: Vec::new(),
             const_pool_size: 0,
-        });
+        }));
     }
 }
 
@@ -1580,14 +1588,14 @@ pub(crate) fn merge_backend_terminal_exit_layouts<T: AsRef<majit_ir::Op>>(
             .entry(layout.op_index)
             .or_insert_with(|| StoredExitLayout {
                 source_op_index: Some(layout.op_index),
-                recovery_layout: layout.recovery_layout.clone(),
+                recovery_layout: layout.recovery_layout.clone().map(std::sync::Arc::new),
                 resume_layout: None,
                 storage: None,
                 descr: descr_from_op.clone(),
                 op_arg_types_for_jump: op_arg_types_for_jump.clone(),
             });
         entry.source_op_index = Some(layout.op_index);
-        entry.recovery_layout = layout.recovery_layout.clone();
+        entry.recovery_layout = layout.recovery_layout.clone().map(std::sync::Arc::new);
         if entry.descr.is_none() {
             entry.descr = descr_from_op;
         }
@@ -2379,10 +2387,10 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
             trace_id,
             inputargs,
             trace_info,
-            recovery_layout.as_ref(),
+            recovery_layout.as_deref(),
         );
         if let Some(exit_layout) = exit_layouts.get_mut(fail_index) {
-            exit_layout.resume_layout = Some(layout.clone());
+            exit_layout.resume_layout = Some(std::sync::Arc::new(layout.clone()));
         }
     }
 }
@@ -2401,8 +2409,8 @@ pub(crate) fn patch_guard_recovery_layouts_for_trace(
             continue;
         };
         let recovery_layout = resume_layout
-            .to_exit_recovery_layout_with_caller_prefix(exit_layout.recovery_layout.as_ref());
-        exit_layout.recovery_layout = Some(recovery_layout);
+            .to_exit_recovery_layout_with_caller_prefix(exit_layout.recovery_layout.as_deref());
+        exit_layout.recovery_layout = Some(std::sync::Arc::new(recovery_layout));
     }
 }
 
@@ -2417,14 +2425,14 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
             continue;
         };
         let recovery_layout = resume_layout
-            .to_exit_recovery_layout_with_caller_prefix(exit_layout.recovery_layout.as_ref());
+            .to_exit_recovery_layout_with_caller_prefix(exit_layout.recovery_layout.as_deref());
         if backend.update_terminal_exit_recovery_layout(
             token,
             trace_id,
             op_index,
             recovery_layout.clone(),
         ) {
-            exit_layout.recovery_layout = Some(recovery_layout);
+            exit_layout.recovery_layout = Some(std::sync::Arc::new(recovery_layout));
         }
     }
 }

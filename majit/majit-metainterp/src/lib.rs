@@ -185,8 +185,8 @@ pub use io_buffer::{
     io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,
 };
 pub use jit_state::{
-    DeoptMaterializationCache, GuardResumeReg, JitState, PendingFieldWriteLayout, ResumeDataResult,
-    bridge_decode_red,
+    DeoptMaterializationCache, GuardResumeFrame, GuardResumeReg, JitState, PendingFieldWriteLayout,
+    ResumeDataResult, bridge_decode_red,
 };
 pub use jitcode::{
     BC_GOTO, EmbeddedJitCodeTable, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, RuntimeBhDescr,
@@ -249,7 +249,7 @@ pub use pyjitpl::{
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
     set_record_application_traceback_hook, set_record_discarded_level_traceback_hook,
     set_record_inline_application_traceback_hook, set_resolve_exception_context_hook,
-    trace_jitcode, trace_jitcode_at_resume_position, trace_jitcode_from_merge_point,
+    trace_jitcode, trace_jitcode_at_resume_framestack, trace_jitcode_from_merge_point,
     trace_jitcode_with_args, trace_jitcode_with_args_and_runtime,
 };
 pub use resume_box_reader::{
@@ -1850,6 +1850,36 @@ pub const MC_DIAG_LABELS: &[&str] = &[
     "guard_resume_decline_replay_incomplete",
     "guard_resume_decline_regcount",
     "guard_resume_decline_unreadable_reg",
+    // The rungs the same ladder grew once it rebuilt EVERY encoded resume
+    // section rather than the root alone. All five are disagreements between
+    // the resume stream's frame chain and the bytecode that pushed it, and a
+    // nonzero one is worth reading as a defect rather than as a workload
+    // property: 88 = a section names a `jitcode_index` the flat registry does
+    // not hand out; 89 = a section below the top is not suspended on the far
+    // side of a `BC_INLINE_CALL`, so nothing names its callee or its result
+    // register; 90 = that call's `j` operand does not resolve to a JitCode; 91
+    // = it names a different callee than the section stacked on it; 92 = the
+    // callee ends in a typed return the call site has no slot for.
+    "guard_resume_decline_unregistered_jitcode",
+    "guard_resume_decline_no_inline_call_site",
+    "guard_resume_decline_call_not_jitcode",
+    "guard_resume_decline_callee_mismatch",
+    "guard_resume_decline_return_slot",
+    // 93 = the resume spans more than one frame and the sym reserves an
+    // identity-only int range. Unlike 88-92 this is not a disagreement: the
+    // snapshot trim blanked those registers in every frame below the root and
+    // nothing re-derives them, so a nonzero tally is a workload property of a
+    // `split_dispatch` symbol, not a defect. Only a symbol that opts in can
+    // raise it; every other one reserves nothing and never reaches the test.
+    "guard_resume_decline_reserved_identity",
+    // 94 = the inline-frame snapshot trim blanked a reserved identity slot
+    // that held a LIVE (non-constant) box. 93 counts the guards the bridge
+    // walk refuses because of the trim; this counts the slots the trim
+    // actually took something away from, which is the quantity that decides
+    // whether the blackhole arm 93 hands those guards to can read a fabricated
+    // zero through `load_state_field/di`. A slot that already held a constant
+    // loses nothing, so it is not counted.
+    "inline_frame_trim_blanked_live_int",
 ];
 
 /// Render every [`MC_DIAG`] tally as space-separated `label=count` pairs.
@@ -1931,6 +1961,40 @@ pub fn guard_census_summary(top: usize) -> String {
         "guard_census distinct={} total={total} top={heaviest}",
         rows.len()
     )
+}
+
+/// The index of `label` in [`MC_DIAG_LABELS`], resolved at compile time.
+///
+/// A bump site that spells its slot as a literal reads back as internally
+/// consistent when the number is wrong: every reader prints
+/// `MC_DIAG_LABELS[slot]` beside the count, so the wrong tally is announced
+/// under the wrong name and nothing disagrees. Naming the label instead makes
+/// a renamed or removed slot fail the BUILD at the bump site.
+pub const fn mc_diag_slot(label: &str) -> usize {
+    // `str` carries no const `==`.
+    const fn str_eq(a: &str, b: &str) -> bool {
+        let a = a.as_bytes();
+        let b = b.as_bytes();
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut slot = 0;
+    while slot < MC_DIAG_LABELS.len() {
+        if str_eq(MC_DIAG_LABELS[slot], label) {
+            return slot;
+        }
+        slot += 1;
+    }
+    panic!("no MC_DIAG slot carries this label");
 }
 
 /// Read an `MC_DIAG` tally (saturating). Surfaced via `pyre_jit_mc_diag`.

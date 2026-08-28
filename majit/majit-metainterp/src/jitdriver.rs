@@ -82,19 +82,53 @@ pub struct SingleFrameBlackholeResult {
     pub virtualizable_ptr: i64,
 }
 
+/// The blackhole's view of `metainterp_sd.jitdrivers_sd`, cast once and shared.
+///
+/// `bhimpl_jit_merge_point` indexes the prebuilt `jitdrivers_sd` directly, so
+/// nothing about this table is per-resume; the rows only need re-casting
+/// because the blackhole names the result kind, the portal runner and the
+/// portal calldescr in its own types.  The cast is memoised on the static data
+/// that owns the rows and invalidated by `finish_setup_descrs_for_jitdrivers`,
+/// so a resume pays one `Arc` clone rather than one `BhCallDescr` per driver.
 fn bh_jitdrivers_sd(
     metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
-) -> Vec<crate::blackhole::BhJitDriverSd> {
+) -> std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
+    let table = metainterp_sd
+        .bh_jitdrivers_sd
+        .get_or_init(|| build_bh_jitdrivers_sd(metainterp_sd));
+    debug_assert!(
+        table.len() == metainterp_sd.jitdrivers_sd.len()
+            && table
+                .iter()
+                .zip(&metainterp_sd.jitdrivers_sd)
+                .all(|(bh, jd)| {
+                    bh.portal_runner_ptr.map_or(0, |f| f as usize as i64) == jd.portal_runner_adr
+                        && bh.result_type as u8 == bh_return_type(jd.result_type) as u8
+                }),
+        "bh_jitdrivers_sd outlived a `jitdrivers_sd` write that did not run \
+         `finish_setup_descrs_for_jitdrivers`"
+    );
+    std::sync::Arc::clone(table)
+}
+
+/// `warmspot.py:449` `jd.result_type` projected to the blackhole dispatch char.
+fn bh_return_type(result_type: majit_ir::Type) -> crate::blackhole::BhReturnType {
+    match result_type {
+        majit_ir::Type::Int => crate::blackhole::BhReturnType::Int,
+        majit_ir::Type::Ref => crate::blackhole::BhReturnType::Ref,
+        majit_ir::Type::Float => crate::blackhole::BhReturnType::Float,
+        majit_ir::Type::Void => crate::blackhole::BhReturnType::Void,
+    }
+}
+
+fn build_bh_jitdrivers_sd(
+    metainterp_sd: &crate::pyjitpl::MetaInterpStaticData,
+) -> std::sync::Arc<[crate::blackhole::BhJitDriverSd]> {
     metainterp_sd
         .jitdrivers_sd
         .iter()
         .map(|jd| {
-            let result_type = match jd.result_type {
-                majit_ir::Type::Int => crate::blackhole::BhReturnType::Int,
-                majit_ir::Type::Ref => crate::blackhole::BhReturnType::Ref,
-                majit_ir::Type::Float => crate::blackhole::BhReturnType::Float,
-                majit_ir::Type::Void => crate::blackhole::BhReturnType::Void,
-            };
+            let result_type = bh_return_type(jd.result_type);
             let portal_runner_ptr = (jd.portal_runner_adr != 0).then(|| unsafe {
                 std::mem::transmute::<usize, extern "C" fn(i64, i64, i64, i64, i64) -> i64>(
                     jd.portal_runner_adr as usize,
@@ -1830,6 +1864,27 @@ enum GuardResumeDecline {
     /// at all. The walk executes, so a register it cannot read a value out of
     /// is not one it can run past.
     UnreadableRegister,
+    /// A section names a `jitcode_index` the flat registry does not hand out.
+    /// `resume.py:1051` indexes that registry directly, so an index outside it
+    /// names no code to enter.
+    UnregisteredJitcode,
+    /// A section below the top is suspended somewhere that is not the far side
+    /// of a `BC_INLINE_CALL`, so nothing there says which callee it is waiting
+    /// on or which register takes the result.
+    NoInlineCallSite,
+    /// The call site's `j` operand does not resolve to a JitCode, so the frame
+    /// stacked on top of it is not the one the bytecode names.
+    CallSiteNotAJitcode,
+    /// The call site names a different callee than the section actually stacked
+    /// on it, so the two descriptions of the same call stack disagree.
+    CallSiteCalleeMismatch,
+    /// The callee ends in a typed return but the call that pushed it has no
+    /// slot of that kind, so the pop would have nowhere to put the result.
+    CalleeReturnSlotMismatch,
+    /// The resume spans more than one frame and the sym reserves an
+    /// identity-only int range, which the snapshot trim blanked in every
+    /// frame below the root and nothing re-derives.
+    ReservedIdentitySlots,
 }
 
 impl GuardResumeDecline {
@@ -1841,6 +1896,12 @@ impl GuardResumeDecline {
             GuardResumeDecline::ReplayIncomplete => 85,
             GuardResumeDecline::RegCountMismatch => 86,
             GuardResumeDecline::UnreadableRegister => 87,
+            GuardResumeDecline::UnregisteredJitcode => 88,
+            GuardResumeDecline::NoInlineCallSite => 89,
+            GuardResumeDecline::CallSiteNotAJitcode => 90,
+            GuardResumeDecline::CallSiteCalleeMismatch => 91,
+            GuardResumeDecline::CalleeReturnSlotMismatch => 92,
+            GuardResumeDecline::ReservedIdentitySlots => 93,
         }
     }
 
@@ -5069,22 +5130,85 @@ impl<S: JitState> JitDriver<S> {
         }
         // From here the trace session is LIVE, so a decline has to tear it
         // down rather than return through it.
-        type Seeded = (usize, Vec<crate::jit_state::GuardResumeReg>);
+        type Seeded = Vec<crate::jit_state::GuardResumeFrame>;
         let seeded = (|| -> Result<Seeded, GuardResumeDecline> {
             use GuardResumeDecline as Decline;
             let resume = self
                 .resume_data_result
                 .as_ref()
                 .ok_or(Decline::NoResumeState)?;
-            let frame = resume.frames.first().ok_or(Decline::NoResumeState)?;
+            // The slot the decline arm bumps names the rung; a rung this walk
+            // can refuse at any depth needs the frame it refused at too, so
+            // every decline below also logs. Same policy, and the same reason,
+            // as `read_frame_liveness_reg_indices`: a bridge that is never
+            // built looks exactly like a bridge that was never attempted, and
+            // the difference is the whole diagnosis.
+            if crate::bridge_debug_enabled() {
+                eprintln!(
+                    "[bridgeB] rebuild {} frame(s): {:?}",
+                    resume.frames.len(),
+                    resume
+                        .frames
+                        .iter()
+                        .map(|f| (f.jitcode_index, f.pc, f.values.len()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            // A frame below the root has had its reserved identity-slot
+            // registers blanked to `Const(0)` by the snapshot trim
+            // (`get_list_of_active_snapshot_boxes`), and nothing re-derives
+            // them: `resume.py write_an_int` writes each section's decoded
+            // values, zeros included, into that frame's own bank, and the only
+            // root-to-callee propagation deopt performs is on the
+            // virtualizable FIELDS, never the register file. The root's
+            // registers are not a substitute either — they hold a different
+            // quantity at the same index, which the trim's own note records
+            // for dualtape (identity in a sub-frame's int reg 2, the scalar
+            // `pb` in the root's).
+            //
+            // So refuse, and refuse HERE: this rung's decline leaves through
+            // the same arm as every other one, which returns `None` from
+            // `bridge_from_guard_resume_position` and so falls through to
+            // `compile.py:711 resume_in_blackhole`, which rebuilds every frame
+            // itself. That is what main did for every multi-frame resume, and
+            // it is the upstream shape — `pyjitpl.py _handle_guard_failure`
+            // reaches `compile.py giveup()` once the frames are known. An
+            // abort from inside the walk would NOT do: the walk publishes its
+            // handoff only after `run_to_end`, so an early return leaves both
+            // handoffs empty and the caller resumes at the loop header with no
+            // blackhole at all. The walk has not started here — `merge_point`
+            // is below — so the teardown the arm performs is of the trace
+            // session `start_bridge_tracing` opened, not of a walk in flight.
+            //
+            // `None` — every symbol that has not opted in via `split_dispatch`
+            // — reserves no identity-only register, so nothing was blanked and
+            // this refuses nothing.
+            if resume.frames.len() > 1
+                && let Some((base, end)) = S::reserved_int_identity_range()
+            {
+                if crate::bridge_debug_enabled() {
+                    eprintln!(
+                        "[bridgeB] DECLINE {} frames with reserved identity slots [{base}, {end}): \
+                         the snapshot blanked them and nothing re-derives them",
+                        resume.frames.len(),
+                    );
+                }
+                return Err(Decline::ReservedIdentitySlots);
+            }
             // `resume.py:1338` `jitcode = jitcodes[jitcode_pos]`: the position
             // is an offset into the jitcode the frame NAMES. Entering a
             // different one at that offset lands mid-instruction in unrelated
-            // code, and the walk decodes whatever byte is there. Only the
-            // dispatch jitcode is enterable here, so a frame that names any
-            // other one is a decline.
+            // code, and the walk decodes whatever byte is there. The root frame
+            // is the one this driver re-enters at, so a root that names any
+            // jitcode other than the dispatch one is a decline.
             let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
-            if frame.jitcode_index as usize != dispatch_index {
+            if resume
+                .frames
+                .first()
+                .ok_or(Decline::NoResumeState)?
+                .jitcode_index as usize
+                != dispatch_index
+            {
                 // Unlike the pending-fields decline this one cannot be
                 // hoisted: the frame it reads only exists once
                 // `rebuild_from_resumedata` has run, which is inside the call
@@ -5094,6 +5218,9 @@ impl<S: JitState> JitDriver<S> {
                 // is idempotent (the stream carries the values, so neither
                 // pass reads what the other wrote) and the first set of
                 // virtuals becomes garbage.
+                if crate::bridge_debug_enabled() {
+                    eprintln!("[bridgeB] DECLINE root frame does not name the dispatch jitcode");
+                }
                 return Err(Decline::ForeignJitcode);
             }
             // `resume.py _prepare_pendingfields` replays the guard's deferred
@@ -5113,72 +5240,206 @@ impl<S: JitState> JitDriver<S> {
                 .as_ref()
                 .is_some_and(|ctx| ctx.bridge_replay_incomplete())
             {
+                if crate::bridge_debug_enabled() {
+                    eprintln!("[bridgeB] DECLINE the guard carries pending fields");
+                }
                 return Err(Decline::ReplayIncomplete);
             }
             let fail_types = resume.fail_arg_types.clone();
-            let values = frame.values.clone();
-            let resume_pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
-            let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
-            let reg_indices = ctx
-                .bridge_reg_indices()
-                .ok_or(Decline::NoResumeState)?
-                .clone();
-            // `consume_boxes` fills every live register of the frame, so a
-            // count that disagrees means the two sides read different
-            // liveness and no per-register pairing off them is trustworthy.
-            if reg_indices.total_len() != values.len() {
-                return Err(Decline::RegCountMismatch);
+            // `resume.py:1051` `jitcodes[jitcode_pos]` — the same flat registry
+            // the blackhole rebuild resolves through, so a frame names its
+            // jitcode absolutely and no walk of a parent's `descrs` is needed
+            // to find it. Taken owned because the seeding below borrows
+            // `self.meta.tracing` mutably to intern this bridge's constants.
+            let jitcodes = self.meta.jitcodes().to_vec();
+            let op_live = self.meta.staticdata.op_live as u8;
+            let all_liveness = self.meta.staticdata.liveness_info.clone();
+            // One entry per encoded resume section, in the stream's own order.
+            // `opencoder.py SnapshotIterator.__init__` reverses on the WRITER
+            // side, so the sections are already caller-first and
+            // `rebuild_from_resumedata` just appends them as it reads.
+            let mut sections: Vec<(std::sync::Arc<crate::jitcode::JitCode>, usize)> =
+                Vec::with_capacity(resume.frames.len());
+            for frame in &resume.frames {
+                let Some(jitcode) = jitcodes.get(frame.jitcode_index as usize) else {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE unregistered jitcode_index={}",
+                            frame.jitcode_index
+                        );
+                    }
+                    return Err(Decline::UnregisteredJitcode);
+                };
+                let pc = usize::try_from(frame.pc).map_err(|_| Decline::NoResumeState)?;
+                sections.push((jitcode.clone(), pc));
             }
-            let banks: [(majit_ir::Type, &Vec<u32>, usize); 3] = [
-                (majit_ir::Type::Int, &reg_indices.int, 0),
-                (
-                    majit_ir::Type::Ref,
-                    &reg_indices.ref_,
-                    reg_indices.int.len(),
-                ),
-                (
-                    majit_ir::Type::Float,
-                    &reg_indices.float,
-                    reg_indices.int.len() + reg_indices.ref_.len(),
-                ),
-            ];
-            let mut regs = Vec::with_capacity(values.len());
-            for (bank, indices, base) in banks {
-                for (i, &index) in indices.iter().enumerate() {
-                    let (opref, value) = match &values[base + i] {
-                        RebuiltValue::Box(n, kind) => {
-                            crate::jit_state::bridge_decode_red(*n, *kind, raw_values, &fail_types)
-                        }
-                        RebuiltValue::Const(c) => {
-                            let bits = c.as_raw_i64();
-                            let opref = match bank {
-                                majit_ir::Type::Ref => ctx.const_ref(bits),
-                                majit_ir::Type::Float => ctx.const_float(bits),
-                                _ => ctx.const_int(bits),
-                            };
-                            (opref, bits)
-                        }
-                        // A virtual has an OpRef but no concrete value, and an
-                        // unassigned slot has neither. The walk executes, so a
-                        // register it cannot read a value out of is not a
-                        // register it can run past — decline the whole frame
-                        // rather than enter it half-seeded.
-                        RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => {
-                            return Err(Decline::UnreadableRegister);
-                        }
-                    };
-                    regs.push(crate::jit_state::GuardResumeReg {
-                        bank,
-                        index,
-                        opref,
-                        value,
-                    });
+            // A frame below the top is suspended inside a `BC_INLINE_CALL`
+            // whose operands say which callee it is waiting on and which of its
+            // own registers takes the result. Neither is in the resume stream —
+            // `opencoder.py _ensure_parent_resumedata` blanks the result
+            // register before reading a parent's liveness — so recover them the
+            // way `pyjitpl.py make_result_of_lastop` does, off the bytecode,
+            // and check that the call found there names the frame that is
+            // actually stacked on top of it.
+            let mut call_sites = Vec::with_capacity(sections.len());
+            for (depth, (jitcode, pc)) in sections.iter().enumerate() {
+                let Some((callee, _)) = sections.get(depth + 1) else {
+                    call_sites.push(None);
+                    continue;
+                };
+                let Some(site) = jitcode.inline_call_ending_at(*pc) else {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE no inline call ending at depth={depth} pc={pc} jc={:?}",
+                            jitcode.name()
+                        );
+                    }
+                    return Err(Decline::NoInlineCallSite);
+                };
+                // `as_jitcode_owned`, not `as_jitcode`: a self-recursive
+                // `#[jit_inline]` helper's back edge is a `Weak` descr, so the
+                // owning variant alone misses exactly the recursion this walk
+                // exists to resume through. `BC_INLINE_CALL` resolves its `j`
+                // operand the same way.
+                let Some(named) = jitcode
+                    .descr_at(site.sub_idx)
+                    .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode_owned)
+                else {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE descrs[{}] is not a JitCode at depth={depth}",
+                            site.sub_idx,
+                        );
+                    }
+                    return Err(Decline::CallSiteNotAJitcode);
+                };
+                if named.try_index() != callee.try_index() {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE call at depth={depth} names {:?} not {:?}",
+                            named.try_index(),
+                            callee.try_index()
+                        );
+                    }
+                    return Err(Decline::CallSiteCalleeMismatch);
                 }
+                // The pop reads the return kind off the callee's own trailing
+                // return opcode and then requires the matching caller slot
+                // (`dispatch.rs`, the inline-return arm). A callee that returns
+                // a value into no slot would panic there, so decline here
+                // instead — the blackhole arm rebuilds every frame either way.
+                let returns = crate::jitcode::JitCodeRuntimeExt::trailing_return_info(&**callee)
+                    .map(|(kind, _)| kind);
+                let slot = site.result_slot();
+                if returns.is_some() && slot.map(|(kind, _)| kind) != returns {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE depth={depth} callee returns {returns:?} but the call slot is {slot:?}"
+                        );
+                    }
+                    return Err(Decline::CalleeReturnSlotMismatch);
+                }
+                call_sites.push(Some(site));
             }
-            Ok((resume_pc, regs))
+            let ctx = self.meta.tracing.as_mut().ok_or(Decline::NoResumeState)?;
+            let mut frames = Vec::with_capacity(sections.len());
+            for (depth, (jitcode, pc)) in sections.into_iter().enumerate() {
+                let values = &resume.frames[depth].values;
+                // Every frame reads its own liveness at its own position, which
+                // is what `consume_boxes` does per `f.get_current_position_info()`.
+                // The root's copy is already on the ctx for `setup_bridge_sym`;
+                // recomputing it here keeps one rule for every frame.
+                let reg_indices = crate::resume::read_frame_liveness_reg_indices(
+                    &jitcode,
+                    pc,
+                    op_live,
+                    &all_liveness,
+                );
+                // `consume_boxes` fills every live register of the frame, so a
+                // count that disagrees means the two sides read different
+                // liveness and no per-register pairing off them is trustworthy.
+                if reg_indices.total_len() != values.len() {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] DECLINE depth={depth} pc={pc} liveness {} != values {}",
+                            reg_indices.total_len(),
+                            values.len()
+                        );
+                    }
+                    return Err(Decline::RegCountMismatch);
+                }
+                let banks: [(majit_ir::Type, &Vec<u32>, usize); 3] = [
+                    (majit_ir::Type::Int, &reg_indices.int, 0),
+                    (
+                        majit_ir::Type::Ref,
+                        &reg_indices.ref_,
+                        reg_indices.int.len(),
+                    ),
+                    (
+                        majit_ir::Type::Float,
+                        &reg_indices.float,
+                        reg_indices.int.len() + reg_indices.ref_.len(),
+                    ),
+                ];
+                let mut regs = Vec::with_capacity(values.len());
+                for (bank, indices, base) in banks {
+                    for (i, &index) in indices.iter().enumerate() {
+                        let (opref, value) = match &values[base + i] {
+                            RebuiltValue::Box(n, kind) => crate::jit_state::bridge_decode_red(
+                                *n,
+                                *kind,
+                                raw_values,
+                                &fail_types,
+                            ),
+                            RebuiltValue::Const(c) => {
+                                let bits = c.as_raw_i64();
+                                let opref = match bank {
+                                    majit_ir::Type::Ref => ctx.const_ref(bits),
+                                    majit_ir::Type::Float => ctx.const_float(bits),
+                                    _ => ctx.const_int(bits),
+                                };
+                                (opref, bits)
+                            }
+                            // A virtual has an OpRef but no concrete value, and
+                            // an unassigned slot has neither. The walk executes,
+                            // so a register it cannot read a value out of is not
+                            // a register it can run past — decline the whole
+                            // frame rather than enter it half-seeded.
+                            RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => {
+                                if crate::bridge_debug_enabled() {
+                                    eprintln!(
+                                        "[bridgeB] DECLINE depth={depth} unreadable slot {:?}",
+                                        values[base + i]
+                                    );
+                                }
+                                return Err(Decline::UnreadableRegister);
+                            }
+                        };
+                        regs.push(crate::jit_state::GuardResumeReg {
+                            bank,
+                            index,
+                            opref,
+                            value,
+                        });
+                    }
+                }
+                frames.push(crate::jit_state::GuardResumeFrame {
+                    jitcode,
+                    pc,
+                    regs,
+                    result_slot: call_sites[depth].and_then(|site| site.result_slot()),
+                    // The `descrs` slot the call that pushed THIS frame named —
+                    // it lives on the caller's site, one level out.
+                    sub_idx: depth
+                        .checked_sub(1)
+                        .and_then(|caller| call_sites[caller])
+                        .map(|site| site.sub_idx),
+                });
+            }
+            Ok(frames)
         })();
-        let (resume_pc, regs) = match seeded {
-            Ok(seeded) => seeded,
+        let frames = match seeded {
+            Ok(frames) => frames,
             Err(why) => {
                 crate::mc_diag_bump(why.diag_slot());
                 if crate::majit_log_enabled() {
@@ -5227,10 +5488,8 @@ impl<S: JitState> JitDriver<S> {
                         rec_exec_float,
                         rec_exec_void,
                     );
-                    S::trace_from_guard_resume_position(
-                        ctx, sym, &dispatch, resume_pc, target_pc, &runtime, &regs,
-                    )
-                    .unwrap_or(TraceAction::Abort)
+                    S::trace_from_guard_resume_position(ctx, sym, &frames, target_pc, &runtime)
+                        .unwrap_or(TraceAction::Abort)
                 },
             )
             .unwrap_or(TraceAction::Abort)
@@ -5928,7 +6187,13 @@ impl<S: JitState> JitDriver<S> {
                 // resolve every frame statelessly from the flat global
                 // registry by its self-describing absolute index (no root/sub
                 // branch, no parent-relative descrs walk, no last-frame state).
-                let jitcode_registry = self.meta.jitcodes().to_vec();
+                // `resume.py`'s `jitcode = jitcodes[jitcode_pos]` indexes the
+                // prebuilt list in place.  Borrowing it costs nothing; the
+                // `to_vec` that stood here cloned every `Arc` in the registry
+                // — two atomic RMWs per jitcode — on a path this fixture takes
+                // once per input character.
+                let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] =
+                    self.meta.jitcodes();
                 let resolve_jitcode = |jitcode_index: i32,
                                        pc: i32|
                  -> Option<crate::resume::ResolvedJitCode> {
@@ -8265,6 +8530,10 @@ impl<S: JitState> JitDriver<S> {
             retrace.storage.as_ref(),
         );
         if resume_data_result.is_none() {
+            if crate::bridge_debug_enabled() {
+                eprintln!("[bridgeB] resume data could not be rebuilt — giving up on the bridge",);
+            }
+            self.meta.stage_abort_reason(AbortReason::Bridge.as_int());
             self.meta.abort_trace(false);
             self.clear_tracing_session_state();
             self.resume_data_result = None;
@@ -8272,42 +8541,15 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
         // resume.py:1050-1056 pushes a real MIFrame per encoded section and
-        // resumes in the INNERMOST one.  A state-field bridge seeds only the
-        // root frame: `setup_bridge_sym` reads `frames.first()` and maps its
-        // per-bank live registers onto the sym's identity slots, and the
-        // bridge re-enters at the root dispatch coordinate.  When the guard
-        // failed inside an inlined `#[jit_inline]` callee the stream carries
-        // that callee's frame too, and neither its registers nor its resume pc
-        // have any representation here — re-entering at the root opcode would
-        // re-run a helper that already committed part of its effect (e.g.
-        // `stack.head` stored, `stack.size` not).  Seeding cannot paper over a
-        // missing frame, so give up on the bridge instead of compiling one that
-        // resumes at the wrong coordinate: compile.py `compile.giveup()`
-        // is the sanctioned outcome when a bridge cannot be built, and the
-        // guard keeps deopting through the blackhole, which does rebuild every
-        // frame (resume.py:1437-1442).
-        //
-        // Scoped to state-field drivers by the `dispatch_jitcode` probe — a
-        // JitState that overrides `setup_bridge_sym` with real multi-frame
-        // support (pyre) registers no dispatch JitCode and is unaffected.
-        if self.dispatch_jitcode().is_some()
-            && resume_data_result
-                .as_ref()
-                .is_some_and(|r| r.frames.len() > 1)
-        {
-            if crate::bridge_debug_enabled() {
-                eprintln!(
-                    "[bridgeB] multi-frame resume ({} frames) — only the root frame is seedable, giving up on the bridge",
-                    resume_data_result.as_ref().map_or(0, |r| r.frames.len()),
-                );
-            }
-            self.meta.abort_trace(false);
-            self.clear_tracing_session_state();
-            self.resume_data_result = None;
-            self.last_bridge_is_exception_guard = false;
-            return false;
-        }
-
+        // resumes in the INNERMOST one, which is what
+        // `bridge_from_guard_resume_position` rebuilds: every section becomes a
+        // frame with its own jitcode, its own resume pc and its own registers,
+        // and the callers underneath the guard get back the two fields the
+        // stream does not carry (their `BC_INLINE_CALL`'s result slot and the
+        // callee it named). `setup_bridge_sym` below still reads
+        // `frames.first()` alone, and that stays right: the state fields live
+        // on the root frame, and an inlined `#[jit_inline]` callee holds none
+        // of them.
         let mut sym = S::create_sym(&trace_meta, resume_pc);
         state.initialize_sym(&mut sym, &trace_meta);
         // `create_sym` numbers the state fields off its own `__offset`, which

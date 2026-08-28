@@ -1,0 +1,14 @@
+[package]
+name = "regex"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+cranelift = ["majit-metainterp/cranelift"]
+dynasm = ["majit-metainterp/dynasm"]
+
+[dependencies]
+majit-ir = { workspace = true }
+majit-metainterp = { workspace = true }
+majit-macros = { workspace = true }

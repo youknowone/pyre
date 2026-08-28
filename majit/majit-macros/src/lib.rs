@@ -2668,11 +2668,86 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         stmts
     };
 
+    // `call.py:167-169` `JitCode(name, fnaddr, calldescr)`: the helper's own
+    // translated function is the entry `bhimpl_inline_call_*`
+    // (`blackhole.py:1278-1319`) calls instead of interpreting the body. The
+    // Rust fn re-emitted above IS that function, so the address of an
+    // `extern "C"` trampoline over it is the same program the jitcode encodes;
+    // `emit_helper_call_target_fn` already builds one for the residual-call
+    // policies, with the widened `-> i64` result `bh_call_i_dispatch` reads.
+    //
+    // A helper it declines — a generic, or a parameter type the trampoline
+    // cannot carry — is left at `fnaddr = 0`, which is the byte-interpreted
+    // path this expansion had before.
+    let native_entry = match emit_helper_call_target_fn(&func) {
+        Ok(Some((trace_target, _concrete, wrapper))) => {
+            let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func) {
+                Ok(classes) => classes,
+                Err(err) => return err.to_compile_error().into(),
+            };
+            let result_class =
+                jit_interp::jitcode_lower::inline_return_kind_class(helper.return_kind);
+            Some((wrapper, trace_target, arg_classes, result_class))
+        }
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error().into(),
+    };
+    let (native_entry_fn, set_native_entry) = match &native_entry {
+        // A Float anywhere in the signature leaves `fnaddr` at 0, which is the
+        // byte-interpreted path — the only path any of these helpers had
+        // before a native entry was staged at all.
+        //
+        // `set_native_entry`'s contract is that `arg_classes` and
+        // `result_class` name the ABI of `fnaddr` ITSELF, because
+        // `collect_call_args` walks the string to place the per-kind argument
+        // lists back into declaration positions. The trampoline above is a
+        // WIDENING shim, not the helper: every parameter is declared `i64` and
+        // an `f64` one is reconstructed in the body with `f64::from_bits`
+        // (`helper_arg_from_i64`). `inline_helper_arg_classes` reports the
+        // SOURCE kind, so it says `'f'` where the ABI is an integer register,
+        // and the two consumers of `fnaddr` then disagree in opposite
+        // directions:
+        //
+        // * `collect_call_args` -> `dispatch_classes_body!` transmutes an `'f'`
+        //   to a real `f64` parameter, so the caller writes xmm0/d0 while the
+        //   trampoline reads rdi/x0;
+        // * `collect_call_args_positional` (the `residual_host_call` hook)
+        //   passes every argument as raw `i64` bits, which the trampoline DOES
+        //   want, and then reads a float result back out of an `i64` return —
+        //   which the `-> f64` trace target this stages does not give it.
+        //
+        // Upstream cannot split this way: `call.py get_jitcode_calldescr`
+        // derives both `fnaddr` (`getfunctionptr(graph)`) and the calldescr's
+        // classes from the same `FUNC`. Until the trampoline's signature and
+        // the class string come from one place here too, a Float in either
+        // position is refused rather than described wrongly. The wrapper is
+        // still emitted: the residual-call path reaches it through
+        // `RuntimeBhDescr::Call`, independently of `fnaddr`.
+        Some((wrapper, _target, arg_classes, result_class))
+            if arg_classes.contains('f') || *result_class == 'f' =>
+        {
+            (quote! { #wrapper }, quote! {})
+        }
+        Some((wrapper, target, arg_classes, result_class)) => (
+            quote! { #wrapper },
+            quote! {
+                __builder.set_native_entry(
+                    #target as *const () as usize as i64,
+                    #arg_classes,
+                    #result_class,
+                );
+            },
+        ),
+        None => (quote! {}, quote! {}),
+    };
+
     let expanded = quote! {
         #(#attrs)*
         #vis #sig {
             #block
         }
+
+        #native_entry_fn
 
         // Inline helper jitcodes register
         // per-marker liveness triples through the caller-supplied
@@ -2696,6 +2771,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
             // nothing: a declined helper reports `""` and the reader has no way
             // to tell which of a consumer's dozens it was.
             __builder.set_name(#helper_source_name);
+            #set_native_entry
             #(#ensure_param_regs)*
             #helper_body
             #helper_return

@@ -621,6 +621,32 @@ pub(crate) fn inline_helper_param_layout(
     Ok(layout)
 }
 
+/// The `arg_classes` half of the calldescr `JitCode(name, fnaddr, calldescr)`
+/// (`call.py:167-169`) needs to describe the helper's own entry point: one char
+/// per parameter in source order, which is the order `descr.py create_call_stub`
+/// places them in and the order the blackhole's `collect_call_args` reads them
+/// back out of the per-kind lists.
+///
+/// The result half is not here because the caller already holds it — it is the
+/// `return_kind` [`generate_inline_helper_jitcode_with_calls`] classified off
+/// the same signature, and the jitcode's own typed return is emitted from it.
+pub(crate) fn inline_helper_arg_classes(func: &ItemFn) -> syn::Result<String> {
+    Ok(inline_helper_param_layout(func)?
+        .into_iter()
+        .map(|(kind, _)| inline_return_kind_class(kind))
+        .collect())
+}
+
+/// The `descr.py` argument/result class char for an inline-helper kind.
+pub(crate) fn inline_return_kind_class(kind: InlineReturnKind) -> char {
+    match kind {
+        InlineReturnKind::Int => 'i',
+        InlineReturnKind::Ref => 'r',
+        InlineReturnKind::Float => 'f',
+        InlineReturnKind::Void => 'v',
+    }
+}
+
 pub(crate) fn inline_helper_param_counts(func: &ItemFn) -> syn::Result<(u16, u16, u16)> {
     let layout = inline_helper_param_layout(func)?;
     let mut count_i = 0u16;

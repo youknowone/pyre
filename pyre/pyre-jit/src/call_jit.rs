@@ -2712,26 +2712,27 @@ pub fn blackhole_resume_via_rd_numb(
     //   jitdriver_sd = self.builder.metainterp_sd.jitdrivers_sd[jdindex]
     //   fnptr        = adr2int(jitdriver_sd.portal_runner_adr)
     //   calldescr    = jitdriver_sd.mainjitcode.calldescr
-    let jitdrivers_sd = vec![majit_metainterp::blackhole::BhJitDriverSd {
-        result_type: majit_metainterp::blackhole::BhReturnType::Ref,
-        portal_runner_ptr: Some(bh_portal_runner_c),
-        mainjitcode_calldescr: {
-            // `get_portal_runner` returns this descr paired with
-            // `bh_portal_runner_c`, and the blackhole recursive-portal resume
-            // (`bhimpl_recursive_call_r` -> `bh_call_r`) verifies the merged
-            // green+red argument banks against it — so it must describe the
-            // portal runner, not the traced function.  `bh_portal_runner_c`
-            // consumes the warmspot `portalfunc_ARGS` (`warmspot.py:972-975`):
-            // greens `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
-            // `[frame:r, ec:r]` (`interp_jit.py:67-68`) = 2 int + 3 ref.
-            // `bh.jitcode.calldescr` is the traced function's own frame-based
-            // residual-call descr and does not describe the runner.
-            let mut d = bh.jitcode.calldescr.clone();
-            d.arg_classes = "iirrr".to_string();
-            d.result_type = 'r';
-            d
-        },
-    }];
+    let jitdrivers_sd: std::sync::Arc<[majit_metainterp::blackhole::BhJitDriverSd]> =
+        std::sync::Arc::from([majit_metainterp::blackhole::BhJitDriverSd {
+            result_type: majit_metainterp::blackhole::BhReturnType::Ref,
+            portal_runner_ptr: Some(bh_portal_runner_c),
+            mainjitcode_calldescr: {
+                // `get_portal_runner` returns this descr paired with
+                // `bh_portal_runner_c`, and the blackhole recursive-portal resume
+                // (`bhimpl_recursive_call_r` -> `bh_call_r`) verifies the merged
+                // green+red argument banks against it — so it must describe the
+                // portal runner, not the traced function.  `bh_portal_runner_c`
+                // consumes the warmspot `portalfunc_ARGS` (`warmspot.py:972-975`):
+                // greens `[next_instr:i, is_being_profiled:i, pycode:r]` + reds
+                // `[frame:r, ec:r]` (`interp_jit.py:67-68`) = 2 int + 3 ref.
+                // `bh.jitcode.calldescr` is the traced function's own frame-based
+                // residual-call descr and does not describe the runner.
+                let mut d = bh.jitcode.calldescr.clone();
+                d.arg_classes = "iirrr".to_string();
+                d.result_type = 'r';
+                d
+            },
+        }]);
     {
         let vinfo = bh.virtualizable_info;
         let mut current = Some(&mut bh);
@@ -2747,7 +2748,7 @@ pub fn blackhole_resume_via_rd_numb(
             // acquires the chain.  Publish it to every frame instead: any frame
             // above the bottom one reaches `bhimpl_jit_merge_point`'s
             // recursive-portal branch, which indexes the table directly.
-            frame.jitdrivers_sd = jitdrivers_sd.clone();
+            frame.jitdrivers_sd = std::sync::Arc::clone(&jitdrivers_sd);
             current = frame.nextblackholeinterp.as_deref_mut();
         }
     }

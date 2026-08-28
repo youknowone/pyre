@@ -9,11 +9,11 @@
 //! `ptr_info` / `int_bound` projections, and the borrow-guard wrappers those
 //! projections hand back.
 //!
-//! Hosted in `majit-ir` so the slot can carry `Weak<Op>` / `Weak<InputArg>`
+//! Hosted in `majit-ir` so the slot can carry `Rc<Op>` / `Rc<InputArg>`
 //! without a `majit-metainterp -> majit-ir` circular dep.
 
 use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 #[cfg(feature = "test-support")]
 use crate::OpRef;
@@ -35,19 +35,25 @@ pub enum Forwarded {
     None,
 
     /// `resoperation.py AbstractResOp` forwarding — direct
-    /// `Weak<Op>` reference. The chain walker upgrades the `Weak` into a
-    /// producer-bound `Operand::Op` (via `Operand::from_bound_op`) and
-    /// continues from there. A dropped `Weak` terminates the chain at the predecessor
-    /// (PyPy never observes a dropped target — RPython keeps the
-    /// underlying object alive through the trace `operations` list).
-    Op(Weak<Op>),
+    /// `OpRc` reference. The chain walker steps straight into a
+    /// producer-bound `Operand::Op` and continues from there.
+    ///
+    /// The slot OWNS its target, because `_forwarded` is an ordinary
+    /// attribute assignment in RPython and the target is additionally
+    /// reachable from the trace `operations` list, so a forwarding target
+    /// is never collected while a chain step still names it. Holding a
+    /// `Weak` here instead made that reachability a pyre-side invariant
+    /// spread over `resop_refs` / `phase1_emit_ops` / `new_operations`, and
+    /// a target held by none of them died mid-optimization: the walker then
+    /// stopped one hop early and handed its caller an operand that was still
+    /// forwarding.
+    Op(Rc<Op>),
 
     /// `resoperation.py AbstractInputArg` forwarding — direct
-    /// `Weak<InputArg>` reference. Same chain-walk semantics as `Op`
-    /// (producer-bound `Operand::from_bound_inputarg` materialization). RPython
-    /// uses this for inputarg→inputarg redirects in bridge import and
-    /// retrace remap (compile.py / unroll.py).
-    InputArg(Weak<InputArg>),
+    /// `InputArgRc` reference. Same chain-walk and same ownership as `Op`.
+    /// RPython uses this for inputarg→inputarg redirects in bridge import
+    /// and retrace remap (compile.py / unroll.py).
+    InputArg(Rc<InputArg>),
 
     /// `history.py ConstInt` / `ConstFloat` / `ConstPtr`
     /// — forwarding terminates here; the constant value is carried
@@ -91,13 +97,13 @@ impl std::fmt::Debug for Forwarded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Compact by design: `Info(OpInfo)` carries the abstract-value graph
         // (nested ops / virtual fields whose own `forwarded` slots reference
-        // back through non-`Weak` `Info` edges), so a derived Debug recurses
+        // back through `Info` edges), so a derived Debug recurses
         // without bound and overflows the stack when a `forwarded`-bearing
         // `Op` / `InputArg` is printed. Render the variant shape only.
         match self {
             Forwarded::None => f.write_str("None"),
-            Forwarded::Op(_) => f.write_str("Op(Weak)"),
-            Forwarded::InputArg(_) => f.write_str("InputArg(Weak)"),
+            Forwarded::Op(_) => f.write_str("Op(..)"),
+            Forwarded::InputArg(_) => f.write_str("InputArg(..)"),
             Forwarded::Const(c) => write!(f, "Const({c:?})"),
             Forwarded::Info(_) => f.write_str("Info(..)"),
         }
@@ -151,7 +157,7 @@ pub trait ForwardingHost {
             !self.is_same_op(target),
             "set_forwarded_op on the same Op creates a one-node chain cycle"
         );
-        self.store_forwarded(Forwarded::Op(Rc::downgrade(target)));
+        self.store_forwarded(Forwarded::Op(Rc::clone(target)));
     }
 
     /// `compile.py` / `unroll.py` InputArg→InputArg redirect.
@@ -161,7 +167,7 @@ pub trait ForwardingHost {
             "set_forwarded_inputarg on the same InputArg creates a one-node \
              chain cycle"
         );
-        self.store_forwarded(Forwarded::InputArg(Rc::downgrade(target)));
+        self.store_forwarded(Forwarded::InputArg(Rc::clone(target)));
     }
 
     /// `optimizer.py make_constant(box, constbox)` — terminate the chain
