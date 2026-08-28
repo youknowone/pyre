@@ -86,6 +86,13 @@ pub struct ScanStats {
     /// pin whose argument does not trace back to a set.  Neither graded nor
     /// claimed clean -- a set read short would accuse correct code.
     pub withheld_contents_opaque: usize,
+    /// Of [`Self::withheld_bracket_short`], those missing a root the body
+    /// produced itself, which no caller's bracket can be covering.
+    pub withheld_bracket_short_body_local: usize,
+    /// Of [`Self::withheld_bracket_short`], those missing a root this body goes
+    /// on to address as a `list` or `dict`.  A caller's pin does not answer for
+    /// these, so they do not depend on the intra-procedural limit.
+    pub withheld_bracket_short_movable: usize,
     /// The [`ScanStats::withheld_bracket_short`] calls, named.
     pub short_brackets: Vec<ShortBracket>,
 }
@@ -103,6 +110,20 @@ pub struct ShortBracket {
     pub callee_name: String,
     /// Live across the call and not pinned by the bracket that dominates it.
     pub missing: Vec<String>,
+    /// Of [`Self::missing`], those the body produced itself rather than took as
+    /// a parameter.  The scan is intra-procedural, so a missing *parameter* may
+    /// be pinned by the caller -- `build_class_inner` says in prose that its
+    /// only caller keeps its arguments pinned for the whole call, and no read
+    /// of this body can see that.  Nothing outside the body can have pinned a
+    /// local it produced, so these are the ones a caller cannot account for.
+    pub missing_local: Vec<String>,
+    /// Of [`Self::missing`], those this body later hands to a callee whose name
+    /// says it addresses a `list` or a `dict` -- the two kinds whose header a
+    /// minor collection relocates.  A caller's pin cannot rescue one of these:
+    /// the collection rewrites the caller's slot, not this body's copy, so the
+    /// word in hand is a corpse either way.  The bracket-contents twin of the
+    /// `tier 1.5` column, which the gate holds at zero.
+    pub missing_movable: Vec<String>,
     /// What the bracket does pin here, so the two columns can be read
     /// together: an empty one is a scope opened over no roots at all.
     pub pinned: Vec<String>,
@@ -762,7 +783,35 @@ pub fn scan(
                     stats.withheld_bracket_covers += 1;
                     continue;
                 }
+                // Locals `1..=arg_count` are this body's parameters; 0 is the
+                // return place.
+                let params = 1..=body.locals.arg_count;
+                let mut missing_local: Vec<String> = after
+                    .iter()
+                    .filter(|l| !held.contains(l) && !params.contains(*l))
+                    .map(|l| gc_locals[l].clone())
+                    .collect();
+                // A caller's pin keeps the object alive; it does not keep
+                // *this* body's copy correct.  A collection rewrites the slot
+                // the caller reads back from, not the callee's local, so a
+                // missing root of a kind that relocates is stale here however
+                // well the caller bracketed it.  `build_class_inner` says as
+                // much the other way round -- its borrowed arguments are safe
+                // because they are tuples, which never move.
+                let mut missing_movable: Vec<String> = after
+                    .iter()
+                    .filter(|l| !held.contains(l) && movable_args.contains(l))
+                    .map(|l| gc_locals[l].clone())
+                    .collect();
                 missing.sort();
+                missing_local.sort();
+                missing_movable.sort();
+                if !missing_local.is_empty() {
+                    stats.withheld_bracket_short_body_local += 1;
+                }
+                if !missing_movable.is_empty() {
+                    stats.withheld_bracket_short_movable += 1;
+                }
                 let mut pinned: Vec<String> = held
                     .iter()
                     .filter_map(|l| gc_locals.get(l).cloned())
@@ -775,6 +824,8 @@ pub fn scan(
                     line: at.beg.line,
                     callee_name: cg.names.get(callee).cloned().unwrap_or_default(),
                     missing,
+                    missing_local,
+                    missing_movable,
                     pinned,
                 });
                 continue;

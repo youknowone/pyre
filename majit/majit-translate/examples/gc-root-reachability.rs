@@ -364,14 +364,26 @@ fn main() {
             stats.withheld_bracket_short,
             stats.withheld_contents_opaque
         );
+        println!(
+            "           of the SHORT, {} miss a root the body produced itself \
+             (no caller's bracket can be covering those)",
+            stats.withheld_bracket_short_body_local
+        );
+        println!(
+            "           of the SHORT, {} miss a root this body later addresses \
+             as a list/dict (a caller's pin cannot rescue those)",
+            stats.withheld_bracket_short_movable
+        );
         for sb in stats.short_brackets.iter().take(20) {
             println!(
-                "           SHORT {}:{} {} -> {}  missing [{}]  pinned [{}]",
+                "           SHORT {}:{} {} -> {}  missing [{}]  body-local [{}]  movable [{}]  pinned [{}]",
                 sb.file,
                 sb.line,
                 sb.func_name,
                 sb.callee_name,
                 sb.missing.join(", "),
+                sb.missing_local.join(", "),
+                sb.missing_movable.join(", "),
                 sb.pinned.join(", ")
             );
         }
@@ -388,6 +400,8 @@ fn main() {
                     "file": sb.file, "line": sb.line, "func": sb.func_name,
                     "callee": sb.callee_name,
                     "missing": sb.missing,
+                    "missing_local": sb.missing_local,
+                    "missing_movable": sb.missing_movable,
                     "pinned": sb.pinned,
                 });
                 out.push_str(&row.to_string());
