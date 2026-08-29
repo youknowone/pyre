@@ -390,6 +390,66 @@ so a pass of `n` characters grows at most about `n / 200` bridges however many
 distinct mark patterns the tree has. majit is rate-limited by the same
 parameter and grows 84 over 32,768 characters.
 
+### Where majit's 4.1x goes
+
+Three theories about that gap were measured and two of them were wrong, so the
+numbers matter more than the reasoning:
+
+**Not the bridge cascade.** The branching portal deopts about once per character
+and never converges, but so does RPython — see "The bridges are RPython's too"
+above. Refuted.
+
+**Not the blackhole byte-interpreting callees.** That was recorded as majit's
+big deviation, at 2142 blackhole ops per character against 39. Re-measured with
+`MAJIT_BH_DEBUG=1 MAJIT_GUARDLOG=1` at 1024 characters, and with RPython's own
+dump counted the same way (`bh: (\w+)` lines over `runner.py 20 1024`), both
+halves of that were wrong:
+
+| per deopt | RPython | majit |
+|---|---:|---:|
+| blackhole ops | **82.0** | **124.3** |
+| native callee call | 3.38 `residual_call_ir_i` | 3.41 `inline_call` |
+| register copies | 3.09 `int_copy` | 36.08 (`move_i` + `move_i_c`) |
+
+The native callee call is at parity. `[bh-setpos]` and `[bh-frame]` are both
+33,222, so not one `inline_call` seats an interpreted frame — every one takes
+the native arm. The blackhole is 1.5x, not 55x, and 1.5x cannot produce 4.1x.
+
+The register-copy row is a real deviation —
+`majit-macros/.../jitcode_lower/lowerer.rs` `alloc_reg` is a bump counter, where
+upstream runs `rpython/tool/algo/regalloc.py` before flatten (`codewriter.py
+:45-47`) and coalesces variables joined by Goto link args, so `insert_renamings`'
+`if v == w: continue` (`flatten.py:314`) fires. majit has that allocator ported
+at `majit-translate/src/tool/algo/regalloc.rs`, wired into the flowspace
+codewriter path and not into the proc-macro path. But it is worth ~33 ops inside
+the 15% below, so it is not this gap either.
+
+**It is bridge compilation, and allocation traffic inside it.** `/usr/bin/sample`
+over a 262,144-character run, counting only the `shortcircuit::mainloop`
+subtree (5,993 samples):
+
+| | samples | share |
+|---|---:|---:|
+| jitdriver back-edge → MetaInterp: record + optimize | 2,633 | **44%** |
+| ↳ `Optimizer::optimize_bridge` | 1,267 | 21% |
+| ↳ ↳ `emit_operation` → `store_final_boxes_in_guard` → `ResumeDataLoopMemo::number` | 221 | 4% |
+| `BlackholeInterpreter::resume_mainloop` | 876 | 15% |
+
+Upstream's own `PYPYLOG=jit-summary` on this spelling reports `Tracing 0.145s` +
+`Backend 0.107s` of `TOTAL 0.847s` — **30%** — while compiling **1185** bridges
+over 262,144 characters. majit compiles about **half** as many per character
+(38 over 16,384) and spends **more** of its time doing it, so its per-bridge
+cost is roughly 3x upstream's.
+
+What that time is made of, from the same profile's flat histogram and from
+`--features alloc-census`: `malloc`/`free` symbols are the largest single bucket
+(~2,800 of 17,146 samples), `majit_ir::resoperation::Op::clone` is the fifth
+hottest leaf, and the row allocates **67 times per input character** across more
+than 400 distinct size classes. RPython builds its trace in the opencoder's flat
+buffer and its resume data in a nursery; majit builds both out of `Rc<Op>` and
+per-guard `Vec`s. That is the gap, it is architectural rather than a single
+defect, and closing it is not a change this file can carry.
+
 ### One caveat about the majit column
 
 `matches()` builds a fresh `JitDriver` per call, so each of majit's five timed
