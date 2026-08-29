@@ -1,5 +1,6 @@
 # pyre-check: max-pypy-ratio=381
 # pyre-check: jitstats-band=guard_failures=2
+# pyre-check: spec-folds=binary_op_descent,compare_op_descent
 # One host disagrees with the other two by a single count: at the same
 # commit the ubuntu-24.04 and windows-latest legs read dynasm
 # guard_failures=2507 and macos-latest read 2508, while loops_compiled=7 and
