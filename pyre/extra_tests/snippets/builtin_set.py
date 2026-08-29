@@ -1,5 +1,28 @@
 from testutils import assert_raises
 
+setlike_docs = {
+    "__reduce__": "Return state information for pickling.",
+    "copy": "Return a shallow copy of a set.",
+    "intersection": "Return a new set with elements common to the set and all others.",
+    "isdisjoint": "Return True if two sets have a null intersection.",
+    "issubset": "Report whether another set contains this set.",
+    "issuperset": "Report whether this set contains another set.",
+    "union": "Return a new set with elements from the set and all others.",
+}
+for set_type in (set, frozenset):
+    for method_name, expected_doc in setlike_docs.items():
+        assert getattr(set_type, method_name).__doc__ == expected_doc
+
+assert set.clear.__doc__ == "Remove all elements from this set."
+assert (
+    set.difference_update.__doc__
+    == "Update the set, removing elements found in others."
+)
+assert (
+    set.intersection_update.__doc__
+    == "Update the set, keeping only elements found in it and all others."
+)
+
 assert set([1, 2]) == set([1, 2])
 assert not set([1, 2, 3]) == set([1, 2])
 

@@ -26368,10 +26368,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__reduce__",
                 setlike_gateway(frozen, set_gateway_reduce, frozenset_gateway_reduce),
                 1,
+                "Return state information for pickling.",
             ),
         )
     };
@@ -26533,9 +26534,10 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "union",
-            make_builtin_function(
+            crate::gateway::make_builtin_function_with_doc(
                 "union",
                 setlike_gateway(frozen, set_gateway_union, frozenset_gateway_union),
+                "Return a new set with elements from the set and all others.",
             ),
         )
     };
@@ -26543,13 +26545,14 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection",
-            make_builtin_function(
+            crate::gateway::make_builtin_function_with_doc(
                 "intersection",
                 setlike_gateway(
                     frozen,
                     set_gateway_intersection,
                     frozenset_gateway_intersection,
                 ),
+                "Return a new set with elements common to the set and all others.",
             ),
         )
     };
@@ -26582,10 +26585,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "issubset",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "issubset",
                 setlike_gateway(frozen, set_gateway_issubset, frozenset_gateway_issubset),
                 2,
+                "Report whether another set contains this set.",
             ),
         )
     };
@@ -26593,10 +26597,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "issuperset",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "issuperset",
                 setlike_gateway(frozen, set_gateway_issuperset, frozenset_gateway_issuperset),
                 2,
+                "Report whether this set contains another set.",
             ),
         )
     };
@@ -26604,10 +26609,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isdisjoint",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "isdisjoint",
                 setlike_gateway(frozen, set_gateway_isdisjoint, frozenset_gateway_isdisjoint),
                 2,
+                "Return True if two sets have a null intersection.",
             ),
         )
     };
@@ -26617,10 +26623,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             "copy",
             // `setobject.py descr_copy` — a shallow copy, taking the
             // storage over rather than hashing the elements again.
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "copy",
                 setlike_gateway(frozen, set_gateway_copy, frozenset_gateway_copy),
                 1,
+                "Return a shallow copy of a set.",
             ),
         )
     };
@@ -27586,7 +27593,7 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "clear",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "clear",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "clear", true)?;
@@ -27595,6 +27602,7 @@ fn init_set_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 1,
+                "Remove all elements from this set.",
             ),
         )
     };
@@ -27617,22 +27625,30 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "difference_update",
-            make_builtin_function("difference_update", |args| {
-                crate::type_methods::require_set_receiver(args, "difference_update", true)?;
-                crate::type_methods::reject_kwargs(args, "difference_update")?;
-                set_method_difference_update(args)
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "difference_update",
+                |args| {
+                    crate::type_methods::require_set_receiver(args, "difference_update", true)?;
+                    crate::type_methods::reject_kwargs(args, "difference_update")?;
+                    set_method_difference_update(args)
+                },
+                "Update the set, removing elements found in others.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection_update",
-            make_builtin_function("intersection_update", |args| {
-                crate::type_methods::require_set_receiver(args, "intersection_update", true)?;
-                crate::type_methods::reject_kwargs(args, "intersection_update")?;
-                set_method_intersection_update(args)
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "intersection_update",
+                |args| {
+                    crate::type_methods::require_set_receiver(args, "intersection_update", true)?;
+                    crate::type_methods::reject_kwargs(args, "intersection_update")?;
+                    set_method_intersection_update(args)
+                },
+                "Update the set, keeping only elements found in it and all others.",
+            ),
         )
     };
     unsafe {
