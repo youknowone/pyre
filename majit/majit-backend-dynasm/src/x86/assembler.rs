@@ -4267,6 +4267,9 @@ impl<'a> Assembler386<'a> {
             | OpCode::CallReleaseGilI
             | OpCode::CallReleaseGilF
             | OpCode::CallReleaseGilN => {
+                let is_raw_free = op.opcode == OpCode::CallN
+                    && op.with_call_descr(|cd| cd.get_extra_info().oopspecindex)
+                        == Some(majit_ir::OopSpecIndex::RawFree);
                 if matches!(
                     op.opcode,
                     OpCode::CallMayForceI
@@ -4279,7 +4282,11 @@ impl<'a> Assembler386<'a> {
                 ) {
                     self._store_force_index_if_next_guard(ops, op_index, fail_index);
                 }
-                self.genop_call_with_arglocs(op, arglocs);
+                if is_raw_free {
+                    self.genop_nursery_free_inline_x86(op, arglocs);
+                } else {
+                    self.genop_call_with_arglocs(op, arglocs);
+                }
             }
             OpCode::CallR => {
                 let is_nursery_alloc = op.with_call_descr(|cd| cd.get_extra_info().runtime_helper)
@@ -7051,6 +7058,86 @@ impl<'a> Assembler386<'a> {
             self.store_rax_to_result(op.pos.get());
         }
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
+
+        dynasm!(self.mc ; .arch x64 ; =>slow_path);
+        self.genop_call_with_arglocs(op, arglocs);
+        dynasm!(self.mc ; .arch x64 ; =>done);
+    }
+
+    /// Inline recycle push for a `raw_free` whose allocator publishes a
+    /// recycle window.
+    ///
+    /// Publishing the window and the list head declares that releasing a cell
+    /// inside the window is exactly `cell.link = *head; *head = cell`, with
+    /// the link word at offset 8 — the same two-word headerless cell
+    /// [`Self::genop_nursery_alloc_inline_x86`] hands out. An allocator that
+    /// publishes neither keeps the whole release on the residual call, and so
+    /// does a cell the window rejects, which is how a null pointer and a cell
+    /// the allocator no longer owns reach the callee's own tests.
+    ///
+    /// The op stays a call, so `before_call` has already put the register file
+    /// in its across-the-call shape; what this replaces is the branch to the
+    /// callee and the callee's own body. It cannot collect and emits no
+    /// gcmap, matching the descr the release carries.
+    fn genop_nursery_free_inline_x86(&mut self, op: &Op, arglocs: &[Loc]) {
+        let window_addr = crate::runner::dynasm_nursery_recycle_window_addr();
+        let head_addr = crate::runner::dynasm_nursery_recycle_list_addr();
+        if window_addr == 0 || head_addr == 0 {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        }
+        let func_index = 3 + usize::from(op.opcode.is_call_release_gil());
+        let Some(&cell_loc) = arglocs.get(func_index + 1) else {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        };
+
+        // Two caller-save registers the call's own operands do not occupy, so
+        // the slow path still finds its arglocs where regalloc left them.
+        let fn_loc = arglocs.get(func_index).copied();
+        let source_regs = [fn_loc.and_then(|loc| loc.as_reg()), cell_loc.as_reg()];
+        let mut picked = Vec::new();
+        for &reg in crate::x86::regalloc::SAVE_AROUND_CALL_CORE_REGS {
+            if source_regs
+                .iter()
+                .flatten()
+                .any(|source| source.is_core_reg() && source.value == reg.value)
+            {
+                continue;
+            }
+            picked.push(reg);
+            if picked.len() == 2 {
+                break;
+            }
+        }
+        if picked.len() < 2 {
+            self.genop_call_with_arglocs(op, arglocs);
+            return;
+        }
+        let cell_reg = picked[0].value;
+        let offset_reg = picked[1].value;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let window = window_addr as i64;
+        let head = head_addr as i64;
+
+        let cell_dst = Loc::Reg(crate::regloc::RegLoc::new(cell_reg, false));
+        self.regalloc_mov(&cell_loc, &cell_dst);
+
+        let slow_path = self.mc.new_dynamic_label();
+        let done = self.mc.new_dynamic_label();
+
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD window
+            ; mov Rq(offset_reg), Rq(cell_reg)
+            ; sub Rq(offset_reg), [Rq(scratch)]                     // cell - base
+            ; cmp Rq(offset_reg), [Rq(scratch) + 8]                 // vs width
+            ; jae =>slow_path                                       // outside the window
+            ; mov Rq(scratch), QWORD head
+            ; mov Rq(offset_reg), [Rq(scratch)]                     // old head
+            ; mov [Rq(cell_reg) + 8], Rq(offset_reg)                // cell's link word
+            ; mov [Rq(scratch)], Rq(cell_reg)                       // *recycle_head = cell
+            ; jmp =>done
+        );
 
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
         self.genop_call_with_arglocs(op, arglocs);

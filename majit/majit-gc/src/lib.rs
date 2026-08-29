@@ -983,6 +983,21 @@ pub trait GcAllocator: Send {
         0
     }
 
+    /// Address of a two-word `[base, width]` pair naming the byte range whose
+    /// cells the recycle list accepts, or 0 when this allocator publishes
+    /// none.
+    ///
+    /// Publishing it alongside [`Self::nursery_recycle_list_addr`] declares
+    /// that releasing a cell whose address satisfies the unsigned test
+    /// `addr - base < width` is exactly `cell.link = *head; *head = cell`,
+    /// with the link word at offset 8 — the same two-word headerless cell the
+    /// inline nursery bump initialises. A cell that fails the test has to
+    /// reach the ordinary helper, which is also where the whole release goes
+    /// when either address is 0.
+    fn nursery_recycle_window_addr(&self) -> usize {
+        0
+    }
+
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;
 

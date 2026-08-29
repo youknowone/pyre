@@ -562,6 +562,10 @@ pub(crate) fn dynasm_nursery_recycle_list_addr() -> usize {
     with_dynasm_active_gc(|gc| gc.nursery_recycle_list_addr()).unwrap_or(0)
 }
 
+pub(crate) fn dynasm_nursery_recycle_window_addr() -> usize {
+    with_dynasm_active_gc(|gc| gc.nursery_recycle_window_addr()).unwrap_or(0)
+}
+
 /// Per-backend `CPU.load_supported_factors` (rewrite.py:1124 /
 /// x86/runner.py:31 / llmodel.py:39). x86 addressing scales natively by
 /// 1/2/4/8, aarch64 has no scaled store form and always expects factor 1.
