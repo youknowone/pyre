@@ -318,6 +318,24 @@ impl CBuilder {
             &db.gcpolicy.policy_class,
             GcPolicyClass::FrameworkShadowStack
         ) {
+            // Placeholder, not a port. `framework.py:258` builds this as
+            // `inputconst(r_gc_data, self.gcdata)`, whose concretetype is the
+            // rtyper repr of the `gctypelayout.GCData` instance -- a pointer.
+            // Neither `gctypelayout.GCData` nor a repr for it exists on this
+            // side yet, so the constant stands in as an opaque host object
+            // typed `Void`.
+            //
+            // Inert at this stage and only at this stage: the sole consumer,
+            // `shadowcolor.py add_enter_leave_roots_frame`, puts the constant
+            // in `gc_enter_roots_frame`'s argument list and never reads it,
+            // which is what the port does too. What needs the real type is
+            // `framework.py _gc_adr_of_gcdata_attr` (`:999`), reached from
+            // `gct_gc_adr_of_root_stack_base` and `gct_gc_adr_of_root_stack_top`:
+            // it asks for `.concretetype.TO` and emits `cast_ptr_to_adr`, and
+            // a `Void` constant has neither. Those two are unported -- their
+            // names are in `lloperation.rs`, which is a table entry and not an
+            // implementation -- so porting them means giving `GCData` a repr
+            // here first rather than reading through this stand-in.
             let c_gcdata = crate::flowspace::model::Hlvalue::Constant(
                 crate::flowspace::model::Constant::with_concretetype(
                     crate::flowspace::model::ConstValue::HostObject(
