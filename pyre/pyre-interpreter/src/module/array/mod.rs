@@ -148,9 +148,50 @@ fn unicode_char_w(w: PyObjectRef) -> Result<u32, PyError> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Core mutation helpers.
+// Element unpacking.
 // ──────────────────────────────────────────────────────────────────────
 
+/// PyPy `W_Array.w_getitem`: box one live array element, with the raw-integer
+/// mode `compare_arrays` uses for unicode items.
+///
+/// [3.14-spec] PyPy reports its array-specific out-of-range sentence here.
+/// `arraymodule.c` `u_getitem` / `w_getitem` at v3.14.6 instead call
+/// `PyUnicode_FromOrdinal`, whose observable error is the `chr()` sentence
+/// below. Keep PyPy's `integer_instead_of_char` shape: same-descriptor array
+/// comparisons use it to compare even malformed raw code points without
+/// trying to construct a Python string.
+pub(crate) fn array_w_getitem(
+    obj: PyObjectRef,
+    index: usize,
+    integer_instead_of_char: bool,
+) -> PyResult {
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+    if matches!(typecode, b'u' | b'w') {
+        let itemsize = unsafe { arr::w_array_itemsize(obj) };
+        let offset = index * itemsize;
+        let bytes = unsafe { arr::w_array_bytes(obj) };
+        let code = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        if integer_instead_of_char {
+            // PyPy casts the `u` wchar_t through `lltype.Signed`, matching
+            // v3.14.6's `u_compareitems(wchar_t)`. The 3.14 `w` descriptor is
+            // Py_UCS4 and therefore keeps the full unsigned value.
+            let value = if typecode == b'u' {
+                i32::from_ne_bytes(code.to_ne_bytes()) as i64
+            } else {
+                code as i64
+            };
+            return Ok(pyre_object::w_int_new(value));
+        }
+        let point = CodePoint::from_u32(code)
+            .ok_or_else(|| PyError::value_error("chr() arg not in range(0x110000)"))?;
+        let mut one = Wtf8Buf::new();
+        one.push(point);
+        return Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(one));
+    }
+    Ok(unsafe { arr::w_array_unpack_item(obj, index) })
+}
+
+// Core mutation helpers.
 fn array_check_resize(obj: PyObjectRef) -> Result<(), PyError> {
     if unsafe { arr::w_array_exports(obj) } != 0 {
         Err(PyError::new(
@@ -586,7 +627,7 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
     }
     let i = index_in_range(obj, key, "array")?;
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
-    Ok(unsafe { arr::w_array_unpack_item(obj, i) })
+    array_w_getitem(obj, i, false)
 }
 
 fn array_setitem(args: &[PyObjectRef]) -> PyResult {
@@ -929,9 +970,13 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
             "pop index out of range".to_string(),
         ));
     }
-    array_check_resize(obj)?;
     let isz = unsafe { arr::w_array_itemsize(obj) };
-    let w_val = unsafe { arr::w_array_unpack_item(obj, i as usize) };
+    let w_val = array_w_getitem(obj, i as usize, false)?;
+    // PyPy `W_Array.descr_pop` boxes the item before `setlen` checks exports;
+    // v3.14.6 `array_array_pop_impl` likewise calls `getarrayitem` before
+    // `array_del_slice`. An invalid unicode value therefore wins over a live
+    // export, and either error leaves the array untouched.
+    array_check_resize(obj)?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     vec.drain(i as usize * isz..i as usize * isz + isz);
     Ok(w_val)
@@ -991,7 +1036,7 @@ fn array_index_count(obj: PyObjectRef, w_value: PyObjectRef, count: bool) -> Res
         if i >= unsafe { arr::w_array_len(obj) } {
             break;
         }
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
+        let w_item = array_w_getitem(obj, i, false)?;
         let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if crate::baseobjspace::eq_w(w_item, w_value)? {
             if count {
@@ -1066,7 +1111,7 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
         if i >= unsafe { arr::w_array_len(obj) } as i64 {
             break;
         }
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i as usize) };
+        let w_item = array_w_getitem(obj, i as usize, false)?;
         let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if crate::baseobjspace::eq_w(w_item, w_value)? {
             return Ok(pyre_object::w_int_new(i));
@@ -1134,7 +1179,7 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
     let len = unsafe { arr::w_array_len(obj) };
     let mut items = Vec::with_capacity(len);
     for i in 0..len {
-        items.push(unsafe { arr::w_array_unpack_item(obj, i) });
+        items.push(array_w_getitem(obj, i, false)?);
     }
     Ok(pyre_object::w_list_new(items))
 }
@@ -1351,19 +1396,41 @@ fn array_tofile_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.tounicode")?;
-    let obj = args[0];
-    if !matches!(unsafe { arr::w_array_typecode(obj) }, b'u' | b'w') {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(args[0]);
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+    if !matches!(typecode, b'u' | b'w') {
+        // [3.14-spec] PyPy `descr_tounicode` names only type `u`; v3.14.6
+        // `array_array_tounicode_impl` exposes both unicode typecodes in the
+        // public sentence now that `w` is part of the module surface.
         return Err(PyError::value_error(
-            "tounicode() may only be called on unicode type arrays",
+            "tounicode() may only be called on unicode type arrays ('u' or 'w')",
         ));
     }
-    let len = unsafe { arr::w_array_len(obj) };
     let bytes = unsafe { arr::w_array_bytes(obj) };
-    let mut wb = Wtf8Buf::new();
-    for i in 0..len {
-        let cp = u32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-        let point = CodePoint::from_u32(cp)
-            .ok_or_else(|| PyError::value_error("character out of range"))?;
+    if typecode == b'w' {
+        // `array_array_tounicode_impl` at v3.14.6 routes `w` through the
+        // native-order UTF-32 decoder. Reuse PyPy's
+        // `str_decode_utf_32_helper` port so BOM consumption, surrogate
+        // rejection, error spans, and byte-order-specific codec names stay
+        // identical to the public codec rather than growing a second loop.
+        let (decoded, _, _) = crate::type_methods::decode_utf16_32_helper(
+            bytes, true, None, "utf-32", "strict", true,
+        )?;
+        return Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(decoded));
+    }
+
+    // PyPy `descr_tounicode` uses `wcharpsize2utf8`, which admits lone
+    // surrogates and raises for the first value above U+10ffff. The same
+    // shape implements `PyUnicode_FromWideChar`, used for `u` by v3.14.6.
+    let mut wb = Wtf8Buf::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let code = u32::from_ne_bytes(chunk.try_into().unwrap());
+        let point = CodePoint::from_u32(code).ok_or_else(|| {
+            PyError::value_error(format!(
+                "character U+{code:x} is not in range [U+0000; U+10ffff]"
+            ))
+        })?;
         wb.push(point);
     }
     Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(wb))
@@ -1453,6 +1520,10 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
     let mut out = rustpython_wtf8::Wtf8Buf::new();
     out.push_str(&format!("{class_name}('{tc}', "));
     if matches!(tc, 'u' | 'w') {
+        // [3.14-spec] PyPy `descr_repr` catches this ValueError and prints a
+        // `<character ...>` placeholder. v3.14.6 `array_repr` propagates any
+        // failure from `array_array_tounicode_impl`, including the structured
+        // UTF-32 error for `w`.
         let s = array_tounicode_method(&[current_obj()])?;
         out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(s)? });
         out.push_str(")");
@@ -1463,7 +1534,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
         if i != 0 {
             out.push_str(", ");
         }
-        let w_item = unsafe { arr::w_array_unpack_item(current_obj(), i) };
+        let w_item = array_w_getitem(current_obj(), i, false)?;
         out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(w_item)? });
     }
     out.push_str("])");
@@ -1493,9 +1564,16 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
         return Ok(pyre_object::w_bool_from(true));
     }
     let n = la.min(lb);
+    let typecode_a = unsafe { arr::w_array_typecode(a) };
+    let typecode_b = unsafe { arr::w_array_typecode(b) };
+    // PyPy `compare_arrays` requests `integer_instead_of_char` so malformed
+    // unicode storage remains comparable. [3.14-spec] v3.14.6 does that raw
+    // comparison only when both descriptors match; differing typecodes take
+    // `getarrayitem` and can therefore raise while boxing an invalid scalar.
+    let integer_instead_of_char = typecode_a == typecode_b && matches!(typecode_a, b'u' | b'w');
     for i in 0..n {
-        let ea = unsafe { arr::w_array_unpack_item(a, i) };
-        let eb = unsafe { arr::w_array_unpack_item(b, i) };
+        let ea = array_w_getitem(a, i, integer_instead_of_char)?;
+        let eb = array_w_getitem(b, i, integer_instead_of_char)?;
         match op {
             0 => {
                 if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {

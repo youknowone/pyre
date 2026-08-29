@@ -1712,10 +1712,13 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
                 }
             } else if pyre_object::interp_array::is_array(si.seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(si.seq) {
-                    Some(pyre_object::interp_array::w_array_unpack_item(
-                        si.seq,
-                        idx as usize,
-                    ))
+                    // [3.14-spec] PyPy's generic `W_SeqIterObject.descr_next`
+                    // advances only after `getitem` succeeds (and clears the
+                    // source on any error). v3.14.6 `arrayiter_next` passes
+                    // `it->index++` to the item getter, so an invalid unicode
+                    // slot raises once and the following slot remains next.
+                    si.index += 1;
+                    return crate::module::array::array_w_getitem(si.seq, idx as usize, false);
                 } else {
                     None
                 }

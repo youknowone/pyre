@@ -16158,10 +16158,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
             } else if pyre_object::interp_array::is_array(seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
-                    Some(pyre_object::interp_array::w_array_unpack_item(
-                        seq,
-                        idx as usize,
-                    ))
+                    // [3.14-spec] `arrayiter_next` at v3.14.6 advances its
+                    // cursor as part of the getitem argument, even when an
+                    // invalid unicode value makes that getitem raise.
+                    (*iter_ptr).index += 1;
+                    return crate::module::array::array_w_getitem(seq, idx as usize, false);
                 } else {
                     None
                 }

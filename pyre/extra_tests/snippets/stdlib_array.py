@@ -1135,3 +1135,147 @@ fresh_buffer_info.append(1)
 buffer_address, buffer_length = fresh_buffer_info.buffer_info()
 assert buffer_address > 0
 assert buffer_length == 1
+
+
+def raw_unicode_array(typecode, *codepoints):
+    value = array(typecode)
+    value.frombytes(b"".join(code.to_bytes(4, sys.byteorder) for code in codepoints))
+    return value
+
+
+# PyPy's `W_Array.w_getitem` validates raw unicode storage.  CPython 3.14
+# reaches the same boundary through `PyUnicode_FromOrdinal`, whose exact
+# ValueError is the public contract.  Every item-producing operation must use
+# that boundary rather than silently turning an invalid scalar into "".
+invalid_item_message = "chr() arg not in range(0x110000)"
+for unicode_typecode in ("u", "w"):
+    for operation in (
+        lambda value: value[0],
+        lambda value: value.tolist(),
+        lambda value: list(value),
+        lambda value: value.count("x"),
+        lambda value: value.index("x"),
+        lambda value: value.remove("x"),
+        lambda value: "x" in value,
+    ):
+        invalid_unicode = raw_unicode_array(unicode_typecode, 0x110000)
+        with assert_raises(ValueError) as error:
+            operation(invalid_unicode)
+        assert str(error.exception) == invalid_item_message
+        assert invalid_unicode.tobytes() == (0x110000).to_bytes(4, sys.byteorder)
+
+    # `arrayiter_next` advances its cursor as it calls the item getter: the
+    # malformed slot raises once, then the following valid slot is still next.
+    invalid_unicode = raw_unicode_array(unicode_typecode, 0x110000, ord("A"))
+    invalid_iterator = iter(invalid_unicode)
+    with assert_raises(ValueError) as error:
+        next(invalid_iterator)
+    assert str(error.exception) == invalid_item_message
+    assert next(invalid_iterator) == "A"
+    with assert_raises(StopIteration):
+        next(invalid_iterator)
+
+    # The generic reverse-sequence iterator follows both upstreams here: an
+    # item error clears its source instead of leaving the earlier slot live.
+    reverse_invalid = raw_unicode_array(unicode_typecode, ord("A"), 0x110000)
+    reverse_iterator = reversed(reverse_invalid)
+    with assert_raises(ValueError) as error:
+        next(reverse_iterator)
+    assert str(error.exception) == invalid_item_message
+    with assert_raises(StopIteration):
+        next(reverse_iterator)
+
+    # Both upstreams compare same-kind unicode arrays as raw integers, so an
+    # invalid stored scalar remains comparable without being boxed as str.
+    invalid_left = raw_unicode_array(unicode_typecode, 0x110000)
+    invalid_equal = raw_unicode_array(unicode_typecode, 0x110000)
+    invalid_greater = raw_unicode_array(unicode_typecode, 0x110001)
+    assert invalid_left == invalid_equal
+    assert invalid_left < invalid_greater
+    all_bits = raw_unicode_array(unicode_typecode, 0xFFFFFFFF)
+    zero = raw_unicode_array(unicode_typecode, 0)
+    if unicode_typecode == "u":
+        assert all_bits < zero  # signed wchar_t
+    else:
+        assert all_bits > zero  # unsigned Py_UCS4
+
+    # `pop` obtains the item before attempting the resize.  The ValueError
+    # therefore wins even with a live export, and neither failure mutates it.
+    invalid_unicode = raw_unicode_array(unicode_typecode, 0x110000)
+    invalid_export = memoryview(invalid_unicode)
+    with assert_raises(ValueError) as error:
+        invalid_unicode.pop()
+    assert str(error.exception) == invalid_item_message
+    assert len(invalid_unicode) == 1
+    invalid_export.release()
+
+# Different descriptors take the ordinary item-boxing comparison path.
+invalid_u = raw_unicode_array("u", 0x110000)
+invalid_w = raw_unicode_array("w", 0x110000)
+with assert_raises(ValueError) as error:
+    invalid_u == invalid_w
+assert str(error.exception) == invalid_item_message
+assert array("u", "A") != array("I", [ord("A")])
+with assert_raises(TypeError):
+    array("u", "A") < array("I", [ord("A")])
+
+# `u.tounicode()` follows PyPy's wchar conversion: surrogates survive, while
+# the first value above U+10ffff reports the wide-char ValueError verbatim.
+with assert_raises(ValueError) as error:
+    array("i").tounicode()
+assert str(error.exception) == (
+    "tounicode() may only be called on unicode type arrays ('u' or 'w')"
+)
+assert raw_unicode_array("u", 0xD800).tounicode() == "\ud800"
+invalid_u = raw_unicode_array("u", 0x110000)
+invalid_wide_message = (
+    "character U+110000 is not in range [U+0000; U+10ffff]"
+)
+for operation in (lambda: invalid_u.tounicode(), lambda: repr(invalid_u)):
+    with assert_raises(ValueError) as error:
+        operation()
+    assert str(error.exception) == invalid_wide_message
+
+# `w.tounicode()` is the native UTF-32 decoder in 3.14: it consumes a BOM,
+# rejects surrogates, and publishes the selected endian codec and four-byte
+# failure span on UnicodeDecodeError.
+assert array("w", "\ufeffA").tounicode() == "A"
+native_utf32 = "utf-32-" + ("le" if sys.byteorder == "little" else "be")
+for codepoint, reason in (
+    (0xD800, "code point in surrogate code point range(0xd800, 0xe000)"),
+    (0x110000, "code point not in range(0x110000)"),
+):
+    invalid_bytes = (
+        ord("A").to_bytes(4, sys.byteorder)
+        + codepoint.to_bytes(4, sys.byteorder)
+        + ord("B").to_bytes(4, sys.byteorder)
+    )
+    invalid_w = array("w")
+    invalid_w.frombytes(invalid_bytes)
+    for operation in (lambda: invalid_w.tounicode(), lambda: repr(invalid_w)):
+        with assert_raises(UnicodeDecodeError) as error:
+            operation()
+        exception = error.exception
+        assert exception.encoding == native_utf32
+        assert exception.object == invalid_bytes
+        assert exception.start == 4
+        assert exception.end == 8
+        assert exception.reason == reason
+
+# A reversed BOM changes both decoding order and the codec name carried by
+# the error; the native-order array storage is deliberately treated as bytes
+# by `PyUnicode_DecodeUTF32` at this boundary.
+opposite_order = "big" if sys.byteorder == "little" else "little"
+opposite_bytes = (0xFEFF).to_bytes(4, opposite_order) + (0x110000).to_bytes(
+    4, opposite_order
+)
+opposite_w = array("w")
+opposite_w.frombytes(opposite_bytes)
+with assert_raises(UnicodeDecodeError) as error:
+    opposite_w.tounicode()
+assert error.exception.encoding == "utf-32-" + (
+    "be" if opposite_order == "big" else "le"
+)
+assert error.exception.object == opposite_bytes
+assert error.exception.start == 4
+assert error.exception.end == 8
