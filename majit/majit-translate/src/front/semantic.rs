@@ -577,7 +577,31 @@ impl<'a> MirGraphLookup<'a> {
 /// in the set and carry their hints. Its conclusion survived its evidence,
 /// which is why the reason mattered — an absent hint would put the fix
 /// upstream, and an erased one puts it in the two under-approximations below.
-/// They are live suspects today, not contingencies:
+/// They are live suspects today, not contingencies — and the producer of each
+/// hinted value, which is what `class_roots` has to recognise, says which:
+///
+/// ```text
+/// createframe_obj            AccessDirectly     <- SyntheticTransparentCtor{name:"PyFrame", is_struct}
+/// finish_for_call_..._obj    AccessDirectly     <- SyntheticTransparentCtor{name:"PyFrame", is_struct}
+/// eval::dispatch             AccessDirectly     <- Input{name:"frame", class_root:Some("PyFrame")}
+/// app_profile_call           NoAccessDirectly   <- Input{name:"frame", class_root:Some("PyFrame")}
+/// createframe_obj            FreshVirtualizable <- (no producing op in the graph)
+/// finish_for_call_..._obj    FreshVirtualizable <- (no producing op in the graph)
+/// ```
+///
+/// So the first under-approximation is NOT the eraser for `access_directly`:
+/// every one of those four resolves to the bare leaf `PyFrame`, which is the
+/// spelling the declared set holds. What it does erase is `fresh_virtualizable`
+/// — both sites spell `hint_fresh_virtualizable(hint_access_directly(frame))`
+/// and the outer hint's operand is produced by no op in the graph, so it can
+/// carry no root and is never seeded.
+///
+/// That leaves the second as the eraser for `access_directly`. The flag is set
+/// only through `reaching`: a `(callee, pos)` pair needs `flagged > 0 &&
+/// unflagged == 0`, so one unhinted caller passing a frame at that position is
+/// enough to erase it, and `PyFrame` has many. Seeding the roots registry
+/// changes nothing — `roots=1 ["PyFrame"]` and an empty registry both flag
+/// zero graphs — which is what rules the root declaration out as the cause.
 ///
 /// * `class_roots` answers with the ctor's own name for a struct literal,
 ///   because that is the spelling everything else uses — `adt_node_class_root`
