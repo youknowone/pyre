@@ -7336,7 +7336,7 @@ mod tests {
         // `mark_card` sets the same flag on the interpreter's object itself.
         for obj in [obj_immed, obj_reg] {
             unsafe {
-                (*majit_gc::header::header_of(obj.0)).set_flag(majit_gc::flags::CARDS_SET);
+                (*majit_gc::header::header_of(obj.0)).set_flag(majit_gc::flags::GCFLAG_CARDS_SET);
             }
         }
         for obj in [obj_immed, obj_reg, obj_interp] {

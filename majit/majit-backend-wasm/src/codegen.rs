@@ -1388,9 +1388,9 @@ fn emit_write_barrier(
         // its upper half (`FLAG_SHIFT == 32`), so on little-endian wasm32 the
         // flags live in the i32 at `obj - 4`; TRACK_YOUNG_PTRS is flag bit 0.
         const FLAGS_HALF_BACKOFS: i32 = (majit_gc::header::GcHeader::SIZE / 2) as i32;
-        const WB_FLAG: i32 = majit_gc::flags::TRACK_YOUNG_PTRS as i32;
+        const WB_FLAG: i32 = majit_gc::flags::GCFLAG_TRACK_YOUNG_PTRS as i32;
         const _: () = assert!(majit_gc::header::FLAG_SHIFT == 32);
-        const _: () = assert!(majit_gc::flags::TRACK_YOUNG_PTRS <= u32::MAX as u64);
+        const _: () = assert!(majit_gc::flags::GCFLAG_TRACK_YOUNG_PTRS <= u32::MAX as u64);
         emit_resolve(sink, constants, value_types, base_ref);
         sink.i32_wrap_i64();
         sink.i32_const(FLAGS_HALF_BACKOFS);

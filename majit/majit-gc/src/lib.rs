@@ -72,38 +72,67 @@ pub(crate) fn invoke_after_minor_collection_hook() {
 
 /// GC flags stored in object headers.
 ///
-/// From incminimark.py GCFLAG_* constants.
+/// incminimark.py `GCFLAG_*`, spelled the same here: a flag test and the
+/// RPython line it came from read alike, so the `GCFLAG_` prefix marks
+/// membership of that set and a constant without it is one this GC adds
+/// (`FINALIZER_REGISTERED`, `FINALIZER_RUN` below).
 pub mod flags {
-    // incminimark.py GCFLAG_* — bit positions must match RPython exactly.
-    // first_gcflag = 1 << 32; each constant below is (first_gcflag << N)
-    // expressed as the unshifted bit index N.
-    /// GCFLAG_TRACK_YOUNG_PTRS (bit 0)
-    pub const TRACK_YOUNG_PTRS: u64 = 1 << 0;
-    /// GCFLAG_NO_HEAP_PTRS (bit 1)
-    pub const NO_HEAP_PTRS: u64 = 1 << 1;
-    /// GCFLAG_VISITED (bit 2)
-    pub const VISITED: u64 = 1 << 2;
-    /// GCFLAG_HAS_SHADOW (bit 3)
-    pub const HAS_SHADOW: u64 = 1 << 3;
-    /// GCFLAG_FINALIZATION_ORDERING (bit 4)
-    pub const FINALIZATION_ORDERING: u64 = 1 << 4;
-    /// GCFLAG_EXTRA (bit 5) — reserved
-    pub const EXTRA: u64 = 1 << 5;
-    /// GCFLAG_HAS_CARDS (bit 6)
-    pub const HAS_CARDS: u64 = 1 << 6;
-    /// GCFLAG_CARDS_SET (bit 7) — MSB of the byte containing TRACK_YOUNG_PTRS.
-    /// The x86 backend relies on this being -0x80 as a signed byte.
-    pub const CARDS_SET: u64 = 1 << 7;
-    /// GCFLAG_VISITED_RMY (bit 8)
-    pub const VISITED_RMY: u64 = 1 << 8;
-    /// GCFLAG_PINNED (bit 9)
-    pub const PINNED: u64 = 1 << 9;
-    /// GCFLAG_IGNORE_FINALIZER (bit 10)
-    pub const IGNORE_FINALIZER: u64 = 1 << 10;
-    /// GCFLAG_SHADOW_INITIALIZED (bit 11)
-    pub const SHADOW_INITIALIZED: u64 = 1 << 11;
-    /// GCFLAG_DUMMY (bit 12)
-    pub const DUMMY: u64 = 1 << 12;
+    // Bit positions must match RPython exactly. Upstream sets
+    // `first_gcflag = 1 << 32` and writes `first_gcflag << N`; the header keeps
+    // flags in the high half already, so each constant is the unshifted index N.
+
+    /// Something must be done to track the young pointers this object may
+    /// hold. Not set on young objects — any young object may point to any
+    /// other — except large arrays, where `GCFLAG_HAS_CARDS` does the tracking
+    /// and this is set anyway to shorten the write barrier. On old and prebuilt
+    /// objects it is usually set, and writing a pointer clears it.
+    pub const GCFLAG_TRACK_YOUNG_PTRS: u64 = 1 << 0;
+    /// Set on a prebuilt object unless it is already listed in
+    /// `prebuilt_root_objects`.
+    ///
+    /// A state, not a claim about the payload's shape. While it is set the
+    /// object holds no heap pointer, and the write barrier keeps that true: the
+    /// first pointer written into the object clears this flag and appends the
+    /// object to `prebuilt_root_objects`. That is what lets marking skip an
+    /// object still carrying it (incminimark.py:2782-2798) and lets
+    /// `_rrc_major_free` read it as "immortal, never traced so far".
+    ///
+    /// The invariant holds only where *every* pointer store into such an object
+    /// runs the barrier. Upstream gets that from the GC transform; a hand-
+    /// written store that skips it leaves a heap pointer behind a set flag, and
+    /// marking then walks past a live object.
+    pub const GCFLAG_NO_HEAP_PTRS: u64 = 1 << 1;
+    /// The object survived a major collection.
+    pub const GCFLAG_VISITED: u64 = 1 << 2;
+    /// Set on a nursery object whose id or identityhash was asked for: space
+    /// the size of the object is already reserved in the non-movable part.
+    pub const GCFLAG_HAS_SHADOW: u64 = 1 << 3;
+    /// Set temporarily during a major collection to order finalizers.
+    pub const GCFLAG_FINALIZATION_ORDERING: u64 = 1 << 4;
+    /// Reserved for RPython.
+    pub const GCFLAG_EXTRA: u64 = 1 << 5;
+    /// Set on an externally raw-malloced array of pointers: it carries extra
+    /// space in front for a bitfield, one bit per `card_page_indices` indices.
+    pub const GCFLAG_HAS_CARDS: u64 = 1 << 6;
+    /// At least one card bit is set. This is the most significant bit of the
+    /// byte holding `GCFLAG_TRACK_YOUNG_PTRS`, which the x86 backend requires.
+    pub const GCFLAG_CARDS_SET: u64 = 1 << 7;
+    /// Set on a raw-malloced young object that survived a minor collection.
+    pub const GCFLAG_VISITED_RMY: u64 = 1 << 8;
+    /// Keep this nursery object in the nursery: a young object carrying it is
+    /// not moved out by a minor collection. See `pin()` / `unpin()`.
+    pub const GCFLAG_PINNED: u64 = 1 << 9;
+    /// The same bit as [`GCFLAG_PINNED`], reused on objects outside the
+    /// nursery, where pinning cannot apply. Set means the object is already an
+    /// element of `old_objects_pointing_to_pinned` and need not be added again.
+    pub const GCFLAG_PINNED_OBJECT_PARENT_KNOWN: u64 = GCFLAG_PINNED;
+    /// `ignore_finalizer()` has been called on the object.
+    pub const GCFLAG_IGNORE_FINALIZER: u64 = 1 << 10;
+    /// A shadow object whose memory was initialized as it was created, so
+    /// tracing out needs no additional copy.
+    pub const GCFLAG_SHADOW_INITIALIZED: u64 = 1 << 11;
+    /// The `ll_dummy_value` from `rpython.rtyper.rmodel`.
+    pub const GCFLAG_DUMMY: u64 = 1 << 12;
     /// The object is already on a finalizer queue (bit 13).
     ///
     /// Not an incminimark flag — bit 13 is `_GCFLAG_FIRST_UNUSED`
@@ -340,8 +369,9 @@ impl WriteBarrierDescr {
     /// header layout. gc.py:259-293 WriteBarrierDescr.__init__.
     pub fn for_current_gc() -> Self {
         let (if_flag_byteofs, if_flag_singlebyte) =
-            Self::extract_flag_byte(flags::TRACK_YOUNG_PTRS);
-        let (cards_set_byteofs, cards_set_singlebyte) = Self::extract_flag_byte(flags::CARDS_SET);
+            Self::extract_flag_byte(flags::GCFLAG_TRACK_YOUNG_PTRS);
+        let (cards_set_byteofs, cards_set_singlebyte) =
+            Self::extract_flag_byte(flags::GCFLAG_CARDS_SET);
         // gc.py:280-281: the x86 backend relies on these two facts
         // to avoid one instruction in _write_barrier_fastpath.
         debug_assert_eq!(
@@ -353,10 +383,10 @@ impl WriteBarrierDescr {
             "CARDS_SET must be the MSB of its byte (-0x80)"
         );
         WriteBarrierDescr {
-            jit_wb_if_flag: flags::TRACK_YOUNG_PTRS,
+            jit_wb_if_flag: flags::GCFLAG_TRACK_YOUNG_PTRS,
             jit_wb_if_flag_byteofs: if_flag_byteofs,
             jit_wb_if_flag_singlebyte: if_flag_singlebyte as u8,
-            jit_wb_cards_set: flags::CARDS_SET,
+            jit_wb_cards_set: flags::GCFLAG_CARDS_SET,
             jit_wb_card_page_shift: crate::collector::DEFAULT_CARD_PAGE_SHIFT,
             jit_wb_cards_set_byteofs: cards_set_byteofs,
             jit_wb_cards_set_singlebyte: cards_set_singlebyte,
@@ -1339,7 +1369,7 @@ impl GcAllocator for GcHandle {
         // No root bracket: the barrier neither allocates nor collects, so
         // nothing inside it can move `obj`.  `do_write_barrier` /
         // `remember_young_pointer` (collector.rs) read headers, append to the
-        // host-allocated `remembered_set`, and clear a tid flag — which is why
+        // host-allocated `old_objects_pointing_to_young`, and clear a tid flag — which is why
         // upstream inlines the barrier at the store (framework.py:533-537) and
         // publishes no shadow-stack root anywhere in it.  Restore the bracket
         // if the remembered set ever becomes GC-managed.
@@ -3192,7 +3222,7 @@ pub fn gc_object_finalizer_pending(addr: usize) -> bool {
     unsafe {
         (*hdr).has_flag(flags::FINALIZER_REGISTERED)
             && !(*hdr).has_flag(flags::FINALIZER_RUN)
-            && !(*hdr).has_flag(flags::IGNORE_FINALIZER)
+            && !(*hdr).has_flag(flags::GCFLAG_IGNORE_FINALIZER)
     }
 }
 
@@ -3713,7 +3743,7 @@ pub fn bh_probe_scan(reason: &str) {
             // remembered set, so a young field in it is legal and will be
             // traced.  Only a flagged object naming the nursery is a lost edge.
             let hdr = (addr - crate::header::GcHeader::SIZE) as *const crate::header::GcHeader;
-            if unsafe { !(*hdr).has_flag(crate::flags::TRACK_YOUNG_PTRS) } {
+            if unsafe { !(*hdr).has_flag(crate::flags::GCFLAG_TRACK_YOUNG_PTRS) } {
                 continue;
             }
             for offset in (0..payload_size).step_by(std::mem::size_of::<usize>()) {

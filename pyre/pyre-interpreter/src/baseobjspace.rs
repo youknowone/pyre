@@ -10121,13 +10121,32 @@ unsafe fn _cached_lookup_where_name(
 /// (which holds live `(w_class, w_value)` refs).
 ///
 /// Every cached value is an MRO type's namespace-dict resident (or a
-/// Box-immortal builtin descriptor), so it is already kept *reachable* by
-/// `walk_builtin_type_dicts_gc` or the heap type's custom trace — this walk is
-/// therefore not load-bearing for reclamation in the current model, and
-/// old-gen residents are not
-/// relocated by a collection, so it forwards no slot in practice today.
-/// It becomes load-bearing once those values become movable (the
-/// movable-object GC phases): `version_tag` is bumped only by `mutated()`,
+/// Box-immortal builtin descriptor), so the value *itself* is already kept
+/// reachable by `walk_builtin_type_dicts_gc` or by the owning type's custom
+/// trace forwarding `t.dict`, and an old-gen resident is not relocated by a
+/// collection — so as a *forwarding* pass this one changes no pointer today.
+///
+/// It is not only a forwarding pass. `eval.rs` hands in a closure that also
+/// runs `walk_raw_function_roots` / `walk_raw_getset_roots` /
+/// `walk_raw_wrapped_function_roots` on every slot it forwards, which makes
+/// this a *descent* path: for a Box-immortal carrier those walks are the only
+/// thing that reaches the carrier's own pointer fields. A heap type reaches
+/// such a value through `t.dict` and the namespace dict's trace, and both stop
+/// at the immortal box. So a Box-immortal function sitting in a *heap* type's
+/// namespace has its payload walked only while it is in this cache — do not
+/// read the paragraph above as licence to drop the call.
+///
+/// Nothing is dropped today only because those payload slots hold
+/// `malloc_typed` strings and static-region type objects, which the collector
+/// does not own. Minting Box-immortal functions is itself the deviation
+/// (upstream has no object outside the GC graph); closing that closes this.
+///
+/// `gc.collect()` clears the cache immediately before collecting
+/// (`module/gc/mod.rs`), so only an automatic collection ever sees a populated
+/// one.
+///
+/// The forwarding half becomes load-bearing once those values become movable
+/// (the movable-object GC phases): `version_tag` is bumped only by `mutated()`,
 /// never by a relocating move, so the cache's *own* copy of each pointer
 /// must be forwarded here or a later hit would read a stale address.
 pub(crate) unsafe fn walk_method_cache_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) {

@@ -269,8 +269,8 @@ impl OldGen {
         self.young_rawmalloced_payloads.clear();
         for object in young {
             let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
-            if hdr.has_flag(flags::VISITED_RMY) {
-                hdr.clear_flag(flags::VISITED_RMY);
+            if hdr.has_flag(flags::GCFLAG_VISITED_RMY) {
+                hdr.clear_flag(flags::GCFLAG_VISITED_RMY);
                 self.old_rawmalloced_objects.push(object);
                 continue;
             }
@@ -396,8 +396,8 @@ impl OldGen {
         while !self.raw_malloc_might_sweep.is_empty() && nobjects > 0 {
             let object = self.raw_malloc_might_sweep.pop().unwrap();
             let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
-            if hdr.has_flag(flags::VISITED) {
-                hdr.clear_flag(flags::VISITED);
+            if hdr.has_flag(flags::GCFLAG_VISITED) {
+                hdr.clear_flag(flags::GCFLAG_VISITED);
                 self.old_rawmalloced_objects.push(object);
             } else {
                 if log_free {
@@ -436,8 +436,8 @@ impl OldGen {
         self.ac.mass_free_incremental(
             &mut |header_ptr| unsafe {
                 let hdr = &mut *(header_ptr as *mut GcHeader);
-                if hdr.has_flag(flags::VISITED) {
-                    hdr.clear_flag(flags::VISITED);
+                if hdr.has_flag(flags::GCFLAG_VISITED) {
+                    hdr.clear_flag(flags::GCFLAG_VISITED);
                     false
                 } else {
                     if log_free {
@@ -546,7 +546,7 @@ impl OldGen {
     }
 
     pub fn mark_visited(obj_addr: usize) {
-        unsafe { (*header_of(obj_addr)).set_flag(flags::VISITED) };
+        unsafe { (*header_of(obj_addr)).set_flag(flags::GCFLAG_VISITED) };
     }
 }
 
@@ -623,10 +623,10 @@ mod tests {
         unsafe {
             *p1.cast::<GcHeader>() = GcHeader::new(0);
             *p2.cast::<GcHeader>() = GcHeader::new(0);
-            (*p1.cast::<GcHeader>()).set_flag(flags::VISITED);
+            (*p1.cast::<GcHeader>()).set_flag(flags::GCFLAG_VISITED);
         }
         oldgen.sweep();
-        assert!(!unsafe { (*p1.cast::<GcHeader>()).has_flag(flags::VISITED) });
+        assert!(!unsafe { (*p1.cast::<GcHeader>()).has_flag(flags::GCFLAG_VISITED) });
         let p3 = oldgen.alloc(GcHeader::SIZE + 16);
         assert_eq!(p3, p2);
     }
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(unsafe { *ptr.sub(1) }, 0);
         unsafe {
             *ptr.cast::<GcHeader>() = GcHeader::new(0);
-            (*ptr.cast::<GcHeader>()).set_flag(flags::VISITED);
+            (*ptr.cast::<GcHeader>()).set_flag(flags::GCFLAG_VISITED);
         }
         assert!(oldgen.contains(ptr as usize + GcHeader::SIZE));
         assert_eq!(oldgen.total_bytes(), round_up(size + 2 * WORD));

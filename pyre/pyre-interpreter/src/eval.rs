@@ -307,7 +307,15 @@ unsafe fn walk_raw_function_roots(
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
     unsafe {
-        if value.is_null() || !crate::is_function(value) {
+        // `is_function_carrier`, not `is_function`: `SLOT_WRAPPER_TYPE` is
+        // registered to the same `function_tid` as `FUNCTION_TYPE`
+        // (`pyre-jit/src/eval.rs` `register_vtable_for_type`), so the
+        // collector's census already says a slot wrapper carries Function's
+        // offsets. The carriers are Box-immortal, which makes this walk their
+        // only tracing path, and `typedef.rs` stamps `w_qualname`/`w_objclass`
+        // onto one *before* `function_retag_slot_wrapper` swaps `ob_type` —
+        // the narrower gate then refused the whole population afterwards.
+        if value.is_null() || !crate::is_function_carrier(value) {
             return;
         }
         let func = &mut *(value as *mut crate::function::Function);
@@ -315,6 +323,14 @@ unsafe fn walk_raw_function_roots(
         // The code object caches its own globals dict (`PyCode.w_globals`).
         // Reuse the same walk for managed custom tracing and bootstrap code.
         walk_raw_code_roots(func.code as PyObjectRef, visitor);
+        // `function.py:51 self.name` — the wrapped `__name__`, stamped at
+        // construction and replaced by `f.__name__ = ...`. Both stores already
+        // run `function_write_barrier`, but a Box-immortal function is reached
+        // only through this walk, so leaving the slot out gave the string a
+        // rename installs no root at all. A managed function reaches the same
+        // field through `FUNCTION_GC_TYPE_ID`'s offsets, which is why the gap
+        // showed up on immortal functions alone.
+        visitor(&mut *(&mut func.w_name as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.closure as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.defs_w as *mut PyObjectRef as *mut majit_ir::GcRef));
         visitor(&mut *(&mut func.w_kw_defs as *mut PyObjectRef as *mut majit_ir::GcRef));
@@ -5945,5 +5961,77 @@ result = (
             let result = w_dict_getitem_str(frame.get_w_globals(), "result").unwrap();
             assert!(crate::baseobjspace::is_true(result).unwrap());
         }
+    }
+
+    /// `walk_raw_function_roots` is the only tracing path a Box-immortal
+    /// function has, so every slot `FUNCTION_GC_PTR_OFFSETS` declares must be
+    /// forwarded by that walk unless it is deliberately exempt. The two lists
+    /// drifted apart once: `w_name` was declared and not walked, so the string
+    /// `f.__name__ = ...` installs had no root at all on an immortal function,
+    /// while a managed one traced it through `FUNCTION_GC_TYPE_ID`. This runs
+    /// the real walker and records the offsets it visits, so a field cannot be
+    /// half-wired again.
+    #[test]
+    fn walk_raw_function_roots_covers_every_declared_gc_offset() {
+        // A zeroed `Function` is a valid subject: the walk hands each slot to
+        // the visitor as a pointer, and null is the legitimate "not stamped
+        // yet" value. Only `ob_type` has to be real, because `is_function`
+        // gates the walk on pointer identity with `FUNCTION_TYPE`.
+        let mut func: crate::function::Function =
+            unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+        func.ob.ob_type = &crate::function::FUNCTION_TYPE as *const _;
+        let base = &func as *const crate::function::Function as usize;
+
+        let mut seen: Vec<usize> = Vec::new();
+        {
+            let mut record = |slot: &mut majit_ir::GcRef| {
+                seen.push(slot as *mut majit_ir::GcRef as usize - base);
+            };
+            unsafe {
+                walk_raw_function_roots(
+                    &mut func as *mut crate::function::Function as PyObjectRef,
+                    &mut record,
+                );
+            }
+        }
+        seen.sort_unstable();
+        seen.dedup();
+
+        // The same carrier retagged as a slot wrapper must still be walked:
+        // `SLOT_WRAPPER_TYPE` shares `FUNCTION_TYPE`'s registered offsets, and
+        // these carriers are immortal, so a refusal here is a population the
+        // collector believes is traced and nothing traces.
+        func.ob.ob_type = &crate::function::SLOT_WRAPPER_TYPE as *const _;
+        let mut seen_wrapper: Vec<usize> = Vec::new();
+        {
+            let mut record = |slot: &mut majit_ir::GcRef| {
+                seen_wrapper.push(slot as *mut majit_ir::GcRef as usize - base);
+            };
+            unsafe {
+                walk_raw_function_roots(
+                    &mut func as *mut crate::function::Function as PyObjectRef,
+                    &mut record,
+                );
+            }
+        }
+        seen_wrapper.sort_unstable();
+        seen_wrapper.dedup();
+        assert_eq!(
+            seen_wrapper, seen,
+            "slot-wrapper carrier must be walked too"
+        );
+
+        // `name` is the one declared offset this walk skips: an immortal
+        // function's name box comes from `malloc_raw`, so the collector never
+        // owns it, while a managed function's GC box is reached through the
+        // type id's offsets.
+        let exempt = std::mem::offset_of!(crate::function::Function, name);
+        let mut expected: Vec<usize> = crate::function::FUNCTION_GC_PTR_OFFSETS
+            .iter()
+            .copied()
+            .filter(|off| *off != exempt)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(seen, expected);
     }
 }
