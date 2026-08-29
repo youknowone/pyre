@@ -85,12 +85,73 @@ fn stat(args: &[PyObjectRef], default_follow: bool) -> Result<PyObjectRef, crate
     stat_resolved(&resolved)
 }
 
+/// The guest's working directory, once something has changed it.
+///
+/// The seam resolves a relative name against the embedder's directory, which is
+/// what `getcwd` reports until `chdir` runs.  After that the guest owns the
+/// answer, and a relative path is joined here before it crosses -- the same
+/// place `getcwd` reads, so the two never disagree.
+static WORKING_DIRECTORY: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// The directory a relative path is resolved against, as bytes.
+fn cwd_bytes() -> Vec<u8> {
+    if let Some(directory) = WORKING_DIRECTORY.lock().unwrap().clone() {
+        return directory;
+    }
+    crate::importing::source_cwd().unwrap_or_default()
+}
+
+/// `path` as the seam should see it: an absolute name unchanged, a relative one
+/// joined to the working directory.
+///
+/// An empty name stays empty so that the seam reports `ENOENT` for it, which is
+/// what `open("")` owes its caller rather than the working directory's contents.
+fn resolve_against_cwd(path: &[u8]) -> Vec<u8> {
+    if path.is_empty() || path.starts_with(b"/") {
+        return path.to_vec();
+    }
+    let mut resolved = cwd_bytes();
+    if resolved.is_empty() {
+        return path.to_vec();
+    }
+    if !resolved.ends_with(b"/") {
+        resolved.push(b'/');
+    }
+    resolved.extend_from_slice(path);
+    resolved
+}
+
+/// `posix.chdir(path)` — the directory later relative paths resolve against.
+///
+/// `fchdir` is what a descriptor argument would need, and the seam has no
+/// directory descriptor to offer it, so a name is the only spelling accepted.
+fn chdir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let resolved = path_arg(args, "chdir")?;
+    let target = resolve_against_cwd(&resolved.as_bytes);
+    let path: std::path::PathBuf = crate::gateway::os_string_from_fs_bytes(&target).into();
+    if !crate::importing::source_is_dir(&path) {
+        // The two answers a failed `chdir` gives: the name is not there, or it
+        // is there and is not a directory.
+        let errno = match crate::importing::source_file_size(&path) {
+            Ok(_) => crate::builtins::wasm_errno::ENOTDIR,
+            Err(e) => crate::builtins::wasm_errno::seam_errno(&e),
+        };
+        return Err(crate::PyError::os_error_syscall(errno, resolved.w_path()));
+    }
+    *WORKING_DIRECTORY.lock().unwrap() = Some(target);
+    Ok(pyre_object::w_none())
+}
+
 /// The seam takes a `&Path`, and on this target an `OsStr` is the byte string
 /// itself, so the filesystem bytes cross it whole rather than through a text
 /// spelling that a name without one would not survive: an entry `listdir`
 /// reported is an entry `stat` can be called with again.
-fn seam_path(bytes: &[u8]) -> std::path::PathBuf {
-    crate::gateway::os_string_from_fs_bytes(bytes).into()
+///
+/// This is the one place a relative name becomes an absolute one, so every
+/// entry point that takes a path resolves it against the same directory
+/// `getcwd` reports.
+pub(crate) fn seam_path(bytes: &[u8]) -> std::path::PathBuf {
+    crate::gateway::os_string_from_fs_bytes(&resolve_against_cwd(bytes)).into()
 }
 
 /// The seam's `io::Error` as the OSError it stands for, named by the path
@@ -129,6 +190,14 @@ fn make_stat_result(mode: i64, size: i64) -> PyObjectRef {
         ("st_ctime_ns", pyre_object::w_int_new(0)),
     ];
     crate::_structseq::new_instance_with_extra(super::stat_result_seq_type(), seq, extras)
+}
+
+/// `os.terminal_size` structseq — `(columns, lines)`.
+fn terminal_size_seq_type() -> PyObjectRef {
+    static TERMINAL_SIZE_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TERMINAL_SIZE_SEQ_TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq("os.terminal_size", &["columns", "lines"]) as usize
+    }) as PyObjectRef
 }
 
 /// `posix.listdir(path=None)` — the entry names the seam reports, in its
@@ -741,6 +810,107 @@ fn readlink(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     ))
 }
 
+/// The guest's environment.
+///
+/// This is what a C library's `environ` array is: the store `putenv` and
+/// `unsetenv` write to, and the one `posix.environ` is built from once.  `os.py`
+/// wraps that dict rather than copying it, so `os.environ` tracks the dict and
+/// these two track this map -- the same two-place split every platform has, and
+/// the reason a bare `os.putenv` is not visible through `os.environ` there
+/// either.  `_create_environ` is what reads this side back, which is how
+/// `os.reload_environ()` sees what `putenv` wrote.
+///
+/// The guest is started with no environment: the runner forwards the few
+/// variables the launcher options resolve against rather than an environment
+/// block, so this begins empty and holds whatever the program puts in it.
+static ENVIRONMENT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+/// A fresh dict holding what the environment holds now.
+///
+/// Bytes on both sides: `os.py` encodes a key before it stores one and decodes
+/// it on the way back, and `os.environb` hands the same dict out undecoded.
+fn environ_snapshot() -> PyObjectRef {
+    let entries: Vec<(Vec<u8>, Vec<u8>)> = ENVIRONMENT
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    for (name, value) in entries {
+        let key_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_bytes_from_bytes(&name));
+        let w_value = pyre_object::w_bytes_from_bytes(&value);
+        let _ = crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::gc_roots::shadow_stack_get(key_slot),
+            w_value,
+        );
+    }
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
+}
+
+/// The name or value argument of `putenv` / `unsetenv`, as the bytes the
+/// environment holds.
+///
+/// `os.environ` hands these down already encoded, and `os.environb` hands down
+/// bytes to begin with, so both spellings arrive here and both are kept as
+/// bytes: a name that came from the embedder is a name the guest can set again,
+/// whatever it spells.
+fn env_bytes_arg(
+    w_arg: PyObjectRef,
+    name: &'static str,
+) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
+    crate::gateway::fsencode_path_w(w_arg).map_err(|_| {
+        crate::PyError::type_error(format!("{name}() argument must be str or bytes"))
+    })
+}
+
+/// `posix.putenv(name, value)` — add or replace one variable.
+fn putenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &[], "putenv")?;
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "putenv expected 2 arguments, got {}",
+            pos.len()
+        )));
+    }
+    let name = env_bytes_arg(pos[0], "putenv")?;
+    // `putenv` is defined over `name=value`, so a name carrying the separator
+    // could not be spelled back out of the environment it went into.
+    if name.as_bytes.contains(&b'=') {
+        return Err(crate::PyError::value_error(
+            "illegal environment variable name",
+        ));
+    }
+    let value = env_bytes_arg(pos[1], "putenv")?;
+    ENVIRONMENT
+        .lock()
+        .unwrap()
+        .insert(name.as_bytes.clone(), value.as_bytes.clone());
+    Ok(pyre_object::w_none())
+}
+
+/// `posix.unsetenv(name)` — remove one variable, or leave an absent one absent.
+fn unsetenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let name = env_bytes_arg(
+        args.first()
+            .copied()
+            .ok_or_else(|| crate::PyError::type_error("unsetenv expected 1 argument, got 0"))?,
+        "unsetenv",
+    )?;
+    // A name nothing set is a name already unset, which is what the syscall
+    // reports and what `os.environ.__delitem__` relies on so that it can raise
+    // the KeyError itself, against the caller's own spelling of the key.
+    ENVIRONMENT.lock().unwrap().remove(&name.as_bytes);
+    Ok(pyre_object::w_none())
+}
+
 /// `posix.unlink(path, *, dir_fd=None)` / `posix.rmdir(path, *, dir_fd=None)`
 /// — the entry points a read-only mount publishes and refuses.
 fn refuse_write(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef, crate::PyError> {
@@ -752,17 +922,22 @@ fn refuse_write(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef,
 }
 
 pub fn register_module(ns: PyObjectRef) {
-    // `os._createenviron` reads this dict directly and wraps it, so `os.environ`
-    // is a live view of it.  The guest is started with no environment — the
-    // runner hands the interpreter the few variables it forwards, rather than
-    // an environment block — so it starts empty and stays whatever the program
-    // puts in it.
-    crate::module_ns_store(ns, "environ", pyre_object::w_dict_new());
+    // `os._create_environ_mapping` binds this dict itself rather than copying
+    // it, so `os.environ._data` is this object and `os.environ` is a live view
+    // of it.  The guest is started with no environment — the runner hands the
+    // interpreter the few variables it forwards, rather than an environment
+    // block — so this begins empty and holds whatever the program puts in it.
+    crate::module_ns_store(ns, "environ", environ_snapshot());
     // `os.py` builds `supports_dir_fd` and friends only when this exists, and
     // then reads `stat` out of its own namespace to seed `supports_fd`.  Empty:
     // no call here takes a directory or a descriptor argument.
     crate::module_ns_store(ns, "_have_functions", pyre_object::w_list_new(vec![]));
     crate::module_ns_store(ns, "stat_result", super::stat_result_seq_type());
+    // `posixmodule_exec` publishes this type on every platform, and only the
+    // `get_terminal_size` that fills one is guarded: `shutil.get_terminal_size`
+    // catches the AttributeError from the missing call and builds its fallback
+    // out of the type, so a target with neither raises from the handler.
+    crate::module_ns_store(ns, "terminal_size", terminal_size_seq_type());
     // `follow_symlinks` and `dir_fd` are keyword-only, so neither entry point
     // can take the fixed-arity carrier that rejects keywords.
     crate::module_ns_store(
@@ -784,6 +959,44 @@ pub fn register_module(ns: PyObjectRef) {
         ns,
         "scandir",
         crate::make_builtin_function("scandir", scandir),
+    );
+    crate::module_ns_store(ns, "chdir", crate::make_builtin_function("chdir", chdir));
+    // `os.environ.__setitem__` calls `putenv` by name, so a target without it
+    // cannot set a variable at all.
+    crate::module_ns_store(ns, "putenv", crate::make_builtin_function("putenv", putenv));
+    // `os.reload_environ` exists only where this does, and it is the one reader
+    // that can see what a bare `putenv` wrote.
+    crate::module_ns_store(
+        ns,
+        "_create_environ",
+        crate::make_builtin_function_with_arity(
+            "_create_environ",
+            |_args| Ok(environ_snapshot()),
+            0,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "unsetenv",
+        crate::make_builtin_function_with_arity("unsetenv", unsetenv, 1),
+    );
+    // One wasm instance, one process, and it is not one the embedder named.
+    crate::module_ns_store(
+        ns,
+        "getpid",
+        crate::make_builtin_function_with_arity("getpid", |_args| Ok(pyre_object::w_int_new(1)), 0),
+    );
+    // No terminal is reachable through the seam, so no descriptor is one.  The
+    // answer is False rather than an error for the same reason it is on every
+    // other platform: `isatty` reports, it does not validate.
+    crate::module_ns_store(
+        ns,
+        "isatty",
+        crate::make_builtin_function_with_arity(
+            "isatty",
+            |_args| Ok(pyre_object::w_bool_from(false)),
+            1,
+        ),
     );
     // `os.walk` catches `OSError` from the iterator and `shutil` calls
     // `isinstance(entry, os.DirEntry)`, so both the type and the entries it
@@ -914,11 +1127,6 @@ pub fn register_module(ns: PyObjectRef) {
     for (name, value) in constants {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
-}
-
-/// The embedder's working directory, or nothing when it reports none.
-fn cwd_bytes() -> Vec<u8> {
-    crate::importing::source_cwd().unwrap_or_default()
 }
 
 /// `posix.urandom(n)` — the same entry point the syscall arm publishes, over

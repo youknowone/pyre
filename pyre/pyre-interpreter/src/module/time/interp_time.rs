@@ -921,13 +921,306 @@ fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
         .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
 }
 
-// wasm32 has no libc `struct tm` calendar conversions; the broken-down-time
-// functions raise rather than dropping `time` from the module registry.
+/// The calendar a target with no libc has to compute for itself.
+///
+/// The conversions are the civil/serial-day pair whose derivation shifts the
+/// year to start in March: the leap day then falls at the end of the cycle and
+/// every case but the 400-year one disappears.  Days are counted from the
+/// epoch, so the pair is exact for every `time_t` the guest can hold.
+///
+/// One zone, and it is UTC.  There is no tzdata to read and no `TZ` to read one
+/// with, which is why `tzname` is `("UTC", "UTC")` and `timezone` is 0 here:
+/// `localtime` can only answer what `gmtime` answers.
 #[cfg(target_arch = "wasm32")]
-fn _c_gmtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
-    Err(crate::PyError::not_implemented(
-        "time.gmtime is unavailable on wasm32",
-    ))
+mod wasm_calendar {
+    use super::c_tm;
+
+    /// The widest field a `%<width>` prefix can ask a conversion to fill.
+    const MAX_FIELD_WIDTH: usize = 64;
+
+    /// The one zone this target has.  `time.tzname` publishes the same name
+    /// twice, and it is what `%Z` reports for a time that carries none.
+    const ZONE_NAME: &str = "UTC";
+
+    /// `y`, `m` and `d` for a day number counted from the epoch.
+    fn civil_from_days(days: i64) -> (i64, i64, i64) {
+        // Shift to an era starting 0000-03-01, which is what makes the leap
+        // day the last day of the 400-year cycle.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (era * 400 + yoe + i64::from(m <= 2), m, d)
+    }
+
+    /// The inverse: the day number a civil date names.  Out-of-range `m` and
+    /// `d` carry the way `mktime` normalizes them.
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = y - i64::from(m <= 2);
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let mp = if m > 2 { m - 3 } else { m + 9 };
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    fn is_leap(year: i64) -> bool {
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    }
+
+    /// The day of the year, counted from zero, that `struct tm` carries.
+    fn day_of_year(year: i64, month: i64, day: i64) -> i64 {
+        const CUMULATIVE: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+        CUMULATIVE[(month - 1) as usize] + day - 1 + i64::from(month > 2 && is_leap(year))
+    }
+
+    /// Broken-down UTC time for a count of seconds from the epoch, or nothing
+    /// for one whose year does not fit the `tm_year` field.
+    pub fn broken_down(seconds: i64) -> Option<c_tm> {
+        let days = seconds.div_euclid(86_400);
+        let rest = seconds.rem_euclid(86_400);
+        let (year, month, day) = civil_from_days(days);
+        Some(c_tm {
+            tm_sec: (rest % 60) as i32,
+            tm_min: ((rest / 60) % 60) as i32,
+            tm_hour: (rest / 3600) as i32,
+            tm_mday: day as i32,
+            tm_mon: (month - 1) as i32,
+            tm_year: i32::try_from(year - 1900).ok()?,
+            // 1970-01-01 was a Thursday, and `tm_wday` counts from Sunday.
+            tm_wday: ((days.rem_euclid(7) + 4) % 7) as i32,
+            tm_yday: day_of_year(year, month, day) as i32,
+            tm_isdst: 0,
+            tm_gmtoff: 0,
+            tm_zone: ZONE_NAME.to_string(),
+        })
+    }
+
+    /// The seconds a broken-down time names, with `tm_wday` and `tm_yday`
+    /// recomputed from the fields that were given.  Out-of-range fields carry
+    /// into the ones above them, which is the normalization `mktime` performs.
+    pub fn seconds_from(tm: &mut c_tm) -> Option<i64> {
+        let month_total = i64::from(tm.tm_year) + 1900 + i64::from(tm.tm_mon).div_euclid(12);
+        let month = i64::from(tm.tm_mon).rem_euclid(12) + 1;
+        let days = days_from_civil(month_total, month, i64::from(tm.tm_mday));
+        let seconds = days.checked_mul(86_400)?
+            + i64::from(tm.tm_hour) * 3600
+            + i64::from(tm.tm_min) * 60
+            + i64::from(tm.tm_sec);
+        let normalized = broken_down(seconds)?;
+        tm.tm_wday = normalized.tm_wday;
+        tm.tm_yday = normalized.tm_yday;
+        Some(seconds)
+    }
+
+    const WDAY_ABBR: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const WDAY_FULL: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MON_ABBR: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    const MON_FULL: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+
+    /// The weekday 31 December of `year` falls on, counted from Sunday.
+    fn dec31_weekday(year: i64) -> i64 {
+        (year + year.div_euclid(4) - year.div_euclid(100) + year.div_euclid(400)).rem_euclid(7)
+    }
+
+    /// A year holds 53 ISO weeks when it ends on a Thursday, or when the year
+    /// before it ended on a Wednesday and so pushed a week across.  Every other
+    /// year holds 52.
+    fn iso_weeks_in_year(year: i64) -> i64 {
+        52 + i64::from(dec31_weekday(year) == 4 || dec31_weekday(year - 1) == 3)
+    }
+
+    /// The ISO 8601 week-based year and week number.  A date in the first days
+    /// of January can belong to the last week of the year before it, and one in
+    /// the last days of December to week 1 of the year after.
+    fn iso_week(tm: &c_tm) -> (i64, i64) {
+        let year = i64::from(tm.tm_year) + 1900;
+        // ISO counts Monday as 1 and Sunday as 7; `tm_wday` counts from Sunday.
+        let weekday = if tm.tm_wday == 0 {
+            7
+        } else {
+            i64::from(tm.tm_wday)
+        };
+        let week = (i64::from(tm.tm_yday) + 1 - weekday + 10) / 7;
+        if week < 1 {
+            (year - 1, iso_weeks_in_year(year - 1))
+        } else if week > iso_weeks_in_year(year) {
+            (year + 1, 1)
+        } else {
+            (year, week)
+        }
+    }
+
+    /// One directive's expansion, or nothing for a byte that names none.
+    ///
+    /// An unrecognised conversion expands to nothing here and the caller echoes
+    /// the whole `%…` sequence it was spelled with.
+    fn directive(key: u8, tm: &c_tm) -> Option<String> {
+        let year = i64::from(tm.tm_year) + 1900;
+        let hour12 = match tm.tm_hour % 12 {
+            0 => 12,
+            other => other,
+        };
+        Some(match key {
+            b'a' => WDAY_ABBR[tm.tm_wday as usize % 7].to_string(),
+            b'A' => WDAY_FULL[tm.tm_wday as usize % 7].to_string(),
+            b'b' | b'h' => MON_ABBR[tm.tm_mon as usize % 12].to_string(),
+            b'B' => MON_FULL[tm.tm_mon as usize % 12].to_string(),
+            b'c' => format!(
+                "{} {} {:2} {:02}:{:02}:{:02} {year}",
+                WDAY_ABBR[tm.tm_wday as usize % 7],
+                MON_ABBR[tm.tm_mon as usize % 12],
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            ),
+            b'C' => format!("{:02}", year.div_euclid(100)),
+            b'd' => format!("{:02}", tm.tm_mday),
+            b'D' => format!(
+                "{:02}/{:02}/{:02}",
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                year.rem_euclid(100)
+            ),
+            b'e' => format!("{:2}", tm.tm_mday),
+            b'F' => format!("{year}-{:02}-{:02}", tm.tm_mon + 1, tm.tm_mday),
+            b'g' => format!("{:02}", iso_week(tm).0.rem_euclid(100)),
+            b'G' => iso_week(tm).0.to_string(),
+            b'H' => format!("{:02}", tm.tm_hour),
+            b'I' => format!("{hour12:02}"),
+            b'j' => format!("{:03}", tm.tm_yday + 1),
+            b'm' => format!("{:02}", tm.tm_mon + 1),
+            b'M' => format!("{:02}", tm.tm_min),
+            b'n' => "\n".to_string(),
+            b'p' => if tm.tm_hour < 12 { "AM" } else { "PM" }.to_string(),
+            b'r' => format!(
+                "{hour12:02}:{:02}:{:02} {}",
+                tm.tm_min,
+                tm.tm_sec,
+                if tm.tm_hour < 12 { "AM" } else { "PM" }
+            ),
+            b'R' => format!("{:02}:{:02}", tm.tm_hour, tm.tm_min),
+            b'S' => format!("{:02}", tm.tm_sec),
+            b't' => "\t".to_string(),
+            b'T' | b'X' => format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec),
+            b'u' => (if tm.tm_wday == 0 { 7 } else { tm.tm_wday }).to_string(),
+            // Weeks counted from the year's first Sunday (`%U`) and its first
+            // Monday (`%W`); the days before that one are week zero.
+            b'U' => format!("{:02}", (tm.tm_yday + 7 - tm.tm_wday) / 7),
+            b'V' => format!("{:02}", iso_week(tm).1),
+            b'w' => tm.tm_wday.to_string(),
+            b'W' => format!("{:02}", (tm.tm_yday + 7 - (tm.tm_wday + 6) % 7) / 7),
+            b'x' => format!(
+                "{:02}/{:02}/{:02}",
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                year.rem_euclid(100)
+            ),
+            b'y' => format!("{:02}", year.rem_euclid(100)),
+            b'Y' => year.to_string(),
+            b'z' => "+0000".to_string(),
+            // A caller's own 9-tuple carries no zone, and neither does the
+            // view `_gettmarg` takes of a `struct_time`, whose zone sits
+            // outside the sequence.  A C library falls back to `tzname` for
+            // exactly that argument, and there is one name to fall back to.
+            b'Z' if tm.tm_zone.is_empty() => ZONE_NAME.to_string(),
+            b'Z' => tm.tm_zone.clone(),
+            b'%' => "%".to_string(),
+            _ => return None,
+        })
+    }
+
+    /// A minimum field width zero-pads a numeric expansion, so that `%4Y`
+    /// renders year 1 as `0001`.  Anything else is handed back unpadded.
+    fn pad_to_width(text: String, width: usize) -> String {
+        let digits = text.strip_prefix(['+', '-']).unwrap_or(&text);
+        if text.len() >= width || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return text;
+        }
+        let sign = &text[..text.len() - digits.len()];
+        let zeros = "0".repeat(width - text.len());
+        format!("{sign}{zeros}{digits}")
+    }
+
+    /// `format` with each directive replaced, over bytes rather than text: a
+    /// format spelling a lone surrogate is WTF-8, and the bytes it is made of
+    /// are echoed unchanged the way a C library echoes what it does not read.
+    pub fn render(format: &[u8], tm: &c_tm) -> Vec<u8> {
+        let mut out = Vec::with_capacity(format.len());
+        let mut index = 0;
+        while index < format.len() {
+            if format[index] != b'%' {
+                out.push(format[index]);
+                index += 1;
+                continue;
+            }
+            // `%[+][width][E|O]<conversion>`.  The flag and the width are the
+            // extension `test.support.has_strftime_extensions` probes for; the
+            // two modifiers name locale alternatives this build does not have,
+            // and are accepted so that the conversion after them still lands.
+            let mut cursor = index + 1;
+            if format.get(cursor) == Some(&b'+') {
+                cursor += 1;
+            }
+            let width_start = cursor;
+            while format.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+            let width = std::str::from_utf8(&format[width_start..cursor])
+                .ok()
+                .and_then(|digits| digits.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(MAX_FIELD_WIDTH);
+            if matches!(format.get(cursor), Some(b'E' | b'O')) {
+                cursor += 1;
+            }
+            match format
+                .get(cursor)
+                .copied()
+                .and_then(|key| directive(key, tm))
+            {
+                Some(text) => out.extend_from_slice(pad_to_width(text, width).as_bytes()),
+                None => out.extend_from_slice(&format[index..format.len().min(cursor + 1)]),
+            }
+            index = cursor + 1;
+        }
+        out
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn _c_gmtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    wasm_calendar::broken_down(seconds)
+        .ok_or_else(|| crate::PyError::os_error("unconvertible time"))
 }
 
 // `interp_time.py c_gmtime` libc backend, used when the host_env
@@ -966,10 +1259,8 @@ fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn _c_localtime(_seconds: time_t) -> Result<c_tm, crate::PyError> {
-    Err(crate::PyError::not_implemented(
-        "time.localtime is unavailable on wasm32",
-    ))
+fn _c_localtime(seconds: time_t) -> Result<c_tm, crate::PyError> {
+    _c_gmtime(seconds)
 }
 
 #[cfg(all(unix, not(feature = "host_env")))]
@@ -1600,14 +1891,17 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // that would otherwise decode back into one Unicode scalar).
     let format_len = fmt_wtf8.code_points().count();
 
-    // wasm32 has no libc `strftime`; the function raises rather than dropping
-    // `time` from the module registry (same policy as `gmtime`/`localtime`).
+    // No libc `strftime` here, so the directives are expanded in this module.
+    // An embedded NUL is literal data rather than the end of the format, and
+    // needs no segmenting: nothing downstream reads the bytes as a C string.
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = format_len;
-        Err(crate::PyError::not_implemented(
-            "time.strftime is unavailable on wasm32",
-        ))
+        let _ = (format_len, passthrough);
+        let rendered = wasm_calendar::render(fmt_wtf8.as_bytes(), &tm);
+        Ok(match pyre_object::rutf8::wtf8_from_bytes(&rendered, true) {
+            Ok(wtf8) => w_str_from_wtf8_managed(wtf8.to_owned()),
+            Err(_) => crate::typedef::charp2uni(&rendered),
+        })
     }
     // strftime consults $TZ/tzname (%Z/%z) and the LC_TIME locale DB; under
     // sandbox the registration is stubbed, so the real body is compiled out.
@@ -1759,13 +2053,15 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 
 /// time.mktime(tuple) — interp_time.mktime
 pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    // No libc `struct tm` calendar on wasm32 (and other bare targets).
+    // One zone, and it is UTC, so the seconds a broken-down time names are the
+    // ones `gmtime` would hand back for it.  `tm_isdst` names no second
+    // reading here and is ignored the way it is on a platform with no DST rule.
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = args;
-        Err(crate::PyError::not_implemented(
-            "time.mktime is unavailable on this platform",
-        ))
+        let mut tm = _gettmarg(args, false)?;
+        let seconds = wasm_calendar::seconds_from(&mut tm)
+            .ok_or_else(|| crate::PyError::overflow_error("mktime argument out of range"))?;
+        Ok(floatobject::w_float_new(seconds as f64))
     }
     #[cfg(any(unix, windows))]
     {
@@ -1836,20 +2132,10 @@ fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
 pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let seconds = _get_seconds(args)?;
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = seconds;
-        Err(crate::PyError::not_implemented(
-            "time.ctime is unavailable on wasm32",
-        ))
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        // interp_time.py:ctime always delegates through localtime + _asctime.
-        // Keep one result-allocation path on Unix and Windows alike.
-        let tm = _c_localtime(seconds)?;
-        _asctime_from_tm(&tm)
-    }
+    // interp_time.py:ctime always delegates through localtime + _asctime.
+    // Keep one result-allocation path on every target.
+    let tm = _c_localtime(seconds)?;
+    _asctime_from_tm(&tm)
 }
 
 /// `app_time.py strptime` — parse `string` per `format`, delegating to
