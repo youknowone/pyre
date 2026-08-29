@@ -4044,7 +4044,9 @@ fn function_graph_to_flowspace_inner(
             continue;
         }
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))? {
+            if let Some(hlvalue) =
+                legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))?
+            {
                 // `legacy_const_define_hlvalue` only returns `Some` for ops
                 // with a result Variable, so this is always present here.
                 let Some(result_var) = legacy_op.result.as_ref() else {
@@ -4295,14 +4297,20 @@ fn function_graph_to_flowspace_inner(
             })
             .collect();
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))? {
+            if let Some(hlvalue) =
+                legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))?
+            {
                 if let Some(result_var) = legacy_op.result.as_ref() {
                     value_map.insert(result_var.clone(), hlvalue.clone());
                     if let Some(name) = legacy.value_name_for(result_var) {
                         name_to_value.insert(name.to_string(), hlvalue);
                     }
                 }
-                translated_ops.extend(translate_op_or_frontier(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op_or_frontier(
+                    legacy_op,
+                    &value_map,
+                    call_registry,
+                )?);
                 continue;
             }
 
@@ -4366,7 +4374,11 @@ fn function_graph_to_flowspace_inner(
                         )));
                     }
                 }
-                translated_ops.extend(translate_op_or_frontier(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op_or_frontier(
+                    legacy_op,
+                    &value_map,
+                    call_registry,
+                )?);
                 continue;
             }
 
@@ -4432,7 +4444,11 @@ fn function_graph_to_flowspace_inner(
             {
                 continue;
             }
-            translated_ops.extend(translate_op_or_frontier(legacy_op, &value_map, call_registry)?);
+            translated_ops.extend(translate_op_or_frontier(
+                legacy_op,
+                &value_map,
+                call_registry,
+            )?);
             if let Some(result_var) = legacy_op.result.as_ref()
                 && let Some(name) = legacy.value_name_for(result_var)
                 && let Some(value) = value_map.get(result_var).cloned()

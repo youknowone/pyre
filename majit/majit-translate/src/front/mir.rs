@@ -2330,6 +2330,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         if !lo.result_exc_call_results.is_empty()
+            || !lo.option_ok_or_else_try_sites.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
@@ -2377,6 +2378,16 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
         }
+        let option_ok_or_else_try_rewritten = if lo.option_ok_or_else_try_sites.is_empty() {
+            0
+        } else {
+            crate::front::result_exc::rewire_option_ok_or_else_try_sites(
+                &mut lo.graph,
+                &lo.option_ok_or_else_try_sites,
+                result_exc_callee,
+                static_addrs.error_carrier,
+            )
+        };
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
@@ -2687,6 +2698,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
+            || option_ok_or_else_try_rewritten > 0
             || next_rewritten > 0
             || checked_arith_rewritten > 0
             || checked_arith_uint_rewritten > 0
@@ -3278,6 +3290,13 @@ struct Lowering<'a> {
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
     result_exc_call_results: Vec<(Variable, Option<String>, ValueType)>,
+    /// Foreign `Option::ok_or_else(opt, closure)` results consumed immediately
+    /// by `?`, recorded for the combined value-or-exception rewrite in
+    /// [`crate::front::result_exc::rewire_option_ok_or_else_try_sites`].
+    /// This cannot share `result_exc_call_results`: the Option combinator is
+    /// not itself a translated scoped callee, so its `Result` shell must be
+    /// removed together with the Option select.
+    option_ok_or_else_try_sites: Vec<crate::front::result_exc::OptionOkOrElseTrySite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.  The paired [`ValueType`] is the
@@ -3601,6 +3620,7 @@ impl<'a> Lowering<'a> {
             string_byte_view_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
+            option_ok_or_else_try_sites: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_uint_sites: Vec::new(),
@@ -10987,10 +11007,35 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // `Option::ok_or_else(opt, closure)?` is one combined value-or-raise
+        // boundary in the translated graph.  Record it separately from an
+        // ordinary scoped `Result` call: `ok_or_else` is a foreign core
+        // combinator, and lowering only the downstream `?` would leave that
+        // unregistered residual (while lowering only the Option select would
+        // materialise the Result shell RPython never has).
+        let captured_option_ok_or_else_try = if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && name == "ok_or_else"
+            && args.len() == 2
+            && let Some(site) = self.recognize_option_ok_or_else_try_site(
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            ) {
+            self.option_ok_or_else_try_sites.push(site);
+            true
+        } else {
+            false
+        };
         // Capture scoped `Result<T, PyError>` call results for the
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
         if let OpKind::Call { .. } = &op_kind
+            && !captured_option_ok_or_else_try
             && callee_name_path.is_some()
             && crate::front::result_exc::tyref_is_result_of_carrier(
                 &call.dest.ty,
@@ -14545,6 +14590,48 @@ impl<'a> Lowering<'a> {
             result_ty,
             args_tuple_suffix,
             niche,
+        })
+    }
+
+    /// Resolve `Option::ok_or_else(opt, closure) -> Result<T, E>` for the
+    /// combined Option-select + immediate-`?` exception rewrite.
+    ///
+    /// The destination must use the configured exception carrier; this keeps
+    /// ordinary `ok_or_else` values and non-Python error domains as residual
+    /// Rust combinators.  The post-pass additionally proves the compiler's
+    /// private `Try::branch` diamond before it mutates the graph.
+    fn recognize_option_ok_or_else_try_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::result_exc::OptionOkOrElseTrySite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc)
+            || !crate::front::result_exc::tyref_is_result_of_carrier(
+                dest_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
+            return None;
+        }
+        let (option_owner, some_owner, payload_ty) =
+            self.resolve_option_consumer_owners(recv_ty)?;
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        let error_ty = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)
+            .map(|ty| tyref_to_value_type(&ty, self.llbc))
+            .unwrap_or(ValueType::Ref(None));
+        Some(crate::front::result_exc::OptionOkOrElseTrySite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            call_once_owner,
+            payload_ty,
+            error_ty,
+            niche: self.tyref_is_niche_option_ptr(recv_ty),
         })
     }
 
@@ -33760,6 +33847,72 @@ mod tests {
                 "the caller must rebuild one Result::{variant} shell"
             );
         }
+    }
+
+    /// PyPy's `_IOBase.writelines_w` receives `self` directly from the
+    /// gateway and raises on a missing receiver.  The Rust gateway spells the
+    /// same boundary as `args.first().copied().ok_or_else(...)?`; after the
+    /// combined lowering neither the foreign Option combinator nor the Result
+    /// `?` shell may survive, and the niladic closure's error must terminate on
+    /// the graph exception edge.
+    #[test]
+    #[ignore]
+    fn iobase_writelines_ok_or_else_try_is_value_or_exception() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "iobase_writelines",
+            crate::HostStaticAddrs {
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_wrappers: &[],
+                    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                    from_exc_object: Some(("PyError", "from_exc_object")),
+                },
+                ..crate::HostStaticAddrs::default()
+            },
+        )
+        .expect("lower iobase_writelines");
+
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "ok_or_else"
+                )
+            }),
+            "the foreign Option::ok_or_else residual must be gone"
+        );
+        let error_arm = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "call_once"
+                    )
+                })
+            })
+            .expect("the None arm calls its error closure");
+        assert!(
+            error_arm
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the None arm must raise through the native graph exception edge"
+        );
     }
 
     #[test]

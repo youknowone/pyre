@@ -50,6 +50,12 @@
 //!   `Link.last_exception`), which `flatten.rs` already turns into
 //!   `catch_exception` / rethrow shapes.
 //!
+//! - **Option-to-error rule** ([`rewire_option_ok_or_else_try_sites`]):
+//!   `Option::ok_or_else(...)?` is fused as one value-or-exception branch.
+//!   The Some arm forwards the payload directly; the None arm invokes the
+//!   niladic error closure and raises its materialised exception.  Neither the
+//!   foreign Option combinator nor its transient Result shell survives.
+//!
 //! ## Scope discipline
 //!
 //! Both rules must apply together per callee: a transformed callee
@@ -290,6 +296,22 @@ fn result_ok_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::V
         .and_then(|t| t.get(0))
 }
 
+/// The `Err` payload slot of a `Result<T, E>` type value.
+fn result_err_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
+    let body = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    if adt_path_of(body, llbc).as_deref() != Some("core::result::Result") {
+        return None;
+    }
+    body.get("Adt")
+        .and_then(|a| a.get("generics"))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.get(1))
+}
+
 /// The `Ok` payload of a `Result<T, PyError>` as its own [`TyRef`], or
 /// `None` when `ty` is not a `Result`.
 ///
@@ -299,6 +321,11 @@ fn result_ok_slot<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::V
 /// callee's result therefore have to read `T`, not the `Result` ADT.
 pub(crate) fn tyref_result_ok(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     result_ok_slot(ty, llbc).and_then(|slot| serde_json::from_value(slot.clone()).ok())
+}
+
+/// The `E` payload of a `Result<T, E>` as its own [`TyRef`].
+pub(crate) fn tyref_result_err(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    result_err_slot(ty, llbc).and_then(|slot| serde_json::from_value(slot.clone()).ok())
 }
 
 /// The `T` payload slot of an `Option<T>` type value, or `None` when `ty` is
@@ -657,29 +684,7 @@ fn lower_result_exc_returns_inner(
             // A carrier that declares no materialiser is already one such
             // value — a single owned word — so the payload is forwarded
             // into the raise unchanged and no call is emitted at all.
-            let v_exc = match spec.to_exc_object {
-                Some(segments) => graph
-                    .push_op_var(
-                        block_id,
-                        OpKind::Call {
-                            // The free-function spelling, not the method: it is
-                            // `dont_look_inside` and its address is published, so
-                            // the raise site records one residual call instead of
-                            // inlining the materialisation body — whose GC-root,
-                            // `w_exception_new_empty_impl`, WTF-8 and allocation
-                            // calls would otherwise sit in this JitCode and refuse
-                            // every descent that reaches it.
-                            target: CallTarget::FunctionPath {
-                                segments: segments.iter().copied().map(str::to_string).collect(),
-                            },
-                            args: vec![payload],
-                            result_ty: ValueType::Ref(None),
-                        },
-                        true,
-                    )
-                    .expect("to_exc_object call must produce a value"),
-                None => payload,
-            };
+            let v_exc = materialize_error_to_exc_object(graph, block_id, payload, spec);
             // `graph.set_raise_values(block, etype, evalue)`. The `etype`
             // link arg is write-only: `make_return`'s 2-arg arm emits
             // `raise <args[1]>` and never reads `args[0]`
@@ -721,6 +726,37 @@ fn lower_result_exc_returns_inner(
         ));
     }
     Ok(rewritten)
+}
+
+/// Materialise the carrier payload in the trace-level exception-value domain.
+///
+/// The free-function spelling is intentional: the helper is
+/// `dont_look_inside` and its published residual address keeps the carrier's
+/// allocation/rooting implementation out of the caller JitCode.  A consumer
+/// whose carrier already is the exception value declares no helper and gets
+/// the identity path.
+fn materialize_error_to_exc_object(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    payload: Variable,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Variable {
+    match spec.to_exc_object {
+        Some(segments) => graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: segments.iter().copied().map(str::to_string).collect(),
+                    },
+                    args: vec![payload],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("to_exc_object call must produce a value"),
+        None => payload,
+    }
 }
 
 /// True when some block's `Call` result flows straight to `returnblock`
@@ -1155,6 +1191,27 @@ pub(crate) struct RewireOutcome {
     pub fused: usize,
 }
 
+/// A foreign `Option::ok_or_else(opt, closure)` whose `Result<T, E>` is
+/// consumed immediately by Rust's `?` diamond.
+///
+/// RPython never materialises either shell at this boundary: for the motivating
+/// gateway, PyPy's `W_IOBase.writelines_w(self, space, w_lines)` receives the
+/// value directly and raises on the graph exception edge
+/// (`pypy/module/_io/interp_iobase.py:303-323`).  The MIR frontend records the
+/// owners while the concrete `Option<T>` / closure / `Result<T, E>` types are
+/// still available, then [`rewire_option_ok_or_else_try_sites`] restores that
+/// same value-or-raise graph shape after lowering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OptionOkOrElseTrySite {
+    pub result_var: Variable,
+    pub option_owner: String,
+    pub some_owner: String,
+    pub call_once_owner: String,
+    pub payload_ty: ValueType,
+    pub error_ty: ValueType,
+    pub niche: bool,
+}
+
 /// Per-site disposition for [`rewire_one_call_site`].
 enum SiteOutcome {
     Diamond,
@@ -1188,6 +1245,7 @@ pub(crate) fn rewire_result_exc_call_sites(
             payload_ty,
             enclosing_scoped,
             spec,
+            true,
         );
         let site = match site {
             Ok(site) => site,
@@ -1215,6 +1273,224 @@ pub(crate) fn rewire_result_exc_call_sites(
     Ok(outcome)
 }
 
+/// Fuse `Option::ok_or_else(...)?` into one Option test whose `Some` arm
+/// forwards `T` and whose `None` arm calls the niladic error closure and
+/// raises through the graph's native exception edge.
+///
+/// This is deliberately a combined rewrite.  Treating `ok_or_else` as an
+/// ordinary Option closure-select would build a `Result`, while treating it
+/// only as an ordinary scoped Result call would leave the foreign method as a
+/// residual.  RPython's flow graph has neither shell: it carries the value on
+/// the normal edge and the exception object on the exceptional edge
+/// (`rpython/translator/exceptiontransform.py:212-242`,
+/// `rpython/jit/codewriter/jtransform.py:406-469`).
+///
+/// The ordinary `?` matcher validates before its sole fallible mutation (the
+/// positional payload collapse).  The Option splice begins only after that
+/// matcher reports a complete private diamond; from there its sources are
+/// derived directly from the already-validated normal link, so no second
+/// decline point exists.  A mismatch therefore keeps the byte-identical
+/// residual call for the legacy fallback without cloning a potentially large
+/// portal graph per site.
+pub(crate) fn rewire_option_ok_or_else_try_sites(
+    graph: &mut FunctionGraph,
+    sites: &[OptionOkOrElseTrySite],
+    enclosing_scoped: bool,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> usize {
+    let mut rewritten = 0usize;
+    for site in sites {
+        match rewire_one_option_ok_or_else_try_site(graph, site, enclosing_scoped, spec) {
+            Ok(()) => rewritten += 1,
+            Err(msg) => {
+                crate::decline::record_reason(
+                    RESULT_EXC_CALLER_GATE,
+                    "option-ok-or-else-try-declined",
+                    &msg,
+                    &graph.name,
+                );
+            }
+        }
+    }
+    rewritten
+}
+
+fn rewire_one_option_ok_or_else_try_site(
+    graph: &mut FunctionGraph,
+    site: &OptionOkOrElseTrySite,
+    enclosing_scoped: bool,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Result<(), String> {
+    use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+
+    let name = graph.name.clone();
+    let a = graph
+        .blocks
+        .iter()
+        .position(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&site.result_var))
+        })
+        .ok_or_else(|| format!("{name}: ok_or_else result var has no producer block"))?;
+    let call_idx = graph.blocks[a]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&site.result_var))
+        .ok_or_else(|| format!("{name}: ok_or_else producer op vanished"))?;
+    if call_idx + 1 != graph.blocks[a].operations.len() {
+        return Err(format!(
+            "{name}: ok_or_else call is not the last operation of block {a}"
+        ));
+    }
+    let (opt, env) = match &graph.blocks[a].operations[call_idx].kind {
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } if name == "ok_or_else" && args.len() == 2 => (args[0].clone(), args[1].clone()),
+        other => {
+            return Err(format!(
+                "{name}: recorded ok_or_else site has a different producer: {other:?}"
+            ));
+        }
+    };
+
+    let result_shape = rewire_one_call_site(
+        graph,
+        &site.result_var,
+        "",
+        &site.payload_ty,
+        enclosing_scoped,
+        spec,
+        false,
+    )?;
+    if !matches!(result_shape, SiteOutcome::Diamond) {
+        return Err(format!(
+            "{name}: ok_or_else result is not consumed by an immediate `?` diamond"
+        ));
+    }
+
+    let a_id = graph.blocks[a].id;
+    debug_assert!(matches!(
+        graph.blocks[a].exitswitch,
+        Some(ExitSwitch::LastException)
+    ));
+    debug_assert_eq!(graph.blocks[a].exits.len(), 2);
+    let normal = graph.blocks[a]
+        .exits
+        .iter()
+        .find(|link| link.exitcase.is_none())
+        .cloned()
+        .expect("the Result diamond rewrite always installs one normal exit");
+
+    let mut carried = Vec::new();
+    for arg in &normal.args {
+        if let LinkArg::Value(v) = arg
+            && *v != site.result_var
+            && !carried.contains(v)
+        {
+            carried.push(v.clone());
+        }
+    }
+    let mut some_sources = carried.clone();
+    if !some_sources.contains(&opt) {
+        some_sources.push(opt.clone());
+    }
+    let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
+    let (none_bb, none_inputs) = graph.create_block_with_arg_vars(1);
+
+    let opt_in_some = map_source(&some_sources, &some_inputs, &opt)
+        .expect("some_sources explicitly includes the Option value");
+    let payload = if site.niche {
+        opt_in_some
+    } else {
+        let payload = graph.alloc_value_var();
+        graph
+            .block_mut(some_bb)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(payload.clone()),
+                kind: OpKind::FieldRead {
+                    base: opt_in_some,
+                    field: crate::model::FieldDescriptor {
+                        name: "__pos_0".to_string(),
+                        owner_root: Some(site.some_owner.clone()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                    },
+                    ty: site.payload_ty.clone(),
+                    pure: true,
+                },
+            });
+        payload
+    };
+    let some_args = reproduce_exit_args(
+        &normal,
+        &site.result_var,
+        &payload,
+        &some_sources,
+        &some_inputs,
+        &name,
+    )
+    .expect("some_sources contains every non-result value from the normal link");
+    close_goto_mixed(graph, some_bb, normal.target, some_args);
+
+    let env_in_none = none_inputs[0].clone();
+    let error = crate::front::option_closure_select::emit_call_once(
+        graph,
+        none_bb,
+        env_in_none,
+        None,
+        &site.call_once_owner,
+        site.error_ty.clone(),
+        "",
+    );
+    let exc = materialize_error_to_exc_object(graph, none_bb, error, spec);
+    graph.set_raise_values(none_bb, exc.clone(), exc);
+
+    graph.blocks[a].operations.truncate(call_idx);
+    let disc = graph.alloc_value_var();
+    if site.niche {
+        let null = graph.push_null_mut_ptr(a_id);
+        graph
+            .block_mut(a_id)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(disc.clone()),
+                kind: OpKind::BinOp {
+                    op: "ne".to_string(),
+                    lhs: opt.clone(),
+                    rhs: null,
+                    result_ty: ValueType::Int,
+                },
+            });
+    } else {
+        graph
+            .block_mut(a_id)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(disc.clone()),
+                kind: OpKind::FieldRead {
+                    base: opt.clone(),
+                    field: crate::model::FieldDescriptor {
+                        name: "__discriminant".to_string(),
+                        owner_root: Some(site.option_owner.clone()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                    },
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+            });
+    }
+    graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, vec![env]);
+    Ok(())
+}
+
 fn rewire_one_call_site(
     graph: &mut FunctionGraph,
     r: &Variable,
@@ -1222,6 +1498,7 @@ fn rewire_one_call_site(
     payload_ty: &ValueType,
     enclosing_scoped: bool,
     spec: crate::ErrorCarrierSpec<'_>,
+    allow_fallback: bool,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
@@ -1256,6 +1533,11 @@ fn rewire_one_call_site(
         )
     });
     let Some(branch_op_idx) = branch_op_idx else {
+        if !allow_fallback {
+            return Err(format!(
+                "{name}: scoped call result has no immediate Result::branch consumer"
+            ));
+        }
         // No `Result::branch` op → a hand-written `match` consumer.  The
         // drain-loop `match next()` fusion recognises its exact shape and
         // rewrites it into an exception-edge handler with an object-level
@@ -1328,6 +1610,11 @@ fn rewire_one_call_site(
     // AST-import code, off every hot path, but it is a real change to
     // pyre's compiled surface and any jitstats move traces here first.
     if assert_single_pred(graph, b, &name).is_err() {
+        if !allow_fallback {
+            return Err(format!(
+                "{name}: Result::branch block {b} is shared by multiple predecessors"
+            ));
+        }
         catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
         return Ok(SiteOutcome::Rewrapped);
     }
@@ -1342,6 +1629,11 @@ fn rewire_one_call_site(
     let (c, cf_c) =
         follow_single_exit(graph, b, &cf).map_err(|e| format!("{name}: branch block exit: {e}"))?;
     if assert_single_pred(graph, c, &name).is_err() {
+        if !allow_fallback {
+            return Err(format!(
+                "{name}: ControlFlow discriminant block {c} is shared by multiple predecessors"
+            ));
+        }
         catch_and_rewrap(graph, a, r, suffix, payload_ty, spec)?;
         return Ok(SiteOutcome::Rewrapped);
     }

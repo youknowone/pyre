@@ -3661,8 +3661,7 @@ fn run_two_phase_prepass_inner(
                     // MAJIT_RTYPER_FRONTIER: the adapter's whole call-wall set
                     // for this subject, not just the wall it stopped at. One
                     // line per wall, so the record splits without a banner.
-                    for wall in
-                        crate::translator::rtyper::flowspace_adapter::take_frontier_walls()
+                    for wall in crate::translator::rtyper::flowspace_adapter::take_frontier_walls()
                     {
                         eprintln!("[PREPASS phaseA wall] {:?}: {wall}", path);
                     }

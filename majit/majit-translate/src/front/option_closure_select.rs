@@ -498,7 +498,7 @@ fn read_some_payload(
 /// the single closure argument (a `(x,)` tuple) or `None` for a niladic closure
 /// (an empty tuple the opaque body ignores) — the same `Args`-tuple shape
 /// `Rvalue::Aggregate` emits.
-fn emit_call_once(
+pub(crate) fn emit_call_once(
     graph: &mut FunctionGraph,
     block: BlockId,
     env: Variable,
