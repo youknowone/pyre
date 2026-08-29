@@ -52,7 +52,7 @@ mod tests {
             assert!(!is_int(a));
             let hdr = majit_gc::header::header_of(a as usize);
             assert_eq!((*hdr).type_id(), W_NONE_GC_TYPE_ID);
-            assert!((*hdr).has_flag(majit_gc::flags::GCFLAG_NO_HEAP_PTRS));
+            assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));
         }
     }
 }

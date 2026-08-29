@@ -2197,6 +2197,7 @@ dependencies = [
 name = "majit-gc"
 version = "0.0.2"
 dependencies = [
+ "bitflags 2.13.0",
  "indexmap",
  "libc",
  "majit-ir",

@@ -6186,7 +6186,7 @@ GC-owned; stopping rather than dereferencing an unvalidated f_backref\n"
             (
                 header.type_id(),
                 header.is_forwarded(),
-                header.has_flag(majit_gc::flags::GCFLAG_TRACK_YOUNG_PTRS),
+                header.has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS),
             )
         } else {
             (u32::MAX, false, false)

@@ -4,13 +4,15 @@
 //! the type ID (lower 32 bits) and GC flags (upper 32 bits), matching
 //! incminimark's HDR.tid layout where `first_gcflag = 1 << (LONG_BIT//2)`.
 
+use crate::GcFlags;
+
 /// Number of bits reserved for the type ID in the lower half.
 pub const TYPE_ID_BITS: u32 = 32;
 pub const TYPE_ID_MASK: u64 = (1u64 << TYPE_ID_BITS) - 1;
 
-/// Shift applied to flag constants from `crate::flags` to position them
-/// in the upper half of the header word. The flags module defines flags
-/// at positions 0..N, but in the header they live at positions 32..32+N.
+/// Shift applied to `GcFlags` to position it in the upper half of the
+/// header word. `GcFlags` declares each flag at position 0..N, but in the
+/// header they live at positions 32..32+N.
 pub const FLAG_SHIFT: u32 = TYPE_ID_BITS;
 
 /// The sentinel value written into a forwarded nursery object's header.
@@ -46,10 +48,9 @@ impl GcHeader {
     }
 
     /// Create a new header with the given type ID and initial flags.
-    /// `raw_flags` are the flag constants from `crate::flags` (unshifted).
-    pub fn with_flags(type_id: u32, raw_flags: u64) -> Self {
+    pub fn with_flags(type_id: u32, raw_flags: GcFlags) -> Self {
         GcHeader {
-            tid_and_flags: ((raw_flags) << FLAG_SHIFT) | (type_id as u64),
+            tid_and_flags: (raw_flags.bits() << FLAG_SHIFT) | (type_id as u64),
         }
     }
 
@@ -59,28 +60,31 @@ impl GcHeader {
         (self.tid_and_flags & TYPE_ID_MASK) as u32
     }
 
-    /// Extract the raw flags (shifted back to positions 0..N).
+    /// Extract the flags (shifted back to positions 0..N).
+    ///
+    /// A forwarded header sets every bit, so the read retains bits no
+    /// constant names rather than dropping them.
     #[inline]
-    pub fn flags(self) -> u64 {
-        self.tid_and_flags >> FLAG_SHIFT
+    pub fn flags(self) -> GcFlags {
+        GcFlags::from_bits_retain(self.tid_and_flags >> FLAG_SHIFT)
     }
 
-    /// Set a flag bit. `flag` is an unshifted constant from `crate::flags`.
+    /// Set a flag bit.
     #[inline]
-    pub fn set_flag(&mut self, flag: u64) {
-        self.tid_and_flags |= flag << FLAG_SHIFT;
+    pub fn set_flag(&mut self, flag: GcFlags) {
+        self.tid_and_flags |= flag.bits() << FLAG_SHIFT;
     }
 
-    /// Clear a flag bit. `flag` is an unshifted constant from `crate::flags`.
+    /// Clear a flag bit.
     #[inline]
-    pub fn clear_flag(&mut self, flag: u64) {
-        self.tid_and_flags &= !(flag << FLAG_SHIFT);
+    pub fn clear_flag(&mut self, flag: GcFlags) {
+        self.tid_and_flags &= !(flag.bits() << FLAG_SHIFT);
     }
 
-    /// Test whether a flag bit is set. `flag` is an unshifted constant from `crate::flags`.
+    /// Test whether a flag bit is set.
     #[inline]
-    pub fn has_flag(self, flag: u64) -> bool {
-        self.tid_and_flags & (flag << FLAG_SHIFT) != 0
+    pub fn has_flag(self, flag: GcFlags) -> bool {
+        self.tid_and_flags & (flag.bits() << FLAG_SHIFT) != 0
     }
 
     /// Check if this header indicates a forwarded object.
@@ -210,7 +214,7 @@ pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
         value,
         GcHeader::with_flags(
             type_id,
-            crate::flags::GCFLAG_NO_HEAP_PTRS | crate::flags::GCFLAG_TRACK_YOUNG_PTRS,
+            crate::GcFlags::GCFLAG_NO_HEAP_PTRS | crate::GcFlags::GCFLAG_TRACK_YOUNG_PTRS,
         ),
     )
 }
@@ -241,35 +245,38 @@ fn alloc_with_gc_header_flags<T>(value: T, header: GcHeader) -> *mut T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flags;
+    use crate::GcFlags;
 
     #[test]
     fn test_new_header() {
         let hdr = GcHeader::new(42);
         assert_eq!(hdr.type_id(), 42);
-        assert_eq!(hdr.flags(), 0);
+        assert_eq!(hdr.flags(), GcFlags::empty());
     }
 
     #[test]
     fn test_with_flags() {
-        let hdr = GcHeader::with_flags(7, flags::GCFLAG_TRACK_YOUNG_PTRS | flags::GCFLAG_VISITED);
+        let hdr = GcHeader::with_flags(
+            7,
+            GcFlags::GCFLAG_TRACK_YOUNG_PTRS | GcFlags::GCFLAG_VISITED,
+        );
         assert_eq!(hdr.type_id(), 7);
-        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
-        assert!(hdr.has_flag(flags::GCFLAG_VISITED));
-        assert!(!hdr.has_flag(flags::GCFLAG_PINNED));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_VISITED));
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_PINNED));
     }
 
     #[test]
     fn test_set_clear_flag() {
         let mut hdr = GcHeader::new(1);
-        assert!(!hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
 
-        hdr.set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
-        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+        hdr.set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
         assert_eq!(hdr.type_id(), 1);
 
-        hdr.clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
-        assert!(!hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+        hdr.clear_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
         assert_eq!(hdr.type_id(), 1);
     }
 
@@ -297,39 +304,39 @@ mod tests {
             let hdr = header_of(p as usize);
             // type id recorded; flags clear (init_gc_object flags=0).
             assert_eq!((*hdr).type_id(), 0x1357);
-            assert_eq!((*hdr).flags(), 0);
-            assert!(!(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
-            assert!(!(*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS));
+            assert_eq!((*hdr).flags(), GcFlags::empty());
+            assert!(!(*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+            assert!(!(*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
         }
     }
 
     #[test]
     fn test_flags_dont_clobber_type_id() {
         let mut hdr = GcHeader::new(0xDEAD);
-        hdr.set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
-        hdr.set_flag(flags::GCFLAG_VISITED);
-        hdr.set_flag(flags::GCFLAG_PINNED);
+        hdr.set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+        hdr.set_flag(GcFlags::GCFLAG_VISITED);
+        hdr.set_flag(GcFlags::GCFLAG_PINNED);
         assert_eq!(hdr.type_id(), 0xDEAD);
-        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
-        assert!(hdr.has_flag(flags::GCFLAG_VISITED));
-        assert!(hdr.has_flag(flags::GCFLAG_PINNED));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_VISITED));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_PINNED));
     }
 
     #[test]
     fn test_multiple_flags() {
         let mut hdr = GcHeader::new(0);
-        hdr.set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
-        hdr.set_flag(flags::GCFLAG_HAS_CARDS);
-        hdr.set_flag(flags::GCFLAG_CARDS_SET);
+        hdr.set_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+        hdr.set_flag(GcFlags::GCFLAG_HAS_CARDS);
+        hdr.set_flag(GcFlags::GCFLAG_CARDS_SET);
 
-        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
-        assert!(hdr.has_flag(flags::GCFLAG_HAS_CARDS));
-        assert!(hdr.has_flag(flags::GCFLAG_CARDS_SET));
-        assert!(!hdr.has_flag(flags::GCFLAG_VISITED));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_HAS_CARDS));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_CARDS_SET));
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_VISITED));
 
-        hdr.clear_flag(flags::GCFLAG_HAS_CARDS);
-        assert!(!hdr.has_flag(flags::GCFLAG_HAS_CARDS));
-        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+        hdr.clear_flag(GcFlags::GCFLAG_HAS_CARDS);
+        assert!(!hdr.has_flag(GcFlags::GCFLAG_HAS_CARDS));
+        assert!(hdr.has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
     }
 
     #[test]

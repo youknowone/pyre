@@ -501,7 +501,7 @@ mod tests {
             // The header carries the real GC type id, not a 0 placeholder.
             let hdr = majit_gc::header::header_of(p as usize);
             assert_eq!((*hdr).type_id(), 0xDEAD_BEEF);
-            assert_eq!((*hdr).flags(), 0);
+            assert_eq!((*hdr).flags(), majit_gc::GcFlags::empty());
         }
     }
 }
