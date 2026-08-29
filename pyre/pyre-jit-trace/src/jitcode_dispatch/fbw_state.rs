@@ -1262,6 +1262,14 @@ pub fn fbw_foriter_report_delivered() {
 /// was not parked at the header its body pc names.  That is one lost iteration,
 /// so it bumps the gated tally as well as the census column.
 pub fn fbw_foriter_report_refused_header() {
+    // The frame is parked at the pc the walk entered from, which is before
+    // everything the walk executed, so the resume re-reaches this FOR_ITER.
+    // Restoring the cursor makes it re-consume the item the walk took; without
+    // it the resume reads the NEXT one and the iteration is lost.  Only this
+    // refusal may do it: the R1 body-effect refusal below means an effect
+    // already committed for this iteration, and re-running that body would
+    // double it.
+    fbw_bridge_iter_journal_rollback();
     crate::trace::fbw_diag::record_foriter_item_dropped();
     census_report_pending(super::ForiterInflightOutcome::RefusedHeader);
 }

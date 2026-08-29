@@ -3857,13 +3857,12 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // exhaustion arm) still records the completion; a successful attempt
     // replaces the entry with a fresh one anyway.
     if helper == majit_ir::RuntimeHelperKind::ForIterNext {
-        // A bridge/retrace recording walk has no forward delivery on abort, so
-        // journal the pre-advance cursor the way the range and zip FOR_ITER
-        // specializations journal theirs: without it the non-commit epilogue
-        // has nothing to restore and the consumed item is lost.
-        if ctx.trace_ctx.is_bridge_trace
-            && let Some(&iter) = args.first()
-        {
+        // Journal the pre-advance cursor the way the range and zip FOR_ITER
+        // specializations journal theirs.  A bridge recording that does not
+        // commit restores it in the walk epilogue; a root walk keeps it until
+        // the delivery site, which restores it only when it could not hand the
+        // item back at the loop header.
+        if let Some(&iter) = args.first() {
             fbw_bridge_iter_journal_capture(iter as pyre_object::PyObjectRef);
         }
         let body = fbw_foriter_body_from_op_pc(ctx, op_pc)

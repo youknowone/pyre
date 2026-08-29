@@ -2384,8 +2384,11 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // RETURN_VALUE but lost its result, so the interpreter fell through
         // with `None` (`pickletools.optimize` after the carrier abort).
         // The chain ran the callee forward from where the sub-walk stopped, so
-        // the eager stores it journaled stand exactly once.
+        // the eager stores it journaled stand exactly once.  Its iterator
+        // advances stand for the same reason, so drop their pre-advance
+        // cursors rather than restoring them.
         crate::jitcode_dispatch::fbw_store_journal_commit();
+        crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
     } else {
         // No blackhole terminal belongs to this walk.  Clear any sub-walk
         // payload before the guard-state replay, as the old unconditional
@@ -2394,8 +2397,11 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // Non-commit epilogue: the sub-walk concrete-executed the reconstructed
         // callee, and the blackhole replays it from the guard, so restore the
         // pre-walk heap rather than dropping the journals (which would leave every
-        // eager store standing to be applied a second time).
+        // eager store standing to be applied a second time).  The replay
+        // re-executes the sub-walk's FOR_ITER consumes too, so put their
+        // cursors back on the same condition.
         crate::jitcode_dispatch::fbw_store_journal_rollback();
+        crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
     }
     p2_drain_abort()
 }
@@ -5422,8 +5428,13 @@ fn run_perfn_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::fbw_locals_mirror_rollback();
         // A bridge/retrace recording that does not commit restores the
         // iterator cursor it eagerly advanced, so the interpreter resume
-        // re-consumes the in-flight item exactly once (no drop).
-        crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
+        // re-consumes the in-flight item exactly once (no drop).  A root walk
+        // keeps its entries instead: its abort still has the in-flight
+        // delivery ahead of it, and restoring here would put the cursor back
+        // for an item the delivery then also pushes.
+        if is_bridge_trace {
+            crate::jitcode_dispatch::fbw_bridge_iter_journal_rollback();
+        }
     }
     if authoritative {
         let mut end = match &walk_result {
@@ -6302,8 +6313,16 @@ fn full_body_walk_trace<Sym: WalkSym>(
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     // A continuation keeps them instead: see [`WalkJournals`].
+    //
+    // The cursor journal is settled by the same two owners as the store
+    // journal -- this walk's epilogue, or the delivery site after it -- so it
+    // is reset on the same condition.  A fresh walk drops what an aborted one
+    // left behind, which would otherwise be restored against an iterator this
+    // walk never advanced; a continuation keeps the drain sub-walks' entries
+    // for its own epilogue to settle.
     if matches!(journals, WalkJournals::Reset) {
         crate::jitcode_dispatch::fbw_store_journal_reset();
+        crate::jitcode_dispatch::fbw_bridge_iter_journal_clear();
     }
     // A bridge resumes mid-loop from a guard failure; its input args are the
     // guard's resumedata, already seeded into the bridge sym by
