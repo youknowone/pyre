@@ -10322,6 +10322,30 @@ impl JitState for PyreJitState {
         }
     }
 
+    fn extract_live_values_into(
+        &self,
+        meta: &Self::Meta,
+        out: &mut Vec<Value>,
+        raw: &mut Vec<i64>,
+        types: &mut Vec<Type>,
+    ) {
+        let _ = (raw, types);
+        if meta.trace_extra_reds == 1 {
+            // `warmstate.py WarmEnterState.make_entry_point` specializes the
+            // red-argument walk and hands the already-separated `frame` and
+            // `ec` values to `EnterJitAssembler`; it does not allocate a list
+            // and copy it into another entry buffer. The owning method above
+            // remains the cold-path API, while the warm entry refills the
+            // driver's retained buffer directly.
+            out.push(Value::Ref(majit_ir::GcRef(self.frame)));
+            out.push(Value::Ref(majit_ir::GcRef(
+                self.execution_context_as_usize(),
+            )));
+        } else {
+            out.extend(self.expanded_virtualizable_live_values_with_extra_reds(meta, &[]));
+        }
+    }
+
     fn close_loop_live_values(
         ctx: &majit_metainterp::TraceCtx,
         sym: &Self::Sym,
@@ -10404,6 +10428,15 @@ impl JitState for PyreJitState {
             Self::pypyjit_live_value_types_with_ec(meta)
         } else {
             Self::expanded_virtualizable_live_value_types_with_extra_reds(meta, &[])
+        }
+    }
+
+    fn live_value_types_into(&self, meta: &Self::Meta, out: &mut Vec<Type>) {
+        if meta.trace_extra_reds == 1 {
+            out.push(Type::Ref);
+            out.push(Type::Ref);
+        } else {
+            out.extend(Self::expanded_virtualizable_live_value_types_with_extra_reds(meta, &[]));
         }
     }
 
@@ -13567,6 +13600,16 @@ mod tests {
             with_ec[1],
             Value::Ref(majit_ir::GcRef(state.execution_context))
         );
+
+        let mut reused = Vec::with_capacity(2);
+        let allocation = reused.as_ptr();
+        let mut raw = Vec::new();
+        let mut types = Vec::new();
+        state.extract_live_values_into(&meta, &mut reused, &mut raw, &mut types);
+        assert_eq!(reused, with_ec);
+        assert_eq!(reused.as_ptr(), allocation);
+        assert!(raw.is_empty());
+        assert!(types.is_empty());
     }
 
     #[test]
@@ -13589,6 +13632,12 @@ mod tests {
             with_ec,
             vec![descriptor.reds()[0].tp, descriptor.reds()[1].tp]
         );
+
+        let mut reused = Vec::with_capacity(2);
+        let allocation = reused.as_ptr();
+        <PyreJitState as JitState>::live_value_types_into(&empty_state(), &meta, &mut reused);
+        assert_eq!(reused, with_ec);
+        assert_eq!(reused.as_ptr(), allocation);
     }
 
     #[test]
