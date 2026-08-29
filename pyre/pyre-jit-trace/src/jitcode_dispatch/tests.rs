@@ -226,6 +226,118 @@ fn a_blocker_behind_an_executed_call_is_a_decline() {
     assert!(!summary.body_not_walked);
 }
 
+/// An executed residual call the effectinfo names effect-free -- elidable,
+/// loop-invariant, or `not_in_trace` -- applies nothing a rollback would have
+/// to undo, so a blocker behind it stays on the rewind leg.  The scan asks
+/// through the `call_effect_free` hook; the helper without the hook keeps the
+/// conservative reading.
+#[test]
+fn a_blocker_behind_an_effect_free_call_is_not_a_decline() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+
+    let mut code = residual_call_with_funcbox(1);
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+
+    let mut asked = Vec::new();
+    let summary = super::inline_call::summarize_body_blockers_with(
+        &code,
+        1,
+        &[real, symbolic],
+        |_, _| None,
+        &mut |_, _| true,
+        &mut |descr_index| {
+            asked.push(descr_index);
+            true
+        },
+        &mut |_| None,
+    );
+    assert_eq!(
+        asked,
+        vec![0],
+        "only the real call's descr is asked; the blocker stops the walk"
+    );
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+    assert_eq!(summary.blocker_after_effect, None);
+    assert!(!summary.may_execute_effect);
+
+    let conservative =
+        super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
+    assert_eq!(conservative.blocker_after_effect, Some(symbolic));
+}
+
+/// A field write into an object this body allocated is no effect: a rewind
+/// drops the allocation.  The same write into a register the body did not
+/// fill from a `new*` keeps the conservative reading.
+#[test]
+fn a_write_into_a_fresh_allocation_is_not_an_effect() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let table = insns_opname_to_byte();
+    let new = *table
+        .get("new/d>r")
+        .expect("`new/d>r` must be in insns table");
+    let setfield = *table
+        .get("setfield_gc_i/rid")
+        .expect("`setfield_gc_i/rid` must be in insns table");
+
+    // r1 = new; r1.field = i0; residual(symbolic)
+    let mut code = vec![new, 0, 0, 1, setfield, 1, 0, 0, 0];
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_effect_free, Some(symbolic));
+    assert_eq!(summary.blocker_after_effect, None);
+    assert!(!summary.may_execute_effect);
+
+    // r2 was never allocated here: the write is an effect.
+    let mut code = vec![new, 0, 0, 1, setfield, 2, 0, 0, 0];
+    code.extend(residual_call_with_funcbox(1));
+    code.extend(void_return());
+    let summary = super::inline_call::summarize_body_blockers(&code, 1, &[symbolic], |_| None);
+    assert_eq!(summary.blocker_after_effect, Some(symbolic));
+    assert!(summary.may_execute_effect);
+}
+
+/// A `switch` whose arm table is known continues only at its arms and the
+/// fallthrough, so the state at one arm's switch does not reach a region no
+/// arm names; without the table every instruction start is a successor.
+#[test]
+fn a_switch_with_a_known_table_does_not_leak_its_state_to_every_start() {
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments(["__len"]);
+    let real = 0x1234_5678i64;
+    let switch = *insns_opname_to_byte()
+        .get("switch/id")
+        .expect("`switch/id` must be in insns table");
+
+    // 0: residual(real)  6: switch i0 d0  10: return  11: residual(symbolic)  17: return
+    let mut code = residual_call_with_funcbox(1);
+    code.extend([switch, 0, 0, 0]);
+    code.extend(void_return());
+    code.extend(residual_call_with_funcbox(2));
+    code.extend(void_return());
+    assert_eq!(code.len(), 18);
+
+    let known = super::inline_call::summarize_body_blockers_with(
+        &code,
+        1,
+        &[real, symbolic],
+        |_, _| None,
+        &mut |_, _| true,
+        &mut |_| false,
+        &mut |_| Some(vec![10]),
+    );
+    assert_eq!(
+        known.blocker_after_effect, None,
+        "pc 11 is no arm and no fallthrough"
+    );
+    assert_eq!(known.blocker_effect_free, None);
+
+    let widened =
+        super::inline_call::summarize_body_blockers(&code, 1, &[real, symbolic], |_| None);
+    assert_eq!(widened.blocker_after_effect, Some(symbolic));
+}
+
 /// A callee's blocker is judged by what has run in the caller, not by what had
 /// run in the callee: the same body reached with an effect behind it holds a
 /// blocker no rollback covers.

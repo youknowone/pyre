@@ -909,9 +909,30 @@ fn collect_descent_effect_aware_blockers(
             here.push((blocker, effect));
             false
         },
+        &mut residual_call_is_effect_free,
+        &mut switch_descr_targets,
     );
     for (blocker, effect) in here {
         record_reachable_blocker(out, blocker, entry_effect || effect);
+    }
+    let memo = descent_blocker_summary(jitcode_index);
+    eprintln!(
+        "[builtin-inline-summary] jitcode={jitcode_index} may_effect={} free={:?} after={:?} not_walked={}",
+        memo.may_execute_effect,
+        memo.blocker_effect_free.map(|b| format!("{b:#x}")),
+        memo.blocker_after_effect.map(|b| format!("{b:#x}")),
+        memo.body_not_walked
+    );
+    if let Some(pc) = memo.first_effect_pc {
+        let (opname, descr) = crate::jitcode_runtime::decode_op_at(jitcode.code.as_slice(), pc)
+            .map(|d| {
+                let descr = descr_operand_index(jitcode.code.as_slice(), &d);
+                (d.opname, descr)
+            })
+            .unwrap_or(("?", None));
+        eprintln!(
+            "[builtin-inline-first-effect] jitcode={jitcode_index} pc={pc} op={opname} descr={descr:?}"
+        );
     }
     for (callee, caller_effect) in callees {
         collect_descent_effect_aware_blockers(callee, entry_effect || caller_effect, visited, out);
@@ -1034,6 +1055,10 @@ struct DescentPoint {
     /// `allocate_callee_register_banks` uses: the slots at and above
     /// `num_regs_i` are pre-filled from `constants_i`.
     known_i: Vec<Option<i64>>,
+    /// Which Ref-bank slots hold an object this body itself allocated (a
+    /// `new*` result) on every path to here.  A write into such an object is
+    /// not an effect: a rewind discards the allocation with it.
+    fresh_r: Vec<bool>,
 }
 
 /// Whether stepping `opname` applies an effect the walk would have to undo.
@@ -1080,6 +1105,88 @@ fn label_operand_offset(argcodes: &str) -> Option<usize> {
     None
 }
 
+/// Register operands are one byte, so this many Ref-bank slots cover any body.
+const FRESH_SLOTS: usize = 256;
+
+/// Whether `op` is a heap write whose object operand -- the leading `r`
+/// register of every `setfield_gc_*` / `setarrayitem_gc_*` /
+/// `setinteriorfield_gc_*` -- holds an object allocated by this body.  The
+/// vable spellings write the frame, which is never fresh, and are not asked.
+fn heap_write_into_fresh_object(
+    code: &[u8],
+    op: &crate::jitcode_runtime::DecodedOp,
+    fresh_r: &[bool],
+) -> bool {
+    (op.opname.starts_with("setfield_gc")
+        || op.opname.starts_with("setarrayitem_gc")
+        || op.opname.starts_with("setinteriorfield_gc"))
+        && op.argcodes.starts_with('r')
+        && code
+            .get(op.pc + 1)
+            .is_some_and(|&obj| fresh_r.get(obj as usize).copied().unwrap_or(false))
+}
+
+/// The descr-pool index an op's first `d` operand names, read past the
+/// register and varlist operands before it the way `decode_op_at` advances
+/// over them: the funcbox and varlists of a `residual_call_*`, the key
+/// register of a `switch/id`.
+fn descr_operand_index(code: &[u8], op: &crate::jitcode_runtime::DecodedOp) -> Option<usize> {
+    let mut cursor = op.pc + 1;
+    for c in op.argcodes.chars() {
+        match c {
+            'i' | 'c' | 'r' | 'f' => cursor += 1,
+            'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
+            'd' => {
+                return Some(
+                    *code.get(cursor)? as usize | ((*code.get(cursor + 1)? as usize) << 8),
+                );
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether the residual call behind `descr_index` applies no effect the walk
+/// would have to undo, by the call's own effectinfo: an elidable or
+/// loop-invariant callee writes no live heap, and a `not_in_trace` callee runs
+/// at trace time under the contract that what it does is invisible to the
+/// program (`do_not_in_trace_call`).  Anything else keeps the scan's
+/// conservative reading of an executed residual call as effectful.
+fn residual_call_is_effect_free(descr_index: usize) -> bool {
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    let Some(descr) = descrs.at(descr_index) else {
+        return false;
+    };
+    let Some(call) = descr.as_call_descr() else {
+        return false;
+    };
+    let info = call.get_extra_info();
+    info.oopspecindex == majit_ir::descr::OopSpecIndex::NotInTrace
+        || matches!(
+            info.extraeffect,
+            majit_ir::ExtraEffect::ElidableCannotRaise
+                | majit_ir::ExtraEffect::ElidableCanRaise
+                | majit_ir::ExtraEffect::ElidableOrMemoryError
+                | majit_ir::ExtraEffect::LoopInvariant
+        )
+}
+
+/// The arm targets of the `switch/id` whose descr is `descr_index`, in key
+/// order, or `None` when the descr is not a switch table.
+fn switch_descr_targets(descr_index: usize) -> Option<Vec<usize>> {
+    let descrs = crate::jitcode_runtime::descr_ref_table();
+    let descr = descrs.at(descr_index)?;
+    let switch = descr.as_switch_descr()?;
+    Some(
+        switch
+            .const_keys_in_order()
+            .iter()
+            .filter_map(|&key| switch.lookup(key))
+            .collect(),
+    )
+}
+
 /// Recursive worker of [`descent_blocker_summary`].  `seen` is the stack of
 /// jitcode indices currently being scanned.
 fn summarize_descent_blockers(
@@ -1112,16 +1219,19 @@ fn summarize_descent_blockers(
     };
     seen.push(jitcode_index);
     let descrs = crate::jitcode_runtime::descr_ref_table();
-    let summary = summarize_body_blockers(
+    let summary = summarize_body_blockers_with(
         jitcode.code.as_slice(),
         jitcode.num_regs_i(),
         jitcode.constants_i.as_slice(),
-        |descr_index| {
+        |descr_index, _caller_effect| {
             descrs
                 .at(descr_index)
                 .and_then(|descr| descr.as_jitcode_descr().map(|jc| jc.jitcode_index()))
                 .map(|callee| summarize_descent_blockers(callee, seen))
         },
+        &mut |_blocker, _effect| true,
+        &mut residual_call_is_effect_free,
+        &mut switch_descr_targets,
     );
     seen.pop();
     summary
@@ -1145,6 +1255,8 @@ pub(crate) fn summarize_body_blockers(
         constants_i,
         |descr_index, _caller_effect| callee_summary(descr_index),
         &mut |_blocker, _effect| true,
+        &mut |_descr_index| false,
+        &mut |_descr_index| None,
     )
 }
 
@@ -1161,12 +1273,23 @@ pub(crate) fn summarize_body_blockers(
 /// `inline_call`, which the summary itself does not need — it folds the two
 /// cases through `blocker_after_effect.or(blocker_effect_free)` — but which a
 /// walk descending into the callee needs to classify what it finds there.
-fn summarize_body_blockers_with(
+///
+/// `call_effect_free` answers a `residual_call_*` op's descr index with
+/// whether that call is exempt from the effectful reading
+/// `descent_op_applies_effect` gives every residual call; the production
+/// answer is [`residual_call_is_effect_free`].
+///
+/// `switch_targets` answers a `switch/id` op's descr index with the arm
+/// targets its table holds ([`switch_descr_targets`]); `None` widens the
+/// successors to every instruction start.
+pub(crate) fn summarize_body_blockers_with(
     code: &[u8],
     num_regs_i: usize,
     constants_i: &[i64],
     mut callee_summary: impl FnMut(usize, bool) -> Option<DescentBlockerSummary>,
     on_blocker: &mut dyn FnMut(i64, bool) -> bool,
+    call_effect_free: &mut dyn FnMut(usize) -> bool,
+    switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
 ) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
@@ -1214,6 +1337,7 @@ fn summarize_body_blockers_with(
         DescentPoint {
             effect: false,
             known_i: entry_known,
+            fresh_r: vec![false; FRESH_SLOTS],
         },
     );
     let mut work = std::collections::VecDeque::from([0usize]);
@@ -1242,6 +1366,12 @@ fn summarize_body_blockers_with(
                                 widened = true;
                             }
                         }
+                        for (slot, incoming) in existing.fresh_r.iter_mut().zip(&state.fresh_r) {
+                            if *slot && !*incoming {
+                                *slot = false;
+                                widened = true;
+                            }
+                        }
                         if widened {
                             $work.push_back(target);
                         }
@@ -1264,6 +1394,7 @@ fn summarize_body_blockers_with(
         };
         let mut effect = point.effect;
         let mut known_i = point.known_i;
+        let mut fresh_r = point.fresh_r;
 
         if d.opname.starts_with("residual_call") {
             // Every `residual_call_*` argcode string opens with the `i` funcbox
@@ -1303,6 +1434,7 @@ fn summarize_body_blockers_with(
                 }
                 if callee.may_execute_effect {
                     effect = true;
+                    summary.first_effect_pc.get_or_insert(d.pc);
                 }
                 // The descent enters this callee, so a region of it the callee's
                 // own scan could not read is a region of this descent.
@@ -1317,10 +1449,16 @@ fn summarize_body_blockers_with(
                 // region of this descent the scan did not walk.
                 summary.body_not_walked = true;
                 effect = true;
+                summary.first_effect_pc.get_or_insert(d.pc);
             }
         }
-        if descent_op_applies_effect(d.opname) {
+        if descent_op_applies_effect(d.opname)
+            && !(d.opname.starts_with("residual_call")
+                && descr_operand_index(code, &d).is_some_and(|index| call_effect_free(index)))
+            && !heap_write_into_fresh_object(code, &d, &fresh_r)
+        {
             effect = true;
+            summary.first_effect_pc.get_or_insert(d.pc);
         }
         if effect {
             summary.may_execute_effect = true;
@@ -1344,10 +1482,22 @@ fn summarize_body_blockers_with(
                 *slot = carried;
             }
         }
+        // A Ref-bank write is fresh only when a `new*` op produced it; any
+        // other producer -- a field read, a call result, a copy -- may name
+        // live heap.
+        if d.argcodes
+            .split_once('>')
+            .is_some_and(|(_, dst)| dst == "r")
+            && let Some(&dst) = code.get(d.next_pc.wrapping_sub(1))
+            && let Some(slot) = fresh_r.get_mut(dst as usize)
+        {
+            *slot = d.opname.starts_with("new");
+        }
 
         let state = DescentPoint {
             effect,
             known_i: known_i.clone(),
+            fresh_r: fresh_r.clone(),
         };
         let label = label_operand_offset(d.argcodes).map(|off| read_label(code, &d, off));
         match d.opname {
@@ -1377,6 +1527,7 @@ fn summarize_body_blockers_with(
                         DescentPoint {
                             effect: true,
                             known_i: handler_known.clone(),
+                            fresh_r: vec![false; FRESH_SLOTS],
                         }
                     );
                 }
@@ -1406,6 +1557,7 @@ fn summarize_body_blockers_with(
                         DescentPoint {
                             effect: true,
                             known_i: handler_known.clone(),
+                            fresh_r: vec![false; FRESH_SLOTS],
                         }
                     );
                 }
@@ -1413,10 +1565,23 @@ fn summarize_body_blockers_with(
             }
             "switch" => {
                 // The arm table hangs off the descr rather than the code
-                // bytes, so name every instruction start as a successor.  That
-                // is a superset of the arms, which keeps the answer sound.
-                for &target in &starts {
-                    push!(points, work, target, state.clone());
+                // bytes.  With the table in hand the successors are its arms
+                // plus the fallthrough a key outside the table takes
+                // (`bhimpl_switch`); without it every instruction start is
+                // named, a superset that keeps the answer sound but lets the
+                // state at one arm's switch reach every other arm.
+                match descr_operand_index(code, &d).and_then(|index| switch_targets(index)) {
+                    Some(targets) => {
+                        for target in targets {
+                            push!(points, work, target, state.clone());
+                        }
+                        push!(points, work, d.next_pc, state);
+                    }
+                    None => {
+                        for &target in &starts {
+                            push!(points, work, target, state.clone());
+                        }
+                    }
                 }
             }
             _ => {
