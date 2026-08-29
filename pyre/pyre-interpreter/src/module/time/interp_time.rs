@@ -1147,7 +1147,15 @@ mod wasm_calendar {
             ),
             b'y' => format!("{:02}", year.rem_euclid(100)),
             b'Y' => year.to_string(),
-            b'z' => "+0000".to_string(),
+            // A time that does not say whether it is in daylight saving does
+            // not name a zone either, and both conversions come back empty.
+            b'z' | b'Z' if tm.tm_isdst < 0 => String::new(),
+            // The offset the caller supplied, in the `+HHMM` the C library
+            // writes: whole hours times a hundred plus the leftover minutes.
+            b'z' => {
+                let offset = tm.tm_gmtoff / 3600 * 100 + tm.tm_gmtoff % 3600 / 60;
+                format!("{}{:04}", if offset < 0 { '-' } else { '+' }, offset.abs())
+            }
             // A caller's own 9-tuple carries no zone, and neither does the
             // view `_gettmarg` takes of a `struct_time`, whose zone sits
             // outside the sequence.  A C library falls back to `tzname` for
