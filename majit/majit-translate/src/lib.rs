@@ -2150,6 +2150,9 @@ fn analyze_pipeline_from_module_paths(
         &config.pipeline.jit_drivers,
         &config.pipeline.transform.jitdriver_receiver_roots,
     );
+    for path in &config.pipeline.helper_graphs {
+        call_control.register_helper_graph(path.clone());
+    }
     // warmspot.py WarmRunnerDesc.make_virtualizable_infos —
     // assigns each registered driver's virtualizable metadata only after the
     // complete driver set exists.
@@ -2952,6 +2955,7 @@ mod portal_driver_tests {
             transform: GraphTransformConfig::default(),
             jit_drivers: vec![driver(portal.clone())],
             register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
         };
         register_configured_jitdrivers(
             &mut call_control,
@@ -3027,6 +3031,7 @@ mod portal_driver_tests {
                 split_portal: true,
             }],
             register_trait_families: Vec::new(),
+            helper_graphs: Vec::new(),
         };
         register_configured_jitdrivers(
             &mut call_control,
