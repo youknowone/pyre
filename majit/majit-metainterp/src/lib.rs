@@ -1562,16 +1562,14 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 /// it.  A `debug_assert!` cannot see that; the imbalance is only visible across
 /// a whole run.
 ///
-/// 61-63 are `maybe_start_tracing`'s two early returns and their denominator,
-/// which is 61 and is bumped unconditionally at entry so the two refusals can
-/// be read as fractions rather than bare totals: 62 = `sync_before` returned
-/// false, 63 = `live_values_match_descriptor` returned false. Both return
-/// before `on_back_edge_typed`, so `61 - 62 - 63` is the number of calls that
-/// reach the hotness counter at all. The two are counted separately because a
-/// deferral past the counter is worth the cost of whichever refusal dominates,
-/// and nothing currently says which does; a slot reading 0 across the corpus
-/// says its refusal never fires, which is a different design than one that
-/// fires often.
+/// 61-63 are `maybe_start_tracing`'s two trace-start refusals and their
+/// denominator. 61 is bumped unconditionally at entry, before the cheap
+/// hotness decision, so it remains the population against which both refusal
+/// rates are read: 62 = `sync_before` returned false, 63 =
+/// `live_values_match_descriptor` returned false. The two refusal checks run
+/// only after the counter answers `StartTracing`, matching `warmstate.py`'s
+/// tick-before-`bound_reached` ordering, and are counted separately because
+/// they reject different frontend contracts.
 ///
 /// 64-66 split slot 23, which is bumped on the disjunction
 /// `cell.is_compiled() || cell.is_tracing()` and so cannot attribute: the

@@ -5206,15 +5206,65 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// `green_key_values` and `driver_descriptor` arrive unbuilt — a key
-    /// factory and a borrow — because only the `StartTracing` arm below
-    /// consumes them.  warmstate.py `maybe_compile_and_run` orders the
-    /// decision the same way: greenargs, hash, `lookup_chain`, then
-    /// `jitcounter.tick` (`:467`), and only past the counter does it reach
-    /// `confirm_enter_jit` (`:501`) and the red-argument extraction loop
-    /// (`:503-506`).  `bound_reached` is handed `*args` raw for exactly this
-    /// reason.  Building either eagerly at the call site pays for both on the
-    /// `NotHot` / `RunCompiled` arms, which drop them unread.
+    /// Cheap half of `warmstate.py maybe_compile_and_run`: resolve the cell and
+    /// tick its counter, but do not build or consume tracing state.
+    ///
+    /// Upstream orders the decision the same way: greenargs, hash,
+    /// `lookup_chain`, then `jitcounter.tick` (`warmstate.py
+    /// maybe_compile_and_run`), and only the overflow calls `bound_reached`.
+    /// Returning `StartTracing` here is permission to build the frontend
+    /// snapshot and call [`Self::start_back_edge_trace`]; it has not marked the
+    /// cell as tracing yet, so a later descriptor/live-value refusal remains a
+    /// clean refusal rather than stranding a `JC_TRACING` cell.
+    pub(crate) fn on_back_edge_typed_decision(
+        &mut self,
+        green_key: u64,
+        green_key_raw: (usize, usize),
+    ) -> HotResult {
+        if self.tracing.is_some() {
+            return HotResult::AlreadyTracing;
+        }
+
+        // warmstate.py:446-511 — decide via the typed greenkey when the
+        // raw (code, pc) is available so the installed cell carries a
+        // `comparekey` when the start is committed, matching
+        // `JitCell.get_jitcell_for_args`.  The decision-only form deliberately
+        // leaves that commit to `start_back_edge_trace`, after the caller's
+        // frontend refusals.
+        match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            self.warm_state
+                .maybe_compile_decision_with_key(key, |_| true)
+        }) {
+            Some(hot) => hot,
+            None => self.warm_state.maybe_compile_decision(green_key),
+        }
+    }
+
+    /// Commit a `StartTracing` answer from
+    /// [`Self::on_back_edge_typed_decision`] and consume the expensive tracing
+    /// arguments.  `bound_reached` re-runs the cell policy without ticking the
+    /// counter, then marks the cell and sets up the trace.
+    pub(crate) fn start_back_edge_trace(
+        &mut self,
+        green_key: u64,
+        green_key_raw: (usize, usize),
+        green_key_values: Option<&dyn Fn() -> majit_ir::GreenKey>,
+        driver_descriptor: Option<&JitDriverStaticData>,
+        live_values: &[Value],
+    ) -> BackEdgeAction {
+        self.bound_reached(
+            green_key,
+            green_key_raw,
+            green_key_values.map(|make_key| make_key()),
+            driver_descriptor.cloned(),
+            live_values,
+        )
+    }
+
+    /// Compatibility wrapper that performs both halves in one call.
+    ///
+    /// `green_key_values` and `driver_descriptor` still arrive as a factory
+    /// and a borrow because only the `StartTracing` arm consumes them.
     pub fn on_back_edge_typed(
         &mut self,
         green_key: u64,
@@ -5223,53 +5273,15 @@ impl<M: Clone> MetaInterp<M> {
         driver_descriptor: Option<&JitDriverStaticData>,
         live_values: &[Value],
     ) -> BackEdgeAction {
-        if self.tracing.is_some() {
-            return BackEdgeAction::AlreadyTracing;
-        }
-
-        // warmstate.py:446-511 — decide via the typed greenkey when the
-        // raw (code, pc) is available so the installed cell carries a
-        // `comparekey` (`maybe_compile_with_key` → `ensure_cell_for_key`),
-        // matching `JitCell.get_jitcell_for_args`. The cell bucket is
-        // `key.get_uhash()` == `make_green_key`, so the legacy u64 hash
-        // flow still resolves to the same cell.
-        let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            self.warm_state.maybe_compile_with_key(key)
-        }) {
-            Some(h) => h,
-            None => self.warm_state.maybe_compile(green_key),
-        };
-        match hot {
+        match self.on_back_edge_typed_decision(green_key, green_key_raw) {
             HotResult::NotHot => BackEdgeAction::Interpret,
-            HotResult::StartTracing => {
-                self.prepare_trace_start_runtime();
-                // `maybe_compile_with_key` has just installed (or found) this
-                // key's cell, so resolving now names it — and the trace, its
-                // `compiled_loops` entry, its `JitCellToken::green_key` and
-                // every `rd_loop_token` stamped off that token all inherit the
-                // CELL key rather than a bucket hash they would each have to
-                // re-resolve. `warmstate.py:511 raise
-                // EnterJitAssembler(procedure_token, *execute_args)` carries
-                // the resolved artifact on for the same reason.
-                let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                    self.warm_state.cell_key_for(key)
-                })
-                .flatten()
-                .unwrap_or(green_key);
-                // The only reader of either value.  The key factory closes over
-                // `Copy` locals bound once at the back edge
-                // (`jit_interp/mod.rs` `__green_slotN`), and the descriptor
-                // borrow points at a snapshot `Arc` built by
-                // `driver_descriptor_for`, so neither observes anything the
-                // counter consultation above may have changed.
-                self.setup_tracing(
-                    green_key,
-                    green_key_raw,
-                    green_key_values.map(|make_key| make_key()),
-                    driver_descriptor.cloned(),
-                    live_values,
-                )
-            }
+            HotResult::StartTracing => self.start_back_edge_trace(
+                green_key,
+                green_key_raw,
+                green_key_values,
+                driver_descriptor,
+                live_values,
+            ),
             HotResult::AlreadyTracing => BackEdgeAction::AlreadyTracing,
             HotResult::RunCompiled => BackEdgeAction::RunCompiled,
         }

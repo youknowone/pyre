@@ -1596,7 +1596,7 @@ fn declarative_driver_rejects_live_value_type_mismatch() {
 }
 
 #[test]
-fn declarative_driver_can_reject_virtualizable_sync_before_tracing_starts() {
+fn declarative_driver_can_reject_virtualizable_sync_after_the_counter_fires() {
     let descriptor =
         DeclarativeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
@@ -1620,7 +1620,10 @@ fn declarative_driver_can_reject_virtualizable_sync_before_tracing_starts() {
             .back_edge_keyed(77, 77, &mut state, &(), || {})
             .is_none()
     );
-    assert_eq!(state.before_sync_calls, 2);
+    // `warmstate.py maybe_compile_and_run` ticks before `bound_reached`: the
+    // cold edge does not build/sync frontend state, while the hot edge still
+    // gives `sync_before` the same veto over the tracing start.
+    assert_eq!(state.before_sync_calls, 1);
     assert_eq!(state.after_sync_calls, 0);
     assert!(!driver.is_tracing());
 }

@@ -818,7 +818,7 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
-use crate::warmstate::FunctionEntryStep;
+use crate::warmstate::{FunctionEntryStep, HotResult};
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
@@ -1429,20 +1429,28 @@ impl JitDriverStaticData {
         self.portal_calldescr = Some(descr);
     }
 
-    /// Get only the green variables.
-    pub fn greens(&self) -> Vec<&JitDriverVar> {
-        self.vars
-            .iter()
-            .filter(|v| v.kind == VarKind::Green)
-            .collect()
+    /// Index separating the constructor-preserved `[greens..., reds...]`
+    /// layout. Keeping the declaration partition in `vars` lets both accessors
+    /// below borrow slices instead of allocating pointer vectors.
+    fn green_red_split(&self) -> usize {
+        let split = self.vars.partition_point(|var| var.kind == VarKind::Green);
+        debug_assert!(
+            self.vars[split..]
+                .iter()
+                .all(|var| var.kind == VarKind::Red),
+            "JitDriverStaticData vars must keep greens before reds"
+        );
+        split
     }
 
-    /// Get only the red variables.
-    pub fn reds(&self) -> Vec<&JitDriverVar> {
-        self.vars
-            .iter()
-            .filter(|v| v.kind == VarKind::Red)
-            .collect()
+    /// Get only the green variables without allocating.
+    pub fn greens(&self) -> &[JitDriverVar] {
+        &self.vars[..self.green_red_split()]
+    }
+
+    /// Get only the red variables without allocating.
+    pub fn reds(&self) -> &[JitDriverVar] {
+        &self.vars[self.green_red_split()..]
     }
 
     /// Number of green variables.
@@ -4991,9 +4999,9 @@ impl<S: JitState> JitDriver<S> {
     /// Takes the green key's hash eagerly and the key itself lazily.
     ///
     /// Only the hash is needed unconditionally — it selects the cell and
-    /// answers `has_compiled_loop`. The typed [`GreenKey`] is read at exactly
-    /// one place, `Self::maybe_start_tracing`'s `on_back_edge_typed` call,
-    /// which is reached only after `back_edge_internal`'s early returns
+    /// answers `has_compiled_loop`. The typed [`GreenKey`] is read only by the
+    /// cell-resolution/decision path and, on a tracing start, by the tracing
+    /// commit. Both are reached only after `back_edge_internal`'s early returns
     /// (already tracing, `!can_trace`, cross-loop-cut decline, and the whole
     /// `has_compiled_loop` branch — i.e. every entry into compiled code).
     /// Building it eagerly spent the key's `values` / `types` vectors on those
@@ -7008,6 +7016,28 @@ impl<S: JitState> JitDriver<S> {
         // the same two checks, and folding three doors into one slot would say
         // nothing about any of them.
         crate::mc_diag_bump(61); // mst_entered
+        // warmstate.py `maybe_compile_and_run` consults the cell before
+        // `bound_reached` builds tracing state.  Pyre's abort ceiling is the
+        // equivalent permanent refusal: `back_edge_internal` has already
+        // resolved the bucket hash to this one cell key, so the latch can be
+        // answered without constructing frontend state.  Keep slot 81 on the
+        // same population as the mirrored refusal in
+        // `maybe_compile_decision_with_meta`.
+        if self.meta.warm_state.is_ceiling_latched(green_key) {
+            crate::mc_diag_bump(81); // abort_ceiling_refused
+            return false;
+        }
+
+        match self
+            .meta
+            .on_back_edge_typed_decision(green_key, (state.code_ptr(), target_pc))
+        {
+            HotResult::NotHot | HotResult::AlreadyTracing | HotResult::RunCompiled => {
+                return false;
+            }
+            HotResult::StartTracing => {}
+        }
+
         let meta = state.build_meta(target_pc, env);
         let descriptor = self.driver_descriptor_for(state, &meta);
         // Resolved here with the descriptor and carried to both ends of
@@ -7029,15 +7059,13 @@ impl<S: JitState> JitDriver<S> {
             return false;
         }
 
-        match self.meta.on_back_edge_typed(
+        match self.meta.start_back_edge_trace(
             green_key,
             (state.code_ptr(), target_pc),
-            // Neither the typed key nor the descriptor is built here. Both are
-            // read at exactly one site — the `StartTracing` arm inside
-            // `on_back_edge_typed` — so the factory and a borrow are passed
-            // instead of a built key and a deep clone. Every earlier return in
-            // `back_edge_internal`, and both returns above, leave them unbuilt;
-            // the `Interpret` and `RunCompiled` arms drop them unread.
+            // Neither the typed key nor the descriptor is built before the
+            // counter decision. Both are consumed only while committing its
+            // `StartTracing` answer, so the factory and a borrow avoid a deep
+            // clone until this cold arm.
             structured_green_key,
             descriptor.as_deref(),
             &live_values,
@@ -9107,6 +9135,12 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct CountingDoorState {
+        build_meta_calls: std::cell::Cell<usize>,
+        extract_live_values_calls: std::cell::Cell<usize>,
+    }
+
+    #[derive(Default)]
     struct TypedInputState {
         raw_live_values: Vec<i64>,
         typed_live_values: Vec<Value>,
@@ -9151,6 +9185,42 @@ mod tests {
         fn restore_values(&mut self, _meta: &Self::Meta, values: &[Value]) {
             self.restored_values = values.to_vec();
         }
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
+    impl JitState for CountingDoorState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {
+            self.build_meta_calls.set(self.build_meta_calls.get() + 1);
+        }
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+            self.extract_live_values_calls
+                .set(self.extract_live_values_calls.get() + 1);
+            Vec::new()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
 
         fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
             Vec::new()
@@ -9481,6 +9551,57 @@ mod tests {
             crate::mc_diag(61) >= before + 2,
             "mst_entered did not move across two back edges that reached the door"
         );
+    }
+
+    #[test]
+    fn cold_back_edges_do_not_build_frontend_state() {
+        let mut driver = JitDriver::<CountingDoorState>::new(10);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 4299u64;
+        let mut state = CountingDoorState::default();
+
+        for _ in 0..4 {
+            assert!(
+                driver
+                    .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+                    .is_none()
+            );
+        }
+
+        assert!(!driver.is_tracing());
+        assert_eq!(state.build_meta_calls.get(), 0);
+        assert_eq!(state.extract_live_values_calls.get(), 0);
+    }
+
+    #[test]
+    fn ceiling_latched_back_edge_skips_frontend_state() {
+        use crate::warmstate::MAX_TRACE_ABORT_COUNT;
+
+        let mut driver = JitDriver::<CountingDoorState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let key = 4343u64;
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(key, &[]),
+            BackEdgeAction::StartedTracing
+        ));
+        driver.meta.abort_trace(false);
+        for _ in 1..MAX_TRACE_ABORT_COUNT {
+            driver.meta.warm_state_mut().abort_tracing(key, false);
+        }
+        assert!(driver.meta.warm_state.is_ceiling_latched(key));
+
+        let mut state = CountingDoorState::default();
+        assert!(
+            driver
+                .back_edge_or_run_compiled_keyed(key, 7, &mut state, &(), || {})
+                .is_none()
+        );
+        assert_eq!(state.build_meta_calls.get(), 0);
+        assert_eq!(state.extract_live_values_calls.get(), 0);
     }
 
     #[test]
