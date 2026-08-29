@@ -12649,16 +12649,32 @@ fn handle<Sym: WalkSym>(
                         .map(|frame| frame.w_code),
                 );
             }
+            // A carrier resume has no return site to hand a
+            // `SubLoopCalleeCallAssembler` to: `drive_bridge_frame_subwalk` is
+            // the reconstructed frame's own walk, so the outcome surfaces out of
+            // it and reaches the drain, which threads only `SubReturn` and
+            // `SubRaise` and sends everything else to its journal-rollback abort
+            // epilogue.  That epilogue hands the guard back to a blackhole resume
+            // from `rd_numb`, re-entering this frame at the coordinate the walk
+            // started from, and the journal does not reach a residual call that
+            // already wrote the live heap.  `ZipExtFile.read` is the witness: its
+            // slow path clears `_readbuffer` and zeroes `_offset` before reaching
+            // the `while n > 0` header, so the re-entry recomputes `n` and `buf`
+            // from the cleared buffer and the member loses one buffer's worth of
+            // bytes.  `carrier_resume` is set on the reconstructed frame's own
+            // context and nowhere else, so a nested inline inside that frame
+            // still folds its own recursive call to a CALL_ASSEMBLER.
             let callee_code = (!ctx.is_top_level
-                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
-            .then(|| {
-                ctx.session
-                    .borrow()
-                    .framestack
-                    .last()
-                    .map(|frame| frame.w_code)
-            })
-            .flatten();
+                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none()
+                && !ctx.fbw_mode.carrier_resume)
+                .then(|| {
+                    ctx.session
+                        .borrow()
+                        .framestack
+                        .last()
+                        .map(|frame| frame.w_code)
+                })
+                .flatten();
             if let Some(callee_code) = callee_code {
                 let callee_key = crate::driver::make_green_key(
                     callee_code as *const (),
@@ -12698,12 +12714,17 @@ fn handle<Sym: WalkSym>(
                     // surface a recursive CALL_ASSEMBLER request to the caller's
                     // inline return site (mirror `opimpl_recursive_call_
                     // assembler`, metainterp.rs).
-                    let callee_code = ctx
-                        .session
-                        .borrow()
-                        .framestack
-                        .last()
-                        .map(|frame| frame.w_code);
+                    // Same carrier-resume exclusion as the arm above, for
+                    // the same reason.
+                    let callee_code = (!ctx.fbw_mode.carrier_resume)
+                        .then(|| {
+                            ctx.session
+                                .borrow()
+                                .framestack
+                                .last()
+                                .map(|frame| frame.w_code)
+                        })
+                        .flatten();
                     if let Some(callee_code) = callee_code {
                         let callee_key = crate::driver::make_green_key(
                             callee_code as *const (),
