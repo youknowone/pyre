@@ -1,12 +1,13 @@
 # pyre-check: max-pypy-ratio=6
-# The ceiling sits between the two measured states: folded this runs 2.5x
-# pypy, and with `unary_invert_int` suppressed about 15.8x.
+# pyre-check: spec-folds=unary_negative_descent,unary_invert_descent
+# The ceiling sits between the two measured states: with the orthodox unary
+# descents this runs 2.5x pypy, and with invert descent suppressed about 15.8x.
 # Unary operations must observe the current loop-carried integer. Exercise
 # both ordinary values and the large-integer boundary, plus neighboring
 # operations that serve as controls. Deterministic.
-# A hot `~i` loop is folded here too: without the `unary_invert_int` fold each
-# iteration leaves a `CallMayForce` residual instead of an `IntInvert`, which
-# measures 6.9x on its own (0.095s -> 0.653s).
+# A hot `~i` loop is descended here too: without `unary_invert_descent` each
+# iteration leaves a `CallMayForce` residual instead of the interpreter body's
+# `IntInvert`, which measures 6.9x on its own (0.095s -> 0.653s).
 
 
 def loop_carried_neg(n):
@@ -44,7 +45,7 @@ print(controls(30000))
 
 
 def hot_invert(n):
-    """Hot `~int`, the `unary_invert_int` fold."""
+    """Hot `~int`, served by the interpreter-body invert descent."""
     s = 0
     i = 0
     while i < n:
