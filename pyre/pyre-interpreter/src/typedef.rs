@@ -25194,7 +25194,11 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", bytearray_descr_init),
+            crate::gateway::make_builtin_function_with_doc(
+                "__init__",
+                bytearray_descr_init,
+                "Initialize self.  See help(type(self)) for accurate signature.",
+            ),
         )
     };
     unsafe {
@@ -25212,7 +25216,6 @@ fn init_bytearray_type(ns: PyObjectRef) {
     for (name, function, arity) in [
         ("__repr__", bytearray_descr_repr as DunderFn, 1),
         ("__str__", bytearray_descr_repr, 1),
-        ("__reduce__", bytearray_descr_reduce, 1),
         ("__reduce_ex__", bytearray_descr_reduce_ex, 2),
         ("__alloc__", bytearray_descr_alloc, 1),
         ("resize", bytearray_descr_resize, 2),
@@ -25225,6 +25228,18 @@ fn init_bytearray_type(ns: PyObjectRef) {
             )
         };
     }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__reduce__",
+                bytearray_descr_reduce,
+                1,
+                "Return state information for pickling.",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -25243,12 +25258,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__mod__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__mod__",
                 |args| unsafe {
                     crate::objspace::std::formatting::bytes_format_percent(args[0], args[1])
                 },
                 2,
+                "Return self%value.",
             ),
         )
     };
@@ -25256,7 +25272,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rmod__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__rmod__",
                 |args| {
                     if unsafe { pyre_object::is_bytearray(args[1]) } {
@@ -25268,6 +25284,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "Return value%self.",
             ),
         )
     };

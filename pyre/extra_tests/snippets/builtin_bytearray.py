@@ -4,6 +4,15 @@ import sys
 
 from testutils import assert_raises
 
+bytearray_descriptor_docs = {
+    "__init__": "Initialize self.  See help(type(self)) for accurate signature.",
+    "__mod__": "Return self%value.",
+    "__rmod__": "Return value%self.",
+    "__reduce__": "Return state information for pickling.",
+}
+for method_name, expected_doc in bytearray_descriptor_docs.items():
+    assert getattr(bytearray, method_name).__doc__ == expected_doc
+
 # new
 assert bytearray([1, 2, 3])
 assert bytearray((1, 2, 3))
