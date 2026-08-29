@@ -22755,6 +22755,22 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 crate::builtins::sequence_fast(iterable, "can only join an iterable")?
             }
         };
+        // `StringMethods.descr_join` asks `_join_return_one` before entering
+        // `_str_join_many_items`.  `W_BytesObject._join_return_one` accepts
+        // only an exact `bytes` item (including when the separator itself is
+        // a user subclass); `W_BytearrayObject._join_return_one` is always
+        // false because its mutable result must be fresh.
+        if items.len() == 1
+            && unsafe { pyre_object::bytesobject::is_bytes(args[0]) }
+            && unsafe {
+                pyre_object::pyobject::is_exact_type(
+                    items[0],
+                    &pyre_object::bytesobject::BYTES_TYPE,
+                )
+            }
+        {
+            return Ok(items[0]);
+        }
         let mut out: Vec<u8> = Vec::new();
         for (i, &item) in items.iter().enumerate() {
             if i > 0 {

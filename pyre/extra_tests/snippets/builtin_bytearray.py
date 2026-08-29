@@ -370,6 +370,10 @@ with assert_raises(TypeError):
 assert bytearray(b"abc").join((bytearray(b"123"), bytearray(b"xyz"))) == bytearray(
     b"123abcxyz"
 )
+join_item = bytes(bytearray(b"single"))
+joined_item = bytearray().join([join_item])
+assert joined_item == bytearray(b"single")
+assert joined_item is not join_item
 
 
 # endswith startswith
