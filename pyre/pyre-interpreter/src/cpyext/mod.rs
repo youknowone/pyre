@@ -680,7 +680,7 @@ pub fn create_dynamic(spec: PyObjectRef) -> Result<PyObjectRef, crate::PyError> 
 #[majit_macros::dont_look_inside]
 pub(super) fn call_cfunction(
     function: *const std::ffi::c_void,
-    flags: c_int,
+    flags: methodobject::MethFlags,
     w_self: PyObjectRef,
     positional: &[PyObjectRef],
     keywords: &[(String, PyObjectRef)],
@@ -693,13 +693,13 @@ pub(super) fn call_cfunction(
 /// arguments.
 pub(super) fn call_cfunction_in_class(
     function: *const std::ffi::c_void,
-    flags: c_int,
+    flags: methodobject::MethFlags,
     w_self: PyObjectRef,
     defining_class: Option<PyObjectRef>,
     positional: &[PyObjectRef],
     keywords: &[(String, PyObjectRef)],
 ) -> Result<PyObjectRef, crate::PyError> {
-    use methodobject::{METH_FASTCALL, METH_KEYWORDS, METH_NOARGS, METH_O};
+    use methodobject::MethFlags;
 
     if function.is_null() {
         return Err(crate::PyError::new(
@@ -720,7 +720,7 @@ pub(super) fn call_cfunction_in_class(
     }
     let value_slot = |index: usize| pyre_object::gc_roots::shadow_stack_get(base + 1 + index);
 
-    let fastcall = flags & METH_FASTCALL != 0;
+    let fastcall = flags.contains(MethFlags::METH_FASTCALL);
     let mut arguments = std::ptr::null_mut();
     let mut keywords_arg = std::ptr::null_mut();
     let mut fastcall_slots: Vec<*mut CPyObject> = Vec::new();
@@ -728,19 +728,19 @@ pub(super) fn call_cfunction_in_class(
         for index in 0..positional.len() + keywords.len() {
             fastcall_slots.push(pyobject::make_ref(value_slot(index)));
         }
-        if flags & METH_KEYWORDS != 0 && !keywords.is_empty() {
+        if flags.contains(MethFlags::METH_KEYWORDS) && !keywords.is_empty() {
             let names: Vec<PyObjectRef> = keywords
                 .iter()
                 .map(|(name, _)| pyre_object::w_str_new(name))
                 .collect();
             keywords_arg = pyobject::make_ref(pyre_object::tupleobject::w_tuple_new(names));
         }
-    } else if flags & (METH_NOARGS | METH_O) == 0 {
+    } else if !flags.intersects(MethFlags::METH_NOARGS | MethFlags::METH_O) {
         let items: Vec<PyObjectRef> = (0..positional.len()).map(value_slot).collect();
         let tuple = pyre_object::tupleobject::w_tuple_new(items);
         let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(tuple);
-        if flags & METH_KEYWORDS != 0 && !keywords.is_empty() {
+        if flags.contains(MethFlags::METH_KEYWORDS) && !keywords.is_empty() {
             let dict = pyre_object::dictmultiobject::w_dict_new();
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(dict);
@@ -756,7 +756,7 @@ pub(super) fn call_cfunction_in_class(
             keywords_arg = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(dict_slot));
         }
         arguments = pyobject::make_ref(pyre_object::gc_roots::shadow_stack_get(tuple_slot));
-    } else if flags & METH_O != 0 {
+    } else if flags.contains(MethFlags::METH_O) {
         arguments = pyobject::make_ref(value_slot(0));
     }
 
@@ -784,7 +784,7 @@ pub(super) fn call_cfunction_in_class(
                 positional.len() as isize,
                 keywords_arg,
             )
-        } else if fastcall && flags & METH_KEYWORDS != 0 {
+        } else if fastcall && flags.contains(MethFlags::METH_KEYWORDS) {
             let call: unsafe extern "C" fn(
                 *mut CPyObject,
                 *const *mut CPyObject,
@@ -804,7 +804,7 @@ pub(super) fn call_cfunction_in_class(
                 isize,
             ) -> *mut CPyObject = std::mem::transmute(function);
             call(receiver, fastcall_slots.as_ptr(), positional.len() as isize)
-        } else if flags & METH_KEYWORDS != 0 {
+        } else if flags.contains(MethFlags::METH_KEYWORDS) {
             let call: unsafe extern "C" fn(
                 *mut CPyObject,
                 *mut CPyObject,

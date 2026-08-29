@@ -1,7 +1,7 @@
 //! Module definitions and method-table conversion -- PyPy
 //! `cpyext/modsupport.py`.
 
-use super::methodobject::{CPyMethodDef, METH_CLASS, METH_COEXIST, METH_STATIC, new_pycfunction};
+use super::methodobject::{CPyMethodDef, MethFlags, new_pycfunction};
 use super::pyerrors::{self, trap};
 use super::pyobject::{self, CPyObject, REFCNT_IMMORTAL};
 use pyre_object::{PY_NULL, PyObjectRef};
@@ -296,7 +296,8 @@ fn convert_method_defs(
         }
         index += 1;
         let name = text_or_empty(unsafe { (*method).ml_name });
-        if unsafe { (*method).ml_flags } & (METH_CLASS | METH_STATIC) != 0 {
+        if unsafe { (*method).ml_flags }.intersects(MethFlags::METH_CLASS | MethFlags::METH_STATIC)
+        {
             return Err(crate::PyError::value_error(
                 "module functions cannot set METH_CLASS or METH_STATIC",
             ));

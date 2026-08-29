@@ -106,7 +106,7 @@ pub struct CPyMemberDef {
     pub name: *const c_char,
     pub type_code: c_int,
     pub offset: isize,
-    pub flags: c_int,
+    pub flags: MemberFlags,
     pub doc: *const c_char,
 }
 
@@ -2451,7 +2451,8 @@ pub fn type_vectorcall(
     }
     super::call_cfunction(
         unsafe { (*tp).tp_vectorcall },
-        super::methodobject::METH_FASTCALL | super::methodobject::METH_KEYWORDS,
+        super::methodobject::MethFlags::METH_FASTCALL
+            | super::methodobject::MethFlags::METH_KEYWORDS,
         w_type,
         positional,
         keywords,
@@ -2808,7 +2809,7 @@ fn defining_class(
     carrier: PyObjectRef,
     method: *mut super::methodobject::CPyMethodDef,
 ) -> Option<PyObjectRef> {
-    if unsafe { (*method).ml_flags } & super::methodobject::METH_METHOD == 0 {
+    if !unsafe { (*method).ml_flags }.contains(super::methodobject::MethFlags::METH_METHOD) {
         return None;
     }
     carrier_objclass(carrier)
@@ -3059,20 +3060,37 @@ pub const T_LONGLONG: c_int = 17;
 pub const T_ULONGLONG: c_int = 18;
 pub const T_PYSSIZET: c_int = 19;
 pub const T_NONE: c_int = 20;
-/// `READONLY`.
-pub const MEMBER_READONLY: c_int = 1;
-/// `Py_AUDIT_READ` -- reading the member emits `object.__getattr__`.
-pub const MEMBER_AUDIT_READ: c_int = 2;
-/// `Py_RELATIVE_OFFSET` -- `offset` counts from the extra data a negative
-/// `basicsize` asked for, not from the block.  [`from_spec`] resolves it.
-pub const MEMBER_RELATIVE_OFFSET: c_int = 8;
+bitflags::bitflags! {
+    /// The `object.h` flags a `PyMemberDef` row carries.
+    ///
+    /// Two places spell this table: the header an extension compiles against
+    /// and this declaration.  `every_member_flag_is_the_bit_the_header_gives_it`
+    /// compares the two, walking `Flags::FLAGS` rather than a list somebody
+    /// has to remember to extend.  The names are the header's, uppercased;
+    /// `structmember.h` spells the first one `READONLY` as well.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct MemberFlags: c_int {
+        const PY_READONLY = 1;
+        /// Reading the member emits `object.__getattr__`.
+        const PY_AUDIT_READ = 2;
+        /// `offset` counts from the extra data a negative `basicsize` asked
+        /// for, not from the block.  [`from_spec`] resolves it.
+        const PY_RELATIVE_OFFSET = 8;
+    }
+}
 
-/// A member still carrying [`MEMBER_RELATIVE_OFFSET`] has an `offset` its
+/// C writes a member's `flags` through its own `int` declaration, so the
+/// mirror's field has to be that word and nothing wider or narrower.
+const _: () = assert!(size_of::<MemberFlags>() == size_of::<c_int>());
+const _: () = assert!(align_of::<MemberFlags>() == align_of::<c_int>());
+
+/// A member still carrying [`MemberFlags::PY_RELATIVE_OFFSET`] has an `offset` its
 /// reader cannot use: nothing but the type it was built for knows where the
 /// extra data starts.  A table declared statically has no extra data at all,
 /// so one that sets the flag is a declaration error.
 fn reject_relative_offset(member: *mut CPyMemberDef, entry: &str) -> Result<(), crate::PyError> {
-    if unsafe { (*member).flags } & MEMBER_RELATIVE_OFFSET == 0 {
+    if !unsafe { (*member).flags }.contains(MemberFlags::PY_RELATIVE_OFFSET) {
         return Ok(());
     }
     Err(crate::PyError::new(
@@ -3171,7 +3189,7 @@ fn write_member(
             .to_string_lossy()
             .into_owned()
     };
-    if unsafe { (*member).flags } & MEMBER_READONLY != 0 {
+    if unsafe { (*member).flags }.contains(MemberFlags::PY_READONLY) {
         return Err(crate::PyError::attribute_error("readonly attribute"));
     }
     let type_code = unsafe { (*member).type_code };
@@ -3289,7 +3307,7 @@ fn audit_member_read(
     instance: PyObjectRef,
     member: *mut CPyMemberDef,
 ) -> Result<PyObjectRef, crate::PyError> {
-    if unsafe { (*member).flags } & MEMBER_AUDIT_READ == 0
+    if !unsafe { (*member).flags }.contains(MemberFlags::PY_AUDIT_READ)
         || !crate::module::sys::vm::audit_hooks_armed()
     {
         return Ok(instance);
@@ -3463,7 +3481,8 @@ fn slot_new(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, cr
     }
     super::call_cfunction(
         slot,
-        super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
+        super::methodobject::MethFlags::METH_VARARGS
+            | super::methodobject::MethFlags::METH_KEYWORDS,
         cls,
         &positional,
         &keywords,
@@ -3519,11 +3538,13 @@ fn slot_call(slot: *const c_void, args: &[PyObjectRef]) -> Result<PyObjectRef, c
     let (function, flags) = match vectorcall {
         Some(function) => (
             function as *const c_void,
-            super::methodobject::METH_FASTCALL | super::methodobject::METH_KEYWORDS,
+            super::methodobject::MethFlags::METH_FASTCALL
+                | super::methodobject::MethFlags::METH_KEYWORDS,
         ),
         None => (
             slot,
-            super::methodobject::METH_VARARGS | super::methodobject::METH_KEYWORDS,
+            super::methodobject::MethFlags::METH_VARARGS
+                | super::methodobject::MethFlags::METH_KEYWORDS,
         ),
     };
     super::call_cfunction(function, flags, w_self, &positional, &keywords)
@@ -4674,9 +4695,10 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         // each naming a different receiver.  A row carrying both is refused
         // before the type is built.
         let flags = unsafe { (*method).ml_flags };
-        let carrier_type = match flags & super::methodobject::METH_CLASS {
-            0 => method_descriptor_type(),
-            _ => classmethod_descriptor_type(),
+        let carrier_type = if flags.contains(super::methodobject::MethFlags::METH_CLASS) {
+            classmethod_descriptor_type()
+        } else {
+            method_descriptor_type()
         };
         let descriptor = new_carrier(
             carrier_type,
@@ -4690,26 +4712,25 @@ fn install_namespace(ns: PyObjectRef, tp: *mut CPyTypeObject) {
         // A static row is a function bound to the type, wrapped so that
         // reading it through the class or an instance yields the function
         // itself rather than binding a receiver a second time.
-        let descriptor = match flags & super::methodobject::METH_STATIC {
-            0 => pyre_object::gc_roots::shadow_stack_get(descriptor_slot),
-            _ => {
-                let owner = reload();
-                match super::methodobject::new_pycfunction(method, owner, owner) {
-                    Ok(function) => {
-                        let function_slot = pyre_object::gc_roots::shadow_stack_len();
-                        let _ = roots.pin_root(function);
-                        pyre_object::function::w_staticmethod_new(
-                            pyre_object::gc_roots::shadow_stack_get(function_slot),
-                        )
-                    }
-                    // The name is left unbound rather than bound to something
-                    // that would take its first argument as a receiver.
-                    Err(error) => {
-                        super::pyerrors::set_pending_error(error);
-                        continue;
-                    }
+        let descriptor = if flags.contains(super::methodobject::MethFlags::METH_STATIC) {
+            let owner = reload();
+            match super::methodobject::new_pycfunction(method, owner, owner) {
+                Ok(function) => {
+                    let function_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = roots.pin_root(function);
+                    pyre_object::function::w_staticmethod_new(
+                        pyre_object::gc_roots::shadow_stack_get(function_slot),
+                    )
+                }
+                // The name is left unbound rather than bound to something
+                // that would take its first argument as a receiver.
+                Err(error) => {
+                    super::pyerrors::set_pending_error(error);
+                    continue;
                 }
             }
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(descriptor_slot)
         };
         let descriptor_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(descriptor);
@@ -5263,8 +5284,8 @@ fn ready(tp: *mut CPyTypeObject, w_metaclass: PyObjectRef) -> Result<(), crate::
         let method = unsafe { (*tp).tp_methods.offset(index) };
         index += 1;
         let flags = unsafe { (*method).ml_flags };
-        if flags & super::methodobject::METH_CLASS == 0
-            || flags & super::methodobject::METH_STATIC == 0
+        if !flags.contains(super::methodobject::MethFlags::METH_CLASS)
+            || !flags.contains(super::methodobject::MethFlags::METH_STATIC)
         {
             continue;
         }
@@ -5846,7 +5867,7 @@ fn special_offset(member: *mut CPyMemberDef) -> Result<isize, crate::PyError> {
     };
     let complaint = if unsafe { (*member).type_code } != T_PYSSIZET {
         format!("type of {} must be Py_T_PYSSIZET", name())
-    } else if unsafe { (*member).flags } != MEMBER_READONLY {
+    } else if unsafe { (*member).flags } != MemberFlags::PY_READONLY {
         format!(
             "flags for {} must be Py_READONLY or (Py_READONLY | Py_RELATIVE_OFFSET)",
             name()
@@ -5886,13 +5907,13 @@ unsafe fn resolve_relative_members(
     while !unsafe { (*members.offset(index)).name }.is_null() {
         let mut member = unsafe { std::ptr::read(members.offset(index)) };
         index += 1;
-        if member.flags & MEMBER_RELATIVE_OFFSET != 0 {
+        if member.flags.contains(MemberFlags::PY_RELATIVE_OFFSET) {
             let complaint = if declared > 0 {
                 "With Py_RELATIVE_OFFSET, basicsize must be negative."
             } else if member.offset < 0 || member.offset >= -declared {
                 "Member offset out of range (0..-basicsize)"
             } else {
-                member.flags &= !MEMBER_RELATIVE_OFFSET;
+                member.flags &= !MemberFlags::PY_RELATIVE_OFFSET;
                 member.offset += type_data_offset;
                 ""
             };
@@ -5911,7 +5932,7 @@ unsafe fn resolve_relative_members(
         name: std::ptr::null(),
         type_code: 0,
         offset: 0,
-        flags: 0,
+        flags: MemberFlags::empty(),
         doc: std::ptr::null(),
     });
     unsafe { (*tp).tp_members = Box::leak(table.into_boxed_slice()).as_mut_ptr() };
@@ -7100,5 +7121,60 @@ mod tests {
             "the header defines {checked} slot identifiers and slot_id has {}",
             super::slot_id::ALL.len()
         );
+    }
+
+    /// A member's `flags` word is one thing two places spell: an extension
+    /// compiled against `include/pyre3.14t/object.h` builds it, and this file
+    /// reads it.  Nothing tied the two together, so this walks the header and
+    /// rejects any flag whose bit the Rust side spells differently.
+    #[test]
+    fn every_member_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        // `Py_READONLY`, `Py_AUDIT_READ`, `Py_RELATIVE_OFFSET` -- decimal, and
+        // the only `Py_` macros that are.  The type codes beside them are
+        // `Py_T_*`, which this leaves alone.
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define Py_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            if name.starts_with("T_") || name.starts_with("TPFLAGS_") {
+                continue;
+            }
+            let Ok(value) = body.trim().parse::<std::ffi::c_int>() else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        // A parser that read nothing would agree with every flag below, so the
+        // floor comes first.
+        assert!(
+            header.len() >= 3,
+            "object.h declares more plain Py_ constants than the {} this read",
+            header.len()
+        );
+
+        for flag in super::MemberFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("PY_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let (_, theirs) = header
+                .iter()
+                .find(|(known, _)| known.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("object.h declares no Py_{name}"));
+            assert_eq!(
+                ours, *theirs,
+                "Py_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
     }
 }
