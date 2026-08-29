@@ -402,29 +402,22 @@ fn chase_pinned(l: u64, defs: &HashMap<u64, PinSrc>, out: &mut HashSet<u64>, dep
 /// `publish_roots` is `pin_roots` without the normalize half, and pins just
 /// the same.
 ///
-/// The free functions only. `RootScope`'s inherent `publish` / `get` / `set`
-/// (`pyre-object/src/gc_roots.rs:500-559`) are the same operations reached
-/// through the guard, and none of them ends with a suffix here — `::publish`
-/// is not `::publish_roots`. Counted over the four files that use them:
-///
-/// * 26 bodies use only the methods. `saw_pin_call` stays false for those, so
-///   they are withheld as unreadable rather than graded — the conservative
-///   answer, and part of what the census reports as "could not be read".
-/// * 3 bodies use both a free pin and a method (`baseobjspace::next`,
-///   `dictmultiobject::w_dict_setdefault_checked`, `builtins::builtin_print`).
-///   Those are graded with the method-published roots missing from `held`, so
-///   they can be reported SHORT while actually covered.
-///
-/// Recognizing the methods here without also modelling `RootScope`'s `Drop`
-/// (gc_roots.rs:587-598, which truncates the shadow stack) would move the
-/// error the wrong way: a call after the guard is dropped would inherit a
-/// stale pinned set and read as covered. A false SHORT asks for a look; a
-/// false covered hides a missing root. So the pair lands together or not at
-/// all, and until then those 3 bodies are the known skew in the SHORT count.
+/// The free functions and the scope-local `pin_root` / `publish` forms.
+/// `scan` models the matching `RootScope` Drop at the same time, so a method
+/// pin cannot leak into calls after its guard was truncated.  Scope-local
+/// `set` / `save_run` overwrite coloured slots and remain opaque until the
+/// analysis carries a slot-to-root map; guessing there could claim false
+/// coverage.
 fn is_pin_fn(name: &str) -> bool {
     name.ends_with("::pin_root")
         || name.ends_with("::pin_roots")
         || name.ends_with("::publish_roots")
+        || (name.contains("gc_roots::<Impl>") && name.ends_with("::publish"))
+}
+
+fn reads_root_slot(name: &str) -> bool {
+    name.ends_with("gc_roots::shadow_stack_get")
+        || (name.contains("gc_roots::<Impl>") && name.ends_with("::get"))
 }
 
 fn successors(t: &TermKind) -> Vec<u64> {
@@ -537,25 +530,86 @@ pub fn scan(
                 _ => false,
             })
             .collect();
-        let unbracketed: HashSet<usize> = if bracket_blocks.is_empty() {
-            (0..n).collect()
-        } else {
-            let mut seen: HashSet<usize> = HashSet::new();
-            let mut work = vec![0usize];
-            while let Some(cur) = work.pop() {
-                if bracket_blocks.contains(&cur) || !seen.insert(cur) {
-                    continue;
-                }
-                if let Some(t) = &terms[cur] {
-                    for s in successors(t) {
-                        if (s as usize) < n {
-                            work.push(s as usize);
+        // Active root-scope locals at each block entry, one sorted set per
+        // feasible path state.  Merely removing every opener block from the
+        // CFG (the old implementation) made its bracket last until function
+        // exit: a collecting call after `RootScope::drop` was silently read as
+        // covered.  Charon's Drop place tells us exactly which guard ends.
+        let mut active_at: Vec<HashSet<Vec<u64>>> = vec![HashSet::new(); n];
+        if n > 0 {
+            active_at[0].insert(Vec::new());
+        }
+        let mut scope_work = if n > 0 { vec![0usize] } else { Vec::new() };
+        while let Some(b) = scope_work.pop() {
+            let states: Vec<Vec<u64>> = active_at[b].iter().cloned().collect();
+            let Some(term) = &terms[b] else {
+                continue;
+            };
+            for state in states {
+                let mut normal = state.clone();
+                let mut unwind = state;
+                match term {
+                    TermKind::Call {
+                        call,
+                        target,
+                        on_unwind,
+                    } => {
+                        let opens = match &call.func {
+                            CallFunc::Regular(reg) => matches!(
+                                &reg.kind,
+                                CallKind::Fun(FunId::Regular { id }) if push_roots.contains(id)
+                            ),
+                            _ => false,
+                        };
+                        if opens && let Some(scope) = bare_local(&call.dest) {
+                            match normal.binary_search(&scope) {
+                                Ok(_) => {}
+                                Err(i) => normal.insert(i, scope),
+                            }
                         }
+                        for (succ, next) in [(*target, normal), (*on_unwind, unwind)] {
+                            if (succ as usize) < n && active_at[succ as usize].insert(next) {
+                                scope_work.push(succ as usize);
+                            }
+                        }
+                        continue;
+                    }
+                    TermKind::Drop { place, .. } => {
+                        if let Some(scope) = place_local(place) {
+                            if let Ok(i) = normal.binary_search(&scope) {
+                                normal.remove(i);
+                            }
+                            if let Ok(i) = unwind.binary_search(&scope) {
+                                unwind.remove(i);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for succ in successors(term) {
+                    if (succ as usize) < n && active_at[succ as usize].insert(normal.clone()) {
+                        scope_work.push(succ as usize);
                     }
                 }
             }
-            seen
-        };
+        }
+        let unbracketed: HashSet<usize> = (0..n)
+            .filter(|&b| active_at[b].iter().any(Vec::is_empty))
+            .collect();
+        let has_nested_scopes = active_at
+            .iter()
+            .flat_map(HashSet::iter)
+            .any(|scopes| scopes.len() > 1);
+        let term_closes_root_scope: Vec<bool> = (0..n)
+            .map(|b| match &terms[b] {
+                Some(TermKind::Drop { place, .. }) => place_local(place).is_some_and(|scope| {
+                    active_at[b]
+                        .iter()
+                        .any(|active| active.binary_search(&scope).is_ok())
+                }),
+                _ => false,
+            })
+            .collect();
         // Reachable from entry, brackets and all.  A block no path reaches
         // has no meet to take, and a must-analysis would hand it the universe
         // and read every root as pinned; it is also not a block whose bracket
@@ -614,7 +668,10 @@ pub fn scan(
 
         // A body whose pinned set cannot be read is not a body with an empty
         // one: grading it would turn "not understood" into "root missing".
-        let mut opaque_contents = unparsed_terms || unparsed_stmts;
+        // The pin-set analysis below stores only root locals, not which nested
+        // guard owns each one.  Keep nested bodies unread rather than letting
+        // an inner Drop falsely retain its pins as outer-scope coverage.
+        let mut opaque_contents = unparsed_terms || unparsed_stmts || has_nested_scopes;
         let mut saw_pin_call = false;
         let mut term_pins: Vec<HashSet<u64>> = vec![HashSet::new(); n];
         // The locals a pin was *handed*, as distinct from the word it hands
@@ -643,10 +700,19 @@ pub fn scan(
                 opaque_contents = true;
                 continue;
             }
+            if name.contains("gc_roots::<Impl>")
+                && (name.ends_with("::set") || name.ends_with("::save_run"))
+            {
+                // These overwrite an existing coloured slot.  Without a
+                // slot→root map, retaining the old root or replacing the
+                // wrong one could both claim false coverage.
+                opaque_contents = true;
+                continue;
+            }
             // Reading a slot back yields the word the slot holds now, which
             // is rooted by whatever pinned it; the index it takes is not a
             // root, so only the result is read here.
-            let reads_a_slot_back = name.ends_with("gc_roots::shadow_stack_get");
+            let reads_a_slot_back = reads_root_slot(name);
             if !is_pin_fn(name) && !reads_a_slot_back {
                 continue;
             }
@@ -731,6 +797,12 @@ pub fn scan(
         let universe: HashSet<u64> = gc_locals.keys().copied().collect();
         let out_of = |b: usize, pin: &[HashSet<u64>]| -> HashSet<u64> {
             let mut s: HashSet<u64> = pin[b].difference(&stmt_kills[b]).copied().collect();
+            if term_closes_root_scope[b] {
+                // Nested scopes were marked opaque above.  In the remaining
+                // bodies this Drop closes the one live scope, so every pin it
+                // owned leaves the root stack here.
+                s.clear();
+            }
             if let Some(TermKind::Call { call, .. }) = &terms[b] {
                 if let Some(d) = bare_local(&call.dest) {
                     s.remove(&d);
@@ -1077,6 +1149,11 @@ fn transfer_term(t: &TermKind, live: &mut HashSet<u64>) {
         }
         TermKind::Switch { discr, .. } => use_operand(discr, live),
         TermKind::Assert { assert, .. } => use_operand(&assert.cond, live),
+        TermKind::Drop { place, .. } => {
+            if let Some(l) = place_local(place) {
+                live.insert(l);
+            }
+        }
         _ => {}
     }
 }
