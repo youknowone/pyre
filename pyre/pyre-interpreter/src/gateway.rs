@@ -1305,6 +1305,19 @@ pub fn make_builtin_function_as_builtin(name: &'static str, func: BuiltinCodeFn)
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// Docstring-carrying [`make_builtin_function_as_builtin`].  PyPy's
+/// `interp2app` keeps the app-visible docstring on the gateway `BuiltinCode`;
+/// builtin `__new__` carriers need the same storage while retaining their
+/// `BuiltinFunction` identity for `copyreg` parity.
+pub fn make_builtin_function_as_builtin_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`
 /// descriptors need the builtin-function carrier for `copyreg` parity while
 /// still routing keyword-only arguments through the gateway binder.

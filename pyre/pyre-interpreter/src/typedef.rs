@@ -3115,6 +3115,16 @@ pub(crate) fn make_new_descr(
     crate::gateway::make_builtin_function_as_builtin("__new__", func)
 }
 
+/// Docstring-carrying [`make_new_descr`].  PyPy's `interp2app` registration
+/// for constructors preserves the gateway function's app-visible `__doc__`;
+/// this explicit literal is the Rust equivalent for a builtin carrier.
+pub(crate) fn make_new_descr_with_doc(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    docstring: &'static str,
+) -> PyObjectRef {
+    crate::gateway::make_builtin_function_as_builtin_with_doc("__new__", func, docstring)
+}
+
 /// Signature-aware [`make_new_descr`] for builtin constructors with keyword
 /// or keyword-only parameters.
 pub(crate) fn make_new_descr_with_signature(
@@ -5524,14 +5534,21 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(list_descr_new),
+            make_new_descr_with_doc(
+                list_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", list_descr_init),
+            crate::gateway::make_builtin_function_with_doc(
+                "__init__",
+                list_descr_init,
+                "Initialize self.  See help(type(self)) for accurate signature.",
+            ),
         )
     };
     unsafe {
