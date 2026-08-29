@@ -9756,6 +9756,26 @@ impl<M: Clone> MetaInterp<M> {
         self.clear_trace_session();
     }
 
+    /// Drop a trace which the frontend declined before it became a traced
+    /// abort.
+    ///
+    /// `TraceAction::Decline` is pyre's pre-trace coverage fallback.  Its
+    /// upstream counterpart refuses the graph before entering
+    /// `MetaInterp._interpret`, so no `SwitchToBlackhole` reaches
+    /// `MetaInterp.aborted_tracing`; `WarmEnterState.maybe_compile_and_run`
+    /// only clears `JC_TRACING` in its `finally` arm.  Undo the locally-started
+    /// tracing state without charging the pyre-local abort ceiling.
+    pub fn decline_trace_live(&mut self) {
+        self.force_finish_trace = false;
+        self.clear_retrace_state();
+        if let Some(ctx) = self.tracing.take() {
+            self.warm_state.decline_tracing(ctx.green_key);
+            self.pending_token = None;
+        }
+        self.clear_pending_abort();
+        self.clear_trace_session();
+    }
+
     /// Drop the `pending_abort_*` payload staged by live trace teardown.
     ///
     /// `abort_trace_live` stages `(green_key, permanent)` for the
@@ -16778,25 +16798,24 @@ impl<M: Clone> MetaInterp<M> {
                 Some((bridge.trace_id, bridge.fail_index)),
                 finish_descr,
             );
-            // pyjitpl.py raise_if_successful(): successful
-            // bridge closure terminates tracing.  Consume the whole
-            // session (bridge + trace_meta) and unwind the tracer via
-            // `abort_trace_live` (live cleanup + `pending_abort_*`
-            // staging) — NOT `abort_trace`, because that also fires
-            // `aborted_tracing(Generic)` which would double-count the
-            // upstream abort hook (pyjitpl.py:2491 fires it once with
-            // `stb.reason` via the caller-side catch).  On success no
-            // catch fires, so we clear the staged `pending_abort_*`
-            // below to keep the next aborted_tracing clean.
+            // pyjitpl.py `raise_if_successful`: a compiled bridge leaves via
+            // `ContinueRunningNormally`, not the `SwitchToBlackhole` catch in
+            // `MetaInterp._interpret`.  It therefore clears the live tracing
+            // state without calling `WarmEnterState.abort_tracing`; charging
+            // this successful FINISH as an abort makes the source loop hit
+            // pyre's abort ceiling after several recursive bridges.
             self.clear_trace_session();
-            self.abort_trace_live(false);
             return match outcome {
-                CompileOutcome::Compiled { .. } | CompileOutcome::Cancelled => {
-                    // Drop the `pending_abort_*` staged by
-                    // `abort_trace_live` — on success no abort hook
-                    // fires, so letting stale greenkey linger would
-                    // attach this successfully-compiled bridge's key
-                    // to a later, unrelated abort.
+                CompileOutcome::Compiled { .. } => {
+                    self.finish_trace_live();
+                    self.clear_pending_abort();
+                    Ok(())
+                }
+                CompileOutcome::Cancelled => {
+                    // Preserve the existing cancelled-compile teardown: it
+                    // does not propagate a SwitchToBlackhole reason, but it is
+                    // not a successful compile either.
+                    self.abort_trace_live(false);
                     self.clear_pending_abort();
                     Ok(())
                 }
@@ -16806,6 +16825,7 @@ impl<M: Clone> MetaInterp<M> {
                 // bridge FINISH path shares the same giveup reason as
                 // the root FINISH path.
                 CompileOutcome::Aborted => {
+                    self.abort_trace_live(false);
                     crate::mc_diag_bump(49);
                     Err(SwitchToBlackhole::giveup())
                 }

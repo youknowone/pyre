@@ -1489,6 +1489,19 @@ impl WarmEnterState {
         }
     }
 
+    /// Undo a tracing start which the frontend declined before recording.
+    ///
+    /// This is the local counterpart of `warmstate.py`
+    /// `maybe_compile_and_run`'s unconditional `finally` clear when the
+    /// pre-trace policy refuses a graph: there is no `SwitchToBlackhole`, so
+    /// `aborted_tracing` and the pyre-local abort ceiling do not participate.
+    pub fn decline_tracing(&mut self, cell_key: u64) {
+        if let Some(cell) = self.cell_by_key_mut(cell_key) {
+            cell.flags &= !jc_flags::JC_TRACING;
+            cell.state = BaseJitCellState::NotHot;
+        }
+    }
+
     /// Mark that tracing was aborted for a green key.
     ///
     /// Non-permanent aborts clear `JC_TRACING` and allow a future retry until
@@ -5011,6 +5024,28 @@ mod tests {
             !ws.can_inline_callable(key),
             "a ceiling-latched location is still inlinable as a callee",
         );
+    }
+
+    /// A frontend coverage decline happens before upstream enters
+    /// `MetaInterp._interpret`, so it cannot raise `SwitchToBlackhole` or
+    /// contribute to `aborted_tracing`.  Repeating the local fallback past the
+    /// pyre-only ceiling must therefore leave the cell traceable.
+    #[test]
+    fn a_pretrace_decline_does_not_charge_the_abort_ceiling() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xDEC11E;
+
+        for _ in 0..=MAX_TRACE_ABORT_COUNT {
+            ws.mark_as_being_traced(key);
+            ws.decline_tracing(key);
+        }
+
+        let cell = ws.get_cell(key).expect("decline keeps the warm-state cell");
+        assert_eq!(cell.abort_count, 0);
+        assert_eq!(cell.state, BaseJitCellState::NotHot);
+        assert_eq!(cell.flags & jc_flags::JC_TRACING, 0);
+        assert_eq!(cell.flags & jc_flags::JC_DONT_TRACE_HERE, 0);
+        assert!(ws.can_inline_callable(key));
     }
 
     #[test]
