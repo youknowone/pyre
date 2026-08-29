@@ -116,6 +116,109 @@ with assert_raises(TypeError) as error:
     array("i").append(1, 2)
 assert str(error.exception) == "array.append() takes exactly one argument (2 given)"
 
+# PyPy W_Array.extend raw-copies a same-kind array before falling back to
+# _fromiterable, and that fallback mints the iterator before its first append.
+# CPython 3.14 shares append's two-conversion ins1 path for every streamed item.
+extend_target = array("i", [1])
+
+
+class GrowingExtendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        extend_target.append(2)
+        gc.collect()
+        return 3
+
+
+growing_extend_item = GrowingExtendItem()
+extend_target.extend([growing_extend_item])
+assert growing_extend_item.calls == 2
+assert extend_target == array("i", [1, 3, 2])
+
+extend_target = array("i", [1])
+
+
+class ClearingExtendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        del extend_target[:]
+        return 3
+
+
+clearing_extend_item = ClearingExtendItem()
+extend_target.extend([clearing_extend_item])
+assert clearing_extend_item.calls == 2
+assert extend_target == array("i")
+
+
+class RawArraySubclass(array):
+    def __iter__(self):
+        raise AssertionError("same-kind array extend must copy raw storage")
+
+
+extend_target = array("i", [1])
+extend_target.extend(RawArraySubclass("i", [2]))
+assert extend_target == array("i", [1, 2])
+
+exported_extend = array("i", [1])
+exported_extend_view = memoryview(exported_extend)
+with assert_raises(TypeError) as error:
+    exported_extend.extend(array("h"))
+assert str(error.exception) == "can only extend with array of same kind"
+assert exported_extend.extend(array("i")) is None
+assert exported_extend.extend([]) is None
+
+
+class EmptyExtendIterator:
+    def __init__(self):
+        self.events = []
+
+    def __iter__(self):
+        self.events.append("iter")
+        return self
+
+    def __next__(self):
+        self.events.append("next")
+        raise StopIteration
+
+
+empty_extend_iterator = EmptyExtendIterator()
+assert exported_extend.extend(empty_extend_iterator) is None
+assert empty_extend_iterator.events == ["iter", "next"]
+
+
+class ExportedExtendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        return 2
+
+
+exported_extend_item = ExportedExtendItem()
+with assert_raises(BufferError):
+    exported_extend.extend([exported_extend_item])
+assert exported_extend_item.calls == 1
+assert exported_extend == array("i", [1])
+exported_extend_view.release()
+
+with assert_raises(TypeError) as error:
+    array("i").extend()
+assert str(error.exception) == "extend() takes exactly 1 positional argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").extend([], [])
+assert str(error.exception) == "extend() takes at most 1 argument (2 given)"
+with assert_raises(TypeError) as error:
+    RawArraySubclass("i").extend(iterable=[])
+assert str(error.exception) == "extend() takes exactly 1 positional argument (0 given)"
+
 # PyPy's W_ArrayBase.descr_index supplies the optional bounds to
 # index_count_array.  CPython 3.14 keeps the same observable positional search
 # but makes the public bounds positional-only.

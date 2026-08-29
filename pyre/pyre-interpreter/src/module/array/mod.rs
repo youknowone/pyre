@@ -151,17 +151,6 @@ fn unicode_char_w(w: PyObjectRef) -> Result<u32, PyError> {
 // Core mutation helpers.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Append one packed value (`append` / single-element `extend`).
-fn array_append(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
-    array_check_resize(obj)?;
-    let tc = unsafe { arr::w_array_typecode(obj) };
-    let mut buf: Bytes = [0u8; 8];
-    let n = pack_into(tc, w_value, &mut buf)?;
-    let vec = unsafe { arr::w_array_vec_mut(obj) };
-    vec.extend_from_slice(&buf[..n]);
-    Ok(())
-}
-
 fn array_check_resize(obj: PyObjectRef) -> Result<(), PyError> {
     if unsafe { arr::w_array_exports(obj) } != 0 {
         Err(PyError::new(
@@ -173,15 +162,77 @@ fn array_check_resize(obj: PyObjectRef) -> Result<(), PyError> {
     }
 }
 
-/// Extend from any iterable, packing each element (`descr_extend`).
+/// Append one item through the public 3.14 `ins1` conversion sequence.
+///
+/// PyPy `W_Array.descr_append` converts `w_x` before `setlen`.
+/// [3.14-spec] CPython v3.14.6 `Modules/arraymodule.c` `ins1` preserves that
+/// ordering, but validates once at index -1, resizes from the length captured
+/// before validation, then converts once more for the actual slot.  `append`
+/// and `array_iter_extend` share this helper so callbacks see the same receiver
+/// state on both paths.
+fn array_append_value(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_value]);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let old_len = unsafe { arr::w_array_len(obj) };
+    let itemsize = unsafe { arr::w_array_itemsize(obj) };
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+
+    let mut validated: Bytes = [0; 8];
+    pack_into(
+        typecode,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        &mut validated,
+    )?;
+
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    array_check_resize(obj)?;
+    let new_len = old_len
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(itemsize))
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    if new_len > vec.len() {
+        vec.try_reserve(new_len - vec.len())
+            .map_err(|_| PyError::memory_error(""))?;
+    }
+    vec.resize(new_len, 0);
+
+    let mut packed: Bytes = [0; 8];
+    let packed_len = pack_into(
+        typecode,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        &mut packed,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    if old_len < unsafe { arr::w_array_len(obj) } {
+        // CPython writes through the pointer captured after resize even when
+        // the second conversion resized the receiver.  Preserve the visible
+        // slot write while it remains live, without reproducing a stale raw
+        // write when the callback cleared the receiver.
+        let start = old_len * itemsize;
+        let vec = unsafe { arr::w_array_vec_mut(obj) };
+        vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
+    }
+    Ok(())
+}
+
+/// Extend from any iterable (`W_Array.extend` / `_fromiterable`).
 fn array_extend_iterable(
     obj: PyObjectRef,
     w_iterable: PyObjectRef,
     reject_different_array: bool,
 ) -> Result<(), PyError> {
-    array_check_resize(obj)?;
-    // A fast path for same-typecode arrays: raw byte concat.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_iterable]);
+
+    // PyPy `W_Array.extend` handles an array source before `_fromiterable`:
+    // compare the descriptors, size once, then raw-copy the source.  Like its
+    // `oldlen` / `new` loop, keep the original source length when self is also
+    // the iterable and copy from the resized receiver's leading range.
+    let w_iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if unsafe { arr::is_array(w_iterable) } {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
         let dst_tc = unsafe { arr::w_array_typecode(obj) };
         let src_tc = unsafe { arr::w_array_typecode(w_iterable) };
         if dst_tc != src_tc {
@@ -191,25 +242,66 @@ fn array_extend_iterable(
                 ));
             }
         } else {
-            let src_bytes = unsafe { arr::w_array_bytes(w_iterable) }.to_vec();
+            let src_len = unsafe { arr::w_array_bytes(w_iterable) }.len();
+            // CPython `array_do_extend` treats an empty source as a true
+            // no-op, so it succeeds even while the receiver exports a buffer.
+            if src_len == 0 {
+                return Ok(());
+            }
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            array_check_resize(obj)?;
+            let dst_len = unsafe { arr::w_array_bytes(obj) }.len();
+            let new_len = dst_len
+                .checked_add(src_len)
+                .ok_or_else(|| PyError::memory_error(""))?;
+            if std::ptr::eq(obj, w_iterable) {
+                let vec = unsafe { arr::w_array_vec_mut(obj) };
+                vec.try_reserve(src_len)
+                    .map_err(|_| PyError::memory_error(""))?;
+                vec.resize(new_len, 0);
+                // PyPy copies `srcbuf[0:new]` into the newly sized receiver;
+                // CPython `array_do_extend` does the same with `memcpy`.
+                // The source and destination byte ranges are adjacent.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        vec.as_ptr(),
+                        vec.as_mut_ptr().add(dst_len),
+                        src_len,
+                    )
+                };
+                return Ok(());
+            }
+
+            // The objects are distinct and no Python runs between these two
+            // borrows, so resizing the destination cannot move the source.
+            let src_bytes = unsafe { arr::w_array_bytes(w_iterable) };
             let vec = unsafe { arr::w_array_vec_mut(obj) };
-            vec.extend_from_slice(&src_bytes);
+            vec.try_reserve(src_len)
+                .map_err(|_| PyError::memory_error(""))?;
+            vec.extend_from_slice(src_bytes);
             return Ok(());
         }
     }
-    // The iterator is minted here and nothing else refers to it, while `next`
-    // and `array_append` both run Python.  An iterator and an array are stable
-    // allocations, so neither address goes stale; what the scope buys is that
-    // an unmarked block is not swept out from under the loop.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj = pyre_object::gc_roots::pin_root(obj);
+
+    // PyPy `_fromiterable` and CPython `array_iter_extend` mint the iterator
+    // before attempting any resize.  Consequently an empty iterable remains
+    // a no-op under a live export, and iterator side effects precede the first
+    // per-item resize check.
+    let w_iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
     let w_iter = pyre_object::gc_roots::pin_root(w_iter);
     loop {
         match crate::baseobjspace::next(w_iter) {
-            Ok(w_item) => array_append(obj, w_item)?,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Ok(w_item) => {
+                let obj = pyre_object::gc_roots::shadow_stack_get(base);
+                array_append_value(obj, w_item)?;
+            }
+            Err(e) => {
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -618,60 +710,32 @@ fn array_append_method(args: &[PyObjectRef]) -> PyResult {
         )));
     }
 
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(args);
-    let obj = pyre_object::gc_roots::shadow_stack_get(base);
-    let old_len = unsafe { arr::w_array_len(obj) };
-    let itemsize = unsafe { arr::w_array_itemsize(obj) };
-    let typecode = unsafe { arr::w_array_typecode(obj) };
-
-    // PyPy `W_Array.descr_append` converts `w_x` before calling `setlen`.
-    // [3.14-spec] CPython 3.14.6 `ins1` additionally calls the descriptor's
-    // setitem once at index -1 to validate, resizes from the pre-conversion
-    // length, then converts again for the real slot.  The two conversions and
-    // the resize between them are observable through `__index__`/`__float__`.
-    let mut validated: Bytes = [0; 8];
-    pack_into(
-        typecode,
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-        &mut validated,
-    )?;
-
-    let obj = pyre_object::gc_roots::shadow_stack_get(base);
-    array_check_resize(obj)?;
-    let new_len = old_len
-        .checked_add(1)
-        .and_then(|len| len.checked_mul(itemsize))
-        .ok_or_else(|| PyError::memory_error(""))?;
-    let vec = unsafe { arr::w_array_vec_mut(obj) };
-    if new_len > vec.len() {
-        vec.try_reserve(new_len - vec.len())
-            .map_err(|_| PyError::memory_error(""))?;
-    }
-    vec.resize(new_len, 0);
-
-    let mut packed: Bytes = [0; 8];
-    let packed_len = pack_into(
-        typecode,
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-        &mut packed,
-    )?;
-    let obj = pyre_object::gc_roots::shadow_stack_get(base);
-    if old_len < unsafe { arr::w_array_len(obj) } {
-        // CPython 3.14.6 writes through the pointer captured after resize even
-        // if the second conversion resized the array again.  Keep the same
-        // visible slot update when it remains live, without reproducing that
-        // out-of-bounds raw write when user code cleared the receiver.
-        let start = old_len * itemsize;
-        let vec = unsafe { arr::w_array_vec_mut(obj) };
-        vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
-    }
+    array_append_value(args[0], args[1])?;
     Ok(pyre_object::w_none())
 }
 
 fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.extend")?;
-    array_extend_iterable(args[0], args[1], true)?;
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let positional_given = if positional.is_empty() {
+        0
+    } else {
+        positional.len() - 1
+    };
+    let supplied = positional_given + crate::builtins::real_kwarg_count(kwargs);
+    // [3.14-spec] CPython v3.14.6 `array_array_extend`'s positional-only
+    // clinic gateway checks the required positional count before diagnosing
+    // its blank keyword slot; PyPy's interp2app gateway reports its own owner.
+    if positional_given == 0 {
+        return Err(PyError::type_error(
+            "extend() takes exactly 1 positional argument (0 given)",
+        ));
+    }
+    if supplied > 1 {
+        return Err(PyError::type_error(format!(
+            "extend() takes at most 1 argument ({supplied} given)"
+        )));
+    }
+    array_extend_iterable(positional[0], positional[1], true)?;
     Ok(pyre_object::w_none())
 }
 
@@ -1697,7 +1761,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
                 pyre_object::longobject::w_long_new(BigInt::from(raw))
             }
         };
-        array_append(obj, w_item)?;
+        array_append_value(obj, w_item)?;
     }
     Ok(obj)
 }
@@ -1822,7 +1886,13 @@ pub fn init_array_type(ns: PyObjectRef) {
             crate::make_builtin_function("append", array_append_method),
         )
     };
-    m(ns, "extend", array_extend_method, 2);
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "extend",
+            crate::make_builtin_function("extend", array_extend_method),
+        )
+    };
     // `insert` uses the PyArg_UnpackTuple arity wording and the fixed
     // `array.insert` keyword owner, both supplied by its gateway body.
     unsafe {
