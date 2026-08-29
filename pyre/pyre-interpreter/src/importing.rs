@@ -4672,13 +4672,14 @@ fn absolute_import(
         // even though `parent_package_path` cannot turn it into directories.
         // Without the check a dotted name whose parent is a plain module falls
         // back to the top-level search and can resolve to a same-leaf builtin.
+        // `_bootstrap._find_and_load` returns a `sys.modules` hit before
+        // `_find_and_load_unlocked` runs, so the parent binding below is the
+        // business of a load this call actually performed.  Read before
+        // `load_part`, which answers the cache and cannot be asked afterwards.
+        let was_cached = check_sys_modules(&full_name).is_some();
         let parent_dirs = match parent {
             None => None,
-            Some(_)
-                if check_sys_modules(&full_name).is_some() || sys_modules_blocks(&full_name) =>
-            {
-                None
-            }
+            Some(_) if was_cached || sys_modules_blocks(&full_name) => None,
             Some(parent_mod) => {
                 if crate::baseobjspace::findattr_result(parent_mod, "__path__")?.is_none() {
                     let parent_name = parts[..level].join(".");
@@ -4703,7 +4704,8 @@ fn absolute_import(
         // submodule as an attribute of its parent package so `import a.b`
         // makes `a.b` reachable. Only an AttributeError is swallowed (with an
         // ImportWarning); any other exception propagates.
-        if let Some(parent_mod) = parent
+        if !was_cached
+            && let Some(parent_mod) = parent
             && let Err(err) = crate::setattr_str(parent_mod, part, module)
         {
             if err.kind != crate::PyErrorKind::AttributeError {
@@ -5365,6 +5367,8 @@ pub fn importhook(
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
     // CPython 3.14 import.c / PyPy's import-level validation: negative
     // levels are rejected independently of the module name.  An empty name
     // is valid only for an actual relative import (`from . import x`).
@@ -5381,11 +5385,186 @@ pub fn importhook(
         ));
     }
 
-    if level > 0 {
-        return relative_import(name, w_globals, w_fromlist, level, execution_context);
+    // The import below runs module bodies, so the caller's raw `w_fromlist`
+    // is stale by the time `handle_fromlist` reads it back.
+    let fromlist_missing = w_fromlist.is_null() || unsafe { is_none(w_fromlist) };
+    let _roots = push_roots();
+    let fromlist_slot = shadow_stack_len();
+    let _ = pin_root(if w_fromlist.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_fromlist
+    });
+
+    let w_mod = if level > 0 {
+        relative_import(name, w_globals, w_fromlist, level, execution_context)?
+    } else {
+        absolute_import(name, w_fromlist, execution_context)?
+    };
+    if fromlist_missing {
+        return Ok(w_mod);
     }
 
-    absolute_import(name, w_fromlist, execution_context)
+    // `_bootstrap.py __import__`: `if not fromlist: ... else: if
+    // hasattr(module, '__path__'): return _handle_fromlist(module, fromlist,
+    // _gcd_import)`.  A module that is not a package answers the list from
+    // its own attributes and needs no further import.  The empty-fromlist
+    // spelling stays with the leaf `absolute_import` already picked.
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_mod);
+    if crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?
+        && crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?.is_some()
+    {
+        handle_fromlist(
+            shadow_stack_get(mod_slot),
+            shadow_stack_get(fromlist_slot),
+            false,
+            execution_context,
+        )?;
+    }
+    Ok(shadow_stack_get(mod_slot))
+}
+
+// ── _handle_fromlist ─────────────────────────────────────────────────
+// `_bootstrap.py _handle_fromlist()`
+
+/// Import the submodules a `from <package> import ...` names.
+///
+/// Every name the package does not already carry is imported as
+/// `<__name__>.<name>`, and that import binds it as an attribute of the
+/// package on the way out -- which is what makes `from package import
+/// submodule` resolve to a submodule no attribute holds yet.  `IMPORT_FROM`
+/// runs after this and only reads what it left behind.
+///
+/// The app-level bootstrap owns this wherever `importlib._bootstrap` is
+/// installed, reached through `handle_fromlist_fast` or
+/// `call_bootstrap_import`.  The native importer stands in while it is not --
+/// during startup, and for a guest carrying no importlib at all -- so it owes
+/// the same work; `import_` is fixed to `absolute_import` there rather than
+/// being passed in.
+///
+/// Returns unit rather than the module: the caller holds the pinned leaf, and
+/// the imports below can move whatever this were to hand back.
+fn handle_fromlist(
+    w_mod: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    recursive: bool,
+    execution_context: *const PyExecutionContext,
+) -> Result<(), crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_mod);
+    let fromlist_slot = shadow_stack_len();
+    let _ = pin_root(w_fromlist);
+
+    // `for x in fromlist` — iterated lazily, one item fully processed before
+    // the next is requested.  A custom iterable is observable here: draining it
+    // up front lets a later `__next__` error preempt the TypeError an earlier
+    // item already owes, and hides an import an earlier item performed from the
+    // `__next__` that follows it.
+    let w_iter = crate::baseobjspace::iter(shadow_stack_get(fromlist_slot))?;
+    let iter_slot = shadow_stack_len();
+    let _ = pin_root(w_iter);
+
+    loop {
+        let w_x = match crate::baseobjspace::next(shadow_stack_get(iter_slot)) {
+            Ok(item) => item,
+            Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+            Err(err) => return Err(err),
+        };
+        let _item_roots = push_roots();
+        let x_slot = shadow_stack_len();
+        let _ = pin_root(w_x);
+
+        if !unsafe { pyre_object::is_str(shadow_stack_get(x_slot)) } {
+            // The `__name__` read runs first: it can collect, and both it and
+            // `type_name_of`'s view into the type object move under it.
+            let mut message: Wtf8Buf = "Item in ".into();
+            if recursive {
+                let w_name =
+                    crate::baseobjspace::getattr_str(shadow_stack_get(mod_slot), "__name__")?;
+                message.push_wtf8(&unsafe { crate::display::py_str_wtf8(w_name) }?);
+                message.push_str(".__all__");
+            } else {
+                message.push_str("``from list''");
+            }
+            message.push_str(" must be str, not ");
+            message.push_str(unsafe { pyre_object::type_name_of(shadow_stack_get(x_slot)) });
+            return Err(crate::PyError::type_error(message));
+        }
+
+        // `__all__` is expanded once; a name inside it that is itself `*` is an
+        // ordinary name, not a second expansion.
+        if unsafe { pyre_object::w_str_get_value_opt(shadow_stack_get(x_slot)) } == Some("*") {
+            if !recursive
+                && let Some(w_all) =
+                    crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__all__")?
+            {
+                handle_fromlist(shadow_stack_get(mod_slot), w_all, true, execution_context)?;
+            }
+            continue;
+        }
+
+        // `hasattr(module, x)` — keyed by the item object rather than a `&str`
+        // spelling of it, so a name carrying a lone surrogate is looked up as
+        // written instead of reaching an accessor that rejects it.
+        match crate::baseobjspace::getattr(shadow_stack_get(mod_slot), shadow_stack_get(x_slot)) {
+            Ok(_) => continue,
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
+        }
+
+        // `from_name = f'{module.__name__}.{x}'` — a formatted read.  A package
+        // object whose `__name__` is not a str is coerced the way the f-string
+        // coerces it, not handed to a str-only accessor: `sys.modules` can hold
+        // any object with a `__path__`.
+        let w_name = crate::baseobjspace::getattr_str(shadow_stack_get(mod_slot), "__name__")?;
+        let mut from_name = unsafe { crate::display::py_str_wtf8(w_name) }?;
+        from_name.push_str(".");
+        from_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(shadow_stack_get(x_slot)) });
+        // The native importer names modules by `&str` throughout, so a child
+        // whose name has no UTF-8 spelling can be neither found, cached nor
+        // blocked here.  That is the outcome `_handle_fromlist` already
+        // swallows: the import raises `ModuleNotFoundError` for exactly this
+        // name and no `sys.modules` entry contradicts it.
+        let Ok(child) = from_name.as_str() else {
+            continue;
+        };
+        if let Err(err) = absolute_import(child, pyre_object::PY_NULL, execution_context) {
+            // Backwards-compatibility dictates we ignore failed imports
+            // triggered by fromlist for modules that don't exist:
+            // `exc.name == from_name and sys.modules.get(from_name,
+            // _NEEDS_LOADING) is not None`.  The absent key answers the
+            // sentinel, so the only entry that re-raises is an explicit
+            // `None` block.
+            if err.kind != crate::PyErrorKind::ModuleNotFoundError
+                || !error_names_module(&err, child)
+                || sys_modules_blocks(child)
+            {
+                return Err(err);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a ModuleNotFoundError's `name` is exactly `module_name` -- the
+/// `exc.name == from_name` half of `_handle_fromlist`'s suppression test.  An
+/// error raised for a *different* name propagates: `from a import b` where
+/// `a.b` exists but its body raises `ModuleNotFoundError` for `c` is a real
+/// failure.
+fn error_names_module(err: &crate::PyError, module_name: &str) -> bool {
+    if err.w_name_context.is_null() || !unsafe { pyre_object::is_str(err.w_name_context) } {
+        return false;
+    }
+    // `_opt`, not `w_str_get_value`: a module name reaches here through
+    // `fsdecode` and so may hold a lone surrogate, which the panicking
+    // spelling would turn into a crash.  Such a name is simply not equal to
+    // the `&str` the caller built.
+    let name = unsafe { pyre_object::w_str_get_value_opt(err.w_name_context) };
+    name == Some(module_name)
 }
 
 /// Relative import: `from .foo import bar` (level=1), `from ..foo import bar` (level=2).
@@ -5671,74 +5850,26 @@ pub(crate) fn module_shadow_info(
     Ok((Some(origin), true, shadowing_stdlib))
 }
 
-pub fn import_from(
-    module: PyObjectRef,
-    name: &str,
-    execution_context: *const PyExecutionContext,
-) -> Result<PyObjectRef, crate::PyError> {
+pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
     // pyopcode.py import_from — first `space.getattr(w_module, w_name)`,
     // which honours the module attribute protocol (`__getattribute__` /
-    // `__getattr__`).  Only an AttributeError falls through to the submodule
-    // import below; any other error propagates.
+    // `__getattr__`).  Only an AttributeError falls through to the
+    // `sys.modules` lookup below; any other error propagates.
     match crate::baseobjspace::getattr_str(module, name) {
         Ok(value) => return Ok(value),
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {}
         Err(e) => return Err(e),
     }
 
-    // PyPy: pyopcode.py _import_from — try importing as a submodule.
-    // Build fullname = module.__name__ + "." + name and import it.
-    // Same `w_dict` routing as the first lookup so dict-subclass-backed
-    // Modules' submodule fallback honours overridden `__getitem__`.
-    if unsafe { is_module(module) } {
-        let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
-        if !w_dict.is_null()
-            && unsafe { pyre_object::is_dict(w_dict) }
-            && let Some(modname_obj) =
-                unsafe { pyre_object::w_dict_getitem_str(w_dict, "__name__") }
-            && !modname_obj.is_null()
-            && unsafe { pyre_object::is_str(modname_obj) }
-        {
-            let modname = unsafe { pyre_object::w_str_get_value(modname_obj) };
-            let fullname = format!("{modname}.{name}");
-            match importhook(
-                &fullname,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-                execution_context,
-            ) {
-                Ok(_) => {
-                    // importhook returns the top-level module when
-                    // fromlist is empty. Retrieve the actual leaf
-                    // module from sys.modules.
-                    if let Some(submod) = check_sys_modules(&fullname) {
-                        unsafe {
-                            pyre_object::dictmultiobject::w_dict_setitem_str(w_dict, name, submod);
-                        }
-                        return Ok(submod);
-                    }
-                }
-                Err(e) => {
-                    // A ModuleNotFoundError naming `fullname` itself
-                    // means `name` is simply not a submodule, so fall
-                    // through to the attribute-style "cannot import
-                    // name".  Any other failure is a transitive import
-                    // error inside the submodule and must propagate
-                    // rather than be masked (`_handle_fromlist`).
-                    let absent_submodule = e.kind == crate::PyErrorKind::ModuleNotFoundError
-                        && e.message
-                            .contains(&rustpython_wtf8::Wtf8Buf::from_string(format!(
-                                "'{fullname}'"
-                            )));
-                    if !absent_submodule {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
-
+    // pyopcode.py import_from — the submodule case is a plain
+    // `space.getitem(space.sys.get('modules'), w_fullname)` lookup.  No import
+    // runs here and nothing is stored back onto the parent: `__import__` has
+    // already run `_handle_fromlist` (app-level through `handle_fromlist_fast`
+    // / `call_bootstrap_import`, or `handle_fromlist` on the native importer),
+    // so this lookup only covers what that binding missed -- a submodule whose
+    // `sys.modules` entry predates the import, which `_find_and_load` answers
+    // from the cache without touching the parent.
+    //
     // import_from Issue #17636 — a submodule already bound in sys.modules under
     // `<__name__>.<name>` is returned even when the parent object rejected the
     // attribute (e.g. a non-module stand-in with restrictive slots that

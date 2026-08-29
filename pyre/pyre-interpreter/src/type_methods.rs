@@ -2927,6 +2927,53 @@ pub(crate) fn call_format_dispatch(
     }
 }
 
+/// Whether the type-level `__format__` in `meth` is the shared builtin body
+/// that `int`, `bool`, `float` and `str` publish, *and* applies to `val`.
+///
+/// The question the dispatch below has to answer is not how `__format__` is
+/// spelled but whether calling it is the same thing as calling
+/// [`format_with_spec_public`] -- which holds for [`builtin_value_format`] and
+/// for nothing else, since that body is exactly `format_with_spec_public(self,
+/// spec)` once its non-empty spec is read back out.  `object.__format__`
+/// carries its own body and is not recognised, so a class that defines no
+/// `__format__` of its own still reaches the TypeError it raises for a
+/// non-empty spec.
+///
+/// The test this replaced named `BUILTIN_FUNCTION_TYPE`, a type a type-level
+/// lookup never returns: `int.__format__` is a `method_descriptor`, so the
+/// disjunct was true for every builtin and the fast path below it was
+/// unreachable.  `f"{k:>5}"` on an exact `int` wrapped its spec in a `str`,
+/// walked the generic call path, and read the same bytes back out.
+///
+/// # Safety
+/// `val` and `meth` must be valid, non-null pointers to a `PyObject`.
+unsafe fn is_shared_builtin_format(val: PyObjectRef, meth: PyObjectRef) -> bool {
+    unsafe {
+        let Some(found) = crate::jit_builtin_folds::builtin_code_fn_of(meth) else {
+            return false;
+        };
+        if !crate::gateway::builtin_code_fn_eq(found, builtin_value_format) {
+            return false;
+        }
+        // `descr_check` — the descriptor a type-level lookup finds need not be
+        // the one that type publishes.  `class S(str): __format__ =
+        // int.__format__` installs `int`'s, and calling it owes the descriptor
+        // TypeError rather than formatting the receiver as a `str`.  Only a
+        // descriptor whose `__objclass__` the receiver satisfies is the
+        // inherited one whose call this path may stand in for.
+        let Ok(owner) = crate::function::fget_func_objclass(meth) else {
+            return false;
+        };
+        let Some(w_type) = crate::typedef::r#type(val) else {
+            return false;
+        };
+        // The exact builtin -- the whole of what this path exists for -- is one
+        // comparison; only a subclass pays the MRO scan.
+        let w_type = w_type.as_ptr();
+        std::ptr::eq(w_type, owner) || crate::baseobjspace::issubtype_w(w_type, owner)
+    }
+}
+
 /// `PyObject_Format` — when `val` is a class instance whose type defines
 /// `__format__`, dispatch to it (the result must be a `str`); otherwise
 /// apply the shared builtin spec parser, with an empty spec collapsing to
@@ -2947,16 +2994,15 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
         return Ok(unsafe { crate::py_str_wtf8(val)? });
     }
     // A class instance always dispatches to its `__format__` (its own
-    // override or the inherited `object.__format__`).  A builtin subclass
-    // dispatches whenever it overrides `__format__` with anything other than
-    // the inherited builtin default — a `def`, `@staticmethod`,
-    // `@classmethod`, or any non-`BUILTIN_FUNCTION_TYPE` descriptor; the
-    // builtin default takes the fast path below, which formats the
+    // override or the inherited `object.__format__`).  A builtin dispatches
+    // whenever its `__format__` is anything other than the shared builtin
+    // default — a `def`, `@staticmethod`, `@classmethod`, another type's own
+    // builtin body (`object.__format__` among them), or any other descriptor;
+    // the shared default takes the fast path below, which formats the
     // underlying value directly.  `__format__` is resolved on the type (not
     // the instance) so an instance-dict attribute does not shadow it.
     if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }
-        && (unsafe { is_instance(val) }
-            || !unsafe { py_type_check(meth, &crate::function::BUILTIN_FUNCTION_TYPE) })
+        && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
     {
         let spec_obj = pyre_object::w_str_from_wtf8(spec.to_wtf8_buf());
         return call_format_dispatch(val, meth, spec_obj);

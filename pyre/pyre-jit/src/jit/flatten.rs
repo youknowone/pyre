@@ -3517,8 +3517,8 @@ pub struct LoweringContext {
     /// `co_names` index) lowered to `residual_call_ir_r(ConstInt(fn_idx),
     /// ListI([name_idx]), ListR([module, code]), Descr) → reg` via
     /// [`lower_import_from_hlop_to_insn`]; `bh_import_from_fn` runs
-    /// `importing::import_from` (submodule import may run module top-level
-    /// Python → `MayForce`).
+    /// `importing::import_from` (a `getattr` on the module, so a user
+    /// `__getattribute__` / `__getattr__` may run Python → `MayForce`).
     pub import_from_fn_idx: u16,
     /// `load_super_attr_fn` descrs-pool index.  LOAD_SUPER_ATTR records the
     /// `load_super_attr(global_super, self, cls, frame, code, name_idx,
@@ -6840,9 +6840,9 @@ where
 /// `result: Ref` to `residual_call_ir_r(ConstInt(import_from_fn_idx),
 /// ListI([name_idx]), ListR([module, code]), Descr) → reg` — the same
 /// two-Ref shape as [`lower_getattr_hlop_to_insn`].  `bh_import_from_fn`
-/// resolves `getattr(module, name)` with a submodule-import fallback that may
-/// run module top-level Python → `MayForce`.  `module` is the peeked TOS
-/// (IMPORT_FROM does not pop it).
+/// resolves `getattr(module, name)` with a `sys.modules` fallback; the getattr
+/// may run a user `__getattribute__` / `__getattr__` → `MayForce`.  `module`
+/// is the peeked TOS (IMPORT_FROM does not pop it).
 ///
 /// Returns `None` for non-`import_from` opnames so the caller can fall
 /// through to other lowering arms.
@@ -13827,8 +13827,8 @@ mod tests {
     fn lower_import_from_hlop_emits_import_from_fn_residual() {
         // `import_from(module, code, name_idx)` →
         // `residual_call_ir_r(ConstInt(import_from_fn_idx), ListI([name_idx]),
-        // ListR([module, code]), Descr) → reg` (MayForce — a submodule-import
-        // fallback may run a module's top-level Python).  Two Ref operands —
+        // ListR([module, code]), Descr) → reg` (MayForce — the `getattr` may
+        // run a user `__getattribute__` / `__getattr__`).  Two Ref operands —
         // the peeked TOS module and the jitcode's own code object — plus one
         // Int; the same two-Ref shape as `getattr`.
         let module_var = Variable::new(VariableId(8), Kind::Ref);

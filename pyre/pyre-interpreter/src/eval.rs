@@ -4246,9 +4246,8 @@ impl OpcodeStepExecutor for PyFrame {
     // Stack: [module] → peek module, push getattr(module, name)
     fn import_from(&mut self, name: &str) -> Result<(), PyError> {
         let module = self.peek();
-        let ec = crate::call::getexecutioncontext();
         let anchor = FrameAnchor::new(self);
-        let attr = crate::importing::import_from(module, name, ec)?;
+        let attr = crate::importing::import_from(module, name)?;
         Self::push_anchored(&anchor, attr)
     }
 
