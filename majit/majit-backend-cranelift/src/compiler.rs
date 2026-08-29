@@ -515,6 +515,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         Some(gc_remove_root_via_active_runtime),
     );
     majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
+    majit_gc::set_active_gc_shrink_array(Some(gc_shrink_array_via_active_runtime));
     majit_gc::set_active_gc_is_nursery_object(Some(gc_is_nursery_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
@@ -2093,6 +2094,16 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
+}
+
+/// `llop.shrink_array`. Read-only on the collector, as
+/// `gc_owns_object_via_active_runtime` is.
+fn gc_shrink_array_via_active_runtime(addr: usize, smaller_length: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.shrink_array(addr, smaller_length)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.shrink_array(addr, smaller_length))
 }
 
 fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
@@ -4197,7 +4208,12 @@ extern "C" fn gc_alloc_typed_nursery_shim(type_id: u64, size: u64) -> u64 {
     })
 }
 
-extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64, type_id: u64) -> u64 {
+extern "C" fn gc_alloc_varsize_shim(
+    base_size: u64,
+    item_size: u64,
+    length: u64,
+    type_id: u64,
+) -> u64 {
     with_cranelift_gc_required(|gc| {
         gc.alloc_varsize_typed(
             type_id as u32,
@@ -4205,7 +4221,7 @@ extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64,
             item_size as usize,
             length as usize,
         )
-            .0 as u64
+        .0 as u64
     })
 }
 

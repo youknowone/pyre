@@ -3632,9 +3632,12 @@ impl MiniMarkGC {
 
     /// Whether `mirror`'s count makes it root its linked object.
     ///
-    /// `incminimark.py:3263` is the bare `rc != REFCNT_FROM_PYPY` — every
-    /// reference above the link share is one C holds, and holding it is what
-    /// roots.  The subtraction is [`rawrefcount::CEdgeCensusFn`]'s: a reference
+    /// `incminimark.py:3264` is `rc == REFCNT_FROM_PYPY or rc ==
+    /// REFCNT_FROM_PYPY_LIGHT` — every reference above the link share is one C
+    /// holds, and holding it is what roots.  The light disjunct is dropped
+    /// because no mirror carries that count (see
+    /// [`rawrefcount::REFCNT_IMMORTAL`]); with one, the base share to subtract
+    /// below would have to be the light constant for such a mirror.  The subtraction is [`rawrefcount::CEdgeCensusFn`]'s: a reference
     /// another block in the census supplies is not one from outside the heap,
     /// and whether *that* block's own object lives is settled by the trace, in
     /// [`Self::mark_c_edges`], rather than assumed here.
@@ -4122,10 +4125,12 @@ impl MiniMarkGC {
     /// incminimark.py `_rrc_free`.
     ///
     /// The linked object has died, so the interpreter's share of the count goes
-    /// away.  incminimark.py:3328-3335's `REFCNT_FROM_PYPY_LIGHT` branch has no
-    /// port — nothing here creates a light mirror — and the immortal branch
-    /// (:3326) is unreachable, because a count above the link share forces the
-    /// linked object alive in both trace passes.
+    /// away.  incminimark.py:3325-3332's `REFCNT_FROM_PYPY_LIGHT` branch has no
+    /// port, for the reason [`rawrefcount::REFCNT_IMMORTAL`] records: no
+    /// translated `cpyext` creates a light mirror, so upstream never takes that
+    /// branch either.  The immortal branch is pyre's own and is unreachable,
+    /// because a count above the link share forces the linked object alive in
+    /// both trace passes.
     fn _rrc_free(&mut self, mirror: usize) {
         let header = rawrefcount::pyobj(mirror);
         let mut rc = unsafe { (*header).ob_refcnt };
@@ -4562,6 +4567,58 @@ impl MiniMarkGC {
             // describe one — so a larger result is a decode failure, not a
             // request the allocator could ever serve.
             .filter(|&size| size <= isize::MAX as usize - GcHeader::SIZE)
+    }
+
+    /// incminimark.py:1160-1182 `shrink_array`.
+    ///
+    /// Records that a varsize object is shorter than it was, so that when it
+    /// leaves the nursery it consumes less memory. The object keeps its
+    /// address; the tail is simply never copied out, and the nursery reclaims
+    /// it wholesale at the next reset the way it reclaims anything unreached.
+    ///
+    /// Writing the length field is the whole of the operation. Upstream also
+    /// calls `llarena.arena_shrink_obj`, but that is `pass` in a translated
+    /// build (`llarena.py:557 llimpl_arena_shrink_obj`) — it exists for the
+    /// fake arena's own reservation bookkeeping, which pyre's bump-pointer
+    /// nursery has no counterpart to. Nothing walks the nursery linearly, so
+    /// no reader has to be told about the gap.
+    ///
+    /// Declined for an object outside the nursery — upstream's comment names
+    /// the consequence, "an array with GCFLAG_HAS_CARDS is never resized", and
+    /// a carded array is rawmalloced and so already excluded — and for one
+    /// with a shadow, whose shadow was allocated at the old length and would
+    /// be partly stranded.
+    ///
+    /// `false` means the caller must allocate a smaller object and copy, which
+    /// is exactly what `rgc.ll_shrink_array` does with that answer
+    /// (`rgc.py:475-478`).
+    pub fn shrink_array(&self, obj_addr: usize, smaller_length: usize) -> bool {
+        if !self.is_in_nursery(obj_addr) {
+            return false;
+        }
+        let hdr = unsafe { header_of(obj_addr) };
+        if unsafe { (*hdr).has_flag(flags::HAS_SHADOW) } {
+            return false;
+        }
+        let type_id = unsafe { (*hdr).type_id() };
+        if (type_id as usize) >= self.types.len() {
+            return false;
+        }
+        let type_info = self.types.get(type_id);
+        // `varsize_offset_to_length` is asked of a varsize type only; a fixed
+        // one has no length field to write, and `length_offset` on it is the
+        // registration default rather than an answer.
+        if type_info.item_size == 0 {
+            return false;
+        }
+        let length_ptr = (obj_addr + type_info.length_offset) as *mut usize;
+        debug_assert!(
+            smaller_length <= unsafe { *length_ptr },
+            "shrink_array asked to grow an array: {smaller_length} > {}",
+            unsafe { *length_ptr }
+        );
+        unsafe { *length_ptr = smaller_length };
+        true
     }
 
     /// Panicking [`Self::try_size_for_typeid`], for the collector paths that
@@ -7837,8 +7894,8 @@ impl MiniMarkGC {
     /// can build today.
     ///
     /// It stops rejecting them the moment a production caller of that
-    /// allocator lands, and the sites that owe this call then are the item
-    /// moves in `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
+    /// allocator lands, and the sites that owe this call are the item moves in
+    /// `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
     /// `object_remove` and `object_drain` each shift items with a bare
     /// `ptr::copy`, and `object_reverse` permutes them with a bare
     /// `slice::reverse`. The last one is the one to miss: it moves pointers
@@ -7850,15 +7907,15 @@ impl MiniMarkGC {
     /// Upstream reaches this barrier from those operations through
     /// `rgc.ll_arraymove`, which `ll_insert_nonneg`, `ll_pop_zero`,
     /// `ll_delitem_nonneg` and `ll_listdelslice_startstop` all call; pyre's
-    /// list is not an rtyper-lowered list, so it has no such seam and the
-    /// calls have to be written at those four sites.
+    /// list is not an rtyper-lowered list, so it has no such seam, and the
+    /// four calls are written out at those sites as
+    /// `listobject::list_before_move_barrier`.
     ///
-    /// The order is not free. These sites are prerequisites of that
-    /// production caller, not siblings of it: with cards live and a move
+    /// The order was not free. Those sites are prerequisites of a production
+    /// card allocator, not siblings of it: with cards live and a move
     /// unbarriered, a minor scans only the dirty pages and a young pointer
     /// shifted into a clean one is collected while live. That is silent heap
-    /// corruption, where the absence of cards today makes the same code
-    /// correct.
+    /// corruption, where the absence of cards makes the same code correct.
     pub fn writebarrier_before_move(&mut self, array_addr: usize) {
         if self.config.card_page_indices == 0 {
             return;
@@ -8260,6 +8317,10 @@ impl Default for MiniMarkGC {
 impl GcAllocator for MiniMarkGC {
     fn writebarrier_before_move(&mut self, obj: GcRef) {
         MiniMarkGC::writebarrier_before_move(self, obj.0);
+    }
+
+    fn shrink_array(&self, addr: usize, smaller_length: usize) -> bool {
+        MiniMarkGC::shrink_array(self, addr, smaller_length)
     }
 
     fn debug_validate_oldgen_freeblocks(&self, site: &str) {
@@ -10854,6 +10915,103 @@ mod tests {
         let obj = gc.alloc_in_oldgen_with_cards(tid, total_size, length, true);
         assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_HAS_CARDS) });
         assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+    }
+
+    /// incminimark.py:1160-1182 `shrink_array` on the object it accepts: the
+    /// nursery array keeps its address and reports the smaller length, which
+    /// is what a caller returning `p` unchanged relies on.
+    #[test]
+    fn shrink_array_records_a_smaller_length_in_place() {
+        let mut gc = test_gc(4096);
+        // A STR-shaped type: a fixed `hash` word, then the length word the
+        // varsize part is measured by.
+        let tid = gc.register_type(TypeInfo::varsize(16, 8, 8, false, Vec::new()));
+        let obj = gc.alloc_with_type(tid, 16 + 8 * 12);
+        assert!(gc.is_in_nursery(obj.0));
+        unsafe { *((obj.0 + 8) as *mut usize) = 12 };
+        unsafe { *(obj.0 as *mut usize) = 0xdead_beef };
+
+        assert!(gc.shrink_array(obj.0, 5));
+
+        assert_eq!(unsafe { *((obj.0 + 8) as *const usize) }, 5);
+        // The fixed part is untouched: upstream copies it only on the fallback
+        // path, because the accepted path never moves the object.
+        assert_eq!(unsafe { *(obj.0 as *const usize) }, 0xdead_beef);
+    }
+
+    /// incminimark.py:1169-1170: "Only objects in the nursery can be
+    /// resized."  An old-generation array is declined, and that answer is what
+    /// sends `rgc.ll_shrink_array` down its allocate-and-copy path.
+    #[test]
+    fn shrink_array_declines_an_old_generation_array() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(16, 8, 8, false, Vec::new()));
+        let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16 + 8 * 12);
+        assert!(!gc.is_in_nursery(obj.0));
+        unsafe { *((obj.0 + 8) as *mut usize) = 12 };
+
+        assert!(!gc.shrink_array(obj.0, 5));
+
+        assert_eq!(unsafe { *((obj.0 + 8) as *const usize) }, 12);
+    }
+
+    /// incminimark.py:1171-1172: a nursery object with GCFLAG_HAS_SHADOW is
+    /// not resized either, "as this would potentially loose part of the memory
+    /// in the already-allocated shadow".
+    #[test]
+    fn shrink_array_declines_an_object_with_a_shadow() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(16, 8, 8, false, Vec::new()));
+        let obj = gc.alloc_with_type(tid, 16 + 8 * 12);
+        unsafe { *((obj.0 + 8) as *mut usize) = 12 };
+        unsafe { (*header_of(obj.0)).set_flag(flags::HAS_SHADOW) };
+
+        assert!(!gc.shrink_array(obj.0, 5));
+
+        assert_eq!(unsafe { *((obj.0 + 8) as *const usize) }, 12);
+    }
+
+    /// A fixed-size type has no length field, so there is nothing to record.
+    /// Upstream reaches the write through `varsize_offset_to_length`, which
+    /// such a type has no answer for.
+    #[test]
+    fn shrink_array_declines_a_fixed_size_object() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_with_type(tid, 16);
+        assert!(gc.is_in_nursery(obj.0));
+
+        assert!(!gc.shrink_array(obj.0, 1));
+    }
+
+    /// A shrunk nursery array consumes less when it leaves the nursery: the
+    /// promotion copy is sized from the length word the shrink wrote.
+    #[test]
+    fn a_shrunk_array_is_promoted_at_its_smaller_size() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(16, 8, 8, false, Vec::new()));
+        let obj = gc.alloc_with_type(tid, 16 + 8 * 100);
+        unsafe { *(obj.0 as *mut usize) = 0xdead_beef };
+        unsafe { *((obj.0 + 8) as *mut usize) = 100 };
+        assert!(gc.shrink_array(obj.0, 3));
+        let root = crate::shadow_stack::OwnerRootGuard::new(obj);
+        gc.bytes_made_old_since_cycle = 0;
+
+        gc.do_collect_nursery();
+
+        let moved = root.get();
+        assert!(gc.oldgen.contains(moved.0));
+        assert_eq!(unsafe { *(moved.0 as *const usize) }, 0xdead_beef);
+        assert_eq!(unsafe { *((moved.0 + 8) as *const usize) }, 3);
+        // The promotion sizes the copy from the length word, so the shrink is
+        // what the old generation is charged for.
+        assert_eq!(
+            gc.bytes_made_old_since_cycle,
+            GcHeader::SIZE + 16 + 8 * 3,
+            "the promotion copied the pre-shrink size"
+        );
     }
 
     /// incminimark.py:1032-1035, the `alloc_young` arm of the card question.

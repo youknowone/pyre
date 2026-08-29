@@ -33,8 +33,18 @@ pub const REFCNT_FROM_PYPY: isize = (isize::MAX >> 2) + 1;
 /// `rawrefcount.py:16-20` has two constants above [`REFCNT_FROM_PYPY`]:
 /// `REFCNT_FROM_PYPY_LIGHT`, for a mirror whose deallocation is a plain free
 /// with no deallocator to run, and `_Py_IMMORTAL_REFCNT`, for one that is never
-/// deallocated at all.  Only the second has a port — nothing here creates a
-/// light mirror.
+/// deallocated at all.  Only the second has a port, and that is not a gap:
+/// nothing creates a light mirror upstream either.  `cpyext` links every
+/// mirror with the plain share (`pypy/module/cpyext/pyobject.py:288`,
+/// `py_obj.c_ob_refcnt += rawrefcount.REFCNT_FROM_PYPY`), and the only
+/// assignments of the light one in the whole tree are in
+/// `rpython/rlib/test/test_rawrefcount.py` and
+/// `rpython/memory/gc/test/test_rawrefcount.py`.
+/// `pypy/doc/discussion/rawrefcount.rst:120-148` proposes the cases that would
+/// use it — "and we can use REFCNT_FROM_PYPY_LIGHT too: 'tp_dealloc' doesn't
+/// need to be called" — in the future tense.  Its three readers in
+/// `incminimark.py` (:3264, :3325, :3361) are therefore branches the
+/// translated interpreter never takes.
 ///
 /// The value is chosen for headroom rather than to match either upstream
 /// constant: the asserts below hold it at least `1 << 60` clear of the

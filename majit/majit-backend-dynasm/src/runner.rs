@@ -351,6 +351,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_minor_collections_since_major(Some(dynasm_minor_collections_since_major));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
+    majit_gc::set_active_gc_shrink_array(Some(dynasm_gc_shrink_array));
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
@@ -928,6 +929,17 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
+}
+
+/// `llop.shrink_array`. Read-only on the collector — it writes the object's
+/// length field, not the GC's own state — so both arms take a shared borrow,
+/// as `dynasm_gc_owns_object` does.
+fn dynasm_gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.shrink_array(addr, smaller_length)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.shrink_array(addr, smaller_length))
 }
 
 fn dynasm_gc_is_nursery_object(addr: usize) -> bool {

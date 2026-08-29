@@ -711,6 +711,17 @@ pub trait GcAllocator: Send {
     /// collector without card marking wants.
     fn writebarrier_before_move(&mut self, _obj: GcRef) {}
 
+    /// `llop.shrink_array(Bool, p, smallerlength)`, incminimark.py:1160-1182.
+    ///
+    /// Record in place that a varsize object is shorter than it was.  The
+    /// default declines, which is a complete answer: `rgc.ll_shrink_array`
+    /// allocates a smaller object and copies whenever the GC says no
+    /// (`rgc.py:475-478`), so a collector that cannot resize anything is
+    /// served by that path alone.
+    fn shrink_array(&self, _addr: usize, _smaller_length: usize) -> bool {
+        false
+    }
+
     /// incminimark.py jit_remember_young_pointer_from_array:
     /// Called by JIT when TRACK_YOUNG_PTRS set but CARDS_SET not.
     /// Tries to set CARDS_SET if HAS_CARDS; else generic barrier.
@@ -2875,9 +2886,12 @@ pub fn active_minor_collections_since_major() -> usize {
 /// `std::alloc`-allocated ones.
 pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
 pub type GcIsNurseryObjectFn = fn(addr: usize) -> bool;
+/// `llop.shrink_array` — see [`GcAllocator::shrink_array`].
+pub type GcShrinkArrayFn = fn(addr: usize, smaller_length: usize) -> bool;
 
 global_hook!(static ACTIVE_GC_OWNS_OBJECT: GcOwnsObjectFn);
 global_hook!(static ACTIVE_GC_IS_NURSERY_OBJECT: GcIsNurseryObjectFn);
+global_hook!(static ACTIVE_GC_SHRINK_ARRAY: GcShrinkArrayFn);
 
 /// Install the active backend's `is_managed_heap_object` trampoline.
 pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
@@ -2887,6 +2901,11 @@ pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
 /// Install the active backend's nursery-membership predicate.
 pub fn set_active_gc_is_nursery_object(hook: Option<GcIsNurseryObjectFn>) {
     ACTIVE_GC_IS_NURSERY_OBJECT.set(hook);
+}
+
+/// Install the active backend's in-place array shrink.
+pub fn set_active_gc_shrink_array(hook: Option<GcShrinkArrayFn>) {
+    ACTIVE_GC_SHRINK_ARRAY.set(hook);
 }
 
 /// minimark.py `id_or_identityhash` hook.
@@ -2914,6 +2933,20 @@ pub fn gc_id_or_identityhash(addr: usize) -> usize {
 pub fn gc_owns_object(addr: usize) -> bool {
     match ACTIVE_GC_OWNS_OBJECT.get() {
         Some(f) => f(addr),
+        None => false,
+    }
+}
+
+/// `llop.shrink_array(Bool, p, smallerlength)`: record that the varsize object
+/// at `addr` is shorter than it was, in place.
+///
+/// `false` when no backend has installed a hook, or when the object is one its
+/// GC declines to resize.  `rgc.ll_shrink_array` treats that answer as
+/// "allocate a smaller object and copy into it" (`rgc.py:475-478`), and so must
+/// every caller here.
+pub fn gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
+    match ACTIVE_GC_SHRINK_ARRAY.get() {
+        Some(f) => f(addr, smaller_length),
         None => false,
     }
 }
