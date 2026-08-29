@@ -740,6 +740,17 @@ pub fn top() -> (ShadowStackSlot, usize) {
     })
 }
 
+/// Get the top GcRef through one thread-local resolve and one borrow.
+#[inline]
+pub fn top_ref() -> GcRef {
+    SHADOW_STACK.with(|ss| {
+        let ss = ss.borrow();
+        let len = ss.entries.len();
+        debug_assert!(len > 0, "shadow stack empty");
+        ss.entries[len - 1]
+    })
+}
+
 /// Get a GcRef at `index` through a previously resolved [`ShadowStackSlot`].
 ///
 /// # Safety
