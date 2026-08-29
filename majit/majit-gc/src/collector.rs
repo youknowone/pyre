@@ -2022,6 +2022,22 @@ impl MiniMarkGC {
         // Both fallbacks stand in for the nursery bump below, which clears
         // nothing — the same reading `spill_to_oldgen_or_null` takes for this
         // function's fallible counterpart.
+        //
+        // The oversized arm is born OLD here, unlike `alloc_with_type_slow`'s
+        // and `alloc_nursery_collecting_typed_rooted`'s, which take
+        // `try_alloc_young_nonmoving_clear` — `external_malloc(...,
+        // alloc_young=True)`, incminimark.py:719,767. The young birth does not
+        // collect, so the no-collect contract is not what withholds it.
+        //
+        // What withholds it is the root set. Born old, an unrooted block is
+        // reclaimed by the next major; born young, by the next MINOR. Neither
+        // placement makes an unrooted block safe — the major sweeps it just as
+        // the minor frees it — so this is a difference in how long a rooting
+        // gap stays latent, and the callers here are compiled code whose
+        // stack maps this branch exists to avoid consulting. Taking the young
+        // arm turns every such gap into an immediate use-after-free, which is
+        // why it waits on the shadow-stack coverage rather than on anything
+        // in this function.
         if total_size > self.config.large_object_threshold {
             return self.alloc_in_oldgen_nursery_substitute(type_id, total_size);
         }
@@ -2154,6 +2170,14 @@ impl MiniMarkGC {
     /// The old-gen spill
     /// [`try_alloc_with_type_no_collect_with_placement`](Self::try_alloc_with_type_no_collect_with_placement)
     /// leaves out of line, for a large object or a nursery with no room.
+    ///
+    /// Old, not young: [`Self::alloc_with_type_no_collect`] records why the
+    /// no-collect paths withhold `external_malloc`'s `alloc_young` arm.
+    ///
+    /// A `ItemsBlock` past `large_object_threshold` — a list of roughly
+    /// 16,900 items or more — reaches the old generation through here, and so
+    /// stays resident until a major even when the list dies in the loop
+    /// iteration that built it.
     #[cold]
     #[inline(never)]
     fn spill_to_oldgen_or_null(&mut self, type_id: u32, total_size: usize) -> GcRef {
