@@ -1217,6 +1217,9 @@ pub struct CallControl {
     /// Candidate targets — graphs we will inline.
     /// RPython: `CallControl.candidate_graphs`.
     candidate_graphs: HashSet<CallPath>,
+    /// `PipelineConfig::helper_graphs` — host-declared BFS seeds beside the
+    /// portals (`call.py:59-64 inline_calls_to`).
+    helper_seed_graphs: Vec<CallPath>,
 
     /// RPython: `JitDriverStaticData` — metadata for each jitdriver.
     /// `jitdrivers_sd[i]` holds the green/red arg layout for driver i.
@@ -1888,6 +1891,7 @@ impl CallControl {
             trait_method_impls: HashMap::new(),
             method_to_impl_types: HashMap::new(),
             candidate_graphs: HashSet::new(),
+            helper_seed_graphs: Vec::new(),
             jitdrivers_sd: Vec::new(),
             jitcodes: indexmap::IndexMap::new(),
             function_fnaddrs: HashMap::new(),
@@ -3123,6 +3127,18 @@ impl CallControl {
     /// that have access to the compiled helper surface can preload the
     /// equivalent integer address here so `get_jitcode()` and
     /// `fnaddr_for_target()` no longer fall back to symbolic hashes.
+    /// Seed `path` into the `find_all_graphs` BFS beside the portals.
+    ///
+    /// `call.py:59-64` seeds the `inline_calls_to` helper graphs because the
+    /// codewriter lowers an operation straight to a residual call of the
+    /// helper, so no graph calls it in source.  A host lowering an opcode to
+    /// a residual the same way names the residual's body here; the seed is a
+    /// candidate like a portal, and its callees join the closure under the
+    /// same policy as every other call.
+    pub fn register_helper_graph(&mut self, path: CallPath) {
+        self.helper_seed_graphs.push(path);
+    }
+
     pub fn register_function_fnaddr(&mut self, path: CallPath, fnaddr: i64) {
         self.function_fnaddrs.insert(path, fnaddr);
     }
@@ -3931,6 +3947,15 @@ impl CallControl {
                 todo.push(path.clone());
             }
         }
+        // The host's own `inline_calls_to`: the bodies behind the residual
+        // calls it lowers opcodes to (`register_helper_graph`).  A seed with
+        // no graph is reported by the drain loop below.
+        let helper_seeds = self.helper_seed_graphs.clone();
+        for path in helper_seeds {
+            if self.candidate_graphs.insert(path.clone()) {
+                todo.push(path);
+            }
+        }
         // call.py:59-64 — seed the BFS with builtin oopspec helpers so
         // `int_abs` / `int_floordiv` / `int_mod` / `ll_math.ll_math_sqrt`
         // are reachable even when the portal does not call them
@@ -4694,6 +4719,16 @@ impl CallControl {
         let wrappers = self.builtin_wrapper_indirect_graphs().to_vec();
         for wrapper in wrappers {
             self.get_jitcode(&wrapper);
+        }
+        // A helper seed (`register_helper_graph`) is called only from the
+        // residual the host lowers to, never from a graph being flattened,
+        // so no call site allocates its JitCode either; allocate it here so
+        // a descent can resolve the body by path.
+        let helper_seeds = self.helper_seed_graphs.clone();
+        for path in helper_seeds {
+            if self.function_graphs.contains_key(&path) {
+                self.get_jitcode(&path);
+            }
         }
     }
 
