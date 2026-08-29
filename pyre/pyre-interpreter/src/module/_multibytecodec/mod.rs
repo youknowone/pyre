@@ -341,15 +341,50 @@ pub(crate) fn getcodec(args: &[PyObjectRef]) -> crate::PyResult {
     crate::call::call_function_impl_result(cls, &[w_name])
 }
 
-fn raw_encode(args: &[PyObjectRef]) -> crate::PyResult {
+/// Publish the four positional arguments of a `_encode`/`_decode` entry point
+/// as one livevar set.
+///
+/// `text_w`, `is_true`, the buffer acquisition and [`codec_call_control`] all
+/// run Python, and the gateway's argument slice is not a root area, so every
+/// later argument is read back from its slot instead.
+fn publish_codec_args(
+    roots: &pyre_object::gc_roots::RootScope,
+    args: &[PyObjectRef],
+    entry_point: &str,
+) -> Result<usize, crate::PyError> {
     let (positional, _) = crate::builtins::split_builtin_kwargs(args);
     if positional.len() < 4 {
-        return Err(crate::PyError::type_error("_encode() requires 4 arguments"));
+        return Err(crate::PyError::type_error(format!(
+            "{entry_point}() requires 4 arguments"
+        )));
     }
-    let name = crate::baseobjspace::text_w(positional[0])?;
-    let errors = crate::baseobjspace::text_w(positional[2])?;
-    let final_input = crate::baseobjspace::is_true(positional[3])?;
-    let (output, consumed) = encode_impl(name, positional[1], errors, final_input)?;
+    let base = roots.publish(&positional[..4]);
+    roots.normalize(base, 4);
+    Ok(base)
+}
+
+/// Acquire the decoder input and copy it out.  `SimpleBufferBytes` has no
+/// `Drop`, so the export stays active until `release`, and a `bytearray` that
+/// is decoded twice would refuse to resize.
+fn codec_input_bytes(w_input: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    let buffer = crate::baseobjspace::simple_buffer_bytes(w_input)?.ok_or_else(|| {
+        crate::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            crate::type_methods::arg_type_name(w_input)
+        ))
+    })?;
+    let input = buffer.as_bytes().to_vec();
+    buffer.release();
+    Ok(input)
+}
+
+fn raw_encode(args: &[PyObjectRef]) -> crate::PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_encode")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
+    let (output, consumed) = encode_impl(name, roots.get(base + 1), errors, final_input)?;
     Ok(w_tuple_new(vec![
         pyre_object::bytesobject::w_bytes_from_bytes(&output),
         w_int_new(consumed as i64),
@@ -386,18 +421,14 @@ fn codec_call_control(
 }
 
 fn raw_encode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() < 4 {
-        return Err(crate::PyError::type_error(
-            "_encode_stateful() requires 4 arguments",
-        ));
-    }
-    let name = crate::baseobjspace::text_w(positional[0])?;
-    let errors = crate::baseobjspace::text_w(positional[2])?;
-    let (final_input, state, w_state) = codec_call_control(positional[3])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_encode_stateful")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let (final_input, state, w_state) = codec_call_control(roots.get(base + 3))?;
     let (output, consumed, _) = encode_impl_with_state(
         name,
-        positional[1],
+        roots.get(base + 1),
         errors,
         final_input,
         Some(&state),
@@ -410,20 +441,13 @@ fn raw_encode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn raw_decode(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() < 4 {
-        return Err(crate::PyError::type_error("_decode() requires 4 arguments"));
-    }
-    let name = crate::baseobjspace::text_w(positional[0])?;
-    let input = crate::baseobjspace::simple_buffer_bytes(positional[1])?.ok_or_else(|| {
-        crate::PyError::type_error(format!(
-            "a bytes-like object is required, not '{}'",
-            crate::type_methods::arg_type_name(positional[1])
-        ))
-    })?;
-    let errors = crate::baseobjspace::text_w(positional[2])?;
-    let final_input = crate::baseobjspace::is_true(positional[3])?;
-    let (output, consumed) = decode_impl(name, input.as_bytes(), errors, final_input)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_decode")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let input = codec_input_bytes(roots.get(base + 1))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
+    let (output, consumed) = decode_impl(name, &input, errors, final_input)?;
     Ok(w_tuple_new(vec![
         pyre_object::unicodeobject::w_str_from_wtf8_managed(output),
         w_int_new(consumed as i64),
@@ -431,24 +455,15 @@ fn raw_decode(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn raw_decode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() < 4 {
-        return Err(crate::PyError::type_error(
-            "_decode_stateful() requires 4 arguments",
-        ));
-    }
-    let name = crate::baseobjspace::text_w(positional[0])?;
-    let input = crate::baseobjspace::simple_buffer_bytes(positional[1])?.ok_or_else(|| {
-        crate::PyError::type_error(format!(
-            "a bytes-like object is required, not '{}'",
-            crate::type_methods::arg_type_name(positional[1])
-        ))
-    })?;
-    let errors = crate::baseobjspace::text_w(positional[2])?;
-    let (final_input, state, w_state) = codec_call_control(positional[3])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_decode_stateful")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let input = codec_input_bytes(roots.get(base + 1))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let (final_input, state, w_state) = codec_call_control(roots.get(base + 3))?;
     let (output, consumed, _) = decode_impl_with_state(
         name,
-        input.as_bytes(),
+        &input,
         errors,
         final_input,
         Some(&state),
