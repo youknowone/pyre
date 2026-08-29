@@ -2129,12 +2129,43 @@ fn create_segmented_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     mp_opcode_pc: usize,
     mp_green_pc: usize,
-) -> Result<DispatchOutcome, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    // Upstream's cut cannot fail to reach the blackhole: the
+    // `SwitchToBlackhole` it raises is caught by
+    // `run_blackhole_interp_to_cancel_tracing`, whose conversion has no
+    // failure arm.  Single-pass tracing reaches the same guarantee from the
+    // other side -- by cutting only once the forward image exists -- because
+    // the walk has already RUN everything it recorded, so the alternative to
+    // a forward resume is executing that region a second time.  A refusal
+    // leaves `force_finish_trace` armed and the walk recording, so the next
+    // merge point or the too-long check answers instead.
+    //
+    // Before the guard: a refusal must leave no always-fails guard and no
+    // FINISH behind, and the latch records nothing into the trace.
+    if !latch_abort_blackhole(ctx, mp_opcode_pc, "segment-cut") {
+        census_record("SegmentTrace::LatchRefused");
+        return Ok(None);
+    }
+    // The latch answers for the snapshot-array stack source; this leg publishes
+    // from the walker mirror, whose own height check runs only in the adopter.
+    // Ask it here, while a refusal is still free.
+    if !latched_single_frame_mirror_publishable() {
+        drop(take_single_frame_blackhole());
+        census_record("SegmentTrace::MirrorStackRefused");
+        return Ok(None);
+    }
     // pyjitpl.py `generate_guard(rop.GUARD_ALWAYS_FAILS)`. The resume
     // position is the merge-point op, whose preceding `-live-` marker names the
     // boxes the blackhole resumes with.
     ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, mp_opcode_pc)?;
+    if let Err(error) = walker_capture_snapshot_for_last_guard(ctx, mp_opcode_pc) {
+        let cause = error.variant_name();
+        census_record(cause);
+        return Err(DispatchError::SegmentTraceSnapshotUnavailable {
+            pc: mp_opcode_pc,
+            cause,
+        });
+    }
     // pyjitpl.py:1633-1636 `exception_box = ConstInt(ptr2int(
     // llexception.typeptr))` — the AssertionError type pointer the unreachable
     // FINISH escapes with. The op sits behind a guard that always fails, so the
@@ -2169,10 +2200,10 @@ fn create_segmented_trace<Sym: WalkSym>(
     ctx.trace_ctx.walk_final_pc = Some(mp_green_pc);
     ctx.trace_ctx.walk_final_reds = Vec::new();
     // pyjitpl.py:1673 `raise SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`.
-    Ok(DispatchOutcome::SegmentTrace {
+    Ok(Some(DispatchOutcome::SegmentTrace {
         is_loop,
         exception_box,
-    })
+    }))
 }
 
 impl PartialEq for DispatchOutcome {
@@ -2780,6 +2811,13 @@ pub enum DispatchError {
     /// `pyjitpl.py _interpret` calls `blackhole_if_trace_too_long()` right
     /// after `run_one_step()` — and raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
     TraceTooLong { pc: usize, ops: usize },
+    /// A segmented-trace cut had already latched its complete forward
+    /// blackhole image, but the always-failing guard's resume snapshot could
+    /// not be represented. The incomplete segment must be discarded, while
+    /// the latched image must still run forward: replaying from the trace entry
+    /// would repeat the concrete effects the walk already executed. `cause`
+    /// preserves the snapshot builder's original decline class for diagnosis.
+    SegmentTraceSnapshotUnavailable { pc: usize, cause: &'static str },
     /// The traceback node's `last_instr` store could not resolve the
     /// virtualizable static field named `field`: either the trace carries no
     /// `VirtualizableInfo` at all, or the registered one declares no such
@@ -2873,6 +2911,7 @@ impl DispatchError {
             }
             Self::ExcEdgeNoInFrameCatch { .. } => "ExcEdgeNoInFrameCatch",
             Self::TraceTooLong { .. } => "TraceTooLong",
+            Self::SegmentTraceSnapshotUnavailable { .. } => "SegmentTraceSnapshotUnavailable",
             Self::TracebackNodeVableFieldUnavailable { .. } => "TracebackNodeVableFieldUnavailable",
         }
     }
@@ -2940,6 +2979,7 @@ impl DispatchError {
             | Self::InplaceContainerMutationUnsupported { pc, .. }
             | Self::ExcEdgeNoInFrameCatch { pc, .. }
             | Self::TraceTooLong { pc, .. }
+            | Self::SegmentTraceSnapshotUnavailable { pc, .. }
             | Self::TracebackNodeVableFieldUnavailable { pc, .. } => *pc,
         }
     }
@@ -2987,6 +3027,10 @@ impl DispatchError {
                 // still steps aside for it, because it owns a narrower one that
                 // resumes AT the forcing opcode (`flush_qmut_abort_state`).
                 | Self::ForceQuasiImmutable { .. }
+                // Emitted only after both segment-cut blackhole preflights
+                // succeed. The missing guard snapshot affects compilation of
+                // the discarded trace, not the complete forward image.
+                | Self::SegmentTraceSnapshotUnavailable { .. }
         )
     }
 
@@ -6624,6 +6668,14 @@ struct InflightForiter {
     body_completed: bool,
 }
 
+/// Which `(seq, index)` pair a [`BridgeIterJournalEntry::Cursor`] restores.
+#[derive(Clone, Copy)]
+enum BridgeIterKind {
+    List,
+    ListReverse,
+    Tuple,
+}
+
 /// Concrete iterator state to restore when a bridge walk is abandoned.
 #[derive(Clone, Copy)]
 enum BridgeIterJournalEntry {
@@ -6632,7 +6684,10 @@ enum BridgeIterJournalEntry {
         pre_current: i64,
         pre_remaining: i64,
     },
-    Tuple {
+    /// The three iterators whose payload is a source reference plus a cursor,
+    /// and whose successful advance moves only the cursor.
+    Cursor {
+        kind: BridgeIterKind,
         iter: pyre_object::PyObjectRef,
         pre_seq: pyre_object::PyObjectRef,
         pre_index: i64,
@@ -7479,7 +7534,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             BridgeIterJournalEntry::Range { iter, .. } => {
                 visitor(unsafe { &mut *(iter as *mut pyre_object::PyObjectRef).cast() });
             }
-            BridgeIterJournalEntry::Tuple { iter, pre_seq, .. } => {
+            BridgeIterJournalEntry::Cursor { iter, pre_seq, .. } => {
                 visitor(unsafe { &mut *(iter as *mut pyre_object::PyObjectRef).cast() });
                 visitor(unsafe { &mut *(pre_seq as *mut pyre_object::PyObjectRef).cast() });
             }
@@ -12573,7 +12628,9 @@ fn handle<Sym: WalkSym>(
                 && ctx.trace_ctx.force_finish_trace()
                 && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
             {
-                return create_segmented_trace(ctx, op.pc, next_instr).map(|o| (o, op.next_pc));
+                if let Some(outcome) = create_segmented_trace(ctx, op.pc, next_instr)? {
+                    return Ok((outcome, op.next_pc));
+                }
             }
             // An inlined callee's own loop
             // header routes to a `CALL_ASSEMBLER` into its already-compiled loop

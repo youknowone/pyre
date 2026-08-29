@@ -200,6 +200,46 @@ pub(crate) fn take_single_frame_blackhole() -> Option<LatchedSingleFrameBlackhol
     FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| slot.borrow_mut().take())
 }
 
+/// Read-only counterpart of the single-frame adopter's operand-stack gate, for
+/// the legs that publish from the walker mirror instead of from the tracing
+/// snapshot's slot array.
+///
+/// [`latch_abort_blackhole`] proves every capability the snapshot-array source
+/// needs, ending at `can_publish_frame_stack`. The mirror carries a condition of
+/// its own: `capture_frame_stack_from_mirror` declines when the recorded height
+/// disagrees with the forward analysis at the mirror's `py_pc`, rather than
+/// publish a shifted stack. A leg whose adopt treats a decline as an assert has
+/// to answer that here, before it commits to the abort.
+pub(crate) fn latched_single_frame_mirror_publishable() -> bool {
+    FBW_SINGLE_FRAME_BLACKHOLE.with(|slot| {
+        let borrow = slot.borrow();
+        let Some(latched) = borrow.as_ref() else {
+            return false;
+        };
+        let Some(mirror) = latched.mirror_stack.as_ref() else {
+            return false;
+        };
+        let Ok(jitcode_index) = i32::try_from(latched.miframe.jitcode.index()) else {
+            return false;
+        };
+        let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
+        let vable_frame = latched
+            .miframe
+            .ref_values
+            .get(frame_reg as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(0) as usize;
+        vable_frame != 0
+            && crate::state::capture_frame_stack_from_mirror(
+                vable_frame,
+                mirror.py_pc,
+                &mirror.slots,
+            )
+            .is_some()
+    })
+}
+
 pub(crate) fn multi_frame_blackhole_cell_ptr()
 -> *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>> {
     FBW_MULTI_FRAME_BLACKHOLE.with(|cell| cell as *const _)
@@ -3857,6 +3897,14 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // exhaustion arm) still records the completion; a successful attempt
     // replaces the entry with a fresh one anyway.
     if helper == majit_ir::RuntimeHelperKind::ForIterNext {
+        // Journal the pre-advance cursor the way the range and zip FOR_ITER
+        // specializations journal theirs.  A bridge recording that does not
+        // commit restores it in the walk epilogue; a root walk keeps it until
+        // the delivery site, which restores it only when it could not hand the
+        // item back at the loop header.
+        if let Some(&iter) = args.first() {
+            fbw_bridge_iter_journal_capture(iter as pyre_object::PyObjectRef);
+        }
         let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
             .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
         fbw_foriter_inflight_mark_attempt(body);
