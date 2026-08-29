@@ -3105,6 +3105,23 @@ fn sys_modules_dict_entry(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> 
 /// panicking thread's lock straight on, and a `HashMap<String, usize>` has no
 /// invariant a panic mid-`insert`/`remove` could leave broken.
 #[majit_macros::dont_look_inside]
+/// `importing.py check_sys_modules(space, w_modulename)` — the object-keyed
+/// half of the pair whose `&str` half is [`check_sys_modules`].  A module name
+/// is WTF-8 and may hold a lone surrogate, which has no `&str` spelling at all,
+/// so a caller that already holds the name object asks with it.
+pub(crate) fn check_sys_modules_w(w_name: PyObjectRef) -> Option<PyObjectRef> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        // Before the Python-visible dict exists the process registry is the
+        // cache, and it is keyed by `&str`; a name with no UTF-8 spelling
+        // cannot be in it.
+        let name = unsafe { pyre_object::w_str_get_value_opt(w_name) }?;
+        return sys_modules_registry_get(name);
+    }
+    unsafe { pyre_object::w_dict_lookup(dict, w_name) }
+        .filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) })
+}
+
 pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
     SYS_MODULES
         .lock()
@@ -5773,20 +5790,21 @@ pub fn importhook(
     } else {
         absolute_import(name, w_fromlist, execution_context)?
     };
-    if fromlist_missing {
-        return Ok(w_mod);
-    }
-
-    // `_bootstrap.py __import__`: `if not fromlist: ... else: if
-    // hasattr(module, '__path__'): return _handle_fromlist(module, fromlist,
-    // _gcd_import)`.  A module that is not a package answers the list from
-    // its own attributes and needs no further import.  The empty-fromlist
-    // spelling stays with the leaf `absolute_import` already picked.
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_mod);
-    if crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?
-        && crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?.is_some()
-    {
+
+    // `_bootstrap.py __import__` — `if not fromlist:` is a truth test, taken
+    // after the import, and it answers the HEAD package rather than the leaf
+    // `absolute_import` returns for any non-null list.  `[]` and `()` are
+    // falsy and belong on this arm; only an omitted list skips the test.
+    if fromlist_missing || !crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))? {
+        return import_head(name, shadow_stack_get(mod_slot), level, execution_context);
+    }
+
+    // `elif hasattr(module, '__path__'): return _handle_fromlist(module,
+    // fromlist, _gcd_import)` — a module that is not a package answers the
+    // list from its own attributes and needs no further import.
+    if crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__path__")?.is_some() {
         handle_fromlist(
             shadow_stack_get(mod_slot),
             shadow_stack_get(fromlist_slot),
@@ -5795,6 +5813,72 @@ pub fn importhook(
         )?;
     }
     Ok(shadow_stack_get(mod_slot))
+}
+
+// ── __import__'s empty-fromlist tail ─────────────────────────────────
+// `_bootstrap.py __import__`
+
+/// Answer the head package for an import whose fromlist is empty:
+///
+/// ```text
+/// if level == 0:
+///     return _gcd_import(name.partition('.')[0])
+/// elif not name:
+///     return module
+/// else:
+///     cut_off = len(name) - len(name.partition('.')[0])
+///     return sys.modules[module.__name__[:len(module.__name__) - cut_off]]
+/// ```
+///
+/// `dunder_import` answers this from the cache for the app-level importer; the
+/// native one owes the same answer, and without it `import a.b` and
+/// `__import__('a.b', ..., [], 0)` hand back the leaf.
+///
+/// The relative arm slices in bytes rather than code points: a relative import
+/// resolves to `<base>.<name>`, so the trailing `cut_off` bytes of the resolved
+/// name are the trailing bytes of `name` itself and the cut lands in the same
+/// place either way.
+fn import_head(
+    name: &str,
+    w_mod: PyObjectRef,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let dotindex = rpython_str_find_char(name, '.', 0);
+    if dotindex < 0 {
+        // `name.partition('.')[0]` is the whole name, so the head is the module
+        // this call already resolved -- and so is `not name`.
+        return Ok(w_mod);
+    }
+    if level == 0 {
+        // `_gcd_import(name.partition('.')[0])`, answered from `sys.modules`,
+        // which the import that preceded this has already populated.
+        return absolute_import(
+            rpython_str_slice_prefix(name, dotindex),
+            pyre_object::PY_NULL,
+            execution_context,
+        );
+    }
+
+    let _roots = push_roots();
+    let mod_slot = shadow_stack_len();
+    let _ = pin_root(w_mod);
+    let cut_off = name.len() - rpython_str_slice_prefix(name, dotindex).len();
+    let w_name = crate::baseobjspace::getattr_str(shadow_stack_get(mod_slot), "__name__")?;
+    // A resolved module name with no UTF-8 spelling cannot be a `sys.modules`
+    // key this importer can ask for; the leaf is the best answer available.
+    let Some(full) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
+        return Ok(shadow_stack_get(mod_slot));
+    };
+    if cut_off >= full.len() {
+        return Ok(shadow_stack_get(mod_slot));
+    }
+    let head = &full[..full.len() - cut_off];
+    check_sys_modules(head).ok_or_else(|| {
+        crate::PyError::key_error(format!("'{head}' not in sys.modules as expected"))
+    })
 }
 
 // ── _handle_fromlist ─────────────────────────────────────────────────
@@ -6247,12 +6331,33 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     // attribute (e.g. a non-module stand-in with restrictive slots that
     // `_handle_fromlist` could not setattr onto). Read `__name__` off the object
     // rather than requiring it to be a module.
-    if let Ok(w_name) = crate::baseobjspace::getattr_str(module, "__name__")
-        && unsafe { pyre_object::is_str(w_name) }
-    {
-        let modname = unsafe { pyre_object::w_str_get_value(w_name) };
-        let fullname = format!("{modname}.{name}");
-        if let Some(submod) = check_sys_modules(&fullname) {
+    //
+    // pyopcode.py:1152-1158 — `w_pkgname` starts at the default and is
+    // overwritten by ONE `space.getattr(w_module, '__name__')`, whose result
+    // both keys this lookup and names the package in the error below.  Reading
+    // it twice runs a `__getattr__`- or descriptor-backed `__name__` twice,
+    // which the single protected read upstream does not.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let pkgname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let (w_pkgname, named) = match crate::baseobjspace::getattr_str(module, "__name__") {
+        Ok(v) if unsafe { pyre_object::is_str(v) } => (v, true),
+        _ => (pyre_object::w_str_new("<unknown module name>"), false),
+    };
+    // Pinned for the whole function: every lookup below can run a descriptor
+    // or `__getattr__` and so collect, and this name is young and movable.
+    let _ = pyre_object::gc_roots::pin_root(w_pkgname);
+    if named {
+        // A module name is WTF-8 and may carry a lone surrogate, so the key is
+        // assembled as WTF-8 and asked for as an object.  Rendering it through
+        // a `&str` accessor panics on exactly the names `sys.modules` is still
+        // free to hold.
+        let mut fullname = Wtf8Buf::new();
+        fullname.push_wtf8(unsafe {
+            pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(pkgname_slot))
+        });
+        fullname.push_str(".");
+        fullname.push_str(name);
+        if let Some(submod) = check_sys_modules_w(pyre_object::w_str_from_wtf8(fullname)) {
             return Ok(submod);
         }
     }
@@ -6266,16 +6371,6 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     // via `space.getattr(w_module, '__file__')`, so a descriptor- or
     // `__getattr__`-supplied value and a non-module `from` target are honored;
     // a missing / None path takes the default.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let pkgname_slot = pyre_object::gc_roots::shadow_stack_len();
-    let w_pkgname = match crate::baseobjspace::getattr_str(module, "__name__") {
-        Ok(v) if unsafe { pyre_object::is_str(v) } => v,
-        _ => pyre_object::w_str_new("<unknown module name>"),
-    };
-    // The `__file__` lookup below can run a descriptor or `__getattr__` and so
-    // collect; the name string is young and movable, so pin it and read it
-    // back from the slot afterwards.
-    let _ = pyre_object::gc_roots::pin_root(w_pkgname);
     // pypy/module/imp/importing.py get_path — a non-str `__file__`
     // (including None) reports the location as unknown.
     let w_pkgpath = match crate::baseobjspace::getattr_str(module, "__file__") {
@@ -6291,7 +6386,13 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     let _ = pyre_object::gc_roots::pin_root(w_pkgpath);
     let w_pkgname = pyre_object::gc_roots::shadow_stack_get(pkgname_slot);
     // Own the name so the spec lookups below (which allocate) cannot dangle it.
-    let pkgname = unsafe { pyre_object::w_str_get_value(w_pkgname) }.to_string();
+    // Rendered lossily, the way `format!` already renders every field of these
+    // messages except `origin`: a module name is WTF-8 and the `&str` accessor
+    // panics on a lone surrogate. `w_pkgname` itself rides the exception
+    // untouched, so `exc.name` is still exact.
+    let pkgname = unsafe { pyre_object::w_str_get_wtf8(w_pkgname) }
+        .to_string_lossy()
+        .into_owned();
     // Classify the failure through `__spec__`: a same-named file shadowing a
     // search-path module is flagged first, then a module still executing
     // reports the circular-import cause, then an unset submodule slot.

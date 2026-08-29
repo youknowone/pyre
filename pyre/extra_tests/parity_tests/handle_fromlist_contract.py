@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 
 root = tempfile.mkdtemp(prefix="pyre_hfl_")
 os.mkdir(os.path.join(root, "hflpkg"))
@@ -168,6 +169,74 @@ class WatchAfterFirst:
 watcher = WatchAfterFirst()
 __import__("hflpkg", {}, {}, watcher, 0)
 assert watcher.saw is True, "the earlier item's import was not visible"
+
+# `if not fromlist` is a truth test, not a None test: an empty list answers the
+# HEAD package, the same as omitting the argument, while a non-empty one answers
+# the leaf.
+import hflpkg.a
+
+assert __import__("hflpkg.a", {}, {}, [], 0) is sys.modules["hflpkg"]
+assert __import__("hflpkg.a", {}, {}, (), 0) is sys.modules["hflpkg"]
+assert __import__("hflpkg.a", {}, {}, None, 0) is sys.modules["hflpkg"]
+assert __import__("hflpkg.a") is sys.modules["hflpkg"]
+assert __import__("hflpkg.a", {}, {}, ["A"], 0) is sys.modules["hflpkg.a"]
+# A name with no dot answers itself either way.
+assert __import__("hflpkg", {}, {}, [], 0) is sys.modules["hflpkg"]
+
+# `from pkg import name` reads the package's `__name__` once, for the submodule
+# lookup and the ImportError that follows it alike. A module whose `__name__`
+# is a property counts the reads, and a second one is observable to any
+# `__getattr__`- or descriptor-backed name.
+class CountingModule(types.ModuleType):
+    reads = 0
+
+    @property
+    def __name__(self):
+        type(self).reads += 1
+        return "pfcount"
+
+    @__name__.setter
+    def __name__(self, value):
+        pass
+
+
+counting = CountingModule("pfcount")
+sys.modules["pfcount"] = counting
+try:
+    from pfcount import absent
+except ImportError:
+    pass
+assert CountingModule.reads == 1, CountingModule.reads
+
+# ... and the successful lookup reads it once too.
+CountingModule.reads = 0
+piece2 = types.ModuleType("pfcount.piece2")
+sys.modules["pfcount.piece2"] = piece2
+from pfcount import piece2 as got_piece2
+
+assert got_piece2 is piece2
+assert CountingModule.reads == 1, CountingModule.reads
+
+# A module name is WTF-8 and may hold a lone surrogate. Neither the
+# `sys.modules` key the lookup builds nor the ImportError message may reach an
+# accessor that rejects one.
+surrogate = types.ModuleType("pfsur")
+surrogate.__name__ = "pf\ud800sur"
+sys.modules["pfsur"] = surrogate
+try:
+    from pfsur import nothing
+except ImportError as exc:
+    assert exc.name == "pf\ud800sur", exc.name
+else:
+    raise AssertionError("expected ImportError")
+
+# The same name resolves a submodule registered under it.
+deep = types.ModuleType("pf\ud800sur.deep")
+sys.modules["pf\ud800sur.deep"] = deep
+from pfsur import deep as got_deep
+
+assert got_deep is deep
+
 
 sys.path.remove(root)
 shutil.rmtree(root, ignore_errors=True)
