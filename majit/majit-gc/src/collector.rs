@@ -7734,11 +7734,25 @@ impl MiniMarkGC {
     /// allocator lands, and the sites that owe this call then are the item
     /// moves in `pyre_object::listobject`'s `W_ListObject` — `object_insert`,
     /// `object_remove` and `object_drain` each shift items with a bare
-    /// `ptr::copy`. Upstream reaches this barrier from those operations
-    /// through `rgc.ll_arraymove`, which `ll_insert_nonneg`, `ll_pop_zero`,
+    /// `ptr::copy`, and `object_reverse` permutes them with a bare
+    /// `slice::reverse`. The last one is the one to miss: it moves pointers
+    /// across card pages with no copy to search for, and permuting within an
+    /// array leaves the referenced set identical, so only the card
+    /// granularity makes it a move at all. `object_splice` is not on this
+    /// list — it already calls `list_write_barrier` before its copies.
+    ///
+    /// Upstream reaches this barrier from those operations through
+    /// `rgc.ll_arraymove`, which `ll_insert_nonneg`, `ll_pop_zero`,
     /// `ll_delitem_nonneg` and `ll_listdelslice_startstop` all call; pyre's
     /// list is not an rtyper-lowered list, so it has no such seam and the
-    /// calls have to be written at those three sites.
+    /// calls have to be written at those four sites.
+    ///
+    /// The order is not free. These sites are prerequisites of that
+    /// production caller, not siblings of it: with cards live and a move
+    /// unbarriered, a minor scans only the dirty pages and a young pointer
+    /// shifted into a clean one is collected while live. That is silent heap
+    /// corruption, where the absence of cards today makes the same code
+    /// correct.
     pub fn writebarrier_before_move(&mut self, array_addr: usize) {
         if self.config.card_page_indices == 0 {
             return;
