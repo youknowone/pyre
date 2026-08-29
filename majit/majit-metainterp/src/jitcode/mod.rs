@@ -546,9 +546,15 @@ pub struct JitCode {
     /// has received its final function-address bindings and descriptor pool.
     ///
     /// This belongs to the JitCode it describes rather than to a side table.
-    /// [`EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs`] constructs
-    /// new wrappers after applying replacements, so a newly materialized table
-    /// necessarily starts with a fresh answer for its bindings.
+    /// `jitcode_runtime::load_jitcode` runs `patch_constants_i_fnaddrs` on the
+    /// canonical JitCode before any wrapper exists. Likewise,
+    /// `EmbeddedJitCodeTable::materialize_with_replacements` applies
+    /// replacements to a cloned canonical core before `JitCode::from_canonical`
+    /// constructs a fresh wrapper. No production path can therefore observe a
+    /// memo computed before a binding change. The only in-place mutations of a
+    /// wrapper's `constants_i` are five `#[test]` sites in `resume`, `frame`, and
+    /// `pyre-jit-trace::state`; a future non-test mutator would require an
+    /// invalidation hook here.
     reachable_symbolic_residuals: std::sync::OnceLock<ReachableSymbolicResiduals>,
 }
 

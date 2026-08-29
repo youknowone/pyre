@@ -1130,29 +1130,15 @@ pub struct ClosureRuntime<FLabel> {
 static SYMBOLIC_RESIDUAL_TRACE_ABORTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Number of tracing instructions precisely declined because their concrete
-/// residual-call target was still a symbolic path hash.
+/// Number of tracing attempts refused because a residual-call target was still
+/// a symbolic path hash: once per reachable-set preflight refusal, however
+/// many targets it names, plus once per per-instruction residual-call decline.
 pub fn symbolic_residual_trace_aborts() -> u64 {
     SYMBOLIC_RESIDUAL_TRACE_ABORTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
-/// placeholder, once per distinct target.
-///
-/// A placeholder means the host never bound that callee's path, so the address
-/// is a hash of the path rather than code. Jumping to it faults somewhere with
-/// no trace of which callee was missing, and answering 0 (the null-target arm
-/// below) would quietly substitute a wrong result. `blackhole.rs` already
-/// declines the same shape on its own residual-call handlers; this is the
-/// tracing side of that check. Every caller returns [`TraceAction::Abort`]
-/// before making the call, so discarding the recording needs no rollback.
-fn report_symbolic_residual_call_target(
-    ctx: &mut TraceCtx,
-    func: usize,
-    arg_classes: Option<&str>,
-) -> TraceAction {
-    ctx.symbolic_residual_abort = true;
-    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// Print the missing-binding diagnostic once per distinct symbolic target.
+fn report_symbolic_residual_call_target_once(func: usize, arg_classes: Option<&str>) {
     static REPORTED: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeSet<usize>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let first_report = REPORTED
@@ -1179,12 +1165,32 @@ fn report_symbolic_residual_call_target(
             );
         }
     }
+}
+
+/// Report a residual call whose target is still a `symbolic_fnaddr_for_path`
+/// placeholder, once per distinct target.
+///
+/// A placeholder means the host never bound that callee's path, so the address
+/// is a hash of the path rather than code. Jumping to it faults somewhere with
+/// no trace of which callee was missing, and answering 0 (the null-target arm
+/// below) would quietly substitute a wrong result. `blackhole.rs` already
+/// declines the same shape on its own residual-call handlers; this is the
+/// tracing side of that check. Every caller returns [`TraceAction::Abort`]
+/// before making the call, so discarding the recording needs no rollback.
+fn report_symbolic_residual_call_target(
+    ctx: &mut TraceCtx,
+    func: usize,
+    arg_classes: Option<&str>,
+) -> TraceAction {
+    ctx.symbolic_residual_abort = true;
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    report_symbolic_residual_call_target_once(func, arg_classes);
     TraceAction::Abort
 }
 
 /// Refuse a trace whose statically reachable body contains an unbound
 /// symbolic residual target, before the walk can execute any body instruction.
-fn refuse_reachable_symbolic_residuals(ctx: &mut TraceCtx, jitcode: &JitCode) -> bool {
+fn refuse_reachable_symbolic_residuals(jitcode: &JitCode) -> bool {
     let targets = &jitcode.reachable_symbolic_residuals().targets;
     if targets.is_empty() {
         return false;
@@ -1195,12 +1201,10 @@ fn refuse_reachable_symbolic_residuals(ctx: &mut TraceCtx, jitcode: &JitCode) ->
     // the portal too. Such a host cannot complete a trace that does reach the
     // target, and declining before the walk is preferable to duplicating an
     // earlier residual's heap effects.
+    SYMBOLIC_RESIDUAL_TRACE_ABORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     for &target in targets {
-        let _ = report_symbolic_residual_call_target(ctx, target as usize, None);
+        report_symbolic_residual_call_target_once(target as usize, None);
     }
-    // No temporary frame was built, so there is no abort handoff publisher to
-    // consume the site-level marker. Do not leak it into a later walk.
-    ctx.symbolic_residual_abort = false;
     true
 }
 
@@ -10084,7 +10088,7 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    if refuse_reachable_symbolic_residuals(ctx, jitcode) {
+    if refuse_reachable_symbolic_residuals(jitcode) {
         return TraceAction::Abort;
     }
     let jitcode_arc = Arc::new(jitcode.clone());
@@ -10137,9 +10141,14 @@ fn publish_walk_abort_handoff(
         // through and re-runs the source arm. The trace-start reachable-set
         // gate makes that sound for every statically named target because no
         // residual in the refused trace has executed. A funcptr read from a
-        // runtime register is invisible to that scan and reaches this
+        // runtime Int register is invisible to that scan and reaches this
         // site-level backstop; it also takes the arm-replay position, because
         // the post-decode framestack would skip the refused call altogether.
+        // An earlier residual call in that arm may already have committed heap
+        // effects, so replay runs that prefix a second time. This narrowed
+        // duplicate-effect window is the residue the trace-start gate does not
+        // close, and replay is still preferred over publishing the post-decode
+        // framestack and skipping the refused call.
         if std::mem::replace(&mut ctx.symbolic_residual_abort, false) {
             return;
         }
@@ -10259,7 +10268,7 @@ where
 {
     if frames
         .first()
-        .is_some_and(|frame| refuse_reachable_symbolic_residuals(ctx, &frame.jitcode))
+        .is_some_and(|frame| refuse_reachable_symbolic_residuals(&frame.jitcode))
     {
         return TraceAction::Abort;
     }
@@ -10373,7 +10382,7 @@ where
     S: JitCodeSym,
     R: JitCodeRuntime,
 {
-    if refuse_reachable_symbolic_residuals(ctx, jitcode) {
+    if refuse_reachable_symbolic_residuals(jitcode) {
         return TraceAction::Abort;
     }
     let jitcode_arc = Arc::new(jitcode.clone());
@@ -12296,6 +12305,7 @@ mod tests {
 
     static RESIDUAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
+    static SYMBOLIC_RESIDUAL_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     extern "C" fn residual_count_prefix() {
         RESIDUAL_PREFIX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -13189,6 +13199,9 @@ mod tests {
     /// skipping the refused call through a post-decode framestack.
     #[test]
     fn indirect_symbolic_residual_keeps_the_site_level_abort_backstop() {
+        let _counter_guard = SYMBOLIC_RESIDUAL_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = RESIDUAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed);
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(0, 47);
@@ -13263,6 +13276,46 @@ mod tests {
             !ctx.symbolic_residual_abort,
             "the one-shot refusal flag must be consumed by the publisher",
         );
+    }
+
+    #[test]
+    fn reachable_symbolic_preflight_counts_one_refusal_for_two_targets() {
+        let _counter_guard = SYMBOLIC_RESIDUAL_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+            "reachable_symbolic_preflight_first_target",
+        ]);
+        let second = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+            "reachable_symbolic_preflight_second_target",
+        ]);
+        assert_ne!(first, second);
+
+        let mut builder = JitCodeBuilder::new();
+        for target in [first, second] {
+            let target_index = builder.add_fn_ptr(target as usize as *const ());
+            builder.residual_call_void_canonical_via_target_with_effect_info(
+                target_index,
+                &[],
+                residual_effect(majit_ir::descr::ExtraEffect::CannotRaise),
+            );
+        }
+        builder.void_return();
+        let jitcode = builder.finish();
+
+        let mut expected_targets = vec![first, second];
+        expected_targets.sort_unstable();
+        assert_eq!(
+            jitcode.reachable_symbolic_residuals().targets,
+            expected_targets,
+            "the preflight must see both distinct symbolic targets",
+        );
+
+        let before = symbolic_residual_trace_aborts();
+        assert!(refuse_reachable_symbolic_residuals(&jitcode));
+        let after = symbolic_residual_trace_aborts();
+
+        assert_eq!(after - before, 1, "one trace start is one refusal");
     }
 
     #[test]
