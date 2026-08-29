@@ -58,6 +58,19 @@ pub fn set_active_backend_jitframe_gc_type_id(id: u32) {
     majit_backend_dynasm::set_jitframe_gc_type_id(id);
 }
 
+/// Register RPython's `JITFRAME` shape on the frontend-owned collector and
+/// publish the assigned id to the selected native CPU.
+///
+/// Registration belongs to the frontend because its type table fixes the id;
+/// publishing belongs here because this crate alone selects the active CPU.
+/// Call this before `JitDriver::set_gc_allocator`, which freezes the table.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn register_active_backend_jitframe_gc_type(gc: &mut dyn majit_gc::GcAllocator) -> u32 {
+    let id = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+    set_active_backend_jitframe_gc_type_id(id);
+    id
+}
+
 /// Install the process-global collector into the native CPU selected above.
 #[cfg(all(feature = "cranelift", not(target_arch = "wasm32")))]
 pub fn install_active_backend_gc_standalone() {

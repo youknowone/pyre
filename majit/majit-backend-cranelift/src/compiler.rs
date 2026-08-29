@@ -420,7 +420,7 @@ fn resolve_jitframe_heap(gc: &dyn GcAllocator) -> JitFrameHeap {
 /// register the `majit_gc::set_active_*` function-pointer hooks,
 /// without requiring a `CraneliftBackend` instance.
 /// Install a GC box into TLS and register all `set_active_*` hooks.
-/// Shared by `install_gc_standalone` (production) and `set_gc_allocator` (tests).
+/// Used by tests and embedders whose whole managed heap is thread-confined.
 fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
     // Per-thread allocator: its nursery is not the singleton's, so the
     // process-wide published range can no longer answer `is_nursery_object`.
@@ -434,9 +434,9 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) {
 }
 
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
-/// cranelift trampolines. Shared by `install_gc_box` (test: also stores a
-/// box) and `install_gc_standalone` (production: hooks only, no box — the
-/// trampolines then route to the `gc_sync` singleton).
+/// cranelift trampolines. Shared by `install_gc_box` (thread-confined heap:
+/// also stores a box) and `install_gc_standalone` (shared heap: hooks only, no
+/// box; the trampolines then route to the `gc_sync` singleton).
 fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
         check_is_object: Some(check_is_object_via_active_runtime),
@@ -1544,12 +1544,13 @@ thread_local! {
 ///
 /// `gc.py:30` `GcLLDescription.__init__` holds `self.gcdescr` as a plain field
 /// on the backend descriptor — there is no per-thread allocator upstream — so
-/// this cell is scaffolding, not a ported structure. Only `install_gc_box`
-/// fills it and only tests reach that; the production build goes through
-/// `install_gc_standalone` and allocates from the `gc_sync` singleton.
+/// this cell is scaffolding, not a ported structure. `install_gc_box` fills it
+/// for tests and embedders whose complete managed heap is thread-confined; a
+/// runtime with shared managed values uses `install_gc_standalone` and the
+/// `gc_sync` singleton.
 ///
 /// Every accessor opens with `majit_gc::gc_box_installed()`, which without
-/// `majit-gc/gc_box` is a constant `false` — so in a production build each one
+/// `majit-gc/gc_box` is a constant `false` — so in a standalone build each one
 /// folds to `None`, the thread-local becomes unreachable, and the trampolines
 /// call `gc_sync` directly. The gate lives in `majit-gc` because a Cargo
 /// feature is per-crate: this crate cannot `#[cfg]` on a feature of its

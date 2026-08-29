@@ -19,6 +19,7 @@ dynasmrt = { workspace = true }
 libc = { workspace = true }
 indexmap = { workspace = true }
 rustc-hash = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 majit-gc = { workspace = true, features = ["gc_box"] }

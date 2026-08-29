@@ -1959,6 +1959,7 @@ dependencies = [
  "majit-trace",
  "majit-translate",
  "rustc-hash",
+ "smallvec",
 ]
 
 [[package]]

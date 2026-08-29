@@ -1990,17 +1990,19 @@ pub fn supports_guard_gc_type() -> bool {
     ACTIVE_SUPPORTS_GUARD_GC_TYPE.load(std::sync::atomic::Ordering::Acquire)
 }
 
-/// Set once any thread has installed a per-thread GC box on any backend. That
-/// path is test-only: production installs the backend standalone, leaving the
-/// process-global [`gc_sync`] singleton as the sole allocator on every thread.
+/// Set once any thread has installed a per-thread GC box on any backend. The
+/// process-global language runtime installs the backend standalone; this path
+/// also serves embedders whose complete managed heap is execution-context
+/// local and never shares object identity across threads.
 ///
 /// Set-only, never cleared: a backend can drop one thread's box while another
 /// thread still owns one, and clearing the flag would route past that live box.
 ///
 /// RPython has no per-thread allocator — the GC transformer weaves every
 /// `malloc` against the single translation-time `gcdata`
-/// (`gctransform/framework.py`) — so the box is pyre-side test scaffolding, and
-/// the queries below let the allocation path it does not serve skip it.
+/// (`gctransform/framework.py`). A language runtime with shared managed values
+/// must therefore use [`gc_sync`]; a box is valid only when the embedder's heap
+/// itself has the narrower execution-context lifetime.
 ///
 /// Only compiled when a box can exist at all, i.e. under `gc_box`; see
 /// [`gc_box_installed`] for what the other build spells instead.
@@ -2022,8 +2024,8 @@ pub fn note_gc_box_installed() {
 pub fn note_gc_box_installed() {
     panic!(
         "a per-thread GC box was installed in a build without the `gc_box` feature; \
-         production installs the backend standalone (`install_gc_standalone`), and a \
-         test that needs a box must depend on `majit-gc` with `features = [\"gc_box\"]`"
+         a process-global runtime must use `install_gc_standalone`, while a test or \
+         thread-confined embedder must enable `majit-gc/gc_box`"
     );
 }
 
