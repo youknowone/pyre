@@ -212,9 +212,9 @@ pub struct Cpu {
     pub convert_value_fn: extern "C" fn(i64, i64) -> i64,
     /// `bh_import_from_fn(module, code, name_idx)` — IMPORT_FROM residual;
     /// resolves the attribute name from the code object and runs
-    /// `importing::import_from` on the peeked module (namespace lookup, then a
-    /// submodule-import fallback that may run module top-level Python →
-    /// fallible) through the TLS-pinned execution context.
+    /// `importing::import_from` on the peeked module (attribute lookup, then a
+    /// `sys.modules` fallback; a user `__getattribute__` / `__getattr__` may
+    /// run Python → fallible).
     pub import_from_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bh_load_super_attr_fn(global_super, self, cls, frame, code, name_idx,
     /// is_two_arg)` — LOAD_SUPER_ATTR residual. Calls the actual global

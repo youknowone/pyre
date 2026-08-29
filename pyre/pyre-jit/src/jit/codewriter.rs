@@ -3930,8 +3930,9 @@ fn register_helper_fn_pointers(
         cpu.convert_value_fn as *const (),
         CallFlavor::MayForce,
     );
-    // `bh_import_from_fn` runs `importing::import_from` (a submodule-import
-    // fallback may run module top-level Python) → `MayForce`.
+    // `bh_import_from_fn` runs `importing::import_from` (a `getattr` on the
+    // module, so a user `__getattribute__` / `__getattr__` may run Python)
+    // → `MayForce`.
     let import_from_fn = bind(
         assembler,
         cpu.import_from_fn as *const (),
@@ -12445,7 +12446,7 @@ impl CodeWriter {
                         Instruction::ImportFrom { namei } => {
                             // pyopcode.py IMPORT_FROM — PEEK the module (TOS,
                             // NOT popped) and push `getattr(module, name)` (with
-                            // a submodule-import fallback) via the `import_from`
+                            // a `sys.modules` fallback) via the `import_from`
                             // HLOp → `residual_call_ir_r(import_from_fn,
                             // ListI([name_idx]), ListR([module, code]))`.  Net
                             // +1; the module stays on the stack.  Surrogate

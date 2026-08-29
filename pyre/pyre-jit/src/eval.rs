@@ -7709,9 +7709,22 @@ fn for_iter_body_op_is_jit_safe(instr: pyre_interpreter::Instruction) -> bool {
             // always follows an `IMPORT_NAME`, so admitting only the first
             // left `from X import Y` rejected and `ImportName`'s admission
             // inert for that spelling. It peeks the module the previous
-            // opcode pushed and pushes `getattr(module, name)` through one
-            // `import_from` MayForce residual -- the `LoadAttr` shape,
-            // strictly less than the `__import__` call above it.
+            // opcode pushed and pushes the resolved name through one
+            // `import_from` MayForce residual.
+            //
+            // `importing.rs import_from` stores nothing: it is a
+            // `getattr(module, name)` on that module, and on AttributeError a
+            // `sys.modules` lookup for `<__name__>.<name>`.
+            // Both getattrs run the attribute protocol, so a user
+            // `__getattribute__` / `__getattr__` on a module subclass or a
+            // non-module `from` target can run Python and mutate whatever it
+            // reaches -- the same MayForce footing as `LoadAttr` above and
+            // `Call` below.  The residual returns Ref rather than Void, so
+            // `body_effect_candidate` discriminates such an entry by
+            // `entered_user_frame`, and a mid-body abort resumes forward
+            // through `try_commit_midbody_abort` rather than replaying it.
+            // `bench/synth/foriter_import_from_submodule` takes the
+            // `sys.modules` fallback every iteration and pins the count.
             | I::ImportFrom { .. }
             | I::Resume { .. }
             // container builders: produce new heap objects but do not mutate

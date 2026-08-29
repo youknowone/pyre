@@ -2,7 +2,7 @@
 # IMPORT_FROM in a hot loop: `from math import pi, e` runs IMPORT_FROM for
 # each imported name every iteration.  The compiled per-CodeObject jitcode
 # walks the import_from residual (getattr on the peeked module, with a
-# submodule-import fallback) instead of an abort_permanent marker, so the
+# `sys.modules` fallback) instead of an abort_permanent marker, so the
 # hot body JIT-compiles rather than declining to the trait leg.  The
 # residual's `__path__` probe runs suppressed (`_PyObject_LookupAttr`), so
 # the discarded miss skips the `__spec__` shadowing diagnosis.  Output is
