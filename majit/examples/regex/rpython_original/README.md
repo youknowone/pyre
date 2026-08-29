@@ -35,7 +35,7 @@ compile, without a multi-hour translation.
 
 ```text
 === result: 0 (0 == did not match, which is the benchmark) ===
-=== 1 loop(s)/bridge(s) compiled ===
+=== 1 loop(s), 9 bridge(s), 0 aborted (trace_eagerness=200) ===
 
 --- trace 0: 306 ops total, 153 in the peeled body ---
   debug_merge_point            2
@@ -48,9 +48,20 @@ compile, without a multi-hour translation.
   benchmark input is generated *not* to match, because a matcher may stop early
   on a match and then the per-character cost is hidden. A `1` here would mean
   the generator drifted, not that something got faster.
-* **`1 loop(s)/bridge(s) compiled`** — the whole scan is one trace. The regex
-  is the JitDriver's green, so every character shares one green key. More than
-  one would mean the tree stopped being constant to the tracer.
+* **`1 loop(s)`** — one compiled loop for the whole scan. The regex is the
+  JitDriver's green, so every character shares one green key; a second loop
+  would mean the tree stopped being constant to the tracer. Bridges are counted
+  separately and a nonzero count is not that signal — see below.
+* **`9 bridge(s)`, `trace_eagerness=200`** — the branching body's guards do
+  fail, about once per input character, and a guard that has failed 200 times
+  earns a bridge. Both numbers are load-bearing and both were wrong here until
+  measured: `stats.get_all_loops()` is fed by `send_loop_to_backend`'s
+  `add_new_loop` (compile.py:550) and by nothing else, so it never counted a
+  bridge, and `warmspot.py:112` pins `set_param_trace_eagerness(2)` "for
+  tests", at which this run compiles **1407** bridges rather than 9. `runner.py`
+  now reads `stats.compiled_count`, which counts both (compile.py:552,
+  compile.py:604), and pins the eagerness to the `rlib/jit.py` PARAMETERS
+  default of 200 that a translated PyPy and majit both use.
 * **`306 ops total, 153 in the peeled body`** — a compiled loop is preamble plus
   peeled body. The preamble runs once; the **peeled body is what runs per input
   character**, and it is the only half worth grading. Reading 306 would charge
@@ -155,6 +166,77 @@ The 21-node row is the control: the store count tracks the node count on all
 three, so the census is measuring the tree and not a constant. It also lands
 the guard counts exactly on top of each other, 9 against 9 — at this size the
 branching portal is not merely close to RPython's shape, it *is* it.
+
+## The bridges are RPython's too
+
+The census above grades the loop body. It says nothing about what happens when
+that body's guards *fail*, and on the branching portal they fail constantly —
+about once per input character, at every length, never settling. Bridges
+accumulate and the rate never converges. Read alone that is the signature of a
+bridge cascade: bridges that never rejoin the loop, so every one spawns the
+next.
+
+It is not a majit defect. RPython's JIT does the same thing on the same body:
+
+| `n = 20`, `trace_eagerness = 200` | RPython | majit |
+|---|---:|---:|
+| loops, 4096 chars | 1 | 1 |
+| bridges, 4096 chars | 9 | 10 |
+| deopts per character, 4096 chars | 0.9990 | 0.9961 |
+| bridges, 16384 chars | 41 | 38 |
+| deopts per character, 16384 chars | 0.9998 | 0.9973 |
+| distinct guards that ever failed, 16384 chars | 388 | 344 |
+
+Within a run majit attaches 38 bridges over 16384 characters and a bridged
+guard then fails **zero** more times — it is patched into its bridge and never
+returns to the frontend. So the residual rate is not bridges failing to take.
+It is the guards that have not earned one yet, and their shape is the point:
+306 unbridged coordinates, 8735 failures between them, **median 10** and a
+maximum of 190. Only 8 are anywhere near the 200 the counter wants; 147 fired
+fewer than ten times.
+
+That is a tree fanning out faster than the counter can close it, not a queue
+draining. Each bridge is a new trace carrying its own guards, those guards
+carry the next ones, and the input ends long before the frontier is covered.
+RPython's 388 distinct failing guards against 41 bridges is the same shape at
+the same scale. The body has 27 guards; neither JIT saturates what is behind
+them.
+
+Two measurement bugs on this side had to be fixed before the comparison could
+be made at all, and both of them made majit look broken when it was not:
+
+* `runner.py` printed `len(stats.get_all_loops())` under the label
+  "loop(s)/bridge(s) compiled". That list is appended by
+  `send_loop_to_backend` (compile.py:550) and by nothing else, so it never held
+  a bridge. It reported **1** for a run that compiled nine, which reads as
+  "RPython needs no bridges here" — the opposite of what happens.
+* The harness ran at `trace_eagerness = 2`, pinned by `warmspot.py:112` "for
+  tests", against the `rlib/jit.py` PARAMETERS default of 200 that a translated
+  PyPy and majit both use. At 2 this run compiles **1407** bridges over 4096
+  characters. Compared against majit's 10 that reads as majit refusing to
+  bridge — again the opposite.
+
+`runner.py` now reads `stats.compiled_count`, which counts loops and bridges
+both (compile.py:552, compile.py:604), and pins the eagerness to 200.
+
+The translated build had been saying this all along, further down this file: a
+`PYPYLOG=jit-summary` run of the `and`/`or` target reports 1 loop and **1185
+bridges** over 262,144 characters — one per 221 — against the in-process
+runner's claim of none at all. Two measurements of the same program disagreeing
+by 1185 was the thing to chase, and it was not chased, because one of them was
+printed under a label that made it look like an answer.
+
+This table is asserted too, by `the_branching_portal_bridges_like_the_rpython_original`
+in `shortcircuit.rs`, with RPython's column recorded beside the command that
+re-derives it. The band is deliberately loose — half to double on the bridge
+count — because which guards cross the 200th failure before the input ends is a
+boundary effect, not behaviour. The deopt rate is the tight one. Both halves
+have been watched to fail:
+
+| break | what the gate did |
+|---|---|
+| the masking portal substituted for the branching one — 0 bridges, 1 deopt | the rate assertion fired: `deopted 0.0002 times per character ... RPython deopts 0.9990` |
+| RPython's recorded bridge count moved 9 → 100 | the band assertion fired: `majit grew 10 bridge(s) ... where RPython grows 100` |
 
 ## This comparison is a gate, not a paragraph
 

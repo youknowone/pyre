@@ -8427,6 +8427,17 @@ impl<M: Clone> MetaInterp<M> {
                 let fail_descr = descr_arc
                     .as_fail_descr()
                     .expect("bridge source op.descr must implement FailDescr");
+                // The `@@@GUARD` line in `record_guard_failure_event` names the
+                // coordinate a failure arrived at; this names the coordinate a
+                // bridge attached to. Only both together answer the question
+                // that log exists for — whether a coordinate that keeps
+                // arriving was ever bridged at all, or is bridged and still
+                // returning. Ordered against `@@@GUARD` in one stream, a
+                // failure after this line for the same coordinate is a bridge
+                // that did not take.
+                if guardlog_enabled() {
+                    eprintln!("@@@BRIDGE tid={trace_id} fail={fail_index}");
+                }
                 let success = self.compile_bridge(
                     origin_key,
                     green_key,

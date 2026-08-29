@@ -988,6 +988,85 @@ mod tests {
         assert_eq!(warm, crate::interp::matches(root, &hit));
     }
 
+    /// RPython's own bridge behaviour on this body, recorded, so majit's can
+    /// be graded against it rather than against an intuition.
+    ///
+    /// The branching portal deopts about once per input character and grows
+    /// bridges without ever settling, and for a long time that read as a majit
+    /// defect — a bridge cascade that never closes. It is not. RPython's JIT
+    /// does the same thing on the same body, to within a tenth of a percent on
+    /// the deopt rate. What the numbers cost to obtain is the reason they are
+    /// pinned here:
+    ///
+    /// * `stats.get_all_loops()` counts LOOPS. `send_loop_to_backend` calls
+    ///   `add_new_loop` (compile.py:550); `send_bridge_to_backend` does not.
+    ///   Read as "loops and bridges" it reports 1 for a run that compiled 9.
+    /// * `warmspot.py:112` pins `set_param_trace_eagerness(2)` "for tests",
+    ///   against the `rlib/jit.py` PARAMETERS default of 200 that a translated
+    ///   PyPy and majit both use. At 2 the same run compiles 1407 bridges.
+    ///
+    /// Re-derive with (`runner.py` pins the eagerness itself):
+    ///
+    /// ```sh
+    /// pypy majit/examples/regex/rpython_original/runner.py 20 4096
+    /// ```
+    const RPYTHON_BRIDGES: [(usize, usize); 2] = [(4096, 9), (16384, 41)];
+    /// Guard failures reaching RPython's frontend at those same two lengths —
+    /// 0.9990 and 0.9998 per input character.
+    const RPYTHON_GUARD_FAILURES: [(usize, usize); 2] = [(4096, 4092), (16384, 16380)];
+
+    /// The branching portal's deopt rate and bridge growth are RPython's, not a
+    /// majit defect.
+    ///
+    /// Both sides are asked the same question — same regex, same input, same
+    /// trace eagerness — and the assertion is that majit tracks RPython, not
+    /// that either number is small. A tighter band than this would be measuring
+    /// the counter's phase against the input length rather than the behaviour:
+    /// a bridge is earned on the 200th failure of one guard, so which guards
+    /// cross the line before the input ends is a boundary effect.
+    #[test]
+    fn the_branching_portal_bridges_like_the_rpython_original() {
+        for (&(len, rp_bridges), &(_, rp_failures)) in
+            RPYTHON_BRIDGES.iter().zip(RPYTHON_GUARD_FAILURES.iter())
+        {
+            let s = nonmatching(len, 20, 42);
+            let r = measure(lower(&bench_regex(20)), &s);
+            let bridges = r.bridges.expect("the probe was installed");
+            let failures = r.guard_failures.expect("the probe was installed");
+            println!(
+                "[bridges] {len:6} chars: majit {bridges:3} bridge(s) \
+                 {failures:6} deopt(s) ({:.4}/char) | rpython {rp_bridges:3} \
+                 {rp_failures:6} ({:.4}/char)",
+                failures as f64 / len as f64,
+                rp_failures as f64 / len as f64,
+            );
+            assert_eq!(
+                r.compiles, 1,
+                "the branching portal compiled {} loops",
+                r.compiles
+            );
+            // The deopt rate is the finding: both sides leave compiled code
+            // once per input character. This is the number that says the
+            // branching body is hostile to a trace, on RPython as on majit.
+            let rate = failures as f64 / len as f64;
+            assert!(
+                (0.90..=1.01).contains(&rate),
+                "the branching portal deopted {rate:.4} times per character \
+                 over {len}; RPython deopts {:.4} times, and the whole point \
+                 of this row is that the two agree",
+                rp_failures as f64 / len as f64,
+            );
+            // Bridges grow with the input on both sides, at the same rate. A
+            // half-to-double band is what a threshold-crossing count supports.
+            assert!(
+                bridges * 2 >= rp_bridges && bridges <= rp_bridges * 2,
+                "majit grew {bridges} bridge(s) over {len} characters where \
+                 RPython grows {rp_bridges}; a cascade that has stopped \
+                 tracking the original is what this asserts against",
+            );
+        }
+    }
+
     /// The experiment's first half: what the two bodies look like.
     ///
     /// The numbers pinned here are the ones the module doc's table reports, and

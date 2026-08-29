@@ -68,8 +68,20 @@ sys.path.insert(0, _ROOT)
 from rpython.jit.metainterp.test.support import LLJitMixin
 from rpython.jit.metainterp.warmspot import get_stats
 
+from rpython.rlib import jit
+
 import fixture
 import marked
+
+
+# `warmspot.py:112` runs `jd.warmstate.set_param_trace_eagerness(2)  # for
+# tests`, hardcoded, where a translated PyPy uses the `rlib/jit.py` PARAMETERS
+# default of 200 and so does majit. Left alone the two sides answer different
+# questions: at 2 this matcher compiles 1407 bridges over 4096 characters, at
+# 200 it compiles 9, so a bridge count taken here is not comparable to majit's.
+# `build_and_match` sets it back with `jit.set_param`, which runs after
+# warmspot's setup and is the supported way to move a parameter.
+TRACE_EAGERNESS = int(os.environ.get('RP_TRACE_EAGERNESS', '200'))
 
 
 class RegexJit(LLJitMixin):
@@ -80,6 +92,7 @@ def build_and_match(n, length, seed):
     """The entry point `meta_interp` traces. Everything is built inside it,
     because the harness annotates from the argument types and ints are the
     only shape that is unambiguous."""
+    jit.set_param(marked.jitdriver, 'trace_eagerness', TRACE_EAGERNESS)
     re = fixture.bench_regex(n)
     s = fixture.nonmatching(length, n, seed)
     if marked.match(re, s):
@@ -129,7 +142,15 @@ def main():
 
     stats = get_stats()
     loops = stats.get_all_loops()
-    print('=== %d loop(s)/bridge(s) compiled ===' % len(loops))
+    # `send_loop_to_backend` calls `stats.add_new_loop` (compile.py:550);
+    # `send_bridge_to_backend` does not. So `get_all_loops()` is the LOOPS, and
+    # the bridges are only in `compiled_count`, which counts both
+    # (compile.py:552, compile.py:604). Printing `len(loops)` and calling it
+    # "loops/bridges" reports 1 for a run that compiled nine bridges.
+    bridges = stats.compiled_count - len(loops)
+    print('=== %d loop(s), %d bridge(s), %d aborted '
+          '(trace_eagerness=%d) ===' % (
+              len(loops), bridges, stats.aborted_count, TRACE_EAGERNESS))
     for idx, loop in enumerate(loops):
         body = peeled(loop.operations)
         print('')
