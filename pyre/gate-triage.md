@@ -223,12 +223,13 @@ build.
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
 
-### §6b — VALUE knobs (15): config, not gates
+### §6b — VALUE knobs (18): config, not gates
 
 `PYRE_FBW_MAX_SUBWALK_DEPTH`, `PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
 `PYRE_PORTAL_METATRACE_ENTRY`, `PYRE_PORTAL_METATRACE_SKIP`,
+`PYRE_CENSUS_TRACE_SIZE`, `PYRE_CENSUS_TRACE_SKIP`, `PYRE_REGEX_LENGTHS`,
 `MAJIT_DTRACE_CONST_FROM`, `MAJIT_DTRACE_CONST_TO`,
 `MAJIT_TRACE_CALL_DIAG`, `MAJIT_TRACE_OPS_DIAG`,
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,

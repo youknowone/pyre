@@ -189,6 +189,8 @@ fn bench(
         !run(root, s),
         "{name}: the benchmark input is supposed NOT to match"
     );
+    #[cfg(feature = "alloc-census")]
+    alloc_census::rearm_trace(name);
     let before = counter.map_or(0, |c| c.load(Ordering::Relaxed));
     #[cfg(feature = "alloc-census")]
     let alloc_before = alloc_census::read();
@@ -243,6 +245,8 @@ fn census(body: &[majit_ir::OpCode]) -> String {
 }
 
 fn main() {
+    #[cfg(feature = "alloc-census")]
+    alloc_census::configure_trace_from_env();
     // Before anything runs compiled code. `target.py --opt=jit` is a translated
     // binary and carries a collector; this is majit's side of that.
     gc::install();
@@ -299,23 +303,22 @@ fn main() {
             "the benchmark input is supposed NOT to match"
         );
 
-        let rows = [
-            bench(NAMES[0], roots[0], &s, None, |r, s| interp::matches(r, s)),
-            bench(
-                NAMES[1],
-                roots[1],
-                &s,
-                Some(&jit_interp::COMPILES),
-                |r, s| jit_interp::matches(r, s, THRESHOLD),
-            ),
-            bench(
-                NAMES[2],
-                roots[2],
-                &s,
-                Some(&shortcircuit::COMPILES),
-                |r, s| shortcircuit::matches(r, s, THRESHOLD),
-            ),
-        ];
+        let interp_row = bench(NAMES[0], roots[0], &s, None, |r, s| interp::matches(r, s));
+        let masking_row = bench(
+            NAMES[1],
+            roots[1],
+            &s,
+            Some(&jit_interp::COMPILES),
+            |r, s| jit_interp::matches(r, s, THRESHOLD),
+        );
+        let branching_row = bench(
+            NAMES[2],
+            roots[2],
+            &s,
+            Some(&shortcircuit::COMPILES),
+            |r, s| shortcircuit::matches(r, s, THRESHOLD),
+        );
+        let rows = [interp_row, masking_row, branching_row];
 
         println!();
         println!("  {} chars, no match as intended:", commas(len as f64));

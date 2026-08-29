@@ -16284,7 +16284,11 @@ fn collect_guards(
                                 length,
                             }
                         }
-                        majit_ir::RdVirtualInfo::Empty => continue,
+                        // `ResumeDataVirtualAdder._number_virtuals` can leave
+                        // a None hole when loop-memo numbering is reused by a
+                        // later guard. Keep it in the vector: skipping it
+                        // would shift every subsequent TAGVIRTUAL index.
+                        majit_ir::RdVirtualInfo::Empty => ExitVirtualLayout::Hole,
                     };
                     recovery_layout.virtual_layouts.push(layout);
                 }

@@ -197,10 +197,11 @@ fn root_forwarded_gcref(
             // (ConstInt), never a traced ref — no rooting needed.
             _ => {}
         }
-    } else if let majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) = forwarded
+    } else if let majit_ir::forwarding::Forwarded::Const(cell) = forwarded
+        && let majit_ir::Value::Ref(gcref) = cell.get()
         && !gcref.is_null()
     {
-        let ss_idx = majit_gc::shadow_stack::push(*gcref);
+        let ss_idx = majit_gc::shadow_stack::push(gcref);
         rooted_refs.push((dummy_key, const_ref_field, ss_idx));
     }
 }
@@ -234,13 +235,16 @@ fn refresh_forwarded_const_ref(
     forwarded: &std::cell::RefCell<majit_ir::forwarding::Forwarded>,
     updated: majit_ir::GcRef,
 ) {
-    let is_const_ref = matches!(
-        &*forwarded.borrow(),
-        majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(_))
-    );
-    if is_const_ref {
-        *forwarded.borrow_mut() =
-            majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(updated));
+    let cell = match &*forwarded.borrow() {
+        majit_ir::forwarding::Forwarded::Const(cell)
+            if matches!(cell.get(), majit_ir::Value::Ref(_)) =>
+        {
+            Some(std::rc::Rc::clone(cell))
+        }
+        _ => None,
+    };
+    if let Some(cell) = cell {
+        cell.set(majit_ir::Value::Ref(updated));
     }
 }
 
@@ -2633,8 +2637,11 @@ impl ExportedState {
             let mut forwarded = forwarded.borrow_mut();
             match &mut *forwarded {
                 majit_ir::forwarding::Forwarded::Info(info) => visit_op_info(info, visitor),
-                majit_ir::forwarding::Forwarded::Const(majit_ir::Const::Ref(gcref)) => {
-                    visitor(gcref)
+                majit_ir::forwarding::Forwarded::Const(cell) => {
+                    if let majit_ir::Value::Ref(mut gcref) = cell.get() {
+                        visitor(&mut gcref);
+                        cell.set(majit_ir::Value::Ref(gcref));
+                    }
                 }
                 _ => {}
             }

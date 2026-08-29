@@ -201,6 +201,12 @@ pub enum ExitVirtualKind {
 /// Backend-neutral description of a materialized virtual object.
 #[derive(Debug, Clone)]
 pub enum ExitVirtualLayout {
+    /// `resume.py ResumeDataVirtualAdder._number_virtuals` initializes
+    /// `storage.rd_virtuals` as `[None] * length`.  Reusing the loop memo's
+    /// virtual numbers can therefore leave holes in an individual guard.
+    /// Keep the slot so every later `TAGVIRTUAL` index remains stable; a hole
+    /// is unreachable by that guard and is never materialized.
+    Hole,
     /// resume.py VirtualInfo — allocate_with_vtable(descr=self.descr).
     Object {
         /// resume.py self.descr — live SizeDescr for allocate_with_vtable.
@@ -298,6 +304,7 @@ pub enum ExitVirtualLayout {
 impl ExitVirtualLayout {
     pub fn shifted_virtuals(&self, virtual_offset: usize) -> Self {
         match self {
+            Self::Hole => Self::Hole,
             Self::Object {
                 descr,
                 type_id,
@@ -442,6 +449,7 @@ fn opt_descr_ptr_eq(a: &Option<majit_ir::DescrRef>, b: &Option<majit_ir::DescrRe
 impl PartialEq for ExitVirtualLayout {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Hole, Self::Hole) => true,
             (
                 Self::Object {
                     descr: a_descr,

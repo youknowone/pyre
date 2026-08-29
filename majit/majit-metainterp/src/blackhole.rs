@@ -385,6 +385,19 @@ pub struct BlackholeInterpreter {
     /// frame is indistinguishable from a fresh one because those THREE steps
     /// together cover every field, not because any one of them does.
     pub(crate) inline_callee_scratch: Option<Box<BlackholeInterpreter>>,
+    /// Per-kind argument lists for the native arm of `BC_INLINE_CALL`.
+    ///
+    /// RPython `BlackholeInterpreter.bhimpl_inline_call_irf_*` receives the
+    /// already-built `args_i` / `args_r` / `args_f` lists and immediately
+    /// hands them to `cpu.bh_call_*`.  pyre's `inline_call_nested_ext`
+    /// adapter has to regroup its `(kind, caller_src, callee_dst)` triples
+    /// into those lists.  Keeping the backing stores on the interpreter
+    /// preserves the upstream per-interpreter ownership and avoids three
+    /// system-heap allocations on every blackhole inline call.  They are a
+    /// disposable cache only: no identity or value survives a call.
+    pub(crate) native_inline_args_i_scratch: Vec<i64>,
+    pub(crate) native_inline_args_r_scratch: Vec<i64>,
+    pub(crate) native_inline_args_f_scratch: Vec<i64>,
     /// State-field JIT register layout (`StateFieldLayout`).  Set on the
     /// root resume frame from `JitState::state_field_layout` so the
     /// `state_field` handlers can map a logical field/array index to the
@@ -515,6 +528,9 @@ impl Default for BlackholeInterpreter {
             virtualizable_stack_base: 0,
             dispatch_table: std::sync::Arc::new(Vec::new()),
             inline_callee_scratch: None,
+            native_inline_args_i_scratch: Vec::new(),
+            native_inline_args_r_scratch: Vec::new(),
+            native_inline_args_f_scratch: Vec::new(),
             state_field_layout: StateFieldLayout::default(),
         }
     }
@@ -12254,9 +12270,18 @@ fn inline_call_native(
     // count - 1) and every kind's count is <= `num_args`.  The `truncate`s
     // below cut each bank back to what was actually placed, which is what
     // `collect_call_args` walks.
-    let mut args_i = vec![0i64; num_args];
-    let mut args_r = vec![0i64; num_args];
-    let mut args_f = vec![0i64; num_args];
+    // `BlackholeInterpreter.bhimpl_inline_call_irf_*` owns no callee frame;
+    // the argument lists live only for this direct `cpu.bh_call_*`.  Reuse
+    // their storage just like `setposition` reuses the interpreter's register
+    // lists.  Take them out while the call runs so the shared `&self` call
+    // helpers and the later mutable result/exception handling do not require
+    // a Rust-only interior-mutability owner.
+    let mut args_i = std::mem::take(&mut bh.native_inline_args_i_scratch);
+    let mut args_r = std::mem::take(&mut bh.native_inline_args_r_scratch);
+    let mut args_f = std::mem::take(&mut bh.native_inline_args_f_scratch);
+    args_i.resize(num_args, 0);
+    args_r.resize(num_args, 0);
+    args_f.resize(num_args, 0);
     let (mut len_i, mut len_r, mut len_f) = (0usize, 0usize, 0usize);
     for _ in 0..num_args {
         let kind = JitArgKind::decode(jitcode::read_u8(code, &mut p));
@@ -12283,33 +12308,65 @@ fn inline_call_native(
     // handlers above; clearing it first is what makes a stale value from an
     // earlier call unable to be read as this one's.
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
-    match calldescr.result_type {
+
+    // The local ref list must remain a moving-GC root during the residual
+    // call.  In RPython it is a GC-managed list and the shadow-stack transform
+    // roots it automatically.  pyre's explicit transform already uses this
+    // slice-root mechanism for resume construction; register this borrowed
+    // list for the strictly nested call window and pop it before returning the
+    // storage to the interpreter cache.
+    let args_root_depth = majit_gc::shadow_stack::resume_ref_roots_depth();
+    unsafe {
+        majit_gc::shadow_stack::push_resume_ref_roots(args_r.as_mut_slice());
+    }
+    let outcome = match calldescr.result_type {
         'i' => {
             let result = bh.bhimpl_inline_call_irf_i(fnaddr, &args_i, &args_r, &args_f, calldescr);
-            check_residual_call_exception_after(bh, p)?;
-            if let Some(dst) = return_i {
-                bh.registers_i[dst] = result;
+            let outcome = check_residual_call_exception_after(bh, p);
+            if outcome.is_ok() {
+                if let Some(dst) = return_i {
+                    bh.registers_i[dst] = result;
+                }
             }
+            outcome
         }
         'r' => {
             let result = bh.bhimpl_inline_call_irf_r(fnaddr, &args_i, &args_r, &args_f, calldescr);
-            check_residual_call_exception_after(bh, p)?;
-            if let Some(dst) = return_r {
-                bh.registers_r[dst] = result.0 as i64;
+            let outcome = check_residual_call_exception_after(bh, p);
+            if outcome.is_ok() {
+                if let Some(dst) = return_r {
+                    bh.registers_r[dst] = result.0 as i64;
+                }
             }
+            outcome
         }
         'f' => {
             let result = bh.bhimpl_inline_call_irf_f(fnaddr, &args_i, &args_r, &args_f, calldescr);
-            check_residual_call_exception_after(bh, p)?;
-            if let Some(dst) = return_f {
-                bh.registers_f[dst] = result.to_bits() as i64;
+            let outcome = check_residual_call_exception_after(bh, p);
+            if outcome.is_ok() {
+                if let Some(dst) = return_f {
+                    bh.registers_f[dst] = result.to_bits() as i64;
+                }
             }
+            outcome
         }
         _ => {
             bh.bhimpl_inline_call_irf_v(fnaddr, &args_i, &args_r, &args_f, calldescr);
-            check_residual_call_exception_after(bh, p)?;
+            check_residual_call_exception_after(bh, p)
         }
-    }
+    };
+    majit_gc::shadow_stack::pop_resume_ref_roots_to(args_root_depth);
+
+    // Clear the logical contents (especially dead refs) while retaining the
+    // three capacities for the next native inline call.  Restore them before
+    // propagating `outcome`, so exceptional calls reuse storage too.
+    args_i.clear();
+    args_r.clear();
+    args_f.clear();
+    bh.native_inline_args_i_scratch = args_i;
+    bh.native_inline_args_r_scratch = args_r;
+    bh.native_inline_args_f_scratch = args_f;
+    outcome?;
     Ok(p)
 }
 

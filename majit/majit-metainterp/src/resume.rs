@@ -8,6 +8,7 @@
 
 use indexmap::{IndexMap, IndexSet};
 use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
@@ -107,9 +108,12 @@ fn leaf3_prov_enabled() -> bool {
 /// `_number_virtuals` iterates it directly. #160/S11 keys this map by the
 /// canonical [`Operand`](majit_ir::operand::Operand) (`Rc::ptr_eq` on the
 /// producer = PyPy `box is box`), the faithful port of the dict-by-`is` —
-/// `Operand` IS the box object `resume.py liveboxes` stores; the no-HashMap
-/// house rule keeps the `IndexMap` backing (linear scan, dict-assignment
-/// semantics, preserved insertion order). Two reaches of one logical box
+/// `Operand` IS the box object `resume.py liveboxes` stores. The backing is the
+/// literal small insertion-ordered sequence of `(box, tag)` pairs: resume
+/// numbering walks it in insertion order, and the regex/JIT workloads keep
+/// these maps small enough that a linear identity lookup avoids IndexMap's
+/// separate hash-index allocation without changing dict-assignment semantics.
+/// Two reaches of one logical box
 /// resolve to one producer Rc (via `from_bound_op`/`from_bound_inputarg`) and
 /// collapse to one key; distinct boxes — e.g. an `InputArg` vs a `ResOp`
 /// result — stay distinct, where a raw-position key could have aliased them.
@@ -123,19 +127,21 @@ fn leaf3_prov_enabled() -> bool {
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: indexmap::IndexMap<majit_ir::operand::Operand, i16>,
+    entries: Vec<(majit_ir::operand::Operand, i16)>,
 }
 
 impl LiveboxMap {
     pub fn new() -> Self {
         Self {
-            entries: indexmap::IndexMap::new(),
+            entries: Vec::new(),
         }
     }
 
     #[inline(always)]
     pub fn get(&self, b: &majit_ir::operand::Operand) -> Option<i16> {
-        self.entries.get(b).copied()
+        self.entries
+            .iter()
+            .find_map(|(key, value)| (key == b).then_some(*value))
     }
 
     #[inline(always)]
@@ -146,18 +152,22 @@ impl LiveboxMap {
              `_number_boxes` invariant — `isinstance(box, Const)` is encoded \
              via `getconst(box)` and never enters numb_state.liveboxes",
         );
-        self.entries.insert(b, value);
+        if let Some((_, old_value)) = self.entries.iter_mut().find(|(key, _)| key == &b) {
+            *old_value = value;
+        } else {
+            self.entries.push((b, value));
+        }
     }
 
     #[inline(always)]
     pub fn contains_key(&self, b: &majit_ir::operand::Operand) -> bool {
-        self.entries.contains_key(b)
+        self.entries.iter().any(|(key, _)| key == b)
     }
 
     /// Iterate over all (canonical box, tag) pairs in RPython dict insertion
     /// order (Rc::ptr_eq identity = PyPy `box is box`).
     pub fn iter(&self) -> impl Iterator<Item = (majit_ir::operand::Operand, i16)> + '_ {
-        self.entries.iter().map(|(op, v)| (op.clone(), *v))
+        self.entries.iter().map(|(op, value)| (op.clone(), *value))
     }
 }
 
@@ -3947,7 +3957,82 @@ impl ResumeDataLoopMemo {
         env: &dyn BoxEnv,
         minimum_virtualizable_size: i64,
     ) -> Result<NumberingState, TagOverflow> {
-        let size_hint = snapshot.estimated_size();
+        let frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 1]> = snapshot
+            .framestack
+            .iter()
+            .map(|frame| {
+                (
+                    frame.jitcode_index,
+                    frame.pc,
+                    frame.py_pc,
+                    frame.boxes.as_slice(),
+                )
+            })
+            .collect();
+        self.number_slices(
+            &snapshot.vable_array,
+            &snapshot.vref_array,
+            &frames,
+            env,
+            minimum_virtualizable_size,
+        )
+    }
+
+    /// `resume.py ResumeDataLoopMemo.number` over the trace's existing
+    /// snapshot arrays.
+    ///
+    /// RPython's `SnapshotIterator` reads the opencoder buffer lazily; it does
+    /// not copy every live-box array once per guard. The optimizer stores the
+    /// equivalent arrays separately, so this entry point borrows those slices
+    /// and only builds the one-element frame descriptor inline for the common
+    /// single-frame case.
+    pub fn number_from_parts(
+        &mut self,
+        snapshot_boxes: &[SnapshotBox],
+        frame_sizes: Option<&[usize]>,
+        frame_pcs: &[(i32, i32, i32)],
+        vable_array: &[SnapshotBox],
+        vref_array: &[SnapshotBox],
+        env: &dyn BoxEnv,
+        minimum_virtualizable_size: i64,
+    ) -> Result<NumberingState, TagOverflow> {
+        let mut frames: SmallVec<[(i32, i32, i32, &[SnapshotBox]); 1]> = SmallVec::new();
+        if let Some(sizes) = frame_sizes.filter(|sizes| sizes.len() > 1) {
+            let mut offset = 0;
+            for (i, &size) in sizes.iter().enumerate() {
+                let end = (offset + size).min(snapshot_boxes.len());
+                let (jitcode_index, pc, py_pc) = frame_pcs.get(i).copied().unwrap_or((0, 0, 0));
+                frames.push((jitcode_index, pc, py_pc, &snapshot_boxes[offset..end]));
+                offset = end;
+            }
+        } else {
+            let (jitcode_index, pc, py_pc) = frame_pcs.first().copied().unwrap_or((0, 0, 0));
+            frames.push((jitcode_index, pc, py_pc, snapshot_boxes));
+        }
+        self.number_slices(
+            vable_array,
+            vref_array,
+            &frames,
+            env,
+            minimum_virtualizable_size,
+        )
+    }
+
+    fn number_slices(
+        &mut self,
+        vable_array: &[SnapshotBox],
+        vref_array: &[SnapshotBox],
+        frames: &[(i32, i32, i32, &[SnapshotBox])],
+        env: &dyn BoxEnv,
+        minimum_virtualizable_size: i64,
+    ) -> Result<NumberingState, TagOverflow> {
+        let size_hint = vable_array.len()
+            + vref_array.len()
+            + frames
+                .iter()
+                .map(|(_, _, _, boxes)| boxes.len() + 3)
+                .sum::<usize>()
+            + 4;
         let mut numb_state = NumberingState::new(size_hint);
 
         // resume.py:231-232: patch later
@@ -3958,9 +4043,9 @@ impl ResumeDataLoopMemo {
         // virtualizable itself is one entry in the array too, so use '>'.
         if minimum_virtualizable_size != -1 {
             debug_assert!(
-                snapshot.vable_array.len() as i64 > minimum_virtualizable_size,
+                vable_array.len() as i64 > minimum_virtualizable_size,
                 "vable_array length {} not > minimum_virtualizable_size {}",
-                snapshot.vable_array.len(),
+                vable_array.len(),
                 minimum_virtualizable_size
             );
         }
@@ -3978,24 +4063,24 @@ impl ResumeDataLoopMemo {
         // `consume_vable_info`; `seed_bridge_virtualizable_boxes`'s
         // `split_first`). Numbering must not reorder it again — running the
         // whole array through `_number_boxes()` unchanged is the parity.
-        numb_state.append_int(snapshot.vable_array.len() as i64);
-        self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
+        numb_state.append_int(vable_array.len() as i64);
+        self._number_boxes(vable_array, &mut numb_state, env)?;
 
         // resume.py:243-247: virtualref array
-        let vref_len = snapshot.vref_array.len();
+        let vref_len = vref_array.len();
         debug_assert!(vref_len & 1 == 0, "vref_array length must be even");
         numb_state.append_int((vref_len >> 1) as i64);
-        self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
+        self._number_boxes(vref_array, &mut numb_state, env)?;
 
         // resume.py:249-253: frame chain.
         // Per-frame: jitcode_index, pc, py_pc, [tagged_values...].
         // RPython uses jitcode.get_live_vars_info(pc) at decode time
         // to know how many tagged values each frame has.
-        for frame in &snapshot.framestack {
-            numb_state.append_int(frame.jitcode_index as i64);
-            numb_state.append_int(frame.pc as i64);
-            numb_state.append_int(frame.py_pc as i64);
-            self._number_boxes(&frame.boxes, &mut numb_state, env)?;
+        for &(jitcode_index, pc, py_pc, boxes) in frames {
+            numb_state.append_int(jitcode_index as i64);
+            numb_state.append_int(pc as i64);
+            numb_state.append_int(py_pc as i64);
+            self._number_boxes(boxes, &mut numb_state, env)?;
         }
 
         // resume.py:254: patch total size

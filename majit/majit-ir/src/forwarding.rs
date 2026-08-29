@@ -12,7 +12,7 @@
 //! Hosted in `majit-ir` so the slot can carry `Rc<Op>` / `Rc<InputArg>`
 //! without a `majit-metainterp -> majit-ir` circular dep.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 #[cfg(feature = "test-support")]
@@ -21,7 +21,7 @@ use crate::intbound::IntBound;
 use crate::op_info::OpInfo;
 use crate::ptr_info::PtrInfo;
 use crate::resoperation::Op;
-use crate::value::{Const, InputArg};
+use crate::value::{Const, InputArg, Value};
 
 /// Variant of the `_forwarded` slot.
 ///
@@ -55,16 +55,12 @@ pub enum Forwarded {
     /// and retrace remap (compile.py / unroll.py).
     InputArg(Rc<InputArg>),
 
-    /// `history.py ConstInt` / `ConstFloat` / `ConstPtr`
-    /// — forwarding terminates here; the constant value is carried
-    /// inline. Chain walkers stop on this variant (`not_const=true`
-    /// returns the pre-Const box; `not_const=false` materializes a
-    /// terminal const-bearing operand).
-    ///
-    /// PyPy has no analog (callers hold the Python `Const` object
-    /// directly); `box_to_opref` reconstructs the inline-Const OpRef
-    /// from the payload value (history.py/268/314).
-    Const(Const),
+    /// `history.py ConstInt` / `ConstFloat` / `ConstPtr` object assigned to
+    /// `_forwarded`. Forwarding terminates here; chain walkers clone this
+    /// handle, so every read returns the SAME Const identity instead of
+    /// allocating a fresh wrapper from an inline value. The `Cell` permits
+    /// the explicit GC walker to forward `ConstPtr` in place.
+    Const(Rc<Cell<Value>>),
 
     /// `optimizeopt/info.py AbstractInfo (is_info_class = True)` family —
     /// `PtrInfo`, `IntBound`, `FloatConstInfo`, `EmptyInfo`, etc.
@@ -104,7 +100,7 @@ impl std::fmt::Debug for Forwarded {
             Forwarded::None => f.write_str("None"),
             Forwarded::Op(_) => f.write_str("Op(..)"),
             Forwarded::InputArg(_) => f.write_str("InputArg(..)"),
-            Forwarded::Const(c) => write!(f, "Const({c:?})"),
+            Forwarded::Const(c) => write!(f, "Const({:?})", c.get()),
             Forwarded::Info(_) => f.write_str("Info(..)"),
         }
     }
@@ -173,7 +169,10 @@ pub trait ForwardingHost {
     /// `optimizer.py make_constant(box, constbox)` — terminate the chain
     /// in an inline constant value.
     fn set_forwarded_const(&self, value: Const) {
-        self.store_forwarded(Forwarded::Const(value));
+        // `optimizer.py make_constant` stores the Const object itself in the
+        // box's `_forwarded` slot. Mint that object once at the write, not on
+        // every `get_box_replacement` read.
+        self.store_forwarded(Forwarded::Const(Rc::new(Cell::new(value.to_value()))));
     }
 
     /// `resoperation.py set_forwarded(forwarded_to)` — Info target.

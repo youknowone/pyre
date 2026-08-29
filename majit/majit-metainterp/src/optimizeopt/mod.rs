@@ -834,6 +834,14 @@ pub struct OptContext {
     /// (calldescr, func_ptr) pairs. Used by generate_modified_call
     /// (vstring.py:853) to emit specialized string comparison calls.
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
+    /// optimizer.py:732 `self.resumedata_memo`.
+    ///
+    /// RPython allocates one ResumeDataLoopMemo in `Optimizer.__init__` and
+    /// every guard emitted by that optimizer numbers through the same object.
+    /// `Rc<RefCell<_>>` preserves that shared object identity while allowing
+    /// `OptContext` (the Rust borrow-splitting adaptation of Optimizer) to own
+    /// the guard-emission path.
+    pub resumedata_memo: std::rc::Rc<std::cell::RefCell<crate::resume::ResumeDataLoopMemo>>,
     /// resume.py parity: per-guard snapshot boxes from tracing time.
     /// Used by emit() to call store_final_boxes_in_guard inline (RPython
     /// calls this during optimization, not post-assembly).
@@ -1806,6 +1814,9 @@ impl OptContext {
 
             in_final_emission: false,
             callinfocollection: None,
+            resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::resume::ResumeDataLoopMemo::new(),
+            )),
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),
@@ -2421,6 +2432,9 @@ impl OptContext {
 
             in_final_emission: false,
             callinfocollection: None,
+            resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::resume::ResumeDataLoopMemo::new(),
+            )),
             pending_for_guard: Vec::new(),
             pending_pure_from_args: Vec::new(),
             pending_pure_from_args2: Vec::new(),
@@ -4020,16 +4034,17 @@ impl OptContext {
                     // optimizer.py `getinfo` parity for the Const
                     // terminal — Refs surface as `ConstPtrInfo`, Floats as
                     // `FloatConstInfo`, Ints as `IntBound::from_constant`.
-                    match *c {
-                        majit_ir::Const::Ref(gcref) => Some(OpInfo::ptr(
+                    match c.get() {
+                        majit_ir::Value::Ref(gcref) => Some(OpInfo::ptr(
                             crate::optimizeopt::info::PtrInfo::Constant(gcref),
                         )),
-                        majit_ir::Const::Float(f) => Some(OpInfo::FloatConstInfo(
+                        majit_ir::Value::Float(f) => Some(OpInfo::FloatConstInfo(
                             crate::optimizeopt::info::FloatConstInfo::new(f),
                         )),
-                        majit_ir::Const::Int(i) => Some(OpInfo::int_bound(
+                        majit_ir::Value::Int(i) => Some(OpInfo::int_bound(
                             crate::optimizeopt::intutils::IntBound::from_constant(i),
                         )),
+                        majit_ir::Value::Void => None,
                     }
                 }
                 _ => None,
@@ -5015,7 +5030,16 @@ impl OptContext {
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
         self.heal_arg_to_canonical(arg);
 
-        if arg.bound_op().is_some() || arg.is_constant() {
+        // `Const.get_box_replacement()` is identity in resoperation.py: a
+        // Const has no `_forwarded` slot and cannot have a different
+        // canonical host in the positional stores. Returning the carried
+        // object also preserves Const identity; the old OpRef round-trip
+        // allocated a replacement `Rc<Cell<Value>>` on every pass visit.
+        if arg.is_constant() {
+            return arg.clone();
+        }
+
+        if arg.bound_op().is_some() {
             let resolved = arg.get_box_replacement(false);
             // Self-resolved box-native: the canonical forwarding for this
             // position lives in the `OpRef` store (see `get_box_replacement_operand`).
@@ -5038,7 +5062,11 @@ impl OptContext {
     pub fn resolve_operand_operand_opt(&self, arg: &Operand) -> Option<Operand> {
         self.heal_arg_to_canonical(arg);
 
-        if arg.bound_op().is_some() || arg.is_constant() {
+        if arg.is_constant() {
+            return Some(arg.clone());
+        }
+
+        if arg.bound_op().is_some() {
             let resolved = arg.get_box_replacement(false);
             if resolved.same_box(arg) {
                 Some(
@@ -5155,6 +5183,14 @@ impl OptContext {
     /// returns `opref` unchanged (`from_opref(o).to_opref() == o`) — but
     /// without fabricating the intermediate position-only box.
     pub(crate) fn get_replacement_opref(&self, opref: OpRef) -> OpRef {
+        // `resoperation.py get_box_replacement(Const)` returns that same
+        // Const immediately: Const has no `_forwarded` slot.  The flat OpRef
+        // bridge already carries its complete value, so do not manufacture an
+        // `Rc<Cell<Value>>` object merely to convert it straight back to the
+        // identical OpRef.
+        if opref.is_constant() || opref.is_none() {
+            return opref;
+        }
         match self.get_box_replacement_operand_opt(opref) {
             Some(o) => o.to_opref(),
             None => opref,
@@ -6431,66 +6467,24 @@ impl OptContext {
         // and PtrInfo to correctly assign TAGVIRTUAL via _number_boxes.
         // _number_virtuals then builds rd_virtuals from PtrInfo.
         let snapshot_boxes = snapshot_get(&self.snapshot_boxes, op.rd_resume_position.get())
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
         let vable_oprefs = snapshot_get(&self.snapshot_vable_boxes, op.rd_resume_position.get())
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
         let vref_oprefs = snapshot_get(&self.snapshot_vref_boxes, op.rd_resume_position.get())
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
         let frame_pcs = snapshot_get(&self.snapshot_frame_pcs, op.rd_resume_position.get())
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
 
         // resume.py:201-202 get_box_replacement parity:
         // Pass ORIGINAL (unresolved) snapshot boxes. _number_boxes calls
         // env.get_box_replacement per-box, which resolves through the
         // replacement chain while preserving virtual identity.
-        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position.get());
-        let mut snapshot = if let Some(sizes) = frame_sizes.filter(|s| s.len() > 1) {
-            // Multi-frame: split snapshot_boxes into per-frame chunks.
-            let mut frames = Vec::new();
-            let mut offset = 0;
-            for (i, &size) in sizes.iter().enumerate() {
-                let end = (offset + size).min(snapshot_boxes.len());
-                let frame_boxes: Vec<SnapshotBox> = snapshot_boxes[offset..end].to_vec();
-                let (jitcode_index, pc, py_pc) = frame_pcs.get(i).copied().unwrap_or((0, 0, 0));
-                frames.push(crate::resume::SnapshotFrame {
-                    jitcode_index,
-                    pc,
-                    py_pc,
-                    boxes: frame_boxes,
-                });
-                offset = end;
-            }
-            Snapshot {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                framestack: frames,
-            }
-        } else {
-            let (jitcode_index, pc, py_pc) = frame_pcs.first().copied().unwrap_or((0, 0, 0));
-            Snapshot {
-                vable_array: Vec::new(),
-                vref_array: Vec::new(),
-                framestack: vec![crate::resume::SnapshotFrame {
-                    jitcode_index,
-                    pc,
-                    py_pc,
-                    boxes: snapshot_boxes.clone(),
-                }],
-            }
-        };
-        // pyjitpl.py:2588: vable_array stores virtualizable_boxes.
-        // ni/vsd are constants (TAGINT/TAGCONST) so they don't affect
-        // TAGBOX numbering. The same OpRefs also appear in fail_args —
-        // _number_boxes deduplicates via liveboxes HashMap.
-        snapshot.vable_array = vable_oprefs;
-        // resume.py _number_boxes also reads vref_array as a
-        // separate section after vable_array. opencoder.py:767
-        // create_top_snapshot writes both arrays into the snapshot.
-        snapshot.vref_array = vref_oprefs;
+        let frame_sizes = snapshot_get(&self.snapshot_frame_sizes, op.rd_resume_position.get())
+            .map(Vec::as_slice);
 
         // Compare every snapshot cell's carried type with the type encoded by
         // its `OpRef` variant. `None` is an unclassified producer rather than
@@ -6501,12 +6495,10 @@ impl OptContext {
             let mut agree = 0usize;
             let mut disagree = 0usize;
             let mut untyped = 0usize;
-            let cells = snapshot
-                .framestack
+            let cells = snapshot_boxes
                 .iter()
-                .flat_map(|frame| frame.boxes.iter())
-                .chain(snapshot.vable_array.iter())
-                .chain(snapshot.vref_array.iter());
+                .chain(vable_oprefs.iter())
+                .chain(vref_oprefs.iter());
             for cell in cells {
                 let encoded = cell.opref.ty();
                 match cell.tp {
@@ -6532,8 +6524,7 @@ impl OptContext {
 
         if crate::callee_rca_enabled() {
             let env = OptBoxEnv { ctx: self };
-            let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot
-                .vable_array
+            let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = vable_oprefs
                 .iter()
                 .map(|boxref| {
                     let boxref = boxref.opref();
@@ -6570,8 +6561,7 @@ impl OptContext {
                     (boxref, resolved, is_virtual, tp)
                 })
                 .collect();
-            let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot
-                .vable_array
+            let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = vable_oprefs
                 .iter()
                 .map(|boxref| {
                     let boxref = boxref.opref();
@@ -6594,7 +6584,7 @@ impl OptContext {
 
         // resume.py: delegate to ResumeDataVirtualAdder.finish()
         let env = OptBoxEnv { ctx: self };
-        let mut memo = ResumeDataLoopMemo::new();
+        let mut memo = self.resumedata_memo.borrow_mut();
         // resume.py:403-405 passes `minimum_virtualizable_size` here, which
         // arms the `resume.py` length check inside `number()`. This
         // call site used to hardcode `-1`, so the check — ported faithfully in
@@ -6623,7 +6613,15 @@ impl OptContext {
         // cannot raise to abandon the trace (`protect_speculative_operation`
         // uses the same one). Both discard the compilation and leave the
         // interpreter to carry on from state the JIT never took over.
-        let Ok(numb_state) = memo.number(&snapshot, &env, self.minimum_virtualizable_size) else {
+        let Ok(numb_state) = memo.number_from_parts(
+            snapshot_boxes,
+            frame_sizes,
+            frame_pcs,
+            vable_oprefs,
+            vref_oprefs,
+            &env,
+            self.minimum_virtualizable_size,
+        ) else {
             self.signal_invalid_loop("resume numbering: TagOverflow");
             return;
         };
@@ -9116,7 +9114,7 @@ mod boxref_forwarding_tests {
         // The IntBound on old is gone (overwritten by Forwarded::Op(const)).
         // Const targets do not carry transferred info — PyPy skips this case.
         match &b0.get_forwarded() {
-            BoxForwarded::Const(majit_ir::Const::Int(v)) => assert_eq!(*v, 42),
+            BoxForwarded::Const(c) => assert_eq!(c.get(), majit_ir::Value::Int(42)),
             other => panic!("expected b0 to forward to Const, got {:?}", other),
         }
     }
@@ -9149,8 +9147,8 @@ mod boxref_forwarding_tests {
         ctx.seed_boxes_canonical(std::slice::from_ref(&b));
         ctx.make_constant_arg(&b, Value::Ref(GcRef(0xdead_beef)));
         match &b.get_forwarded() {
-            BoxForwarded::Const(majit_ir::Const::Ref(g)) => {
-                assert_eq!(*g, GcRef(0xdead_beef));
+            BoxForwarded::Const(c) => {
+                assert_eq!(c.get(), majit_ir::Value::Ref(GcRef(0xdead_beef)));
             }
             other => panic!(
                 "expected Forwarded::Const(Ref) post make_constant, got {:?}",
@@ -9161,10 +9159,10 @@ mod boxref_forwarding_tests {
         // forwarded slot.
         ctx.make_nonnull(&b);
         match &b.get_forwarded() {
-            BoxForwarded::Const(majit_ir::Const::Ref(g)) => {
+            BoxForwarded::Const(c) => {
                 assert_eq!(
-                    *g,
-                    GcRef(0xdead_beef),
+                    c.get(),
+                    majit_ir::Value::Ref(GcRef(0xdead_beef)),
                     "make_nonnull must not overwrite the Const slot"
                 );
             }
@@ -9197,7 +9195,16 @@ mod boxref_forwarding_tests {
         assert!(b0_after.get_box_replacement(false).is_constant());
         // `Forwarded::Const(constval)` planted directly via set_forwarded_const.
         b1.set_forwarded_const(majit_ir::Const::Int(42));
-        assert!(b1.get_box_replacement(false).is_constant());
+        let first = b1.get_box_replacement(false);
+        let second = b1.get_box_replacement(false);
+        assert!(first.is_constant());
+        match (&first, &second) {
+            (Operand::Const(a), Operand::Const(b)) => assert!(
+                std::rc::Rc::ptr_eq(a, b),
+                "get_box_replacement must return the Const object stored in _forwarded"
+            ),
+            other => panic!("expected two Const terminals, got {other:?}"),
+        }
         // Negative case: operand with no constant forwarding.
         let (nb, _ia_nb) = bound_inputarg_operand(Type::Int, 0);
         assert!(!nb.get_box_replacement(false).is_constant());
@@ -9210,8 +9217,8 @@ mod boxref_forwarding_tests {
         let (mut ctx, b0, _b1, _ia_holder) = ctx_with_two_int_boxes();
         ctx.make_constant_arg(&b0, Value::Int(42));
         match &b0.get_forwarded() {
-            BoxForwarded::Const(majit_ir::Const::Int(v)) => {
-                assert_eq!(*v, 42);
+            BoxForwarded::Const(c) => {
+                assert_eq!(c.get(), majit_ir::Value::Int(42));
             }
             other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
@@ -9246,8 +9253,8 @@ mod boxref_forwarding_tests {
         let b_const = ctx.materialize_operand_at(const_opref);
         ctx.make_equal_to(&b0, &b_const);
         match &b0.get_forwarded() {
-            BoxForwarded::Const(majit_ir::Const::Int(v)) => {
-                assert_eq!(*v, 42);
+            BoxForwarded::Const(c) => {
+                assert_eq!(c.get(), majit_ir::Value::Int(42));
             }
             other => panic!("expected Forwarded::Const(Int 42), got {:?}", other),
         }
