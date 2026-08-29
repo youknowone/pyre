@@ -108,11 +108,12 @@ fn leaf3_prov_enabled() -> bool {
 /// `_number_virtuals` iterates it directly. #160/S11 keys this map by the
 /// canonical [`Operand`](majit_ir::operand::Operand) (`Rc::ptr_eq` on the
 /// producer = PyPy `box is box`), the faithful port of the dict-by-`is` —
-/// `Operand` IS the box object `resume.py liveboxes` stores. The backing is the
-/// literal small insertion-ordered sequence of `(box, tag)` pairs: resume
-/// numbering walks it in insertion order, and the regex/JIT workloads keep
-/// these maps small enough that a linear identity lookup avoids IndexMap's
-/// separate hash-index allocation without changing dict-assignment semantics.
+/// `Operand` IS the box object `resume.py liveboxes` stores. The backing is an
+/// insertion-ordered sequence of `(box, tag)` pairs — resume numbering walks it
+/// in that order — looked up by a linear identity scan while the map is small,
+/// which is where IndexMap's separate hash-index allocation was the cost, and
+/// through an identity index above that, which is where the scan would be.
+/// Neither changes dict-assignment semantics.
 /// Two reaches of one logical box
 /// resolve to one producer Rc (via `from_bound_op`/`from_bound_inputarg`) and
 /// collapse to one key; distinct boxes — e.g. an `InputArg` vs a `ResOp`
@@ -128,20 +129,44 @@ fn leaf3_prov_enabled() -> bool {
 /// numbering state.
 pub struct LiveboxMap {
     entries: Vec<(majit_ir::operand::Operand, i16)>,
+    /// Identity index over `entries`, built once the map outgrows
+    /// [`Self::LINEAR_MAX`] and maintained from then on.
+    ///
+    /// `dict` is O(1) at every size, and a guard's live set is not bounded:
+    /// `_number_boxes` looks up (and usually inserts) once per live box, so a
+    /// scan-only map is quadratic per guard and multiplies bridge-compilation
+    /// time on a trace with hundreds of them. The scan is kept for the small
+    /// maps the JIT workloads actually produce — where a few pointer compares
+    /// beat hashing and the index's allocation is the cost being avoided —
+    /// and abandoned as soon as that stops being true.
+    index: Option<std::collections::HashMap<majit_ir::operand::Operand, usize, FxBuildHasher>>,
 }
 
 impl LiveboxMap {
+    /// Entries held before the identity index is built. Below this a linear
+    /// identity scan is a handful of pointer compares against one cache line
+    /// or two; above it the scan is what the index exists to replace.
+    const LINEAR_MAX: usize = 16;
+
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            index: None,
+        }
+    }
+
+    /// Slot of `b` in `entries`, through the index once there is one.
+    #[inline(always)]
+    fn position(&self, b: &majit_ir::operand::Operand) -> Option<usize> {
+        match self.index.as_ref() {
+            Some(index) => index.get(b).copied(),
+            None => self.entries.iter().position(|(key, _)| key == b),
         }
     }
 
     #[inline(always)]
     pub fn get(&self, b: &majit_ir::operand::Operand) -> Option<i16> {
-        self.entries
-            .iter()
-            .find_map(|(key, value)| (key == b).then_some(*value))
+        self.position(b).map(|at| self.entries[at].1)
     }
 
     #[inline(always)]
@@ -152,16 +177,32 @@ impl LiveboxMap {
              `_number_boxes` invariant — `isinstance(box, Const)` is encoded \
              via `getconst(box)` and never enters numb_state.liveboxes",
         );
-        if let Some((_, old_value)) = self.entries.iter_mut().find(|(key, _)| key == &b) {
-            *old_value = value;
-        } else {
-            self.entries.push((b, value));
+        if let Some(at) = self.position(&b) {
+            self.entries[at].1 = value;
+            return;
+        }
+        let at = self.entries.len();
+        self.entries.push((b.clone(), value));
+        match self.index.as_mut() {
+            Some(index) => {
+                index.insert(b, at);
+            }
+            None if self.entries.len() > Self::LINEAR_MAX => {
+                self.index = Some(
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .map(|(at, (key, _))| (key.clone(), at))
+                        .collect(),
+                );
+            }
+            None => {}
         }
     }
 
     #[inline(always)]
     pub fn contains_key(&self, b: &majit_ir::operand::Operand) -> bool {
-        self.entries.iter().any(|(key, _)| key == b)
+        self.position(b).is_some()
     }
 
     /// Iterate over all (canonical box, tag) pairs in RPython dict insertion
