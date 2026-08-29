@@ -254,14 +254,16 @@ impl Llbc {
             Some(row) if row.id == file_id => row,
             _ => files.iter().find(|row| row.id == file_id)?,
         };
-        // `FileName` is a single-variant object; the variant names the
-        // provenance and the payload is the path either way.
-        row.name
-            .as_object()?
-            .values()
-            .next()?
-            .as_str()
-            .or_else(|| row.name.as_str())
+        // A row that spells its name as a bare string is answered before
+        // the object form is tried: `as_object` on a string is `None`, so
+        // asking for the object first ends the lookup and no fallback
+        // behind that question can run.
+        if let Some(path) = row.name.as_str() {
+            return Some(path);
+        }
+        // `FileName` is otherwise a single-variant object; the variant names
+        // the provenance and the payload is the path either way.
+        row.name.as_object()?.values().next()?.as_str()
     }
 
     /// Look up a `TraitDecl` by its Charon `def_id`.
@@ -474,6 +476,14 @@ mod tests {
         // path whatever the variant is called.
         let l = llbc(r#"[{"id":0,"name":{"Virtual":"v.rs"}}]"#);
         assert_eq!(l.file_path(0), Some("v.rs"));
+    }
+
+    #[test]
+    fn a_name_written_as_a_bare_string_is_read_as_the_path() {
+        // Not the object form, so the object lookup answers `None`; the
+        // string has to be tried first or this row reads as unnamed.
+        let l = llbc(r#"[{"id":0,"name":"bare.rs"}]"#);
+        assert_eq!(l.file_path(0), Some("bare.rs"));
     }
 
     #[test]

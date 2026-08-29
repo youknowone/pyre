@@ -549,6 +549,13 @@ pub trait GcAllocator: Send {
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef;
 
     /// Allocate a variable-size object (array/string).
+    /// Allocate a variable-size object **as type id 0**.
+    ///
+    /// Type id 0 is not a sentinel: [`crate::trace::TypeRegistry::get`] indexes
+    /// the table, so 0 names whichever type registered first and the object is
+    /// traced with that type's layout. Prefer
+    /// [`Self::alloc_varsize_typed`] wherever a descr is in reach -- which, at
+    /// the JIT allocation sites, it always is.
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef;
 
     /// Allocate a variable-size object with a known GC type id.
@@ -559,6 +566,10 @@ pub trait GcAllocator: Send {
         item_size: usize,
         length: usize,
     ) -> GcRef {
+        // Dropping the id records the object as type 0 -- see
+        // [`Self::alloc_varsize`]. That is only tolerable for an allocator
+        // with no type table to record it in; a collector that has one must
+        // override this.
         let _ = type_id;
         self.alloc_varsize(base_size, item_size, length)
     }
@@ -690,6 +701,25 @@ pub trait GcAllocator: Send {
     /// preserves the safe entry point for backends without that distinction.
     fn write_barrier_managed(&mut self, obj: GcRef) {
         self.write_barrier(obj);
+    }
+
+    /// incminimark.py `writebarrier_before_move`: generalize `obj`'s cards
+    /// before its items are permuted in place.  A move stores no new
+    /// reference, so [`Self::write_barrier`] does not answer for it; what
+    /// changes is which card page holds each pointer, and a minor reaches a
+    /// carded array only through its dirty pages.  The default is the no-op a
+    /// collector without card marking wants.
+    fn writebarrier_before_move(&mut self, _obj: GcRef) {}
+
+    /// `llop.shrink_array(Bool, p, smallerlength)`, incminimark.py:1160-1182.
+    ///
+    /// Record in place that a varsize object is shorter than it was.  The
+    /// default declines, which is a complete answer: `rgc.ll_shrink_array`
+    /// allocates a smaller object and copies whenever the GC says no
+    /// (`rgc.py:475-478`), so a collector that cannot resize anything is
+    /// served by that path alone.
+    fn shrink_array(&self, _addr: usize, _smaller_length: usize) -> bool {
+        false
     }
 
     /// incminimark.py jit_remember_young_pointer_from_array:
@@ -2856,9 +2886,12 @@ pub fn active_minor_collections_since_major() -> usize {
 /// `std::alloc`-allocated ones.
 pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
 pub type GcIsNurseryObjectFn = fn(addr: usize) -> bool;
+/// `llop.shrink_array` — see [`GcAllocator::shrink_array`].
+pub type GcShrinkArrayFn = fn(addr: usize, smaller_length: usize) -> bool;
 
 global_hook!(static ACTIVE_GC_OWNS_OBJECT: GcOwnsObjectFn);
 global_hook!(static ACTIVE_GC_IS_NURSERY_OBJECT: GcIsNurseryObjectFn);
+global_hook!(static ACTIVE_GC_SHRINK_ARRAY: GcShrinkArrayFn);
 
 /// Install the active backend's `is_managed_heap_object` trampoline.
 pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
@@ -2868,6 +2901,11 @@ pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
 /// Install the active backend's nursery-membership predicate.
 pub fn set_active_gc_is_nursery_object(hook: Option<GcIsNurseryObjectFn>) {
     ACTIVE_GC_IS_NURSERY_OBJECT.set(hook);
+}
+
+/// Install the active backend's in-place array shrink.
+pub fn set_active_gc_shrink_array(hook: Option<GcShrinkArrayFn>) {
+    ACTIVE_GC_SHRINK_ARRAY.set(hook);
 }
 
 /// minimark.py `id_or_identityhash` hook.
@@ -2895,6 +2933,20 @@ pub fn gc_id_or_identityhash(addr: usize) -> usize {
 pub fn gc_owns_object(addr: usize) -> bool {
     match ACTIVE_GC_OWNS_OBJECT.get() {
         Some(f) => f(addr),
+        None => false,
+    }
+}
+
+/// `llop.shrink_array(Bool, p, smallerlength)`: record that the varsize object
+/// at `addr` is shorter than it was, in place.
+///
+/// `false` when no backend has installed a hook, or when the object is one its
+/// GC declines to resize.  `rgc.ll_shrink_array` treats that answer as
+/// "allocate a smaller object and copy into it" (`rgc.py:475-478`), and so must
+/// every caller here.
+pub fn gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
+    match ACTIVE_GC_SHRINK_ARRAY.get() {
+        Some(f) => f(addr, smaller_length),
         None => false,
     }
 }
@@ -3388,6 +3440,7 @@ pub type WriteBarrierFn = fn(obj: GcRef);
 
 global_hook!(static ACTIVE_WRITE_BARRIER: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_MANAGED: WriteBarrierFn);
+global_hook!(static ACTIVE_WRITE_BARRIER_BEFORE_MOVE: WriteBarrierFn);
 
 /// Install the active backend's write-barrier callback. Pass `None` to clear.
 pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
@@ -3399,6 +3452,11 @@ pub fn set_active_write_barrier_managed(hook: Option<WriteBarrierFn>) {
     ACTIVE_WRITE_BARRIER_MANAGED.set(hook);
 }
 
+/// Install the active backend's before-move barrier. Pass `None` to clear.
+pub fn set_active_write_barrier_before_move(hook: Option<WriteBarrierFn>) {
+    ACTIVE_WRITE_BARRIER_BEFORE_MOVE.set(hook);
+}
+
 /// Perform a write barrier through the active backend.
 ///
 /// Calling convention: callers must invoke this before storing a GC reference
@@ -3407,6 +3465,20 @@ pub fn set_active_write_barrier_managed(hook: Option<WriteBarrierFn>) {
 /// [`WriteBarrierFn`]; this is a no-op when no barrier is installed.
 pub fn gc_write_barrier(obj: GcRef) {
     if let Some(f) = ACTIVE_WRITE_BARRIER.get() {
+        f(obj)
+    }
+}
+
+/// Generalize `obj`'s cards before its items are permuted in place.
+///
+/// The ordinary barrier answers "a reference was stored into `obj`", which a
+/// move does not do: the set of referenced objects is unchanged and only which
+/// card page holds each pointer changes. A minor scans a carded array's dirty
+/// pages alone, so a young pointer shifted into a clean page is not reached.
+/// Calling convention: invoke this before the move, matching
+/// [`MiniMarkGC::writebarrier_before_move`].
+pub fn gc_write_barrier_before_move(obj: GcRef) {
+    if let Some(f) = ACTIVE_WRITE_BARRIER_BEFORE_MOVE.get() {
         f(obj)
     }
 }

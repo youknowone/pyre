@@ -351,9 +351,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_minor_collections_since_major(Some(dynasm_minor_collections_since_major));
     majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
     majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
+    majit_gc::set_active_gc_shrink_array(Some(dynasm_gc_shrink_array));
     majit_gc::set_active_gc_is_nursery_object(Some(dynasm_gc_is_nursery_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(dynasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(dynasm_gc_write_barrier));
+    majit_gc::set_active_write_barrier_before_move(Some(dynasm_gc_write_barrier_before_move));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
     majit_gc::set_active_finalizer_hooks(
         Some(dynasm_register_finalizer),
@@ -879,6 +881,14 @@ fn dynasm_gc_remove_root(slot: *mut GcRef) {
 
 /// Host-side write-barrier trampoline for GC-managed objects updated
 /// outside compiled code.
+fn dynasm_gc_write_barrier_before_move(obj: GcRef) {
+    if gc_box::with_mut(|g| g.writebarrier_before_move(obj)).is_some() {
+        return;
+    }
+    // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
+    majit_gc::gc_sync::gc_op(|g| g.writebarrier_before_move(obj.0));
+}
+
 fn dynasm_gc_write_barrier(obj: GcRef) {
     if gc_box::with_mut(|g| g.write_barrier(obj)).is_some() {
         return;
@@ -919,6 +929,17 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
+}
+
+/// `llop.shrink_array`. Read-only on the collector — it writes the object's
+/// length field, not the GC's own state — so both arms take a shared borrow,
+/// as `dynasm_gc_owns_object` does.
+fn dynasm_gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.shrink_array(addr, smaller_length)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.shrink_array(addr, smaller_length))
 }
 
 fn dynasm_gc_is_nursery_object(addr: usize) -> bool {
@@ -1051,11 +1072,17 @@ pub extern "C" fn dynasm_nursery_slowpath_varsize(
     base_size: u64,
     item_size: u64,
     length: u64,
+    type_id: u64,
 ) -> u64 {
     let gc_hdr = majit_gc::header::GcHeader::SIZE;
     let result = with_dynasm_active_gc_mut(|gc| {
-        gc.alloc_varsize(base_size as usize, item_size as usize, length as usize)
-            .0 as u64
+        gc.alloc_varsize_typed(
+            type_id as u32,
+            base_size as usize,
+            item_size as usize,
+            length as usize,
+        )
+        .0 as u64
     });
     result.unwrap_or_else(|| {
         let Some(total) = (item_size as usize)
@@ -4074,7 +4101,7 @@ mod tests {
 
     #[test]
     fn varsize_slowpaths_return_null_on_size_overflow() {
-        assert_eq!(dynasm_nursery_slowpath_varsize(0, 2, u64::MAX), 0);
+        assert_eq!(dynasm_nursery_slowpath_varsize(0, 2, u64::MAX, 0), 0);
         assert_eq!(
             dynasm_alloc_oldgen_varsize_typed_and_set_len(1, 0, 2, 0, usize::MAX),
             0

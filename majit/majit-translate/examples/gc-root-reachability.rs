@@ -15,8 +15,33 @@ use majit_translate::memory::gctransform::{framework, liveness};
 
 const PYTHON_DISPATCH_SEEDS_REF: &[&str] = framework::PYTHON_DISPATCH_SEEDS;
 
+/// Write one artefact's rows out, truncating the file on the first artefact
+/// of the run and appending for every one after it.
+///
+/// The scan takes a list of artefacts and each has its own rows, so a plain
+/// write leaves only the last artefact's -- and leaves it looking complete.
+/// `opened` is what tells the first artefact from the rest.
+fn write_rows(
+    path: &str,
+    rows: &str,
+    opened: &mut std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    if opened.insert(path.to_string()) {
+        opts.write(true).create(true).truncate(true);
+    } else {
+        opts.append(true).create(true);
+    }
+    opts.open(path)?.write_all(rows.as_bytes())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A run that says it wrote and did not must not exit 0: the file it
+    // named is what a consumer reads, and an absent one reads as no findings.
+    let mut write_failed = false;
+    let mut opened: std::collections::HashSet<String> = Default::default();
     if args.is_empty() {
         eprintln!("usage: gc-root-reachability <file.ullbc>...");
         std::process::exit(2);
@@ -327,6 +352,19 @@ fn main() {
         // The other direction, and the one that finds defects rather than
         // overhead: a call that can collect, a GC pointer live across it, and
         // no bracket anywhere in the function.
+        // How far past a named callee the movable ranking looks.  0 is the
+        // shipped behaviour and the one the gate's `tier 1.5` invariant was
+        // recorded against; raising it is a measurement, not a new default.
+        let movable_hops: u32 = std::env::var("GC_MOVABLE_HOPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let movable_callees =
+            liveness::movable_callee_ids(&cg, liveness::MOVABLE_GC_MARKERS, movable_hops);
+        println!(
+            "   movable-addressing callees at {movable_hops} hop(s): {}",
+            movable_callees.len()
+        );
         let gc_tys = liveness::gc_ptr_type_ids(&llbc);
         if gc_tys.is_empty() {
             println!("   (no PyObjectRef type id found — liveness scan skipped)");
@@ -339,7 +377,7 @@ fn main() {
             &reach,
             &push_root_ids,
             &gc_tys,
-            liveness::MOVABLE_GC_MARKERS,
+            &movable_callees,
         );
         println!(
             "   liveness scan: {} bodies; {} with a terminator this reader could not parse; \
@@ -350,6 +388,155 @@ fn main() {
             "       and {} body/bodies with a statement this reader could not parse",
             stats.unparsed_statement_bodies
         );
+        // The withheld figure above says a bracket dominates the call.  It does
+        // not say the root the call needed is in that bracket, and nothing has
+        // ever asked: `postprocess_double_check` asserts exactly this upstream,
+        // after `shadowcolor.py` has run, whereas every bracket in this
+        // artefact is hand-written and ungraded.  A bracket read as coverage
+        // while pinning the wrong set is worse than no bracket, because it also
+        // removes the call from the finding count above.
+        println!(
+            "       of those withheld: {} pin every live pointer, {} are SHORT a root, \
+             {} could not be read",
+            stats.withheld_bracket_covers,
+            stats.withheld_bracket_short,
+            stats.withheld_contents_opaque
+        );
+        println!(
+            "           of the SHORT, {} miss a root the body produced itself \
+             (no caller's bracket can be covering those)",
+            stats.withheld_bracket_short_body_local
+        );
+        println!(
+            "           of the SHORT, {} miss a root this body later addresses \
+             as a list/dict (a caller's pin cannot rescue those)",
+            stats.withheld_bracket_short_movable
+        );
+        for sb in stats.short_brackets.iter().take(20) {
+            println!(
+                "           SHORT {}:{} {} -> {}  missing [{}]  body-local [{}]  movable [{}]  pinned [{}]",
+                sb.file,
+                sb.line,
+                sb.func_name,
+                sb.callee_name,
+                sb.missing.join(", "),
+                sb.missing_local.join(", "),
+                sb.missing_movable.join(", "),
+                sb.pinned.join(", ")
+            );
+        }
+        if stats.short_brackets.len() > 20 {
+            println!(
+                "           ... and {} more (set GC_SHORT_BRACKETS_JSON to read them all)",
+                stats.short_brackets.len() - 20
+            );
+        }
+        // Item 11 of the GC advisory: a site that pins and then goes on using
+        // the local it passed in, rather than the word the pin handed back.
+        // `let _ = pin_root(x)` is the sanctioned spelling for a liveness-only
+        // pin, and writing it asserts that x's kind never moves; the `movable`
+        // column is that assertion checked.
+        let by_pin: std::collections::BTreeMap<&str, usize> =
+            stats
+                .stale_pin_reads
+                .iter()
+                .fold(Default::default(), |mut m, r| {
+                    *m.entry(r.pin_name.rsplit("::").next().unwrap_or("?"))
+                        .or_default() += 1;
+                    m
+                });
+        println!(
+            "   pins whose argument the body still reads afterwards: {} ({} reading a local \
+             later addressed as a list/dict)",
+            stats.pin_arg_read_after, stats.pin_arg_read_after_movable
+        );
+        println!(
+            "       by pin: {}",
+            by_pin
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for r in stats
+            .stale_pin_reads
+            .iter()
+            .filter(|r| !r.movable.is_empty())
+            .take(20)
+        {
+            println!(
+                "           STALE-PIN {}:{} {} [{}]  movable [{}]  via {}",
+                r.file,
+                r.line,
+                r.func_name,
+                r.locals.join(", "),
+                r.movable.join(", "),
+                r.pin_name.rsplit("::").next().unwrap_or("?")
+            );
+        }
+        // Two filters sit between the count above and the rows just printed:
+        // only a non-empty `movable` column prints, and only the first 20 of
+        // those. A run whose stale pins are all non-movable prints the count
+        // and no rows at all, so say where the rest are — the short-bracket
+        // block above owes and prints the same hint.
+        let stale_pins_shown = stats
+            .stale_pin_reads
+            .iter()
+            .filter(|r| !r.movable.is_empty())
+            .count()
+            .min(20);
+        if stats.stale_pin_reads.len() > stale_pins_shown {
+            println!(
+                "           ... and {} more (set GC_STALE_PIN_JSON to read them all)",
+                stats.stale_pin_reads.len() - stale_pins_shown
+            );
+        }
+        if let Ok(path) = std::env::var("GC_STALE_PIN_JSON") {
+            let mut out = String::new();
+            for r in &stats.stale_pin_reads {
+                let row = serde_json::json!({
+                    "file": r.file, "line": r.line, "func": r.func_name,
+                    "pin": r.pin_name, "locals": r.locals, "movable": r.movable,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match write_rows(&path, &out, &mut opened) {
+                Ok(()) => println!(
+                    "       wrote {} stale-pin read(s) to {path}",
+                    stats.stale_pin_reads.len()
+                ),
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("GC_SHORT_BRACKETS_JSON") {
+            let mut out = String::new();
+            for sb in &stats.short_brackets {
+                let row = serde_json::json!({
+                    "file": sb.file, "line": sb.line, "func": sb.func_name,
+                    "callee": sb.callee_name,
+                    "missing": sb.missing,
+                    "missing_local": sb.missing_local,
+                    "missing_movable": sb.missing_movable,
+                    "pinned": sb.pinned,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match write_rows(&path, &out, &mut opened) {
+                Ok(()) => println!(
+                    "       wrote {} short bracket(s) to {path}",
+                    stats.short_brackets.len()
+                ),
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
+            }
+        }
         // The resolved graph is an *under*-approximation of what collects: a
         // call whose dispatch edge is unresolved is excluded, so a clean
         // resolved census is not a clean census.  Re-run with the opaque set
@@ -362,7 +549,7 @@ fn main() {
             &conservative,
             &push_root_ids,
             &gc_tys,
-            liveness::MOVABLE_GC_MARKERS,
+            &movable_callees,
         );
         let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
             .iter()
@@ -428,12 +615,15 @@ fn main() {
                 out.push_str(&row.to_string());
                 out.push('\n');
             }
-            match std::fs::write(&path, out) {
+            match write_rows(&path, &out, &mut opened) {
                 Ok(()) => println!("       wrote {} finding(s) to {path}", found.len()),
                 // A report that says it wrote and did not is worse than one
                 // that fails, so this is loud even though the scan itself
-                // succeeded.
-                Err(e) => println!("       FAILED to write {path}: {e}"),
+                // succeeded, and the run's exit status carries it too.
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
             }
         }
         // Tier 1: the callee is *itself* a dispatch seed, so "this call runs
@@ -529,10 +719,19 @@ fn main() {
             continue;
         }
         let no_bracket: std::collections::HashSet<u64> = Default::default();
+        // The frame has no list/dict-addressing call to rank by: a stale frame
+        // is read back through `FrameAnchor`, not dereferenced as a container.
+        let no_movable: std::collections::HashSet<u64> = Default::default();
         let (frames, frame_stats) =
-            liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &[]);
-        let (frames_conservative, _) =
-            liveness::scan(&llbc, &cg, &conservative, &no_bracket, &frame_tys, &[]);
+            liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &no_movable);
+        let (frames_conservative, _) = liveness::scan(
+            &llbc,
+            &cg,
+            &conservative,
+            &no_bracket,
+            &frame_tys,
+            &no_movable,
+        );
         let frame_fns: std::collections::BTreeSet<&str> =
             frames.iter().map(|f| f.func_name.as_str()).collect();
         println!(
@@ -598,5 +797,8 @@ fn main() {
                 );
             }
         }
+    }
+    if write_failed {
+        std::process::exit(1);
     }
 }

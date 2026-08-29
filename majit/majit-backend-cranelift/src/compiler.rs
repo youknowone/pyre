@@ -515,9 +515,13 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         Some(gc_remove_root_via_active_runtime),
     );
     majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
+    majit_gc::set_active_gc_shrink_array(Some(gc_shrink_array_via_active_runtime));
     majit_gc::set_active_gc_is_nursery_object(Some(gc_is_nursery_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
+    majit_gc::set_active_write_barrier_before_move(Some(
+        gc_write_barrier_before_move_via_active_runtime,
+    ));
     majit_gc::set_active_finalizer_hooks(
         Some(register_finalizer_via_active_runtime),
         Some(finalizer_next_dead_via_active_runtime),
@@ -2046,6 +2050,15 @@ fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
 
 /// Host-side write-barrier trampoline for GC-managed objects updated
 /// outside compiled code.
+fn gc_write_barrier_before_move_via_active_runtime(obj: GcRef) {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.writebarrier_before_move(obj));
+    } else if majit_gc::gc_sync::is_initialized() {
+        // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
+        majit_gc::gc_sync::gc_op(|g| g.writebarrier_before_move(obj.0));
+    }
+}
+
 fn gc_write_barrier_via_active_runtime(obj: GcRef) {
     if gc_box::present() {
         with_cranelift_gc(|gc| gc.write_barrier(obj));
@@ -2081,6 +2094,16 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
     }
     majit_gc::gc_sync::is_initialized()
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
+}
+
+/// `llop.shrink_array`. Read-only on the collector, as
+/// `gc_owns_object_via_active_runtime` is.
+fn gc_shrink_array_via_active_runtime(addr: usize, smaller_length: usize) -> bool {
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.shrink_array(addr, smaller_length)) {
+        return r;
+    }
+    majit_gc::gc_sync::is_initialized()
+        && majit_gc::gc_sync::gc_query_reentrant(|g| g.shrink_array(addr, smaller_length))
 }
 
 fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
@@ -4185,10 +4208,20 @@ extern "C" fn gc_alloc_typed_nursery_shim(type_id: u64, size: u64) -> u64 {
     })
 }
 
-extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64) -> u64 {
+extern "C" fn gc_alloc_varsize_shim(
+    base_size: u64,
+    item_size: u64,
+    length: u64,
+    type_id: u64,
+) -> u64 {
     with_cranelift_gc_required(|gc| {
-        gc.alloc_varsize(base_size as usize, item_size as usize, length as usize)
-            .0 as u64
+        gc.alloc_varsize_typed(
+            type_id as u32,
+            base_size as usize,
+            item_size as usize,
+            length as usize,
+        )
+        .0 as u64
     })
 }
 
@@ -13408,6 +13441,9 @@ impl CraneliftBackend {
                         .expect("CallMallocNurseryVarsize descr must be an ArrayDescr");
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
+                    // The descr's tid, not 0: a varsize object typed 0 is
+                    // traced with the layout of whatever registered first.
+                    let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
                     // rewrite.py:858: args = [ConstInt(kind), ConstInt(itemsize), v_length]
                     let length = resolve_opref_or_imm(
                         &mut builder,
@@ -13427,7 +13463,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         per_call_gcmap,
                         gc_alloc_varsize_shim as *const () as usize,
-                        &[base_size, item_size, length],
+                        &[base_size, item_size, length, type_id],
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
@@ -15310,16 +15346,18 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     let __descr_arc = op.getdescr();
-                    let (base_size, item_size) =
+                    let (base_size, item_size, type_id) =
                         if let Some(ad) = __descr_arc.as_ref().and_then(|d| d.as_array_descr()) {
                             (
                                 builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
                                 builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
+                                builder.ins().iconst(cl_types::I64, ad.type_id() as i64),
                             )
                         } else {
                             (
                                 builder.ins().iconst(cl_types::I64, 16),
                                 builder.ins().iconst(cl_types::I64, 8),
+                                builder.ins().iconst(cl_types::I64, 0),
                             )
                         };
                     let result = emit_collecting_gc_call(
@@ -15334,7 +15372,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         per_call_gcmap,
                         gc_alloc_varsize_shim as *const () as usize,
-                        &[base_size, item_size, length],
+                        &[base_size, item_size, length, type_id],
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");

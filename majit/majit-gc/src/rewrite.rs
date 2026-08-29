@@ -1595,6 +1595,18 @@ impl GcRewriterImpl {
             &[kind_ref, itemsize_ref, v_length],
         );
         varsize_op.setdescr(arraydescr);
+        // rewrite.py:863-866, said out loud because the fixed-size sibling
+        // does the opposite and the difference is one absent call:
+        //
+        //     # don't record v_result into self.write_barrier_applied:
+        //     # it can be a large, young array with card marking, and then
+        //     # the GC relies on the write barrier being called
+        //
+        // No `remember_write_barrier` here. The length is not known at
+        // rewrite time, so this array may be the one case a fresh allocation
+        // is not exempt: `try_alloc_young_nonmoving_with_cards` gives a large
+        // young array GCFLAG_HAS_CARDS, and a card is set by the barrier or
+        // not at all.
         Some(st.emit_result(varsize_op, result_pos))
     }
 
@@ -5624,6 +5636,58 @@ mod tests {
                 "fresh alloc is wb_applied → no WB_ARRAY (num_elem={num_elem})"
             );
         }
+    }
+
+    /// rewrite.py:863-866: a variable-length nursery array is NOT recorded in
+    /// `write_barrier_applied`, unlike every other fresh allocation.
+    ///
+    /// The exemption the fixed-size path takes is sound because a small fresh
+    /// object cannot have cards. This one can: its length is unknown at
+    /// rewrite time, so the allocation may land on the large young arm and
+    /// come back carded, and then a card is set by the barrier or not at all.
+    /// The invariant lives as an *absent* `remember_write_barrier` call, which
+    /// is exactly the shape a later optimizer removes by accident.
+    #[test]
+    fn a_varsize_nursery_array_is_not_exempt_from_the_write_barrier() {
+        let rw = make_rewriter_with_cards();
+        // A non-constant length: no entry in `constants`, so `resolve_constant`
+        // answers None and `handle_new_array` takes the varsize nursery path.
+        let len_ref = OpRef::int_op(10_000);
+        let new_array = Op::with_descr(OpCode::NewArray, &[ro(len_ref)], array_descr_ref());
+        new_array.pos.set(OpRef::ref_op(0));
+        let ops = vec![
+            new_array,
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[
+                    ro(OpRef::ref_op(0)),
+                    ro(OpRef::int_op(1)),
+                    ro(OpRef::ref_op(2)),
+                ],
+                array_descr_ref(),
+            ),
+            Op::new(OpCode::Finish, &[]),
+        ];
+
+        let result = rw.rewrite_for_gc(&ops);
+
+        assert_eq!(
+            result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CallMallocNurseryVarsize)
+                .count(),
+            1,
+            "the fixture must reach the varsize nursery path, or it asserts nothing"
+        );
+        let wb_arr = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::CondCallGcWbArray)
+            .count();
+        assert_eq!(
+            wb_arr, 1,
+            "a varsize nursery array keeps its card barrier: it may be large, \
+             young and carded"
+        );
     }
 
     #[test]

@@ -59,6 +59,21 @@ pub fn register_pyre_class_offsets(pytype_ptr: usize, offsets: &'static [usize])
 /// process-global read lock — cheap and alloc-free, safe while the collector
 /// is marking; a poisoned lock reads as `None`.
 ///
+/// The hash map is not the `AddressDict`/`AddressMap` an upstream reader might
+/// expect to see here.  Those are the collector's own address-to-address
+/// tables, sized against the heap and rebuilt per collection; this is a
+/// type-pointer-to-static-slice registry with one entry per `#[pyre_class]`
+/// type, written only at init.  The two have neither the same population nor
+/// the same lifetime, so upstream's structure is not the comparison.
+///
+/// What does carry weight is the single-writer claim above, and it is a
+/// comment rather than an invariant the code enforces: every writer runs
+/// inside `pyre-jit`'s single-threaded driver init, so no marking thread can
+/// find the lock held.  A registration added later from a live interpreter —
+/// a dynamically created class, say — would break that, and the symptom would
+/// be a collector thread blocked on a mutator that is itself waiting for the
+/// collection.  Keep new `register_pyre_class_offsets` calls in init.
+///
 /// # Safety
 /// `ob_type` must be null or point to a valid, `'static` `PyType`.
 pub unsafe fn offsets_for_pytype(
@@ -686,10 +701,16 @@ pub type GcWriteBarrierHookFn = fn(obj: *mut u8);
 
 majit_gc::global_hook!(static GC_WRITE_BARRIER_HOOK: GcWriteBarrierHookFn);
 majit_gc::global_hook!(static GC_WRITE_BARRIER_MANAGED_HOOK: GcWriteBarrierHookFn);
+majit_gc::global_hook!(static GC_WRITE_BARRIER_BEFORE_MOVE_HOOK: GcWriteBarrierHookFn);
 
 /// Install the write-barrier callback.
 pub fn register_gc_write_barrier_hook(hook: GcWriteBarrierHookFn) {
     GC_WRITE_BARRIER_HOOK.set(Some(hook));
+}
+
+/// Install the callback run before an object's items are permuted in place.
+pub fn register_gc_write_barrier_before_move_hook(hook: GcWriteBarrierHookFn) {
+    GC_WRITE_BARRIER_BEFORE_MOVE_HOOK.set(Some(hook));
 }
 
 /// Install the callback for objects returned by a managed allocation hook.
@@ -714,6 +735,24 @@ pub fn clear_gc_write_barrier_managed_hook() {
 #[majit_macros::dont_look_inside]
 pub extern "C" fn try_gc_write_barrier(obj: *mut u8) -> bool {
     match GC_WRITE_BARRIER_HOOK.get() {
+        Some(f) => {
+            f(obj);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Generalize `obj`'s cards before its items are permuted in place.
+///
+/// A move stores no new reference, so [`try_gc_write_barrier`] does not answer
+/// for it: the referenced set is unchanged and only which card page holds each
+/// pointer moves. A minor reaches a carded array through its dirty pages
+/// alone, so a young pointer shifted into a clean page is not scanned.
+// `dont_look_inside`: host hook dispatch, as for `try_gc_write_barrier`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn try_gc_write_barrier_before_move(obj: *mut u8) -> bool {
+    match GC_WRITE_BARRIER_BEFORE_MOVE_HOOK.get() {
         Some(f) => {
             f(obj);
             true

@@ -140,11 +140,21 @@ fn shrink_array_width(buf: i64) -> (usize, usize) {
 
 /// Width-parametric `rgc.ll_shrink_array(buf, new_len)` core.
 ///
-/// Because the `len` word doubles as the freeing capacity, the shrink cannot
-/// truncate in place: it allocates a fresh `new_len` buffer, copies `new_len`
-/// items, frees the old buffer, and returns the new one (whose `len` word is now
+/// `rgc.py:475-476` asks the GC first — `if llop.shrink_array(Bool, p,
+/// smallerlength): return p` — and only allocates when the answer is no. The
+/// GC says yes for a nursery object, where the shrink is the length word alone
+/// and the buffer keeps its address.
+///
+/// The fallback allocates a fresh `new_len` buffer, copies `new_len` items,
+/// frees the old buffer, and returns the new one (whose `len` word is now
 /// exactly `new_len`, so a caller returning it directly reports the right
-/// length). `base_size`/`item_size` select STR (`LOWLEVEL_STR_BASE_SIZE`, 1) vs
+/// length). It is what the raw-fallback buffer takes, and there the shrink
+/// *cannot* truncate in place: the `len` word doubles as the capacity
+/// [`bh_free_lowlevel_string`] reconstructs the `Layout` from. A GC-owned
+/// buffer has no such reader — that function returns early for one, and the
+/// collector sizes it from the same length word the shrink just wrote.
+///
+/// `base_size`/`item_size` select STR (`LOWLEVEL_STR_BASE_SIZE`, 1) vs
 /// UNICODE (`LOWLEVEL_UNICODE_BASE_SIZE`, 4); the `chars` array offset is the
 /// same two words in both widths.
 fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: usize) -> i64 {
@@ -152,6 +162,9 @@ fn shrink_lowlevel_array(buf: i64, new_len: i64, base_size: usize, item_size: us
         return 0;
     }
     let new_len = if new_len < 0 { 0 } else { new_len as usize };
+    if majit_gc::gc_shrink_array(buf as usize, new_len) {
+        return buf;
+    }
     let new_buf = bh_alloc_lowlevel_string(new_len, base_size, item_size);
     if new_buf == 0 {
         return 0;
