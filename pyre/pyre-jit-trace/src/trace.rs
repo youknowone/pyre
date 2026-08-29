@@ -3436,10 +3436,19 @@ fn try_adopt_multi_frame_blackhole(
         return false;
     };
     let mut root_stack = if latched.publish_root_stack {
-        // Same split as the single-frame arm.  The multi-frame `WalkAbort`
-        // latch carries no mirror (its `ctx` is the innermost callee, not
-        // frame 0), so this declines and the abort keeps the legacy replay.
-        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort {
+        // Same split as the single-frame arm: `WalkAbort` and `VableEscape`
+        // stop INSIDE an opcode, and for a root walk the snapshot array was
+        // never written there — it still holds the pre-walk stack (see
+        // `capture_frame_stack_from_mirror`).  Both multi-frame latches
+        // reconstruct frame 0 from the paused caller image
+        // (`capture_root_parent_resume_stack`) because their `ctx` is the
+        // innermost callee; a latch that could not build one leaves no mirror
+        // here, which declines the adopt and keeps the legacy replay.
+        // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
+        // array is the image RPython would copy.
+        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
+            || commit_leg == WalkEndCommitLeg::VableEscape
+        {
             latched.mirror_stack.as_ref().and_then(|mirror| {
                 crate::state::capture_frame_stack_from_mirror(
                     root_addr,
