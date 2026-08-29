@@ -897,7 +897,7 @@ fn real_main(binary_name: &str) {
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let compile_path = script_compile_path(&path);
-            let session = run_script_path(&path, &compile_path, no_site, binary_name, true);
+            let session = run_script_path(&compile_path, no_site, binary_name, true);
             if session.is_some() {
                 repl::run_repl(true, no_site, session);
             }
@@ -2590,7 +2590,6 @@ fn read_script_source(
 }
 
 fn run_script_path(
-    path: &str,
     filename: &str,
     no_site: bool,
     binary_name: &str,
@@ -2623,8 +2622,13 @@ fn run_script_path(
             // the package's own loader when it runs `__main__` below.
             seed_main_loader(canonical, None, ec_ptr);
             import_site(no_site, canonical, ec_ptr);
+            let outcome = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false);
+            // Asked after the entry point has run, the way the source-file and
+            // `-m` paths ask it: `pymain_run_python` reads `PYTHONINSPECT` at
+            // the end "to give programs the opportunity to set it from Python",
+            // and a directory or zipapp `__main__` is such a program.
             let inspect = prompt_requested(run_code);
-            if let Err(e) = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false) {
+            if let Err(e) = outcome {
                 report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
             }
             finish_or_inspect(inspect, execution_context, canonical, main_module)
@@ -2633,7 +2637,13 @@ fn run_script_path(
             let main_file = absolute_script_path(filename);
             let filename = main_file.as_deref().unwrap_or(filename);
             eval_source_in_main(
-                || read_script_source(path, binary_name, canonical, ec_ptr),
+                // The resolved path rather than the argv spelling: the read is
+                // deferred until `site` has been imported, so a `sitecustomize`
+                // that changes the working directory would otherwise resolve a
+                // relative argv against the new one -- opening a different
+                // same-named file than the one `__file__` names, or none.  The
+                // file a run opens and the file it reports are the same file.
+                || read_script_source(filename, binary_name, canonical, ec_ptr),
                 Mode::Exec,
                 filename,
                 main_file.as_deref(),
