@@ -2095,39 +2095,40 @@ fn array_set_slice(
     value: PyObjectRef,
 ) -> PyResult {
     let idxs = slice_index_list(slice, meta.length)?;
-    let tc = cdata::type_code_of(meta.proto);
-    let items = if unsafe { pyre_object::is_bytes(value) }
-        && matches!(tc.as_deref(), Some("c" | "b" | "B"))
-    {
-        unsafe { pyre_object::bytesobject::w_bytes_data(value) }
-            .iter()
-            .map(|&byte| {
-                if tc.as_deref() == Some("c") {
-                    pyre_object::bytesobject::w_bytes_from_bytes(&[byte])
-                } else {
-                    pyre_object::w_int_new(byte as i64)
-                }
-            })
-            .collect()
-    } else if unsafe { pyre_object::is_str(value) } && tc.as_deref() == Some("u") {
-        unsafe { pyre_object::w_str_get_wtf8(value) }
-            .code_points()
-            .map(|point| {
-                let mut text = rustpython_wtf8::Wtf8Buf::new();
-                text.push(point);
-                pyre_object::w_str_from_wtf8(text)
-            })
-            .collect()
-    } else {
-        seq_items(value).ok_or_else(|| crate::PyError::type_error("can only assign a sequence"))?
-    };
-    if items.len() != idxs.len() {
+    // `Array_ass_subscript` reads the right-hand side through
+    // `PySequence_Length` and then `PySequence_GetItem` per index, so any
+    // sequence will do — an `array.array`, a `range`, a `memoryview`, a class
+    // with `__len__` and `__getitem__` — and each element then reaches the
+    // same conversion an indexed assignment uses.  A character array needs no
+    // case of its own: `b"abc"` indexes to ints, which the `c` converter takes
+    // as `chr` values, and a `str` indexes to one-character strings.
+    //
+    // A length that cannot be read is not reported.  Upstream leaves it at -1,
+    // which the size check refuses in place of whatever the failed read raised;
+    // pyre reads the length and the item through `__len__` / `__getitem__`
+    // where upstream uses the sequence-only pair, so a mapping of the matching
+    // size reaches the item read rather than that refusal.
+    let other_len = crate::baseobjspace::len_w(value).unwrap_or(-1);
+    if other_len != idxs.len() as i64 {
         return Err(crate::PyError::value_error(
             "Can only assign sequence of same size",
         ));
     }
-    for (i, v) in idxs.into_iter().zip(items) {
-        array_set_index(obj, meta, i, v)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_roots(&[obj, value]);
+    for (i, index) in idxs.into_iter().enumerate() {
+        let item = crate::baseobjspace::getitem(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::w_int_new(i as i64),
+        )?;
+        let item = pyre_object::gc_roots::pin_root(item);
+        array_set_index(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            meta,
+            index,
+            item,
+        )?;
     }
     Ok(pyre_object::w_none())
 }
