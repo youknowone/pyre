@@ -741,13 +741,18 @@ fn real_main(binary_name: &str) {
     // [executable] + argv` records the list `entry_point` handed on.
     let (argv, heapsize) = take_heapsize_option(binary_name, std::env::args_os().collect());
     importing::set_sys_orig_argv(argv.clone());
-    let (mode, flags, args) = match parse_args(binary_name, argv) {
+    let (mode, mut flags, args) = match parse_args(binary_name, argv) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{binary_name}: {e}");
             std::process::exit(2);
         }
     };
+    // A `._pth` beside the executable names every `sys.path` entry itself, so
+    // it also isolates the interpreter from the environment and skips `site`.
+    // Applied after the option parse, which is where the variables it
+    // overrides have already been folded in.
+    importing::apply_pth_config(&mut flags);
     let LaunchFlags {
         inspect,
         quiet,

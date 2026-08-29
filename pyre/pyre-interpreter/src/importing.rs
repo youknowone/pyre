@@ -2149,6 +2149,9 @@ pub(crate) struct StartupPathConfig {
     /// This is exposed as `sys._stdlib_dir` and is deliberately distinct from
     /// the complete search list above.
     pub stdlib: Option<PathBuf>,
+    /// The `._pth` beside the executable, when the deployment placed one.
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    pub pth: Option<PthConfig>,
 }
 
 #[cfg(feature = "host_env")]
@@ -2576,6 +2579,157 @@ fn prefix_from_stdlib(stdlib: &Path) -> PathBuf {
     not(feature = "sandbox"),
     not(target_arch = "wasm32")
 ))]
+#[derive(Clone, Debug)]
+pub(crate) struct PthConfig {
+    /// The directory holding the file.  Every relative line resolves against
+    /// it and it is the prefix the interpreter goes on to report.
+    pub dir: PathBuf,
+    /// One entry per usable line, in the file's order; duplicates are kept
+    /// because the file is the search path verbatim.
+    pub entries: Vec<PathBuf>,
+    /// Whether a line asked for `site` back.
+    pub import_site: bool,
+}
+
+/// The name a `._pth` beside `executable` would have.
+///
+/// Windows drops an `exe` or `dll` extension first, so the file beside
+/// `python.exe` is `python._pth`; every other platform appends to the whole
+/// name, leaving `python3.14._pth`.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn pth_path_beside(executable: &Path) -> Option<PathBuf> {
+    let parent = executable.parent()?;
+    let mut name = executable.file_name()?.to_os_string();
+    #[cfg(windows)]
+    if executable
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe") || ext.eq_ignore_ascii_case("dll"))
+        && let Some(stem) = executable.file_stem()
+    {
+        name = stem.to_os_string();
+    }
+    name.push("._pth");
+    Some(parent.join(name))
+}
+
+/// The `._pth` beside the executable, parsed.
+///
+/// A `._pth` replaces the whole path computation: the file lists every
+/// `sys.path` entry, the directory holding it is the prefix, the environment
+/// is not consulted, no `sys.path[0]` is prepended, and `site` is skipped
+/// unless a line reads `import site`.  A line is taken up to its first `#` and
+/// then stripped; what is left empty is dropped.  `PYTHONHOME` does not
+/// suppress the search — only an embedder calling `Py_SetPythonHome` does, and
+/// there is no such caller here.
+///
+/// PyPy's `initpath` computes the search path from the executable alone and
+/// has no `._pth` at all, so there is no shape to follow there.  3.14 has one
+/// and `test_site._pthFileTests` asserts it, so it is 3.14's, measured against
+/// 3.14.2 on this host over the eleven cases the parser distinguishes.
+///
+/// The search visits the interpreter library, the invoked executable and the
+/// process image in that order.  This interpreter is one static executable —
+/// which is what `sys.dllhandle` being 0 says, `GetModuleFileName(NULL)`
+/// naming the executable itself — so the library and the first executable are
+/// the same file, leaving two candidates.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn read_pth_config(executable: &Path) -> Option<PthConfig> {
+    let image = std::env::current_exe().ok();
+    for candidate in [Some(executable.to_path_buf()), image]
+        .into_iter()
+        .flatten()
+    {
+        let Some(path) = pth_path_beside(&candidate) else {
+            continue;
+        };
+        let Ok(mut contents) = host_fs::read(&path) else {
+            continue;
+        };
+        // The bounded bootstrap read `pyvenv.cfg` takes is 16 KiB.  A `._pth`
+        // is deliberately longer — `test_site` writes one of about 32 KB,
+        // which is the size gh-113628 was about — so the bound here is larger,
+        // and is still a bound.
+        contents.truncate(1024 * 1024);
+        let dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        let dir = std::path::absolute(&dir).unwrap_or(dir);
+        return Some(parse_pth(dir, &String::from_utf8_lossy(&contents)));
+    }
+    None
+}
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+fn parse_pth(dir: PathBuf, text: &str) -> PthConfig {
+    let mut config = PthConfig {
+        dir,
+        entries: Vec::new(),
+        import_site: false,
+    };
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "import site" {
+            config.import_site = true;
+        } else if line.starts_with("import ") {
+            eprintln!("unsupported 'import' line in ._pth file");
+        } else {
+            // The entry is `abspath(join(pth_dir, line))`: an absolute line
+            // replaces the directory, and either way the result is collapsed
+            // lexically, so `..` walks up a level the file never has to spell
+            // out.
+            let entry = normalize_lexically(&config.dir.join(line));
+            config.entries.push(entry);
+        }
+    }
+    config
+}
+
+/// Fold a `._pth` beside the executable into the launcher options.
+///
+/// Its presence is a configuration in itself, and `sys.flags` has to report
+/// that before the first `import sys`.  `-S` still wins over an `import site`
+/// line: the option was named and the file only declines to remove `site`.
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
+pub fn apply_pth_config(flags: &mut crate::launch_env::LaunchFlags) {
+    let Some(pth) = startup_path_config().pth.as_ref() else {
+        return;
+    };
+    flags.isolated = true;
+    flags.ignore_environment = true;
+    flags.safe_path = true;
+    flags.no_site = flags.no_site || !pth.import_site;
+}
+
+/// A build with no host filesystem has no file to find.
+#[cfg(not(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+)))]
+pub fn apply_pth_config(_flags: &mut crate::launch_env::LaunchFlags) {}
+
+#[cfg(all(
+    feature = "host_env",
+    not(feature = "sandbox"),
+    not(target_arch = "wasm32")
+))]
 fn read_pyvenv_config(executable: &Path) -> Option<(PathBuf, PyVenvConfig)> {
     let exe_dir = executable.parent()?;
     for candidate in [
@@ -2604,6 +2758,37 @@ fn compute_startup_path_config_from(
     executable: PathBuf,
     explicit_stdlib: Option<PathBuf>,
 ) -> StartupPathConfig {
+    // A `._pth` answers the whole question, so neither `pyvenv.cfg` nor the
+    // landmark search below is consulted.  `stdlib_paths` is the file's list
+    // verbatim: `ensure_stdlib_path` appends exactly that and nothing else,
+    // and `apply_pth_config` has already suppressed the `PYTHONPATH` seed and
+    // the `sys.path[0]` entry.
+    if let Some(pth) = read_pth_config(&executable) {
+        return StartupPathConfig {
+            base_executable: executable.clone(),
+            executable,
+            prefix: pth.dir.clone(),
+            base_prefix: pth.dir.clone(),
+            stdlib_paths: pth.entries.clone(),
+            // `sys._stdlib_dir` names one directory rather than the search
+            // list, and it is the directory frozen modules read their sources
+            // out of, so it has to be one that exists.  3.14 spells it
+            // `<prefix>/Lib` without looking, which is a directory this layout
+            // does not have under either name; the prefix probe is the same
+            // question asked the way this tree answers it, and an entry
+            // holding `site.py` answers a file that points elsewhere.
+            stdlib: stdlib_at_prefix(&pth.dir)
+                .and_then(|(_, stdlib_dir)| stdlib_dir)
+                .or_else(|| {
+                    pth.entries
+                        .iter()
+                        .find(|entry| entry.join("site.py").is_file())
+                        .cloned()
+                }),
+            pth: Some(pth),
+        };
+    }
+
     let pyvenv = read_pyvenv_config(&executable);
 
     let base_executable = pyvenv
@@ -2675,6 +2860,7 @@ fn compute_startup_path_config_from(
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         stdlib_paths,
         stdlib,
+        pth: None,
     }
 }
 
@@ -3571,6 +3757,19 @@ fn ensure_stdlib_path() {
         return;
     }
     let config = startup_path_config();
+    // A `._pth` is `sys.path` verbatim, down to a repeated line being a
+    // repeated entry, so its list is staged as written rather than through
+    // `add_sys_path`, which folds a duplicate away.  An empty file is likewise
+    // the search path the deployment asked for, so the "keep the binary inside
+    // its tree" warning below does not apply to it either.
+    #[cfg(not(feature = "sandbox"))]
+    if config.pth.is_some() {
+        SYS_PATH
+            .lock()
+            .unwrap()
+            .extend(config.stdlib_paths.iter().cloned());
+        return;
+    }
     if config.stdlib_paths.is_empty() {
         let warning = format!(
             "debug: WARNING: Library path not found, using the existing sys.path;\n\
@@ -6328,6 +6527,40 @@ mod tests {
         assert!(src.contains("def compile"));
         assert!(vfs.read_to_string(&mount.join("re/_nope.py")).is_err());
         assert!(!vfs.is_file(&mount.join("re/_nope.py")));
+    }
+
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    #[test]
+    fn a_pth_line_is_taken_up_to_its_first_hash_and_then_stripped() {
+        let dir = PathBuf::from(if cfg!(windows) {
+            r"C:\deploy"
+        } else {
+            "/deploy"
+        });
+        // Written with CRLF, which is what `test_site` writes on Windows and
+        // what the file must not carry into an entry.
+        let config = parse_pth(
+            dir.clone(),
+            "#skipme\r\n# also skipped\r\nkeep#trailing\r\n  padded  \r\n\r\n\
+             same\r\nsame\r\n.\r\n..\r\nimport site\r\nimport os\r\n",
+        );
+        assert!(config.import_site);
+        // A repeated line is a repeated entry: the file is `sys.path` verbatim.
+        assert_eq!(
+            config.entries,
+            vec![
+                dir.join("keep"),
+                dir.join("padded"),
+                dir.join("same"),
+                dir.join("same"),
+                dir.clone(),
+                dir.parent().unwrap().to_path_buf(),
+            ]
+        );
     }
 
     #[test]
