@@ -996,3 +996,52 @@ with assert_raises(EOFError) as error:
     over_read.fromfile(OverReader(), 1)
 assert str(error.exception) == "read() didn't return enough bytes"
 assert over_read == array("i", [6, 7])
+
+# PyPy descr_frombytes acquires BUF_SIMPLE, so memoryview and array exporters
+# participate alongside bytes/bytearray.  The 3.14 boundary additionally
+# requires the exporter's own itemsize to be one.
+buffer_array = array("B")
+buffer_array.frombytes(memoryview(b"\x01\x02"))
+buffer_array.frombytes(array("B", [3, 4]))
+assert buffer_array == array("B", [1, 2, 3, 4])
+
+with assert_raises(BufferError) as error:
+    array("B").frombytes(memoryview(b"\x01\x02\x03\x04")[::2])
+assert str(error.exception) == "memoryview: underlying buffer is not C-contiguous"
+
+for typed_source in (array("i", [1]), memoryview(array("i", [1]))):
+    with assert_raises(TypeError) as error:
+        array("B").frombytes(typed_source)
+    assert str(error.exception) == "a bytes-like object is required"
+
+# `_frombytes` validates byte alignment and the zero-length fast path before
+# attempting a resize, even while the receiver is exporting a view.
+exported_frombytes = array("i", [1])
+exported_frombytes_view = memoryview(exported_frombytes)
+exported_frombytes.frombytes(b"")
+with assert_raises(ValueError) as error:
+    exported_frombytes.frombytes(b"x")
+assert str(error.exception) == "bytes length not a multiple of item size"
+assert exported_frombytes == array("i", [1])
+exported_frombytes_view.release()
+
+self_frombytes = array("B", [1, 2])
+with assert_raises(BufferError) as error:
+    self_frombytes.frombytes(self_frombytes)
+assert str(error.exception) == "cannot resize an array that is exporting buffers"
+assert self_frombytes == array("B", [1, 2])
+
+# PEP 688 exporters use the same acquired view and paired release callback.
+release_target = array("B")
+
+
+class ReleasingByteExporter:
+    def __buffer__(self, flags):
+        return memoryview(b"\x05")
+
+    def __release_buffer__(self, view):
+        release_target.append(6)
+
+
+release_target.frombytes(ReleasingByteExporter())
+assert release_target == array("B", [5, 6])

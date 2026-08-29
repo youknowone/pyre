@@ -9286,6 +9286,7 @@ pub fn charbuf_w(obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
 pub(crate) struct SimpleBufferBytes {
     _roots: pyre_object::gc_roots::RootScope,
     data: Vec<u8>,
+    itemsize: i64,
     native_owner_slot: Option<usize>,
     native_export_active: bool,
     release_view_slot: Option<usize>,
@@ -9294,6 +9295,13 @@ pub(crate) struct SimpleBufferBytes {
 impl SimpleBufferBytes {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// `Py_buffer.itemsize` / `BufferView.getitemsize` captured with the
+    /// export.  Consumers such as `array.frombytes` distinguish a byte buffer
+    /// from a typed exporter even though both expose the same raw byte run.
+    pub(crate) fn itemsize(&self) -> i64 {
+        self.itemsize
     }
 
     /// `PyBuffer_Release`: release errors are unraisable and must not replace
@@ -9386,6 +9394,7 @@ fn buffer_bytes(
             return Ok(Some(SimpleBufferBytes {
                 _roots: roots,
                 data: crate::builtins::memoryview_gather_bytes(r_obj),
+                itemsize: pyre_object::memoryview::w_memoryview_view(r_obj).itemsize(),
                 native_owner_slot: None,
                 native_export_active: false,
                 release_view_slot: None,
@@ -9395,9 +9404,21 @@ fn buffer_bytes(
     let native_export_active = unsafe { crate::builtins::buffer_export_incref(r_obj) };
     match crate::typedef::buffer_as_bytes_like(r_obj) {
         Ok(Some(w_bytes)) => {
+            let mut itemsize = if unsafe { pyre_object::interp_array::is_array(r_obj) } {
+                unsafe { pyre_object::interp_array::w_array_itemsize(r_obj) as i64 }
+            } else {
+                1
+            };
+            #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+            if let Some((_, _, _, _, c_itemsize, _)) =
+                crate::module::_ctypes::cdata::cdata_buffer_view(r_obj)
+            {
+                itemsize = c_itemsize as i64;
+            }
             return Ok(Some(SimpleBufferBytes {
                 _roots: roots,
                 data: unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec(),
+                itemsize,
                 native_owner_slot: native_export_active.then_some(obj_slot),
                 native_export_active,
                 release_view_slot: None,
@@ -9445,6 +9466,7 @@ fn buffer_bytes(
             let buffer = SimpleBufferBytes {
                 _roots: roots,
                 data: Vec::new(),
+                itemsize: 1,
                 native_owner_slot: None,
                 native_export_active: false,
                 release_view_slot: Some(view_slot),
@@ -9458,6 +9480,7 @@ fn buffer_bytes(
         Ok(Some(SimpleBufferBytes {
             _roots: roots,
             data: crate::builtins::memoryview_gather_bytes(r_view),
+            itemsize: pyre_object::memoryview::w_memoryview_view(r_view).itemsize(),
             native_owner_slot: None,
             native_export_active: false,
             release_view_slot: Some(view_slot),

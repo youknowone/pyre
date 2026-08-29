@@ -309,14 +309,23 @@ fn array_extend_iterable(
 
 /// Append raw bytes (`frombytes`); length must be a multiple of itemsize.
 fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
-    array_check_resize(obj)?;
     let isz = unsafe { arr::w_array_itemsize(obj) };
     if !bytes.len().is_multiple_of(isz) {
         return Err(PyError::value_error(
             "bytes length not a multiple of item size",
         ));
     }
+    // PyPy `_frombytes` returns before `setlen` when the copied buffer is
+    // empty; CPython's `frombytes` likewise skips `array_resize` for n == 0.
+    // An empty append therefore succeeds under an outstanding export, and a
+    // malformed length above wins over that export's resize error.
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    array_check_resize(obj)?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.try_reserve(bytes.len())
+        .map_err(|_| PyError::memory_error(""))?;
     vec.extend_from_slice(bytes);
     Ok(())
 }
@@ -1233,14 +1242,36 @@ fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.frombytes")?;
-    if !unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    // PyPy `descr_frombytes` enters `bufferstr_w` / `acquire_readbuf` and
+    // copies a BUF_SIMPLE view before `_frombytes`.  Use the same paired
+    // acquisition rather than narrowing the public method to bytes and
+    // bytearray.
+    let source = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(source)? else {
         return Err(PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
-            crate::type_methods::arg_type_name(args[1])
+            crate::type_methods::arg_type_name(source)
         )));
+    };
+    // [3.14-spec] `arraymodule.c::frombytes` rejects a typed Py_buffer even
+    // though PyPy's `bufferstr_w` accepts its raw bytes.  The itemsize check is
+    // observable for `memoryview(array('i'))` and `array('i')` exporters.
+    if buffer.itemsize() != 1 {
+        let error = PyError::type_error("a bytes-like object is required");
+        buffer.release();
+        return Err(error);
     }
-    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[1]) }.to_vec();
-    array_frombytes(args[0], &bytes)?;
+    let bytes = buffer.as_bytes().to_vec();
+    // [3.14-spec] CPython keeps the Py_buffer export active through
+    // `array_resize`, so `a.frombytes(a)` raises BufferError for an itemsize-1
+    // array.  PyPy releases its copied buffer before `_frombytes`; retaining
+    // this lease is the minimal lifetime difference forced by that visible
+    // result.  Release errors remain unraisable and never replace `result`.
+    let result = array_frombytes(pyre_object::gc_roots::shadow_stack_get(base), &bytes);
+    buffer.release();
+    result?;
     Ok(pyre_object::w_none())
 }
 
