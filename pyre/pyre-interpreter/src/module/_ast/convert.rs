@@ -2290,6 +2290,7 @@ pub fn parse_to_object_with_opts(
         crate::builtins::compile_err_to_syntax_error(
             crate::compile::CompileError::from_ruff_parse_error(error, &source_file, mode),
             source,
+            mode,
         )
     })?;
     // [3.14-spec] CPython `_PyPegen_new_identifier` performs this check as it
@@ -2320,7 +2321,9 @@ pub fn parse_to_object_with_opts(
         parsed.tokens(),
         crate::module::sys::state::int_max_str_digits().max(0) as usize,
     ) {
-        return Err(crate::builtins::compile_err_to_syntax_error(error, source));
+        return Err(crate::builtins::compile_err_to_syntax_error(
+            error, source, mode,
+        ));
     }
     let mut collected = super::type_comments::TypeComments::default();
     if type_comments {
@@ -2409,6 +2412,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
                 crate::compile::Mode::Eval,
             ),
             source,
+            crate::compile::Mode::Eval,
         )
     };
     let eof = ruff_text_size::TextSize::new(source.len() as u32);
@@ -2511,6 +2515,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
                 crate::compile::Mode::Eval,
             ),
             source,
+            crate::compile::Mode::Eval,
         )
     })?;
     let ast::Mod::Expression(wrapped_expression) = wrapped_parsed.into_syntax() else {
@@ -2595,6 +2600,7 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
                 crate::compile::Mode::Eval,
             ),
             source,
+            crate::compile::Mode::Eval,
         )
     })?;
     validate_parser_identifiers(source, parsed.tokens())?;
@@ -2617,7 +2623,11 @@ pub fn parse_func_type_to_object(source: &str, feature_version: i64) -> crate::P
         parsed.tokens(),
         crate::module::sys::state::int_max_str_digits().max(0) as usize,
     ) {
-        return Err(crate::builtins::compile_err_to_syntax_error(error, source));
+        return Err(crate::builtins::compile_err_to_syntax_error(
+            error,
+            source,
+            crate::compile::Mode::Eval,
+        ));
     }
     let ast::Mod::Expression(expression) = parsed.into_syntax() else {
         return Err(invalid(eof_range));
