@@ -7237,11 +7237,19 @@ mod tests {
 
     // ── COND_CALL_GC_WB_ARRAY inline card marking ──────────────────────
 
-    /// Array length large enough that indices land in more than one card
-    /// byte at the default `card_page_indices = 128` (incminimark.py:275):
-    /// eight cards per byte means index 1024 is the first index in card
-    /// byte 1.
-    const CARD_ARRAY_LENGTH: usize = 2048;
+    /// Array length that satisfies both clauses of the card question that a
+    /// fixture controls (incminimark.py:1017-1019).
+    ///
+    /// Indices must land in more than one card byte at the default
+    /// `card_page_indices = 128` (incminimark.py:275): eight cards per byte
+    /// means index 1024 is the first index in card byte 1.
+    ///
+    /// And the array must be a *large* object — the third clause denies cards
+    /// to anything the arena arm could have taken. A whole card page above
+    /// `(16384 + 512) * WORD` clears it with the base and length words
+    /// included; the indices below still land in bytes 0 and 1, and the card
+    /// bytes past them stay clean.
+    const CARD_ARRAY_LENGTH: usize = 17024;
 
     /// incminimark.py `external_malloc` with card bits: an
     /// old-gen varsize array whose items are GC pointers gets GCFLAG_HAS_CARDS
@@ -7249,7 +7257,18 @@ mod tests {
     fn alloc_old_card_array(gc: &mut majit_gc::collector::MiniMarkGC, type_id: u32) -> GcRef {
         let item_size = std::mem::size_of::<GcRef>();
         let total_size = majit_gc::header::GcHeader::SIZE + 8 + item_size * CARD_ARRAY_LENGTH;
+        // Said out loud rather than left to the card assertions: a length that
+        // stopped clearing the threshold would disarm this test into asserting
+        // that two clean arrays match.
+        assert!(
+            total_size > majit_gc::GcAllocator::max_nursery_object_size(gc),
+            "CARD_ARRAY_LENGTH no longer describes a large object, so it gets no cards"
+        );
         let obj = gc.alloc_in_oldgen_with_cards(type_id, total_size, CARD_ARRAY_LENGTH, true);
+        assert!(
+            unsafe { (*majit_gc::header::header_of(obj.0)).has_flag(majit_gc::flags::HAS_CARDS) },
+            "the fixture array must carry cards"
+        );
         // `dirty_cards` reads the length out of the array's own length field.
         unsafe { *(obj.0 as *mut usize) = CARD_ARRAY_LENGTH };
         obj
