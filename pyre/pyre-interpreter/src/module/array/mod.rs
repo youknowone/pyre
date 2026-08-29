@@ -726,12 +726,13 @@ fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
-    let idx = array_find(
+    let idx = array_index_count(
         pyre_object::gc_roots::shadow_stack_get(base),
         pyre_object::gc_roots::shadow_stack_get(base + 1),
+        false,
     )?;
-    match idx {
-        Some(i) => {
+    match usize::try_from(idx) {
+        Ok(i) => {
             let obj = pyre_object::gc_roots::shadow_stack_get(base);
             // [3.14-spec] CPython `array_array_remove_impl` hands the matched
             // index to `array_del_slice`; if `__eq__` already shrank the array
@@ -750,17 +751,19 @@ fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
             vec.drain(i * isz..i * isz + isz);
             Ok(pyre_object::w_none())
         }
-        None => Err(PyError::value_error("array.remove(x): x not in array")),
+        Err(_) => Err(PyError::value_error("array.remove(x): x not in array")),
     }
 }
 
-/// First index whose element equals `w_value`, via `==`.
-fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, PyError> {
-    // PyPy `index_count_array`: the receiver and needle stay red/live, and
-    // `arr.len` is checked at every loop boundary because equality is user
-    // code that may resize and collect either object.
+/// First matching index, or the total number of matches, via `==`.
+fn array_index_count(obj: PyObjectRef, w_value: PyObjectRef, count: bool) -> Result<i64, PyError> {
+    // PyPy `index_count_array` shares this loop between index-like searches
+    // and count.  The receiver and needle stay red/live, and `arr.len` is
+    // checked at every loop boundary because equality is user code that may
+    // resize and collect either object.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj, w_value]);
+    let mut cnt = 0i64;
     let mut i = 0;
     loop {
         let obj = pyre_object::gc_roots::shadow_stack_get(base);
@@ -770,11 +773,15 @@ fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, P
         let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
         let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if crate::baseobjspace::eq_w(w_item, w_value)? {
-            return Ok(Some(i));
+            if count {
+                cnt += 1;
+            } else {
+                return Ok(i as i64);
+            }
         }
         i += 1;
     }
-    Ok(None)
+    Ok(if count { cnt } else { -1 })
 }
 
 fn array_index_method(args: &[PyObjectRef]) -> PyResult {
@@ -866,17 +873,16 @@ fn array_buffer(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.count")?;
-    let obj = args[0];
-    let len = unsafe { arr::w_array_len(obj) };
-    let mut count = 0i64;
-    for i in 0..len {
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
-        if crate::baseobjspace::eq_w(w_item, args[1])? {
-            count += 1;
-        }
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "count")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.count() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
     }
-    Ok(pyre_object::w_int_new(count))
+    Ok(pyre_object::w_int_new(array_index_count(
+        args[0], args[1], true,
+    )?))
 }
 
 fn array_reverse_method(args: &[PyObjectRef]) -> PyResult {
@@ -1024,7 +1030,7 @@ fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {
 fn array_contains_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__contains__")?;
     Ok(pyre_object::w_bool_from(
-        array_find(args[0], args[1])?.is_some(),
+        array_index_count(args[0], args[1], false)? >= 0,
     ))
 }
 
@@ -1680,7 +1686,14 @@ pub fn init_array_type(ns: PyObjectRef) {
             crate::make_builtin_function("index", array_index_method),
         )
     };
-    m(ns, "count", array_count_method, 2);
+    // `count` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "count",
+            crate::make_builtin_function("count", array_count_method),
+        )
+    };
     m(ns, "clear", array_clear_method, 1);
     m(ns, "__release_buffer__", array_release_buffer, 2);
     m(ns, "__buffer__", array_buffer, 2);

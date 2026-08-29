@@ -303,6 +303,61 @@ with assert_raises(TypeError) as error:
     array("i").remove(1, 2)
 assert str(error.exception) == "array.remove() takes exactly one argument (2 given)"
 
+# PyPy's index_count_array shares one live-length loop between its index-like
+# searches and count.  CPython 3.14 likewise re-reads Py_SIZE(self) at every
+# array_array_count_impl iteration, so comparison may grow or shrink the
+# receiver without leaving a stale raw-buffer bound behind.
+count_growing = array("i", [1, 2])
+count_calls = []
+
+
+class GrowingCountNeedle:
+    def __eq__(self, other):
+        count_calls.append(other)
+        if other == 1:
+            count_growing.append(3)
+            gc.collect()
+        return other == 3
+
+
+assert count_growing.count(GrowingCountNeedle()) == 1
+assert count_calls == [1, 2, 3]
+assert count_growing == array("i", [1, 2, 3])
+
+count_cleared_false = array("i", [1, 2])
+
+
+class ClearingFalseCountNeedle:
+    def __eq__(self, other):
+        del count_cleared_false[:]
+        return False
+
+
+assert count_cleared_false.count(ClearingFalseCountNeedle()) == 0
+assert count_cleared_false == array("i")
+
+count_cleared_true = array("i", [1, 2])
+
+
+class ClearingTrueCountNeedle:
+    def __eq__(self, other):
+        del count_cleared_true[:]
+        return True
+
+
+assert count_cleared_true.count(ClearingTrueCountNeedle()) == 1
+assert count_cleared_true == array("i")
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i", [1]).count(x=1)
+assert str(error.exception) == "array.count() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").count()
+assert str(error.exception) == "array.count() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").count(1, 2)
+assert str(error.exception) == "array.count() takes exactly one argument (2 given)"
+
 # slice assignment step overflow behaviour test
 T = "I"
 a = array(T, range(10))
