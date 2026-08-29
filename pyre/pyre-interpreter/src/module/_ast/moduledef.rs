@@ -782,7 +782,9 @@ fn ast_replace(args: &[PyObjectRef]) -> crate::PyResult {
             continue;
         }
         if !crate::type_methods::set_discard_checked(roots.get(expecting_slot), key)? {
-            let key_repr = ast_field_repr(key)?;
+            // The discard hashes and compares the key through the Python
+            // protocol, so read it back rather than reusing the local.
+            let key_repr = ast_field_repr(roots.get(keyword_base + index * 2))?;
             return Err(crate::PyError::type_error(crate::display::wtf8_format!(
                 ast_instance_type_name(roots.get(zelf_slot)),
                 ".__replace__ got an unexpected keyword argument ",
