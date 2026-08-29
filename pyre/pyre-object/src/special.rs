@@ -76,7 +76,7 @@ mod tests {
             unsafe {
                 let hdr = majit_gc::header::header_of(obj as usize);
                 assert_eq!((*hdr).type_id(), type_id);
-                assert!((*hdr).has_flag(majit_gc::flags::NO_HEAP_PTRS));
+                assert!((*hdr).has_flag(majit_gc::flags::GCFLAG_NO_HEAP_PTRS));
             }
         }
     }

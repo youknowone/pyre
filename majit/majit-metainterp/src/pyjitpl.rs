@@ -25568,7 +25568,7 @@ mod tests {
             .get_cell(green_key)
             .expect("temp callback should install a jit cell");
         assert_ne!(
-            cell.flags & crate::warmstate::jc_flags::TEMPORARY,
+            cell.flags & crate::warmstate::jc_flags::JC_TEMPORARY,
             0,
             "temp callback token should mark the cell as TEMPORARY"
         );

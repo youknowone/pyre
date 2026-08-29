@@ -21,17 +21,17 @@ use crate::recorder::Trace;
 /// Flags on a BaseJitCell, mirroring warmstate.py JC_* constants.
 pub mod jc_flags {
     /// We are currently tracing from this green key.
-    pub const TRACING: u8 = 0x01;
+    pub const JC_TRACING: u8 = 0x01;
     /// Don't trace here (e.g., trace was too long last time).
-    pub const DONT_TRACE_HERE: u8 = 0x02;
+    pub const JC_DONT_TRACE_HERE: u8 = 0x02;
     /// Has a temporary procedure token (CALL_ASSEMBLER fallback).
-    pub const TEMPORARY: u8 = 0x04;
+    pub const JC_TEMPORARY: u8 = 0x04;
     /// Tracing has occurred at least once from this key.
-    pub const TRACING_OCCURRED: u8 = 0x08;
+    pub const JC_TRACING_OCCURRED: u8 = 0x08;
     /// warmstate.py: JC_FORCE_FINISH — the loop has a FINISH that
     /// returns a raw int (not a boxed pointer). Used by
     /// call_assembler to decide whether to unbox the result.
-    pub const FORCE_FINISH: u8 = 0x10;
+    pub const JC_FORCE_FINISH: u8 = 0x10;
 }
 
 /// Explicit state of a BaseJitCell in the JIT lifecycle.
@@ -230,13 +230,13 @@ impl BaseJitCell {
     }
 
     pub fn is_tracing(&self) -> bool {
-        self.flags & jc_flags::TRACING != 0
+        self.flags & jc_flags::JC_TRACING != 0
     }
 
     /// warmstate.py — get_procedure_token returns None for
     /// invalidated tokens. is_compiled additionally excludes TEMPORARY.
     pub fn is_compiled(&self) -> bool {
-        self.get_procedure_token().is_some() && (self.flags & jc_flags::TEMPORARY == 0)
+        self.get_procedure_token().is_some() && (self.flags & jc_flags::JC_TEMPORARY == 0)
     }
 
     /// warmstate.py `get_procedure_token`.
@@ -315,9 +315,9 @@ impl BaseJitCell {
             .replace(Self::_makeref(&loop_token))
             .and_then(|wref| wref.upgrade());
         if tmp {
-            self.flags |= jc_flags::TEMPORARY;
+            self.flags |= jc_flags::JC_TEMPORARY;
         } else {
-            self.flags &= !jc_flags::TEMPORARY;
+            self.flags &= !jc_flags::JC_TEMPORARY;
             self.state = BaseJitCellState::Compiled;
         }
         old
@@ -362,15 +362,15 @@ impl BaseJitCell {
         if self.get_procedure_token().is_some() {
             return false; // has a valid procedure token
         }
-        if self.flags & jc_flags::TRACING != 0 {
+        if self.flags & jc_flags::JC_TRACING != 0 {
             return false; // currently tracing
         }
-        if self.flags & jc_flags::DONT_TRACE_HERE != 0 {
+        if self.flags & jc_flags::JC_DONT_TRACE_HERE != 0 {
             // Remove only if we had a token that is now dead.
             return self.has_seen_a_procedure_token();
         }
         // warmstate.py:222-225
-        if self.flags & jc_flags::FORCE_FINISH != 0 {
+        if self.flags & jc_flags::JC_FORCE_FINISH != 0 {
             return false;
         }
         true
@@ -773,10 +773,10 @@ impl WarmEnterState {
         flags: u8,
         has_seen_a_procedure_token: bool,
     ) -> bool {
-        if flags & jc_flags::DONT_TRACE_HERE == 0 || has_seen_a_procedure_token {
+        if flags & jc_flags::JC_DONT_TRACE_HERE == 0 || has_seen_a_procedure_token {
             return false;
         }
-        if flags & jc_flags::TRACING_OCCURRED != 0 {
+        if flags & jc_flags::JC_TRACING_OCCURRED != 0 {
             let bucket = self.bucket_of(cell_key);
             self.counter.tick(bucket, self.increment_threshold)
         } else {
@@ -800,7 +800,7 @@ impl WarmEnterState {
         self.tracing_generation += 1;
         let current_generation = self.tracing_generation;
         let cell = self.ensure_cell_by_key(cell_key);
-        cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+        cell.flags |= jc_flags::JC_TRACING | jc_flags::JC_TRACING_OCCURRED;
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
 
@@ -915,7 +915,7 @@ impl WarmEnterState {
             if cell.is_compiled() || cell.is_tracing() {
                 return true;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0 {
                 return false;
             }
         }
@@ -926,7 +926,7 @@ impl WarmEnterState {
     /// warmstate.py:467: jitcounter.tick(hash, increment_threshold).
     pub fn counter_tick(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key(cell_key) {
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0 {
                 return;
             }
         }
@@ -944,7 +944,7 @@ impl WarmEnterState {
             // procedure token it once saw has since been invalidated: that
             // dead entry must fall through to cleanup_chain (warmstate.py:483-491)
             // instead of returning early and lingering in the chain.
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0
+            if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0
                 && cell.has_seen_a_procedure_token()
                 && cell.get_procedure_token().is_some()
             {
@@ -1086,7 +1086,7 @@ impl WarmEnterState {
             }
             // A JC_DONT_TRACE_HERE cell declines here, except when its token
             // is dead — that entry belongs to the cleanup path above.
-            if flags & jc_flags::DONT_TRACE_HERE != 0 && !dead_token {
+            if flags & jc_flags::JC_DONT_TRACE_HERE != 0 && !dead_token {
                 return HotResult::NotHot;
             }
             if dead_token {
@@ -1232,7 +1232,7 @@ impl WarmEnterState {
             }
             // A JC_DONT_TRACE_HERE cell declines here, except when its token
             // is dead — that entry belongs to the cleanup path above.
-            if flags & jc_flags::DONT_TRACE_HERE != 0 && !dead_token {
+            if flags & jc_flags::JC_DONT_TRACE_HERE != 0 && !dead_token {
                 return HotResult::NotHot;
             }
             if dead_token {
@@ -1292,7 +1292,7 @@ impl WarmEnterState {
         let cell = self
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
-        cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+        cell.flags |= jc_flags::JC_TRACING | jc_flags::JC_TRACING_OCCURRED;
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
         HotResult::StartTracing
@@ -1303,7 +1303,7 @@ impl WarmEnterState {
     /// clears `JC_TRACING` on its own cell rather than the bucket head.
     pub fn finish_tracing_for_key(&mut self, key: &GreenKey) {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            cell.flags &= !jc_flags::TRACING;
+            cell.flags &= !jc_flags::JC_TRACING;
             // State remains Tracing until attach_procedure_to_interp is called.
         }
     }
@@ -1313,12 +1313,12 @@ impl WarmEnterState {
     /// cell's `JC_TRACING` / pyre-local abort-count / `DONT_TRACE_HERE` state.
     pub fn abort_tracing_for_key(&mut self, key: &GreenKey, disable_noninlinable_function: bool) {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            cell.flags &= !jc_flags::TRACING;
+            cell.flags &= !jc_flags::JC_TRACING;
             cell.abort_count += 1;
-            let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
+            let already_banned = cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0;
             let ceiling_reached = cell.abort_ceiling_latched();
             if disable_noninlinable_function || already_banned || ceiling_reached {
-                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.flags |= jc_flags::JC_DONT_TRACE_HERE;
             }
             if ceiling_reached && !already_banned && !disable_noninlinable_function {
                 crate::mc_diag_bump(80); // abort_ceiling_banned
@@ -1356,7 +1356,7 @@ impl WarmEnterState {
         let cell = self
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
-        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        cell.flags |= jc_flags::JC_DONT_TRACE_HERE;
     }
 
     /// Force-start tracing for a green key, bypassing the hot counter.
@@ -1382,8 +1382,8 @@ impl WarmEnterState {
             // callee's real standalone trace even when that callee was marked
             // non-inlinable.  Refusing the combination here strands the
             // JC_FORCE_FINISH retry installed after a trace-too-long abort.
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0
-                && cell.flags & jc_flags::TEMPORARY == 0
+            if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0
+                && cell.flags & jc_flags::JC_TEMPORARY == 0
                 && cell.has_seen_a_procedure_token()
             {
                 return HotResult::NotHot;
@@ -1415,8 +1415,8 @@ impl WarmEnterState {
             if cell.is_tracing() {
                 return HotResult::AlreadyTracing;
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0
-                && cell.flags & jc_flags::TEMPORARY == 0
+            if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0
+                && cell.flags & jc_flags::JC_TEMPORARY == 0
                 && cell.has_seen_a_procedure_token()
             {
                 return HotResult::NotHot;
@@ -1448,7 +1448,7 @@ impl WarmEnterState {
     /// `attach_procedure_to_interp` with the resulting JitCellToken.
     pub fn finish_tracing(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
-            cell.flags &= !jc_flags::TRACING;
+            cell.flags &= !jc_flags::JC_TRACING;
             // State remains Tracing until attach_procedure_to_interp is called.
         }
     }
@@ -1459,16 +1459,16 @@ impl WarmEnterState {
     /// pyre's abort ceiling marks the location `DONT_TRACE_HERE`.
     pub fn abort_tracing(&mut self, cell_key: u64, disable_noninlinable_function: bool) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
-            cell.flags &= !jc_flags::TRACING;
+            cell.flags &= !jc_flags::JC_TRACING;
             cell.abort_count += 1;
             // The last disjunct is pyre's abort ceiling: too many failed
             // attempts permanently disable tracing here — and, through the same
             // flag, inlining from elsewhere.  `MAX_TRACE_ABORT_COUNT` carries
             // the measurement that keeps the two together.
-            let already_banned = cell.flags & jc_flags::DONT_TRACE_HERE != 0;
+            let already_banned = cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0;
             let ceiling_reached = cell.abort_ceiling_latched();
             if disable_noninlinable_function || already_banned || ceiling_reached {
-                cell.flags |= jc_flags::DONT_TRACE_HERE;
+                cell.flags |= jc_flags::JC_DONT_TRACE_HERE;
             }
             if ceiling_reached && !already_banned && !disable_noninlinable_function {
                 crate::mc_diag_bump(80); // abort_ceiling_banned
@@ -1505,7 +1505,7 @@ impl WarmEnterState {
     ) -> Option<Arc<JitCellToken>> {
         let token = token.into();
         let cell = self.ensure_cell_by_key(cell_key);
-        cell.flags &= !jc_flags::TRACING;
+        cell.flags &= !jc_flags::JC_TRACING;
         let previous = cell.set_procedure_token(token, false);
         self.bump_cell_generation();
         previous
@@ -1530,7 +1530,7 @@ impl WarmEnterState {
         let cell = self
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
-        cell.flags &= !jc_flags::TRACING;
+        cell.flags &= !jc_flags::JC_TRACING;
         let previous = cell.set_procedure_token(token, false);
         self.bump_cell_generation();
         previous
@@ -1566,7 +1566,7 @@ impl WarmEnterState {
     /// the state transition for whichever cell they touch.
     pub fn clear_tracing_flag(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
-            cell.flags &= !jc_flags::TRACING;
+            cell.flags &= !jc_flags::JC_TRACING;
         }
     }
 
@@ -1601,7 +1601,7 @@ impl WarmEnterState {
     /// separately.
     pub fn clear_tracing_flag_for_key(&mut self, key: &GreenKey) {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
-            cell.flags &= !jc_flags::TRACING;
+            cell.flags &= !jc_flags::JC_TRACING;
         }
     }
 
@@ -1758,7 +1758,7 @@ impl WarmEnterState {
     /// Check if a green key carries `JC_DONT_TRACE_HERE`.
     pub fn is_dont_trace_here(&self, cell_key: u64) -> bool {
         self.cell_by_key(cell_key)
-            .is_some_and(|c| c.flags & jc_flags::DONT_TRACE_HERE != 0)
+            .is_some_and(|c| c.flags & jc_flags::JC_DONT_TRACE_HERE != 0)
     }
 
     /// Get a reference to the BaseJitCell for a green key, if it exists.
@@ -2129,7 +2129,7 @@ impl WarmEnterState {
     /// converge to a separate functrace / call_assembler path.
     pub fn can_inline_callable(&self, callee_key: u64) -> bool {
         self.cell_by_key(callee_key)
-            .is_none_or(|cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
+            .is_none_or(|cell| cell.flags & jc_flags::JC_DONT_TRACE_HERE == 0)
     }
 
     /// Typed-key variant of [`Self::can_inline_callable`].
@@ -2142,7 +2142,7 @@ impl WarmEnterState {
     /// typed cell.
     pub fn can_inline_callable_for_key(&self, key: &GreenKey) -> bool {
         self.lookup_chain_with_key(key)
-            .is_none_or(|cell| cell.flags & jc_flags::DONT_TRACE_HERE == 0)
+            .is_none_or(|cell| cell.flags & jc_flags::JC_DONT_TRACE_HERE == 0)
     }
 
     /// Mark a callee as a location that should no longer be inlined into
@@ -2151,7 +2151,7 @@ impl WarmEnterState {
     /// This is the warm-state equivalent of PyPy's `disable_noninlinable_function()`.
     pub fn disable_noninlinable_function(&mut self, callee_key: u64) {
         let cell = self.ensure_cell_by_key(callee_key);
-        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        cell.flags |= jc_flags::JC_DONT_TRACE_HERE;
     }
 
     /// Mark a callee as currently being traced.
@@ -2160,8 +2160,8 @@ impl WarmEnterState {
     pub fn mark_as_being_traced(&mut self, callee_key: u64) {
         let tracing_generation = self.tracing_generation;
         let cell = self.ensure_cell_by_key(callee_key);
-        cell.flags |= jc_flags::TRACING;
-        if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+        cell.flags |= jc_flags::JC_TRACING;
+        if cell.flags & jc_flags::JC_TRACING_OCCURRED == 0 {
             cell.state = BaseJitCellState::Tracing;
             cell.tracing_generation = tracing_generation;
         }
@@ -2186,8 +2186,8 @@ impl WarmEnterState {
         let cell = self
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
-        cell.flags |= jc_flags::TRACING;
-        if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+        cell.flags |= jc_flags::JC_TRACING;
+        if cell.flags & jc_flags::JC_TRACING_OCCURRED == 0 {
             cell.state = BaseJitCellState::Tracing;
             cell.tracing_generation = tracing_generation;
         }
@@ -2224,7 +2224,7 @@ impl WarmEnterState {
     /// wherever the green key itself is in scope.
     pub fn mark_force_finish_tracing(&mut self, cell_key: u64) {
         let cell = self.ensure_cell_by_key(cell_key);
-        cell.flags |= jc_flags::FORCE_FINISH;
+        cell.flags |= jc_flags::JC_FORCE_FINISH;
     }
 
     /// Typed form of [`Self::mark_force_finish_tracing`].
@@ -2237,7 +2237,7 @@ impl WarmEnterState {
         let cell = self
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
-        cell.flags |= jc_flags::FORCE_FINISH;
+        cell.flags |= jc_flags::JC_FORCE_FINISH;
     }
 
     /// warmstate.py `bool(cell.flags & JC_FORCE_FINISH)` — read the sticky
@@ -2247,7 +2247,7 @@ impl WarmEnterState {
     /// is removed.
     pub fn should_force_finish_tracing(&self, cell_key: u64) -> bool {
         self.cell_by_key(cell_key)
-            .is_some_and(|cell| cell.flags & jc_flags::FORCE_FINISH != 0)
+            .is_some_and(|cell| cell.flags & jc_flags::JC_FORCE_FINISH != 0)
     }
 
     /// Boost the current loop/function green key so the next execution
@@ -2409,7 +2409,7 @@ impl WarmEnterState {
             // interpreter callback used until the non-inlinable callee gets
             // its own real trace, not evidence that the callee was already
             // compiled separately.
-            if cell.flags & jc_flags::TEMPORARY != 0 {
+            if cell.flags & jc_flags::JC_TEMPORARY != 0 {
                 crate::mc_diag_bump(25);
                 return if self
                     .counter
@@ -2420,7 +2420,7 @@ impl WarmEnterState {
                     FunctionEntryStep::NotHot
                 };
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
                     // A non-temporary token that was once seen but has since
                     // been invalidated falls through to the cleanup gate below
@@ -2430,7 +2430,7 @@ impl WarmEnterState {
                     if cell.get_procedure_token().is_some() {
                         return FunctionEntryStep::NotHot;
                     }
-                } else if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+                } else if cell.flags & jc_flags::JC_TRACING_OCCURRED == 0 {
                     return FunctionEntryStep::Proceed;
                 }
             }
@@ -2505,16 +2505,16 @@ impl WarmEnterState {
                 crate::mc_diag_bump(81); // abort_ceiling_refused
                 return false;
             }
-            if cell.flags & jc_flags::TEMPORARY != 0 {
+            if cell.flags & jc_flags::JC_TEMPORARY != 0 {
                 crate::mc_diag_bump(25);
                 return self.counter.tick(bucket, self.increment_function_threshold);
             }
-            if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+            if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0 {
                 if cell.has_seen_a_procedure_token() {
                     if cell.get_procedure_token().is_some() {
                         return false;
                     }
-                } else if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
+                } else if cell.flags & jc_flags::JC_TRACING_OCCURRED == 0 {
                     return true;
                 }
             }
@@ -2652,15 +2652,15 @@ impl WarmEnterState {
 
         match new_state {
             BaseJitCellState::NotHot => {
-                cell.flags &= !(jc_flags::TRACING | jc_flags::DONT_TRACE_HERE);
+                cell.flags &= !(jc_flags::JC_TRACING | jc_flags::JC_DONT_TRACE_HERE);
                 cell.state = BaseJitCellState::NotHot;
             }
             BaseJitCellState::Tracing => {
-                cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
+                cell.flags |= jc_flags::JC_TRACING | jc_flags::JC_TRACING_OCCURRED;
                 cell.state = BaseJitCellState::Tracing;
             }
             BaseJitCellState::Compiled => {
-                cell.flags &= !jc_flags::TRACING;
+                cell.flags &= !jc_flags::JC_TRACING;
                 cell.state = BaseJitCellState::Compiled;
             }
             BaseJitCellState::Invalidated => {
@@ -2968,7 +2968,7 @@ impl WarmEnterState {
                 // Counted off the flag, not the lifecycle state: a denial is
                 // orthogonal to where the cell is in that lifecycle, and a cell
                 // denied while it goes on to trace carries only the flag.
-                if cell.flags & jc_flags::DONT_TRACE_HERE != 0 {
+                if cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0 {
                     stats.num_disable_noninlinable_function += 1;
                 }
                 cur = cell.next.as_deref();
@@ -3837,7 +3837,7 @@ mod tests {
 
         let cell = ws.get_cell(42).unwrap();
         assert!(!cell.is_tracing());
-        assert!(cell.flags & jc_flags::TRACING_OCCURRED != 0);
+        assert!(cell.flags & jc_flags::JC_TRACING_OCCURRED != 0);
     }
 
     #[test]
@@ -3852,7 +3852,7 @@ mod tests {
 
         let cell = ws.get_cell(42).unwrap();
         assert!(!cell.is_tracing());
-        assert!(cell.flags & jc_flags::DONT_TRACE_HERE != 0);
+        assert!(cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0);
 
         // RPython warmstate.py: a DONT_TRACE_HERE cell with no procedure token
         // still retriggers separate tracing after warming up again.
@@ -4093,7 +4093,7 @@ mod tests {
 
         // The key is now blacklisted.
         let cell = ws.get_cell(42).unwrap();
-        assert!(cell.flags & jc_flags::DONT_TRACE_HERE != 0);
+        assert!(cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0);
         assert!(!cell.is_tracing());
 
         // RPython warmstate.py: DONT_TRACE_HERE still allows separate
@@ -4230,14 +4230,14 @@ mod tests {
         }
 
         let cell = ws.get_cell(key).unwrap();
-        assert!(cell.flags & jc_flags::TRACING_OCCURRED != 0);
+        assert!(cell.flags & jc_flags::JC_TRACING_OCCURRED != 0);
 
         ws.abort_tracing(key, false);
 
         let cell = ws.get_cell(key).unwrap();
         assert!(!cell.is_tracing());
         assert!(
-            cell.flags & jc_flags::TRACING_OCCURRED != 0,
+            cell.flags & jc_flags::JC_TRACING_OCCURRED != 0,
             "TRACING_OCCURRED should persist after abort"
         );
     }
@@ -4812,7 +4812,7 @@ mod tests {
         assert_eq!(ws.get_cell_state(key), BaseJitCellState::NotHot);
         // DONT_TRACE_HERE flag should be cleared
         let cell = ws.get_cell(key).unwrap();
-        assert!(cell.flags & jc_flags::DONT_TRACE_HERE == 0);
+        assert!(cell.flags & jc_flags::JC_DONT_TRACE_HERE == 0);
     }
 
     /// `warmstate.py bound_reached` traces unconditionally once
@@ -5087,12 +5087,12 @@ mod tests {
 
         // A cell that is tracing should NOT be removable
         let mut cell = BaseJitCell::new();
-        cell.flags |= jc_flags::TRACING;
+        cell.flags |= jc_flags::JC_TRACING;
         assert!(!cell.should_remove_jitcell());
 
         // A cell with DONT_TRACE_HERE but no token history is removable
         let mut cell = BaseJitCell::new();
-        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        cell.flags |= jc_flags::JC_DONT_TRACE_HERE;
         assert!(!cell.should_remove_jitcell()); // has_seen_a_procedure_token is false
 
         // warmstate.py — a `JC_DONT_TRACE_HERE` cell that HAD a
@@ -5102,7 +5102,7 @@ mod tests {
         // slot (warmstate.py:198-199), which is what the arm below is a
         // reading of.
         let mut cell = BaseJitCell::new();
-        cell.flags |= jc_flags::DONT_TRACE_HERE;
+        cell.flags |= jc_flags::JC_DONT_TRACE_HERE;
         {
             let token = Arc::new(JitCellToken::new(42));
             cell.set_procedure_token(Arc::clone(&token), false);
@@ -5126,7 +5126,7 @@ mod tests {
 
         // warmstate.py:222-225: FORCE_FINISH must NOT be removed
         let mut cell = BaseJitCell::new();
-        cell.flags |= jc_flags::FORCE_FINISH;
+        cell.flags |= jc_flags::JC_FORCE_FINISH;
         assert!(!cell.should_remove_jitcell());
     }
 
@@ -5587,7 +5587,7 @@ mod tests {
             .get_cell(key.get_uhash())
             .expect("typed form installs a cell");
         assert!(
-            typed_cell.flags & jc_flags::DONT_TRACE_HERE != 0,
+            typed_cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0,
             "typed form must set DONT_TRACE_HERE"
         );
         assert_eq!(
@@ -5602,7 +5602,7 @@ mod tests {
             .get_cell(key.get_uhash())
             .expect("hash form installs a cell");
         assert!(
-            hashed_cell.flags & jc_flags::DONT_TRACE_HERE != 0,
+            hashed_cell.flags & jc_flags::JC_DONT_TRACE_HERE != 0,
             "hash form must set DONT_TRACE_HERE — the flag is not the delta"
         );
         assert!(
@@ -5636,7 +5636,7 @@ mod tests {
         // install per install_new_cell's "prepend new cell, fold
         // existing keepable cells in front" semantics.
         let mut cell_first = BaseJitCell::new();
-        cell_first.flags |= jc_flags::TRACING;
+        cell_first.flags |= jc_flags::JC_TRACING;
         cell_first.comparekey = Some(key_head_after_chain.clone());
         ws.install_new_cell(bucket, Some(cell_first));
         // Second install — keep predicate doesn't matter for this one,
@@ -5672,11 +5672,11 @@ mod tests {
         let mut ws = WarmEnterState::new(100);
         let bucket = target.get_uhash();
         let mut decoy_cell = BaseJitCell::new();
-        decoy_cell.flags |= jc_flags::TRACING;
+        decoy_cell.flags |= jc_flags::JC_TRACING;
         decoy_cell.comparekey = Some(decoy.clone());
         ws.install_new_cell(bucket, Some(decoy_cell));
         let mut target_cell = BaseJitCell::new();
-        target_cell.flags |= jc_flags::TRACING;
+        target_cell.flags |= jc_flags::JC_TRACING;
         target_cell.comparekey = Some(target.clone());
         ws.install_new_cell(bucket, Some(target_cell));
         ws
@@ -5690,10 +5690,16 @@ mod tests {
         ws.finish_tracing_for_key(&target);
         let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
         assert_eq!(head.comparekey.as_ref(), Some(&decoy));
-        assert!(head.flags & jc_flags::TRACING != 0, "decoy head untouched");
+        assert!(
+            head.flags & jc_flags::JC_TRACING != 0,
+            "decoy head untouched"
+        );
         let hit = head.next.as_deref().expect("target chained behind decoy");
         assert_eq!(hit.comparekey.as_ref(), Some(&target));
-        assert!(hit.flags & jc_flags::TRACING == 0, "target TRACING cleared");
+        assert!(
+            hit.flags & jc_flags::JC_TRACING == 0,
+            "target TRACING cleared"
+        );
     }
 
     #[test]
@@ -5704,17 +5710,20 @@ mod tests {
         ws.abort_tracing_for_key(&target, true);
         let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
         assert!(
-            head.flags & jc_flags::TRACING != 0,
+            head.flags & jc_flags::JC_TRACING != 0,
             "decoy head still TRACING"
         );
         assert!(
-            head.flags & jc_flags::DONT_TRACE_HERE == 0,
+            head.flags & jc_flags::JC_DONT_TRACE_HERE == 0,
             "decoy not disabled"
         );
         let hit = head.next.as_deref().expect("target chained behind decoy");
-        assert!(hit.flags & jc_flags::TRACING == 0, "target TRACING cleared");
         assert!(
-            hit.flags & jc_flags::DONT_TRACE_HERE != 0,
+            hit.flags & jc_flags::JC_TRACING == 0,
+            "target TRACING cleared"
+        );
+        assert!(
+            hit.flags & jc_flags::JC_DONT_TRACE_HERE != 0,
             "target disabled by permanent abort"
         );
     }
@@ -5727,12 +5736,12 @@ mod tests {
         ws.mark_dont_trace_for_key(&target);
         let head = ws.lookup_chain(target.get_uhash()).expect("bucket head");
         assert!(
-            head.flags & jc_flags::DONT_TRACE_HERE == 0,
+            head.flags & jc_flags::JC_DONT_TRACE_HERE == 0,
             "decoy head not disabled"
         );
         let hit = head.next.as_deref().expect("target chained behind decoy");
         assert!(
-            hit.flags & jc_flags::DONT_TRACE_HERE != 0,
+            hit.flags & jc_flags::JC_DONT_TRACE_HERE != 0,
             "target disabled"
         );
     }
@@ -5750,12 +5759,12 @@ mod tests {
         // this fixture would be testing nothing.
         ws.memory_manager.keep_loop_alive(&token);
         let mut decoy_cell = BaseJitCell::new();
-        decoy_cell.flags |= jc_flags::TRACING;
+        decoy_cell.flags |= jc_flags::JC_TRACING;
         decoy_cell.comparekey = Some(decoy.clone());
         decoy_cell.loop_token = Some(std::sync::Arc::downgrade(&token));
         ws.install_new_cell(bucket, Some(decoy_cell));
         let mut target_cell = BaseJitCell::new();
-        target_cell.flags |= jc_flags::TRACING;
+        target_cell.flags |= jc_flags::JC_TRACING;
         target_cell.comparekey = Some(target.clone());
         target_cell.loop_token = Some(std::sync::Arc::downgrade(&token));
         ws.install_new_cell(bucket, Some(target_cell));
@@ -5806,7 +5815,7 @@ mod tests {
         // JC_TEMPORARY must be set since tmp=true.
         let cell = ws.lookup_chain_with_key(&key).expect("cell installed");
         assert!(
-            cell.flags & jc_flags::TEMPORARY != 0,
+            cell.flags & jc_flags::JC_TEMPORARY != 0,
             "tmp token must set JC_TEMPORARY"
         );
     }
@@ -5837,9 +5846,9 @@ mod tests {
 
         let typed = ws.lookup_chain_with_key(&key).expect("typed callee cell");
         assert_ne!(typed.cell_key, Some(bucket), "typed cell is chained/minted");
-        assert_ne!(typed.flags & jc_flags::TEMPORARY, 0);
-        assert_ne!(typed.flags & jc_flags::DONT_TRACE_HERE, 0);
-        assert_ne!(typed.flags & jc_flags::FORCE_FINISH, 0);
+        assert_ne!(typed.flags & jc_flags::JC_TEMPORARY, 0);
+        assert_ne!(typed.flags & jc_flags::JC_DONT_TRACE_HERE, 0);
+        assert_ne!(typed.flags & jc_flags::JC_FORCE_FINISH, 0);
 
         assert!(
             ws.should_trace_function_entry_for_key(&key),
@@ -5853,7 +5862,7 @@ mod tests {
         let typed = ws.lookup_chain_with_key(&key).expect("typed callee cell");
         assert!(typed.is_tracing(), "the matching typed cell starts tracing");
         assert_ne!(
-            typed.flags & jc_flags::FORCE_FINISH,
+            typed.flags & jc_flags::JC_FORCE_FINISH,
             0,
             "the standalone retry retains its segmenting request"
         );
@@ -5978,7 +5987,7 @@ mod tests {
              it can store no comparekey",
         );
         assert_ne!(
-            head.flags & jc_flags::DONT_TRACE_HERE,
+            head.flags & jc_flags::JC_DONT_TRACE_HERE,
             0,
             "the head still holds the mark the hash form wrote",
         );
@@ -6275,7 +6284,7 @@ mod tests {
         // TRACING keeps the head non-removable so the second install chains
         // behind it rather than replacing it (counter.py:246-256).
         let mut head = BaseJitCell::new();
-        head.flags |= jc_flags::TRACING;
+        head.flags |= jc_flags::JC_TRACING;
         head.comparekey = Some(key_head.clone());
         ws.install_new_cell(bucket, Some(head));
 
@@ -6285,7 +6294,7 @@ mod tests {
         // handle is weak (`warmstate.py:188`, `memmgr.py:9-14`).
         ws.memory_manager.keep_loop_alive(&chained_token);
         let mut tail = BaseJitCell::new();
-        tail.flags |= jc_flags::TRACING;
+        tail.flags |= jc_flags::JC_TRACING;
         tail.comparekey = Some(key_tail.clone());
         tail.loop_token = Some(std::sync::Arc::downgrade(&chained_token));
         ws.install_new_cell(bucket, Some(tail));
@@ -6367,7 +6376,7 @@ mod tests {
         // (counter.py:246-256 should_remove gate) so the next install
         // chains B behind A.
         let mut cell_a = BaseJitCell::new();
-        cell_a.flags |= jc_flags::TRACING;
+        cell_a.flags |= jc_flags::JC_TRACING;
         cell_a.comparekey = Some(key_a.clone());
         ws.install_new_cell(bucket, Some(cell_a));
 
@@ -6498,7 +6507,7 @@ mod tests {
             .lookup_chain_with_key(&key)
             .expect("the key must own a cell reachable by comparekey");
         assert!(
-            cell.flags & jc_flags::TRACING != 0,
+            cell.flags & jc_flags::JC_TRACING != 0,
             "TRACING must land on the key's own cell",
         );
         assert_eq!(
@@ -6564,7 +6573,7 @@ mod tests {
             "the procedure token must land on the key's own cell",
         );
         assert_eq!(
-            cell.flags & jc_flags::TRACING,
+            cell.flags & jc_flags::JC_TRACING,
             0,
             "and TRACING must be cleared on that same cell",
         );
@@ -7359,7 +7368,7 @@ mod tests {
             .lookup_chain_with_key(&key)
             .expect("the key must own a cell reachable by comparekey");
         assert!(
-            cell.flags & jc_flags::FORCE_FINISH != 0,
+            cell.flags & jc_flags::JC_FORCE_FINISH != 0,
             "FORCE_FINISH is sticky and never cleared, so landing it on the \
              wrong cell of the bucket is permanent",
         );
@@ -7397,13 +7406,13 @@ mod tests {
         // it rather than dropping it (counter.py:246-256 should_remove gate).
         let mut tail = BaseJitCell::new();
         tail.state = BaseJitCellState::Tracing;
-        tail.flags |= jc_flags::TRACING;
+        tail.flags |= jc_flags::JC_TRACING;
         tail.comparekey = Some(key_tail);
         ws.install_new_cell(bucket, Some(tail));
 
         let mut head = BaseJitCell::new();
         head.state = BaseJitCellState::Compiled;
-        head.flags |= jc_flags::TRACING;
+        head.flags |= jc_flags::JC_TRACING;
         head.comparekey = Some(key_head);
         ws.install_new_cell(bucket, Some(head));
 
@@ -7441,7 +7450,7 @@ mod tests {
 
         // Head A: must stay non-removable across B's install.
         let mut cell_a = BaseJitCell::new();
-        cell_a.flags |= jc_flags::TRACING;
+        cell_a.flags |= jc_flags::JC_TRACING;
         cell_a.comparekey = Some(key_a.clone());
         ws.install_new_cell(bucket, Some(cell_a));
 

@@ -307,15 +307,23 @@ pub fn malloc_typed<T: GcType>(value: T) -> *mut T {
 }
 
 /// [`malloc_typed`] for an immortal leaf singleton — the header carries
-/// `init_gc_object_immortal`'s `NO_HEAP_PTRS | TRACK_YOUNG_PTRS`, so the
-/// collector recognises it as a prebuilt root and stops there instead of
-/// reading a payload it has no trace shape for.
+/// `init_gc_object_immortal`'s `GCFLAG_NO_HEAP_PTRS | GCFLAG_TRACK_YOUNG_PTRS`,
+/// so marking skips the object instead of reading a payload it has no trace
+/// shape for.
 ///
-/// Restricted to payloads that hold no reference at all: `None`, `True`,
-/// `False`, `NotImplemented`, `Ellipsis`. A box with reference fields must use
-/// [`malloc_typed`] and be reached through the raw-root walkers instead —
-/// `NO_HEAP_PTRS` there would be a false claim, and
-/// `majit_gc::header::alloc_with_gc_header_immortal` records what that costs.
+/// `GCFLAG_NO_HEAP_PTRS` is a state — "holds no heap pointer, and is not in
+/// `prebuilt_root_objects` yet" — which the write barrier is what ends, on the
+/// first pointer stored into the object. Upstream can stamp prebuilt objects
+/// that do carry reference fields, because those fields name other prebuilt
+/// objects and the GC transform barriers every later store. A box allocated at
+/// runtime here satisfies neither half: its reference fields are written
+/// straight to memory at construction.
+///
+/// Hence the restriction to payloads holding no reference at all: `None`,
+/// `True`, `False`, `NotImplemented`, `Ellipsis`. A box with reference fields
+/// must use [`malloc_typed`] and be reached through the raw-root walkers
+/// instead; `majit_gc::header::alloc_with_gc_header_immortal` records the
+/// measured failure that follows from stamping one anyway.
 #[inline]
 pub fn malloc_typed_immortal<T: GcType>(value: T) -> *mut T {
     debug_assert_eq!(

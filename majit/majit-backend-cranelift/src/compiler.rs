@@ -18993,7 +18993,7 @@ mod tests {
         }
 
         let tracks_young =
-            |addr: usize| unsafe { (*header_of(addr)).has_flag(flags::TRACK_YOUNG_PTRS) };
+            |addr: usize| unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
         let in_nursery = |addr: usize| with_cranelift_gc_required(|gc| gc.is_nursery_object(addr));
 
         assert!(
@@ -25132,9 +25132,9 @@ mod tests {
         let token = JitCellToken::new(1503);
         backend.compile_loop(&inputargs, &ops, &token).unwrap();
 
-        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
         backend.execute_token(&token, &[Value::Ref(obj)]);
-        assert!(!unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(!unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
     /// test_gc_integration.py test_malloc_1:

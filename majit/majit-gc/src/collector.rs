@@ -996,7 +996,7 @@ pub struct MiniMarkGC {
     /// True while [`do_collect_oldgen_nonmoving`](MiniMarkGC::do_collect_oldgen_nonmoving)
     /// is running. A non-moving major skips the leading minor, so unlike
     /// `do_collect_full` it marks through a *populated* nursery: `mark_object`
-    /// / `seed_major_root` set `flags::VISITED` on reachable nursery objects
+    /// / `seed_major_root` set `flags::GCFLAG_VISITED` on reachable nursery objects
     /// that no sweep then clears (the sweep only walks old-gen). While this is
     /// set, every *young* object greyed this cycle is recorded in
     /// `oldgen_nonmoving_young_marks` so VISITED can be cleared as the
@@ -1396,9 +1396,12 @@ impl MiniMarkGC {
             if self.card_page_shift > 0 && has_gc_ptrs_in_var && length > 0 {
                 let extra_words = self.card_marking_words_for_length(length);
                 let chs = 8 * extra_words; // WORD * extra_words
-                (chs, flags::HAS_CARDS | flags::TRACK_YOUNG_PTRS)
+                (
+                    chs,
+                    flags::GCFLAG_HAS_CARDS | flags::GCFLAG_TRACK_YOUNG_PTRS,
+                )
             } else {
-                (0, flags::TRACK_YOUNG_PTRS)
+                (0, flags::GCFLAG_TRACK_YOUNG_PTRS)
             };
 
         let ptr = self
@@ -2140,7 +2143,7 @@ impl MiniMarkGC {
     }
 
     /// Flags for an object born directly into the old generation, adding
-    /// `flags::VISITED` while a major marking cycle is in progress.
+    /// `flags::GCFLAG_VISITED` while a major marking cycle is in progress.
     ///
     /// An object allocated straight into the old generation during MARKING (a
     /// large object or nursery-full fallback) enters the still-active page/raw
@@ -2153,7 +2156,7 @@ impl MiniMarkGC {
     #[inline]
     fn oldgen_birth_flags(&self, base: u64) -> u64 {
         if self.gc_state == GcState::Marking {
-            base | flags::VISITED
+            base | flags::GCFLAG_VISITED
         } else {
             base
         }
@@ -2283,7 +2286,7 @@ impl MiniMarkGC {
                         slot as usize,
                         slot as usize - here,
                         self.nursery.contains(value),
-                        unsafe { (*header_of(here)).has_flag(flags::TRACK_YOUNG_PTRS) },
+                        unsafe { (*header_of(here)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) },
                         remembered,
                         crate::bh_probe_was_barriered(here),
                         parent.unwrap_or(0),
@@ -2445,7 +2448,7 @@ impl MiniMarkGC {
                                 .collect()
                         },
                         track_young_ptrs: unsafe {
-                            (*header_of(addr)).has_flag(flags::TRACK_YOUNG_PTRS)
+                            (*header_of(addr)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS)
                         },
                         remembered: self.remembered_set.contains(&addr),
                         barriered_ever: crate::bh_probe_was_barriered(addr),
@@ -2638,7 +2641,10 @@ impl MiniMarkGC {
         // Old objects start with TRACK_YOUNG_PTRS set (they need write barrier).
         // An object born into the old generation while a major marking cycle is
         // in progress must also be allocated black (see `oldgen_birth_flags`).
-        *hdr = GcHeader::with_flags(type_id, self.oldgen_birth_flags(flags::TRACK_YOUNG_PTRS));
+        *hdr = GcHeader::with_flags(
+            type_id,
+            self.oldgen_birth_flags(flags::GCFLAG_TRACK_YOUNG_PTRS),
+        );
         self.bytes_made_old_since_cycle =
             self.bytes_made_old_since_cycle.saturating_add(total_size);
         let obj_addr = (ptr as usize) + GcHeader::SIZE;
@@ -2833,10 +2839,10 @@ impl MiniMarkGC {
     /// freed at its end.
     fn visit_young_rawmalloced_object(&mut self, obj_addr: usize) {
         let hdr = unsafe { header_of(obj_addr) };
-        if unsafe { (*hdr).has_flag(flags::VISITED_RMY) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED_RMY) } {
             return;
         }
-        unsafe { (*hdr).set_flag(flags::VISITED_RMY) };
+        unsafe { (*hdr).set_flag(flags::GCFLAG_VISITED_RMY) };
         // incminimark.py:2280-2283 `size_objects_made_old`: the promotion is
         // where these bytes become old, so it is where the major-progress
         // accounting must see them.
@@ -2849,12 +2855,12 @@ impl MiniMarkGC {
         // incminimark.py:2285-2297. TRACK_YOUNG_PTRS is clear on every young
         // birth, so the first arm always runs; the remembered walk is what sets
         // the flag and forwards whatever nursery children the object holds.
-        if unsafe { !(*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+        if unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
             self.remembered_set.push(obj_addr);
         }
-        if unsafe { (*hdr).has_flag(flags::HAS_CARDS) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
             debug_assert!(
-                unsafe { (*hdr).has_flag(flags::CARDS_SET) },
+                unsafe { (*hdr).has_flag(flags::GCFLAG_CARDS_SET) },
                 "young array: GCFLAG_HAS_CARDS without GCFLAG_CARDS_SET"
             );
             self.old_objects_with_cards_set.push(obj_addr);
@@ -2866,8 +2872,8 @@ impl MiniMarkGC {
         // filled, so black alone would leave its children unmarked. Mark it and
         // re-queue it gray, the way `drag_out_root` does for a root first seen
         // during MARKING.
-        if self.gc_state == GcState::Marking && unsafe { !(*hdr).has_flag(flags::VISITED) } {
-            unsafe { (*hdr).set_flag(flags::VISITED) };
+        if self.gc_state == GcState::Marking && unsafe { !(*hdr).has_flag(flags::GCFLAG_VISITED) } {
+            unsafe { (*hdr).set_flag(flags::GCFLAG_VISITED) };
             self.incr_state.more_gray_stack.push(obj_addr);
         }
     }
@@ -2939,7 +2945,7 @@ impl MiniMarkGC {
         if self.gc_state == GcState::Marking {
             for &obj_addr in &self.old_objects_pointing_to_pinned {
                 let hdr = unsafe { header_of(obj_addr) };
-                if unsafe { (*hdr).has_flag(flags::VISITED) } {
+                if unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) } {
                     self.incr_state.more_gray_stack.push(obj_addr);
                 }
             }
@@ -3120,7 +3126,7 @@ impl MiniMarkGC {
             let remembered_now: Vec<usize> = self.remembered_set.to_vec();
             for obj_addr in remembered_now {
                 let hdr = unsafe { header_of(obj_addr) };
-                if unsafe { (*hdr).has_flag(flags::VISITED) } {
+                if unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) } {
                     self.incr_state.more_gray_stack.push(obj_addr);
                 }
             }
@@ -3164,7 +3170,7 @@ impl MiniMarkGC {
 
                 // incminimark.py:2095-2098: re-set TRACK_YOUNG_PTRS.
                 unsafe {
-                    (*header_of(obj_addr)).set_flag(flags::TRACK_YOUNG_PTRS);
+                    (*header_of(obj_addr)).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
                 }
 
                 // Trace this old-gen object's fields and copy any nursery
@@ -3230,7 +3236,7 @@ impl MiniMarkGC {
                 // not reach is about to be freed and must lose it.
                 if oldgen.young_rawmalloced_contains(owner) {
                     let hdr = unsafe { header_of(owner) };
-                    return unsafe { (*hdr).has_flag(flags::VISITED_RMY) }.then_some(owner);
+                    return unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED_RMY) }.then_some(owner);
                 }
                 return Some(owner);
             }
@@ -3238,8 +3244,8 @@ impl MiniMarkGC {
             let hdr = (owner - GcHeader::SIZE) as *const GcHeader;
             if unsafe {
                 !(*hdr).is_forwarded()
-                    && (*hdr).has_flag(flags::PINNED)
-                    && (*hdr).has_flag(flags::VISITED)
+                    && (*hdr).has_flag(flags::GCFLAG_PINNED)
+                    && (*hdr).has_flag(flags::GCFLAG_VISITED)
             } {
                 return Some(owner);
             }
@@ -3272,7 +3278,7 @@ impl MiniMarkGC {
                         // Safe because `pin` rejects types carrying GC
                         // pointers, as `record_pinned_object_with_shadow`
                         // requires before keeping the shadow black.
-                        unsafe { (*header_of(shadow_addr)).set_flag(flags::VISITED) };
+                        unsafe { (*header_of(shadow_addr)).set_flag(flags::GCFLAG_VISITED) };
                     }
                     new_shadows.insert(obj_addr, shadow_addr);
                 }
@@ -3314,7 +3320,7 @@ impl MiniMarkGC {
         // incminimark.py:1949-1951: the PINNED bit is reused on old objects as
         // PINNED_OBJECT_PARENT_KNOWN only within one minor collection.
         for &obj_addr in &self.old_objects_pointing_to_pinned {
-            unsafe { (*header_of(obj_addr)).clear_flag(flags::PINNED) };
+            unsafe { (*header_of(obj_addr)).clear_flag(flags::GCFLAG_PINNED_OBJECT_PARENT_KNOWN) };
         }
         self.refresh_published_nursery_top();
 
@@ -3394,7 +3400,7 @@ impl MiniMarkGC {
             // not change either way — so the surviving case updates nothing and
             // only hands the weakref to the next major cycle.
             if self.is_young_rawmalloced(pointing_to) {
-                if unsafe { (*header_of(pointing_to)).has_flag(flags::VISITED_RMY) } {
+                if unsafe { (*header_of(pointing_to)).has_flag(flags::GCFLAG_VISITED_RMY) } {
                     self.old_objects_with_weakrefs.push(new_obj);
                 } else {
                     unsafe { (*weakptr_slot).0 = 0 };
@@ -3438,7 +3444,7 @@ impl MiniMarkGC {
         debug_assert!(self.oldgen_nonmoving_active);
         for obj_addr in self.young_objects_with_weakrefs.iter().copied() {
             let weakref_hdr = unsafe { header_of(obj_addr) };
-            if unsafe { !(*weakref_hdr).has_flag(flags::VISITED) } {
+            if unsafe { !(*weakref_hdr).has_flag(flags::GCFLAG_VISITED) } {
                 continue;
             }
             let weakptr_slot = (obj_addr + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef;
@@ -3448,8 +3454,8 @@ impl MiniMarkGC {
             }
             let target_hdr = unsafe { header_of(pointing_to) };
             if unsafe {
-                !(*target_hdr).has_flag(flags::VISITED)
-                    || (*target_hdr).has_flag(flags::FINALIZATION_ORDERING)
+                !(*target_hdr).has_flag(flags::GCFLAG_VISITED)
+                    || (*target_hdr).has_flag(flags::GCFLAG_FINALIZATION_ORDERING)
             } {
                 unsafe { (*weakptr_slot).0 = 0 };
             }
@@ -3543,7 +3549,9 @@ impl MiniMarkGC {
             return true;
         }
         let hdr = unsafe { header_of(obj) };
-        unsafe { (*hdr).has_flag(flags::VISITED) || (*hdr).has_flag(flags::NO_HEAP_PTRS) }
+        unsafe {
+            (*hdr).has_flag(flags::GCFLAG_VISITED) || (*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS)
+        }
     }
 
     /// Mark what the C fields of a block whose own object survived reference.
@@ -3671,7 +3679,9 @@ impl MiniMarkGC {
             return false;
         }
         let hdr = unsafe { &*header_of(obj) };
-        !hdr.is_forwarded() && hdr.has_flag(flags::PINNED) && hdr.has_flag(flags::VISITED)
+        !hdr.is_forwarded()
+            && hdr.has_flag(flags::GCFLAG_PINNED)
+            && hdr.has_flag(flags::GCFLAG_VISITED)
     }
 
     fn rrc_young_object_alive(&self, obj: usize) -> bool {
@@ -3681,7 +3691,7 @@ impl MiniMarkGC {
         if self.is_young_rawmalloced(obj) {
             // incminimark.py:3300-3306: a young raw-malloced object survives
             // without moving, and GCFLAG_VISITED_RMY is what says so.
-            return unsafe { (*header_of(obj)).has_flag(flags::VISITED_RMY) };
+            return unsafe { (*header_of(obj)).has_flag(flags::GCFLAG_VISITED_RMY) };
         }
         if !self.is_nursery_object_start(obj) {
             return true;
@@ -3938,7 +3948,7 @@ impl MiniMarkGC {
         // a forwarding pointer. Its link already names its final address, so a
         // survivor only changes lists.
         if self.is_young_rawmalloced(obj) {
-            if unsafe { (*header_of(obj)).has_flag(flags::VISITED_RMY) } {
+            if unsafe { (*header_of(obj)).has_flag(flags::GCFLAG_VISITED_RMY) } {
                 match list {
                     RrcList::P => {
                         self.rrc.p_dict.insert(obj, mirror);
@@ -4126,7 +4136,10 @@ impl MiniMarkGC {
             true
         } else {
             let hdr = unsafe { header_of(obj) };
-            unsafe { (*hdr).has_flag(flags::VISITED) || (*hdr).has_flag(flags::NO_HEAP_PTRS) }
+            unsafe {
+                (*hdr).has_flag(flags::GCFLAG_VISITED)
+                    || (*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS)
+            }
         };
         if alive {
             surviving.push(mirror);
@@ -4170,7 +4183,7 @@ impl MiniMarkGC {
                 // through `get_possibly_forwarded_tid` — the object may have
                 // been forwarded by an earlier root walk this collection.
                 let hdr = self.get_possibly_forwarded_header(obj_addr);
-                if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
+                if unsafe { (*hdr).has_flag(flags::GCFLAG_IGNORE_FINALIZER) } {
                     continue;
                 }
                 let mut root = GcRef(obj_addr);
@@ -4181,7 +4194,7 @@ impl MiniMarkGC {
                     continue;
                 }
                 let hdr = unsafe { header_of(obj_addr) };
-                if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
+                if unsafe { (*hdr).has_flag(flags::GCFLAG_IGNORE_FINALIZER) } {
                     continue;
                 }
                 // incminimark.py:1838-1841 "they all survive": a registered
@@ -4220,7 +4233,7 @@ impl MiniMarkGC {
             // `free_young_rawmalloced_objects` reads the same flag a few steps
             // after it.
             if self.is_young_rawmalloced(obj_addr) {
-                if unsafe { (*header_of(obj_addr)).has_flag(flags::VISITED_RMY) } {
+                if unsafe { (*header_of(obj_addr)).has_flag(flags::GCFLAG_VISITED_RMY) } {
                     // Promoted in place: the address does not change, so the
                     // old-generation list takes it unchanged.
                     self.old_objects_with_destructors.push(obj_addr);
@@ -4267,21 +4280,21 @@ impl MiniMarkGC {
             // every other old-gen object — the write barrier tracks it through
             // that flag. (The source header was copied from the nursery object,
             // which does not carry it.)
-            (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
             // A shadow reserved during marking is an old-gen object subject to
             // this cycle's future sweep; keep it black so marking does not
             // reclaim the reserved identity home before the object is copied in
             // (incminimark.py record_pinned_object_with_shadow). See
             // `oldgen_birth_flags`.
             if self.gc_state == GcState::Marking {
-                (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::VISITED);
+                (*(shadow_hdr_ptr as *mut GcHeader)).set_flag(flags::GCFLAG_VISITED);
             }
             if item_size > 0 {
                 *((shadow_obj + length_offset) as *mut usize) =
                     *((obj_addr + length_offset) as *const usize);
             }
             let nursery_hdr = (obj_addr - GcHeader::SIZE) as *mut GcHeader;
-            (*nursery_hdr).set_flag(flags::HAS_SHADOW);
+            (*nursery_hdr).set_flag(flags::GCFLAG_HAS_SHADOW);
         }
         self.nursery_objects_shadows.insert(obj_addr, shadow_obj);
         shadow_obj
@@ -4300,7 +4313,7 @@ impl MiniMarkGC {
             !hdr.is_forwarded(),
             "stale pointer into the nursery: find_shadow reached a forwarded header at {obj_addr:#x}"
         );
-        if hdr.has_flag(flags::HAS_SHADOW) {
+        if hdr.has_flag(flags::GCFLAG_HAS_SHADOW) {
             // incminimark.py:2855-2857 `ll_assert(shadow != NULL,
             // "GCFLAG_HAS_SHADOW but no shadow found")`.  HAS_SHADOW
             // guarantees the map holds the shadow; a missing entry is a GC
@@ -4329,10 +4342,10 @@ impl MiniMarkGC {
         }
         let shadow = self.find_shadow(obj_addr);
         let hdr = unsafe { header_of(obj_addr) };
-        if unsafe { (*hdr).has_flag(flags::SHADOW_INITIALIZED) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_SHADOW_INITIALIZED) } {
             return shadow;
         }
-        unsafe { (*hdr).set_flag(flags::SHADOW_INITIALIZED) };
+        unsafe { (*hdr).set_flag(flags::GCFLAG_SHADOW_INITIALIZED) };
         let type_id = unsafe { (*hdr).type_id() };
         let payload_size = self.size_for_typeid(obj_addr, type_id, "move_out_of_nursery");
         // Payload only: `allocate_shadow` already wrote the shadow's own header
@@ -4505,7 +4518,7 @@ impl MiniMarkGC {
         // `IncrementalMiniMarkGC._trace_drag_out`: pin state lives on the
         // object header. Pinning is not a root; append the header address to
         // the survivor AddressStack only when a real traced edge reaches it.
-        if unsafe { (*hdr_ptr).has_flag(flags::PINNED) } {
+        if unsafe { (*hdr_ptr).has_flag(flags::GCFLAG_PINNED) } {
             // incminimark.py:2194-2199 records an old parent. The list outlives
             // the nursery reset at the end of this minor and is dereferenced in
             // the next one, so a nursery holder would become a read of recycled
@@ -4515,16 +4528,16 @@ impl MiniMarkGC {
                 && !self.is_in_nursery(holder_addr)
             {
                 let holder_hdr = unsafe { header_of(holder_addr) };
-                if unsafe { !(*holder_hdr).has_flag(flags::PINNED) } {
+                if unsafe { !(*holder_hdr).has_flag(flags::GCFLAG_PINNED_OBJECT_PARENT_KNOWN) } {
                     self.old_objects_pointing_to_pinned.push(holder_addr);
                     self.updated_old_objects_pointing_to_pinned = true;
-                    unsafe { (*holder_hdr).set_flag(flags::PINNED) };
+                    unsafe { (*holder_hdr).set_flag(flags::GCFLAG_PINNED_OBJECT_PARENT_KNOWN) };
                 }
             }
-            if unsafe { (*hdr_ptr).has_flag(flags::VISITED) } {
+            if unsafe { (*hdr_ptr).has_flag(flags::GCFLAG_VISITED) } {
                 return GcRef(obj_addr);
             }
-            unsafe { (*hdr_ptr).set_flag(flags::VISITED) };
+            unsafe { (*hdr_ptr).set_flag(flags::GCFLAG_VISITED) };
             self.surviving_pinned_objects
                 .push(obj_addr - GcHeader::SIZE);
             self.pinned_objects_in_nursery += 1;
@@ -4607,7 +4620,7 @@ impl MiniMarkGC {
         // shadow (from id() or identityhash()), copy into it instead
         // of a fresh allocation.
         let header_ptr = obj_addr - GcHeader::SIZE;
-        let new_header_ptr = if unsafe { (*hdr_ptr).has_flag(flags::HAS_SHADOW) } {
+        let new_header_ptr = if unsafe { (*hdr_ptr).has_flag(flags::GCFLAG_HAS_SHADOW) } {
             // incminimark.py:2213-2214 `ll_assert(newobj != NULL,
             // "GCFLAG_HAS_SHADOW but no shadow found")` — HAS_SHADOW
             // guarantees the shadow map entry exists.
@@ -4622,7 +4635,7 @@ impl MiniMarkGC {
             // incremental cycle could reclaim it (see test_pin_id_bug).
             // Remember VISITED and re-apply it after the copy.
             let shadow_was_visited =
-                unsafe { (*(shadow_hdr as *const GcHeader)).has_flag(flags::VISITED) };
+                unsafe { (*(shadow_hdr as *const GcHeader)).has_flag(flags::GCFLAG_VISITED) };
             // incminimark.py `_trace_drag_out`: `if (tid &
             // GCFLAG_SHADOW_INITIALIZED) != 0: copy = False`.
             // `move_out_of_nursery` has already filled this shadow, and its
@@ -4630,17 +4643,18 @@ impl MiniMarkGC {
             // merely redundant: HAS_SHADOW and SHADOW_INITIALIZED "have no
             // meaning in non-nursery objects", so the second copy is what would
             // carry the nursery flag word onto an object that has the right one.
-            let shadow_initialized = unsafe { (*hdr_ptr).has_flag(flags::SHADOW_INITIALIZED) };
+            let shadow_initialized =
+                unsafe { (*hdr_ptr).has_flag(flags::GCFLAG_SHADOW_INITIALIZED) };
             // minimark.py:1518-1520: clear HAS_SHADOW before copy so the
             // flag does not propagate to the shadow object itself.
-            unsafe { (*hdr_ptr).clear_flag(flags::HAS_SHADOW) };
+            unsafe { (*hdr_ptr).clear_flag(flags::GCFLAG_HAS_SHADOW) };
             if !shadow_initialized {
                 unsafe {
                     std::ptr::copy_nonoverlapping(header_ptr as *const u8, shadow_hdr, total_size);
                 }
             }
             if shadow_was_visited {
-                unsafe { (*(shadow_hdr as *mut GcHeader)).set_flag(flags::VISITED) };
+                unsafe { (*(shadow_hdr as *mut GcHeader)).set_flag(flags::GCFLAG_VISITED) };
                 // The copy above replaced every field of an object the marker
                 // has already accounted for as black, and the incoming values
                 // are this cycle's first sight of them: the shadow was reserved
@@ -4682,7 +4696,7 @@ impl MiniMarkGC {
         // copied from the nursery object, which does not carry it.)
         unsafe {
             let h = new_header_ptr as *mut GcHeader;
-            (*h).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*h).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
         }
 
         // Install forwarding pointer in the nursery copy.
@@ -4696,7 +4710,7 @@ impl MiniMarkGC {
             // Clear TRACK_YOUNG_PTRS temporarily so the processing loop
             // can re-set it after processing.
             unsafe {
-                (*(new_header_ptr as *mut GcHeader)).clear_flag(flags::TRACK_YOUNG_PTRS);
+                (*(new_header_ptr as *mut GcHeader)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
             }
             self.remembered_set.push(new_obj_addr);
             if crate::gc_lifetime_log_enabled() {
@@ -4777,8 +4791,10 @@ impl MiniMarkGC {
         // walk performs no address-table lookup at all.
         if self.gc_state == GcState::Marking && self.is_managed_heap_object(gcref.0) {
             let hdr = unsafe { header_of(gcref.0) };
-            if unsafe { !(*hdr).has_flag(flags::VISITED) && !(*hdr).has_flag(flags::PINNED) } {
-                unsafe { (*hdr).set_flag(flags::VISITED) };
+            if unsafe {
+                !(*hdr).has_flag(flags::GCFLAG_VISITED) && !(*hdr).has_flag(flags::GCFLAG_PINNED)
+            } {
+                unsafe { (*hdr).set_flag(flags::GCFLAG_VISITED) };
                 self.incr_state.more_gray_stack.push(gcref.0);
                 self.note_nonmoving_young_mark(gcref.0);
             }
@@ -5009,8 +5025,8 @@ impl MiniMarkGC {
         // SAFETY: header_of returns a raw pointer; keep each access
         // short-lived to avoid creating overlapping exclusive borrows.
         let newly_marked = unsafe {
-            if !(*hdr).has_flag(flags::VISITED) {
-                (*hdr).set_flag(flags::VISITED);
+            if !(*hdr).has_flag(flags::GCFLAG_VISITED) {
+                (*hdr).set_flag(flags::GCFLAG_VISITED);
                 true
             } else {
                 false
@@ -5028,8 +5044,10 @@ impl MiniMarkGC {
             // mutator barrier. Arm this newly seeded old root in the
             // existing old_objects_pointing_to_young shape once, so that
             // minor forwards any such spill before resetting nursery.
-            if !self.is_in_nursery(gcref.0) && unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
-                unsafe { (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS) };
+            if !self.is_in_nursery(gcref.0)
+                && unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) }
+            {
+                unsafe { (*hdr).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
                 self.remembered_set.push(gcref.0);
                 if crate::gc_lifetime_log_enabled() {
                     eprintln!(
@@ -5073,7 +5091,7 @@ impl MiniMarkGC {
     }
 
     /// Record a *young* object greyed during a non-moving major so its stale
-    /// `flags::VISITED` is cleared as the strictly-last collection step.
+    /// `flags::GCFLAG_VISITED` is cleared as the strictly-last collection step.
     /// No-op (just two range checks) outside a non-moving major; the normal
     /// incremental path runs after a minor, so nothing young survives to here.
     ///
@@ -5269,11 +5287,11 @@ impl MiniMarkGC {
     /// incminimark.py `prebuilt_root_objects.foreach(_collect_obj)`.
     fn seed_prebuilt_root(&mut self, addr: usize) {
         let hdr = unsafe { header_of(addr) };
-        debug_assert!(unsafe { !(*hdr).has_flag(flags::NO_HEAP_PTRS) });
-        if unsafe { !(*hdr).has_flag(flags::VISITED) } {
+        debug_assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) });
+        if unsafe { !(*hdr).has_flag(flags::GCFLAG_VISITED) } {
             unsafe {
-                (*hdr).set_flag(flags::VISITED);
-                (*hdr).set_flag(flags::TRACK_YOUNG_PTRS);
+                (*hdr).set_flag(flags::GCFLAG_VISITED);
+                (*hdr).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
             }
             self.incr_state.gray_stack.push(addr);
         }
@@ -5432,10 +5450,10 @@ impl MiniMarkGC {
                 continue;
             }
             let hdr = unsafe { header_of(gcref.0) };
-            if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+            if unsafe { (*hdr).has_flag(flags::GCFLAG_EXTRA) } {
                 continue;
             }
-            unsafe { (*hdr).set_flag(flags::EXTRA) };
+            unsafe { (*hdr).set_flag(flags::GCFLAG_EXTRA) };
             let is_requested_generation = match generation {
                 -1 => true,
                 // Youth, not nursery residency: a young raw-malloced object is
@@ -5447,7 +5465,7 @@ impl MiniMarkGC {
             };
             let type_id = unsafe { (*hdr).type_id() };
             if is_requested_generation
-                && !unsafe { (*hdr).has_flag(flags::DUMMY) }
+                && !unsafe { (*hdr).has_flag(flags::GCFLAG_DUMMY) }
                 && self.types.get(type_id).is_object
                 && !self.types.get(type_id).hide_from_app_level_inspector
             {
@@ -5464,10 +5482,10 @@ impl MiniMarkGC {
                 continue;
             }
             let hdr = unsafe { header_of(gcref.0) };
-            if unsafe { !(*hdr).has_flag(flags::EXTRA) } {
+            if unsafe { !(*hdr).has_flag(flags::GCFLAG_EXTRA) } {
                 continue;
             }
-            unsafe { (*hdr).clear_flag(flags::EXTRA) };
+            unsafe { (*hdr).clear_flag(flags::GCFLAG_EXTRA) };
             self.visit_referents(gcref.0, &mut |child| pending.push(child));
         }
         for gcref in result {
@@ -5635,10 +5653,10 @@ impl MiniMarkGC {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_EXTRA) } {
             return;
         }
-        unsafe { (*hdr).set_flag(flags::EXTRA) };
+        unsafe { (*hdr).set_flag(flags::GCFLAG_EXTRA) };
         pending.push(obj);
     }
 
@@ -5668,10 +5686,10 @@ impl MiniMarkGC {
                 continue;
             }
             let hdr = unsafe { header_of(obj.0) };
-            if unsafe { !(*hdr).has_flag(flags::EXTRA) } {
+            if unsafe { !(*hdr).has_flag(flags::GCFLAG_EXTRA) } {
                 continue;
             }
-            unsafe { (*hdr).clear_flag(flags::EXTRA) };
+            unsafe { (*hdr).clear_flag(flags::GCFLAG_EXTRA) };
             self.visit_referents(obj.0, &mut |child| pending.push(child));
         }
     }
@@ -5692,7 +5710,7 @@ impl MiniMarkGC {
         // object however its type reads.  Only a managed object carries the
         // header the flag lives in.
         if self.is_managed_heap_object(obj.0)
-            && unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
+            && unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_DUMMY) }
         {
             return false;
         }
@@ -5720,7 +5738,7 @@ impl MiniMarkGC {
             return true;
         }
         if !self.is_managed_heap_object(obj.0)
-            || unsafe { (*header_of(obj.0)).has_flag(flags::DUMMY) }
+            || unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_DUMMY) }
         {
             return false;
         }
@@ -5767,10 +5785,10 @@ impl MiniMarkGC {
                 }
                 if self.is_managed_heap_object(child.0) {
                     let hdr = unsafe { header_of(child.0) };
-                    if unsafe { (*hdr).has_flag(flags::EXTRA) } {
+                    if unsafe { (*hdr).has_flag(flags::GCFLAG_EXTRA) } {
                         continue;
                     }
-                    unsafe { (*hdr).set_flag(flags::EXTRA) };
+                    unsafe { (*hdr).set_flag(flags::GCFLAG_EXTRA) };
                 } else if pending.contains(&child) {
                     // RPython toggles GCFLAG_EXTRA on prebuilt objects too.
                     // Pyre's foreign wrappers have no GC header, so the same
@@ -5798,7 +5816,7 @@ impl MiniMarkGC {
         }
         for gcref in &pending {
             if self.is_managed_heap_object(gcref.0) {
-                unsafe { (*header_of(gcref.0)).clear_flag(flags::EXTRA) };
+                unsafe { (*header_of(gcref.0)).clear_flag(flags::GCFLAG_EXTRA) };
             }
         }
         for gcref in result {
@@ -6009,11 +6027,11 @@ impl MiniMarkGC {
             "object in nursery after collection at {obj_addr:#x}"
         );
         assert!(
-            !hdr.has_flag(flags::VISITED_RMY),
+            !hdr.has_flag(flags::GCFLAG_VISITED_RMY),
             "GCFLAG_VISITED_RMY after collection at {obj_addr:#x}"
         );
         assert!(
-            !hdr.has_flag(flags::PINNED),
+            !hdr.has_flag(flags::GCFLAG_PINNED),
             "GCFLAG_PINNED outside the nursery after collection at {obj_addr:#x}"
         );
     }
@@ -6341,8 +6359,8 @@ impl MiniMarkGC {
                     self.major_collections,
                 );
             }
-            if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                unsafe { (*hdr).set_flag(flags::VISITED) };
+            if unsafe { !(*hdr).has_flag(flags::GCFLAG_VISITED) } {
+                unsafe { (*hdr).set_flag(flags::GCFLAG_VISITED) };
                 self.incr_state.gray_stack.push(addr);
                 self.note_nonmoving_young_mark(addr);
             }
@@ -6382,12 +6400,12 @@ impl MiniMarkGC {
                 !unsafe { (*header_of(obj_addr)).is_forwarded() },
                 "stale major worklist entry: forwarded header at {obj_addr:#x}"
             );
-            if unsafe { (*header_of(obj_addr)).has_flag(flags::HAS_SHADOW) } {
+            if unsafe { (*header_of(obj_addr)).has_flag(flags::GCFLAG_HAS_SHADOW) } {
                 let shadow_obj = *self
                     .nursery_objects_shadows
                     .get(&obj_addr)
                     .expect("GCFLAG_HAS_SHADOW but no shadow found");
-                unsafe { (*header_of(shadow_obj)).set_flag(flags::VISITED) };
+                unsafe { (*header_of(shadow_obj)).set_flag(flags::GCFLAG_VISITED) };
             }
         }
         let custom_trace;
@@ -6476,7 +6494,7 @@ impl MiniMarkGC {
     fn rescan_remembered_black_and_drain(&mut self) {
         let snapshot: Vec<usize> = self.remembered_set.to_vec();
         for addr in snapshot {
-            if unsafe { (*header_of(addr)).has_flag(flags::VISITED) } {
+            if unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_VISITED) } {
                 self.incr_state.gray_stack.push(addr);
             }
         }
@@ -6523,7 +6541,7 @@ impl MiniMarkGC {
             // marks it without queueing it.
             let regray = !self.is_in_nursery(gcref.0)
                 && self.is_managed_heap_object(gcref.0)
-                && unsafe { (*header_of(gcref.0)).has_flag(flags::VISITED) };
+                && unsafe { (*header_of(gcref.0)).has_flag(flags::GCFLAG_VISITED) };
             if regray {
                 self.incr_state.gray_stack.push(gcref.0);
             } else {
@@ -6561,7 +6579,7 @@ impl MiniMarkGC {
                     return Some(owner);
                 }
                 let hdr = unsafe { header_of(owner) };
-                unsafe { (*hdr).has_flag(flags::VISITED) }.then_some(owner)
+                unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) }.then_some(owner)
             };
             let roots = crate::shadow_stack::mark_ephemeron_tables(&mut classify_owner);
             for root in roots {
@@ -6645,9 +6663,9 @@ impl MiniMarkGC {
         // minor does not trace freed memory. A no-op for do_collect_full, whose
         // leading minor already drained both sets.
         self.remembered_set
-            .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
+            .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_VISITED) });
         self.old_objects_with_cards_set
-            .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::VISITED) });
+            .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_VISITED) });
         // Embedder side tables keyed by owner address hold their value as a
         // root, so an entry outlives its owner unless it is dropped here —
         // the same "the target died" question `invalidate_old_weakrefs` just
@@ -6660,7 +6678,7 @@ impl MiniMarkGC {
                 return Some(owner);
             }
             let hdr = unsafe { header_of(owner) };
-            if unsafe { (*hdr).has_flag(flags::VISITED) } {
+            if unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) } {
                 Some(owner)
             } else {
                 None
@@ -6705,7 +6723,7 @@ impl MiniMarkGC {
         // stack before arena sweep invalidates their addresses. Survivors have
         // VISITED set at this point; the oldgen sweep clears it later.
         self.old_objects_pointing_to_pinned
-            .retain(|&obj_addr| unsafe { (*header_of(obj_addr)).has_flag(flags::VISITED) });
+            .retain(|&obj_addr| unsafe { (*header_of(obj_addr)).has_flag(flags::GCFLAG_VISITED) });
         self.updated_old_objects_pointing_to_pinned = true;
         // incminimark.py:2528-2529 — VISITED still distinguishes survivors, so
         // this is where each mirror learns whether its object made it.
@@ -6764,7 +6782,7 @@ impl MiniMarkGC {
         // incminimark.py:2563-2564: prebuilt objects are outside the arena
         // sweep, so reset their mark bit explicitly for the next cycle.
         for &addr in &self.prebuilt_root_objects {
-            unsafe { (*header_of(addr)).clear_flag(flags::VISITED) };
+            unsafe { (*header_of(addr)).clear_flag(flags::GCFLAG_VISITED) };
         }
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
@@ -6905,7 +6923,7 @@ impl MiniMarkGC {
         for obj_addr in entries {
             let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
             // incminimark.py:3112: weakref itself not marked → dies.
-            if unsafe { !(*hdr_ptr).has_flag(flags::VISITED) } {
+            if unsafe { !(*hdr_ptr).has_flag(flags::GCFLAG_VISITED) } {
                 continue;
             }
             let weakptr_slot = (obj_addr + crate::weakref::WEAKPTR_OFFSET) as *mut GcRef;
@@ -6930,8 +6948,8 @@ impl MiniMarkGC {
             // their weakrefs observe death before `__del__` runs.
             let target_hdr = (pointing_to - GcHeader::SIZE) as *const GcHeader;
             if unsafe {
-                (*target_hdr).has_flag(flags::VISITED)
-                    && !(*target_hdr).has_flag(flags::FINALIZATION_ORDERING)
+                (*target_hdr).has_flag(flags::GCFLAG_VISITED)
+                    && !(*target_hdr).has_flag(flags::GCFLAG_FINALIZATION_ORDERING)
             } {
                 new_with_weakref.push(obj_addr);
             } else {
@@ -6943,8 +6961,8 @@ impl MiniMarkGC {
 
     fn finalization_state(&self, obj_addr: usize) -> u8 {
         let hdr = unsafe { header_of(obj_addr) };
-        let visited = unsafe { (*hdr).has_flag(flags::VISITED) };
-        let ordering = unsafe { (*hdr).has_flag(flags::FINALIZATION_ORDERING) };
+        let visited = unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) };
+        let ordering = unsafe { (*hdr).has_flag(flags::GCFLAG_FINALIZATION_ORDERING) };
         match (visited, ordering) {
             (false, false) => 0,
             (false, true) => 1,
@@ -6994,7 +7012,7 @@ impl MiniMarkGC {
         let mut pending = vec![obj_addr];
         while let Some(addr) = pending.pop() {
             if self.finalization_state(addr) == 2 {
-                unsafe { (*header_of(addr)).clear_flag(flags::FINALIZATION_ORDERING) };
+                unsafe { (*header_of(addr)).clear_flag(flags::GCFLAG_FINALIZATION_ORDERING) };
                 pending.extend(self.finalizer_children(addr));
             }
         }
@@ -7034,10 +7052,10 @@ impl MiniMarkGC {
 
         while let Some((obj_addr, fq_index)) = self.old_objects_with_finalizers.pop_front() {
             let hdr = unsafe { header_of(obj_addr) };
-            if unsafe { (*hdr).has_flag(flags::IGNORE_FINALIZER) } {
+            if unsafe { (*hdr).has_flag(flags::GCFLAG_IGNORE_FINALIZER) } {
                 continue;
             }
-            if unsafe { (*hdr).has_flag(flags::VISITED) } {
+            if unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) } {
                 new_with_finalizer.push_back((obj_addr, fq_index));
                 continue;
             }
@@ -7047,7 +7065,7 @@ impl MiniMarkGC {
             while let Some(addr) = pending.pop() {
                 match self.finalization_state(addr) {
                     0 => {
-                        unsafe { (*header_of(addr)).set_flag(flags::FINALIZATION_ORDERING) };
+                        unsafe { (*header_of(addr)).set_flag(flags::GCFLAG_FINALIZATION_ORDERING) };
                         // incminimark.py:3011-3020
                         //
                         // Upstream reaches this seam only after a minor has
@@ -7130,7 +7148,7 @@ impl MiniMarkGC {
         let mut new_objects = Vec::with_capacity(entries.len());
         for obj_addr in entries {
             let hdr_ptr = (obj_addr - GcHeader::SIZE) as *const GcHeader;
-            if unsafe { (*hdr_ptr).has_flag(flags::VISITED) } {
+            if unsafe { (*hdr_ptr).has_flag(flags::GCFLAG_VISITED) } {
                 // surviving
                 new_objects.push(obj_addr);
             } else {
@@ -7341,7 +7359,7 @@ impl MiniMarkGC {
     /// fully followed and the target old object is marked before the sweep.
     ///
     /// Unlike a moving minor, nursery survivors keep their addresses, so a
-    /// `flags::VISITED` set on a marked-through nursery object would otherwise
+    /// `flags::GCFLAG_VISITED` set on a marked-through nursery object would otherwise
     /// survive into the next minor's promoted copy (`copy_nursery_object`
     /// memcpys the header verbatim). The strictly-last step clears VISITED on
     /// exactly the nursery objects greyed this cycle — after
@@ -7394,7 +7412,7 @@ impl MiniMarkGC {
             // already cleared.
             if self.is_in_nursery(addr) || self.is_young_rawmalloced(addr) {
                 let hdr = unsafe { header_of(addr) };
-                unsafe { (*hdr).clear_flag(flags::VISITED) };
+                unsafe { (*hdr).clear_flag(flags::GCFLAG_VISITED) };
             }
         }
     }
@@ -7473,7 +7491,7 @@ impl MiniMarkGC {
         }
         if self.is_managed_heap_object(obj.0) {
             let hdr = unsafe { header_of(obj.0) };
-            if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            if unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
                 self.remember_young_pointer(obj);
             }
             return;
@@ -7490,7 +7508,7 @@ impl MiniMarkGC {
         let Some(hdr) = self.registered_external_header(obj.0) else {
             return;
         };
-        if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
             self.remember_young_pointer(obj);
         }
     }
@@ -7504,7 +7522,7 @@ impl MiniMarkGC {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
             self.remember_young_pointer(obj);
         }
     }
@@ -7534,9 +7552,9 @@ impl MiniMarkGC {
             );
         }
         unsafe {
-            (*hdr).clear_flag(flags::TRACK_YOUNG_PTRS);
-            if (*hdr).has_flag(flags::NO_HEAP_PTRS) {
-                (*hdr).clear_flag(flags::NO_HEAP_PTRS);
+            (*hdr).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
+            if (*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) {
+                (*hdr).clear_flag(flags::GCFLAG_NO_HEAP_PTRS);
                 self.prebuilt_root_objects.push(obj.0);
             }
         }
@@ -7553,7 +7571,7 @@ impl MiniMarkGC {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
             self.remember_young_pointer_from_array2(obj, index, card_page_shift);
         }
     }
@@ -7569,7 +7587,7 @@ impl MiniMarkGC {
         card_page_shift: u32,
     ) {
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { !(*hdr).has_flag(flags::HAS_CARDS) } {
+        if unsafe { !(*hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
             // No cards — fall back to the generic _remember_young_pointer_inlined.
             self.remember_young_pointer(obj);
             return;
@@ -7585,10 +7603,10 @@ impl MiniMarkGC {
     /// back to remember_young_pointer (generic barrier).
     pub fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { (*hdr).has_flag(flags::HAS_CARDS) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
             // incminimark.py:1614-1615
             self.old_objects_with_cards_set.push(obj.0);
-            unsafe { (*hdr).set_flag(flags::CARDS_SET) };
+            unsafe { (*hdr).set_flag(flags::GCFLAG_CARDS_SET) };
         } else {
             // No cards: the JIT already passed the inline flag test, so use
             // the corresponding remember_young_pointer path.
@@ -7632,34 +7650,35 @@ impl MiniMarkGC {
         let dest_hdr = unsafe { header_of(dest_addr) };
         // The fast path of the write barrier: a destination already on the
         // remembered set needs nothing more.
-        if unsafe { !(*dest_hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+        if unsafe { !(*dest_hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
             return true;
         }
 
-        if self.config.card_page_indices > 0 && unsafe { (*source_hdr).has_flag(flags::HAS_CARDS) }
+        if self.config.card_page_indices > 0
+            && unsafe { (*source_hdr).has_flag(flags::GCFLAG_HAS_CARDS) }
         {
-            if unsafe { !(*source_hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            if unsafe { !(*source_hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
                 // "The source object may have random young pointers."
                 return false;
             }
-            if unsafe { !(*dest_hdr).has_flag(flags::HAS_CARDS) } {
+            if unsafe { !(*dest_hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
                 // "The dest object doesn't have cards.  Do it manually."
                 return false;
             }
             debug_assert!(
-                unsafe { !(*dest_hdr).has_flag(flags::NO_HEAP_PTRS) },
+                unsafe { !(*dest_hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) },
                 "prebuilt object with cards is not supported"
             );
-            if unsafe { !(*source_hdr).has_flag(flags::CARDS_SET) } {
+            if unsafe { !(*source_hdr).has_flag(flags::GCFLAG_CARDS_SET) } {
                 // The source has no young pointers at all, so no card needs
                 // marking.  A black destination still has to go gray and be
                 // rescanned, which is what `collect_cardrefs_to_nursery` reads
                 // CARDS_SET for at the end of a marking step.
                 if self.gc_state == GcState::Marking
-                    && unsafe { !(*dest_hdr).has_flag(flags::CARDS_SET) }
+                    && unsafe { !(*dest_hdr).has_flag(flags::GCFLAG_CARDS_SET) }
                 {
                     self.old_objects_with_cards_set.push(dest_addr);
-                    unsafe { (*dest_hdr).set_flag(flags::CARDS_SET) };
+                    unsafe { (*dest_hdr).set_flag(flags::GCFLAG_CARDS_SET) };
                 }
                 return true;
             }
@@ -7676,16 +7695,16 @@ impl MiniMarkGC {
         // barrier is also what turns a black object gray again, so a source
         // that already lost the flag can still hold pointers this copy must
         // report.
-        if unsafe { !(*source_hdr).has_flag(flags::TRACK_YOUNG_PTRS) }
+        if unsafe { !(*source_hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) }
             || self.gc_state == GcState::Marking
         {
             self.remember_young_pointer(GcRef(dest_addr));
         }
 
-        if unsafe { (*dest_hdr).has_flag(flags::NO_HEAP_PTRS) }
-            && unsafe { !(*source_hdr).has_flag(flags::NO_HEAP_PTRS) }
+        if unsafe { (*dest_hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) }
+            && unsafe { !(*source_hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) }
         {
-            unsafe { (*dest_hdr).clear_flag(flags::NO_HEAP_PTRS) };
+            unsafe { (*dest_hdr).clear_flag(flags::GCFLAG_NO_HEAP_PTRS) };
             self.prebuilt_root_objects.push(dest_addr);
         }
         true
@@ -7719,7 +7738,7 @@ impl MiniMarkGC {
             return;
         }
         let hdr = unsafe { header_of(array_addr) };
-        if unsafe { (*hdr).has_flag(flags::CARDS_SET) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_CARDS_SET) } {
             self.do_write_barrier(GcRef(array_addr));
         }
     }
@@ -7739,9 +7758,9 @@ impl MiniMarkGC {
         }
         if anybyte != 0 {
             let dest_hdr = unsafe { header_of(dest_addr) };
-            if unsafe { !(*dest_hdr).has_flag(flags::CARDS_SET) } {
+            if unsafe { !(*dest_hdr).has_flag(flags::GCFLAG_CARDS_SET) } {
                 self.old_objects_with_cards_set.push(dest_addr);
-                unsafe { (*dest_hdr).set_flag(flags::CARDS_SET) };
+                unsafe { (*dest_hdr).set_flag(flags::GCFLAG_CARDS_SET) };
             }
         }
     }
@@ -7769,9 +7788,9 @@ impl MiniMarkGC {
 
         // incminimark.py:1596-1598: if CARDS_SET not set, track and set.
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { !(*hdr).has_flag(flags::CARDS_SET) } {
+        if unsafe { !(*hdr).has_flag(flags::GCFLAG_CARDS_SET) } {
             self.old_objects_with_cards_set.push(obj.0);
-            unsafe { (*hdr).set_flag(flags::CARDS_SET) };
+            unsafe { (*hdr).set_flag(flags::GCFLAG_CARDS_SET) };
         }
     }
 
@@ -7779,7 +7798,7 @@ impl MiniMarkGC {
     /// Reads inline card bytes before the GcHeader.
     pub fn is_card_dirty(&self, obj: GcRef, card_index: usize) -> bool {
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { !(*hdr).has_flag(flags::HAS_CARDS) } {
+        if unsafe { !(*hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
             return false;
         }
         let byteindex = card_index >> 3;
@@ -7792,7 +7811,7 @@ impl MiniMarkGC {
     /// Reads inline card bytes before the GcHeader.
     pub fn dirty_cards(&self, obj: GcRef) -> Vec<usize> {
         let hdr = unsafe { header_of(obj.0) };
-        if unsafe { !(*hdr).has_flag(flags::HAS_CARDS) } {
+        if unsafe { !(*hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
             return Vec::new();
         }
         let type_id = unsafe { (*hdr).type_id() };
@@ -7820,9 +7839,9 @@ impl MiniMarkGC {
         while let Some(obj) = self.old_objects_with_cards_set.pop() {
             // incminimark.py:2016-2020
             let hdr = unsafe { header_of(obj) };
-            debug_assert!(unsafe { (*hdr).has_flag(flags::HAS_CARDS) });
-            debug_assert!(unsafe { (*hdr).has_flag(flags::CARDS_SET) });
-            unsafe { (*hdr).clear_flag(flags::CARDS_SET) };
+            debug_assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) });
+            debug_assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_CARDS_SET) });
+            unsafe { (*hdr).clear_flag(flags::GCFLAG_CARDS_SET) };
 
             // incminimark.py:2023-2026
             let type_id = unsafe { (*hdr).type_id() };
@@ -7834,7 +7853,7 @@ impl MiniMarkGC {
             // incminimark.py:2033-2039: if !TRACK_YOUNG_PTRS, object is also
             // in old_objects_pointing_to_young and will be fully traced.
             // Just clear card bytes.
-            if unsafe { !(*hdr).has_flag(flags::TRACK_YOUNG_PTRS) } {
+            if unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
                 for bi in 0..bytes {
                     let p = Self::get_card_ptr(obj, bi);
                     unsafe {
@@ -7921,7 +7940,7 @@ impl MiniMarkGC {
             // leave the still-reachable card object white for the incremental
             // sweep to reclaim.
             if self.gc_state == GcState::Marking {
-                unsafe { (*hdr).set_flag(flags::VISITED) };
+                unsafe { (*hdr).set_flag(flags::GCFLAG_VISITED) };
                 self.incr_state.more_gray_stack.push(obj);
             }
         }
@@ -7930,8 +7949,8 @@ impl MiniMarkGC {
     /// Clear inline card bytes for a given object.
     pub fn clear_cards(&mut self, obj_addr: usize) {
         let hdr = unsafe { header_of(obj_addr) };
-        if unsafe { !(*hdr).has_flag(flags::HAS_CARDS) } {
-            unsafe { (*hdr).clear_flag(flags::CARDS_SET) };
+        if unsafe { !(*hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
+            unsafe { (*hdr).clear_flag(flags::GCFLAG_CARDS_SET) };
             return;
         }
         let type_id = unsafe { (*hdr).type_id() };
@@ -7945,7 +7964,7 @@ impl MiniMarkGC {
                 *p = 0;
             }
         }
-        unsafe { (*hdr).clear_flag(flags::CARDS_SET) };
+        unsafe { (*hdr).clear_flag(flags::GCFLAG_CARDS_SET) };
     }
 
     // ── JIT integration hooks ──
@@ -8020,7 +8039,7 @@ impl MiniMarkGC {
             let type_id = unsafe { (*header_of(obj_addr)).type_id() };
             let payload_size = self.size_for_typeid(obj_addr, type_id, "pinned_barriers");
             let object_size = Self::nursery_allocation_size(GcHeader::SIZE + payload_size);
-            unsafe { (*header_of(obj_addr)).clear_flag(flags::VISITED) };
+            unsafe { (*header_of(obj_addr)).clear_flag(flags::GCFLAG_VISITED) };
             barriers.push_back(header_addr);
             previous_end = header_addr + object_size;
         }
@@ -8076,7 +8095,7 @@ impl MiniMarkGC {
             return false;
         }
         unsafe {
-            (*header_of(obj.0)).set_flag(flags::PINNED);
+            (*header_of(obj.0)).set_flag(flags::GCFLAG_PINNED);
         }
         self.pinned_objects_in_nursery += 1;
         true
@@ -8086,7 +8105,7 @@ impl MiniMarkGC {
     pub fn unpin(&mut self, obj: GcRef) {
         assert!(self.is_pinned(obj), "unpin: object is already not pinned");
         unsafe {
-            (*header_of(obj.0)).clear_flag(flags::PINNED);
+            (*header_of(obj.0)).clear_flag(flags::GCFLAG_PINNED);
         }
         self.pinned_objects_in_nursery -= 1;
     }
@@ -8097,7 +8116,7 @@ impl MiniMarkGC {
             return false;
         }
         let hdr = unsafe { &*header_of(obj.0) };
-        !hdr.is_forwarded() && hdr.has_flag(flags::PINNED)
+        !hdr.is_forwarded() && hdr.has_flag(flags::GCFLAG_PINNED)
     }
 
     /// Number of objects in the remembered set (for testing / diagnostics).
@@ -8435,7 +8454,7 @@ impl GcAllocator for MiniMarkGC {
             return;
         }
         let hdr = unsafe { header_of(obj.0) };
-        unsafe { (*hdr).set_flag(flags::IGNORE_FINALIZER) };
+        unsafe { (*hdr).set_flag(flags::GCFLAG_IGNORE_FINALIZER) };
     }
 
     fn finalizer_next_dead(&mut self, fq_index: usize) -> Option<GcRef> {
@@ -9031,7 +9050,7 @@ mod tests {
             "a reached object survives its minor"
         );
         assert!(
-            unsafe { !(*header_of(root.0)).has_flag(flags::VISITED_RMY) },
+            unsafe { !(*header_of(root.0)).has_flag(flags::GCFLAG_VISITED_RMY) },
             "incminimark.py:2663 clears the flag on the survivor"
         );
         // A second minor must not free it either: it is on
@@ -9062,7 +9081,7 @@ mod tests {
         );
         let hdr = unsafe { header_of(addr) };
         assert!(
-            unsafe { !(*hdr).has_flag(flags::VISITED) },
+            unsafe { !(*hdr).has_flag(flags::GCFLAG_VISITED) },
             "and it leaves no mark behind: a VISITED that survives the cycle \
              is read by the NEXT major as `already greyed`, which skips the \
              object and leaves its children untraced"
@@ -9182,7 +9201,7 @@ mod tests {
         let obj = gc.alloc_with_type(tid, large);
         assert!(!gc.is_young_rawmalloced(obj.0), "born old");
         assert!(
-            unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) },
+            unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) },
             "and with the old generation's birth flags"
         );
     }
@@ -9493,7 +9512,7 @@ mod tests {
         assert!(get_objects(&mut gc, 1).is_empty());
         assert!(get_objects(&mut gc, 2).is_empty());
         for object in [holder, raw, leaf] {
-            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::GCFLAG_EXTRA) });
         }
 
         gc.do_collect_nursery();
@@ -9505,7 +9524,7 @@ mod tests {
         assert!(old.contains(&holder));
         assert!(old.contains(&leaf));
         for object in [holder, raw, leaf] {
-            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::GCFLAG_EXTRA) });
         }
         gc.roots.clear();
     }
@@ -9568,7 +9587,7 @@ mod tests {
 
         assert_eq!(gc.do_dump_rpy_heap(-1), Err(libc::EBADF));
         for object in [holder, leaf] {
-            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::GCFLAG_EXTRA) });
         }
         assert!(gc.types.typeids_text().starts_with(b"member0"));
         assert_eq!(gc.types.typeids_list(), vec![0, 0, 1]);
@@ -9595,7 +9614,7 @@ mod tests {
         let dummy = gc.alloc_with_type(object_tid, ptr_size);
         let mut holder = gc.alloc_with_type(object_tid, ptr_size);
         unsafe {
-            (*header_of(dummy.0)).set_flag(flags::DUMMY);
+            (*header_of(dummy.0)).set_flag(flags::GCFLAG_DUMMY);
             *(hidden.0 as *mut GcRef) = leaf;
             *(dummy.0 as *mut GcRef) = tail;
             *(holder.0 as *mut GcRef) = hidden;
@@ -9614,7 +9633,7 @@ mod tests {
         assert_eq!(referents, vec![tail]);
 
         for object in [holder, hidden, dummy, leaf, tail] {
-            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::GCFLAG_EXTRA) });
         }
         gc.roots.clear();
     }
@@ -9651,7 +9670,7 @@ mod tests {
         assert!(!referents.contains(&raw));
         assert!(!referents.contains(&holder));
         for object in [holder, raw, near, far] {
-            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::GCFLAG_EXTRA) });
         }
 
         // A self-referential object terminates instead of looping forever.
@@ -9699,7 +9718,7 @@ mod tests {
         gc.do_get_referents(holder, &mut |gcref| referents.push(gcref));
         assert_eq!(referents, vec![class]);
         for object in [holder, class, item] {
-            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::EXTRA) });
+            assert!(!unsafe { (*header_of(object.0)).has_flag(flags::GCFLAG_EXTRA) });
         }
         gc.roots.clear();
     }
@@ -9853,8 +9872,8 @@ mod tests {
         let descr = gc
             .get_write_barrier_descr()
             .expect("MiniMark must expose its write-barrier descriptor");
-        assert_eq!(descr.jit_wb_if_flag, flags::TRACK_YOUNG_PTRS);
-        assert_eq!(descr.jit_wb_cards_set, flags::CARDS_SET);
+        assert_eq!(descr.jit_wb_if_flag, flags::GCFLAG_TRACK_YOUNG_PTRS);
+        assert_eq!(descr.jit_wb_cards_set, flags::GCFLAG_CARDS_SET);
         assert_eq!(descr.jit_wb_card_page_shift, gc.card_page_shift);
     }
 
@@ -9869,7 +9888,7 @@ mod tests {
         let descr = gc
             .get_write_barrier_descr()
             .expect("MiniMark must retain its generic write barrier");
-        assert_eq!(descr.jit_wb_if_flag, flags::TRACK_YOUNG_PTRS);
+        assert_eq!(descr.jit_wb_if_flag, flags::GCFLAG_TRACK_YOUNG_PTRS);
         assert_eq!(descr.jit_wb_cards_set, 0);
         assert_eq!(descr.jit_wb_card_page_shift, 0);
     }
@@ -10622,11 +10641,11 @@ mod tests {
 
         // The old object should have TRACK_YOUNG_PTRS.
         let hdr = unsafe { header_of(old_obj.0) };
-        assert!(unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
 
         // Write barrier clears the flag and adds to remembered set.
         gc.do_write_barrier(old_obj);
-        assert!(unsafe { !(*hdr).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
         assert_eq!(gc.remembered_set.len(), 1);
 
         // Second call: flag already cleared, should not add again.
@@ -10654,13 +10673,13 @@ mod tests {
         // clear. Stamp incminimark's `init_gc_object_immortal` shape by hand
         // to exercise the lifecycle this test is about.
         unsafe {
-            (*hdr).set_flag(flags::NO_HEAP_PTRS);
-            (*hdr).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*hdr).set_flag(flags::GCFLAG_NO_HEAP_PTRS);
+            (*hdr).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
         }
-        assert!(unsafe { (*hdr).has_flag(flags::NO_HEAP_PTRS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) });
 
         gc.do_write_barrier(prebuilt_ref);
-        assert!(unsafe { !(*hdr).has_flag(flags::NO_HEAP_PTRS) });
+        assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) });
         assert_eq!(gc.remembered_set, vec![prebuilt_ref.0]);
         assert_eq!(gc.prebuilt_root_objects, vec![prebuilt_ref.0]);
 
@@ -10673,7 +10692,7 @@ mod tests {
         assert_eq!(gc.prebuilt_root_objects, vec![prebuilt_ref.0]);
         gc.collect_full();
         assert!(gc.oldgen.contains(promoted_child.0));
-        assert!(unsafe { !(*hdr).has_flag(flags::VISITED) });
+        assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_VISITED) });
     }
 
     // incminimark gates the write barrier solely on GCFLAG_TRACK_YOUNG_PTRS:
@@ -10686,7 +10705,7 @@ mod tests {
         let mut gc = test_gc(1024);
         gc.register_type(TypeInfo::simple(16));
         let obj = gc.alloc_in_oldgen_clear(0, GcHeader::SIZE + 16);
-        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
     #[test]
@@ -10697,7 +10716,7 @@ mod tests {
         let length = 4usize;
         let total_size = GcHeader::SIZE + 8 + ptr_size * length;
         let obj = gc.alloc_in_oldgen_with_cards(tid, total_size, length, true);
-        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
     #[test]
@@ -10710,7 +10729,7 @@ mod tests {
         gc.collect_nursery();
         // `root` now holds the promoted old-gen address.
         assert!(!gc.is_in_nursery(root.0));
-        assert!(unsafe { (*header_of(root.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(root.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
         gc.roots.clear();
     }
 
@@ -10720,7 +10739,7 @@ mod tests {
         gc.register_type(TypeInfo::simple(16));
         let obj = gc.alloc_with_type(0, 16);
         let shadow = gc.allocate_shadow(obj.0);
-        assert!(unsafe { (*header_of(shadow)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(shadow)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
     #[test]
@@ -10746,7 +10765,7 @@ mod tests {
         gc.do_collect_oldgen_nonmoving();
         assert_eq!(gc.oldgen.object_count(), 1);
         assert!(gc.oldgen.contains(shadow));
-        assert!(!unsafe { (*header_of(shadow)).has_flag(flags::VISITED) });
+        assert!(!unsafe { (*header_of(shadow)).has_flag(flags::GCFLAG_VISITED) });
 
         // The following minor occupies exactly that reserved identity home.
         gc.do_collect_nursery();
@@ -10871,7 +10890,7 @@ mod tests {
         let fake = base as *mut GcHeader;
         unsafe {
             fake.write(GcHeader::new(other_tid));
-            (*fake).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*fake).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
         }
         let fake_bits_before = unsafe { (*fake).tid_and_flags };
 
@@ -11483,14 +11502,14 @@ mod tests {
         let tid = gc.register_type(TypeInfo::simple(8));
         let old = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 8);
         let hdr = unsafe { header_of(old.0) };
-        assert!(!unsafe { (*hdr).has_flag(flags::VISITED) });
+        assert!(!unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) });
 
         gc.gc_state = GcState::Marking;
         let mut root = old;
         gc.drag_out_root(&mut root);
 
         assert_eq!(root, old);
-        assert!(unsafe { (*hdr).has_flag(flags::VISITED) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) });
         assert!(gc.incr_state.gray_stack.is_empty());
         assert_eq!(gc.incr_state.more_gray_stack.pop(), Some(old.0));
     }
@@ -11517,7 +11536,7 @@ mod tests {
         let mut gc = test_gc(4096);
         let (obj, _) = alloc_card_array(&mut gc, 512);
         let hdr = unsafe { header_of(obj.0) };
-        assert!(unsafe { (*hdr).has_flag(flags::HAS_CARDS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) });
 
         // Card-marking write barrier: mark card for index 5.
         gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
@@ -11528,7 +11547,7 @@ mod tests {
             "card 0 should be dirty after writing index 5"
         );
         assert!(
-            unsafe { (*hdr).has_flag(flags::CARDS_SET) },
+            unsafe { (*hdr).has_flag(flags::GCFLAG_CARDS_SET) },
             "CARDS_SET flag should be set"
         );
 
@@ -11546,7 +11565,7 @@ mod tests {
         let mut gc = test_gc(4096);
         let (obj, array_length) = alloc_card_array(&mut gc, 512);
         let hdr = unsafe { header_of(obj.0) };
-        assert!(unsafe { (*hdr).has_flag(flags::HAS_CARDS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) });
 
         // external_malloc is not zero-filled.  Initialize every item that
         // dirty-card tracing is allowed to read, as production allocation
@@ -11563,7 +11582,7 @@ mod tests {
         gc.do_write_barrier_card(obj, 0, DEFAULT_CARD_PAGE_SHIFT);
         gc.do_write_barrier_card(obj, 200, DEFAULT_CARD_PAGE_SHIFT);
         assert!(
-            unsafe { (*hdr).has_flag(flags::CARDS_SET) },
+            unsafe { (*hdr).has_flag(flags::GCFLAG_CARDS_SET) },
             "CARDS_SET should be set before collection"
         );
 
@@ -11577,7 +11596,7 @@ mod tests {
 
         let hdr = unsafe { header_of(root.0) };
         assert!(
-            unsafe { !(*hdr).has_flag(flags::CARDS_SET) },
+            unsafe { !(*hdr).has_flag(flags::GCFLAG_CARDS_SET) },
             "CARDS_SET flag should be cleared after collection"
         );
         assert!(
@@ -11884,7 +11903,7 @@ mod tests {
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::simple(16));
         let modified = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
-        unsafe { (*header_of(modified.0)).set_flag(flags::VISITED) };
+        unsafe { (*header_of(modified.0)).set_flag(flags::GCFLAG_VISITED) };
 
         gc.gc_state = GcState::Marking;
         gc.incr_state.gray_stack.clear();
@@ -12055,7 +12074,7 @@ mod tests {
         gc.do_collect_nursery();
         assert!(!gc.is_in_nursery(root.0), "the object promoted");
 
-        unsafe { (*header_of(root.0)).set_flag(flags::VISITED_RMY) };
+        unsafe { (*header_of(root.0)).set_flag(flags::GCFLAG_VISITED_RMY) };
         gc.debug_check_consistency();
     }
 
@@ -12085,9 +12104,9 @@ mod tests {
         unsafe { gc.roots.add(&mut root) };
         gc.do_collect_nursery();
 
-        unsafe { (*header_of(root.0)).set_flag(flags::VISITED_RMY) };
+        unsafe { (*header_of(root.0)).set_flag(flags::GCFLAG_VISITED_RMY) };
         gc.debug_check_consistency();
-        unsafe { (*header_of(root.0)).clear_flag(flags::VISITED_RMY) };
+        unsafe { (*header_of(root.0)).clear_flag(flags::GCFLAG_VISITED_RMY) };
         gc.roots.clear();
     }
 
@@ -12353,7 +12372,7 @@ mod tests {
         }
 
         let hdr = unsafe { header_of(arr.0) };
-        assert!(unsafe { (*hdr).has_flag(flags::HAS_CARDS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) });
 
         // Initialize all array slots to NULL.
         let items_start = arr.0 + 8;
@@ -12430,7 +12449,7 @@ mod tests {
         // Cards should be cleared after collection.
         let hdr = unsafe { header_of(root.0) };
         assert!(
-            unsafe { !(*hdr).has_flag(flags::CARDS_SET) },
+            unsafe { !(*hdr).has_flag(flags::GCFLAG_CARDS_SET) },
             "CARDS_SET should be cleared after collection"
         );
         assert!(
@@ -12438,7 +12457,7 @@ mod tests {
             "old_objects_with_cards_set should be empty after collection"
         );
         assert!(
-            unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) },
+            unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) },
             "TRACK_YOUNG_PTRS should be re-set after collection"
         );
 
@@ -12506,9 +12525,9 @@ mod tests {
         assert!(!gc.is_in_nursery(root_c.0));
 
         // All old-gen objects should have TRACK_YOUNG_PTRS set.
-        assert!(unsafe { (*header_of(root_a.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
-        assert!(unsafe { (*header_of(root_b.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
-        assert!(unsafe { (*header_of(root_c.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(root_a.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(root_b.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(root_c.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
 
         // Start an incremental marking cycle with budget=1 so it stays
         // active across multiple steps.
@@ -12522,9 +12541,9 @@ mod tests {
         // mutator write-barrier behavior this test covers.
         gc.remembered_set.clear();
         unsafe {
-            (*header_of(root_a.0)).set_flag(flags::TRACK_YOUNG_PTRS);
-            (*header_of(root_b.0)).set_flag(flags::TRACK_YOUNG_PTRS);
-            (*header_of(root_c.0)).set_flag(flags::TRACK_YOUNG_PTRS);
+            (*header_of(root_a.0)).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
+            (*header_of(root_b.0)).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
+            (*header_of(root_c.0)).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
         }
 
         // During marking, perform write barriers on A and B.
@@ -12547,10 +12566,10 @@ mod tests {
         );
 
         // TRACK_YOUNG_PTRS should be cleared on A and B.
-        assert!(!unsafe { (*header_of(root_a.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
-        assert!(!unsafe { (*header_of(root_b.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(!unsafe { (*header_of(root_a.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
+        assert!(!unsafe { (*header_of(root_b.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
         // C still has it.
-        assert!(unsafe { (*header_of(root_c.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(root_c.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
 
         // Drive the incremental cycle to completion via nursery collections.
         for _ in 0..50 {
@@ -12818,12 +12837,12 @@ mod tests {
 
         // Initially TRACK_YOUNG_PTRS is set.
         let hdr = unsafe { header_of(obj.0) };
-        assert!(unsafe { (*hdr).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
 
         // JIT fast-path barrier: clears flag and adds to remembered set.
         gc.jit_remember_young_pointer(obj);
 
-        assert!(unsafe { !(*hdr).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
         assert_eq!(gc.remembered_set_len(), 1);
 
         // Calling again adds a second entry (JIT fast-path does not
@@ -13760,12 +13779,12 @@ cache size\t: 8192 kB\n";
         // The must-fix: no greyed nursery object retains VISITED.
         let n_hdr = unsafe { header_of(n.0) };
         assert!(
-            unsafe { !(*n_hdr).has_flag(flags::VISITED) },
+            unsafe { !(*n_hdr).has_flag(flags::GCFLAG_VISITED) },
             "stale nursery VISITED would memcpy into the next minor's promotion"
         );
         // q (old-gen survivor) had VISITED cleared by the oldgen sweep.
         let q_hdr = unsafe { header_of(q.0) };
-        assert!(unsafe { !(*q_hdr).has_flag(flags::VISITED) });
+        assert!(unsafe { !(*q_hdr).has_flag(flags::GCFLAG_VISITED) });
 
         gc.roots.clear();
     }
@@ -13834,7 +13853,7 @@ cache size\t: 8192 kB\n";
         assert_eq!(gc.old_objects_with_weakrefs.len(), 1);
         assert!(gc.is_in_nursery(n_root.0));
         let n_hdr = unsafe { header_of(n_root.0) };
-        assert!(unsafe { !(*n_hdr).has_flag(flags::VISITED) });
+        assert!(unsafe { !(*n_hdr).has_flag(flags::GCFLAG_VISITED) });
 
         gc.roots.clear();
     }
@@ -14108,7 +14127,7 @@ cache size\t: 8192 kB\n";
         assert_eq!(gc.old_objects_with_finalizers.len(), 1);
 
         GcAllocator::ignore_finalizer(&mut gc, obj);
-        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::IGNORE_FINALIZER) });
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_IGNORE_FINALIZER) });
 
         gc.roots.remove(&mut root);
         gc.do_collect_oldgen_nonmoving();
@@ -14137,14 +14156,14 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
         let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
-        unsafe { (*header_of(source.0)).clear_flag(flags::TRACK_YOUNG_PTRS) };
+        unsafe { (*header_of(source.0)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
         let before = gc.remembered_set.len();
 
         assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
 
         assert_eq!(gc.remembered_set.len(), before + 1);
         assert!(gc.remembered_set.contains(&dest.0));
-        assert!(unsafe { !(*header_of(dest.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { !(*header_of(dest.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
     /// A source that still carries TRACK_YOUNG_PTRS has no young pointers to
@@ -14162,7 +14181,7 @@ cache size\t: 8192 kB\n";
         assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
 
         assert_eq!(gc.remembered_set.len(), before);
-        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::TRACK_YOUNG_PTRS) });
+        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
     /// A destination already on the remembered set is the fast path: nothing
@@ -14174,8 +14193,8 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
         let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
-        unsafe { (*header_of(source.0)).clear_flag(flags::TRACK_YOUNG_PTRS) };
-        unsafe { (*header_of(dest.0)).clear_flag(flags::TRACK_YOUNG_PTRS) };
+        unsafe { (*header_of(source.0)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
+        unsafe { (*header_of(dest.0)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
         let before = gc.remembered_set.len();
 
         assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
@@ -14192,7 +14211,7 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
         let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
-        unsafe { (*header_of(source.0)).set_flag(flags::HAS_CARDS) };
+        unsafe { (*header_of(source.0)).set_flag(flags::GCFLAG_HAS_CARDS) };
         assert!(gc.config.card_page_indices > 0);
 
         assert!(!gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
@@ -14206,7 +14225,7 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
         let source = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
         let dest = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
-        unsafe { (*header_of(source.0)).set_flag(flags::CARDS_SET) };
+        unsafe { (*header_of(source.0)).set_flag(flags::GCFLAG_CARDS_SET) };
 
         assert!(!gc.writebarrier_before_copy(source.0, dest.0, 1, 0, 64));
     }
@@ -14220,16 +14239,16 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
         let source = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
         let dest = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
-        assert!(unsafe { (*header_of(source.0)).has_flag(flags::HAS_CARDS) });
-        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::HAS_CARDS) });
+        assert!(unsafe { (*header_of(source.0)).has_flag(flags::GCFLAG_HAS_CARDS) });
+        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::GCFLAG_HAS_CARDS) });
         unsafe { *MiniMarkGC::get_card_ptr(source.0, 0) = 0b0000_0101 };
-        unsafe { (*header_of(source.0)).set_flag(flags::CARDS_SET) };
+        unsafe { (*header_of(source.0)).set_flag(flags::GCFLAG_CARDS_SET) };
         gc.old_objects_with_cards_set.clear();
 
         assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 64));
 
         assert_eq!(unsafe { *MiniMarkGC::get_card_ptr(dest.0, 0) }, 0b0000_0101);
-        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::CARDS_SET) });
+        assert!(unsafe { (*header_of(dest.0)).has_flag(flags::GCFLAG_CARDS_SET) });
         assert_eq!(gc.old_objects_with_cards_set, vec![dest.0]);
     }
 
@@ -14241,7 +14260,7 @@ cache size\t: 8192 kB\n";
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
         let array = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
-        unsafe { (*header_of(array.0)).set_flag(flags::CARDS_SET) };
+        unsafe { (*header_of(array.0)).set_flag(flags::GCFLAG_CARDS_SET) };
         let before = gc.remembered_set.len();
 
         gc.writebarrier_before_move(array.0);
@@ -14277,7 +14296,7 @@ cache size\t: 8192 kB\n";
         let shadow = gc.move_out_of_nursery(obj.0);
         assert_ne!(shadow, obj.0);
         assert!(!gc.is_in_nursery(shadow));
-        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::SHADOW_INITIALIZED) });
+        assert!(unsafe { (*header_of(obj.0)).has_flag(flags::GCFLAG_SHADOW_INITIALIZED) });
         assert_eq!(unsafe { *(shadow as *const u64) }, 0xfeed_face);
         assert_eq!(gc.move_out_of_nursery(obj.0), shadow);
 
@@ -14300,7 +14319,7 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::simple(16));
         let obj = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + 16);
         assert_eq!(gc.move_out_of_nursery(obj.0), obj.0);
-        assert!(unsafe { !(*header_of(obj.0)).has_flag(flags::SHADOW_INITIALIZED) });
+        assert!(unsafe { !(*header_of(obj.0)).has_flag(flags::GCFLAG_SHADOW_INITIALIZED) });
     }
 
     /// incminimark.py `collect(gen)`: a negative generation is the minor that

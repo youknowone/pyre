@@ -192,8 +192,13 @@ pub fn alloc_with_gc_header<T>(value: T, type_id: u32) -> *mut T {
 /// [`alloc_with_gc_header`] for a genuine immortal leaf — `init_gc_object_immortal`
 /// (`NO_HEAP_PTRS | TRACK_YOUNG_PTRS`), incminimark's prebuilt shape.
 ///
-/// `NO_HEAP_PTRS` asserts the object holds no reference the collector must
-/// follow, so only a payload that really is a leaf may use this: the `None` /
+/// `GCFLAG_NO_HEAP_PTRS` asserts the object holds no heap pointer *yet*: while
+/// it is set marking skips the object, and the first pointer written into it is
+/// expected to clear the flag and enrol the object in `prebuilt_root_objects`.
+/// Upstream does stamp prebuilt objects that have reference fields, because
+/// those fields name other prebuilt objects and the GC transform puts a barrier
+/// on every later store. Neither condition holds for a box allocated here, so
+/// only a payload that is a leaf and stays one may use this: the `None` /
 /// `True` / `False` / `NotImplemented` / `Ellipsis` singletons, whose whole body
 /// is a `PyObject` header with a null `w_class`. An ordinary `#[pyre_class]`
 /// box does NOT qualify — its reference fields are written at construction with
@@ -205,7 +210,7 @@ pub fn alloc_with_gc_header_immortal<T>(value: T, type_id: u32) -> *mut T {
         value,
         GcHeader::with_flags(
             type_id,
-            crate::flags::NO_HEAP_PTRS | crate::flags::TRACK_YOUNG_PTRS,
+            crate::flags::GCFLAG_NO_HEAP_PTRS | crate::flags::GCFLAG_TRACK_YOUNG_PTRS,
         ),
     )
 }
@@ -247,24 +252,24 @@ mod tests {
 
     #[test]
     fn test_with_flags() {
-        let hdr = GcHeader::with_flags(7, flags::TRACK_YOUNG_PTRS | flags::VISITED);
+        let hdr = GcHeader::with_flags(7, flags::GCFLAG_TRACK_YOUNG_PTRS | flags::GCFLAG_VISITED);
         assert_eq!(hdr.type_id(), 7);
-        assert!(hdr.has_flag(flags::TRACK_YOUNG_PTRS));
-        assert!(hdr.has_flag(flags::VISITED));
-        assert!(!hdr.has_flag(flags::PINNED));
+        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(hdr.has_flag(flags::GCFLAG_VISITED));
+        assert!(!hdr.has_flag(flags::GCFLAG_PINNED));
     }
 
     #[test]
     fn test_set_clear_flag() {
         let mut hdr = GcHeader::new(1);
-        assert!(!hdr.has_flag(flags::TRACK_YOUNG_PTRS));
+        assert!(!hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
 
-        hdr.set_flag(flags::TRACK_YOUNG_PTRS);
-        assert!(hdr.has_flag(flags::TRACK_YOUNG_PTRS));
+        hdr.set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
+        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
         assert_eq!(hdr.type_id(), 1);
 
-        hdr.clear_flag(flags::TRACK_YOUNG_PTRS);
-        assert!(!hdr.has_flag(flags::TRACK_YOUNG_PTRS));
+        hdr.clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
+        assert!(!hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
         assert_eq!(hdr.type_id(), 1);
     }
 
@@ -293,38 +298,38 @@ mod tests {
             // type id recorded; flags clear (init_gc_object flags=0).
             assert_eq!((*hdr).type_id(), 0x1357);
             assert_eq!((*hdr).flags(), 0);
-            assert!(!(*hdr).has_flag(flags::TRACK_YOUNG_PTRS));
-            assert!(!(*hdr).has_flag(flags::NO_HEAP_PTRS));
+            assert!(!(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+            assert!(!(*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS));
         }
     }
 
     #[test]
     fn test_flags_dont_clobber_type_id() {
         let mut hdr = GcHeader::new(0xDEAD);
-        hdr.set_flag(flags::TRACK_YOUNG_PTRS);
-        hdr.set_flag(flags::VISITED);
-        hdr.set_flag(flags::PINNED);
+        hdr.set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
+        hdr.set_flag(flags::GCFLAG_VISITED);
+        hdr.set_flag(flags::GCFLAG_PINNED);
         assert_eq!(hdr.type_id(), 0xDEAD);
-        assert!(hdr.has_flag(flags::TRACK_YOUNG_PTRS));
-        assert!(hdr.has_flag(flags::VISITED));
-        assert!(hdr.has_flag(flags::PINNED));
+        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(hdr.has_flag(flags::GCFLAG_VISITED));
+        assert!(hdr.has_flag(flags::GCFLAG_PINNED));
     }
 
     #[test]
     fn test_multiple_flags() {
         let mut hdr = GcHeader::new(0);
-        hdr.set_flag(flags::TRACK_YOUNG_PTRS);
-        hdr.set_flag(flags::HAS_CARDS);
-        hdr.set_flag(flags::CARDS_SET);
+        hdr.set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
+        hdr.set_flag(flags::GCFLAG_HAS_CARDS);
+        hdr.set_flag(flags::GCFLAG_CARDS_SET);
 
-        assert!(hdr.has_flag(flags::TRACK_YOUNG_PTRS));
-        assert!(hdr.has_flag(flags::HAS_CARDS));
-        assert!(hdr.has_flag(flags::CARDS_SET));
-        assert!(!hdr.has_flag(flags::VISITED));
+        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
+        assert!(hdr.has_flag(flags::GCFLAG_HAS_CARDS));
+        assert!(hdr.has_flag(flags::GCFLAG_CARDS_SET));
+        assert!(!hdr.has_flag(flags::GCFLAG_VISITED));
 
-        hdr.clear_flag(flags::HAS_CARDS);
-        assert!(!hdr.has_flag(flags::HAS_CARDS));
-        assert!(hdr.has_flag(flags::TRACK_YOUNG_PTRS));
+        hdr.clear_flag(flags::GCFLAG_HAS_CARDS);
+        assert!(!hdr.has_flag(flags::GCFLAG_HAS_CARDS));
+        assert!(hdr.has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS));
     }
 
     #[test]
