@@ -1075,10 +1075,15 @@ exported_unicode_view.release()
 exported_unicode.fromunicode("x")
 assert exported_unicode.tounicode() == "x"
 
-# PyPy `descr_repr` uses the concrete class's current name.  There is no
-# separate `__str__` entry in either upstream; object stringification falls
-# back to the same repr slot.
+# PyPy `W_ArrayBase.descr_repr` reads `space.type(self).getname(space)`: the
+# exact builtin uses its public `__name__` (`array`, not its qualified TypeDef
+# registration name `array.array`), and a subclass uses its current name.
+# There is no separate `__str__` entry in either upstream; object
+# stringification falls back to the same repr slot.
 assert "__str__" not in array.__dict__
+assert repr(array("i")) == "array('i')"
+assert repr(array("i", [1, 2])) == "array('i', [1, 2])"
+assert repr(array("u", "x")) == "array('u', 'x')"
 
 
 class NamedArray(array):

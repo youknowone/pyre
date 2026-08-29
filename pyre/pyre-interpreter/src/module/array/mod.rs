@@ -1506,10 +1506,15 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
     let _ = pyre_object::gc_roots::pin_root(obj);
     let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
     // PyPy `W_ArrayBase.descr_repr` obtains
-    // `space.type(self).getname(space)`.  This is deliberately the live
-    // subclass name (including a later `__name__` assignment), not the fixed
-    // builtin owner's name.
-    let class_name = crate::baseobjspace::object_functionstr_type_name(current_obj());
+    // `space.type(self).getname(space)`: the Python-visible `__name__`, not
+    // the TypeDef's module-qualified registration name.  In particular the
+    // builtin TypeDef is registered as `array.array` but formats as `array`,
+    // while a subclass keeps its live (and assignable) `__name__`.
+    let w_type = crate::typedef::r#type(current_obj())
+        .expect("an array instance must have a Python type object");
+    let class_name = unsafe {
+        pyre_object::w_str_get_value(pyre_object::w_type_get_name_obj(w_type.as_ptr())).to_string()
+    };
     let tc = unsafe { arr::w_array_typecode(current_obj()) } as char;
     let len = unsafe { arr::w_array_len(current_obj()) };
     if len == 0 {
