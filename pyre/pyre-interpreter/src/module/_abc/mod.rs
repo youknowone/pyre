@@ -569,10 +569,10 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(subclass)
 }
 
-/// `typeobject.py PATMA_SEQUENCE` — `Py_TPFLAGS_SEQUENCE`.
-const PATMA_SEQUENCE: i64 = 1 << 5;
-/// `typeobject.py PATMA_MAPPING` — `Py_TPFLAGS_MAPPING`.
-const PATMA_MAPPING: i64 = 1 << 6;
+/// `interp_abc.py` takes both markers from `typeobject.py`, which is where the
+/// bits are declared.
+use pyre_object::typeobject::{PATMA_MAPPING, PATMA_SEQUENCE};
+
 /// `app_abc.py COLLECTION_FLAGS`.
 const COLLECTION_FLAGS: i64 = PATMA_SEQUENCE | PATMA_MAPPING;
 

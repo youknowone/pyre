@@ -17,3 +17,4 @@ pyre-macros = { workspace = true }
 indexmap = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 linkme = { workspace = true }
+bitflags = { workspace = true }

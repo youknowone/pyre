@@ -257,59 +257,9 @@ pub struct CPyHeapTypeObject {
     pub ht_module: *mut CPyObject,
 }
 
-bitflags::bitflags! {
-    /// The `object.h` type flags.
-    ///
-    /// `tp_flags` is one `unsigned long` that two places spell: the header an
-    /// extension compiles against, and this file.  Upstream keeps no such
-    /// pair -- `cpyext/api.py` reads each value out of the real header with
-    /// `rffi_platform.ConstantInteger` -- so the test at the foot of this file
-    /// compares the two, walking `Flags::FLAGS` rather than a list somebody
-    /// has to remember to extend.
-    ///
-    /// The names are the header's, prefix and all: a constant here is the flag
-    /// `Py_TPFLAGS_*` names in C, at the bit C gives it.
-    #[repr(transparent)]
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub struct TpFlags: std::ffi::c_ulong {
-        const PY_TPFLAGS_DEFAULT = 0;
-        /// `_Py_TPFLAGS_STATIC_BUILTIN` is internal to CPython, so the header
-        /// an extension compiles against declares it no more than `Python.h`
-        /// does.  It is the one flag here with no header counterpart.
-        const PY_TPFLAGS_STATIC_BUILTIN = 1 << 1;
-        const PY_TPFLAGS_DISALLOW_INSTANTIATION = 1 << 7;
-        const PY_TPFLAGS_IMMUTABLETYPE = 1 << 8;
-        const PY_TPFLAGS_HEAPTYPE = 1 << 9;
-        const PY_TPFLAGS_BASETYPE = 1 << 10;
-        /// PEP 590 -- the type lends its instances a `vectorcallfunc`, stored
-        /// in each of them at `tp_vectorcall_offset`.  A type carrying the bit
-        /// is readied with `tp_call` filled and the offset positive, so the
-        /// two are read together and never apart.
-        const PY_TPFLAGS_HAVE_VECTORCALL = 1 << 11;
-        const PY_TPFLAGS_READY = 1 << 12;
-        const PY_TPFLAGS_READYING = 1 << 13;
-        const PY_TPFLAGS_HAVE_GC = 1 << 14;
-        const PY_TPFLAGS_ITEMS_AT_END = 1 << 23;
-        /// The fast-subclass flags -- `inherit_special`'s "Setup fast subclass
-        /// flags".
-        ///
-        /// A `Py*_Check` written for C is a flag test rather than a call, so a
-        /// type whose bit is clear reads as not being one.
-        const PY_TPFLAGS_LONG_SUBCLASS = 1 << 24;
-        const PY_TPFLAGS_LIST_SUBCLASS = 1 << 25;
-        const PY_TPFLAGS_TUPLE_SUBCLASS = 1 << 26;
-        const PY_TPFLAGS_BYTES_SUBCLASS = 1 << 27;
-        const PY_TPFLAGS_UNICODE_SUBCLASS = 1 << 28;
-        const PY_TPFLAGS_DICT_SUBCLASS = 1 << 29;
-        const PY_TPFLAGS_BASE_EXC_SUBCLASS = 1 << 30;
-        const PY_TPFLAGS_TYPE_SUBCLASS = 1 << 31;
-    }
-}
-
-/// C writes `tp_flags` through its own `unsigned long` declaration, so the
-/// mirror's field has to be that word and nothing wider or narrower.
-const _: () = assert!(size_of::<TpFlags>() == size_of::<std::ffi::c_ulong>());
-const _: () = assert!(align_of::<TpFlags>() == align_of::<std::ffi::c_ulong>());
+/// The `tp_flags` word, declared with the rest of the type object in
+/// `pyre_object::typeobject` and compared against the header there.
+pub use pyre_object::typeobject::TpFlags;
 
 /// The fast-subclass flags, in the order `inherit_special` tests them
 /// (`typeobject.py:492-509`): the first base that matches wins, so a type is
@@ -816,7 +766,7 @@ pub(super) fn describe_interpreter_type(mirror: *mut CPyTypeObject, w_type: PyOb
         false => TpFlags::empty(),
     };
     let static_builtin = match unsafe { pyre_object::w_type_is_cpython_static_builtin(w_type) } {
-        true => TpFlags::PY_TPFLAGS_STATIC_BUILTIN,
+        true => TpFlags::_PY_TPFLAGS_STATIC_BUILTIN,
         false => TpFlags::empty(),
     };
     let immutabletype = match unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
@@ -7149,89 +7099,6 @@ mod tests {
             super::slot_id::ALL.len(),
             "the header defines {checked} slot identifiers and slot_id has {}",
             super::slot_id::ALL.len()
-        );
-    }
-
-    /// `tp_flags` is one word two places spell: an extension compiled against
-    /// `include/pyre3.14t/object.h` puts bits into it, and this file tests
-    /// them.  Nothing ties the two together -- upstream has no such pair,
-    /// because `api.py` reads each value out of the real header with
-    /// `rffi_platform.ConstantInteger` -- so this walks the header and rejects
-    /// any flag whose bit the Rust side spells differently.
-    ///
-    /// `TpFlags::FLAGS` is what makes the walk complete: it carries every
-    /// constant the `bitflags!` block declares, so a flag added there is
-    /// compared here without anyone remembering to list it.
-    #[test]
-    fn every_tp_flag_is_the_bit_the_header_gives_it() {
-        use bitflags::Flags as _;
-
-        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
-
-        // `(1UL << N)`, and the bare `0UL` that `DEFAULT` and the Stackless
-        // extension carry.  A composite body names other flags rather than a
-        // number -- `Py_TPFLAGS_PREHEADER` is the only one -- and is skipped.
-        let mut header: Vec<(&str, std::ffi::c_ulong)> = Vec::new();
-        for line in HEADER.lines() {
-            let Some(rest) = line.strip_prefix("#define Py_TPFLAGS_") else {
-                continue;
-            };
-            let Some((name, body)) = rest.split_once(' ') else {
-                continue;
-            };
-            let value = if let Some(shift) = body
-                .strip_prefix("(1UL <<")
-                .and_then(|body| body.strip_suffix(')'))
-            {
-                let Ok(bit) = shift.trim().parse::<u32>() else {
-                    continue;
-                };
-                1 << bit
-            } else if let Some(digits) = body.strip_suffix("UL") {
-                let Ok(value) = digits.parse::<std::ffi::c_ulong>() else {
-                    continue;
-                };
-                value
-            } else {
-                continue;
-            };
-            header.push((name, value));
-        }
-
-        // A parser that read nothing would agree with every flag below, so the
-        // floor comes first.  The header carries 29 flags a number can be read
-        // off; the bound is loose enough to survive one being added.
-        assert!(
-            header.len() >= 25,
-            "object.h declares more type flags than the {} this read",
-            header.len()
-        );
-
-        let mut checked = 0;
-        for flag in super::TpFlags::FLAGS {
-            let name = flag
-                .name()
-                .strip_prefix("PY_TPFLAGS_")
-                .expect("every flag is declared under the header's own name");
-            let ours = flag.value().bits();
-            let Some((_, theirs)) = header.iter().find(|(known, _)| *known == name) else {
-                assert_eq!(
-                    name, "STATIC_BUILTIN",
-                    "object.h declares no Py_TPFLAGS_{name}"
-                );
-                continue;
-            };
-            assert_eq!(
-                ours, *theirs,
-                "Py_TPFLAGS_{name} is {theirs:#x} in object.h and {ours:#x} here"
-            );
-            checked += 1;
-        }
-
-        assert_eq!(
-            checked,
-            super::TpFlags::FLAGS.len() - 1,
-            "every flag but STATIC_BUILTIN has a header counterpart"
         );
     }
 }

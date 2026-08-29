@@ -60,8 +60,9 @@ mod tests {
     #[test]
     fn native_type_family_has_common_meta_and_cpython_314_owner() {
         crate::typedef::init_typeobjects();
-        const IMMUTABLETYPE: i64 = 1 << 8;
-        const HEAPTYPE: i64 = 1 << 9;
+        const IMMUTABLETYPE: i64 =
+            pyre_object::typeobject::TpFlags::PY_TPFLAGS_IMMUTABLETYPE.as_int();
+        const HEAPTYPE: i64 = pyre_object::typeobject::TpFlags::PY_TPFLAGS_HEAPTYPE.as_int();
         const MASK: i64 = IMMUTABLETYPE | HEAPTYPE;
 
         let ctype = metaclass::ctype_type();

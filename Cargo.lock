@@ -3111,6 +3111,7 @@ dependencies = [
 name = "pyre-object"
 version = "0.0.2"
 dependencies = [
+ "bitflags 2.13.0",
  "indexmap",
  "linkme",
  "majit-gc",
