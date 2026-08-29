@@ -451,17 +451,34 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
 
 /// `fromunicode` — append code points of a str to a `'u'` array.
 fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError> {
-    array_check_resize(obj)?;
+    // [3.14-spec] Argument Clinic's `unicode` converter runs before
+    // `array_array_fromunicode_impl`, whereas PyPy's `descr_fromunicode`
+    // checks the receiver typecode before entering `fromsequence`.
+    if !unsafe { pyre_object::is_str(w_str) } {
+        return Err(PyError::type_error(format!(
+            "fromunicode() argument must be str, not {}",
+            crate::type_methods::clinic_arg_type_name(w_str)
+        )));
+    }
     if !matches!(unsafe { arr::w_array_typecode(obj) }, b'u' | b'w') {
         return Err(PyError::value_error(
-            "fromunicode() may only be called on unicode type arrays",
+            "fromunicode() may only be called on unicode type arrays ('u' or 'w')",
         ));
     }
-    if !unsafe { pyre_object::is_str(w_str) } {
-        return Err(PyError::type_error("fromunicode() argument must be str"));
-    }
     let s = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_str) };
+    let count = s.code_points().count();
+    // PyPy's `fromsequence` performs no resize for an empty unicode string;
+    // CPython's same-size `array_resize` also accepts it under a live export.
+    if count == 0 {
+        return Ok(());
+    }
+    array_check_resize(obj)?;
+    let byte_count = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| PyError::memory_error(""))?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.try_reserve(byte_count)
+        .map_err(|_| PyError::memory_error(""))?;
     for cp in s.code_points() {
         vec.extend_from_slice(&cp.to_u32().to_ne_bytes());
     }

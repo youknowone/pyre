@@ -1045,3 +1045,32 @@ class ReleasingByteExporter:
 
 release_target.frombytes(ReleasingByteExporter())
 assert release_target == array("B", [5, 6])
+
+# `fromunicode` validates its unicode argument and receiver kind before the
+# resize boundary.  Empty input follows PyPy's no-append path and remains
+# valid while a buffer export is alive.
+exported_nonunicode = array("i", [1])
+exported_nonunicode_view = memoryview(exported_nonunicode)
+with assert_raises(TypeError) as error:
+    exported_nonunicode.fromunicode(1)
+assert str(error.exception) == "fromunicode() argument must be str, not int"
+with assert_raises(ValueError) as error:
+    exported_nonunicode.fromunicode("x")
+assert (
+    str(error.exception)
+    == "fromunicode() may only be called on unicode type arrays ('u' or 'w')"
+)
+exported_nonunicode_view.release()
+
+exported_unicode = array("u")
+exported_unicode_view = memoryview(exported_unicode)
+assert exported_unicode.fromunicode("") is None
+with assert_raises(TypeError) as error:
+    exported_unicode.fromunicode(1)
+assert str(error.exception) == "fromunicode() argument must be str, not int"
+with assert_raises(BufferError) as error:
+    exported_unicode.fromunicode("x")
+assert str(error.exception) == "cannot resize an array that is exporting buffers"
+exported_unicode_view.release()
+exported_unicode.fromunicode("x")
+assert exported_unicode.tounicode() == "x"
