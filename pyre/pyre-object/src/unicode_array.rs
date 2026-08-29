@@ -16,7 +16,7 @@ use rustpython_wtf8::Wtf8Buf;
 #[repr(C)]
 pub struct UnicodeArray {
     pub block: *mut ItemsBlock,
-    len: usize,
+    pub(crate) len: usize,
 }
 
 pub const UNICODE_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(UnicodeArray, block);

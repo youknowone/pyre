@@ -16,7 +16,7 @@ use crate::pyobject::PyObjectRef;
 #[repr(C)]
 pub struct BytesArray {
     pub block: *mut ItemsBlock,
-    len: usize,
+    pub(crate) len: usize,
 }
 
 pub const BYTES_ARRAY_BLOCK_OFFSET: usize = std::mem::offset_of!(BytesArray, block);
