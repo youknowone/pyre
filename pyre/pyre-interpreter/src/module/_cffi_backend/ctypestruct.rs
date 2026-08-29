@@ -202,7 +202,11 @@ unsafe fn convert_bitfield_to_object(
 ) -> Result<PyObjectRef, PyError> {
     let bitsize = field.bitsize as u32;
     let raw = unsafe { misc::read_raw_unsigned_data(cdata, ct.size)? };
-    let valuemask = (1u64 << bitsize) - 1;
+    // A field as wide as its own type shifts by the full width.  The masks are
+    // built with the shift the hardware performs — which leaves the operand
+    // alone — because that is what the translated `r_ulonglong` arithmetic
+    // these expressions come from compiles to.
+    let valuemask = 1u64.wrapping_shl(bitsize).wrapping_sub(1);
     if ct.kind == ctypeobj::KIND_PRIM_SIGNED {
         let shiftforsign = 1u64 << (bitsize - 1);
         let value = ((raw >> field.bitshift).wrapping_add(shiftforsign)) & valuemask;
@@ -239,19 +243,26 @@ unsafe fn convert_bitfield_from_object(
     let value = misc::as_long_long(w_ob)?;
     let is_signed = ct.kind == ctypeobj::KIND_PRIM_SIGNED;
     let (fmin, fmax) = if is_signed {
-        let fmax = (1i64 << (bitsize - 1)) - 1;
+        // As in `convert_bitfield_to_object`, the full-width shift is the one
+        // the hardware performs.
+        let half = 1i64.wrapping_shl(bitsize - 1);
+        let fmax = half.wrapping_sub(1);
         // "int x:1" is allowed to receive 1.
-        (-(1i64 << (bitsize - 1)), if fmax == 0 { 1 } else { fmax })
+        (half.wrapping_neg(), if fmax == 0 { 1 } else { fmax })
     } else {
-        (0, ((1u64 << bitsize) - 1) as i64)
+        (0, 1u64.wrapping_shl(bitsize).wrapping_sub(1) as i64)
     };
     if value < fmin || value > fmax {
         return Err(PyError::overflow_error(format!(
             "value {value} outside the range allowed by the bit field width: {fmin} <= x <= {fmax}"
         )));
     }
-    let rawmask = ((1u64 << bitsize) - 1) << field.bitshift;
-    let rawvalue = (value as u64) << field.bitshift;
+    let shift = field.bitshift as u32;
+    let rawmask = 1u64
+        .wrapping_shl(bitsize)
+        .wrapping_sub(1)
+        .wrapping_shl(shift);
+    let rawvalue = (value as u64).wrapping_shl(shift);
     let mut raw = unsafe { misc::read_raw_unsigned_data(cdata, ct.size)? };
     raw = (raw & !rawmask) | (rawvalue & rawmask);
     unsafe {
