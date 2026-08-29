@@ -14297,6 +14297,29 @@ cache size\t: 8192 kB\n";
         assert!(gc.old_objects_pointing_to_young.contains(&array.0));
     }
 
+    /// Type id 0 names a real type -- the first one registered -- so an
+    /// allocation that "has no type" is recorded as that one and traced with
+    /// its layout.  The JIT's varsize helpers used to do exactly this.
+    #[test]
+    fn type_id_zero_is_the_first_registered_type_not_an_absent_one() {
+        let mut gc = test_gc(4096);
+        let first = gc.register_type(TypeInfo::with_gc_ptrs(24, vec![0]));
+        assert_eq!(first, 0, "the first registration owns id 0");
+        let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
+
+        let untyped = gc.alloc_varsize(8, 8, 4);
+        let typed = gc.alloc_varsize_typed(tid, 8, 8, 4);
+
+        assert_eq!(unsafe { (*header_of(untyped.0)).type_id() }, first);
+        assert_eq!(unsafe { (*header_of(typed.0)).type_id() }, tid);
+        // The untyped array now claims a fixed-size type (`item_size == 0`,
+        // so no item is ever walked) that declares a reference at offset 0 --
+        // which in the array is its own length field.
+        assert_eq!(gc.types.get(first).item_size, 0);
+        assert_eq!(gc.types.get(first).gc_ptr_offsets, vec![0]);
+        assert_ne!(gc.types.get(tid).item_size, 0);
+    }
+
     /// The host reaches this barrier as a `GcAllocator`, never as a
     /// `MiniMarkGC`, so the forwarding impl is what production actually runs.
     /// The trait's own default is a no-op, which would silently drop the call.

@@ -549,6 +549,13 @@ pub trait GcAllocator: Send {
     fn alloc_nursery_no_collect(&mut self, size: usize) -> GcRef;
 
     /// Allocate a variable-size object (array/string).
+    /// Allocate a variable-size object **as type id 0**.
+    ///
+    /// Type id 0 is not a sentinel: [`crate::trace::TypeRegistry::get`] indexes
+    /// the table, so 0 names whichever type registered first and the object is
+    /// traced with that type's layout. Prefer
+    /// [`Self::alloc_varsize_typed`] wherever a descr is in reach -- which, at
+    /// the JIT allocation sites, it always is.
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef;
 
     /// Allocate a variable-size object with a known GC type id.
@@ -559,6 +566,10 @@ pub trait GcAllocator: Send {
         item_size: usize,
         length: usize,
     ) -> GcRef {
+        // Dropping the id records the object as type 0 -- see
+        // [`Self::alloc_varsize`]. That is only tolerable for an allocator
+        // with no type table to record it in; a collector that has one must
+        // override this.
         let _ = type_id;
         self.alloc_varsize(base_size, item_size, length)
     }
