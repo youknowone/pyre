@@ -5105,8 +5105,8 @@ impl<'a> Transformer<'a> {
             // Object-strategy storage leaves. The live length is the
             // `W_ListObject.length` header; the items live behind the
             // `items` GcArray block (`Ptr(GcArray(OBJECTPTR))`) whose
-            // offset-0 length header IS the allocated capacity. Element
-            // stores are GC-ref writes, so the array store lowers to
+            // offset-0 length header IS the allocated capacity. Elements are
+            // GC refs, so the array ops lower to `getarrayitem_gc_r` /
             // `setarrayitem_gc_r` (write barrier carried by the resop).
             "list.obj_len" => {
                 let l = args.first()?.clone();
@@ -5238,6 +5238,36 @@ impl<'a> Transformer<'a> {
                         result: op.result.clone(),
                         kind,
                     }],
+                )
+            }
+            "list.obj_getitem" => {
+                let l = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let block = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+                (
+                    "list.obj_getitem → getfield_gc_r(items) + getarrayitem_gc_r",
+                    vec![
+                        SpaceOperation {
+                            result: Some(block.clone()),
+                            kind: OpKind::FieldRead {
+                                base: l,
+                                field: FieldDescriptor::new("items", Some(LIST_OWNER.to_string())),
+                                ty: ValueType::Ref(None),
+                                pure: false,
+                            },
+                        },
+                        SpaceOperation {
+                            result: op.result.clone(),
+                            kind: OpKind::ArrayRead {
+                                base: block,
+                                index,
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: None,
+                                nolength: false,
+                                pure: false,
+                            },
+                        },
+                    ],
                 )
             }
             "list.obj_setitem" => {

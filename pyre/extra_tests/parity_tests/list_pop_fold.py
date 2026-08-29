@@ -116,6 +116,31 @@ def pop_object(n):
 
 
 # ── despecialisation mid-loop: an Integer list that becomes an Object one ──
+class Box(object):
+    def __init__(self, v):
+        self.v = v
+
+def pop_object_strategy(n):
+    pool = [Box(0), Box(1), Box(2), Box(3), Box(4), Box(5), Box(6)]
+    xs = [pool[0]]
+    total = 0
+    i = 0
+    while i < n:
+        xs.append(pool[i % 7])
+        total = total + xs.pop().v
+        i = i + 1
+    return total * 10 + len(xs)
+
+def pop_object_strategy_dead(n):
+    pool = [Box(0), Box(1)]
+    xs = [pool[0], pool[1]]
+    i = 0
+    while i < n:
+        xs.append(pool[i % 2])
+        xs.pop()
+        i = i + 1
+    return len(xs) * 10 + xs[0].v + xs[1].v
+
 def strategy_flip(n):
     xs = [0, 1, 2]
     total = 0
@@ -139,6 +164,12 @@ def run():
     check(pop_indexed(N), sum(range(N // 2)) * 100 + N - N // 2, "pop_indexed")
     check(pop_float(N), (sum(range(N)) * 2 + N) * 10 + 1, "pop_float")
     check(pop_object(N), sum(i % 7 for i in range(N)) * 10 + 1, "pop_object")
+    check(
+        pop_object_strategy(N),
+        sum(i % 7 for i in range(N)) * 10 + 1,
+        "pop_object_strategy",
+    )
+    check(pop_object_strategy_dead(N), 2 * 10 + 0 + 1, "pop_object_strategy_dead")
     check(strategy_flip(N), (sum(range(N)) - N // 2 + 1) * 10 + 3, "strategy_flip")
 
 

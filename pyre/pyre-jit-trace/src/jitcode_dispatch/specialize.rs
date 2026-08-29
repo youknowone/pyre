@@ -15198,9 +15198,9 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     Ok(())
 }
 
-/// Descend the Integer-strategy `w_list_pop_end_inner` body for a bound
-/// `list.pop()` call, recording its length/item array operations instead of an
-/// opaque residual call.
+/// Descend the Integer- or Object-strategy `w_list_pop_end_inner` body for a
+/// bound `list.pop()` call, recording its length/item array operations instead
+/// of an opaque residual call.
 ///
 /// "Guard-free" elsewhere about this body (`listobject.rs` `w_list_pop_end`,
 /// `jitcode_runtime.rs` `list_pop_end_jitcode`) names the *lock* guard: a
@@ -15218,7 +15218,10 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
 /// recording no guard) and returns before `run_sub_jitcode_walk`. Take that
 /// short-circuit away and the walk records the boxing body's own null and
 /// exception guards after the length is already shrunk, and a failure there
-/// pops twice. The pre-fold `GuardClass` / `GuardValue` and the strategy
+/// pops twice. The Object arm returns the element itself, so no boxing call
+/// follows its stores and the hazard cannot arise; Float stays out for want of
+/// a `walker_box_float` to elide its `w_float_new`.
+/// The pre-fold `GuardClass` / `GuardValue` and the strategy
 /// switch's guard are ahead of the store by construction; the body's own ops
 /// are checked instead of assumed —
 /// [`subwalk_guard_follows_store`] reads the window the sub-walk recorded and
@@ -15243,7 +15246,7 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let (inner_func, inner_self, len_before, raw_item) = unsafe {
+    let (inner_func, inner_self, len_before, popped) = unsafe {
         if !pyre_object::function::is_method(callable) {
             return Ok(None);
         }
@@ -15256,10 +15259,10 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
         if pyre_interpreter::lookup_in_type(list_type, "pop") != Some(inner_func) {
             return Ok(None);
         }
-        let Some((len_before, raw_item)) = orthodox_list_pop_recognize(inner_self) else {
+        let Some((len_before, popped)) = orthodox_list_pop_recognize(inner_self) else {
             return Ok(None);
         };
-        (inner_func, inner_self, len_before, raw_item)
+        (inner_func, inner_self, len_before, popped)
     };
 
     // Resolve every possible decline before recording a guard.
@@ -15299,7 +15302,7 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     );
 
     match orthodox_list_pop_commit(
-        ctx, op, sym, &sub_body, self_ref, inner_self, len_before, raw_item, dst,
+        ctx, op, sym, &sub_body, self_ref, inner_self, len_before, popped, dst,
     ) {
         Ok(()) => Ok(Some(())),
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
@@ -15314,14 +15317,29 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     }
 }
 
-/// Recognize a non-empty Integer-strategy list and sample its final unboxed
+/// The popped element, sampled before the descended executor can mutate the
+/// live list. The Integer scalar is GC-immune and boxed after the sub-walk;
+/// the Object element is the value itself, so the commit pins it instead.
+#[derive(Clone, Copy)]
+pub(crate) enum PoppedTail {
+    Int(i64),
+    Object(pyre_object::PyObjectRef),
+}
+
+/// Recognize a non-empty Integer- or Object-strategy list and sample its final
 /// item before the descended executor can mutate the live list.
+///
+/// These two are the strategies whose `w_list_pop_end_inner` arm is decomposed
+/// into `ll_list_{int,obj}_*` leaves; the rest still pop through a fused helper
+/// the sub-walk cannot lower.
 unsafe fn orthodox_list_pop_recognize(
     inner_self: pyre_object::PyObjectRef,
-) -> Option<(usize, i64)> {
-    if !pyre_object::pyobject::is_list(inner_self)
-        || !pyre_object::w_list_uses_int_storage(inner_self)
-    {
+) -> Option<(usize, PoppedTail)> {
+    if !pyre_object::pyobject::is_list(inner_self) {
+        return None;
+    }
+    let int_storage = pyre_object::w_list_uses_int_storage(inner_self);
+    if !int_storage && !pyre_object::w_list_uses_object_storage(inner_self) {
         return None;
     }
     let len_before = pyre_object::w_list_len(inner_self);
@@ -15329,8 +15347,18 @@ unsafe fn orthodox_list_pop_recognize(
         return None;
     }
     let list = &*(inner_self as *const pyre_object::listobject::W_ListObject);
-    let raw_item = pyre_object::listobject::ll_list_int_getitem_fast(list, len_before - 1);
-    Some((len_before, raw_item))
+    let tail = if int_storage {
+        PoppedTail::Int(pyre_object::listobject::ll_list_int_getitem_fast(
+            list,
+            len_before - 1,
+        ))
+    } else {
+        PoppedTail::Object(pyre_object::listobject::ll_list_obj_getitem_fast(
+            list,
+            len_before - 1,
+        ))
+    };
+    Some((len_before, tail))
 }
 
 /// Resolve the pop body and enclosing full-body snapshot before IR emission.
@@ -15393,9 +15421,23 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     self_ref: OpRef,
     inner_self: pyre_object::PyObjectRef,
     len_before: usize,
-    raw_item: i64,
+    popped: PoppedTail,
     dst: usize,
 ) -> Result<(), DispatchError> {
+    // The Object sample is a live ref and the sub-walk below allocates, so pin
+    // it and read it back out of its slot rather than reusing the local
+    // (`pin_root` normalizes the address it publishes; `gc_roots.rs`). The
+    // Integer sample is a scalar and needs none of this.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let popped_slot = match popped {
+        PoppedTail::Object(item) => {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(item);
+            Some(slot)
+        }
+        PoppedTail::Int(_) => None,
+    };
+
     ctx.trace_ctx
         .set_opref_concrete(self_ref, Value::Ref(majit_ir::GcRef(inner_self as usize)));
 
@@ -15420,9 +15462,9 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     // The Integer arm commits `ll_list_int_set_len` before it boxes, so a guard
     // recorded after that store would resume at this CALL boundary and pop a
     // second time. Today none is: the boxing call is short-circuited into
-    // `NewWithVtable` + `SetfieldGc`. Decline rather than inherit that as an
-    // assumption — the caller cuts back to the generic residual, which pops
-    // exactly once.
+    // `NewWithVtable` + `SetfieldGc`, and the Object arm boxes nothing. Decline
+    // rather than inherit that as an assumption — the caller cuts back to the
+    // generic residual, which pops exactly once.
     //
     // Declining is only safe while the receiver is untouched, so it takes the
     // same length re-read the commit below does: on a target whose
@@ -15445,7 +15487,12 @@ pub(crate) fn orthodox_list_pop_commit<Sym: WalkSym>(
     }
     write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
 
-    let w_item = pyre_object::w_int_new(raw_item);
+    let w_item = match popped {
+        PoppedTail::Int(raw_item) => pyre_object::w_int_new(raw_item),
+        PoppedTail::Object(_) => pyre_object::gc_roots::shadow_stack_get(
+            popped_slot.expect("an Object sample is pinned on entry"),
+        ),
+    };
     fbw_list_journal_push_pop_end(inner_self, len_before, w_item);
     if unsafe { pyre_object::w_list_len(inner_self) } == len_before {
         unsafe { pyre_object::w_list_pop_end(inner_self) };
