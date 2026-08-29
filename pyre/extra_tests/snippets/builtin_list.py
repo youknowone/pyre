@@ -8,6 +8,8 @@ assert (
     list.__init__.__doc__
     == "Initialize self.  See help(type(self)) for accurate signature."
 )
+assert list.append.__doc__ == "Append object to the end of the list."
+assert type(list.append).__name__ == "method_descriptor"
 
 x = [1, 2, 3]
 assert x[0] == 1

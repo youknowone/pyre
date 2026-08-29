@@ -3,6 +3,9 @@ import weakref
 
 from testutils import assert_raises
 
+assert type.mro.__doc__ == "Return a type's method resolution order."
+assert type(type.mro).__name__ == "method_descriptor"
+
 # Spec: https://docs.python.org/2/library/types.html
 print(None)
 # TypeType

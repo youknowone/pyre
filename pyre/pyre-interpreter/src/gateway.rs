@@ -1497,6 +1497,20 @@ pub fn make_method_descriptor_with_arity(
     crate::function_new_method_descriptor(code as *const (), name.to_string())
 }
 
+/// Fixed-arity [`make_method_descriptor_with_doc`].  This keeps the
+/// CPython-compatible `method_descriptor` carrier while preserving the
+/// docstring that PyPy's `interp2app` reads from the wrapped function.
+pub fn make_method_descriptor_with_arity_and_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    docstring: &'static str,
+) -> PyObjectRef {
+    debug_assert!(arity <= 4);
+    let code = builtin_code_new_full(name, func, Some(docstring), arity, std::ptr::null());
+    crate::function_new_method_descriptor(code as *const (), name.to_string())
+}
+
 /// Build a CPython-compatible variadic method descriptor carrying the
 /// app-visible docstring supplied by PyPy's `interp2app` registration.
 pub fn make_method_descriptor_with_doc(

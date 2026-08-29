@@ -5600,10 +5600,11 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "append",
-            crate::make_method_descriptor_with_arity(
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
                 "append",
                 crate::type_methods::list_method_append,
                 2,
+                "Append object to the end of the list.",
             ),
         )
     };
@@ -12161,7 +12162,7 @@ fn init_type_type(ns: PyObjectRef) {
     // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
     // `mro()` takes its receiver and nothing else; the declared count is what
     // rejects a surplus argument before the body indexes `args[0]`.
-    let mro_method = make_builtin_function_with_arity(
+    let mro_method = crate::gateway::make_builtin_function_with_arity_and_doc(
         "mro",
         |args| {
             let cls = args[0];
@@ -12173,6 +12174,7 @@ fn init_type_type(ns: PyObjectRef) {
             }))
         },
         1,
+        "Return a type's method resolution order.",
     );
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "mro", mro_method) };
 
