@@ -3525,7 +3525,7 @@ pub trait Backend: Send {
     /// `llmodel.py:816 call_stub_i`: ABI-correct dispatch via the shared
     /// arity table.  Default impl shared by pyre's raw-memory backends
     /// (cranelift, dynasm, wasm) — the `extern "C"` transmute+call is
-    /// portable.  Without it `bhimpl_residual_call_*_i` silently no-ops.
+    /// portable.
     fn bh_call_i(
         &self,
         func: i64,
@@ -3534,9 +3534,7 @@ pub trait Backend: Send {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        if func == 0 {
-            return 0;
-        }
+        assert_ne!(func, 0, "bh_call_i: null function pointer");
         // llmodel.py:818 `calldescr.verify_types(..., history.INT + 'S')`.
         crate::call_stub::verify_result_type(calldescr.result_type, "iS");
         // SAFETY: `func` is a valid funcptr matching the ABI recovered from
@@ -3562,9 +3560,7 @@ pub trait Backend: Send {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> GcRef {
-        if func == 0 {
-            return GcRef::NULL;
-        }
+        assert_ne!(func, 0, "bh_call_r: null function pointer");
         // llmodel.py:824 `calldescr.verify_types(..., history.REF)`.
         crate::call_stub::verify_result_type(calldescr.result_type, "r");
         // SAFETY: see `bh_call_i`.
@@ -3590,9 +3586,7 @@ pub trait Backend: Send {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        if func == 0 {
-            return 0.0;
-        }
+        assert_ne!(func, 0, "bh_call_f: null function pointer");
         // llmodel.py:830 `calldescr.verify_types(..., history.FLOAT + 'L')`.
         crate::call_stub::verify_result_type(calldescr.result_type, "fL");
         // SAFETY: see `bh_call_i`.
@@ -3617,9 +3611,7 @@ pub trait Backend: Send {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        if func == 0 {
-            return;
-        }
+        assert_ne!(func, 0, "bh_call_v: null function pointer");
         // llmodel.py:837 `calldescr.verify_types(..., history.VOID)`.
         crate::call_stub::verify_result_type(calldescr.result_type, "v");
         // SAFETY: see `bh_call_i`.

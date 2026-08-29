@@ -18160,9 +18160,8 @@ impl majit_backend::Backend for CraneliftBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        if func == 0 {
-            return 0;
-        }
+        assert_ne!(func, 0, "bh_call_i: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "iS");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
@@ -18181,9 +18180,7 @@ impl majit_backend::Backend for CraneliftBackend {
     /// llmodel.py bh_call_r: GcRef-returning parallel of `bh_call_i`.
     /// `lltype.Ptr(lltype.GcStruct, ...)` lowers to a host pointer that
     /// matches `i64` on 64-bit; transmute via the shared int dispatcher
-    /// and wrap as `GcRef`. Without this override
-    /// `bhimpl_residual_call_*_r` would silently no-op via the default
-    /// `bh_call_r` trait impl in `majit-backend/src/lib.rs`.
+    /// and wrap as `GcRef`.
     fn bh_call_r(
         &self,
         func: i64,
@@ -18192,9 +18189,8 @@ impl majit_backend::Backend for CraneliftBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        if func == 0 {
-            return majit_ir::GcRef::NULL;
-        }
+        assert_ne!(func, 0, "bh_call_r: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "r");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
@@ -18214,9 +18210,7 @@ impl majit_backend::Backend for CraneliftBackend {
     /// llmodel.py bh_call_f / descr.py create_call_stub
     /// (`RESULT == lltype.Float`): route through the f64-typed
     /// dispatcher so the result lands in xmm0 / d0 rather than rax /
-    /// x0. Without this override `bhimpl_residual_call_*_f` would
-    /// silently no-op via the default `bh_call_f` trait impl
-    /// in `majit-backend/src/lib.rs`.
+    /// x0.
     fn bh_call_f(
         &self,
         func: i64,
@@ -18225,9 +18219,8 @@ impl majit_backend::Backend for CraneliftBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        if func == 0 {
-            return 0.0;
-        }
+        assert_ne!(func, 0, "bh_call_f: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "fL");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
@@ -18245,10 +18238,7 @@ impl majit_backend::Backend for CraneliftBackend {
 
     /// llmodel.py bh_call_v / descr.py create_call_stub
     /// (`RESULT == lltype.Void`): dispatch via the void-typed stub so
-    /// the funcptr is transmuted to `extern "C" fn(...) -> ()`. Without
-    /// this override the canonical `residual_call_*_v` walker would
-    /// silently no-op via the default trait impl
-    /// (`bh_call_v` in `majit-backend/src/lib.rs`).
+    /// the funcptr is transmuted to `extern "C" fn(...) -> ()`.
     fn bh_call_v(
         &self,
         func: i64,
@@ -18262,9 +18252,8 @@ impl majit_backend::Backend for CraneliftBackend {
         // dispatcher so genuinely void C callees use the right C-ABI
         // signature instead of `extern "C" fn(...) -> i64` (which reads
         // garbage from rax/x0).
-        if func == 0 {
-            return;
-        }
+        assert_ne!(func, 0, "bh_call_v: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "v");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,

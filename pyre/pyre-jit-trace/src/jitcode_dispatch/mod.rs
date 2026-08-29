@@ -8238,6 +8238,9 @@ fn walker_execute_may_force_boxed_outcome<Sym: WalkSym>(
         Some(majit_ir::Value::Int(addr)) => addr,
         _ => return None,
     };
+    if func_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
+        return None;
+    }
     let mut args = Vec::with_capacity(allboxes.len() - 1);
     for &arg in &allboxes[1..] {
         let v = match ctx.trace_ctx.box_value(arg) {
@@ -11413,29 +11416,13 @@ fn handle<Sym: WalkSym>(
         "int_guard_value/i" => guard_value_record(code, op, ctx, GuardValueBank::Int),
         "ref_guard_value/r" => guard_value_record(code, op, ctx, GuardValueBank::Ref),
         "float_guard_value/f" => guard_value_record(code, op, ctx, GuardValueBank::Float),
-        "abort/>r" => {
-            // pyre-only result marker: `Assembler::encode_op`'s default
-            // branch emits this when an untranslatable op's result is
-            // classified `Ref` by `infer_concrete_from_op`'s
-            // Abort→GcRef fallback.  Blackhole counterpart
-            // (`handler_abort_result_marker_r`, `blackhole.rs`) is
-            // a pure PC bump — no operand read, no register write, no
-            // IR op recorded.  The actual abort signal is `abort/`
-            // (BC_ABORT = 13), not this; reaching `abort/>r` in normal
-            // flow is upstream-only an artefact of result-kind
-            // classification and the dst slot is never read in a
-            // post-abort code path.
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        "abort/>i" => {
-            // Int-result twin of `abort/>r`. Blackhole counterpart
-            // `handler_abort_result_marker_i` (`blackhole.rs`) is a
-            // pure PC bump — `infer_concrete_from_op`'s Abort→Int fallback
-            // classifies the untranslatable op's result as Int, so the
-            // dst byte is decoded (accounted for in `op.next_pc`) but
-            // never written. Same rationale as `abort/>r`: the real abort
-            // signal is `abort/` / `abort_permanent/`, not this marker.
-            Ok((DispatchOutcome::Continue, op.next_pc))
+        "abort/>r" | "abort/>i" => {
+            // `Assembler::encode_op` retains the result byte when an
+            // untranslatable operation still owns an SSA result.  It remains
+            // an abort: advancing would leave that destination unwritten and
+            // let the trace consume a stale box.  Match the blackhole result
+            // handlers and the result-less `abort/` arm below.
+            Err(DispatchError::AbortMarkerReached { pc: op.pc })
         }
         "abort/" => {
             // pyre-only `BC_ABORT` marker (`handler_abort_marker`,

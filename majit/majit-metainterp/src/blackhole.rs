@@ -3662,6 +3662,26 @@ mod tests {
         assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(0.999)), 0);
     }
 
+    #[test]
+    fn test_executor_cast_float_to_int_rejects_values_outside_signed() {
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_223_372_036_854_775_808.0,
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| { exec_unop(OpCode::CastFloatToInt, f64_bits(value)) })
+                    .is_err(),
+                "cast_float_to_int silently accepted {value:?}",
+            );
+        }
+        assert_eq!(
+            exec_unop(OpCode::CastFloatToInt, f64_bits(i64::MIN as f64)),
+            i64::MIN,
+        );
+    }
+
     // ── Overflow arithmetic ──
 
     #[test]
@@ -3912,6 +3932,18 @@ mod tests {
         assert_eq!(exec_binop(OpCode::UintRshift, 42, 0), 42);
         // -5 << 2 = -20
         assert_eq!(exec_binop(OpCode::IntLshift, -5, 2), -20);
+    }
+
+    #[test]
+    fn test_executor_bad_shift_count_is_rejected() {
+        for opcode in [OpCode::IntLshift, OpCode::IntRshift, OpCode::UintRshift] {
+            for count in [-1, 64] {
+                assert!(
+                    std::panic::catch_unwind(|| exec_binop(opcode, 7, count)).is_err(),
+                    "{opcode:?} silently accepted shift count {count}",
+                );
+            }
+        }
     }
 
     // ── IntSignext ──
@@ -4483,9 +4515,8 @@ mod tests {
         /// The two `fnaddr` classifiers agree with the walker's gate.
         ///
         /// A symbolic hash carries the `SYMBOLIC_FNADDR_BASE` high-16-bit tag;
-        /// `0` is upstream's "no address" spelling (`jitcode.py:14`) and is a
-        /// no-op — not a decline — for `residual_call`, whose backend
-        /// `bh_call_*` returns `0`/null for it.
+        /// `0` is upstream's "no address" spelling
+        /// (`jitcode.py::JitCode.__init__`) and is not callable either.
         #[test]
         fn fnaddr_classifiers_match_the_walker_symbolic_gate() {
             let real = fnaddr_classifiers_match_the_walker_symbolic_gate as *const () as i64;
@@ -4516,6 +4547,34 @@ mod tests {
 
             assert!(!super::is_symbolic_fnaddr(0));
             assert!(!super::is_callable_fnaddr(0));
+        }
+
+        #[test]
+        fn residual_call_handlers_reject_every_unresolved_target() {
+            let handlers: &[super::BhOpcodeHandler] = &[
+                super::handler_residual_call_irf_i,
+                super::handler_residual_call_irf_r,
+                super::handler_residual_call_irf_f,
+                super::handler_residual_call_irf_v,
+                super::handler_residual_call_ir_i,
+                super::handler_residual_call_ir_r,
+                super::handler_residual_call_ir_v,
+                super::handler_residual_call_r_i,
+                super::handler_residual_call_r_r,
+                super::handler_residual_call_r_v,
+            ];
+            let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64
+                | 0x1234_5678_9abc_i64;
+            for target in [0, symbolic] {
+                for handler in handlers {
+                    let mut builder = BlackholeInterpBuilder::new();
+                    let mut bh = builder.acquire_interp();
+                    bh.registers_i = vec![target];
+                    let result = handler(&mut bh, &[0], 0);
+                    assert!(matches!(result, Err(super::DispatchError::LeaveFrame)));
+                    assert!(bh.aborted);
+                }
+            }
         }
 
         #[test]
@@ -5388,18 +5447,23 @@ mod tests {
         /// continuing dispatch past it would misread the next bytes
         /// as opcodes.
         #[test]
-        fn test_handler_abort_marker_sets_aborted_and_leaves_frame() {
-            let mut builder = BlackholeInterpBuilder::new();
-            let mut bh = builder.acquire_interp();
-            assert!(!bh.aborted);
-            let result = super::handler_abort_marker(&mut bh, &[], 0);
-            match result {
-                Err(super::DispatchError::LeaveFrame) => {}
-                other => {
-                    panic!("handler_abort_marker must return Err(LeaveFrame), got {other:?}")
+        fn test_all_abort_handlers_set_aborted_and_leave_frame() {
+            let handlers: &[super::BhOpcodeHandler] = &[
+                super::handler_abort_marker,
+                super::handler_abort_result_marker_i,
+                super::handler_abort_result_marker_r,
+            ];
+            for handler in handlers {
+                let mut builder = BlackholeInterpBuilder::new();
+                let mut bh = builder.acquire_interp();
+                assert!(!bh.aborted);
+                let result = handler(&mut bh, &[0], 0);
+                match result {
+                    Err(super::DispatchError::LeaveFrame) => {}
+                    other => panic!("abort handler must return Err(LeaveFrame), got {other:?}"),
                 }
+                assert!(bh.aborted);
             }
-            assert!(bh.aborted);
         }
 
         /// Integration test: build bytecode manually with known opcode
@@ -5960,19 +6024,37 @@ fn bhimpl_int_xor(a: i64, b: i64) -> i64 {
     a ^ b
 }
 
-/// blackhole.py `bhimpl_int_rshift(a, b): return a >> b`.
+/// `blackhole.py check_shift_count` — the untranslated blackhole rejects a
+/// count outside the machine-word range instead of letting the host language
+/// mask it.  Rust's shift operators panic only in debug for some spellings,
+/// while `wrapping_shl` masks by definition, so keep the upstream check
+/// explicit and identical for all three bhimpls.
+#[inline]
+fn check_shift_count(b: i64) {
+    assert!(
+        (0..i64::BITS as i64).contains(&b),
+        "Shift count, {b}, not in valid range, 0 .. {}.",
+        i64::BITS - 1,
+    );
+}
+
+/// blackhole.py `bhimpl_int_rshift(a, b): check_shift_count(b); return a >> b`.
 fn bhimpl_int_rshift(a: i64, b: i64) -> i64 {
-    a >> (b & 63)
+    check_shift_count(b);
+    a >> (b as u32)
 }
 
-/// blackhole.py `bhimpl_int_lshift(a, b): return intmask(a << b)`.
+/// blackhole.py `bhimpl_int_lshift(a, b): check_shift_count(b); return intmask(a << b)`.
 fn bhimpl_int_lshift(a: i64, b: i64) -> i64 {
-    a.wrapping_shl((b & 63) as u32)
+    check_shift_count(b);
+    a.wrapping_shl(b as u32)
 }
 
-/// blackhole.py `bhimpl_uint_rshift(a, b): return intmask(r_uint(a) >> r_uint(b))`.
+/// blackhole.py `bhimpl_uint_rshift(a, b): check_shift_count(b); return
+/// intmask(r_uint(a) >> r_uint(b))`.
 fn bhimpl_uint_rshift(a: i64, b: i64) -> i64 {
-    ((a as u64) >> ((b as u64) & 63)) as i64
+    check_shift_count(b);
+    ((a as u64) >> (b as u32)) as i64
 }
 
 /// blackhole.py `bhimpl_int_neg(a): return intmask(-a)`.
@@ -6063,7 +6145,18 @@ fn bhimpl_convert_longlong_bytes_to_float(a: i64) -> f64 {
 }
 
 /// blackhole.py `bhimpl_cast_float_to_int(a): return int(int(a))`.
+///
+/// The outer `int()` deliberately makes the untranslated implementation fail
+/// when the truncated result is not a machine Signed value.  Rust's `as i64`
+/// instead saturates non-finite and out-of-range inputs, silently inventing a
+/// result PyPy never returns from this source-level helper.  Keep the valid
+/// domain explicit before applying the identical truncation-toward-zero cast.
 fn bhimpl_cast_float_to_int(a: f64) -> i64 {
+    const SIGNED_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    assert!(
+        a.is_finite() && a >= (i64::MIN as f64) && a < SIGNED_UPPER_EXCLUSIVE,
+        "bhimpl_cast_float_to_int: {a:?} is outside the Signed range",
+    );
     a as i64
 }
 
@@ -6130,15 +6223,16 @@ fn handler_abort_marker(
     Err(DispatchError::LeaveFrame)
 }
 
-/// Handler for pyre-only `abort/>i` — a no-op result marker emitted by
-/// `Assembler::encode_op`'s default branch for `OpKind::Abort { .. }`.
-/// The bytecode layout has no args and a single destination register byte.
+/// Handler for pyre-only `abort/>i`, emitted when the unsupported operation
+/// still owns an SSA result.  The trailing destination byte does not make the
+/// abort recoverable: continuing would expose the destination's stale value.
+/// Match [`handler_abort_marker`] and leave the frame immediately.
 fn handler_abort_result_marker_i(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(position + 1)
+    handler_abort_marker(bh, code, position)
 }
 
 /// Register-slot layout for state-field JIT blackhole resume.
@@ -6512,16 +6606,14 @@ fn handler_abort_permanent(
     Ok(bh.position)
 }
 
-/// Handler for pyre-only `abort/>r` — counterpart of
-/// `abort/>i` with a Ref-classified result register.  Emerges when
-/// pyre's rtyper routes an untranslatable op's result through the
-/// Abort→GcRef fallback (`rtyper.rs::infer_concrete_from_op`).
+/// Handler for pyre-only `abort/>r` — the Ref-result counterpart of
+/// [`handler_abort_result_marker_i`].
 fn handler_abort_result_marker_r(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(position + 1)
+    handler_abort_marker(bh, code, position)
 }
 bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
 // `int_floordiv` / `int_mod` are NOT registered as bytecode handlers:
@@ -8262,17 +8354,14 @@ fn check_residual_call_exception_after(
     })
 }
 
-/// Refuse to jump to a `residual_call_*` funcptr that is a
-/// `symbolic_fnaddr_for_path` hash (see `is_symbolic_fnaddr`).
+/// Refuse to jump to a `residual_call_*` funcptr that is either null or a
+/// `symbolic_fnaddr_for_path` hash (see [`is_callable_fnaddr`]).
 ///
 /// `bh_call_*` takes the funcptr straight to an indirect branch, so a hash
 /// there is a wild call. The walker's residual path already declines this exact
 /// case (`ResidualDecline::Symbolic`); the blackhole has no decline channel, so
 /// it aborts the frame, which hands the continuation back to the interpreter.
 ///
-/// `func == 0` is deliberately *not* rejected: the backends' `bh_call_*` treat
-/// it as a no-op returning `0`/null, a convention pyre relies on for host calls
-/// left unbound on purpose.
 #[inline]
 /// Refuse a register write that would land in the constant table.
 ///
@@ -8292,12 +8381,12 @@ fn debug_assert_constant_slot_untouched(index: usize, num_regs: usize, who: &str
     }
 }
 
-fn reject_symbolic_residual_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
+fn reject_unresolved_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
     if crate::majit_log_enabled() {
         eprintln!(
-            "[bh] residual_call declined: funcptr {func:#x} is a symbolic path hash, not a code \
-             address; register the callee's path in the host's fnaddr bindings (jitcode {:?} pos \
-             {} last {})",
+            "[bh] residual_call declined: funcptr {func:#x} is not a callable code address; \
+             register the callee's path in the host's fnaddr bindings (jitcode {:?} pos {} last \
+             {})",
             bh.jitcode.name, bh.position, bh.last_opcode_position,
         );
     }
@@ -8336,8 +8425,8 @@ fn handler_residual_call_irf_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8359,8 +8448,8 @@ fn handler_residual_call_irf_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8382,8 +8471,8 @@ fn handler_residual_call_irf_f(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8405,8 +8494,8 @@ fn handler_residual_call_irf_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8428,8 +8517,8 @@ fn handler_residual_call_ir_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8450,8 +8539,8 @@ fn handler_residual_call_ir_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8472,8 +8561,8 @@ fn handler_residual_call_ir_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8493,8 +8582,8 @@ fn handler_residual_call_r_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -8514,8 +8603,8 @@ fn handler_residual_call_r_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -8535,8 +8624,8 @@ fn handler_residual_call_r_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -10806,6 +10895,9 @@ fn handler_conditional_call_ir_v(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if condition != 0 {
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         bh.cpu()
             .bh_call_v(func, Some(&ai), Some(&ar), None, &calldescr);
@@ -10825,6 +10917,9 @@ fn handler_conditional_call_value_ir_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
             .cpu()
@@ -10846,6 +10941,9 @@ fn handler_conditional_call_value_ir_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
             .cpu()
@@ -11449,11 +11547,9 @@ pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.
 ///
 /// Stricter than `!is_symbolic_fnaddr`: `0` is upstream's own "no address"
-/// spelling (`jitcode.py JitCode.__init__ fnaddr=None`) and must not be called either. The
-/// `func == 0` arm of the backends' `bh_call_*` returns `0`/null instead, which
-/// is a fine no-op convention for a `residual_call` whose funcptr the host
-/// deliberately left unbound, but for an `inline_call` it would fabricate a
-/// return value for a callee that never ran.
+/// spelling (`jitcode.py JitCode.__init__ fnaddr=None`) and must not be called
+/// either.  Both residual and inline calls decline it before reaching a
+/// backend; otherwise a callee that never ran could fabricate a return value.
 #[inline]
 pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
@@ -11696,6 +11792,10 @@ fn handler_call_assembler_int_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = call_int_function(target.concrete_ptr, &args);
     check_residual_call_exception_after(bh, p)?;
@@ -11719,6 +11819,10 @@ fn handler_call_assembler_ref_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     // RPython `blackhole.py bhimpl_residual_call_irf_r` →
     // `cpu.bh_call_r(...)`; pyre's ref ABI uses the same i64 carrier
@@ -11756,6 +11860,10 @@ fn handler_call_assembler_float_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = call_int_function(target.concrete_ptr, &args);
     check_residual_call_exception_after(bh, p)?;
@@ -11778,6 +11886,10 @@ fn handler_call_assembler_void_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     call_void_function(target.concrete_ptr, &args);
     check_residual_call_exception_after(bh, p)?;
@@ -11833,6 +11945,10 @@ fn handler_cond_call_void_ext(
     let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
     if condition != 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
+        let func = target.concrete_ptr as usize as i64;
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         call_void_function(target.concrete_ptr, &args);
         check_residual_call_exception_after(bh, p_end)?;
@@ -11854,6 +11970,10 @@ fn handler_cond_call_value_int_ext(
     let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
+        let func = target.concrete_ptr as usize as i64;
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         let r = call_int_function(target.concrete_ptr, &args);
         check_residual_call_exception_after(bh, p_end + 1)?;
@@ -11879,6 +11999,10 @@ fn handler_cond_call_value_ref_ext(
     let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
+        let func = target.concrete_ptr as usize as i64;
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // RPython `blackhole.py bhimpl_conditional_call_value_ir_r`
         // → `cpu.bh_call_r(...)` (ref ABI).  See note on

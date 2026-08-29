@@ -10568,6 +10568,10 @@ fn build_concrete_values(
     reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
 )]
 pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
+    assert!(
+        !func_ptr.is_null(),
+        "call_int_function: null function pointer"
+    );
     // Where a backend cannot build a `call_indirect` whose type matches the
     // callee's real signature (wasm32), route through the host trampoline,
     // which reflects the signature and coerces each positional argument.
@@ -10811,6 +10815,10 @@ pub fn call_int_function(func_ptr: *const (), args: &[i64]) -> i64 {
 /// `'i'`/`'r'`/`'f'`/`'v'` exhaustively, so a `Type::Float` slot is always
 /// class `'f'`. Teaching `Type` those classes must extend both sites.
 pub fn call_float_function(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> f64 {
+    assert!(
+        !func_ptr.is_null(),
+        "call_float_function: null function pointer"
+    );
     // Where a backend cannot build a `call_indirect` whose type matches the
     // callee's real signature (wasm32), route through the host trampoline,
     // which reflects the signature and returns an f64 result as its raw bits.
@@ -10885,6 +10893,10 @@ fn arg_classes_from_types(
 /// `execute_varargs`'s portal runner and the CALL_ASSEMBLER family, whose
 /// entry wrapper is `extern "C" fn(..) -> i64` by construction.
 pub fn call_int_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) -> i64 {
+    assert!(
+        !func_ptr.is_null(),
+        "call_int_function_typed: null function pointer"
+    );
     if let Some(hook) = majit_backend::call_stub::residual_host_call() {
         return hook(func_ptr as usize, args);
     }
@@ -10917,6 +10929,10 @@ pub fn call_ref_function(func_ptr: *const (), args: &[i64]) -> i64 {
     reason = "The raw address is an internal JIT/GC handle validated by the descriptor and object-space boundary; making this orchestration API unsafe would incorrectly transfer collector invariants to every caller"
 )]
 pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
+    assert!(
+        !func_ptr.is_null(),
+        "call_void_function: null function pointer"
+    );
     // See `call_int_function`: the host trampoline reflects the callee's real
     // signature, so a void-typed residual whose target actually returns `i64`
     // (e.g. `store_subscr_fn`) — or genuinely returns `()`
@@ -11136,6 +11152,10 @@ pub fn call_void_function(func_ptr: *const (), args: &[i64]) {
 /// host-trampoline path reflects the callee's real signature and coerces each
 /// argument itself, so it takes the positional list unchanged.
 pub fn call_void_function_typed(func_ptr: *const (), args: &[i64], arg_types: &[Type]) {
+    assert!(
+        !func_ptr.is_null(),
+        "call_void_function_typed: null function pointer"
+    );
     if majit_backend::call_stub::residual_host_call().is_some() {
         call_void_function(func_ptr, args);
         return;
@@ -11512,6 +11532,16 @@ mod tests {
             &[Type::Int, Type::Float],
         );
         assert_eq!(result, 7.5, "scale_swapped(3, 2.5) == 7.5");
+    }
+
+    #[test]
+    fn host_call_dispatchers_reject_null_function_pointers() {
+        let null = std::ptr::null();
+        assert!(std::panic::catch_unwind(|| call_int_function(null, &[])).is_err());
+        assert!(std::panic::catch_unwind(|| call_int_function_typed(null, &[], &[])).is_err());
+        assert!(std::panic::catch_unwind(|| call_float_function(null, &[], &[])).is_err());
+        assert!(std::panic::catch_unwind(|| call_void_function(null, &[])).is_err());
+        assert!(std::panic::catch_unwind(|| call_void_function_typed(null, &[], &[])).is_err());
     }
 
     #[derive(Default)]

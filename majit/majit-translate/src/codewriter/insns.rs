@@ -1287,9 +1287,9 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // pyre-only `abort/>r` — Ref-result variant of `abort/`.  Emitted by
     // `Assembler::encode_op`'s default branch when an `OpKind::Abort` with
     // `result_kind: Ref` reaches the assembler.  The blackhole-side
-    // handler `handler_abort_result_marker_r` (in `blackhole.rs`) is a
-    // no-op that advances past the trailing destination register byte;
-    // the abort signal proper goes through `abort/` (`BC_ABORT = 13`).
+    // handler `handler_abort_result_marker_r` (in `blackhole.rs`) aborts
+    // exactly like `abort/` (`BC_ABORT = 13`); the destination byte exists
+    // only because the unsupported operation still owns an SSA result.
     m.insert("abort/>r", BC_ABORT_RESULT_R);
     // pyre-only `vtable_method_ptr/rd>i` — emitted by
     // `OpKind::VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython's dispatch
