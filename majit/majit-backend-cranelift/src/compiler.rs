@@ -8125,11 +8125,12 @@ fn resolve_exit_descr(
         }
     } else if let Some(metainterp_finish) = match_metainterp_finish_descr(jf_descr_raw, attachments)
     {
-        // `history.py:125` `cpu.get_latest_descr(deadframe)` parity:
+        // `history.py AbstractDescr.show` / `cpu.get_latest_descr(deadframe)`:
         // `jf_descr` carries the metainterp `Arc<DoneWithThisFrameDescr*>`
-        // address (compiler.rs baking).  Return that *exact* Arc
-        // so the consumer sees the same identity `compile.py:618-672`
-        // attached on the cpu — not the process-global fallback static.
+        // address (compiler.rs baking).  Return that *exact* Arc so the
+        // consumer sees the same identity `compile.py
+        // make_and_attach_done_descrs` attached on the cpu — not the
+        // process-global fallback static.
         // Both are `Arc<DoneWithThisFrameDescrInt>` (no wrapper) so the
         // trait-method dispatch is identical; only
         // the Arc identity differs, and PyPy parity demands they match.
@@ -8147,26 +8148,10 @@ fn resolve_exit_descr(
             jf_descr_raw as usize,
             attachments.propagate_exception_descr.as_ref(),
         );
+        // The word is non-zero on this arm, and `find_fail_descr_by_ptr`
+        // answers every non-zero word — the cranelift singletons by
+        // identity, anything else through `recover_fail_descr_cell`.
         let fi = arc.as_ref().map(|a| as_fd(a).fail_index()).unwrap_or(0);
-        // compile.py:665-674 parity: done_with_this_frame_descr is a
-        // global singleton — it won't appear in per-trace fail_descrs.
-        let arc = arc.or_else(|| {
-            let ptr = jf_descr_raw as usize;
-            // Singletons are `DescrRef = Arc<dyn Descr>` (fat pointer).
-            // Match on the data-pointer half via
-            // `as *const () as usize`.
-            for global in [
-                &*DONE_WITH_THIS_FRAME_DESCR_INT,
-                &*DONE_WITH_THIS_FRAME_DESCR_FLOAT,
-                &*DONE_WITH_THIS_FRAME_DESCR_REF,
-                &*DONE_WITH_THIS_FRAME_DESCR_VOID,
-            ] {
-                if Arc::as_ptr(global) as *const () as usize == ptr {
-                    return Some(global.clone());
-                }
-            }
-            None
-        });
         (fi, arc.map(ExitDescr::owned))
     }
 }
