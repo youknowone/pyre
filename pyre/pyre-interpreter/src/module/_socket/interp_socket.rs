@@ -1501,7 +1501,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::module_ns_store(
         ns,
         "herror",
-        crate::builtins::make_exc_type(
+        crate::builtins::new_exception_class(
             "socket.herror",
             crate::builtins::exc_os_error_new,
             w_os_error,
@@ -1510,7 +1510,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     crate::module_ns_store(
         ns,
         "gaierror",
-        crate::builtins::make_exc_type(
+        crate::builtins::new_exception_class(
             "socket.gaierror",
             crate::builtins::exc_os_error_new,
             w_os_error,

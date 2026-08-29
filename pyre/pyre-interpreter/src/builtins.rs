@@ -9068,6 +9068,44 @@ pub(crate) fn make_exc_type(
     make_exc_type_with_init(name, None, new_fn, None, base)
 }
 
+/// `new_exception_class` — a module's own exception class, as
+/// `PyErr_NewException` builds one.
+///
+/// Both spellings construct the class by calling `type(name, (base,), {})`:
+/// PyPy through `space.call_function(space.w_type, ...)`, `PyErr_NewException`
+/// through `PyObject_CallFunction((PyObject *)&PyType_Type, ...)`.  What that
+/// gives a class and a statically defined exception does not is a weakref
+/// slot, which is why `weakref.ref(_queue.Empty())` works where
+/// `weakref.ref(Exception())` is a `TypeError`.  Every exception here already
+/// carries the storage; this is the flag that makes it reachable.
+///
+/// Three module exception classes are built another way upstream and carry no
+/// slot: `ssl.SSLError`, `_csv.Error` and `_ctypes.COMError` come from a type
+/// spec that names its own `basicsize`, and a spec that does adds no managed
+/// weakref.  Those three keep [`make_exc_type`] / [`make_exc_type_with_init`].
+pub(crate) fn new_exception_class(
+    name: &'static str,
+    new_fn: crate::gateway::BuiltinCodeFn,
+    base: PyObjectRef,
+) -> PyObjectRef {
+    let cls = make_exc_type(name, new_fn, base);
+    add_weakref_slot(cls, base);
+    cls
+}
+
+/// The weakref half of `type_new_descriptors`: the class gets its own
+/// `__weakref__` descriptor only when the base it takes its layout from has no
+/// slot to inherit, which is why `_pickle.PickleError.__dict__` carries one and
+/// `_pickle.PicklingError.__dict__` does not.  The flag is set either way --
+/// it is what `getweakref` / `setweakref` read.
+fn add_weakref_slot(cls: PyObjectRef, base: PyObjectRef) {
+    if !unsafe { pyre_object::w_type_get_weakrefable(base) } {
+        let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
+        crate::type_dict_store(cls, "__weakref__", descr);
+    }
+    unsafe { pyre_object::w_type_set_weakrefable(cls, true) };
+}
+
 /// PyPy's `_new_exception` stores the supplied docstring directly in each
 /// builtin exception's TypeDef namespace.
 fn make_exc_type_with_doc(
@@ -9723,6 +9761,10 @@ pub(crate) fn make_exc_type_with_init(
 /// `bases`; the first base drives instance layout.  `with_traceback` /
 /// `add_note` are inherited through the MRO from `BaseException`, so
 /// only `__new__` is installed here.
+///
+/// Both classes built this way — `io.UnsupportedOperation` and
+/// `ssl.SSLCertVerificationError` — come from `PyErr_NewException*`, so both
+/// are weak-referenceable for the reason [`new_exception_class`] gives.
 pub(crate) fn make_exc_type_multi(
     name: &'static str,
     new_fn: crate::gateway::BuiltinCodeFn,
@@ -9741,6 +9783,7 @@ pub(crate) fn make_exc_type_multi(
         },
         bases,
     );
+    add_weakref_slot(cls, bases[0]);
     register_exc_class(name, cls)
 }
 
