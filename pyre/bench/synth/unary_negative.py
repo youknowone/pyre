@@ -1,4 +1,5 @@
 # pyre-check: max-pypy-ratio=8
+# pyre-check: spec-folds=unary_negative_descent,unary_negative_int
 # The trip count puts pypy's execution above the startup-subtraction floor, so
 # this ratio is a measurement. The loop runs at parity: ubuntu 1.7x / 1.7x /
 # 1.6x (dynasm / cranelift / wasm), macos 1.1x / 0.6x, windows 1.2x / 1.5x.
@@ -29,6 +30,12 @@ def main():
 # W_LongObject.  The walker fold pins the operand with GUARD_VALUE and takes
 # the _make_ovf2long tail, so the compiled loop must agree with the long result
 # rather than wrapping back to INT_MIN.
+#
+# This is the operand the descent declines, which is why the header names both
+# labels: `main` above is walked (`unary_negative_descent`) and this loop is
+# folded (`unary_negative_int`).  Without the fold the promoted W_LongObject
+# stays a loop argument, `compare_op_long` keeps its bigint call in the body,
+# and the loop runs 2x slower.
 def main_int_min():
     m = -9223372036854775807 - 1  # INT_MIN as a machine int
     acc = 0
