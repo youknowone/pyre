@@ -1056,13 +1056,17 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
             .unwrap_or(std::ptr::null_mut());
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         fields.push(w_type);
-        for item in [
-            unsafe { pyre_object::sliceobject::w_slice_get_start(current()) },
-            unsafe { pyre_object::sliceobject::w_slice_get_stop(current()) },
-            unsafe { pyre_object::sliceobject::w_slice_get_step(current()) },
-        ] {
-            fields.push(_convert_const(std::ptr::null_mut(), item));
-        }
+        // Each conversion allocates, so read the next field off the rooted
+        // slice rather than snapshotting all three up front.
+        fields.push(_convert_const(std::ptr::null_mut(), unsafe {
+            pyre_object::sliceobject::w_slice_get_start(current())
+        }));
+        fields.push(_convert_const(std::ptr::null_mut(), unsafe {
+            pyre_object::sliceobject::w_slice_get_stop(current())
+        }));
+        fields.push(_convert_const(std::ptr::null_mut(), unsafe {
+            pyre_object::sliceobject::w_slice_get_step(current())
+        }));
         return w_tuple_new(fields.take());
     }
     if unsafe { is_exact_type(w_a, &COMPLEX_TYPE) } {
@@ -2009,9 +2013,18 @@ fn code_data_equal(a: &crate::CodeObject, b: &crate::CodeObject) -> bool {
 /// retaining shape-only compiler placeholders.  PyPy never looks behind
 /// `co_consts_w` for equality either.
 unsafe fn code_const_equal(left: PyObjectRef, right: PyObjectRef) -> Result<bool, crate::PyError> {
+    // Converting the left operand allocates -- an exact string constant
+    // already builds a tuple -- so hold both in slots and read the right one
+    // back afterwards.
+    let roots = pyre_object::gc_roots::push_roots();
+    let operands = roots.publish(&[left, right]);
+    roots.normalize(operands, 2);
     let mut converted = pyre_object::gc_roots::RootedItems::new();
-    converted.push(_convert_const(std::ptr::null_mut(), left));
-    converted.push(_convert_const(std::ptr::null_mut(), right));
+    converted.push(_convert_const(std::ptr::null_mut(), roots.get(operands)));
+    converted.push(_convert_const(
+        std::ptr::null_mut(),
+        roots.get(operands + 1),
+    ));
     let converted = converted.take();
     crate::baseobjspace::eq_w(converted[0], converted[1])
 }
