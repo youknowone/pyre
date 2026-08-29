@@ -240,6 +240,7 @@ fn encode_rust_codec_with_state(
                                 position,
                                 end,
                                 "illegal multibyte sequence",
+                                crate::type_methods::EncodeErrorOwner::MultibyteCodec,
                             )?;
                         let bytes = match replacement {
                             crate::type_methods::EncodeReplacement::Bytes(bytes) => bytes,

@@ -3799,6 +3799,7 @@ pub(crate) fn encode_utf8_with_errors(
                     index,
                     error_end,
                     "surrogates not allowed",
+                    EncodeErrorOwner::UnicodeObject,
                 )?;
                 match rep {
                     EncodeReplacement::Str(rcps) => {
@@ -4179,6 +4180,7 @@ fn encode_narrow(
                     start,
                     end,
                     range_msg,
+                    EncodeErrorOwner::UnicodeObject,
                 )?;
                 match rep {
                     EncodeReplacement::Str(rcps) => {
@@ -4346,6 +4348,7 @@ fn encode_utf16_32_impl(
                     index,
                     index + 1,
                     "surrogates not allowed",
+                    EncodeErrorOwner::UnicodeObject,
                 )?;
                 match rep {
                     EncodeReplacement::Str(rcps) => {
@@ -4618,13 +4621,20 @@ fn call_decode_error_handler(
     // in: the reread object (unicodeobject.c insize), or the one it started
     // on (`multibytecodec_decerror`'s `size`).
     let length = new_bytes.as_ref().map_or(data.len(), Vec::len) as i64;
-    // PyPy `_make_errorhandler.call_errorhandler`: a position outside the
-    // machine integer becomes -1, then reaches the common bounds check.  Only
-    // successfully converted negative positions fold against the input length.
+    // `multibytecodec_decerror` substitutes -1 for a position outside the
+    // machine integer and lets the bounds test below report it.  [3.14-spec]
+    // `unicode_decode_call_errorhandler` propagates the `PyLong_AsSsize_t`
+    // failure instead: 3.14.2 answers `OverflowError` for ascii, utf-8,
+    // latin-1 and charmap, and `IndexError: position -1 ...` for the
+    // multibyte engines, while PyPy 7.3.20 folds on both.  The negative fold
+    // stays in the conversion's `else` clause either way, so it runs only for
+    // a position that converted: folding a failure would land on 0 for a
+    // one-unit input and hand the same span back to the handler without end.
+    let folds_overflow = !matches!(resume_in, DecodeResume::RereadObject);
     let newpos = match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4)) {
         Ok(n) if n < 0 => n + length,
         Ok(n) => n,
-        Err(error) if error.kind == crate::PyErrorKind::OverflowError => -1,
+        Err(error) if folds_overflow && error.kind == crate::PyErrorKind::OverflowError => -1,
         Err(error) => return Err(error),
     };
     if newpos < 0 || newpos > length {
@@ -4642,6 +4652,18 @@ fn call_decode_error_handler(
         _ => None,
     };
     Ok((newpos as usize, resume))
+}
+
+/// Which upstream owns the encode error-handler call, mirroring
+/// [`DecodeResume`] on the decode side.  The two disagree over a handler
+/// position that does not fit the machine integer.
+pub(crate) enum EncodeErrorOwner {
+    /// `unicode_encode_call_errorhandler` — every codec in `unicodeobject.c`,
+    /// including `charmap_encode` and the win32 code-page encoder.
+    UnicodeObject,
+    /// `multibytecodec_encerror` — the CJK engines.
+    #[cfg(not(target_arch = "wasm32"))]
+    MultibyteCodec,
 }
 
 /// Replacement returned by a custom encode error handler: either a str
@@ -4668,6 +4690,7 @@ pub(crate) fn call_registered_encode_error_handler(
     start: usize,
     end: usize,
     reason: &str,
+    owner: EncodeErrorOwner,
 ) -> Result<(EncodeReplacement, usize), crate::PyError> {
     let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
         crate::PyError::new(
@@ -4713,12 +4736,14 @@ pub(crate) fn call_registered_encode_error_handler(
     // newpos folds against the source CHARACTER length and resumes into the
     // original code-point sequence.
     let length = char_len as i64;
-    // Same PyPy `_make_errorhandler.call_errorhandler` conversion as the
-    // decode branch: overflow becomes -1 and is rejected by the bounds check.
+    // The same split as the decode branch above: `multibytecodec_encerror`
+    // folds an unrepresentable position to -1, `unicode_encode_call_errorhandler`
+    // refuses it with its own `OverflowError`.
+    let folds_overflow = !matches!(owner, EncodeErrorOwner::UnicodeObject);
     let newpos = match crate::baseobjspace::int_w(w_newpos) {
         Ok(n) if n < 0 => n + length,
         Ok(n) => n,
-        Err(error) if error.kind == crate::PyErrorKind::OverflowError => -1,
+        Err(error) if folds_overflow && error.kind == crate::PyErrorKind::OverflowError => -1,
         Err(error) => return Err(error),
     };
     if newpos < 0 || newpos > length {
