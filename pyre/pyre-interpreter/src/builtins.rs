@@ -7393,6 +7393,7 @@ pub(crate) mod wasm_errno {
     pub const EACCES: i32 = 13;
     pub const EPERM: i32 = 1;
     pub const ESRCH: i32 = 3;
+    pub const EIO: i32 = 5;
     pub const ETIMEDOUT: i32 = 60;
     pub const EBADF: i32 = 9;
     pub const EINVAL: i32 = 22;
@@ -7413,6 +7414,7 @@ pub(crate) mod wasm_errno {
             EPERM => "Operation not permitted",
             ENOENT => "No such file or directory",
             ESRCH => "No such process",
+            EIO => "Input/output error",
             EINTR => "Interrupted system call",
             ECHILD => "No child processes",
             EACCES => "Permission denied",
@@ -7424,6 +7426,7 @@ pub(crate) mod wasm_errno {
             EINPROGRESS => "Operation now in progress",
             EALREADY => "Operation already in progress",
             ENOTSUP => "Operation not supported",
+            EAFNOSUPPORT => "Address family not supported by protocol",
             ECONNABORTED => "Software caused connection abort",
             ECONNRESET => "Connection reset by peer",
             ETIMEDOUT => "Operation timed out",

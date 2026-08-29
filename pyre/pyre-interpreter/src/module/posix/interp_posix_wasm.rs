@@ -1009,29 +1009,253 @@ fn uname(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(crate::_structseq::new_instance(uname_seq_type(), seq))
 }
 
-/// The first path argument of an entry point that takes more after it, with
-/// everything after it accepted and dropped: nothing here reads a mode, a time
-/// pair or a length, because nothing here writes.
+/// What one parameter of a refused entry point is, which decides the
+/// conversion a caller's mistake trips before the mount refuses the call.
+enum Param {
+    /// A path, encoded the way every other entry point encodes one.
+    Path(&'static str),
+    /// An integer, at the width the entry point declares.
+    Int(&'static str),
+    /// A file offset: `r_longlong` in PyPy and `Py_off_t` in 3.14's clinic
+    /// signature, rather than the narrower `c_int` used by modes.
+    Offset(&'static str),
+    /// The positional time pair `utime` validates before it reaches the
+    /// filesystem operation.
+    UTimePair(&'static str),
+    /// A value this arm never reads because it has no effect on this target:
+    /// the POSIX `symlink` implementation ignores `target_is_directory`.
+    Unread(&'static str),
+}
+
+impl Param {
+    fn name(&self) -> &'static str {
+        match self {
+            Param::Path(name)
+            | Param::Int(name)
+            | Param::Offset(name)
+            | Param::UTimePair(name)
+            | Param::Unread(name) => name,
+        }
+    }
+}
+
+/// Validate the time values `interp_posix.parse_utime_args` consumes before
+/// making the mutating call.  A read-only result comes after these conversions:
+/// malformed pairs, mutually exclusive spellings and values outside `time_t`
+/// do not become EROFS merely because this particular mount cannot write.
+fn validate_utime_args(
+    w_times: Option<PyObjectRef>,
+    w_ns: Option<PyObjectRef>,
+) -> Result<(), crate::PyError> {
+    let present = |value: Option<PyObjectRef>| {
+        value.filter(|w_value| !unsafe { is_none(*w_value) })
+    };
+    let times = present(w_times);
+    let ns = present(w_ns);
+    if times.is_some() && ns.is_some() {
+        return Err(crate::PyError::value_error(
+            "utime: you may specify either 'times' or 'ns' but not both",
+        ));
+    }
+
+    let unpack_two = |w_pair: PyObjectRef, what: &str| {
+        if !unsafe { pyre_object::is_tuple(w_pair) }
+            || unsafe { pyre_object::w_tuple_len(w_pair) } != 2
+        {
+            let shape = if what == "times" {
+                "either a tuple of two ints or None"
+            } else {
+                "a tuple of two ints"
+            };
+            return Err(crate::PyError::type_error(format!(
+                "utime: '{what}' must be {shape}"
+            )));
+        }
+        Ok((
+            unsafe { pyre_object::w_tuple_getitem(w_pair, 0) }.unwrap(),
+            unsafe { pyre_object::w_tuple_getitem(w_pair, 1) }.unwrap(),
+        ))
+    };
+    let time_t_overflow = || {
+        crate::PyError::overflow_error("timestamp out of range for platform time_t")
+    };
+    let validate_seconds = |w_value: PyObjectRef| -> Result<(), crate::PyError> {
+        if unsafe { pyre_object::is_int_or_long(w_value) } {
+            crate::builtins::space_index_w(w_value).map_err(|_| time_t_overflow())?;
+            return Ok(());
+        }
+        let w_float = crate::builtins::builtin_float(&[w_value]).map_err(|error| {
+            if error.kind == crate::PyErrorKind::OverflowError {
+                time_t_overflow()
+            } else {
+                crate::PyError::type_error(format!(
+                    "argument must be int or float, not {}",
+                    crate::type_methods::arg_type_name(w_value)
+                ))
+            }
+        })?;
+        let seconds = unsafe { pyre_object::w_float_get_value(w_float) };
+        if seconds.is_nan() {
+            return Err(crate::PyError::value_error(
+                "Invalid value NaN (not a number)",
+            ));
+        }
+        if !(seconds.floor() >= -(2f64.powi(63)) && seconds.floor() < 2f64.powi(63)) {
+            return Err(time_t_overflow());
+        }
+        Ok(())
+    };
+    let validate_nanoseconds = |w_value: PyObjectRef| -> Result<(), crate::PyError> {
+        let w_split = crate::builtins::builtin_divmod(&[
+            w_value,
+            pyre_object::w_int_new(1_000_000_000),
+        ])?;
+        let (Some(w_seconds), Some(w_remainder)) = (unsafe {
+            (
+                pyre_object::w_tuple_getitem(w_split, 0),
+                pyre_object::w_tuple_getitem(w_split, 1),
+            )
+        }) else {
+            return Err(crate::PyError::type_error(
+                "utime: divmod() returned a non-pair",
+            ));
+        };
+        crate::builtins::space_index_w(w_seconds).map_err(|error| {
+            if error.kind == crate::PyErrorKind::OverflowError {
+                time_t_overflow()
+            } else {
+                error
+            }
+        })?;
+        crate::builtins::space_index_w(w_remainder)?;
+        Ok(())
+    };
+
+    if let Some(w_pair) = times {
+        let (w_access, w_modified) = unpack_two(w_pair, "times")?;
+        validate_seconds(w_access)?;
+        validate_seconds(w_modified)?;
+    } else if let Some(w_pair) = ns {
+        let (w_access, w_modified) = unpack_two(w_pair, "ns")?;
+        validate_nanoseconds(w_access)?;
+        validate_nanoseconds(w_modified)?;
+    }
+    Ok(())
+}
+
+/// The signature a refused entry point still has to bind.
 ///
-/// `path_kw` is what that argument is called, which is not the same word for
-/// all of them -- the one-path calls name it `path` and the two-path calls
-/// name it `src` -- and every one of them can be spelled as a keyword.
+/// `EROFS` is the answer to a call this mount cannot carry out, but a call
+/// that never named a valid argument list does not reach the mount at all:
+/// it is the `TypeError` its binding raises on any other host.
+struct WriteSig {
+    /// The positional-or-keyword parameters, in order.  The first path among
+    /// them is the one the `EROFS` is named by, and it is not called the same
+    /// word for all of them -- the one-path calls name it `path` and the
+    /// two-path calls name it `src`.
+    params: &'static [Param],
+    /// How many of `params` a call must supply.
+    required: usize,
+    /// The keyword-only parameters.  Every `dir_fd` among them has to be
+    /// absent, since the seam is handed a name rather than a descriptor to
+    /// resolve against, and `follow_symlinks` has to stay true, since nothing
+    /// this seam reports is a symbolic link.
+    kwonly: &'static [&'static str],
+}
+
+/// Reject a keyword-only argument this platform has no way to honour, using
+/// the wording the argument clinic's own two refusals carry.
+fn check_kwonly(
+    kwargs: Option<PyObjectRef>,
+    name: &'static str,
+    kwonly: &'static [&'static str],
+) -> Result<(), crate::PyError> {
+    for key in kwonly {
+        let Some(w_value) = crate::builtins::kwarg_get(kwargs, key) else {
+            continue;
+        };
+        // `dir_fd_unavailable` names the parameter `dir_fd` whichever of the
+        // three spellings the entry point gave it.
+        let message = if key.ends_with("dir_fd") {
+            (!unsafe { is_none(w_value) }).then(|| "dir_fd unavailable on this platform".to_owned())
+        } else if *key == "follow_symlinks" {
+            (!crate::baseobjspace::is_true(w_value)?)
+                .then(|| format!("{name}: follow_symlinks unavailable on this platform"))
+        } else {
+            None
+        };
+        if let Some(message) = message {
+            return Err(crate::PyError::not_implemented(message));
+        }
+    }
+    Ok(())
+}
+
+/// Bind `sig` against a call and answer with the first path it named.
 fn write_path_arg(
     args: &[PyObjectRef],
     name: &'static str,
-    path_kw: &'static str,
+    sig: &WriteSig,
 ) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    let Some(w_path) = pos
-        .first()
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, path_kw))
-    else {
+    let allowed: Vec<&str> = sig
+        .params
+        .iter()
+        .map(Param::name)
+        .chain(sig.kwonly.iter().copied())
+        .collect();
+    crate::builtins::kwarg_reject_unknown(kwargs, &allowed, name)?;
+    if pos.len() > sig.params.len() {
         return Err(crate::PyError::type_error(format!(
-            "{name}() missing required argument '{path_kw}' (pos 1)"
+            "{name}() takes at most {} positional arguments ({} given)",
+            sig.params.len(),
+            pos.len()
         )));
-    };
-    crate::gateway::fsencode_path_or_fd_w(w_path, name, false)
+    }
+    let mut first_path = None;
+    let mut utime_times = None;
+    let mut has_utime_pair = false;
+    for (slot, param) in sig.params.iter().enumerate() {
+        let bound =
+            crate::builtins::bind_pos_or_kw(pos, kwargs, slot, param.name(), name, slot + 1)?;
+        if matches!(param, Param::UTimePair(_)) {
+            has_utime_pair = true;
+            utime_times = bound;
+        }
+        let Some(w_value) = bound else {
+            if slot < sig.required {
+                return Err(crate::PyError::type_error(format!(
+                    "{name}() missing required argument '{}' (pos {})",
+                    param.name(),
+                    slot + 1
+                )));
+            }
+            continue;
+        };
+        match param {
+            Param::Path(_) => {
+                let resolved = crate::gateway::fsencode_path_or_fd_w(w_value, name, false)?;
+                if first_path.is_none() {
+                    first_path = Some(resolved);
+                }
+            }
+            Param::Int(_) => {
+                crate::baseobjspace::c_int_w(w_value)?;
+            }
+            Param::Offset(_) => {
+                crate::builtins::space_index_w(w_value)?;
+            }
+            Param::UTimePair(_) => {}
+            Param::Unread(_) => {}
+        }
+    }
+    check_kwonly(kwargs, name, sig.kwonly)?;
+    if has_utime_pair {
+        validate_utime_args(utime_times, crate::builtins::kwarg_get(kwargs, "ns"))?;
+    }
+    first_path.ok_or_else(|| {
+        crate::PyError::type_error(format!("{name}() missing required path argument"))
+    })
 }
 
 /// The entry points a read-only mount publishes and refuses, named by the
@@ -1043,14 +1267,68 @@ fn write_path_arg(
 fn refuse_write_path(
     args: &[PyObjectRef],
     name: &'static str,
-    path_kw: &'static str,
+    sig: &WriteSig,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let resolved = write_path_arg(args, name, path_kw)?;
+    let resolved = write_path_arg(args, name, sig)?;
     Err(crate::PyError::os_error_syscall(
         crate::builtins::wasm_errno::EROFS,
         resolved.w_path(),
     ))
 }
+
+/// `mkdir(path, mode=0o777, *, dir_fd=None)`.
+static MKDIR_SIG: WriteSig = WriteSig {
+    params: &[Param::Path("path"), Param::Int("mode")],
+    required: 1,
+    kwonly: &["dir_fd"],
+};
+
+/// `chmod(path, mode, *, dir_fd=None, follow_symlinks=True)`.
+static CHMOD_SIG: WriteSig = WriteSig {
+    params: &[Param::Path("path"), Param::Int("mode")],
+    required: 2,
+    kwonly: &["dir_fd", "follow_symlinks"],
+};
+
+/// `utime(path, times=None, *, ns=..., dir_fd=None, follow_symlinks=True)`.
+static UTIME_SIG: WriteSig = WriteSig {
+    params: &[Param::Path("path"), Param::UTimePair("times")],
+    required: 1,
+    kwonly: &["ns", "dir_fd", "follow_symlinks"],
+};
+
+/// `truncate(path, length)`.
+static TRUNCATE_SIG: WriteSig = WriteSig {
+    params: &[Param::Path("path"), Param::Offset("length")],
+    required: 2,
+    kwonly: &[],
+};
+
+/// `rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None)`, which `replace`
+/// repeats.
+static RENAME_SIG: WriteSig = WriteSig {
+    params: &[Param::Path("src"), Param::Path("dst")],
+    required: 2,
+    kwonly: &["src_dir_fd", "dst_dir_fd"],
+};
+
+/// `link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True)`.
+static LINK_SIG: WriteSig = WriteSig {
+    params: &[Param::Path("src"), Param::Path("dst")],
+    required: 2,
+    kwonly: &["src_dir_fd", "dst_dir_fd", "follow_symlinks"],
+};
+
+/// `symlink(src, dst, target_is_directory=False, *, dir_fd=None)`.
+static SYMLINK_SIG: WriteSig = WriteSig {
+    params: &[
+        Param::Path("src"),
+        Param::Path("dst"),
+        Param::Unread("target_is_directory"),
+    ],
+    required: 2,
+    kwonly: &["dir_fd"],
+};
 
 /// Two of the four `access` mode bits, which the constant table publishes
 /// under the same names.
@@ -1070,6 +1348,12 @@ fn access(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         &["path", "mode", "dir_fd", "effective_ids", "follow_symlinks"],
         "access",
     )?;
+    if pos.len() > 2 {
+        return Err(crate::PyError::type_error(format!(
+            "access() takes at most 2 positional arguments ({} given)",
+            pos.len()
+        )));
+    }
     let Some(w_path) = crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", "access", 2)? else {
         return Err(crate::PyError::type_error(
             "access() missing required argument 'path' (pos 1)",
@@ -1080,8 +1364,19 @@ fn access(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             "access() missing required argument 'mode' (pos 2)",
         ));
     };
-    let mode = unsafe { pyre_object::w_int_get_value(w_mode) };
+    let mode = i64::from(crate::baseobjspace::c_int_w(w_mode)?);
     let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, "access", false)?;
+    check_kwonly(kwargs, "access", &["dir_fd", "follow_symlinks"])?;
+    // The seam answers for the caller, and there is no second identity here
+    // to answer for instead.  Do not turn an exception from a caller's
+    // `__bool__` into the default false spelling.
+    if let Some(w_effective_ids) = crate::builtins::kwarg_get(kwargs, "effective_ids") {
+        if crate::baseobjspace::is_true(w_effective_ids)? {
+            return Err(crate::PyError::not_implemented(
+                "access: effective_ids unavailable on this platform",
+            ));
+        }
+    }
     let path = seam_path(&resolved.as_bytes);
     let is_dir = crate::importing::source_is_dir(&path);
     let exists = is_dir || crate::importing::source_file_size(&path).is_ok();
@@ -1103,7 +1398,7 @@ fn write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             pos.len()
         )));
     }
-    let fd = unsafe { pyre_object::w_int_get_value(pos[0]) };
+    let fd = crate::baseobjspace::c_int_w(pos[0])?;
     let data = unsafe {
         if !pyre_object::bytesobject::is_bytes_like(pos[1]) {
             return Err(crate::PyError::type_error(
@@ -1126,10 +1421,23 @@ fn write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         }
     };
     if !delivered {
-        return Err(crate::PyError::os_error_syscall(
-            crate::builtins::wasm_errno::EBADF,
-            pyre_object::w_none(),
-        ));
+        // No embedder is listening, so the bytes take the descriptor itself,
+        // which is where `emit_stdout` sends them under the same condition.
+        // They go raw: `os.write` is not the layer that rewrites newlines.
+        use std::io::Write;
+        let written = if fd == 1 {
+            std::io::stdout().write_all(data)
+        } else {
+            std::io::stderr().write_all(data)
+        };
+        written.map_err(|error| {
+            crate::PyError::os_error_syscall(
+                error
+                    .raw_os_error()
+                    .unwrap_or(crate::builtins::wasm_errno::EIO),
+                pyre_object::w_none(),
+            )
+        })?;
     }
     Ok(pyre_object::w_int_new(data.len() as i64))
 }
@@ -1143,7 +1451,7 @@ fn sync_fd(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef, crat
             "{name} expected 1 argument, got 0"
         )));
     };
-    let fd = unsafe { pyre_object::w_int_get_value(w_fd) } as i32;
+    let fd = crate::baseobjspace::c_int_w(w_fd)?;
     if fd == 1 || fd == 2 {
         return Ok(pyre_object::w_none());
     }
@@ -1344,47 +1652,48 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // The rest of wasi's writing surface, published so that a program can ask
     // for it and refused because the mount is read-only.  `mkdir` and `chmod`
     // take a mode after the path, `utime` a pair of times, `truncate` a
-    // length: none is read, since none of them gets as far as writing.
+    // length: each is converted before the mount's EROFS is reported, just as
+    // the syscall-backed entry points convert them before making their call.
     crate::module_ns_store(
         ns,
         "mkdir",
-        crate::make_builtin_function("mkdir", |args| refuse_write_path(args, "mkdir", "path")),
+        crate::make_builtin_function("mkdir", |args| refuse_write_path(args, "mkdir", &MKDIR_SIG)),
     );
     crate::module_ns_store(
         ns,
         "chmod",
-        crate::make_builtin_function("chmod", |args| refuse_write_path(args, "chmod", "path")),
+        crate::make_builtin_function("chmod", |args| refuse_write_path(args, "chmod", &CHMOD_SIG)),
     );
     crate::module_ns_store(
         ns,
         "utime",
-        crate::make_builtin_function("utime", |args| refuse_write_path(args, "utime", "path")),
+        crate::make_builtin_function("utime", |args| refuse_write_path(args, "utime", &UTIME_SIG)),
     );
     crate::module_ns_store(
         ns,
         "truncate",
-        crate::make_builtin_function("truncate", |args| refuse_write_path(args, "truncate", "path")),
+        crate::make_builtin_function("truncate", |args| refuse_write_path(args, "truncate", &TRUNCATE_SIG)),
     );
     // The two-path calls, named by their source the way `rename` reports it.
     crate::module_ns_store(
         ns,
         "rename",
-        crate::make_builtin_function("rename", |args| refuse_write_path(args, "rename", "src")),
+        crate::make_builtin_function("rename", |args| refuse_write_path(args, "rename", &RENAME_SIG)),
     );
     crate::module_ns_store(
         ns,
         "replace",
-        crate::make_builtin_function("replace", |args| refuse_write_path(args, "replace", "src")),
+        crate::make_builtin_function("replace", |args| refuse_write_path(args, "replace", &RENAME_SIG)),
     );
     crate::module_ns_store(
         ns,
         "link",
-        crate::make_builtin_function("link", |args| refuse_write_path(args, "link", "src")),
+        crate::make_builtin_function("link", |args| refuse_write_path(args, "link", &LINK_SIG)),
     );
     crate::module_ns_store(
         ns,
         "symlink",
-        crate::make_builtin_function("symlink", |args| refuse_write_path(args, "symlink", "src")),
+        crate::make_builtin_function("symlink", |args| refuse_write_path(args, "symlink", &SYMLINK_SIG)),
     );
     crate::module_ns_store(
         ns,
@@ -1392,7 +1701,14 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         crate::make_builtin_function_with_arity(
             "ftruncate",
             |args| {
-                sync_fd(args, "ftruncate")?;
+                // `interp_posix.ftruncate` unwraps `fd=c_int,
+                // length=r_longlong` before reaching `rposix.ftruncate`; the
+                // descriptor lookup happens only after both conversions.
+                let fd = crate::baseobjspace::c_int_w(args[0])?;
+                crate::builtins::space_index_w(args[1])?;
+                if fd != 1 && fd != 2 {
+                    with_raw_fd(fd, |_| Ok(()))?;
+                }
                 Err(crate::PyError::os_error_syscall(
                     crate::builtins::wasm_errno::EROFS,
                     pyre_object::w_none(),
@@ -1429,7 +1745,12 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         "device_encoding",
         crate::make_builtin_function_with_arity(
             "device_encoding",
-            |_args| Ok(pyre_object::w_none()),
+            |args| {
+                // `interp_posix.device_encoding` takes `fd=c_int` even on a
+                // platform where no descriptor can be a terminal.
+                crate::baseobjspace::c_int_w(args[0])?;
+                Ok(pyre_object::w_none())
+            },
             1,
         ),
     );
