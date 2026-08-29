@@ -1033,13 +1033,18 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
         return w_tuple_new(items.take());
     }
     if unsafe { is_exact_type(w_a, &pyre_object::setobject::FROZENSET_TYPE) } {
-        let len = unsafe { pyre_object::setobject::w_set_len(w_a) };
+        // `w_set_len` counts live elements while `w_set_key_at` is keyed on a
+        // storage slot, and `w_set_copy_storage_from` clones the storage
+        // whole, tombstones included.  Walk the cursor, as every other set
+        // walk does.
         let mut items = pyre_object::gc_roots::RootedItems::new();
-        for index in 0..len {
-            let item = unsafe { pyre_object::setobject::w_set_key_at(current(), index) }
-                .map(|key| key.obj)
-                .unwrap_or(pyre_object::w_none());
-            items.push(_convert_const(std::ptr::null_mut(), item));
+        let mut cursor = 0;
+        while let Some(slot) = unsafe { pyre_object::setobject::w_set_next_slot(current(), cursor) }
+        {
+            if let Some(key) = unsafe { pyre_object::setobject::w_set_key_at(current(), slot) } {
+                items.push(_convert_const(std::ptr::null_mut(), key.obj));
+            }
+            cursor = slot + 1;
         }
         return pyre_object::w_frozenset_from_items(&items.take());
     }
