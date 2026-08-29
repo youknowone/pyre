@@ -10900,7 +10900,8 @@ impl JitState for PyreJitState {
         let semantic_mirror: Vec<OpRef> = if !maps.has_color_map {
             // No per-CodeObject regalloc: colors are slot-identity, so the
             // color bank IS the slot mirror over the semantic prefix. Keep the
-            // in-place identity overlay (stack slots NONE-only, locals vable).
+            // in-place identity overlay, taking the vable image for a slot the
+            // color bank left NONE or decoded to a NULL constant.
             // `!has_color_map` (empty `pcdep_color_slots`) is the field-free
             // successor to the flat `local/stack_color_map.is_empty()` guard, so
             // a zero-local frame that still owns a freely-colored operand stack
@@ -10912,9 +10913,8 @@ impl JitState for PyreJitState {
                 .enumerate()
                 .take(semantic_prefix_len)
             {
-                let is_local = idx < nlocals;
                 let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
-                let want_vable = slot.is_none() || (is_local && slot_is_null_const);
+                let want_vable = slot.is_none() || slot_is_null_const;
                 if want_vable {
                     if let Some(v) = vable_array_items.get(idx).copied() {
                         if !v.is_none() {
@@ -10991,16 +10991,32 @@ impl JitState for PyreJitState {
             }
             // Pcdep-live kept-stack colors absent from the body marker's
             // liveness leave their stack slots NONE after the color→slot
-            // inversion above.  The vable image (`locals_cells_stack_w`)
-            // is authoritative post-guard, so fill NONE stack slots from
-            // it — symmetric to the local overlay.
+            // inversion above, and a color the inversion DID cover can still
+            // decode to a dead temp's NULL constant.  The vable image
+            // (`locals_cells_stack_w`) is authoritative post-guard, so take it
+            // for either — the same null-const rule `overlay_local` applies to
+            // locals.  A NULL here does not mean the slot is empty: an empty
+            // slot reads NULL from the vable image too, so the fill is a no-op
+            // there, while a live slot whose color decoded NULL would otherwise
+            // carry that NULL into the closing JUMP's label argument and hand
+            // it back to the interpreter on the next guard failure.
             for s in nlocals..semantic_prefix_len.min(mirror.len()) {
-                if mirror[s].is_none() {
+                let slot_is_null_const = matches!(mirror[s], OpRef::ConstPtr(v) if v.0 == 0);
+                if mirror[s].is_none() || slot_is_null_const {
                     if let Some(v) = vable_array_items.get(s).copied() {
                         if !v.is_none() {
                             mirror[s] = v;
                             if let Some(&cv) = live_local_values.get(s) {
-                                if !matches!(cv, majit_ir::Value::Void) {
+                                // Skip a NULL source for the same reason
+                                // `overlay_local` does: an empty stack slot
+                                // reads NULL here, and stamping that hole onto
+                                // the box would fold a later residual's Ref
+                                // arg to NULL.
+                                if !matches!(
+                                    cv,
+                                    majit_ir::Value::Void
+                                        | majit_ir::Value::Ref(majit_ir::GcRef(0))
+                                ) {
                                     ctx.try_set_opref_concrete(v, cv);
                                 }
                             }

@@ -2733,6 +2733,17 @@ impl<'a> Assembler386<'a> {
                             result_loc
                         );
                     }
+                    // Byte offset where this op's code begins: the span from
+                    // the last LABEL to the JUMP is one loop iteration, the
+                    // window `jit-log-opt` brackets with its `+508:` prefixes.
+                    if crate::majit_dump_enabled() {
+                        eprintln!(
+                            "[dynasm] @{:#06x} op[{}] {:?}",
+                            self.mc.offset().0,
+                            op_index,
+                            op.opcode
+                        );
+                    }
                     self.pending_malloc_nursery_gcmap = *gcmap;
                     self.regalloc_perform(
                         op,
@@ -2799,6 +2810,11 @@ impl<'a> Assembler386<'a> {
                 self.pending_guard_tokens.len(),
                 fail_index
             );
+        }
+        // Closes the last op's span, the way `--end of the loop--` closes a
+        // `jit-log-opt` listing.
+        if crate::majit_dump_enabled() {
+            eprintln!("[dynasm] @{:#06x} end of ops", self.mc.offset().0);
         }
 
         // assembler.py:1003-1008 `_assemble`: grow the frame to fit a
