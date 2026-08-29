@@ -170,6 +170,12 @@ pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(self_obj);
+    // `close_w` closes the C `FILE` a cffi cast opened over this stream
+    // before the flush below, the same order it takes upstream.
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+    crate::module::_cffi_backend::ctypeptr::close_cffi_fileobj(
+        pyre_object::gc_roots::shadow_stack_get(self_slot),
+    );
     // PyPy `close_w`: `flush()` runs while `closed` is still false, and the
     // internal flag is set in `finally`, even when the virtual flush raises.
     let flushed = call_method_result(
@@ -1308,7 +1314,7 @@ fn init_text_iobase_type(ns: PyObjectRef) {
 /// Process-global abstract IO type objects.  PyPy owns these as the module's
 /// `TypeDef` instances; they are shared by every import and are the actual
 /// bases used by the typed concrete stream payloads below.
-fn io_base_type() -> PyObjectRef {
+pub(crate) fn io_base_type() -> PyObjectRef {
     static TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type_with_base(

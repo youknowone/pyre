@@ -7,6 +7,9 @@
 
 use crate::PyError;
 use pyre_object::PyObjectRef;
+use std::collections::HashSet;
+use std::ffi::{CString, c_char, c_int, c_void};
+use std::sync::{Mutex, OnceLock};
 
 use super::cdataobj::{self, W_CData};
 use super::ctypeobj::{self, W_CType};
@@ -200,6 +203,13 @@ pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyEr
             "cannot cast to '{}'",
             ct.name()
         )));
+    }
+    // `W_CTypePointer.cast`: casting a stream to a `FILE *` opens one over it.
+    if ct.has(ctypeobj::F_FILE_PTR) {
+        let file = prepare_file(w_ob)?;
+        if !file.is_null() {
+            return Ok(cdataobj::new_cdata(file.cast::<u8>(), w_ctype));
+        }
     }
     let value = if let Some(source) = W_CData::from_obj(w_ob)
         && ctypeobj::ctype_at(source.ctype).is_some_and(|it| it.is_ptr_or_array())
@@ -553,7 +563,9 @@ pub unsafe fn pointer_convert_argument_from_object(
         unsafe { pointer_convert_from_object(ct, cdata, w_ob)? };
     }
     unsafe { set_mustfree_flag(cdata, result) };
-    Ok(result == MUSTFREE_FREE)
+    // `convert_argument_from_object` answers with the flag itself, and the
+    // caller widens the cleanup window to any non-zero one.
+    Ok(result != MUSTFREE_NOTHING)
 }
 
 /// `W_CTypePointer.accept_movable_str`.
@@ -621,6 +633,13 @@ unsafe fn prepare_pointer_call_argument(
                 value.code_points().count() as i64
             };
             n + 1
+        } else if ct.has(ctypeobj::F_FILE_PTR) {
+            let file = prepare_file(w_init)?;
+            if file.is_null() {
+                return Ok(MUSTFREE_NOTHING);
+            }
+            cdata.cast::<*mut c_void>().write_unaligned(file);
+            return Ok(super::ctypefunc::MUSTFREE_FILE);
         } else {
             return Ok(MUSTFREE_NOTHING);
         }
@@ -643,4 +662,122 @@ unsafe fn prepare_pointer_call_argument(
     }
     unsafe { cdata.cast::<*mut u8>().write_unaligned(buf) };
     Ok(MUSTFREE_FREE)
+}
+
+// ── the C `FILE` a stream is cast to ────────────────────────────────────
+
+unsafe extern "C" {
+    #[cfg_attr(windows, link_name = "_fdopen")]
+    #[cfg_attr(not(windows), link_name = "fdopen")]
+    fn rffi_fdopen(fd: c_int, mode: *const c_char) -> *mut c_void;
+    #[cfg_attr(windows, link_name = "_dup")]
+    #[cfg_attr(not(windows), link_name = "dup")]
+    fn rffi_dup(fd: c_int) -> c_int;
+    #[cfg_attr(windows, link_name = "_close")]
+    #[cfg_attr(not(windows), link_name = "close")]
+    fn rffi_close(fd: c_int) -> c_int;
+    fn setbuf(stream: *mut c_void, buf: *mut c_char);
+    fn fclose(stream: *mut c_void) -> c_int;
+}
+
+/// The slot `W_IOBase.cffi_fileobj` is here: the address `fdopen` returned,
+/// as an ordinary integer.
+const CFFI_FILEOBJ_SLOT: &str = "__cffi_fileobj__";
+
+/// Every C `FILE` this module has opened.  A stream names its handle by
+/// address, and only an address this module minted is ever closed, so a
+/// value written into the slot from application code is inert.
+fn open_files() -> &'static Mutex<HashSet<usize>> {
+    static OPEN: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    OPEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn lock_open_files() -> std::sync::MutexGuard<'static, HashSet<usize>> {
+    open_files()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The C `FILE` this stream already holds, if it holds one this module made.
+fn held_file(w_fileobj: PyObjectRef) -> Option<usize> {
+    let w_held = crate::baseobjspace::getdictvalue_native(w_fileobj, CFFI_FILEOBJ_SLOT)?;
+    if !unsafe { pyre_object::pyobject::is_int(w_held) } {
+        return None;
+    }
+    let address = unsafe { pyre_object::intobject::w_int_get_value(w_held) } as usize;
+    lock_open_files().contains(&address).then_some(address)
+}
+
+/// `W_CTypePointer.prepare_file` — a stream answers with the C `FILE` over
+/// it, and anything else with a null pointer.
+fn prepare_file(w_ob: PyObjectRef) -> Result<*mut c_void, PyError> {
+    if !crate::baseobjspace::isinstance(w_ob, crate::module::_io::io_base_type())? {
+        return Ok(std::ptr::null_mut());
+    }
+    prepare_file_argument(w_ob)
+}
+
+/// `ctypeptr.py prepare_file_argument`.
+fn prepare_file_argument(w_fileobj: PyObjectRef) -> Result<*mut c_void, PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let file_slot = roots.base();
+    let _ = roots.pin_root(w_fileobj);
+    crate::baseobjspace::call_method_result(roots.get(file_slot), "flush", &[])?;
+    if let Some(held) = held_file(roots.get(file_slot)) {
+        return Ok(held as *mut c_void);
+    }
+
+    let w_fd = crate::baseobjspace::call_method_result(roots.get(file_slot), "fileno", &[])?;
+    let fd_slot = file_slot + 1;
+    let _ = roots.pin_root(w_fd);
+    let fd = crate::baseobjspace::int_w(roots.get(fd_slot))?;
+    if fd < 0 {
+        return Err(PyError::value_error("file has no OS file descriptor"));
+    }
+    let w_mode = crate::baseobjspace::getattr_str(roots.get(file_slot), "mode")?;
+    let mode_slot = fd_slot + 1;
+    let _ = roots.pin_root(w_mode);
+    let mode = crate::baseobjspace::text_w(roots.get(mode_slot))?;
+    let mode = CString::new(mode.as_bytes())
+        .map_err(|_| PyError::value_error("embedded null character"))?;
+
+    // `os.dup` — the C `FILE` gets a descriptor of its own, so closing either
+    // side leaves the other usable.
+    let fd = unsafe { rffi_dup(fd as c_int) };
+    if fd < 0 {
+        return Err(PyError::os_error_with_errno(errno(), "dup failed"));
+    }
+    let llf = unsafe { rffi_fdopen(fd, mode.as_ptr()) };
+    if llf.is_null() {
+        let saved = errno();
+        unsafe { rffi_close(fd) };
+        return Err(PyError::os_error_with_errno(saved, "fdopen failed"));
+    }
+    unsafe { setbuf(llf, std::ptr::null_mut()) };
+
+    let address = llf as usize;
+    lock_open_files().insert(address);
+    let handle_slot = mode_slot + 1;
+    let _ = roots.pin_root(pyre_object::w_int_new(address as i64));
+    crate::baseobjspace::setdictvalue(
+        roots.get(file_slot),
+        CFFI_FILEOBJ_SLOT,
+        roots.get(handle_slot),
+    )?;
+    Ok(llf)
+}
+
+/// `CffiFileObj.close`, which `W_IOBase.close_w` runs before its flush.
+pub fn close_cffi_fileobj(w_fileobj: PyObjectRef) {
+    let Some(address) = held_file(w_fileobj) else {
+        return;
+    };
+    lock_open_files().remove(&address);
+    let _ = crate::baseobjspace::setdictvalue(w_fileobj, CFFI_FILEOBJ_SLOT, pyre_object::w_none());
+    unsafe { fclose(address as *mut c_void) };
+}
+
+/// `rposix.get_saved_errno()`.
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
