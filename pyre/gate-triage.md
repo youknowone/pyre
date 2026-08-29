@@ -235,6 +235,13 @@ build.
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
 `PYRE_WASM_GUEST_PROFILE`, `PYRE_WASM_MODULE`.
 
+`PYRE_REGEX_LENGTHS` replaces the regex example's built-in benchmark lengths
+with a comma-separated list; when it is unset the checked-in `LENGTHS` sweep is
+used. `PYRE_CENSUS_TRACE_SIZE` enables the alloc-census example's bounded
+backtrace attribution for one exact allocation size, and is disabled when
+unset. `PYRE_CENSUS_TRACE_SKIP` is its optional nonnegative sample offset and
+defaults to zero. All three are measurement inputs, not runtime experiments.
+
 `PYRE_FBW_NO_SPECIALIZE` is the one entry here that changes behaviour rather
 than reporting it: its comma-separated selectors (or the reserved `all`) turn
 off that many of the 77 trace-time specialization rows (the `spec_folds!`
