@@ -296,7 +296,11 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
     let stderr = String::from_utf8_lossy(&wasm_run.stderr);
     assert_ran_ok("wasm fannkuch", &wasm_run);
     assert_same_stdout("wasm fannkuch", &wasm_run, &dynasm_run);
-    assert_eq!(stat_value(&stderr, "compiles"), 28);
+    // `compiles` is the host's module-compile tally, one per loop and one per
+    // bridge, so it follows from the committed `pyre/bench/fannkuch.wasm.jitstats`:
+    // `loops_compiled=6` + `bridges_compiled=24`. Re-record it alongside that
+    // baseline.
+    assert_eq!(stat_value(&stderr, "compiles"), 30);
     assert!(
         stat_value(&stderr, "jit_calls") < 100,
         "uniform-i64 blackhole helpers still reflected through the host:\n{stderr}"
