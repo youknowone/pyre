@@ -374,7 +374,9 @@ pub fn is_repr_builtin(callable: PyObjectRef) -> bool {
 
 /// The `BuiltinCodeFn` a callable's wrapped code holds, or `None` when the
 /// callable is not a builtin-code function at all.
-unsafe fn builtin_code_fn_of(callable: PyObjectRef) -> Option<crate::gateway::BuiltinCodeFn> {
+pub(crate) unsafe fn builtin_code_fn_of(
+    callable: PyObjectRef,
+) -> Option<crate::gateway::BuiltinCodeFn> {
     unsafe {
         if callable.is_null() || !crate::is_function(callable) {
             return None;
