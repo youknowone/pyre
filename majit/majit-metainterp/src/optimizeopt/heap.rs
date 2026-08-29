@@ -1013,6 +1013,15 @@ impl OptHeap {
     /// `index_in_parent` space and [`Self::HEADER_FIELD_SLOT_BASE`].
     const UNSLOTTED_FIELD_SLOT_BASE: u32 = 0x4000_0000;
 
+    /// Header-band slot for a descriptor already narrowed to `FieldDescr`.
+    /// Kept beside `field_slot_index` so allocation metadata and heap ops use
+    /// one namespace even when Rust cannot upcast `Arc<dyn FieldDescr>` back
+    /// to the owning `DescrRef` trait object.
+    pub(crate) fn header_field_slot(field_descr: &dyn majit_ir::FieldDescr) -> u32 {
+        debug_assert!(field_descr.is_typeptr() || field_descr.is_w_class());
+        Self::HEADER_FIELD_SLOT_BASE + field_descr.offset() as u32
+    }
+
     /// Compute the `PtrInfo._fields` slot for a field descriptor.
     ///
     /// RPython uses `descr.get_index()` only for `info._fields[index]`
@@ -1051,7 +1060,7 @@ impl OptHeap {
             return descr_idx;
         };
         if field_descr.is_typeptr() || field_descr.is_w_class() {
-            return Self::HEADER_FIELD_SLOT_BASE + field_descr.offset() as u32;
+            return Self::header_field_slot(field_descr);
         }
         let index = field_descr.index_in_parent();
         let holds_this_field = match field_descr.get_parent_descr() {
@@ -2315,6 +2324,15 @@ impl OptHeap {
                     }
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
+                            // heap.py `CachedField._getfield` asserts that an
+                            // AbstractStructPtrInfo supplying a cached value
+                            // is present in `cached_infos`.  Allocation-owned
+                            // header facts start on PtrInfo before this
+                            // per-descr cache sees them, so enlist the object
+                            // now; later calls/writes can then invalidate the
+                            // mutable public class word normally.
+                            let obj_box = ctx.get_box_replacement_operand(obj);
+                            self.field_cache(&descr).register_info(&obj_box);
                             let b_old = Operand::from_bound_op(op_rc);
                             let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
                             ctx.make_equal_to(&b_old, &b_cached);
@@ -2390,6 +2408,8 @@ impl OptHeap {
                 }
                 crate::optimizeopt::info::FieldEntry::Value(cached) => {
                     if !cached.is_none() {
+                        let obj_box = ctx.get_box_replacement_operand(obj);
+                        self.field_cache(&descr).register_info(&obj_box);
                         let b_old = Operand::from_bound_op(op_rc);
                         let b_cached = ctx.get_box_replacement_operand(cached.to_opref());
                         ctx.make_equal_to(&b_old, &b_cached);
