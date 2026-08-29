@@ -12817,13 +12817,16 @@ fn handle<Sym: WalkSym>(
             );
             let resbox =
                 ctx.trace_ctx
-                    .record_op_with_descr(OpCode::NewWithVtable, &[], descr);
+                    .record_op_with_descr(OpCode::NewWithVtable, &[], descr.clone());
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             if let Some(class) = known_class {
                 ctx.trace_ctx
                     .heap_cache_mut()
                     .class_now_known(resbox, class);
             }
+            // The allocation wrote the class word from the size descr (the
+            // `w_class` store above).
+            crate::helpers::note_class_word_after_new(ctx.trace_ctx, resbox, &descr);
             let dst = code[op.pc + 3] as usize;
             if let Some(value) = concrete {
                 ctx.trace_ctx.set_opref_concrete(resbox, value);
