@@ -358,6 +358,110 @@ with assert_raises(TypeError) as error:
     array("i").count(1, 2)
 assert str(error.exception) == "array.count() takes exactly one argument (2 given)"
 
+# PyPy's W_ArrayBase.descr_fromlist accepts only lists and restores the old
+# length around fromsequence failures.  CPython 3.14 additionally reads list
+# subclasses directly and rejects a size change after each converted item.
+fromlist_target = array("i", [9])
+with assert_raises(TypeError) as error:
+    fromlist_target.fromlist((1, 2))
+assert str(error.exception) == "arg must be list"
+assert fromlist_target == array("i", [9])
+
+with assert_raises(TypeError):
+    fromlist_target.fromlist([1, "bad", 2])
+assert fromlist_target == array("i", [9])
+
+
+class DirectListSubclass(list):
+    def __iter__(self):
+        raise AssertionError("fromlist must read list storage directly")
+
+
+fromlist_target.fromlist(DirectListSubclass([1, 2]))
+assert fromlist_target == array("i", [9, 1, 2])
+
+growing_fromlist_source = []
+
+
+class GrowingFromlistItem:
+    def __index__(self):
+        growing_fromlist_source.append(2)
+        gc.collect()
+        return 1
+
+
+growing_fromlist_source.append(GrowingFromlistItem())
+fromlist_target = array("i", [9])
+with assert_raises(RuntimeError) as error:
+    fromlist_target.fromlist(growing_fromlist_source)
+assert str(error.exception) == "list changed size during iteration"
+assert fromlist_target == array("i", [9])
+
+shrinking_fromlist_source = []
+
+
+class ShrinkingFromlistItem:
+    def __index__(self):
+        shrinking_fromlist_source.clear()
+        return 1
+
+
+shrinking_fromlist_source.append(ShrinkingFromlistItem())
+fromlist_target = array("i", [9])
+with assert_raises(RuntimeError) as error:
+    fromlist_target.fromlist(shrinking_fromlist_source)
+assert str(error.exception) == "list changed size during iteration"
+assert fromlist_target == array("i", [9])
+
+# Destination sizing precedes item conversion.  Re-entrant growth therefore
+# remains after the pre-sized slot, while a clear makes that slot non-live.
+reentered_fromlist = array("i", [9])
+
+
+class AppendingFromlistItem:
+    def __index__(self):
+        reentered_fromlist.append(7)
+        return 1
+
+
+reentered_fromlist.fromlist([AppendingFromlistItem()])
+assert reentered_fromlist == array("i", [9, 1, 7])
+
+reentered_fromlist = array("i", [9])
+
+
+class ClearingFromlistItem:
+    def __index__(self):
+        del reentered_fromlist[:]
+        return 1
+
+
+reentered_fromlist.fromlist([ClearingFromlistItem()])
+assert reentered_fromlist == array("i")
+
+# Type/empty-list handling happens before a resize check.  A non-empty list is
+# the first case that needs to grow the exported array.
+exported_fromlist = array("i", [9])
+exported_fromlist_view = memoryview(exported_fromlist)
+with assert_raises(TypeError) as error:
+    exported_fromlist.fromlist(())
+assert str(error.exception) == "arg must be list"
+assert exported_fromlist.fromlist([]) is None
+with assert_raises(BufferError):
+    exported_fromlist.fromlist([1])
+assert exported_fromlist == array("i", [9])
+exported_fromlist_view.release()
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i").fromlist(list=[])
+assert str(error.exception) == "array.fromlist() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").fromlist()
+assert str(error.exception) == "array.fromlist() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").fromlist([], [])
+assert str(error.exception) == "array.fromlist() takes exactly one argument (2 given)"
+
 # slice assignment step overflow behaviour test
 T = "I"
 a = array(T, range(10))

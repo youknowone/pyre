@@ -919,14 +919,115 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.fromlist")?;
-    // `array_array_fromlist` opens at `PyList_Check`, so a tuple or any other
-    // iterable is refused rather than consumed.
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "fromlist")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.fromlist() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    // PyPy `W_ArrayBase.descr_fromlist` rejects non-lists before entering
+    // `fromsequence`, then restores the old length if conversion fails.
     if !unsafe { pyre_object::is_list(args[1]) } {
         return Err(PyError::type_error("arg must be list"));
     }
-    array_extend_iterable(args[0], args[1], true)?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(PY_NULL);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_list = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let n = unsafe { pyre_object::listobject::w_list_len(w_list) };
+    if n == 0 {
+        return Ok(pyre_object::w_none());
+    }
+
+    // Both PyPy `W_Array.fromsequence` and CPython
+    // `array_array_fromlist_impl` size the destination before converting any
+    // item.  That makes an existing export fail here, while an export created
+    // by an item's `__index__` does not block writing the already-sized slot.
+    array_check_resize(obj)?;
+    let itemsize = unsafe { arr::w_array_itemsize(obj) };
+    let old_bytes = unsafe { arr::w_array_bytes(obj) }.to_vec();
+    let added = n
+        .checked_mul(itemsize)
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let new_len = old_bytes
+        .len()
+        .checked_add(added)
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.try_reserve(added)
+        .map_err(|_| PyError::memory_error(""))?;
+    vec.resize(new_len, 0);
+
+    for i in 0..n {
+        let w_list = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        let Some(w_item) = (unsafe { pyre_object::listobject::w_list_getitem(w_list, i as i64) })
+        else {
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            array_restore_fromlist(obj, &old_bytes)?;
+            return Err(PyError::runtime_error("list changed size during iteration"));
+        };
+        pyre_object::gc_roots::shadow_stack_set(item_slot, w_item);
+
+        // [3.14-spec] CPython `array_array_fromlist_impl` uses PyList_GET_ITEM
+        // even for list subclasses and checks the live list size after each
+        // conversion.  PyPy's `fromsequence` can instead fall through to
+        // `_fromiterable` for a subclass and its installed oracle snapshots
+        // list-size changes.  Keep PyPy's pre-size/rollback structure, but use
+        // the 3.14 observable direct-list gateway and mutation error.
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let len_before = unsafe { arr::w_array_len(obj) };
+        let slot = len_before
+            .checked_sub(n)
+            .and_then(|base| base.checked_add(i));
+        let typecode = unsafe { arr::w_array_typecode(obj) };
+        let mut packed: Bytes = [0; 8];
+        let packed_len = match pack_into(
+            typecode,
+            pyre_object::gc_roots::shadow_stack_get(item_slot),
+            &mut packed,
+        ) {
+            Ok(packed_len) => packed_len,
+            Err(error) => {
+                let obj = pyre_object::gc_roots::shadow_stack_get(base);
+                array_restore_fromlist(obj, &old_bytes)?;
+                return Err(error);
+            }
+        };
+
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let live_len = unsafe { arr::w_array_len(obj) };
+        if let Some(slot) = slot {
+            if slot < live_len {
+                let start = slot * itemsize;
+                let vec = unsafe { arr::w_array_vec_mut(obj) };
+                vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
+            }
+        }
+
+        let w_list = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        if unsafe { pyre_object::listobject::w_list_len(w_list) } != n {
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            array_restore_fromlist(obj, &old_bytes)?;
+            return Err(PyError::runtime_error("list changed size during iteration"));
+        }
+    }
     Ok(pyre_object::w_none())
+}
+
+fn array_restore_fromlist(obj: PyObjectRef, old_bytes: &[u8]) -> Result<(), PyError> {
+    // PyPy `W_ArrayBase.descr_fromlist` calls `setlen(s)` on every conversion
+    // failure.  pyre's logical length is the Vec byte length, so restore the
+    // corresponding pre-call byte prefix.  Respect a buffer export created by
+    // conversion just as a fresh resize would.
+    array_check_resize(obj)?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.clear();
+    vec.extend_from_slice(old_bytes);
+    Ok(())
 }
 
 fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
@@ -1699,7 +1800,14 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "__buffer__", array_buffer, 2);
     m(ns, "reverse", array_reverse_method, 1);
     m(ns, "tolist", array_tolist_method, 1);
-    m(ns, "fromlist", array_fromlist_method, 2);
+    // `fromlist` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "fromlist",
+            crate::make_builtin_function("fromlist", array_fromlist_method),
+        )
+    };
     m(ns, "tobytes", array_tobytes_method, 1);
     m(ns, "frombytes", array_frombytes_method, 2);
     m(ns, "tofile", array_tofile_method, 2);
