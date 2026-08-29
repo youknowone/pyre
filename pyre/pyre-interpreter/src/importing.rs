@@ -3841,10 +3841,7 @@ fn ensure_stdlib_path() {
     // its tree" warning below does not apply to it either.
     #[cfg(not(feature = "sandbox"))]
     if config.pth.is_some() {
-        SYS_PATH
-            .lock()
-            .unwrap()
-            .extend(config.stdlib_paths.iter().cloned());
+        SYS_PATH.lock().extend(config.stdlib_paths.iter().cloned());
         return;
     }
     if config.stdlib_paths.is_empty() {
