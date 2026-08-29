@@ -3824,10 +3824,10 @@ fn detach_code_unit_wrapper(code_ptr: *const ()) {
     if code_ptr.is_null() {
         return;
     }
-    let mut registry = code_units()
+    let mut guard = code_units()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let registry = &mut *registry;
+    let registry = &mut *guard;
     let Some(&owner) = registry.owner_of.get(&(code_ptr as usize)) else {
         return;
     };
@@ -3845,6 +3845,10 @@ fn detach_code_unit_wrapper(code_ptr: *const ()) {
     for member in &unit.members {
         registry.owner_of.remove(member);
     }
+    // The graph is out of both maps, so no other caller can reach it, and the
+    // retirement below takes a second lock and frees arbitrary payloads.  It
+    // runs with this one released so neither is an order over the other.
+    drop(guard);
     retire_code_unit(owner as *mut crate::CodeObject, &unit.members);
 }
 
