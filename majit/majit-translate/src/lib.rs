@@ -2228,12 +2228,18 @@ fn register_configured_jitdrivers(
                 .source_identity
                 .clone()
                 .unwrap_or_else(|| original.name.clone());
-            portal.name = format!("{}_portal", original.name);
+            let portal_name = format!(
+                "{}_portal",
+                spec.portal
+                    .last_segment()
+                    .expect("non-empty portal path asserted above")
+            );
+            portal.name = portal_name.clone();
             portal.source_identity = Some(format!("{original_identity}#portal"));
             let mut portal_segments = spec.portal.segments.clone();
             *portal_segments
                 .last_mut()
-                .expect("non-empty portal path asserted above") = portal.name.clone();
+                .expect("non-empty portal path asserted above") = portal_name;
             let portal_path = crate::parse::CallPath::from_segments(portal_segments);
 
             let (marker_block, marker_index) =
@@ -2668,7 +2674,7 @@ mod portal_driver_tests {
 
         let mut call_control = call::CallControl::new();
         let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
-        let mut graph = FunctionGraph::new("eval_loop_jit");
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
         let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
@@ -2725,11 +2731,23 @@ mod portal_driver_tests {
             &config.jit_drivers,
             &config.transform.jitdriver_receiver_roots,
         );
+        let split_portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        assert_eq!(call_control.jitdrivers_sd()[0].portal_graph, split_portal);
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split_portal)
+            .expect("split portal graph must be registered under its derived path");
+        assert_eq!(split_graph.name, "eval_loop_jit_portal");
+        assert_eq!(
+            split_graph.source_identity.as_deref(),
+            Some("pyre_jit::eval::eval_loop_jit#portal")
+        );
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
         let (jitcodes, _, _, _, _) =
             make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
+        assert_eq!(jitcodes[0].name, "eval_loop_jit_portal");
         let merge = jitcodes[0]
             .body()
             ._ssarepr

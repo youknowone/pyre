@@ -7047,8 +7047,8 @@ fn portal_metatrace_enabled() -> bool {
 /// `initialize_state_from_start` is `f = self.newframe(mainjitcode);
 /// f.setup_call(original_boxes)` — entry at pc 0 with the portal's own
 /// arguments, so the prologue runs and the walk reaches the merge point on its
-/// own. `eval_loop_jit`'s `calldescr.arg_classes` is `"r"`: the portal was
-/// never split, so its one argument is the Rust `frame`, not greens+reds.
+/// own. A split portal declares greens followed by reds; an unsplit portal
+/// keeps `eval_loop_jit`'s single `frame` argument.
 fn portal_metatrace_entry_at_start() -> bool {
     static AT_START: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AT_START
@@ -7119,6 +7119,7 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
             portal_index,
             canonical.code.len(),
         );
+        let portal_arg_classes = canonical.calldescr().arg_classes.clone();
         let jitcode = majit_metainterp::JitCode::from_canonical((*canonical).clone());
 
         let header_pc = match pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
@@ -7226,10 +7227,18 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
                 let mut frame =
                     majit_metainterp::MIFrame::setup(jitcode_arc, header_pc, None, Some(ctx));
 
-                let green_int_values = [next_instr, is_being_profiled];
-                for (&reg, &value) in slot_regs[0].iter().zip(green_int_values.iter()) {
+                let next_instr_opref = ctx.const_int(next_instr);
+                let is_being_profiled_opref = ctx.const_int(is_being_profiled);
+                let pycode_opref = ctx.const_ref(pycode as usize as i64);
+                let frame_opref = majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref);
+                let ec_opref = majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Ref);
+
+                let green_int_values = [
+                    (next_instr_opref, next_instr),
+                    (is_being_profiled_opref, is_being_profiled),
+                ];
+                for (&reg, &(opref, value)) in slot_regs[0].iter().zip(green_int_values.iter()) {
                     if reg < frame.int_regs.len() && reg < frame.int_values.len() {
-                        let opref = ctx.const_int(value);
                         frame.int_regs[reg] = Some(opref);
                         frame.int_values[reg] = Some(value);
                     } else {
@@ -7241,10 +7250,9 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
                         );
                     }
                 }
-                let green_ref_values = [pycode as usize as i64];
-                for (&reg, &value) in slot_regs[1].iter().zip(green_ref_values.iter()) {
+                let green_ref_values = [(pycode_opref, pycode as usize as i64)];
+                for (&reg, &(opref, value)) in slot_regs[1].iter().zip(green_ref_values.iter()) {
                     if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
-                        let opref = ctx.const_ref(value);
                         frame.ref_regs[reg] = Some(opref);
                         frame.ref_values[reg] = Some(value);
                     } else {
@@ -7256,18 +7264,12 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
                         );
                     }
                 }
-                let red_ref_values = [live_frame as usize as i64, ec as usize as i64];
-                for (input_index, (&reg, &value)) in slot_regs[4]
-                    .iter()
-                    .zip(red_ref_values.iter())
-                    .enumerate()
-                {
+                let red_ref_values = [
+                    (frame_opref, live_frame as usize as i64),
+                    (ec_opref, ec as usize as i64),
+                ];
+                for (&reg, &(opref, value)) in slot_regs[4].iter().zip(red_ref_values.iter()) {
                     if reg < frame.ref_regs.len() && reg < frame.ref_values.len() {
-                        let input_index = input_index as u32;
-                        let opref = majit_ir::OpRef::input_arg_typed(
-                            input_index,
-                            majit_ir::Type::Ref,
-                        );
                         frame.ref_regs[reg] = Some(opref);
                         frame.ref_values[reg] = Some(value);
                     } else {
@@ -7286,27 +7288,64 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
                 //   f = self.newframe(self.jitdriver_sd.mainjitcode)
                 //   f.setup_call(original_boxes)
                 // `setup_call` packs argboxes into the typed banks in
-                // declaration order, so a `calldescr.arg_classes == "r"`
-                // jitcode takes exactly one ref, at r0. Here that is the live
-                // `PyFrame`: pc=3 calls `FrameRoot::new` on r0 to produce r1,
-                // and r1 is what the loop body's first op reads — the register
-                // merge-point entry cannot supply.
+                // declaration order. The split portal takes its greens then
+                // reds; the unsplit portal takes the live `PyFrame` at r0.
                 //
                 // The merge-point seeds above are left standing: every
                 // register they write is re-written by the prologue before the
                 // marker, and `setup_call` overwrites r0 at entry.
                 let entry_pc = if portal_metatrace_entry_at_start() {
-                    frame.setup_call(&[(
-                        majit_metainterp::JitArgKind::Ref,
-                        majit_ir::OpRef::input_arg_typed(0, majit_ir::Type::Ref),
-                        live_frame as usize as i64,
-                    )]);
+                    let declared_kinds = portal_arg_classes
+                        .chars()
+                        .map(|class| match class {
+                            'i' | 'S' => majit_metainterp::JitArgKind::Int,
+                            'r' => majit_metainterp::JitArgKind::Ref,
+                            'f' | 'L' => majit_metainterp::JitArgKind::Float,
+                            other => panic!("unsupported portal argument class {other:?}"),
+                        })
+                        .collect::<Vec<_>>();
+                    let start_args = match declared_kinds.as_slice() {
+                        [frame_kind] => {
+                            assert_eq!(*frame_kind, majit_metainterp::JitArgKind::Ref);
+                            vec![(*frame_kind, frame_opref, live_frame as usize as i64)]
+                        }
+                        [
+                            next_instr_kind,
+                            profiled_kind,
+                            pycode_kind,
+                            frame_kind,
+                            ec_kind,
+                        ] => vec![
+                            (*next_instr_kind, next_instr_opref, next_instr),
+                            (*profiled_kind, is_being_profiled_opref, is_being_profiled),
+                            (*pycode_kind, pycode_opref, pycode as usize as i64),
+                            (*frame_kind, frame_opref, live_frame as usize as i64),
+                            (*ec_kind, ec_opref, ec as usize as i64),
+                        ],
+                        _ => panic!(
+                            "portal start expected one or five arguments, got {:?}",
+                            portal_arg_classes
+                        ),
+                    };
+                    let seeded_arg_classes = start_args
+                        .iter()
+                        .map(|(kind, _, _)| match kind {
+                            majit_metainterp::JitArgKind::Int => 'i',
+                            majit_metainterp::JitArgKind::Ref => 'r',
+                            majit_metainterp::JitArgKind::Float => 'f',
+                        })
+                        .collect::<String>();
+                    let seeded_values = start_args
+                        .iter()
+                        .map(|(_, _, value)| *value)
+                        .collect::<Vec<_>>();
+                    frame.setup_call(&start_args);
                     // `setup_call` sets `pc = 0`; the walker reads
                     // `code_cursor`, which it does not touch.
                     frame.code_cursor = 0;
                     eprintln!(
-                        "[jd0-mt] entry=start pc=0 setup_call arg_classes=\"r\" r0=0x{:x}",
-                        live_frame as usize,
+                        "[jd0-mt] entry=start pc=0 setup_call arg_classes=\"{}\" args={:?}",
+                        seeded_arg_classes, seeded_values,
                     );
                     0
                 } else {

@@ -338,15 +338,25 @@ fn compute_portal_jitcode_index_for_key(key: &str) -> Option<usize> {
 }
 
 fn compute_portal_jitcode_index() -> Option<usize> {
-    compute_portal_jitcode_index_for_key("eval::eval_loop_jit")
+    let drivers = COMPILED_JIT_DRIVERS.with(|cell| *cell.get_or_init(load_compiled_jit_drivers));
+    let mut matching = drivers.iter().filter(|driver| {
+        get_jitcode_ref_by_index(driver.main_jitcode_index)
+            .is_some_and(|jitcode| jitcode.jitdriver_sd() == Some(0))
+    });
+    let driver = matching.next()?;
+    assert!(
+        matching.next().is_none(),
+        "multiple compiled JIT drivers carry JitDriverStaticData index 0"
+    );
+    Some(driver.main_jitcode_index)
 }
 
 /// RPython: `metainterp_sd.jitcodes[jitdriver_sd.mainjitcode.index]`
 /// (warmspot.py:281-282 + call.py:147-148) — the main
-/// `eval::eval_loop_jit` portal jitcode that `find_all_graphs(portal, policy)`
-/// seeds the jitcode closure from. For a per-driver resolver, use
-/// [`portal_jitcode_for_key`]. Returns `None` when the main eval portal is
-/// absent from the compiled metadata.
+/// portal jitcode for JitDriverStaticData index 0, which
+/// `find_all_graphs(portal, policy)` seeds the jitcode closure from. For a
+/// per-driver path resolver, use [`portal_jitcode_for_key`]. Returns `None`
+/// when driver index 0 is absent from the compiled metadata.
 ///
 /// Trace-side user-function calls (`callee_frame_helper`,
 /// `jit_create_callee_frame_*`, `jit_force_callee_frame`) route through
@@ -2987,25 +2997,25 @@ mod tests {
     #[test]
     fn portal_jitcode_resolves_to_unique_jitdriver_entry() {
         // Verify the portal accessor returns the build-time JitCode for the
-        // unique main eval driver (RPython
+        // unique driver carrying JitDriverStaticData index 0 (RPython
         // call.py `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`).
         let portal = portal_jitcode().expect("build-time pipeline must register a portal jitcode");
-        assert!(
-            portal.jitdriver_sd().is_some(),
-            "portal jitcode must carry a populated `jitdriver_sd` (call.py:148)"
-        );
+        assert_eq!(portal.jitdriver_sd(), Some(0));
         let drivers =
             COMPILED_JIT_DRIVERS.with(|cell| *cell.get_or_init(load_compiled_jit_drivers));
-        let eval_drivers = drivers
+        let main_drivers = drivers
             .iter()
-            .filter(|driver| driver.portal.canonical_key() == "eval::eval_loop_jit")
+            .filter(|driver| {
+                get_jitcode_ref_by_index(driver.main_jitcode_index)
+                    .is_some_and(|jitcode| jitcode.jitdriver_sd() == Some(0))
+            })
             .collect::<Vec<_>>();
         assert_eq!(
-            eval_drivers.len(),
+            main_drivers.len(),
             1,
-            "the main eval portal must resolve to exactly one configured JIT driver"
+            "JitDriverStaticData index 0 must resolve to exactly one compiled JIT driver"
         );
-        assert_eq!(portal.index(), eval_drivers[0].main_jitcode_index);
+        assert_eq!(portal.index(), main_drivers[0].main_jitcode_index);
     }
 
     #[test]
