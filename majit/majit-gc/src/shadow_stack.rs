@@ -726,6 +726,20 @@ pub fn shadow_stack_slot() -> ShadowStackSlot {
     ShadowStackSlot(SHADOW_STACK.with(|ss| ss as *const _))
 }
 
+/// The slot handle and the index of the top entry, from one thread-local
+/// resolve.
+///
+/// The caller guarantees a non-empty stack: the top entry is a root some
+/// enclosing owner pushed and has not yet popped.
+#[inline]
+pub fn top() -> (ShadowStackSlot, usize) {
+    SHADOW_STACK.with(|ss| {
+        let len = ss.borrow().entries.len();
+        assert!(len > 0, "shadow stack empty");
+        (ShadowStackSlot(ss as *const _), len - 1)
+    })
+}
+
 /// Get a GcRef at `index` through a previously resolved [`ShadowStackSlot`].
 ///
 /// # Safety

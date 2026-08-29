@@ -2256,9 +2256,16 @@ fn register_configured_jitdrivers(
                 .function_graphs()
                 .get(&portal_path)
                 .expect("registered split portal path must resolve");
+            // The marker heads the split block up to the operations
+            // `split_block` re-emits before it: upstream inserts `same_as` of
+            // a constant there and `remove_same_as` folds it into the marker's
+            // operand, so the marker lands at index 0; here the receiver's
+            // producer stays as a real operation because operands are
+            // Variables, so only the block is asserted.
             assert_eq!(
-                crate::codewriter::support::find_jit_merge_point(registered, driver_roots),
-                Some((split_start, 0)),
+                crate::codewriter::support::find_jit_merge_point(registered, driver_roots)
+                    .map(|(block, _)| block),
+                Some(split_start),
                 "registered portal path aliased away from the split graph body"
             );
             portal_path
