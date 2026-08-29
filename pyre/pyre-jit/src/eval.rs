@@ -193,8 +193,8 @@ fn pyre_object_gc_finalizer_next_dead_trampoline(fq_index: usize) -> pyre_object
 /// Caller must keep `slot` valid until
 /// [`pyre_object_gc_remove_root_trampoline`] is called with the same
 /// pointer.
-unsafe fn pyre_object_gc_add_root_trampoline(slot: *mut *mut u8) {
-    unsafe { majit_gc::gc_add_root(slot as *mut majit_ir::GcRef) };
+unsafe fn pyre_object_gc_add_root_trampoline(slot: *mut *mut u8) -> bool {
+    unsafe { majit_gc::gc_add_root(slot as *mut majit_ir::GcRef) }
 }
 
 /// Companion to [`pyre_object_gc_add_root_trampoline`].
@@ -5462,7 +5462,6 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.result_type = majit_ir::Type::Ref;
     jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
-    jd.portal_ptr_adr = crate::call_jit::portal_resume_shim as *const () as i64;
     d.meta_interp_mut().register_jitdriver_sd(jd);
     // baseobjspace.py `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
@@ -9374,10 +9373,10 @@ pub(crate) fn portal_activation_result(frame: &mut PyFrame) -> PyResult {
 /// code around CALL_ASSEMBLER.
 ///
 /// This is the `ll_portal_runner` door for the full-body walker's recursive
-/// call.  `record_ec_enter_frame_chain` has already published the frame vref;
-/// install only pyre's extra TLS root, then supply `execute_frame`'s hook
-/// bracket.  The compiled continuation records the matching chain restore and
-/// `virtual_ref_finish` after the call returns.
+/// call.  `record_ec_enter_frame_chain` has already published the callee in
+/// `topframeref`; install only pyre's extra TLS root, then supply
+/// `execute_frame`'s hook bracket.  The compiled continuation records the
+/// matching chain restore after the call returns.
 pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
     let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
     let mut frame_root = FrameRoot::new(frame);

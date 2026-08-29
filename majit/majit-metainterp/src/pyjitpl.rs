@@ -20428,7 +20428,6 @@ mod metainterp_static_data_tests {
             is_recursive: false,
             mainjitcode: None,
             portal_runner_adr: 0,
-            portal_ptr_adr: 0,
             virtualizable_info: None,
             greenfield_info: None,
             index_of_virtualizable: -1,

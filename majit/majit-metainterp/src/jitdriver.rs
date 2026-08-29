@@ -1188,13 +1188,6 @@ pub struct JitDriverStaticData {
     /// `do_recursive_call`'s residual CALL_ASSEMBLER op
     /// (pyjitpl.py:1428-1429).
     pub portal_runner_adr: i64,
-    /// warmspot.py `jd._portal_ptr` — the portal body below
-    /// `ll_portal_runner`'s activation entry.
-    ///
-    /// Concrete execution while tracing a CALL_ASSEMBLER that resumes an
-    /// already-started frame must call this address, while a temporary
-    /// callback compiled for runtime keeps calling `portal_runner_adr`.
-    pub portal_ptr_adr: i64,
     /// jitdriver.py:16 + warmspot.py:520-545 `jd.virtualizable_info`.
     ///
     /// Per-driver `VirtualizableInfo` populated during warmspot setup
@@ -1380,7 +1373,6 @@ impl JitDriverStaticData {
             is_recursive: false,
             mainjitcode: None,
             portal_runner_adr: 0,
-            portal_ptr_adr: 0,
             virtualizable_info: None,
             greenfield_info: None,
             index_of_virtualizable: -1,

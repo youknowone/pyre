@@ -1165,23 +1165,6 @@ pub extern "C" fn ll_portal_runner_shim(
     run_frame_through_portal(frame_ptr, PortalEntry::TracedActivation)
 }
 
-/// `portal_ptr` ABI for concrete continuation of an activation whose prologue
-/// and hook bracket have already run.
-#[majit_macros::jit_may_force]
-pub extern "C" fn portal_resume_shim(
-    next_instr: i64,
-    _is_being_profiled: i64,
-    _pycode: i64,
-    frame_ptr: i64,
-    _ec: i64,
-) -> i64 {
-    if frame_ptr != 0 {
-        let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        frame.set_last_instr_from_next_instr(next_instr as usize);
-    }
-    run_frame_through_portal(frame_ptr, PortalEntry::Resume)
-}
-
 /// warmspot.py — assembler_call_helper.
 ///
 /// Called when CALL_ASSEMBLER guard-fails (not a finish exit).

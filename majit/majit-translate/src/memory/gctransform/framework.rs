@@ -169,7 +169,6 @@ pub const PYTHON_DISPATCH_SEEDS: &[&str] = &[
     // scan over that is vacuous rather than clean.  These are the portal and
     // blackhole entries that artefact does carry.
     "call_jit::ll_portal_runner_shim",
-    "call_jit::portal_resume_shim",
     "call_jit::run_frame_through_portal",
     "call_jit::bh_portal_runner",
     "call_jit::bh_call_self_recursive_portal",
