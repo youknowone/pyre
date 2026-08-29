@@ -1847,6 +1847,10 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_arg_from_imm(Self::abi_int_arg(idx), val, Type::Int);
     }
 
+    fn emit_abi_int_arg_from_mem(&mut self, idx: usize, offset: i32) {
+        self.emit_abi_arg_from_mem(Self::abi_int_arg(idx), offset, Type::Int);
+    }
+
     // Both call sites are `#[cfg(windows)]`, so every other host reads this
     // as unreached.
     #[allow(dead_code)]
@@ -4427,7 +4431,11 @@ impl<'a> Assembler386<'a> {
             // x86/assembler.py malloc_cond_varsize parity
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
             OpCode::CallMallocNurseryVarsize => {
-                let base_size = op.with_array_descr(|ad| ad.base_size()).unwrap_or(16) as i64;
+                let (base_size, type_id) = op
+                    .with_array_descr(|ad| (ad.base_size(), ad.type_id()))
+                    .expect("CallMallocNurseryVarsize requires an ArrayDescr");
+                let base_size = base_size as i64;
+                let type_id = type_id as i64;
                 let itemsize = match arglocs.get(1) {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
@@ -4442,10 +4450,27 @@ impl<'a> Assembler386<'a> {
                 // arg3 is the descr's tid: a varsize object allocated as
                 // type 0 is traced with the layout of whatever registered
                 // first, so its items are never walked.
-                let type_id = op.with_array_descr(|ad| ad.type_id()).unwrap_or(0) as i64;
-                self.emit_abi_int_arg_from_imm(0, base_size);
-                self.emit_abi_int_arg_from_imm(1, itemsize);
-                self.emit_abi_int_arg_from_imm(3, type_id);
+                // Copy the only non-immediate argument first.  Any ABI
+                // argument register can also be `len_r`; writing base/item/tid
+                // first would destroy that value before it reaches arg2.
+                //
+                // assembler.py:2617-2621 `malloc_cond_varsize`:
+                //
+                //     if isinstance(lengthloc, RegLoc):
+                //         varsizeloc = lengthloc
+                //     else:
+                //         self.mc.MOV(edx, lengthloc)
+                //
+                // The stack arm is not the rare one.  `prepare_op_call_malloc_
+                // nursery_varsize` reads `lengthloc` *after*
+                // `spill_or_move_registers_before_call(SAVE_ALL_REGS)` has
+                // popped every register binding, so a live length is in its
+                // frame slot by the time this asks — which is why upstream
+                // spells the register arm as the special case and aarch64
+                // asserts `lengthloc.is_stack()` outright. Substituting an
+                // immediate 0 here sizes the block for no items at all, and
+                // the `gen_initialize_len` store that follows stamps the true
+                // length into it.
                 match arglocs.first() {
                     Some(Loc::Reg(len_r)) => {
                         self.emit_abi_int_arg_from_reg(2, len_r.value as u8);
@@ -4453,10 +4478,17 @@ impl<'a> Assembler386<'a> {
                     Some(Loc::Immed(len_i)) => {
                         self.emit_abi_int_arg_from_imm(2, len_i.value);
                     }
-                    _ => {
-                        self.emit_abi_int_arg_from_imm(2, 0);
+                    Some(Loc::Frame(len_f)) => {
+                        self.emit_abi_int_arg_from_mem(2, len_f.ebp_loc.value);
                     }
+                    Some(Loc::Ebp(len_e)) => {
+                        self.emit_abi_int_arg_from_mem(2, len_e.value);
+                    }
+                    other => panic!("CallMallocNurseryVarsize length is not a value: {other:?}"),
                 }
+                self.emit_abi_int_arg_from_imm(0, base_size);
+                self.emit_abi_int_arg_from_imm(1, itemsize);
+                self.emit_abi_int_arg_from_imm(3, type_id);
                 // assembler.py:649-650 push_gcmap — a null gcmap tells the
                 // collector this frame holds no references, so every pointer
                 // spilled above would survive the collection unforwarded.
