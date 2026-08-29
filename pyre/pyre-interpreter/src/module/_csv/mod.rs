@@ -446,52 +446,44 @@ fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
 /// is.  Naming the module instead resolves through the running `sys.modules`,
 /// which a program is entitled to block -- and then `csv.list_dialects()`
 /// fails on a module it never asked for.
-struct CsvState {
-    dialects: PyObjectRef,
-}
-
-static CSV_STATE: std::sync::atomic::AtomicPtr<CsvState> =
+///
+/// The reference is the atomic word itself, not a field inside an allocation
+/// some other atomic names.  A re-import replaces the mapping while another
+/// thread is inside `list_dialects`, and a plain field written and read across
+/// threads is a data race however the enclosing allocation is reached -- the
+/// sibling `_ast` slot escapes that only because it is published once and never
+/// replaced, which a per-import registry cannot be.  Same shape as
+/// `faulthandler`'s owner slot.
+static CSV_DIALECTS: std::sync::atomic::AtomicPtr<pyre_object::PyObject> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
 /// Forward the registry.  The module namespace holds the same mapping, but
 /// only for as long as the module itself is reachable, and a program that
 /// takes `_csv` out of `sys.modules` leaves this slot its only owner.
+///
+/// Runs from the collector inside the stop-the-world window, so no publish can
+/// interleave between this load and the store that forwards it.
 pub(crate) fn walk_csv_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
-    let ptr = CSV_STATE.load(std::sync::atomic::Ordering::Acquire);
-    if ptr.is_null() {
+    let mut dialects = CSV_DIALECTS.load(std::sync::atomic::Ordering::Acquire);
+    if dialects.is_null() {
         return;
     }
-    unsafe { visitor(&mut *std::ptr::addr_of_mut!((*ptr).dialects)) };
+    visitor(&mut dialects);
+    CSV_DIALECTS.store(dialects, std::sync::atomic::Ordering::Release);
 }
 
 /// Publish the mapping `init` just built.  A re-import mints a fresh one, the
 /// way a fresh module state would.
 fn publish_csv_dialects(dialects: PyObjectRef) {
-    let mut ptr = CSV_STATE.load(std::sync::atomic::Ordering::Acquire);
-    if ptr.is_null() {
-        let created = Box::into_raw(Box::new(CsvState { dialects }));
-        ptr = match CSV_STATE.compare_exchange(
-            std::ptr::null_mut(),
-            created,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => return,
-            Err(existing) => {
-                drop(unsafe { Box::from_raw(created) });
-                existing
-            }
-        };
-    }
-    unsafe { *std::ptr::addr_of_mut!((*ptr).dialects) = dialects };
+    CSV_DIALECTS.store(dialects, std::sync::atomic::Ordering::Release);
 }
 
 fn csv_dialects() -> Result<PyObjectRef, PyError> {
-    let ptr = CSV_STATE.load(std::sync::atomic::Ordering::Acquire);
-    if ptr.is_null() {
+    let dialects = CSV_DIALECTS.load(std::sync::atomic::Ordering::Acquire);
+    if dialects.is_null() {
         return Err(PyError::runtime_error("_csv module not initialized"));
     }
-    Ok(unsafe { std::ptr::read(std::ptr::addr_of!((*ptr).dialects)) })
+    Ok(dialects)
 }
 
 fn lookup_registered_dialect(name: PyObjectRef) -> Result<PyObjectRef, PyError> {
