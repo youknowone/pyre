@@ -15312,20 +15312,39 @@ fn codegen_statement_end(
     Some((end_lineno, end - end_line_start + 1))
 }
 
-/// `pypy/interpreter/astcompiler/consts.py` compilation flag bits.
-const PYCF_ONLY_AST: i64 = 0x0400;
-const PYCF_DONT_IMPLY_DEDENT: i64 = 0x0200;
-const PYCF_SOURCE_IS_UTF8: i64 = 0x0100;
-const PYCF_IGNORE_COOKIE: i64 = 0x0800;
-/// `Include/cpython/compile.h` numbers this one `0x1000`, and `_ast`
-/// publishes it, so the value is observable.  `consts.py` moved it out to
-/// `0x40000000` because it kept `PyCF_ASYNC_HACKS` on `0x1000`; that flag is
-/// gone from 3.14 and the bit is free.
-const PYCF_TYPE_COMMENTS: i64 = 0x1000;
-const PYCF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
-const PYCF_ALLOW_INCOMPLETE_INPUT: i64 = 0x4000;
-const PYCF_OPTIMIZED_AST: i64 = 0x8000 | PYCF_ONLY_AST;
-const PYCF_ACCEPT_NULL_BYTES: i64 = 0x1000_0000;
+/// The `consts.py` compilation flag bits.
+///
+/// Declaring each once mints the table
+/// `every_compile_flag_is_the_bit_consts_gives_it` walks: a flag `consts.py`
+/// also declares is held to the value it gives, one it does not is held to
+/// being absent, and the two that deliberately differ are named there with
+/// what `consts.py` says.
+macro_rules! compile_flags {
+    ($($(#[$doc:meta])* $name:ident = $value:expr,)*) => {
+        $($(#[$doc])* const $name: i64 = $value;)*
+
+        #[cfg(test)]
+        const ALL_PYCF_FLAGS: &[(&str, i64)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+compile_flags! {
+    PYCF_ONLY_AST = 0x0400,
+    PYCF_DONT_IMPLY_DEDENT = 0x0200,
+    PYCF_SOURCE_IS_UTF8 = 0x0100,
+    PYCF_IGNORE_COOKIE = 0x0800,
+    /// `Include/cpython/compile.h` numbers this one `0x1000`, and `_ast`
+    /// publishes it, so the value is observable.  `consts.py` moved it out to
+    /// `0x40000000` because it kept `PyCF_ASYNC_HACKS` on `0x1000`; that flag
+    /// is gone from 3.14 and the bit is free.
+    PYCF_TYPE_COMMENTS = 0x1000,
+    PYCF_ALLOW_TOP_LEVEL_AWAIT = 0x2000,
+    PYCF_ALLOW_INCOMPLETE_INPUT = 0x4000,
+    /// 3.13 added this one, so `consts.py` does not carry it.
+    PYCF_OPTIMIZED_AST = 0x8000 | PYCF_ONLY_AST,
+    PYCF_ACCEPT_NULL_BYTES = 0x1000_0000,
+}
+
 /// `future.py` `allowed_flags` — the union of the `__future__`
 /// `compiler_flag` bits (`CO_FUTURE_DIVISION` … `CO_FUTURE_ANNOTATIONS`),
 /// i.e. the flags `getcodeflags` masks out of a caller's `co_flags`.
@@ -23396,6 +23415,98 @@ mod tests {
         assert_eq!(
             err.message_text(),
             "base is not invertible for the given modulus"
+        );
+    }
+
+    /// `compile()`'s flags word is `consts.py`'s, so the bits are one table in
+    /// two places.  This walks the upstream file and rejects any flag whose
+    /// bit the Rust side spells differently, other than the two named below,
+    /// which differ deliberately and are held to what `consts.py` still says.
+    #[test]
+    fn every_compile_flag_is_the_bit_consts_gives_it() {
+        const CONSTS: &str = include_str!("../../../pypy/interpreter/astcompiler/consts.py");
+
+        // `PyCF_X = 0xN` and `CO_FUTURE_X = 0xN`, both at column zero.
+        let mut upstream: Vec<(&str, i64)> = Vec::new();
+        for line in CONSTS.lines() {
+            let Some((name, body)) = line.split_once('=') else {
+                continue;
+            };
+            let (name, body) = (name.trim_end(), body.trim());
+            if name.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let Some(digits) = body
+                .split_whitespace()
+                .next()
+                .and_then(|w| w.strip_prefix("0x"))
+            else {
+                continue;
+            };
+            let Ok(value) = i64::from_str_radix(digits, 16) else {
+                continue;
+            };
+            upstream.push((name, value));
+        }
+
+        let upstream_bit = |name: &str| {
+            upstream
+                .iter()
+                .find(|(known, _)| *known == name)
+                .map(|(_, value)| *value)
+        };
+
+        // The two the port deliberately numbers differently, with the value
+        // `consts.py` gives, so a change on either side is a failure.
+        const DIVERGES: &[(&str, i64)] = &[("PYCF_TYPE_COMMENTS", 0x4000_0000)];
+
+        let mut compared = 0;
+        for (name, ours) in ALL_PYCF_FLAGS {
+            let upstream_name = format!("PyCF_{}", name.strip_prefix("PYCF_").unwrap());
+            let theirs = upstream_bit(&upstream_name);
+            if let Some((_, declared)) = DIVERGES.iter().find(|(known, _)| known == name) {
+                assert_eq!(
+                    theirs,
+                    Some(*declared),
+                    "{upstream_name} is {theirs:?} in consts.py, not the {declared:#x} \
+                     this port diverges from"
+                );
+                continue;
+            }
+            let Some(theirs) = theirs else {
+                // No upstream name means the claim is that consts.py has no
+                // such flag, which is what the walk holds it to.
+                continue;
+            };
+            assert_eq!(
+                *ours, theirs,
+                "{upstream_name} is {theirs:#x} in consts.py and {ours:#x} here"
+            );
+            compared += 1;
+        }
+
+        // A parser that read nothing would agree with every flag above.
+        assert_eq!(
+            compared,
+            ALL_PYCF_FLAGS.len() - DIVERGES.len() - 1,
+            "the walk compared {compared} of the {} flags this file declares",
+            ALL_PYCF_FLAGS.len()
+        );
+        assert!(
+            upstream_bit("PyCF_OPTIMIZED_AST").is_none(),
+            "consts.py declares PyCF_OPTIMIZED_AST, so this port no longer adds it"
+        );
+
+        // `COMPILER_FLAGS` is `future.py allowed_flags`, an OR of eight bits
+        // written here as one number.
+        let futures: i64 = upstream
+            .iter()
+            .filter(|(name, _)| name.starts_with("CO_FUTURE_"))
+            .map(|(_, value)| *value)
+            .fold(0, |mask, value| mask | value);
+        assert_eq!(
+            COMPILER_FLAGS, futures,
+            "consts.py's CO_FUTURE_ bits are {futures:#x} and COMPILER_FLAGS is {COMPILER_FLAGS:#x}"
         );
     }
 }

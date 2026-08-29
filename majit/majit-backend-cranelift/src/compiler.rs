@@ -1729,8 +1729,8 @@ fn collect_generation_via_active_runtime(generation: i64) {
 fn collect_step_via_active_runtime() -> majit_gc::GcStepTransition {
     with_cranelift_gc(|gc| gc.collect_step()).unwrap_or(majit_gc::GcStepTransition {
         // `rgc.py:20-31`: SCANNING on both sides would never report completion.
-        old_state: majit_gc::GcStepTransition::MARKING,
-        new_state: majit_gc::GcStepTransition::SCANNING,
+        old_state: majit_gc::GcStepTransition::STATE_MARKING,
+        new_state: majit_gc::GcStepTransition::STATE_SCANNING,
     })
 }
 

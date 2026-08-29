@@ -12,6 +12,7 @@
 //! carries that skip forward — so the assertions that would pin these live in
 //! `extra_tests/snippets/` instead.
 
+use majit_gc::GcStepTransition;
 use pyre_object::*;
 use rustpython_wtf8::Wtf8;
 use std::io::Write;
@@ -72,17 +73,23 @@ static GC_THRESHOLD: [AtomicI64; 3] =
 /// empty, which is what `do_get_objects` already answers for it.
 const NUM_GENERATIONS: i64 = 3;
 
-const STATE_SCANNING: u8 = 0;
-const STATE_MARKING: u8 = 1;
-const STATE_SWEEPING: u8 = 2;
-const STATE_FINALIZING: u8 = 3;
-const STATE_USERDEL: u8 = 4;
+/// `hook.py:284-288` takes the four states from `incminimark`, where they are
+/// declared and compared against it, and numbers its own one past the last.
+const STATE_SCANNING: u8 = GcStepTransition::STATE_SCANNING;
+const STATE_MARKING: u8 = GcStepTransition::STATE_MARKING;
+const STATE_SWEEPING: u8 = GcStepTransition::STATE_SWEEPING;
+const STATE_FINALIZING: u8 = GcStepTransition::STATE_FINALIZING;
+const STATE_USERDEL: u8 = GcStepTransition::STATE_FINALIZING + 1;
 
 /// `rgc.py is_done__states`: a major collection has finished when the
 /// step ended in the starting state *and* did not start there. A collector
 /// with no work to do reports `(0, 0)`, which is not the end of anything.
 fn is_done_states(oldstate: u8, newstate: u8) -> bool {
-    oldstate != STATE_SCANNING && newstate == STATE_SCANNING
+    GcStepTransition {
+        old_state: oldstate,
+        new_state: newstate,
+    }
+    .is_done()
 }
 
 /// `interp_gc.py StepCollector.finalizing`. `space.fromcache` owns one

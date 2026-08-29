@@ -851,10 +851,10 @@ enum GcState {
 impl GcState {
     fn encoded(self) -> u8 {
         match self {
-            Self::Scanning => crate::GcStepTransition::SCANNING,
-            Self::Marking => crate::GcStepTransition::MARKING,
-            Self::Sweeping => crate::GcStepTransition::SWEEPING,
-            Self::Finalizing => crate::GcStepTransition::FINALIZING,
+            Self::Scanning => crate::GcStepTransition::STATE_SCANNING,
+            Self::Marking => crate::GcStepTransition::STATE_MARKING,
+            Self::Sweeping => crate::GcStepTransition::STATE_SWEEPING,
+            Self::Finalizing => crate::GcStepTransition::STATE_FINALIZING,
         }
     }
 }
@@ -10611,10 +10611,10 @@ mod tests {
         assert_eq!(
             transitions,
             vec![
-                (Step::SCANNING, Step::MARKING),
-                (Step::MARKING, Step::SWEEPING),
-                (Step::SWEEPING, Step::FINALIZING),
-                (Step::FINALIZING, Step::SCANNING),
+                (Step::STATE_SCANNING, Step::STATE_MARKING),
+                (Step::STATE_MARKING, Step::STATE_SWEEPING),
+                (Step::STATE_SWEEPING, Step::STATE_FINALIZING),
+                (Step::STATE_FINALIZING, Step::STATE_SCANNING),
             ]
         );
         assert!(!gc.isenabled());

@@ -426,17 +426,37 @@ pub struct GcStepTransition {
     pub new_state: u8,
 }
 
-impl GcStepTransition {
-    pub const SCANNING: u8 = 0;
-    pub const MARKING: u8 = 1;
-    pub const SWEEPING: u8 = 2;
-    pub const FINALIZING: u8 = 3;
+/// The `incminimark.py` collection states, under the names it declares.
+///
+/// A step reports one state rather than a set of bits, so these stay numbers.
+/// Declaring each once mints the table
+/// `every_gc_state_is_the_number_incminimark_gives_it` walks, so a state added
+/// here is compared without anyone remembering to list it.
+macro_rules! gc_states {
+    ($($name:ident = $value:expr,)*) => {
+        impl GcStepTransition {
+            $(pub const $name: u8 = $value;)*
+        }
 
+        #[cfg(test)]
+        const ALL_GC_STATES: &[(&str, u8)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+gc_states! {
+    STATE_SCANNING = 0,
+    STATE_MARKING = 1,
+    STATE_SWEEPING = 2,
+    STATE_FINALIZING = 3,
+}
+
+impl GcStepTransition {
     /// `rgc.py is_done__states`: a major collection is done when the
     /// step ended in the starting state *and* did not begin there. A step that
-    /// found no work reports `(SCANNING, SCANNING)`, which completes nothing.
+    /// found no work reports `(STATE_SCANNING, STATE_SCANNING)`, which
+    /// completes nothing.
     pub const fn is_done(self) -> bool {
-        self.old_state != Self::SCANNING && self.new_state == Self::SCANNING
+        self.old_state != Self::STATE_SCANNING && self.new_state == Self::STATE_SCANNING
     }
 }
 
@@ -797,8 +817,8 @@ pub trait GcAllocator: Send {
     fn collect_step(&mut self) -> GcStepTransition {
         self.collect_full();
         GcStepTransition {
-            old_state: GcStepTransition::MARKING,
-            new_state: GcStepTransition::SCANNING,
+            old_state: GcStepTransition::STATE_MARKING,
+            new_state: GcStepTransition::STATE_SCANNING,
         }
     }
 
@@ -2643,8 +2663,8 @@ pub fn set_active_collect_step(hook: Option<CollectStepFn>) {
 pub fn collect_step() -> GcStepTransition {
     ACTIVE_COLLECT_STEP.get().map_or(
         GcStepTransition {
-            old_state: GcStepTransition::MARKING,
-            new_state: GcStepTransition::SCANNING,
+            old_state: GcStepTransition::STATE_MARKING,
+            new_state: GcStepTransition::STATE_SCANNING,
         },
         |step| step(),
     )
@@ -4158,6 +4178,77 @@ mod headerless_no_collect_tests {
             ported + ours,
             GcFlags::FLAGS.len(),
             "the walk reached {ported} ported and {ours} local flags"
+        );
+    }
+
+    /// The state a `collect_step` reports is incminimark's number, and the
+    /// `gc` module publishes it to Python as `STATE_*` and `GC_STATES`.  This
+    /// walks the same file the flags are walked in and rejects any state this
+    /// GC numbers differently, or does not spell at all.
+    #[test]
+    fn every_gc_state_is_the_number_incminimark_gives_it() {
+        const INCMINIMARK: &str = include_str!("../../../rpython/memory/gc/incminimark.py");
+
+        // `STATE_X = N`, at column zero; the file has no other assignment
+        // spelled that way.
+        let mut upstream: Vec<(&str, u8)> = Vec::new();
+        for line in INCMINIMARK.lines() {
+            let Some(rest) = line.strip_prefix("STATE_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once('=') else {
+                continue;
+            };
+            let Ok(value) = body.trim().parse::<u8>() else {
+                continue;
+            };
+            upstream.push((name.trim_end(), value));
+        }
+
+        assert_eq!(
+            upstream.len(),
+            ALL_GC_STATES.len(),
+            "incminimark.py declares {} states and this GC declares {}",
+            upstream.len(),
+            ALL_GC_STATES.len()
+        );
+
+        for (name, theirs) in &upstream {
+            let found = ALL_GC_STATES
+                .iter()
+                .find(|(known, _)| known.strip_prefix("STATE_") == Some(name));
+            let Some((_, ours)) = found else {
+                panic!(
+                    "incminimark.py declares STATE_{name} = {theirs}, and this GC has no STATE_{name}"
+                );
+            };
+            assert_eq!(
+                ours, theirs,
+                "STATE_{name} is {theirs} in incminimark.py and {ours} here"
+            );
+        }
+
+        // `GC_STATES` is the same four in the order the numbers give, and it
+        // is what the `gc` module answers with.
+        let listed = INCMINIMARK
+            .lines()
+            .find_map(|line| line.strip_prefix("GC_STATES = ["))
+            .and_then(|body| body.split_once(']'))
+            .expect("incminimark.py declares GC_STATES")
+            .0;
+        let listed: Vec<&str> = listed
+            .split(',')
+            .map(|name| name.trim().trim_matches('\''))
+            .collect();
+        let mut ordered = ALL_GC_STATES.to_vec();
+        ordered.sort_by_key(|(_, value)| *value);
+        let ordered: Vec<&str> = ordered
+            .iter()
+            .map(|(name, _)| name.strip_prefix("STATE_").unwrap())
+            .collect();
+        assert_eq!(
+            listed, ordered,
+            "incminimark.py's GC_STATES is {listed:?} and this GC's states are {ordered:?}"
         );
     }
 }
