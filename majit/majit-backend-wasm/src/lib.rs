@@ -4143,6 +4143,27 @@ impl majit_backend::Backend for WasmBackend {
                         _ => false,
                     })
                 });
+            // The JUMP hands input `k` back at position `k` only when it
+            // re-presents the state the guard failed on unchanged. One that
+            // reorders those inputs — or repeats one of them — starts the next
+            // pass from a different state vector, which is the same reasoning
+            // the heap carve-out below uses: the shield refuses PROVABLY static
+            // bridges, and a permuted state is not the byte-identical one the
+            // livelock argument rests on. An arg that is not an input reload at
+            // all (a baked constant, a fresh allocation) is static by itself
+            // and does not make the JUMP a permutation.
+            let permutes_inputs = ops
+                .iter()
+                .rev()
+                .find(|op| op.opcode == majit_ir::OpCode::Jump)
+                .is_some_and(|jump| {
+                    jump.getarglist().iter().enumerate().any(|(j, arg)| match arg {
+                        majit_ir::operand::Operand::InputArg(ia) => {
+                            input_pos.get(&ia.index).is_some_and(|&k| k != j)
+                        }
+                        _ => false,
+                    })
+                });
             // Loop state carried on the HEAP (a permutation array flipped via
             // setarrayitem, an object field bumped via setfield, a residual
             // call's arbitrary effects) advances the cycle without any JUMP
@@ -4165,7 +4186,7 @@ impl majit_backend::Backend for WasmBackend {
                             | Unicodesetitem
                     )
             });
-            if !advances && !mutates_heap {
+            if !advances && !permutes_inputs && !mutates_heap {
                 diag_bump(11); // declined: loop-closing bridge advances no loop-carried value
                 return Err(BackendError::Unsupported(
                     "wasm backend: loop-closing bridge advances no loop-carried value \
