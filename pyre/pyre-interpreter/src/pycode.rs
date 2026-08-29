@@ -3991,9 +3991,7 @@ pub fn pin_code_unit(code_ptr: *const ()) {
 /// process lifetime, which is the property those tables were written against.
 fn retire_code_unit(owner: *mut crate::CodeObject, members: &[usize]) {
     {
-        let mut cache = code_locations_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = code_locations_cache().lock();
         for member in members {
             // A `Decoded` record's rows stay leaked: `code_locations` hands
             // them out as `&'static`, and this runs from the collector, which

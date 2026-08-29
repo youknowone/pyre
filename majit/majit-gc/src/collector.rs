@@ -11012,7 +11012,7 @@ mod tests {
     /// promotion copy is sized from the length word the shrink wrote.
     #[test]
     fn a_shrunk_array_is_promoted_at_its_smaller_size() {
-        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::varsize(16, 8, 8, false, Vec::new()));
