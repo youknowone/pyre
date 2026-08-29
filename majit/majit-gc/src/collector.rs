@@ -4621,7 +4621,7 @@ impl MiniMarkGC {
             return false;
         }
         let hdr = unsafe { header_of(obj_addr) };
-        if unsafe { (*hdr).has_flag(flags::HAS_SHADOW) } {
+        if unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_SHADOW) } {
             return false;
         }
         let type_id = unsafe { (*hdr).type_id() };
@@ -10988,7 +10988,7 @@ mod tests {
         let tid = gc.register_type(TypeInfo::varsize(16, 8, 8, false, Vec::new()));
         let obj = gc.alloc_with_type(tid, 16 + 8 * 12);
         unsafe { *((obj.0 + 8) as *mut usize) = 12 };
-        unsafe { (*header_of(obj.0)).set_flag(flags::HAS_SHADOW) };
+        unsafe { (*header_of(obj.0)).set_flag(flags::GCFLAG_HAS_SHADOW) };
 
         assert!(!gc.shrink_array(obj.0, 5));
 

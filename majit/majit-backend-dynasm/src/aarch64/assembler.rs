@@ -7266,7 +7266,9 @@ mod tests {
         );
         let obj = gc.alloc_in_oldgen_with_cards(type_id, total_size, CARD_ARRAY_LENGTH, true);
         assert!(
-            unsafe { (*majit_gc::header::header_of(obj.0)).has_flag(majit_gc::flags::HAS_CARDS) },
+            unsafe {
+                (*majit_gc::header::header_of(obj.0)).has_flag(majit_gc::flags::GCFLAG_HAS_CARDS)
+            },
             "the fixture array must carry cards"
         );
         // `dirty_cards` reads the length out of the array's own length field.
