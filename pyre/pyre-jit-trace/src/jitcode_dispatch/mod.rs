@@ -498,6 +498,25 @@ pub struct InlineFrame {
     /// reaches the live `max_unroll_recursion`, the call folds to a residual
     /// instead of unrolling its call tree (`pyjitpl.py`).
     pub w_code: usize,
+    /// Whether this frame was entered with the portal greenkey that
+    /// `_opimpl_recursive_call` passed to `MetaInterp.perform_call`.
+    ///
+    /// `resume.rebuild_from_resumedata` reconstructs frames with
+    /// `MetaInterp.newframe(jitcode)`, leaving `MIFrame.greenkey` as `None`;
+    /// those frames remain live inline levels but do not contribute to the
+    /// recursive-unroll count. Fresh forward-inline portal calls carry it.
+    pub recursion_greenkey: bool,
+    /// `MetaInterp.call_ids[-1]` for this portal frame
+    /// (`MetaInterp.newframe`).  `DEBUG_MERGE_POINT` carries the id so two
+    /// separate invocations at the same inline depth remain distinguishable.
+    /// Transparent helper levels (`w_code == 0`) are not portal frames and
+    /// inherit the nearest Python frame's id instead of consuming one.
+    pub call_id: u64,
+    /// Last Python opcode for which this frame emitted
+    /// `DEBUG_MERGE_POINT`. A Python opcode can occupy several disjoint
+    /// JitCode emission runs; the marker belongs to the opcode execution, not
+    /// to each run.
+    pub debug_merge_point_py_pc: Option<u32>,
     /// Paused levels sitting between this callee and the next one out,
     /// OUTERMOST-FIRST; empty preserves the straight-line single-frame
     /// collapse while retaining the callee level.
@@ -528,6 +547,11 @@ pub struct WalkSession {
     /// `Snapshot.frames`; a caller is pushed at its inline CALL and popped
     /// when the callee sub-walk returns.
     pub framestack: Vec<InlineFrame>,
+    /// `MetaInterp.current_call_id`: the root portal owns id 0 and each
+    /// subsequently entered Python portal frame consumes the next id.
+    pub next_call_id: u64,
+    /// Root-frame counterpart of [`InlineFrame::debug_merge_point_py_pc`].
+    pub root_debug_merge_point_py_pc: Option<u32>,
     /// Whether an abort fired inside an inline sub-walk. Its `op.pc` is then a
     /// callee coordinate with no meaning in an enclosing frame's JitCode, so
     /// neither abort-point flushing nor a later caller-level blackhole latch
@@ -614,6 +638,8 @@ impl Default for WalkSession {
         Self {
             is_being_profiled: false,
             framestack: Vec::new(),
+            next_call_id: 1,
+            root_debug_merge_point_py_pc: None,
             abort_in_subwalk: false,
             last_exc_value: None,
             last_exc_value_concrete: ConcreteValue::Null,
@@ -2178,6 +2204,7 @@ fn create_segmented_trace<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     mp_opcode_pc: usize,
     mp_green_pc: usize,
+    synthesized_python_opcode_boundary: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     // Upstream's cut cannot fail to reach the blackhole: the
     // `SwitchToBlackhole` it raises is caught by
@@ -2214,7 +2241,12 @@ fn create_segmented_trace<Sym: WalkSym>(
     // position is the merge-point op, whose preceding `-live-` marker names the
     // boxes the blackhole resumes with.
     ctx.trace_ctx.record_guard(OpCode::GuardAlwaysFails, &[], 0);
-    if let Err(error) = walker_capture_snapshot_for_last_guard(ctx, mp_opcode_pc) {
+    let snapshot = if synthesized_python_opcode_boundary {
+        walker_capture_segmented_python_opcode_guard(ctx, mp_opcode_pc)
+    } else {
+        walker_capture_snapshot_for_last_guard(ctx, mp_opcode_pc)
+    };
+    if let Err(error) = snapshot {
         let cause = error.variant_name();
         census_record(cause);
         return Err(DispatchError::SegmentTraceSnapshotUnavailable {
@@ -3461,6 +3493,20 @@ pub fn step<Sym: WalkSym>(
     ctx.trace_ctx.refresh_virtualizable_shadow_from_heap();
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
+    }
+    // Per-CodeObject portal JitCodes contain the lowered Python opcode body,
+    // but not the dispatch loop's `jit_merge_point` marker that preceded that
+    // body in `interp_jit.py`. Restore `MIFrame.debug_merge_point` at the
+    // exact Python-opcode emission boundary before executing the body. A
+    // JitCode that really carries `jit_merge_point` records its marker in that
+    // handler below instead, so it is not doubled here.
+    // `-live-` is codewriter resume metadata, not an interpreter opcode.
+    // Consume it first so the marker on the following real op captures this
+    // opcode's own live anchor rather than the preceding one's.
+    if op.opname != "live" && !op.key.starts_with("jit_merge_point") {
+        if let Some(outcome) = record_python_debug_merge_point(ctx, op.pc)? {
+            return Ok((outcome, op.next_pc));
+        }
     }
     // #73: maintain the `-live-` BEFORE anchor.  Every
     // `-live-` byte the walk decodes becomes the resume point preceding the
@@ -6679,13 +6725,31 @@ impl<'a> InlineFrameGuard<'a> {
     fn enter(
         session: &'a std::cell::RefCell<WalkSession>,
         w_code: usize,
+        recursion_greenkey: bool,
         parents: Vec<InlineParentFrame>,
     ) -> Self {
-        session.borrow_mut().framestack.push(InlineFrame {
+        let mut walk = session.borrow_mut();
+        let call_id = if w_code == 0 {
+            walk.framestack
+                .iter()
+                .rev()
+                .find(|frame| frame.w_code != 0)
+                .map(|frame| frame.call_id)
+                .unwrap_or(0)
+        } else {
+            let call_id = walk.next_call_id;
+            walk.next_call_id = walk.next_call_id.saturating_add(1);
+            call_id
+        };
+        walk.framestack.push(InlineFrame {
             w_code,
+            recursion_greenkey,
+            call_id,
+            debug_merge_point_py_pc: None,
             parents,
             entry_executed_effects: fbw_executed_effect_count(),
         });
+        drop(walk);
         if fbw_depth_census_enabled() {
             fbw_depth_census_record(&session.borrow().framestack);
         }
@@ -7981,6 +8045,109 @@ impl ActiveResumeFrame {
         let code = unsafe { &*code };
         !code.freevars.is_empty() && code.exceptiontable.is_empty()
     }
+}
+
+/// Walker counterpart of `MIFrame.debug_merge_point` for per-CodeObject
+/// JitCodes whose source `interp_jit.py` dispatch marker is outside the body
+/// the codewriter drains.
+///
+/// `PyJitCodeMetadata::py_floor_by_jit_pc` is built from
+/// `SSARepr::pc_first_insn_pos`, so an exact key is the one place the Python
+/// dispatch loop entered that opcode.  Do not use `py_exact_by_jit_pc` here:
+/// it also reopens the opcode's owner around out-of-line exception/cleanup
+/// blocks.  Those blocks run *inside* `PyFrame.handle_bytecode`, after the
+/// `pypyjitdriver.jit_merge_point` in `interp_jit.py`; treating one as a new
+/// dispatch boundary can segment while `MetaInterp.last_exc_value` is still
+/// transient, then resume without the caught exception.
+fn record_python_debug_merge_point<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    let Some(active) = ActiveResumeFrame::current(ctx.session, ctx.fbw_mode.snapshot_sym) else {
+        return Ok(None);
+    };
+    if active.0.code_ptr.is_null() || !active.0.metadata.built_as_portal {
+        return Ok(None);
+    }
+    let Ok(boundary_index) = active
+        .0
+        .metadata
+        .py_floor_by_jit_pc
+        .binary_search_by_key(&(jit_pc as u32), |&(off, _)| off)
+    else {
+        return Ok(None);
+    };
+    let py_pc = active.0.metadata.py_floor_by_jit_pc[boundary_index].1;
+    let w_code = pyre_interpreter::live_code_wrapper(active.0.code_ptr.cast()) as usize;
+    if w_code == 0 {
+        return Ok(None);
+    }
+
+    let (portal_call_depth, current_call_id, is_being_profiled, already_recorded) = {
+        let mut session = ctx.session.borrow_mut();
+        let is_being_profiled = session.is_being_profiled;
+        let mut depth = 0usize;
+        let mut call_id = 0u64;
+        let mut active_frame_index = None;
+        for (index, frame) in session.framestack.iter().enumerate() {
+            if frame.w_code != 0 {
+                depth += 1;
+                call_id = frame.call_id;
+                active_frame_index = Some(index);
+            }
+        }
+        let slot = match active_frame_index {
+            Some(index) => &mut session.framestack[index].debug_merge_point_py_pc,
+            None => &mut session.root_debug_merge_point_py_pc,
+        };
+        let already_recorded = *slot == Some(py_pc);
+        *slot = Some(py_pc);
+        (depth, call_id, is_being_profiled, already_recorded)
+    };
+    if already_recorded {
+        return Ok(None);
+    }
+
+    // pyjitpl.py `MIFrame.debug_merge_point`:
+    // `[jd_index, portal_call_depth, current_call_id] + greenkey`, where the
+    // pypyjit greenkey is `(next_instr, is_being_profiled, pycode)`.
+    let debug_args = [
+        ctx.trace_ctx.const_int(0),
+        ctx.trace_ctx.const_int(portal_call_depth as i64),
+        ctx.trace_ctx.const_int(current_call_id as i64),
+        ctx.trace_ctx.const_int(py_pc as i64),
+        ctx.trace_ctx.const_int(is_being_profiled as i64),
+        ctx.trace_ctx.const_ref(w_code as i64),
+    ];
+    ctx.trace_ctx
+        .record_op(OpCode::DebugMergePoint, &debug_args);
+
+    // `MIFrame.debug_merge_point` performs this check immediately after
+    // recording the marker. A location that already overflowed has
+    // `force_finish_trace` set by `prepare_trace_segmenting`; close it at the
+    // next opcode boundary once it passes 80% of `trace_limit`, before the
+    // `_interpret` loop can turn the same attempt into another 100% abort.
+    //
+    // As in the explicit `jit_merge_point` handler, surface the compile action
+    // only from the top-level walk. An inline sub-walk has no driver arm that
+    // can consume a segmented trace independently of its enclosing call.
+    if ctx.is_top_level
+        && ctx.trace_ctx.force_finish_trace()
+        && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
+        // PyPy reaches `_create_segmented_trace_and_blackhole` from
+        // `MIFrame.debug_merge_point`, then `convert_and_run_from_pyjitpl`
+        // transfers `MetaInterp.last_exc_value` into the first blackhole
+        // frame.  Pyre's per-CodeObject marker is synthesized by the walker,
+        // whose segmented-trace handoff has no blackhole frame on which to
+        // preserve that transient slot.  Defer the cut until the handler has
+        // consumed/cleared it; the DEBUG_MERGE_POINT itself still remains at
+        // the orthodox opcode boundary, and the next safe marker performs the
+        // same 0.8x check.
+        && ctx.session.borrow().last_exc_value.is_none()
+    {
+        return create_segmented_trace(ctx, jit_pc, py_pc as usize, true);
+    }
+    Ok(None)
 }
 
 /// Walker-side port of `pyjitpl.py handle_possible_exception`'s
@@ -13179,15 +13346,6 @@ fn handle<Sym: WalkSym>(
             // Copy the walk green before any mutable session borrow in this
             // handler; key construction and greenboxes must use one value.
             let is_being_profiled = ctx.session.borrow().is_being_profiled;
-            // `dispatch_bytecode`'s `we_are_jitted()` arm reads the portal
-            // frame's `debugdata` at the top of every opcode (pyopcode.py).
-            // The merge point is the trace's counterpart of that loop top.
-            record_portal_debugdata_guard(ctx, op.pc)?;
-            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
-            // (pyframe.py) read the global trace function on every call the
-            // loop makes.  The walker records neither for an inlined callee,
-            // so the loop pins the slot instead.
-            record_portal_tracefunc_guard(ctx, op.pc)?;
             // RPython parity: `opimpl_jit_merge_point` →
             // `reached_loop_header`. pyre's retired
             // trait mirror was `close_loop_args`.
@@ -13220,7 +13378,7 @@ fn handle<Sym: WalkSym>(
             off += n;
             let (gr, n) = read_ref_var_list(code, op, off, ctx)?;
             off += n;
-            let (_gf, n) = read_float_var_list(code, op, off, ctx)?;
+            let (gf, n) = read_float_var_list(code, op, off, ctx)?;
             off += n;
             let (ri, n) = read_int_var_list(code, op, off, ctx)?;
             off += n;
@@ -13236,6 +13394,51 @@ fn handle<Sym: WalkSym>(
                 Some(Value::Int(v)) => v as usize,
                 _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
+
+            // `MIFrame.debug_merge_point` records a real
+            // `DEBUG_MERGE_POINT` operation before any loop-header decision.
+            // It is debugging-only after optimization, but it remains part of
+            // `history.length()` and therefore of `trace_limit`.  Omitting it
+            // makes recursive traces systematically shorter than the same
+            // opcode walk in PyPy and can change which trace reaches the
+            // configured limit.
+            //
+            // RPython operands are
+            // `[jd_index, portal_call_depth, current_call_id] + greenkey`.
+            // The FBW walker keeps portal frames on `WalkSession::framestack`;
+            // canonical helper levels have `w_code == 0` and do not contribute
+            // to either depth or call identity.
+            let (portal_call_depth, current_call_id) = {
+                let session = ctx.session.borrow();
+                let mut depth = 0usize;
+                let mut call_id = 0u64;
+                for frame in session.framestack.iter() {
+                    if frame.w_code != 0 {
+                        depth += 1;
+                        call_id = frame.call_id;
+                    }
+                }
+                (depth, call_id)
+            };
+            let mut debug_args = Vec::with_capacity(3 + gi.len() + gr.len() + gf.len());
+            debug_args.push(ctx.trace_ctx.const_int(jdindex as i64));
+            debug_args.push(ctx.trace_ctx.const_int(portal_call_depth as i64));
+            debug_args.push(ctx.trace_ctx.const_int(current_call_id as i64));
+            debug_args.extend_from_slice(&gi);
+            debug_args.extend_from_slice(&gr);
+            debug_args.extend_from_slice(&gf);
+            ctx.trace_ctx
+                .record_op(OpCode::DebugMergePoint, &debug_args);
+
+            // `dispatch_bytecode`'s `we_are_jitted()` arm reads the portal
+            // frame's `debugdata` at the top of every opcode (pyopcode.py).
+            // The merge point is the trace's counterpart of that loop top.
+            record_portal_debugdata_guard(ctx, op.pc)?;
+            // `execute_frame`'s `ec.call_trace` / `ec.return_trace`
+            // (pyframe.py) read the global trace function on every call the
+            // loop makes.  The walker records neither for an inlined callee,
+            // so the loop pins the slot instead.
+            record_portal_tracefunc_guard(ctx, op.pc)?;
 
             // pyjitpl.py, the tail of `MIFrame.debug_merge_point`,
             // which `opimpl_jit_merge_point` calls at :1542 — ahead of every
@@ -13269,7 +13472,7 @@ fn handle<Sym: WalkSym>(
                 && ctx.trace_ctx.force_finish_trace()
                 && ctx.trace_ctx.num_ops() > ctx.trace_ctx.trace_limit() * 4 / 5
             {
-                if let Some(outcome) = create_segmented_trace(ctx, op.pc, next_instr)? {
+                if let Some(outcome) = create_segmented_trace(ctx, op.pc, next_instr, false)? {
                     return Ok((outcome, op.next_pc));
                 }
             }

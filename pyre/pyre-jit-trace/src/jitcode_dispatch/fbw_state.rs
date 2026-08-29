@@ -67,8 +67,9 @@ pub(crate) fn fbw_max_multiframe_depth() -> usize {
 ///   updates it, so a frame's greenkey stays its ENTRY greens however far its
 ///   pc has since advanced;
 /// * every [`InlineFrame`] is pushed by `InlineFrameGuard::enter` at a callee
-///   entry, and the bridge-reconstructed frames stamp the same `(w_code, 0)`
-///   identity (`state.rs` `reconstruct_inline_recipe`).
+///   entry. Fresh forward calls carry that greenkey, while
+///   `resume.rebuild_from_resumedata` calls `MetaInterp.newframe(jitcode)`
+///   without one, so bridge-reconstructed frames are deliberately skipped.
 ///
 /// The root frame is deliberately absent from this framestack, which is also
 /// what upstream's greenkey compare achieves: the root's greenkey holds the
@@ -78,12 +79,35 @@ pub(crate) fn fbw_inline_recursion_count<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     w_code: usize,
 ) -> usize {
-    ctx.session
-        .borrow()
-        .framestack
+    inline_recursion_count(&ctx.session.borrow().framestack, w_code)
+}
+
+fn inline_recursion_count(frames: &[InlineFrame], w_code: usize) -> usize {
+    frames
         .iter()
-        .filter(|frame| frame.w_code == w_code)
+        .filter(|frame| frame.recursion_greenkey && frame.w_code == w_code)
         .count()
+}
+
+/// Whether the callee portal is already represented by any live inline
+/// frame, independently of `MIFrame.greenkey`.
+///
+/// This is not the upstream recursive-unroll count above. It only keeps
+/// pyre's extra non-recursive call-chain valve from applying to a recursive
+/// portal. PyPy `_opimpl_recursive_call` has no such generic framestack cap;
+/// in particular a frame rebuilt by `resume.rebuild_from_resumedata` has a
+/// `None` greenkey (so it contributes zero to the max-unroll count) but a call
+/// back into the same portal is still recursive and must not acquire a second
+/// local bound.
+pub(crate) fn fbw_recursive_portal_present<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    w_code: usize,
+) -> bool {
+    recursive_portal_present(&ctx.session.borrow().framestack, w_code)
+}
+
+fn recursive_portal_present(frames: &[InlineFrame], w_code: usize) -> bool {
+    frames.iter().any(|frame| frame.w_code == w_code)
 }
 
 /// Total inline-stack bound for a callee after its same-greenkey recursion
@@ -98,11 +122,11 @@ pub(crate) fn fbw_inline_recursion_count<Sym: WalkSym>(
 /// bound because their carrier unwind crosses suspended frames.
 pub(crate) fn fbw_effective_multiframe_depth(
     contains_raise: bool,
-    inline_recursion_count: usize,
+    recursive_portal_present: bool,
 ) -> usize {
     if contains_raise {
         2
-    } else if inline_recursion_count != 0 {
+    } else if recursive_portal_present {
         usize::MAX
     } else {
         fbw_max_multiframe_depth()
@@ -113,15 +137,32 @@ pub(crate) fn fbw_effective_multiframe_depth(
 mod recursion_depth_policy_tests {
     use super::*;
 
+    fn frame(w_code: usize, recursion_greenkey: bool) -> InlineFrame {
+        InlineFrame {
+            w_code,
+            recursion_greenkey,
+            call_id: 0,
+            debug_merge_point_py_pc: None,
+            parents: Vec::new(),
+            entry_executed_effects: 0,
+        }
+    }
+
+    #[test]
+    fn resumed_frames_without_greenkeys_do_not_count_as_recursive_unrolls() {
+        let frames = [frame(42, true), frame(42, false), frame(7, true)];
+        assert_eq!(inline_recursion_count(&frames, 42), 1);
+        assert!(recursive_portal_present(&frames, 42));
+    }
+
     #[test]
     fn value_returning_recursion_is_bounded_only_by_max_unroll_recursion() {
-        assert_eq!(fbw_effective_multiframe_depth(false, 1), usize::MAX);
-        assert_eq!(fbw_effective_multiframe_depth(false, 7), usize::MAX);
+        assert_eq!(fbw_effective_multiframe_depth(false, true), usize::MAX);
     }
 
     #[test]
     fn raising_recursion_keeps_the_carrier_unwind_safety_bound() {
-        assert_eq!(fbw_effective_multiframe_depth(true, 1), 2);
+        assert_eq!(fbw_effective_multiframe_depth(true, true), 2);
     }
 }
 

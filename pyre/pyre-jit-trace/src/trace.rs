@@ -2033,6 +2033,30 @@ fn carrier_py_frame_depth(carrier: &majit_metainterp::BridgeInlineCarrier) -> us
         .count()
 }
 
+/// Whether the root plus reconstructed carrier contain the same Python portal
+/// more than once.
+///
+/// PyPy `_opimpl_recursive_call` gives recursive portals only the
+/// `max_unroll_recursion` bound, and `resume.rebuild_from_resumedata` rebuilds
+/// every encoded frame regardless of depth. Pyre's separate multiframe cap is
+/// a safety valve for ordinary call chains, so it must not become a second
+/// recursion bound merely because a bridge reconstructed the recursive frames
+/// with `MIFrame.greenkey == None`.
+fn carrier_contains_recursive_portal(
+    root_w_code: *const (),
+    carrier: &majit_metainterp::BridgeInlineCarrier,
+) -> bool {
+    let mut seen = vec![root_w_code as usize];
+    for recipe in carrier.recipes.iter() {
+        let w_code = crate::state::recover_inline_callee_code(recipe.code_ptr) as usize;
+        if w_code != 0 && seen.contains(&w_code) {
+            return true;
+        }
+        seen.push(w_code);
+    }
+    false
+}
+
 fn drive_bridge_carrier_walk<Sym: WalkSym>(
     ctx: &mut TraceCtx,
     sym: &mut Sym,
@@ -2062,6 +2086,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let root_ec = sym.concrete_execution_context();
     let root_ec_box = sym.execution_context();
     let root_frame_box = sym.frame();
+    let recursive_carrier = carrier_contains_recursive_portal(w_code, carrier);
     if crate::jitcode_dispatch::p2_diag_enabled() {
         let pcs: Vec<usize> = carrier
             .recipes
@@ -2086,7 +2111,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     //
     // Transient, unlike `NoRecipes` below: the depth is this carrier's, and the
     // same guard can fail again carrying a shallower one.
-    if carrier_py_frame_depth(carrier) > crate::jitcode_dispatch::fbw_max_multiframe_depth() {
+    if !recursive_carrier
+        && carrier_py_frame_depth(carrier) > crate::jitcode_dispatch::fbw_max_multiframe_depth()
+    {
         discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
         crate::jitcode_dispatch::census_record("P2Drain::OverMultiframeDepth");
         return p2_drain_abort();
@@ -2228,8 +2255,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // [root, ..middles.., deepest] chain (else the blackhole rebuilds a
         // framestack missing the middles on such a guard's deopt).
         if carrier.recipes.len() >= 2
-            && carrier_py_frame_depth(carrier)
-                <= crate::jitcode_dispatch::fbw_max_multiframe_depth()
+            && (recursive_carrier
+                || carrier_py_frame_depth(carrier)
+                    <= crate::jitcode_dispatch::fbw_max_multiframe_depth())
         {
             &carrier.recipes[..carrier.recipes.len() - 1]
         } else {
@@ -2352,8 +2380,9 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         let n = carrier.recipes.len();
         let middles = &carrier.recipes[..n.saturating_sub(1)];
         let middles_ok = n >= 1
-            && carrier_py_frame_depth(carrier)
-                <= crate::jitcode_dispatch::fbw_max_multiframe_depth()
+            && (recursive_carrier
+                || carrier_py_frame_depth(carrier)
+                    <= crate::jitcode_dispatch::fbw_max_multiframe_depth())
             && middles.iter().rev().all(|middle| {
                 // `descr_call`'s tail has no handler and no Python frame, so an
                 // exception crossing it neither catches nor leaves a traceback
@@ -4742,6 +4771,13 @@ fn run_perfn_walk<Sym: WalkSym>(
                 crate::jitcode_dispatch::DispatchOutcome::CompileTracePending {
                     loop_header_pc,
                 } => Some(*loop_header_pc),
+                // `MIFrame._create_segmented_trace_and_blackhole` compiles the
+                // prefix and then blackholes from this arbitrary DMP boundary;
+                // it never rewinds to the trace entry.  The single-pass walker
+                // has already executed that prefix, so publish the same
+                // end-of-prefix frame image before the driver consumes
+                // `walk_final_pc` and returns control to the interpreter.
+                crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. } => ctx.walk_final_pc,
                 _ => None,
             };
             if let Some(header_pc) = header_pc {
@@ -4764,7 +4800,15 @@ fn run_perfn_walk<Sym: WalkSym>(
                     }
                     // The loop header IS where this walk ended; the sticky
                     // unjournaled check above is the whole gate.
-                    let _ = commit_walk_end(WalkEndCommitLeg::LoopHeader, WalkEndResume::Terminal);
+                    let leg = if matches!(
+                        outcome,
+                        crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. }
+                    ) {
+                        WalkEndCommitLeg::SegmentTrace
+                    } else {
+                        WalkEndCommitLeg::LoopHeader
+                    };
+                    let _ = commit_walk_end(leg, WalkEndResume::Terminal);
                 } else if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
                         "[fbw-end-flush] declined at header_pc={header_pc} (shadow slot \

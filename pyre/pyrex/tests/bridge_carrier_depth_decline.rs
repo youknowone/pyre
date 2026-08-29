@@ -11,17 +11,19 @@
 //!
 //! The carrier-depth cap is one predicate that used to be read *after* the
 //! sub-walk, in `want_compile`. A carrier over the cap therefore ran the callee
-//! and then took that rollback. With the cap lowered to its minimum the arm is
-//! reachable from a plain recursive program, and the accumulator it corrupts is
-//! a silent wrong answer rather than a crash:
+//! and then took that rollback. Before recursive carriers were separated from
+//! pyre's generic call-chain cap, lowering the cap made this program reach that
+//! arm and corrupt its accumulator rather than crash:
 //!
 //! ```text
 //! PYRE_FBW_MULTIFRAME_DEPTH=1  ->  acc: got 262173, want 578965
 //! ```
 //!
 //! `PYRE_FBW_MULTIFRAME_DEPTH` is a supported knob (`fbw_state.rs`, clamped
-//! 1..7), so this is reachable without a debug build; the same tail is what a
-//! carrier deeper than the default cap of 7 takes.
+//! 1..7). PyPy `_opimpl_recursive_call` bounds recursion only with
+//! `max_unroll_recursion`, so recursive carriers now bypass pyre's additional
+//! generic cap. This fixture pins both that bypass and the original safety
+//! property: no abort may roll back over effects the drain already executed.
 //!
 //! Do not invoke Cargo from this test: the parent `cargo test` holds the target
 //! directory lock. `CARGO_BIN_EXE_pyre-dynasm` supplies the binary Cargo already
@@ -151,11 +153,13 @@ fn the_answer_is_the_same_at_every_carrier_depth_cap() {
 }
 
 #[test]
-fn the_depth_decline_is_the_arm_this_program_reaches() {
+fn a_recursive_carrier_bypasses_the_generic_depth_decline() {
     // Non-vacuity: `the_answer_is_the_same_at_every_carrier_depth_cap` would
-    // also pass if the program stopped reaching the drain at all, so pin the
-    // arm by name. `census_dump` reprints the whole map on every record, so the
-    // count is the value after the colon, never the number of occurrences.
+    // also pass if the program stopped reaching the drain at all.  The lowered
+    // generic cap must not decline this recursive carrier, and a successful
+    // multi-frame adoption proves the drain still handled it. `census_dump`
+    // reprints the whole map on every record, so the count is the value after
+    // the colon, never the number of occurrences.
     let out = run(&[
         ("PYRE_FBW_MULTIFRAME_DEPTH", "1"),
         ("PYRE_FBW_DEBUG_ABORT", "1"),
@@ -171,9 +175,18 @@ fn the_depth_decline_is_the_arm_this_program_reaches() {
         .filter_map(|n| n.trim().parse::<u64>().ok())
         .max()
         .unwrap_or(0);
+    assert_eq!(
+        declines,
+        0,
+        "a recursive carrier was rejected by pyre's generic depth cap\n{}",
+        report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
+    );
+    let adopted = text
+        .lines()
+        .any(|l| l.starts_with("[fbw-blackhole] adopted multi-frame terminal"));
     assert!(
-        declines > 0,
-        "the over-depth arm never fired, so the wrong-answer arm is not what this pins\n{}",
+        adopted,
+        "the drain handled no recursive multi-frame carrier\n{}",
         report("PYRE_FBW_MULTIFRAME_DEPTH=1 census", &out)
     );
     // The rollback the arm exists to avoid: an abort that ran effects and found

@@ -734,14 +734,15 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 /// citing a `warmstate.py` helper; none exists, and a faithful citation over
 /// unfaithful code is worse than no citation.
 ///
-/// The invariant it restores: `equal_whatever(Ref, ..)` and
-/// `hash_whatever(Ref, ..)` both reduce a `Ref` green to its raw address, and
-/// **address equality is a correct identity only while both addresses are kept
-/// alive by their owners** — two distinct *live* objects cannot share an
-/// address.  Upstream satisfies this because the cell that stores the key is
-/// the owner.  Without these hooks a freed referent's address can be recycled
-/// by a different object, whose green key is then byte-identical to the dead
-/// one's: a true collision in the identity that no comparator can resolve.
+/// The invariant it restores: `equal_whatever(Ref, ..)` compares the stored
+/// pointer with the live pointer, so **address equality is a correct identity
+/// only while the stored referent is kept alive by its owner** — two distinct
+/// *live* objects cannot share an address.  `hash_whatever(Ref, ..)` separately
+/// uses the GC's stable identity hash.  Upstream satisfies both because the
+/// cell that stores the key is the owner.  Without these hooks a freed
+/// referent's address can be recycled by a different object, whose green key
+/// is then byte-identical to the dead one's: a true collision in the identity
+/// that no comparator can resolve.
 ///
 /// Ownership belongs to the **stored** key, not to [`GreenKey`] as a type.
 /// A key built to *look up* a cell is transient and the caller is executing
@@ -752,9 +753,11 @@ pub fn set_unicode_resolver(eq: StrEqFn, hash: StrHashFn) {
 /// also where upstream's `setattr` runs.
 pub type RefRetainFn = fn(i64);
 pub type RefReleaseFn = fn(i64);
+pub type RefHashFn = fn(i64) -> u64;
 
 static REF_RETAIN: std::sync::OnceLock<RefRetainFn> = std::sync::OnceLock::new();
 static REF_RELEASE: std::sync::OnceLock<RefReleaseFn> = std::sync::OnceLock::new();
+static REF_HASH: std::sync::OnceLock<RefHashFn> = std::sync::OnceLock::new();
 
 /// Frontend-registered `Ref` green ownership hooks.  Same init-once contract
 /// as [`set_str_resolver`].  Register at JitDriver startup, before any cell
@@ -762,6 +765,16 @@ static REF_RELEASE: std::sync::OnceLock<RefReleaseFn> = std::sync::OnceLock::new
 pub fn set_ref_resolver(retain: RefRetainFn, release: RefReleaseFn) {
     let _ = REF_RETAIN.set(retain);
     let _ = REF_RELEASE.set(release);
+}
+
+/// Runtime implementation of RPython's `lltype.identityhash` for generic GC
+/// pointer greens.  The GC owns this operation: in minimark it gives nursery
+/// objects a stable shadow address and applies `mangle_hash`, while old-gen
+/// objects use their non-moving address.  Frontends without a moving GC may
+/// leave this unset and retain the raw-address fallback used before the hook
+/// existed.
+pub fn set_ref_hash_resolver(hash: RefHashFn) {
+    let _ = REF_HASH.set(hash);
 }
 
 /// OPEN POLICY FORK — the one place that decides what an unregistered
@@ -1092,8 +1105,14 @@ pub fn hash_whatever(tp: GreenType, value: i64) -> u64 {
                  115-121 ll_strhash parity)",
         )(value),
         GreenType::Ref => {
-            // identityhash(x) or 0
-            if value != 0 { value as u64 } else { 0 }
+            // warmstate.py `hash_whatever`: identityhash(x) or 0.  The
+            // identity hash is a GC operation, not the pointer bits: minimark
+            // gives a nursery object a shadow before hashing it.
+            if value == 0 {
+                0
+            } else {
+                REF_HASH.get().map_or(value as u64, |hash| hash(value))
+            }
         }
         GreenType::Float => {
             // rffi.cast(Signed, x) — truncate float to integer

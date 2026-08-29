@@ -4069,8 +4069,8 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // `transparent_helper_subwalk` is set by `run_sub_jitcode_walk` on the
     // sub-context it builds, so every descent into a canonical helper body
     // carries it — not just the ones entered from another sub-walk.
-    let _helper_frame =
-        nested_helper_entry.map(|frame| InlineFrameGuard::enter(ctx.session, 0, vec![frame]));
+    let _helper_frame = nested_helper_entry
+        .map(|frame| InlineFrameGuard::enter(ctx.session, 0, false, vec![frame]));
     let walk_result = run_sub_jitcode_walk(
         ctx,
         op.pc,
@@ -4771,6 +4771,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         })
         .unwrap_or(FBW_DEFAULT_MAX_INLINE_RECURSION);
     let inline_recursion_count = fbw_inline_recursion_count(ctx, callee_code_key);
+    let recursive_portal_present = fbw_recursive_portal_present(ctx, callee_code_key);
     if inline_recursion_count >= max_unroll_recursion {
         if let Some((driver, _)) = crate::driver::try_driver_pair() {
             driver
@@ -5063,7 +5064,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // suspended copies of the same frame, the shape `fbw_max_rec_unroll_depth`
     // bounds above.
     let effective_multiframe_depth =
-        fbw_effective_multiframe_depth(contains_raise, inline_recursion_count);
+        fbw_effective_multiframe_depth(contains_raise, recursive_portal_present);
     // The instance-`__next__` FOR_ITER route uses the same seeded-frame shape
     // as other CALL-entered inlines.  Its catch arm owns exception-to-exhaustion
     // conversion, so neither replay safety nor an unseeded caller-boundary
@@ -6699,7 +6700,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             };
             parents.push(tail);
         }
-        let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, parents);
+        let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, true, parents);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
         let _inline_concrete_frame = InlineConcreteFrameGuard::enter(concrete_callee_frame);
