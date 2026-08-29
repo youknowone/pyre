@@ -2541,7 +2541,7 @@ impl Backend for DynasmBackend {
         // cheap after the cache hit, matching PyPy's "build once per
         // CPU" semantics without requiring every trace-start path to
         // remember to call `_setup_once`.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
@@ -2560,7 +2560,7 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,
@@ -2786,7 +2786,7 @@ impl Backend for DynasmBackend {
         // cheap after the cache hit, matching PyPy's "build once per
         // CPU" semantics without requiring every trace-start path to
         // remember to call `_setup_once`.
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         let malloc_slowpath_fixed = self
             .arch_cpu_ext
             .ensure_malloc_slowpath_fixed(&self.descr_attachments);
@@ -2805,7 +2805,7 @@ impl Backend for DynasmBackend {
             subclass_range_table,
             attached_descrs,
             cpu_handle,
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             malloc_slowpath_fixed,
             #[cfg(target_arch = "x86_64")]
             malloc_slowpath_headerless,

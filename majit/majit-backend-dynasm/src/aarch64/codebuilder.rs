@@ -4,9 +4,60 @@
 /// the trace/op lowering in `assembler.py`.  The dynasm backend still stores
 /// the dynasm assembler inside `AssemblerARM64`, but the codebuilder-shaped
 /// helpers live here so PyPy backend patches have the same file boundary.
+use dynasmrt::aarch64::Assembler;
 use dynasmrt::{DynasmApi, dynasm};
 
 use super::assembler::AssemblerARM64;
+
+/// `codebuilder.py gen_load_int` for standalone per-CPU helper builders.
+///
+/// PyPy builds malloc/propagate slow paths outside the current trace's
+/// `AssemblerARM64.mc`, but they use the same immediate materializer.  Keep
+/// that spelling here instead of duplicating a subtly different MOVZ/MOVK
+/// sequence in each helper builder.
+pub(super) fn emit_mov_imm64_to(mc: &mut Assembler, reg: u32, val: i64) {
+    let r = reg as u8;
+    if val < 0 {
+        if val >= -65536 {
+            let inv = ((!val) as u64 & 0xFFFF) as u32;
+            dynasm!(mc ; .arch aarch64 ; movn X(r), inv);
+            return;
+        }
+        let inv = ((!val) as u64 & 0xFFFF) as u32;
+        dynasm!(mc ; .arch aarch64 ; movn X(r), inv);
+        let mut value = val >> 16;
+        let mut shift = 16;
+        while shift < 64 {
+            let hw = (value & 0xFFFF) as u32;
+            if hw != 0xFFFF {
+                match shift {
+                    16 => dynasm!(mc ; .arch aarch64 ; movk X(r), hw, lsl 16),
+                    32 => dynasm!(mc ; .arch aarch64 ; movk X(r), hw, lsl 32),
+                    48 => dynasm!(mc ; .arch aarch64 ; movk X(r), hw, lsl 48),
+                    _ => unreachable!(),
+                }
+            }
+            shift += 16;
+            value >>= 16;
+        }
+        return;
+    }
+    let mut value = val as u64;
+    dynasm!(mc ; .arch aarch64 ; movz X(r), (value & 0xFFFF) as u32);
+    value >>= 16;
+    let mut shift = 16;
+    while value != 0 {
+        let hw = (value & 0xFFFF) as u32;
+        match shift {
+            16 => dynasm!(mc ; .arch aarch64 ; movk X(r), hw, lsl 16),
+            32 => dynasm!(mc ; .arch aarch64 ; movk X(r), hw, lsl 32),
+            48 => dynasm!(mc ; .arch aarch64 ; movk X(r), hw, lsl 48),
+            _ => unreachable!(),
+        }
+        shift += 16;
+        value >>= 16;
+    }
+}
 
 impl<'a> AssemblerARM64<'a> {
     /// codebuilder.py:509 `gen_load_int`.
@@ -17,47 +68,7 @@ impl<'a> AssemblerARM64<'a> {
     /// always writes 4 words) MUST use [`emit_mov_imm64_fixed4`] instead,
     /// which always emits exactly four words.
     pub(crate) fn emit_mov_imm64(&mut self, reg: u32, val: i64) {
-        let r = reg as u8;
-        if val < 0 {
-            if val >= -65536 {
-                let inv = ((!val) as u64 & 0xFFFF) as u32;
-                dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv);
-                return;
-            }
-            let inv = ((!val) as u64 & 0xFFFF) as u32;
-            dynasm!(self.mc ; .arch aarch64 ; movn X(r), inv);
-            let mut value = val >> 16;
-            let mut shift = 16;
-            while shift < 64 {
-                let hw = (value & 0xFFFF) as u32;
-                if hw != 0xFFFF {
-                    match shift {
-                        16 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 16),
-                        32 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 32),
-                        48 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 48),
-                        _ => unreachable!(),
-                    }
-                }
-                shift += 16;
-                value >>= 16;
-            }
-            return;
-        }
-        let mut value = val as u64;
-        dynasm!(self.mc ; .arch aarch64 ; movz X(r), (value & 0xFFFF) as u32);
-        value >>= 16;
-        let mut shift = 16;
-        while value != 0 {
-            let hw = (value & 0xFFFF) as u32;
-            match shift {
-                16 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 16),
-                32 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 32),
-                48 => dynasm!(self.mc ; .arch aarch64 ; movk X(r), hw, lsl 48),
-                _ => unreachable!(),
-            }
-            shift += 16;
-            value >>= 16;
-        }
+        emit_mov_imm64_to(&mut self.mc, reg, val);
     }
 
     /// Materialise a 64-bit immediate as a fixed four-word

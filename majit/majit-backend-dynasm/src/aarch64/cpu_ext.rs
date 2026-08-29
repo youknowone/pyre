@@ -1,34 +1,62 @@
 //! aarch64-specific per-CPU assembler state held by `DynasmBackend`.
 //!
-//! Mirror of `x86::cpu_ext::X86CpuExt` for `target_arch = "aarch64"`.
-//! PyPy's `aarch64/assembler.py _build_propagate_exception_path`
-//! and `aarch64/assembler.py-... _build_malloc_slowpath` produce
-//! per-CPU trampolines just like x86 does; pyre's aarch64 backend
-//! currently inlines the equivalent slowpath sequences per call site
-//! (`aarch64/assembler.rs::CallMallocNursery*` arms), so there is no
-//! address to memoise yet.
-//!
-//! This placeholder exists so `runner.rs::DynasmBackend` can hold one
-//! arch-specific extension under a single `arch_cpu_ext` field name
-//! regardless of `target_arch`.  When the aarch64 backend grows
-//! `_build_*` builders, port the x86 layout onto this struct.
+//! PyPy stores `self.malloc_slowpath` and
+//! `self.propagate_exception_path` on its one `AssemblerARM64` per CPU.
+//! Pyre creates a trace assembler per compilation, so these code buffers live
+//! one level higher here and every loop/bridge receives the cached address.
 
-pub(crate) struct Aarch64CpuExt;
+use crate::codebuf::ArenaExecutableBuffer;
+use crate::guard::CpuDescrHandle;
+use majit_backend::AsmMemoryManager;
+use std::sync::Arc;
+
+pub(crate) struct Aarch64CpuExt {
+    asm_memory_manager: Arc<AsmMemoryManager>,
+    malloc_slowpath_fixed: Option<usize>,
+    _malloc_slowpath_fixed_buffer: Option<ArenaExecutableBuffer>,
+    propagate_exception_path: Option<usize>,
+    _propagate_exception_path_buffer: Option<ArenaExecutableBuffer>,
+}
 
 impl Aarch64CpuExt {
-    pub(crate) fn new(
-        _asm_memory_manager: std::sync::Arc<majit_backend::AsmMemoryManager>,
-    ) -> Self {
-        Self
+    pub(crate) fn new(asm_memory_manager: Arc<AsmMemoryManager>) -> Self {
+        Self {
+            asm_memory_manager,
+            malloc_slowpath_fixed: None,
+            _malloc_slowpath_fixed_buffer: None,
+            propagate_exception_path: None,
+            _propagate_exception_path_buffer: None,
+        }
     }
 
-    /// Cross-arch stub matching `X86CpuExt::has_propagate_dependent_caches`.
-    /// aarch64 doesn't cache propagate / malloc trampolines yet (the
-    /// sequences are inlined per call site), so no baked immediate
-    /// can go stale.  When aarch64 grows per-CPU trampolines, mirror
-    /// the x86 query so `set_propagate_exception_descr` can enforce
-    /// the same attach-once invariant.
+    fn ensure_propagate_exception_path(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
+        if let Some(addr) = self.propagate_exception_path {
+            return addr;
+        }
+        let (buffer, addr) =
+            super::assembler::build_propagate_exception_path(cpu_handle, &self.asm_memory_manager);
+        debug_assert_ne!(addr, 0);
+        self._propagate_exception_path_buffer = Some(buffer);
+        self.propagate_exception_path = Some(addr);
+        addr
+    }
+
+    /// `aarch64/assembler.py setup_once` / `_build_malloc_slowpath`: build
+    /// once per CPU and reuse for fixed and varsize-frame nursery probes.
+    pub(crate) fn ensure_malloc_slowpath_fixed(&mut self, cpu_handle: &CpuDescrHandle) -> usize {
+        if let Some(addr) = self.malloc_slowpath_fixed {
+            return addr;
+        }
+        let propagate_path = self.ensure_propagate_exception_path(cpu_handle);
+        let (buffer, addr) =
+            super::assembler::build_malloc_slowpath_fixed(propagate_path, &self.asm_memory_manager);
+        debug_assert_ne!(addr, 0);
+        self._malloc_slowpath_fixed_buffer = Some(buffer);
+        self.malloc_slowpath_fixed = Some(addr);
+        addr
+    }
+
     pub(crate) fn has_propagate_dependent_caches(&self) -> bool {
-        false
+        self.malloc_slowpath_fixed.is_some() || self.propagate_exception_path.is_some()
     }
 }

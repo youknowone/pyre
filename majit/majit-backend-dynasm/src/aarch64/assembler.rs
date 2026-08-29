@@ -203,6 +203,177 @@ fn deadframe_slot_for_loc(loc: &Loc) -> Option<u16> {
     }
 }
 
+/// `aarch64/assembler.py _build_propagate_exception_path` — build the
+/// per-CPU exception exit once, outside every loop/bridge buffer.
+pub(crate) fn build_propagate_exception_path(
+    cpu_handle: &crate::guard::CpuDescrHandle,
+    arena: &Arc<AsmMemoryManager>,
+) -> (codebuf::ArenaExecutableBuffer, usize) {
+    let mut mc = Assembler::new().expect("propagate_exception_path: new Assembler");
+    let propagate_descr = cpu_handle.read().descr_ptrs().propagate_exception_descr as i64;
+    let exc_value_addr = crate::jit_exc_value_addr() as i64;
+    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, exc_value_addr);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x0, [x16]
+        ; str xzr, [x16]
+        ; str x0, [x29, JF_GUARD_EXC_OFS as u32]
+    );
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, exc_type_addr);
+    dynasm!(mc ; .arch aarch64 ; str xzr, [x16]);
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 0, propagate_descr);
+    dynasm!(mc ; .arch aarch64 ; str x0, [x29, JF_DESCR_OFS as u32]);
+
+    // `_call_footer`: pop the shadow-stack entry, return the current
+    // jitframe and unwind the compiled entry's call frame.
+    let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, rst);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x17, [x16]
+        ; sub x17, x17, 16
+        ; str x17, [x16]
+        ; mov x0, x29
+        ; ldp x19, x20, [sp, #16]
+        ; ldp x29, x30, [sp], CALL_FRAME_SIZE as i32
+        ; ret
+    );
+
+    let buffer =
+        codebuf::finalize_executable(mc, arena).expect("propagate_exception_path: finalize");
+    let ptr = codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
+/// `aarch64/assembler.py _build_malloc_slowpath(kind='fixed')` — the one
+/// per-CPU slow path shared by `malloc_cond` and
+/// `malloc_cond_varsize_frame`.
+///
+/// Entry follows upstream: x0 is the old nursery head, x1 the bumped head,
+/// x17 the gcmap, and x29 the current jitframe.  x0/x1 are the only managed
+/// registers not preserved.  The helper returns the allocated payload in x0.
+pub(crate) fn build_malloc_slowpath_fixed(
+    propagate_path: usize,
+    arena: &Arc<AsmMemoryManager>,
+) -> (codebuf::ArenaExecutableBuffer, usize) {
+    let mut mc = Assembler::new().expect("malloc_slowpath: new Assembler");
+    let base_ofs = FIRST_ITEM_OFFSET as u32;
+
+    // `_push_all_regs_to_jitframe(mc, [x0, x1], True)`.
+    for (i, reg) in all_gen_regs().iter().enumerate() {
+        if reg.value <= 1 {
+            continue;
+        }
+        let ofs = base_ofs + i as u32 * WORD as u32;
+        dynasm!(mc ; .arch aarch64 ; str X(reg.value), [x29, ofs]);
+    }
+    let float_base = base_ofs + all_gen_regs().len() as u32 * WORD as u32;
+    for reg in all_float_regs() {
+        let ofs = float_base + reg.value as u32 * WORD as u32;
+        dynasm!(mc ; .arch aarch64 ; str D(reg.value), [x29, ofs]);
+    }
+
+    // `_build_malloc_slowpath('fixed')`: recover the byte size, publish the
+    // gcmap, and call the collector helper.  Keep LR on a 16-byte-aligned C
+    // stack slot; the other live state is already in the jitframe.
+    dynasm!(mc ; .arch aarch64
+        ; sub x0, x1, x0
+        ; str x17, [x29, JF_GCMAP_OFS as u32]
+        ; sub sp, sp, 16
+        ; str x30, [sp]
+    );
+    crate::aarch64::codebuilder::emit_mov_imm64_to(
+        &mut mc,
+        16,
+        crate::runner::dynasm_nursery_slowpath as *const () as i64,
+    );
+    dynasm!(mc ; .arch aarch64 ; blr x16);
+
+    // A collection may move the jitframe.  Its shadow-stack top entry is the
+    // canonical post-collection pointer (`_reload_frame_if_necessary`).
+    let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, rst);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x16, [x16]
+        ; sub x16, x16, 8
+        ; ldr x29, [x16]
+    );
+
+    let nonnull = mc.new_dynamic_label();
+    dynasm!(mc ; .arch aarch64 ; cbnz x0, =>nonnull);
+    // The standalone propagate path expects the compiled entry's stack, not
+    // this helper's LR slot.
+    dynasm!(mc ; .arch aarch64 ; add sp, sp, 16);
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, propagate_path as i64);
+    dynasm!(mc ; .arch aarch64
+        ; br x16
+        ; =>nonnull
+    );
+
+    // `_reload_frame_if_necessary` reapplies the frame write barrier after a
+    // moving collection.  No live register needs another save here: all of
+    // them are already resident in the jitframe, while x0 is parked beside
+    // LR across the host helper call.
+    if let Some(wb) = crate::runner::dynasm_write_barrier_descr() {
+        let done_wb = mc.new_dynamic_label();
+        let byteofs = wb.jit_wb_if_flag_byteofs;
+        if (0..4096).contains(&byteofs) {
+            dynasm!(mc ; .arch aarch64 ; ldrb w16, [x29, byteofs as u32]);
+        } else if (-256..0).contains(&byteofs) {
+            dynasm!(mc ; .arch aarch64 ; ldurb w16, [x29, byteofs]);
+        } else {
+            crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 17, byteofs as i64);
+            dynasm!(mc ; .arch aarch64
+                ; add x17, x29, x17
+                ; ldrb w16, [x17]
+            );
+        }
+        dynasm!(mc ; .arch aarch64
+            ; mov w17, wb.jit_wb_if_flag_singlebyte as u32
+            ; tst w16, w17
+            ; b.eq =>done_wb
+            ; str x0, [sp, 8]
+            ; mov x0, x29
+        );
+        crate::aarch64::codebuilder::emit_mov_imm64_to(
+            &mut mc,
+            16,
+            crate::runner::dynasm_write_barrier as *const () as i64,
+        );
+        dynasm!(mc ; .arch aarch64
+            ; blr x16
+            ; ldr x0, [sp, 8]
+            ; =>done_wb
+        );
+    }
+
+    dynasm!(mc ; .arch aarch64 ; str xzr, [x29, JF_GCMAP_OFS as u32]);
+    // `_pop_all_regs_from_jitframe(mc, [x0, x1], True)`.
+    for (i, reg) in all_gen_regs().iter().enumerate().rev() {
+        if reg.value <= 1 {
+            continue;
+        }
+        let ofs = base_ofs + i as u32 * WORD as u32;
+        dynasm!(mc ; .arch aarch64 ; ldr X(reg.value), [x29, ofs]);
+    }
+    for reg in all_float_regs().iter().rev() {
+        let ofs = float_base + reg.value as u32 * WORD as u32;
+        dynasm!(mc ; .arch aarch64 ; ldr D(reg.value), [x29, ofs]);
+    }
+    let (nf_addr, _) = crate::runner::dynasm_nursery_addrs();
+    crate::aarch64::codebuilder::emit_mov_imm64_to(&mut mc, 16, nf_addr as i64);
+    dynasm!(mc ; .arch aarch64
+        ; ldr x1, [x16]
+        ; ldr x30, [sp]
+        ; add sp, sp, 16
+        ; ret
+    );
+
+    let buffer = codebuf::finalize_executable(mc, arena).expect("malloc_slowpath: finalize");
+    let ptr = codebuf::buffer_ptr(&buffer) as usize;
+    (buffer, ptr)
+}
+
 // ── Abstract condition codes ──
 // Architecture-independent CC values used throughout the assembler.
 // Converted to arch-specific encoding at emission time.
@@ -457,6 +628,10 @@ pub struct AssemblerARM64<'a> {
     /// the only formulation cranelift and wasm can express at all. 0
     /// leaves the guard a no-op (bridges / tests with no owning token).
     invalidated_flag_addr: usize,
+    /// `AssemblerARM64.malloc_slowpath`: per-CPU shared slowpath built by
+    /// `_build_malloc_slowpath('fixed')` and used by both fixed-size and
+    /// varsize-frame nursery probes.
+    malloc_slowpath_fixed: usize,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -549,6 +724,7 @@ impl<'a> AssemblerARM64<'a> {
         classptr_to_subclass_range: IndexMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
+        malloc_slowpath_fixed: usize,
         inputargs: &'a [InputArg],
         operations: &'a [Op],
     ) -> Self {
@@ -600,6 +776,7 @@ impl<'a> AssemblerARM64<'a> {
             cpu_handle,
             gc_table_base: 0,
             invalidated_flag_addr: 0,
+            malloc_slowpath_fixed,
         }
     }
 
@@ -3271,53 +3448,51 @@ impl<'a> AssemblerARM64<'a> {
                 }
 
                 dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
-                self.push_all_regs_to_jitframe(
-                    &[crate::aarch64::registers::X0, crate::aarch64::registers::X1],
-                    true,
-                );
-                // aarch64/assembler.py malloc_cond_varsize_frame:
-                // compute size into X0 BEFORE storing gcmap, because the
-                // gcmap store must NOT clobber the slowpath's size arg.
-                // Upstream uses IP1 for the gcmap pointer (gen_load_int_full
-                // r.ip1.value, ...) so the size arg in X0 stays intact.
                 if nf_addr != 0 && nt_addr != 0 {
-                    dynasm!(self.mc ; .arch aarch64 ; sub x0, x1, x0);
-                    let gc_header_size = majit_gc::header::GcHeader::SIZE as u32;
-                    dynasm!(self.mc ; .arch aarch64 ; sub x0, x0, gc_header_size);
-                } else if sizeloc.value != 0 {
-                    dynasm!(self.mc ; .arch aarch64 ; mov x0, X(sizeloc.value));
-                }
-                if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
-                    // Store gcmap into jf[jf_gcmap_ofs] via a scratch reg
-                    // that is NOT X0 (size arg) or X1 (original nursery_free).
-                    // Using x16 (IP0) matches _reload_frame_if_necessary and
-                    // stays out of the argument register path.
-                    self.emit_mov_imm64(16, gcmap as i64);
-                    dynasm!(self.mc ; .arch aarch64
-                        ; str x16, [x29, crate::jitframe::JF_GCMAP_OFS as u32]
-                    );
+                    // `malloc_cond_varsize_frame`: each probe only loads its
+                    // gcmap and calls the one `_build_malloc_slowpath('fixed')`
+                    // body cached on the CPU.  x0/x1 still carry old/new
+                    // nursery heads, exactly the shared stub's ABI.
+                    if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+                        self.emit_mov_imm64(17, gcmap as i64);
+                    } else {
+                        dynasm!(self.mc ; .arch aarch64 ; mov x17, 0);
+                    }
+                    self.emit_mov_imm64(16, self.malloc_slowpath_fixed as i64);
+                    dynasm!(self.mc ; .arch aarch64 ; blr x16);
                 } else {
+                    // Tests without an installed nursery cannot enter the
+                    // shared old/new-head ABI.  Preserve the non-GC fallback.
+                    self.push_all_regs_to_jitframe(
+                        &[crate::aarch64::registers::X0, crate::aarch64::registers::X1],
+                        true,
+                    );
+                    if sizeloc.value != 0 {
+                        dynasm!(self.mc ; .arch aarch64 ; mov x0, X(sizeloc.value));
+                    }
+                    if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+                        self.emit_mov_imm64(16, gcmap as i64);
+                        dynasm!(self.mc ; .arch aarch64
+                            ; str x16, [x29, crate::jitframe::JF_GCMAP_OFS as u32]
+                        );
+                    } else {
+                        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
+                        dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                    }
+                    self.emit_mov_imm64(
+                        16,
+                        crate::runner::dynasm_nursery_slowpath_jitframe as *const () as i64,
+                    );
+                    dynasm!(self.mc ; .arch aarch64 ; blr x16);
+                    self.reload_frame_if_necessary();
                     let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
                     dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+                    self.pop_all_regs_from_jitframe(
+                        &[crate::aarch64::registers::X0, crate::aarch64::registers::X1],
+                        true,
+                    );
+                    self.emit_propagate_memory_error_if_null(0);
                 }
-                self.emit_mov_imm64(
-                    16,
-                    crate::runner::dynasm_nursery_slowpath_jitframe as *const () as i64,
-                );
-                dynasm!(self.mc ; .arch aarch64 ; blr x16);
-                self.reload_frame_if_necessary();
-                let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
-                dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
-                self.pop_all_regs_from_jitframe(
-                    &[crate::aarch64::registers::X0, crate::aarch64::registers::X1],
-                    true,
-                );
-                // `dynasm_nursery_slowpath_jitframe` falls back to
-                // `libc::calloc`, which returns NULL on real host OOM.
-                // Route through the propagate path before the fast/slow
-                // paths join so the null frame pointer never reaches the
-                // CALL_ASSEMBLER store sequence that follows.
-                self.emit_propagate_memory_error_if_null(0);
                 dynasm!(self.mc ; .arch aarch64 ; =>done);
                 if let Some(Loc::Reg(r)) = result_loc
                     && r.value != 0
@@ -6283,77 +6458,18 @@ impl<'a> AssemblerARM64<'a> {
             ; b =>done
         );
 
-        // Slow path: aarch64/assembler.py `_build_malloc_slowpath` parity.
-        //
-        // Before calling `dynasm_nursery_slowpath` (which may trigger a
-        // minor collection) we must spill every managed register holding a
-        // live Ref into its canonical jitframe slot. `gcmap` identifies
-        // those slots by the same register-index table that
-        // `get_gcmap` writes bits from (`core_reg_index`:
-        //   x0..x13 → slots 0..13, x19 → 14, x20 → 15).
-        //
-        // Without this spill the GC walks `jf_frame` slots 0..15 (per
-        // gcmap bits), finds garbage, and returns with live Refs in CPU
-        // registers left pointing into the pre-collection nursery. A
-        // subsequent guard then captures those stale pointers into its
-        // deadframe and the blackhole decoder crashes when reading the
-        // freed object (observed in fib_recursive: `bh_binary_op_fn` gets
-        // an int object with `ob_type=NULL` after minor GC).
-        //
-        // Matches RPython's `_push_all_regs_to_jitframe(mc, [r.x0, r.x1], True)`
-        // before the `BL` and `_pop_all_regs_from_jitframe(mc, [r.x0, r.x1], ...)` after.
-        // x0 is the total_size argument / return pointer; x1 is an internal
-        // temp that regalloc already guarantees doesn't hold a live Ref at
-        // the malloc site (see `MALLOC_NURSERY_CLOBBER`).
+        // `malloc_cond`: publish the site-specific gcmap in ip1 and call the
+        // one per-CPU `_build_malloc_slowpath('fixed')` body.  x0/x1 still
+        // hold old/new nursery heads; the shared body owns all register
+        // preservation, collection, frame reload, write barrier and OOM exit.
         dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
-        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
-        // Save x2..x13, x19/x20 to their slots (x0/x1 excluded per ignored_regs).
-        dynasm!(self.mc ; .arch aarch64
-            ; stp x2, x3, [x29, base_ofs + 2 * 8]
-            ; stp x4, x5, [x29, base_ofs + 4 * 8]
-            ; stp x6, x7, [x29, base_ofs + 6 * 8]
-            ; stp x8, x9, [x29, base_ofs + 8 * 8]
-            ; stp x10, x11, [x29, base_ofs + 10 * 8]
-            ; stp x12, x13, [x29, base_ofs + 12 * 8]
-            ; stp x19, x20, [x29, base_ofs + 14 * 8]
-        );
-        // assembler.py:649-650: store gcmap to jf_gcmap so the collector
-        // can trace live Refs pinned to frame slots during the slow-path
-        // allocator call. The gcmap was captured at regalloc time in
-        // `perform_with_gcmap` and threaded via RegAllocOp::Perform.gcmap.
         if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
-            self.push_gcmap(gcmap as *mut usize);
+            self.emit_mov_imm64(17, gcmap as i64);
         } else {
-            let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
-            dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+            dynasm!(self.mc ; .arch aarch64 ; mov x17, 0);
         }
-        self.emit_mov_imm64(0, total_size);
-        self.emit_mov_imm64(
-            2,
-            crate::runner::dynasm_nursery_slowpath as *const () as i64,
-        );
-        self.emit_malloc_slowpath_helper_call(2);
-        self.reload_frame_if_necessary();
-        // pop_gcmap: clear jf_gcmap after collecting call
-        let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
-        dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
-        // Restore x2..x13, x19/x20 from jitframe slots (GC may have
-        // updated the stored pointers). x0 keeps the allocated payload ptr.
-        let base_ofs_r = crate::jitframe::FIRST_ITEM_OFFSET as i32;
-        dynasm!(self.mc ; .arch aarch64
-            ; ldp x2, x3, [x29, base_ofs_r + 2 * 8]
-            ; ldp x4, x5, [x29, base_ofs_r + 4 * 8]
-            ; ldp x6, x7, [x29, base_ofs_r + 6 * 8]
-            ; ldp x8, x9, [x29, base_ofs_r + 8 * 8]
-            ; ldp x10, x11, [x29, base_ofs_r + 10 * 8]
-            ; ldp x12, x13, [x29, base_ofs_r + 12 * 8]
-            ; ldp x19, x20, [x29, base_ofs_r + 14 * 8]
-        );
-        // `dynasm_nursery_slowpath` returns x0 = 0 on real host OOM
-        // (calloc failure preserved as NULL per runner.rs).  Route
-        // through the propagate path before the fast-path join so the
-        // null pointer never reaches subsequent typed stores.
-        self.emit_propagate_memory_error_if_null(0);
+        self.emit_mov_imm64(16, self.malloc_slowpath_fixed as i64);
+        dynasm!(self.mc ; .arch aarch64 ; blr x16);
 
         dynasm!(self.mc ; .arch aarch64 ; =>done);
     }
