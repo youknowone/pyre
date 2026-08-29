@@ -6339,14 +6339,21 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
     let s = unsafe { w_str_get_wtf8(pos[0]) };
-    let tabsize = match pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
-    {
-        Some(t) => crate::builtins::space_index_w(t)?,
-        None => 8,
-    };
+    // [3.14-spec] PyPy `W_UnicodeObject.descr_expandtabs` unwraps a machine
+    // `int`; CPython `unicode_expandtabs` declares an Argument Clinic `int`
+    // and therefore calls `PyLong_AsInt` before inspecting even an empty
+    // receiver.  Keep PyPy's method body below, but narrow this observable
+    // argument boundary to a C int.
+    let tabsize = i64::from(
+        match pos
+            .get(1)
+            .copied()
+            .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
+        {
+            Some(t) => crate::baseobjspace::index_c_int_w(t)?,
+            None => 8,
+        },
+    );
     // Tabs advance to the next multiple of `tabsize` measured from the
     // start of the current line (the column resets on `\n` / `\r`); a
     // non-positive `tabsize` drops tabs entirely. The expanded length is

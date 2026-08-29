@@ -23302,38 +23302,75 @@ fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         )));
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
-    let tabsize = match pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
-    {
-        Some(t) if !t.is_null() => crate::builtins::space_index_w(t)?,
-        _ => 8,
-    };
+    // [3.14-spec] PyPy `StringMethods.descr_expandtabs` uses
+    // `@unwrap_spec(tabsize=int)`, while CPython's `stringlib_expandtabs`
+    // clinic wrapper uses `PyLong_AsInt`.  The latter is observable before
+    // the body even for an empty receiver, so narrow through the shared
+    // index-protocol C-int converter here.
+    let tabsize = i64::from(
+        match pos
+            .get(1)
+            .copied()
+            .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
+        {
+            Some(t) if !t.is_null() => crate::baseobjspace::index_c_int_w(t)?,
+            _ => 8,
+        },
+    );
     // `unwrap_spec(tabsize=int)` converts before `descr_expandtabs` calls
     // `_val`; a re-entrant `__index__` can therefore resize a bytearray and
     // the method must read the resulting value.
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-    let mut out: Vec<u8> = Vec::with_capacity(data.len());
-    let mut col: i64 = 0;
-    for &b in data {
-        match b {
-            b'\t' => {
-                if tabsize > 0 {
-                    let incr = tabsize - (col % tabsize);
-                    col += incr;
-                    out.resize(out.len() + incr as usize, b' ');
-                }
-            }
-            b'\n' | b'\r' => {
-                out.push(b);
-                col = 0;
-            }
-            _ => {
-                out.push(b);
-                col += 1;
-            }
+    // `StringMethods.descr_expandtabs`: split at tabs, append the first
+    // token, then compute each following indentation from the previous token
+    // (back to its last CR/LF).  RPython's builder turns an unsatisfiable
+    // allocation into MemoryError; reserve fallibly so Rust does the same
+    // instead of aborting the interpreter.
+    let tokens: Vec<&[u8]> = data.split(|&b| b == b'\t').collect();
+    let overflow = || crate::PyError::overflow_error("new string is too long");
+    if tabsize > 0 {
+        let token_count = i64::try_from(tokens.len()).map_err(|_| overflow())?;
+        token_count.checked_mul(tabsize).ok_or_else(overflow)?;
+    }
+    let tabindent = |token: &[u8]| -> usize {
+        if tabsize <= 0 {
+            return 0;
         }
+        let mut distance = 0i64;
+        let mut offset = token.len();
+        while offset > 0 {
+            let b = token[offset - 1];
+            if b == b'\n' || b == b'\r' {
+                break;
+            }
+            distance += 1;
+            offset -= 1;
+        }
+        distance = (tabsize - (distance % tabsize)) % tabsize;
+        if distance == 0 {
+            tabsize as usize
+        } else {
+            distance as usize
+        }
+    };
+    let mut total = tokens.first().map_or(0, |token| token.len());
+    let mut index = 1usize;
+    while index < tokens.len() {
+        total = total
+            .checked_add(tabindent(tokens[index - 1]))
+            .and_then(|n| n.checked_add(tokens[index].len()))
+            .ok_or_else(overflow)?;
+        index += 1;
+    }
+    let mut out = crate::builtins::try_vec_with_capacity(total)?;
+    if let Some(first) = tokens.first() {
+        out.extend_from_slice(first);
+    }
+    let mut index = 1usize;
+    while index < tokens.len() {
+        out.resize(out.len() + tabindent(tokens[index - 1]), b' ');
+        out.extend_from_slice(tokens[index]);
+        index += 1;
     }
     Ok(new_bytes_like(pos[0], &out))
 }

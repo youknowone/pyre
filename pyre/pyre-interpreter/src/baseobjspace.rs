@@ -14787,8 +14787,20 @@ pub fn index_int_w_preserve_negative(obj: PyObjectRef) -> Result<i64, PyError> {
 /// object carrying both dunders would be read from the wrong one, and one
 /// carrying only `__int__` would be accepted where 3.14 raises TypeError.
 pub fn index_c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
-    let value = int_w(space_index(obj)?)?;
-    i32::try_from(value).map_err(|_| PyError::overflow_error("expected a 32-bit integer"))
+    let w_index = space_index(obj)?;
+    let too_large = || PyError::overflow_error("Python int too large to convert to C int");
+    let value = unsafe {
+        if pyre_object::is_long(w_index) {
+            let big = pyre_object::w_long_get_value(w_index);
+            if pyre_object::longobject::jit_bigint_to_i64_fits(big) == 0 {
+                return Err(too_large());
+            }
+            pyre_object::longobject::jit_bigint_to_i64_value(big)
+        } else {
+            int_w(w_index)?
+        }
+    };
+    i32::try_from(value).map_err(|_| too_large())
 }
 
 /// `objspace.honor__builtins__` default is False — the frame builtin is

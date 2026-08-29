@@ -21,4 +21,18 @@ class TabSize:
         return 4
 result = result and value.expandtabs(TabSize()) == bytearray(b'x   y')
 
+# CPython 3.14's clinic wrapper converts `tabsize` with `PyLong_AsInt`
+# before any receiver fast path.  This applies uniformly to str, bytes and
+# bytearray, including an empty value that needs no expansion.
+for value in ('', b'', bytearray()):
+    for tabsize in (2 ** 31, -(2 ** 31) - 1, 2 ** 100):
+        try:
+            value.expandtabs(tabsize)
+        except OverflowError as exc:
+            result = result and str(exc) == (
+                'Python int too large to convert to C int'
+            )
+        else:
+            result = False
+
 assert result
