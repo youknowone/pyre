@@ -930,10 +930,14 @@ pub struct MiniMarkGC {
     pub types: TypeRegistry,
     /// Root set.
     pub roots: RootSet,
-    /// Remembered set: old objects that may point to young objects.
-    /// These are old-gen object payload addresses whose TRACK_YOUNG_PTRS
-    /// flag has been cleared by the write barrier.
-    remembered_set: Vec<usize>,
+    /// incminimark.py:344 `old_objects_pointing_to_young = AddressStack()`.
+    /// Used by minor collection: the (mostly non-young) objects that may
+    /// contain a pointer to a young object.  The write barrier populates it,
+    /// appending an object as it clears that object's
+    /// `GCFLAG_TRACK_YOUNG_PTRS`.  A young array object may enter by
+    /// temporary mistake; the next minor collection removes it again, in
+    /// [`Self::remove_young_arrays_from_old_objects_pointing_to_young`].
+    old_objects_pointing_to_young: Vec<usize>,
     /// incminimark.py:355 `prebuilt_root_objects = AddressStack()`.
     /// Immortal objects enter exactly once, when their first pointer write
     /// clears NO_HEAP_PTRS in the write barrier.
@@ -1264,7 +1268,7 @@ impl MiniMarkGC {
             oldgen: OldGen::new(),
             types: TypeRegistry::new(),
             roots: RootSet::new(),
-            remembered_set: Vec::new(),
+            old_objects_pointing_to_young: Vec::new(),
             prebuilt_root_objects: Vec::new(),
             root_snapshot_capacity: std::cell::Cell::new(0),
             old_objects_with_cards_set: Vec::new(),
@@ -2251,8 +2255,9 @@ impl MiniMarkGC {
             // about separately — the same reading `bh_probe_stale_young_slots`
             // takes.
             let holder_is_old = self.oldgen.contains(here) && !self.is_young_rawmalloced(here);
-            let remembered = self.remembered_set.contains(&here);
-            let parent_remembered = parent.is_some_and(|p| self.remembered_set.contains(&p));
+            let remembered = self.old_objects_pointing_to_young.contains(&here);
+            let parent_remembered =
+                parent.is_some_and(|p| self.old_objects_pointing_to_young.contains(&p));
             self.visit_referent_slots(here, &mut |slot| {
                 let value = unsafe { *slot }.0;
                 if value == 0 {
@@ -2307,8 +2312,8 @@ impl MiniMarkGC {
         // The remembered set is traced whether or not anything still points at
         // its entries, so it is its own population: an entry the root walk
         // never reached is a dead object the minor will still read.
-        for index in 0..self.remembered_set.len() {
-            let here = self.remembered_set[index];
+        for index in 0..self.old_objects_pointing_to_young.len() {
+            let here = self.old_objects_pointing_to_young[index];
             let root_reachable = seen.contains(&here);
             self.visit_referent_slots(here, &mut |slot| {
                 let value = unsafe { *slot }.0;
@@ -2450,7 +2455,7 @@ impl MiniMarkGC {
                         track_young_ptrs: unsafe {
                             (*header_of(addr)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS)
                         },
-                        remembered: self.remembered_set.contains(&addr),
+                        remembered: self.old_objects_pointing_to_young.contains(&addr),
                         barriered_ever: crate::bh_probe_was_barriered(addr),
                         traced_this_minor: crate::bh_probe_was_traced(addr),
                         store_sites: crate::bh_probe_store_sites(addr, offset),
@@ -2462,7 +2467,8 @@ impl MiniMarkGC {
                                     .contains_key(&unsafe { *(p as *const usize) })
                             })
                             .and_then(crate::bh_probe_type_name),
-                        parent_remembered: parent.is_some_and(|p| self.remembered_set.contains(&p)),
+                        parent_remembered: parent
+                            .is_some_and(|p| self.old_objects_pointing_to_young.contains(&p)),
                         parent_barriered_ever: parent.is_some_and(crate::bh_probe_was_barriered),
                         parent_traced_this_minor: parent.is_some_and(crate::bh_probe_was_traced),
                     });
@@ -2856,7 +2862,7 @@ impl MiniMarkGC {
         // birth, so the first arm always runs; the remembered walk is what sets
         // the flag and forwards whatever nursery children the object holds.
         if unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) } {
-            self.remembered_set.push(obj_addr);
+            self.old_objects_pointing_to_young.push(obj_addr);
         }
         if unsafe { (*hdr).has_flag(flags::GCFLAG_HAS_CARDS) } {
             debug_assert!(
@@ -2884,9 +2890,9 @@ impl MiniMarkGC {
     /// An entry naming a young rawmalloced object is a contradiction: this
     /// minor visits it as an object, and if it dies the drain would be reading
     /// a freed header. Upstream drops those entries before the walk starts.
-    fn remove_young_arrays_from_remembered_set(&mut self) {
+    fn remove_young_arrays_from_old_objects_pointing_to_young(&mut self) {
         let oldgen = &self.oldgen;
-        self.remembered_set
+        self.old_objects_pointing_to_young
             .retain(|&obj_addr| !oldgen.young_rawmalloced_contains(obj_addr));
     }
 
@@ -2908,7 +2914,7 @@ impl MiniMarkGC {
             eprintln!(
                 "[gc][minor] start count={} remembered={} cards_set={}",
                 self.minor_collections + 1,
-                self.remembered_set.len(),
+                self.old_objects_pointing_to_young.len(),
                 self.old_objects_with_cards_set.len(),
             );
         }
@@ -2937,7 +2943,7 @@ impl MiniMarkGC {
         self.any_pinned_object_kept = false;
         // incminimark.py:1787-1789: ahead of the re-gray and every root walk.
         if self.oldgen.has_young_rawmalloced() {
-            self.remove_young_arrays_from_remembered_set();
+            self.remove_young_arrays_from_old_objects_pointing_to_young();
         }
         // incminimark.py:1800-1807: a black old parent may expose an unpinned
         // child that will move during this minor, so make the parent gray
@@ -3123,7 +3129,7 @@ impl MiniMarkGC {
         // those black objects so the major collector rescans their new
         // outgoing references before sweep.
         if self.gc_state == GcState::Marking {
-            let remembered_now: Vec<usize> = self.remembered_set.to_vec();
+            let remembered_now: Vec<usize> = self.old_objects_pointing_to_young.to_vec();
             for obj_addr in remembered_now {
                 let hdr = unsafe { header_of(obj_addr) };
                 if unsafe { (*hdr).has_flag(flags::GCFLAG_VISITED) } {
@@ -3162,10 +3168,10 @@ impl MiniMarkGC {
             // incminimark.py: collect_oldrefs_to_nursery.
             let mut idx = 0;
             loop {
-                if idx >= self.remembered_set.len() {
+                if idx >= self.old_objects_pointing_to_young.len() {
                     break;
                 }
-                let obj_addr = self.remembered_set[idx];
+                let obj_addr = self.old_objects_pointing_to_young[idx];
                 idx += 1;
 
                 // incminimark.py:2095-2098: re-set TRACK_YOUNG_PTRS.
@@ -3175,9 +3181,9 @@ impl MiniMarkGC {
 
                 // Trace this old-gen object's fields and copy any nursery
                 // objects they reference.
-                self.trace_and_update_object(obj_addr, "minor_remembered_set");
+                self.trace_and_update_object(obj_addr, "minor_old_objects_pointing_to_young");
             }
-            self.remembered_set.clear();
+            self.old_objects_pointing_to_young.clear();
 
             // incminimark.py:1859-1862: loop back if card-marked objects appeared.
             if self.card_page_shift > 0 && !self.old_objects_with_cards_set.is_empty() {
@@ -4603,7 +4609,7 @@ impl MiniMarkGC {
                 self.describe_generation(obj_addr),
                 self.describe_generation(holder_addr),
                 holder_hdr_tid_and_flags,
-                self.remembered_set.contains(&holder_addr),
+                self.old_objects_pointing_to_young.contains(&holder_addr),
                 self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
                 self.gc_state,
                 self.minor_collections,
@@ -4712,7 +4718,7 @@ impl MiniMarkGC {
             unsafe {
                 (*(new_header_ptr as *mut GcHeader)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
             }
-            self.remembered_set.push(new_obj_addr);
+            self.old_objects_pointing_to_young.push(new_obj_addr);
             if crate::gc_lifetime_log_enabled() {
                 eprintln!(
                     "[gc][remember] addr={:#x} type_id={} source=promotion state={:?}",
@@ -5048,7 +5054,7 @@ impl MiniMarkGC {
                 && unsafe { (*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) }
             {
                 unsafe { (*hdr).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
-                self.remembered_set.push(gcref.0);
+                self.old_objects_pointing_to_young.push(gcref.0);
                 if crate::gc_lifetime_log_enabled() {
                     eprintln!(
                         "[gc][remember] addr={:#x} type_id={} source=major_seed state={:?}",
@@ -6350,7 +6356,7 @@ impl MiniMarkGC {
                     child_vtable_type_id,
                     Self::hex_words(&child_words),
                     holder_hdr.tid_and_flags,
-                    self.remembered_set.contains(&holder_addr),
+                    self.old_objects_pointing_to_young.contains(&holder_addr),
                     self.describe_generation(addr),
                     self.describe_generation(holder_addr),
                     self.describe_enclosing_container(holder_addr, slot_addr, &holder_words),
@@ -6480,7 +6486,7 @@ impl MiniMarkGC {
     /// re-scan before the sweep completes.
     ///
     /// Every old object modified since the last minor collection is recorded in
-    /// `remembered_set` (the write barrier's `old_objects_pointing_to_young`) with
+    /// `old_objects_pointing_to_young` (the write barrier's `old_objects_pointing_to_young`) with
     /// its `TRACK_YOUNG_PTRS` cleared. Such a store may install an `old -> old`
     /// edge to a still-white object. The per-minor black re-grey in
     /// `do_collect_nursery` only re-scans modifications up to the last minor; a
@@ -6492,7 +6498,7 @@ impl MiniMarkGC {
     /// sets VISITED at push time, so a black object is simply re-pushed; white
     /// entries are left for the normal frontier / retain to drop.)
     fn rescan_remembered_black_and_drain(&mut self) {
-        let snapshot: Vec<usize> = self.remembered_set.to_vec();
+        let snapshot: Vec<usize> = self.old_objects_pointing_to_young.to_vec();
         for addr in snapshot {
             if unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_VISITED) } {
                 self.incr_state.gray_stack.push(addr);
@@ -6657,12 +6663,12 @@ impl MiniMarkGC {
         }
         // A non-moving major (do_collect_oldgen_nonmoving) runs with a live
         // nursery and no preceding minor, so the write barrier's
-        // remembered_set / old_objects_with_cards_set are still populated and
+        // old_objects_pointing_to_young / old_objects_with_cards_set are still populated and
         // may name old objects this cycle is about to free. Drop the dead ones
         // (VISITED is still set on every survivor at this point) so the next
         // minor does not trace freed memory. A no-op for do_collect_full, whose
         // leading minor already drained both sets.
-        self.remembered_set
+        self.old_objects_pointing_to_young
             .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_VISITED) });
         self.old_objects_with_cards_set
             .retain(|&addr| unsafe { (*header_of(addr)).has_flag(flags::GCFLAG_VISITED) });
@@ -7478,7 +7484,7 @@ impl MiniMarkGC {
     /// inside the allocation and finds the flag clear. Reaching this helper
     /// with such a frame therefore takes a set flag bit the allocator did not
     /// write; `is_managed_heap_object` is what still keeps the unmanaged block
-    /// out of `remembered_set`, where the next minor would decode a type id
+    /// out of `old_objects_pointing_to_young`, where the next minor would decode a type id
     /// from it. `write_barrier_ignores_unmanaged_jitframe_with_flag_byte_set`
     /// pins that case.
     pub fn do_write_barrier(&mut self, obj: GcRef) {
@@ -7540,7 +7546,7 @@ impl MiniMarkGC {
         // mutated and therefore cannot be re-added between sweep steps.
         let type_id = unsafe { (*header_of(obj.0)).type_id() };
         self.validate_type_id(type_id, obj.0, "remember_young_pointer_insert");
-        self.remembered_set.push(obj.0);
+        self.old_objects_pointing_to_young.push(obj.0);
         crate::bh_probe_note_barriered(obj.0);
         let hdr = unsafe { header_of(obj.0) };
         if crate::gc_lifetime_log_enabled() {
@@ -8120,8 +8126,8 @@ impl MiniMarkGC {
     }
 
     /// Number of objects in the remembered set (for testing / diagnostics).
-    pub fn remembered_set_len(&self) -> usize {
-        self.remembered_set.len()
+    pub fn old_objects_pointing_to_young_len(&self) -> usize {
+        self.old_objects_pointing_to_young.len()
     }
 }
 
@@ -10646,11 +10652,11 @@ mod tests {
         // Write barrier clears the flag and adds to remembered set.
         gc.do_write_barrier(old_obj);
         assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
-        assert_eq!(gc.remembered_set.len(), 1);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 1);
 
         // Second call: flag already cleared, should not add again.
         gc.do_write_barrier(old_obj);
-        assert_eq!(gc.remembered_set.len(), 1);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 1);
     }
 
     #[test]
@@ -10680,7 +10686,7 @@ mod tests {
 
         gc.do_write_barrier(prebuilt_ref);
         assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_NO_HEAP_PTRS) });
-        assert_eq!(gc.remembered_set, vec![prebuilt_ref.0]);
+        assert_eq!(gc.old_objects_pointing_to_young, vec![prebuilt_ref.0]);
         assert_eq!(gc.prebuilt_root_objects, vec![prebuilt_ref.0]);
 
         gc.do_collect_nursery();
@@ -10784,7 +10790,7 @@ mod tests {
         unsafe { *(base as *mut GcHeader) = GcHeader::new(0) };
         let payload = base + GcHeader::SIZE;
         gc.do_write_barrier(GcRef(payload));
-        assert_eq!(gc.remembered_set.len(), 0);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
         drop(buf);
     }
 
@@ -10794,7 +10800,7 @@ mod tests {
         // header at `0 - GcHeader::SIZE`.
         let mut gc = test_gc(1024);
         gc.do_write_barrier(GcRef(0));
-        assert_eq!(gc.remembered_set.len(), 0);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
     }
 
     #[test]
@@ -10812,7 +10818,7 @@ mod tests {
         // this test covers the residue — the helper being entered anyway, with
         // the flag bit set, for a block the GC does not manage. Without the
         // `is_managed_heap_object` guard in `do_write_barrier`, that block
-        // would enter `remembered_set` and the next minor would decode a type
+        // would enter `old_objects_pointing_to_young` and the next minor would decode a type
         // id from those bytes.
         let mut gc = test_gc(1024);
 
@@ -10844,7 +10850,7 @@ mod tests {
 
         gc.do_write_barrier(GcRef(obj));
 
-        assert_eq!(gc.remembered_set.len(), 0);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
         // `remember_young_pointer` clears TRACK_YOUNG_PTRS, so an unchanged
         // byte also proves the barrier never wrote through the fake header.
         assert_eq!(unsafe { *flag_byte }, flag_byte_before);
@@ -10896,7 +10902,7 @@ mod tests {
 
         gc.do_write_barrier(GcRef(obj));
 
-        assert_eq!(gc.remembered_set.len(), 0);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), 0);
         // `remember_young_pointer` clears TRACK_YOUNG_PTRS, so unchanged bits
         // also prove the barrier never wrote through the fake header.
         assert_eq!(unsafe { (*fake).tid_and_flags }, fake_bits_before);
@@ -10923,7 +10929,7 @@ mod tests {
         assert!(!gc.is_in_nursery(root.0));
 
         gc.do_write_barrier(stale_addr);
-        assert!(gc.remembered_set.is_empty());
+        assert!(gc.old_objects_pointing_to_young.is_empty());
         gc.roots.clear();
     }
 
@@ -11633,7 +11639,11 @@ mod tests {
         gc.do_write_barrier_card(obj, 5, DEFAULT_CARD_PAGE_SHIFT);
 
         // Should fall back to full remembered set.
-        assert_eq!(gc.remembered_set.len(), 1, "should add to remembered set");
+        assert_eq!(
+            gc.old_objects_pointing_to_young.len(),
+            1,
+            "should add to remembered set"
+        );
         assert!(
             gc.old_objects_with_cards_set.is_empty(),
             "should not add to old_objects_with_cards_set without HAS_CARDS"
@@ -11765,7 +11775,7 @@ mod tests {
             // through the ordinary mutator write barrier.
             *(root.0 as *mut GcRef) = young;
         }
-        assert!(gc.remembered_set.contains(&root.0));
+        assert!(gc.old_objects_pointing_to_young.contains(&root.0));
 
         gc.disable();
         gc.do_collect_nursery();
@@ -12539,7 +12549,7 @@ mod tests {
         // collector-owned JITFRAME spills cannot strand nursery references.
         // Reset that one-time collector setup here to isolate the ordinary
         // mutator write-barrier behavior this test covers.
-        gc.remembered_set.clear();
+        gc.old_objects_pointing_to_young.clear();
         unsafe {
             (*header_of(root_a.0)).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
             (*header_of(root_b.0)).set_flag(flags::GCFLAG_TRACK_YOUNG_PTRS);
@@ -12552,16 +12562,16 @@ mod tests {
 
         // A and B should be in the remembered set.
         assert!(
-            gc.remembered_set.contains(&root_a.0),
+            gc.old_objects_pointing_to_young.contains(&root_a.0),
             "write barrier should add A to remembered set during marking"
         );
         assert!(
-            gc.remembered_set.contains(&root_b.0),
+            gc.old_objects_pointing_to_young.contains(&root_b.0),
             "write barrier should add B to remembered set during marking"
         );
         // C was not written to, so it shouldn't be in remembered set.
         assert!(
-            !gc.remembered_set.contains(&root_c.0),
+            !gc.old_objects_pointing_to_young.contains(&root_c.0),
             "C should not be in remembered set"
         );
 
@@ -12843,12 +12853,12 @@ mod tests {
         gc.jit_remember_young_pointer(obj);
 
         assert!(unsafe { !(*hdr).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
-        assert_eq!(gc.remembered_set_len(), 1);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 1);
 
         // Calling again adds a second entry (JIT fast-path does not
         // deduplicate; the collector handles this during minor collection).
         gc.jit_remember_young_pointer(obj);
-        assert_eq!(gc.remembered_set_len(), 2);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 2);
     }
 
     #[test]
@@ -14157,12 +14167,12 @@ cache size\t: 8192 kB\n";
         let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         unsafe { (*header_of(source.0)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
-        let before = gc.remembered_set.len();
+        let before = gc.old_objects_pointing_to_young.len();
 
         assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
 
-        assert_eq!(gc.remembered_set.len(), before + 1);
-        assert!(gc.remembered_set.contains(&dest.0));
+        assert_eq!(gc.old_objects_pointing_to_young.len(), before + 1);
+        assert!(gc.old_objects_pointing_to_young.contains(&dest.0));
         assert!(unsafe { !(*header_of(dest.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
@@ -14176,11 +14186,11 @@ cache size\t: 8192 kB\n";
         let source = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         assert_eq!(gc.gc_state, GcState::Scanning);
-        let before = gc.remembered_set.len();
+        let before = gc.old_objects_pointing_to_young.len();
 
         assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
 
-        assert_eq!(gc.remembered_set.len(), before);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), before);
         assert!(unsafe { (*header_of(dest.0)).has_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) });
     }
 
@@ -14195,11 +14205,11 @@ cache size\t: 8192 kB\n";
         let dest = gc.alloc_in_oldgen_clear(tid, GcHeader::SIZE + ptr_size);
         unsafe { (*header_of(source.0)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
         unsafe { (*header_of(dest.0)).clear_flag(flags::GCFLAG_TRACK_YOUNG_PTRS) };
-        let before = gc.remembered_set.len();
+        let before = gc.old_objects_pointing_to_young.len();
 
         assert!(gc.writebarrier_before_copy(source.0, dest.0, 0, 0, 1));
 
-        assert_eq!(gc.remembered_set.len(), before);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), before);
     }
 
     /// The card arms: a source with cards and a destination without cannot be
@@ -14261,12 +14271,12 @@ cache size\t: 8192 kB\n";
         let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
         let array = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
         unsafe { (*header_of(array.0)).set_flag(flags::GCFLAG_CARDS_SET) };
-        let before = gc.remembered_set.len();
+        let before = gc.old_objects_pointing_to_young.len();
 
         gc.writebarrier_before_move(array.0);
 
-        assert_eq!(gc.remembered_set.len(), before + 1);
-        assert!(gc.remembered_set.contains(&array.0));
+        assert_eq!(gc.old_objects_pointing_to_young.len(), before + 1);
+        assert!(gc.old_objects_pointing_to_young.contains(&array.0));
     }
 
     /// An array with no card marked has nothing the move could invalidate.
@@ -14275,11 +14285,11 @@ cache size\t: 8192 kB\n";
         let mut gc = test_gc(4096);
         let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
         let array = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
-        let before = gc.remembered_set.len();
+        let before = gc.old_objects_pointing_to_young.len();
 
         gc.writebarrier_before_move(array.0);
 
-        assert_eq!(gc.remembered_set.len(), before);
+        assert_eq!(gc.old_objects_pointing_to_young.len(), before);
     }
 
     /// incminimark.py `move_out_of_nursery`: "called twice, it should return

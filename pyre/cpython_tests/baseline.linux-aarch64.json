@@ -3,7 +3,7 @@
   "modules": {
     "test.test_unittest": {
       "dynasm": "CRASH",
-      "reason": "GC bug, not a platform difference: invalid type_id at minor_custom_trace_target under minor_remembered_set, aborting through pyre_jit::call_jit::bh_call_fn mid-run. Passes when the driver is run directly, so it needs run.py's process shape to show up"
+      "reason": "GC bug, not a platform difference: invalid type_id at minor_custom_trace_target under minor_old_objects_pointing_to_young, aborting through pyre_jit::call_jit::bh_call_fn mid-run. Passes when the driver is run directly, so it needs run.py's process shape to show up"
     }
   },
   "stdlib_version": "3.14.6"

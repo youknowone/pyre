@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn target_token_minor_scan_follows_minimark_remembered_set_lifetime() {
+    fn target_token_minor_scan_follows_minimark_old_objects_pointing_to_young_lifetime() {
         let mut token = TargetToken::new_loop(1);
         assert!(token.take_minor_scan_pending());
         assert!(!token.take_minor_scan_pending());

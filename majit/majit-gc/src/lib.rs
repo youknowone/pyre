@@ -1369,7 +1369,7 @@ impl GcAllocator for GcHandle {
         // No root bracket: the barrier neither allocates nor collects, so
         // nothing inside it can move `obj`.  `do_write_barrier` /
         // `remember_young_pointer` (collector.rs) read headers, append to the
-        // host-allocated `remembered_set`, and clear a tid flag — which is why
+        // host-allocated `old_objects_pointing_to_young`, and clear a tid flag — which is why
         // upstream inlines the barrier at the store (framework.py:533-537) and
         // publishes no shadow-stack root anywhere in it.  Restore the bracket
         // if the remembered set ever becomes GC-managed.
