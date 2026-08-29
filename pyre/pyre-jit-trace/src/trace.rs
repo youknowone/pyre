@@ -2151,14 +2151,18 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
                 // The sub-walks above already applied each frame's eager stores
                 // and journaled them; hand those journals to the root walk so its
                 // epilogue settles them exactly once.
-                return full_body_walk_trace(
-                    ctx,
-                    sym,
-                    w_code,
-                    root_py_pc,
-                    cf_addr,
-                    WalkJournals::Keep,
-                );
+                let action =
+                    full_body_walk_trace(ctx, sym, w_code, root_py_pc, cf_addr, WalkJournals::Keep);
+                // That epilogue is not guaranteed to run: `full_body_walk_trace`
+                // has declines ahead of it and `run_perfn_walk` has its own
+                // early exits, none of which touch a journal. Whatever the root
+                // walk did not settle is the sub-walks' own unclaimed entries,
+                // and a discarded trace's guard replay needs them unwound.
+                // Sound unconditionally because both settles drain: after a
+                // committed or rolled-back epilogue every log is already empty
+                // and this is a no-op.
+                crate::jitcode_dispatch::fbw_store_journal_rollback();
+                return action;
             }
             crate::jitcode_dispatch::census_record("P2Drain::ResultSlotUnresolved");
         }
@@ -2267,6 +2271,10 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             // seed standing and leak it into a later unrelated walk. Clear
             // any residual seed so exactly this walk can observe it.
             let _ = crate::jitcode_dispatch::take_carrier_raise_seed();
+            // The same early decline leaves the journals this `Keep` handed
+            // over unsettled; drain them for the same reason. A no-op once
+            // the root walk's epilogue has run.
+            crate::jitcode_dispatch::fbw_store_journal_rollback();
             return action;
         }
     }

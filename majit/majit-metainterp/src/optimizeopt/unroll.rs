@@ -4456,17 +4456,32 @@ impl OptUnroll {
                 let num_short_jump_args = short_jump_args.len();
                 // unroll.py `_map_args(mapping, args)`: Const passes
                 // through unchanged, non-Const requires mapping.
-                let mapped_jump_args: Vec<OpRef> = short_jump_args
-                    .iter()
-                    .map(|jump_arg| {
-                        let mapped = if jump_arg.is_constant() {
-                            *jump_arg
-                        } else {
-                            *mapping.get(jump_arg).expect("mapping missing jump_arg")
+                // An unmapped non-Const arg is the same KeyError upstream's
+                // `_map_args` raises, and the other two sites in this function
+                // already answer it by declining to InvalidLoop rather than
+                // substituting the preamble's box. Answer it the same way here
+                // instead of aborting the process.
+                let mut mapped_jump_args: Vec<OpRef> = Vec::with_capacity(num_short_jump_args);
+                for jump_arg in short_jump_args.iter() {
+                    let mapped = if jump_arg.is_constant() {
+                        *jump_arg
+                    } else {
+                        let Some(&mapped) = mapping.get(jump_arg) else {
+                            if crate::optimizeopt::majit_log_enabled() {
+                                eprintln!(
+                                    "[jit] inline_short_preamble: unmapped short jump arg \
+                                     {jump_arg:?} in the force fix-point — InvalidLoop"
+                                );
+                            }
+                            ctx.signal_invalid_loop(
+                                "inline_short_preamble: unmapped jump arg in force fix-point",
+                            );
+                            return Vec::new();
                         };
-                        ctx.get_replacement_opref(mapped)
-                    })
-                    .collect();
+                        mapped
+                    };
+                    mapped_jump_args.push(ctx.get_replacement_opref(mapped));
+                }
                 // unroll.py:419-421
                 for &arg in args_no_virtuals.iter().chain(mapped_jump_args.iter()) {
                     let _ = optimizer.force_box(arg, ctx);
