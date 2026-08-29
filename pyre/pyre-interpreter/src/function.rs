@@ -2927,11 +2927,17 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "arg 3 (name) must be None or string",
         ));
     };
-    // `function.py Function.descr_function__new__` derives the closure
-    // contract from `PyCode.co_freevars`, then validates the tuple length and
-    // every `Cell` before allocating the function.  CPython 3.14's observable
-    // edge differs in two places: a tuple subclass is accepted and an empty
-    // tuple for a code object without free variables is accepted and retained.
+    // [3.14-spec] `function.py Function.descr_function__new__` derives the
+    // closure contract from `PyCode.co_freevars`, then refuses anything but an
+    // exact tuple (`TypeError("invalid closure")`) and refuses a closure at all
+    // for a code object with no free variables (`ValueError("no closure
+    // needed")`).  Measured on 3.14.2: `FunctionType(f.__code__, {}, None,
+    // None, ())` returns a function whose `__closure__` reads back as `()`, and
+    // a `tuple` subclass is accepted and read back as that subclass.  The two
+    // widenings only decide what may be stored once, at construction; the
+    // `closure?[*]` hint (function.py:34) governs rebinding the field and the
+    // immutability of the cells it holds, and every accepted element is still
+    // checked to be a `Cell` below.
     let nfreevars = unsafe { (&(*code_ptr).freevars).len() };
     let closure = if w_closure.is_null() || unsafe { pyre_object::is_none(w_closure) } {
         if nfreevars != 0 {

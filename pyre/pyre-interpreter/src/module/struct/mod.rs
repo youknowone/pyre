@@ -1647,9 +1647,13 @@ crate::py_module! {
             // [3.14-spec] PyPy's `W_Struct.typedef` installs the public
             // `make_weakref_descr(W_Struct)` descriptor, while CPython 3.14's
             // `_struct.Struct` accepts `weakref.ref()` through its native
-            // weak-list offset but exposes no `__weakref__` attribute.  Keep
-            // PyPy's object-owned lifeline and omit only that observable
-            // descriptor spelling.
+            // weak-list offset but exposes no `__weakref__` attribute.
+            // Measured on 3.14.2: `"__weakref__" in vars(_struct.Struct)` is
+            // False while `weakref.ref(_struct.Struct("i"))` succeeds; pypy3
+            // 7.3.20 reports True for the same membership test.  Keep PyPy's
+            // object-owned lifeline and omit only that observable descriptor
+            // spelling; `W_Struct` carries no JIT or immutability hint over
+            // the weakref lifeline.
             pyre_object::w_type_set_weakrefable(struct_type, true);
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 struct_dict,
