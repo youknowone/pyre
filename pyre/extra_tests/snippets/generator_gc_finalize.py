@@ -89,6 +89,40 @@ del gg
 gc.collect()
 assert log == ["sub"], log
 
+# A finalizer closing one yield-from chain must not recursively start the
+# queue drain for every other unreachable chain.  pathlib/glob keeps many of
+# these suspended at once while traversing deep wildcard patterns.
+log = []
+
+
+def chain_leaf(tag):
+    try:
+        yield tag
+    finally:
+        log.append((tag, 0))
+
+
+def chain_wrap(delegate, tag, depth):
+    try:
+        yield from delegate
+    finally:
+        log.append((tag, depth))
+
+
+chains = []
+chain_count = 40
+chain_depth = 30
+for tag in range(chain_count):
+    chain = chain_leaf(tag)
+    for depth in range(1, chain_depth + 1):
+        chain = chain_wrap(chain, tag, depth)
+    next(chain)
+    chains.append(chain)
+del chain
+del chains
+gc.collect()
+assert len(log) == chain_count * (chain_depth + 1), len(log)
+
 # a generator suspended outside any handler needs no cleanup
 log = []
 

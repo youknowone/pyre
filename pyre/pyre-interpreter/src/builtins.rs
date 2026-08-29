@@ -4384,7 +4384,19 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
 
     // app_io.py `_write_prompt`: `str(prompt)`, `stdout.write`, then an
-    // optional `stdout.flush`.
+    // optional `stdout.flush`.  Pyre's default `print()` fast path writes to
+    // the host seam while the Python object still denotes the same stdout;
+    // flush that alias as well before reading.  Without this structural
+    // adaptation, `print("ready"); input()` on a pipe leaves `ready` buffered
+    // where the parent cannot see it, although PyPy's single stream flushes it.
+    if let Ok(orig) = crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sys_slot),
+        "__stdout__",
+    ) && std::ptr::eq(orig, pyre_object::gc_roots::shadow_stack_get(stdout_slot))
+        && crate::module::_io::W_TextIOWrapper::stdio_native_print_errors(orig).is_some()
+    {
+        crate::host_seam::flush_stdout();
+    }
     let prompt_text = builtin_str(&[pyre_object::gc_roots::shadow_stack_get(prompt_slot)])?;
     let _ = pyre_object::gc_roots::pin_root(prompt_text);
     let prompt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -19700,41 +19712,33 @@ fn eintr_retry(e: std::io::Error) -> Result<(), crate::PyError> {
     eintr_retry_with(e, fd_io_err)
 }
 
-/// Read up to `n` bytes (or until EOF when `n` is `None`) from `fd`.
+/// PyPy `W_FileIO.direct_read`: perform one raw read of at most `n` bytes.
+///
+/// This must not fill the requested size.  A pipe may have one complete line
+/// available while its writer remains open; waiting for the rest of the
+/// buffer makes `TextIOWrapper.readline()` block after the newline it needs is
+/// already readable.
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
-fn fd_read(fd: i32, n: Option<usize>) -> Result<Option<Vec<u8>>, crate::PyError> {
-    let mut out = Vec::new();
-    let mut buf = [0u8; 65536];
+fn fd_read(fd: i32, n: usize) -> Result<Option<Vec<u8>>, crate::PyError> {
+    let mut out = vec![0u8; n];
     loop {
-        let want = match n {
-            Some(limit) => {
-                if out.len() >= limit {
-                    break;
-                }
-                (limit - out.len()).min(buf.len())
-            }
-            None => buf.len(),
-        };
-        let got = match fd_read_into(fd, &mut buf[..want]) {
+        let got = match fd_read_into(fd, &mut out) {
             Ok(got) => got,
             Err(err)
                 if err
                     .raw_os_error()
                     .is_some_and(|errno| errno == libc::EAGAIN || errno == libc::EWOULDBLOCK) =>
             {
-                return Ok((!out.is_empty()).then_some(out));
+                return Ok(None);
             }
             Err(err) => {
                 eintr_retry(err)?;
                 continue;
             }
         };
-        if got == 0 {
-            break;
-        }
-        out.extend_from_slice(&buf[..got]);
+        out.truncate(got);
+        return Ok(Some(out));
     }
-    Ok(Some(out))
 }
 
 #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
@@ -19857,7 +19861,7 @@ fn file_method_read(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
         #[cfg(all(feature = "host_env", not(target_arch = "wasm32")))]
         {
             return match n {
-                Some(n) => match fd_read(fd, Some(n))? {
+                Some(n) => match fd_read(fd, n)? {
                     Some(data) => fd_bytes_to_obj(args[0], data),
                     None => Ok(w_none()),
                 },

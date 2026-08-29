@@ -169,8 +169,15 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      - name: Set up PyPy for generated CFFI stdlib modules
+        id: pypy-stdlib
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "pypy3.11"
       - name: Stage the Pyre standard library
         shell: bash
+        env:
+          PYPY3: ${{ steps.pypy-stdlib.outputs.python-path }}
         run: python3 scripts/stage-stdlib.py dist-assets
       - name: Build artifacts
         run: |

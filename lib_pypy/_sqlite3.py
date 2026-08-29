@@ -31,6 +31,7 @@ import sys
 import threading
 import traceback
 import types
+import warnings
 import weakref
 import operator
 from collections import OrderedDict
@@ -213,10 +214,37 @@ exported_sqlite_symbols = [
     'SQLITE_WARNING_AUTOINDEX',
 ]
 
+exported_dbconfig_symbols = [
+    'SQLITE_DBCONFIG_ENABLE_FKEY',
+    'SQLITE_DBCONFIG_ENABLE_TRIGGER',
+    'SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER',
+    'SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION',
+    'SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE',
+    'SQLITE_DBCONFIG_ENABLE_QPSG',
+    'SQLITE_DBCONFIG_TRIGGER_EQP',
+    'SQLITE_DBCONFIG_RESET_DATABASE',
+    'SQLITE_DBCONFIG_DEFENSIVE',
+    'SQLITE_DBCONFIG_WRITABLE_SCHEMA',
+    'SQLITE_DBCONFIG_DQS_DDL',
+    'SQLITE_DBCONFIG_DQS_DML',
+    'SQLITE_DBCONFIG_LEGACY_ALTER_TABLE',
+    'SQLITE_DBCONFIG_ENABLE_VIEW',
+    'SQLITE_DBCONFIG_LEGACY_FILE_FORMAT',
+    'SQLITE_DBCONFIG_TRUSTED_SCHEMA',
+]
+
 
 for symbol in exported_sqlite_symbols:
     if hasattr(_lib, symbol): # some only exist on newer sqlite3 versions
         globals()[symbol] = getattr(_lib, symbol)
+for symbol in exported_dbconfig_symbols:
+    if hasattr(_lib, symbol):
+        globals()[symbol] = getattr(_lib, symbol)
+
+_INT_DBCONFIGS = {
+    globals()[symbol] for symbol in exported_dbconfig_symbols
+    if symbol in globals()
+}
 
 _SQLITE_TRANSIENT = _lib.SQLITE_TRANSIENT
 
@@ -275,6 +303,10 @@ version = "2.6.0"
 PARSE_COLNAMES = 1
 PARSE_DECLTYPES = 2
 
+# CPython 3.14 `module.c` exports this sentinel.  It is deliberately an int,
+# as in the C module, while transaction mechanics remain on PyPy's Connection.
+LEGACY_TRANSACTION_CONTROL = -1
+
 # SQLite version information
 sqlite_version = str(_ffi.string(_lib.sqlite3_libversion()).decode('ascii'))
 _sqlite_version_triple = tuple(int(x) for x in sqlite_version.split('.'))
@@ -332,16 +364,72 @@ for _cls in (Error, Warning, InterfaceError, DatabaseError, InternalError,
     _cls.__module__ = 'sqlite3'                                                                                                                                                                   
 del _cls
 
-def connect(database, timeout=5.0, detect_types=0, isolation_level="",
-                 check_same_thread=True, factory=None, cached_statements=100,
-                 uri=0):
+
+def _warn_deprecated_keywords(owner, names):
+    def decorate(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if any(name in kwargs for name in names):
+                plural = len(names) != 1
+                quoted = ("'" + names[0] + "'" if not plural else
+                          "'" + "', '".join(names[:-1]) +
+                          "' and '" + names[-1] + "'")
+                warnings.warn(
+                    "Passing keyword argument%s %s to %s() is deprecated. "
+                    "Parameter%s %s will become positional-only in Python "
+                    "3.15." % ("s" if plural else "", quoted, owner,
+                               "s" if plural else "", quoted),
+                    DeprecationWarning, stacklevel=2)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorate
+
+
+def connect(database, *args, **kwargs):
+    names = ("timeout", "detect_types", "isolation_level",
+             "check_same_thread", "factory", "cached_statements", "uri")
+    defaults = (5.0, 0, "", True, None, 100, 0)
+    if len(args) > len(names):
+        raise TypeError("connect() takes at most 8 positional arguments")
+    if args:
+        owner = ("_sqlite3.Connection" if len(args) >= 5
+                 else "sqlite3.connect")
+        warnings.warn(
+            "Passing more than 1 positional argument to %s() is deprecated. "
+            "Parameters 'timeout', 'detect_types', 'isolation_level', "
+            "'check_same_thread', 'factory', 'cached_statements' and 'uri' "
+            "will become keyword-only parameters in Python 3.15." % owner,
+            DeprecationWarning,
+            # The custom-Connection case is reached through the test/support
+            # factory relay, matching CPython's hidden vectorcall frame.
+            stacklevel=3 if owner == "_sqlite3.Connection" else 2)
+    values = dict(zip(names, defaults))
+    for name, value in zip(names, args):
+        if name in kwargs:
+            raise TypeError("connect() got multiple values for argument '%s'" % name)
+        values[name] = value
+    autocommit = kwargs.pop("autocommit", LEGACY_TRANSACTION_CONTROL)
+    for name in names:
+        if name in kwargs:
+            values[name] = kwargs.pop(name)
+    if kwargs:
+        name = next(iter(kwargs))
+        raise TypeError("connect() got an unexpected keyword argument '%s'" % name)
+    timeout = values["timeout"]
+    detect_types = values["detect_types"]
+    isolation_level = values["isolation_level"]
+    check_same_thread = values["check_same_thread"]
+    factory = values["factory"]
+    cached_statements = values["cached_statements"]
+    uri = values["uri"]
     factory = Connection if not factory else factory
     # an sqlite3 db seems to be around 100 KiB at least (doesn't matter if
     # backed by :memory: or a file)
     res = factory(database=database, timeout=timeout,
                   detect_types=detect_types, isolation_level=isolation_level,
                   check_same_thread=check_same_thread, factory=factory,
-                  cached_statements=cached_statements, uri=uri)
+                  cached_statements=cached_statements, uri=uri,
+                  autocommit=autocommit)
     add_memory_pressure(100 * 1024)
     return res
 
@@ -379,7 +467,13 @@ class Connection(object):
     _db = None
 
     def __init__(self, database, timeout=5.0, detect_types=0, isolation_level="",
-                 check_same_thread=True, factory=None, cached_statements=100, uri=0):
+                 check_same_thread=True, factory=None, cached_statements=100,
+                 uri=0, *, autocommit=LEGACY_TRANSACTION_CONTROL):
+        if (autocommit is not True and autocommit is not False and
+                autocommit != LEGACY_TRANSACTION_CONTROL):
+            raise ValueError(
+                "autocommit must be True, False, or "
+                "sqlite3.LEGACY_TRANSACTION_CONTROL")
         sys.audit("sqlite3.connect", database)
         self.__initialized = False
         db_star = _ffi.new('sqlite3 **')
@@ -408,6 +502,7 @@ class Connection(object):
         self.text_factory = _unicode_text_factory
 
         self._detect_types = detect_types
+        self._autocommit = autocommit
         self.isolation_level = isolation_level
 
         self.__cursors = set()
@@ -441,15 +536,25 @@ class Connection(object):
         self.DataError = DataError
         self.NotSupportedError = NotSupportedError
         sys.audit("sqlite3.connect/handle", self)
+        # CPython 3.14 `pysqlite_connection_init_impl`: disabled autocommit
+        # starts and thereafter continuously maintains an explicit transaction.
+        if self._autocommit is False:
+            self._begin()
 
     def __del__(self):
         if self._db:
+            # CPython 3.14 `connection_finalize` reports an unclosed database.
+            warnings.warn("unclosed database in %r" % self,
+                          ResourceWarning, stacklevel=1)
             _lib.sqlite3_close(self._db)
 
     def close(self):
         if not self.__initialized:
             raise ProgrammingError("Base Connection.__init__ not called.")
         self._check_thread()
+
+        if self._db and self._autocommit is False and self.in_transaction:
+            self._exec_transaction(b"ROLLBACK")
 
         self.__do_all_statements(Statement._finalize, True)
 
@@ -597,7 +702,7 @@ class Connection(object):
 
     @_check_thread_wrap
     @_check_closed_wrap
-    def __call__(self, sql):
+    def __call__(self, sql, /):
         return self._statement_cache.get(sql)
 
     def _default_cursor_factory(self):
@@ -626,14 +731,17 @@ class Connection(object):
         cur = self.cursor()
         return cur.executescript(*args)
 
-    def iterdump(self):
+    def iterdump(self, *, filter=None):
         from sqlite3.dump import _iterdump
         self._check_closed()
-        return _iterdump(self)
+        return _iterdump(self, filter=filter)
 
     def _begin(self):
+        self._exec_transaction(self._begin_statement or b"BEGIN")
+
+    def _exec_transaction(self, statement):
         statement_star = _ffi.new('sqlite3_stmt **')
-        ret = _lib.sqlite3_prepare_v2(self._db, self._begin_statement, -1,
+        ret = _lib.sqlite3_prepare_v2(self._db, statement, -1,
                                       statement_star, _ffi.NULL)
         try:
             if ret != _lib.SQLITE_OK:
@@ -647,7 +755,11 @@ class Connection(object):
     def commit(self):
         self._check_thread()
         self._check_closed()
+        if self._autocommit is True:
+            return
         if not self.in_transaction:
+            if self._autocommit is False:
+                self._exec_transaction(b"BEGIN")
             return
 
         # PyPy fix for non-refcounting semantics: since 2.7.13 (and in
@@ -674,11 +786,17 @@ class Connection(object):
                 raise self._get_exception(ret)
         finally:
             _lib.sqlite3_finalize(statement_star[0])
+        if self._autocommit is False:
+            self._exec_transaction(b"BEGIN")
 
     def rollback(self):
         self._check_thread()
         self._check_closed()
+        if self._autocommit is True:
+            return
         if not self.in_transaction:
+            if self._autocommit is False:
+                self._exec_transaction(b"BEGIN")
             return
 
         statement_star = _ffi.new('sqlite3_stmt **')
@@ -692,6 +810,8 @@ class Connection(object):
                 raise self._get_exception(ret)
         finally:
             _lib.sqlite3_finalize(statement_star[0])
+        if self._autocommit is False:
+            self._exec_transaction(b"BEGIN")
 
     def __enter__(self):
         return self
@@ -702,9 +822,15 @@ class Connection(object):
         else:
             self.rollback()
 
+    @_warn_deprecated_keywords(
+        "_sqlite3.Connection.create_function", ("name", "narg", "func"))
     @_check_thread_wrap
     @_check_closed_wrap
-    def create_function(self, name, nargs, func, *, deterministic=False):
+    def create_function(self, name, narg, func, *, deterministic=False):
+        limit = _lib.sqlite3_limit(self._db, SQLITE_LIMIT_FUNCTION_ARG, -1)
+        if not -1 <= narg <= limit:
+            raise ProgrammingError(
+                "'narg' must be between -1 and %d, not %d" % (limit, narg))
         try:
             closure = self.__func_cache[func]
         except KeyError:
@@ -726,15 +852,23 @@ class Connection(object):
                 raise NotSupportedError(
                         "deterministic=True requires SQLite 3.8.3 or higher")
             flags |= _lib.SQLITE_DETERMINISTIC
-        ret = _lib.sqlite3_create_function(self._db, name, nargs,
+        ret = _lib.sqlite3_create_function(self._db, name, narg,
                                            flags, _ffi.NULL,
                                            closure, _ffi.NULL, _ffi.NULL)
         if ret != _lib.SQLITE_OK:
             raise self.OperationalError("Error creating function")
 
+    @_warn_deprecated_keywords(
+        "_sqlite3.Connection.create_aggregate",
+        ("name", "n_arg", "aggregate_class"))
     @_check_thread_wrap
     @_check_closed_wrap
-    def create_aggregate(self, name, num_args, cls):
+    def create_aggregate(self, name, n_arg, aggregate_class):
+        limit = _lib.sqlite3_limit(self._db, SQLITE_LIMIT_FUNCTION_ARG, -1)
+        if not -1 <= n_arg <= limit:
+            raise ProgrammingError(
+                "'n_arg' must be between -1 and %d, not %d" % (limit, n_arg))
+        cls = aggregate_class
         try:
             step_callback, final_callback = self.__aggregates[cls]
         except KeyError:
@@ -744,7 +878,7 @@ class Connection(object):
 
         if isinstance(name, unicode):
             name = name.encode('utf-8')
-        ret = _lib.sqlite3_create_function(self._db, name, num_args,
+        ret = _lib.sqlite3_create_function(self._db, name, n_arg,
                                            _lib.SQLITE_UTF8, _ffi.NULL,
                                            _ffi.NULL,
                                            step_callback,
@@ -857,10 +991,13 @@ class Connection(object):
         if ret != _lib.SQLITE_OK:
             raise self._get_exception(ret)
 
+    @_warn_deprecated_keywords(
+        "_sqlite3.Connection.set_authorizer", ("authorizer_callback",))
     @_check_thread_wrap
     @_check_closed_wrap
-    def set_authorizer(self, callback):
+    def set_authorizer(self, authorizer_callback):
         """ Sets authorizer callback. """
+        callback = authorizer_callback
         try:
             authorizer = self.__func_cache[callback]
         except KeyError:
@@ -886,9 +1023,12 @@ class Connection(object):
         if ret != _lib.SQLITE_OK:
             raise self._get_exception(ret)
 
+    @_warn_deprecated_keywords(
+        "_sqlite3.Connection.set_progress_handler", ("progress_handler",))
     @_check_thread_wrap
     @_check_closed_wrap
-    def set_progress_handler(self, callable, n):
+    def set_progress_handler(self, progress_handler, n):
+        callable = progress_handler
         if callable is None:
             progress_handler = _ffi.NULL
         else:
@@ -907,9 +1047,12 @@ class Connection(object):
         _lib.sqlite3_progress_handler(self._db, n, progress_handler,
                                       _ffi.NULL)
 
+    @_warn_deprecated_keywords(
+        "_sqlite3.Connection.set_trace_callback", ("trace_callback",))
     @_check_thread_wrap
     @_check_closed_wrap
-    def set_trace_callback(self, callable):
+    def set_trace_callback(self, trace_callback):
+        callable = trace_callback
         if callable is None:
             trace_callback = _ffi.NULL
         else:
@@ -960,14 +1103,54 @@ class Connection(object):
             self._begin_statement = None
         else:
             if not isinstance(val, str):
-                raise TypeError("isolation level must be " \
-                        "a string or None, not %s" % type(val).__name__)
+                raise TypeError("isolation_level must be str or None")
             stmt = str("BEGIN " + val).upper()
             if stmt not in BEGIN_STATMENTS:
                 raise ValueError("isolation_level string must be '', 'DEFERRED', 'IMMEDIATE', or 'EXCLUSIVE'")
             self._begin_statement = stmt.encode('utf-8')
         self._isolation_level = val
     isolation_level = property(__get_isolation_level, __set_isolation_level)
+
+    def __get_autocommit(self):
+        if self._autocommit is True:
+            return True
+        if self._autocommit is False:
+            return False
+        return LEGACY_TRANSACTION_CONTROL
+
+    def __set_autocommit(self, value):
+        if (value is not True and value is not False and
+                value != LEGACY_TRANSACTION_CONTROL):
+            raise ValueError(
+                "autocommit must be True, False, or "
+                "sqlite3.LEGACY_TRANSACTION_CONTROL")
+        self._check_thread()
+        self._check_closed()
+        self._autocommit = value
+        # CPython 3.14 `set_autocommit`: enabling commits a live transaction;
+        # disabling begins one only when SQLite is currently in autocommit.
+        if value is True and self.in_transaction:
+            self._exec_transaction(b"COMMIT")
+        elif value is False and not self.in_transaction:
+            self._exec_transaction(b"BEGIN")
+
+    autocommit = property(__get_autocommit, __set_autocommit)
+
+    def __get_row_factory(self):
+        return self._row_factory
+
+    def __set_row_factory(self, value):
+        self._row_factory = value
+
+    row_factory = property(__get_row_factory, __set_row_factory)
+
+    def __get_text_factory(self):
+        return self._text_factory
+
+    def __set_text_factory(self, value):
+        self._text_factory = value
+
+    text_factory = property(__get_text_factory, __set_text_factory)
 
     if hasattr(_lib, 'sqlite3_enable_load_extension'):
         @_check_thread_wrap
@@ -1059,6 +1242,30 @@ class Connection(object):
 
     @_check_thread_wrap
     @_check_closed_wrap
+    def setconfig(self, op, enable=True, /):
+        if op not in _INT_DBCONFIGS:
+            raise ValueError("unknown config 'op': %d" % op)
+        current = _ffi.new('int *')
+        rc = _lib.pypy_sqlite3_db_config_int(
+            self._db, op, bool(enable), current)
+        if rc != _lib.SQLITE_OK:
+            raise self._get_exception(rc)
+        if bool(enable) != bool(current[0]):
+            raise OperationalError("Unable to set config")
+
+    @_check_thread_wrap
+    @_check_closed_wrap
+    def getconfig(self, op, /):
+        if op not in _INT_DBCONFIGS:
+            raise ValueError("unknown config 'op': %d" % op)
+        current = _ffi.new('int *')
+        rc = _lib.pypy_sqlite3_db_config_int(self._db, op, -1, current)
+        if rc != _lib.SQLITE_OK:
+            raise self._get_exception(rc)
+        return bool(current[0])
+
+    @_check_thread_wrap
+    @_check_closed_wrap
     def create_window_function(self, name, num_params, aggregate_class):
         """
             name: str
@@ -1072,6 +1279,11 @@ class Connection(object):
 
         Creates or redefines an aggregate window function. Non-standard.
         """
+        limit = _lib.sqlite3_limit(self._db, SQLITE_LIMIT_FUNCTION_ARG, -1)
+        if not -1 <= num_params <= limit:
+            raise ProgrammingError(
+                "'num_params' must be between -1 and %d, not %d" %
+                (limit, num_params))
         try:
             (step_callback, final_callback,
                 value_callback, inverse_callback) = self.__windows[aggregate_class]
@@ -1447,7 +1659,9 @@ class Cursor(object):
                 self.__statement._reset(self.__in_use_token)
             self.__statement = self.__connection._statement_cache.get(sql)
 
-            if self.__connection._begin_statement and self.__statement._is_dml:
+            if (self.__connection._autocommit == LEGACY_TRANSACTION_CONTROL and
+                    self.__connection._begin_statement and
+                    self.__statement._is_dml):
                 if _lib.sqlite3_get_autocommit(self.__connection._db):
                     self.__connection._begin()
 
@@ -1517,7 +1731,8 @@ class Cursor(object):
         statement_star = _ffi.new('sqlite3_stmt **')
         next_char = _ffi.new('char **')
 
-        self.__connection.commit()
+        if self.__connection._autocommit == LEGACY_TRANSACTION_CONTROL:
+            self.__connection.commit()
         while True:
             c_sql = _ffi.new("char[]", sql)
             rc = _lib.sqlite3_prepare(self.__connection._db, c_sql, -1,
@@ -1588,6 +1803,14 @@ class Cursor(object):
     def fetchmany(self, size=None):
         if size is None:
             size = self.arraysize
+        else:
+            size = operator.index(size)
+            if size < 0:
+                raise ValueError("fetchmany(): size parameter cannot be negative")
+            if size > (1 << 32) - 1:
+                raise OverflowError("Python int too large to convert to C unsigned int")
+        if size == 0:
+            return []
         lst = []
         for row in self:
             lst.append(row)
@@ -1597,6 +1820,19 @@ class Cursor(object):
 
     def fetchall(self):
         return list(self)
+
+    def __get_arraysize(self):
+        return self._arraysize
+
+    def __set_arraysize(self, value):
+        value = operator.index(value)
+        if value < 0:
+            raise ValueError("arraysize must be non-negative")
+        if value > (1 << 32) - 1:
+            raise OverflowError("Python int too large to convert to C unsigned int")
+        self._arraysize = value
+
+    arraysize = property(__get_arraysize, __set_arraysize)
 
     def __get_connection(self):
         self.__check_cursor()
@@ -1772,6 +2008,18 @@ class Statement(object):
                                        "there are %d supplied." %
                                        (num_params_needed, num_params))
             for i in range(num_params):
+                param_name = _lib.sqlite3_bind_parameter_name(
+                    self._statement, i + 1)
+                if param_name:
+                    param_name = _ffi.string(param_name)
+                    # CPython 3.14 `bind_parameters`: numbered `?1` remains a
+                    # sequence binding; `:name`, `@name`, and `$name` do not.
+                    if not param_name.startswith(b'?'):
+                        raise ProgrammingError(
+                            "Binding %d ('%s') is a named parameter, but you "
+                            "supplied a sequence which requires nameless "
+                            "(qmark) placeholders." %
+                            (i + 1, param_name.decode('utf-8')))
                 rc = self.__set_param(i + 1, params[i])
                 if rc is _UNSUPPORTED_TYPE:
                     raise ProgrammingError("Error binding parameter %d - "
@@ -1819,6 +2067,8 @@ class Row(object):
         elif isinstance(item, slice):
             return self.values[item]
         elif isinstance(item, str):
+            if self.description is None:
+                raise IndexError("No item with that key: %s" % item)
             for idx, desc in enumerate(self.description):
                 # but to bug compatibility: CPython does case folding only for
                 # ascii chars
@@ -1832,6 +2082,8 @@ class Row(object):
         raise IndexError(f"index must be int or string, not '{type(item).__name__}'")
 
     def keys(self):
+        if self.description is None:
+            return []
         return [desc[0] for desc in self.description]
 
     def __eq__(self, other):
@@ -1979,7 +2231,10 @@ class Blob(object):
                 raise self.__connection._get_exception(rc)
             return _ffi.buffer(raw_buffer, readlen)[::stride]
         else:
-            offset = operator.index(item)
+            try:
+                offset = operator.index(item)
+            except TypeError:
+                raise TypeError("Blob indices must be integers") from None
             if offset < 0:
                 offset += blob_len
             if not 0 <= offset < blob_len:
@@ -1998,6 +2253,8 @@ class Blob(object):
         if isinstance(item, slice):
             start, stop, stride = item.indices(blob_len)
             length = len(range(start, stop, stride))
+            if isinstance(value, memoryview) and not value.c_contiguous:
+                raise BufferError("memoryview: underlying buffer is not C-contiguous")
             if length != len(value):
                 raise IndexError("Blob slice assignment is wrong size")
             if stride == 1:
@@ -2021,7 +2278,10 @@ class Blob(object):
                 if rc != _lib.SQLITE_OK:
                     raise self.__connection._get_exception(rc)
         else:
-            offset = operator.index(item)
+            try:
+                offset = operator.index(item)
+            except TypeError:
+                raise TypeError("Blob indices must be integers") from None
             value = operator.index(value)
             if offset < 0:
                 offset += blob_len
@@ -2034,6 +2294,9 @@ class Blob(object):
             rc = _lib.sqlite3_blob_write(self.__blob, data, len(data), offset)
             if rc != _lib.SQLITE_OK:
                 raise self.__connection._get_exception(rc)
+
+    def __delitem__(self, item):
+        raise TypeError("'_sqlite3.Blob' object doesn't support item deletion")
 
 
     def __iter__(self):
@@ -2147,7 +2410,11 @@ def print_or_clear_traceback(ctx, exc):
     if _enable_callback_tracebacks[0]:
         import __pypy__
         try:
-            __pypy__.write_unraisable('in sqlite3 callback', exc, ctx)
+            # CPython 3.14 `print_or_clear_traceback` includes the callable in
+            # the unraisable context.  PyPy's hook accepts that context as a
+            # string rather than formatting it inside the C error API.
+            __pypy__.write_unraisable(
+                'on sqlite3 callback %r' % (ctx,), exc, ctx)
         except Exception as e:
             # Should never happen
             print(e, file=sys.stderr)
@@ -2274,4 +2541,3 @@ def enable_callback_tracebacks(enable, /):
 register_adapters_and_converters()
 
 threadsafety = [0, 3, 1][_lib.sqlite3_threadsafe()]
-

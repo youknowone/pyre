@@ -411,6 +411,13 @@ fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)
     Ok(None)
 }
 
+/// PyPy `cpyext.api.load_extension_module` looks for the generated CFFI entry
+/// point before either cpyext protocol.
+fn lookup_cffi_init(handle: usize, name: &str) -> Option<usize> {
+    let basename = name.rsplit('.').next().unwrap_or(name);
+    lookup_init_address(handle, &format!("_cffi_pypyinit_{basename}"))
+}
+
 /// What the lookup reports when neither entry point is there.
 fn missing_init_error(name: &str, path: &Path) -> crate::PyError {
     let symbol = match init_basename(name) {
@@ -468,7 +475,7 @@ pub fn load_extension_module(
     // the one library owned by `EXTENSIONS`, so resolve PyPy's cache before
     // opening on this host abstraction.
     if let Some(handle) = cached_extension_handle(path) {
-        if lookup_init(handle, name)?.is_none() {
+        if lookup_cffi_init(handle, name).is_none() && lookup_init(handle, name)?.is_none() {
             return Err(missing_init_error(name, path));
         }
         if let Some(module) = cached_extension(name, path) {
@@ -508,7 +515,14 @@ pub fn load_extension_module(
     // live.  Their types' `tp_traverse` is then a pointer into text nobody has
     // mapped, which the next minor collection walks.  Upstream keeps the
     // library on both of these failures.
+    let cffi_address = lookup_cffi_init(handle, name);
     let found = lookup_init(handle, name)?;
+    if let Some(address) = cffi_address {
+        let module =
+            crate::module::_cffi_backend::cffi1_module::load_cffi1_module(name, path, address)?;
+        fixup_extension(module, name, path, handle);
+        return Ok(module);
+    }
     let Some((protocol, address)) = found else {
         return Err(missing_init_error(name, path));
     };

@@ -320,6 +320,10 @@ int sqlite3_complete(const char *sql);
 
 int sqlite3_limit(sqlite3*, int, int);
 
+/* sqlite3_db_config() is variadic.  Keep the CFFI boundary typed for the
+ * integer configuration family exposed by CPython 3.14. */
+int pypy_sqlite3_db_config_int(sqlite3*, int, int, int*);
+
 void *sqlite3_malloc(int);
 void *sqlite3_malloc64(sqlite3_uint64);
 void sqlite3_free(void*);
@@ -408,6 +412,40 @@ int sqlite3_backup_pagecount(sqlite3_backup *p);
 """)
 
 SQLITE3_VERSION = _get_version()
+
+_ffi.cdef("""
+#define SQLITE_DBCONFIG_ENABLE_FKEY ...
+#define SQLITE_DBCONFIG_ENABLE_TRIGGER ...
+#define SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER ...
+#define SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION ...
+""")
+
+if SQLITE3_VERSION >= 3016000:
+    _ffi.cdef("#define SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE ...")
+if SQLITE3_VERSION >= 3020000:
+    _ffi.cdef("#define SQLITE_DBCONFIG_ENABLE_QPSG ...")
+if SQLITE3_VERSION >= 3022000:
+    _ffi.cdef("#define SQLITE_DBCONFIG_TRIGGER_EQP ...")
+if SQLITE3_VERSION >= 3024000:
+    _ffi.cdef("#define SQLITE_DBCONFIG_RESET_DATABASE ...")
+if SQLITE3_VERSION >= 3026000:
+    _ffi.cdef("#define SQLITE_DBCONFIG_DEFENSIVE ...")
+if SQLITE3_VERSION >= 3028000:
+    _ffi.cdef("#define SQLITE_DBCONFIG_WRITABLE_SCHEMA ...")
+if SQLITE3_VERSION >= 3029000:
+    _ffi.cdef("""
+#define SQLITE_DBCONFIG_DQS_DDL ...
+#define SQLITE_DBCONFIG_DQS_DML ...
+#define SQLITE_DBCONFIG_LEGACY_ALTER_TABLE ...
+""")
+if SQLITE3_VERSION >= 3030000:
+    _ffi.cdef("#define SQLITE_DBCONFIG_ENABLE_VIEW ...")
+if SQLITE3_VERSION >= 3031000:
+    _ffi.cdef("""
+#define SQLITE_DBCONFIG_LEGACY_FILE_FORMAT ...
+#define SQLITE_DBCONFIG_TRUSTED_SCHEMA ...
+""")
+
 if SQLITE3_VERSION >= 3008003:
     _ffi.cdef("""
         #define SQLITE_DETERMINISTIC ...
@@ -558,6 +596,11 @@ else:
 
 SOURCE = """
 #include <sqlite3.h>
+
+int pypy_sqlite3_db_config_int(sqlite3 *db, int op, int value, int *current)
+{
+    return sqlite3_db_config(db, op, value, current);
+}
 
 #ifndef SQLITE_OPEN_URI
 static const long SQLITE_OPEN_URI = 0;

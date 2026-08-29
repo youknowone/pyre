@@ -19145,13 +19145,15 @@ fn generator_throw_impl(args: &[PyObjectRef], warn_legacy_signature: bool) -> Py
     )
 }
 
-/// PyPy: GeneratorIterator.descr_close()
-pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
-    let gen_obj = if args.is_empty() {
-        pyre_object::PY_NULL
-    } else {
-        args[0]
-    };
+/// PyPy: GeneratorIterator.descr_close().
+///
+/// `prompt_finalizers` is true only at the explicit app-level `close()`
+/// boundary.  `GeneratorOrCoroutine._finalize_` also delegates to
+/// `descr_close` in PyPy, but it is already running inside UserDelAction's
+/// queue drain; starting another reachability pass and drain there recursively
+/// enters the finalizer queue once per unreachable generator chain.  Let the
+/// outer PyPy-shaped queue loop own that case.
+fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResult {
     unsafe {
         use pyre_object::generator::*;
         if w_generator_is_exhausted(gen_obj) {
@@ -19163,7 +19165,9 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
                 w_generator_set_exhausted(gen_obj);
             } else {
                 generator_frame_is_finished(gen_obj, &mut *frame_ptr);
-                generator_close_finalizer_boundary();
+                if prompt_finalizers {
+                    generator_close_finalizer_boundary();
+                }
             }
             return Ok(w_none());
         }
@@ -19189,7 +19193,9 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // unlike a Python handler, no PUSH_EXC_INFO will clear the
             // temporary propagation root for us.
             crate::eval::set_in_flight_exception(PY_NULL);
-            generator_close_finalizer_boundary();
+            if prompt_finalizers {
+                generator_close_finalizer_boundary();
+            }
             value
         }
         Err(e) if e.kind == PyErrorKind::GeneratorExit => {
@@ -19197,11 +19203,18 @@ pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
             // GeneratorExit after matching it.  Mirror PUSH_EXC_INFO's
             // ownership transfer by ending pyre's propagation root here.
             crate::eval::set_in_flight_exception(PY_NULL);
-            generator_close_finalizer_boundary();
+            if prompt_finalizers {
+                generator_close_finalizer_boundary();
+            }
             Ok(w_none())
         }
         Err(e) => Err(e),
     }
+}
+
+pub(crate) fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
+    let gen_obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    generator_close_impl(gen_obj, true)
 }
 
 /// PyPy `Coroutine.descr__await__`: return a distinct iterator wrapper rather
@@ -19847,7 +19860,7 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
                     };
                 }
             }
-            return generator_close_method(&[gen_obj]);
+            return generator_close_impl(gen_obj, false);
         }
     }
     Ok(w_none())

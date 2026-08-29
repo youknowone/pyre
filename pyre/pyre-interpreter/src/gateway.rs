@@ -1888,10 +1888,12 @@ pub fn os_string_from_fs_bytes(data: &[u8]) -> std::ffi::OsString {
 /// object travel together. For `os.PathLike`, `w_path` is the result of the
 /// single `__fspath__` call, not the wrapper that supplied it.
 pub struct FsEncodedPath {
-    /// `Path.as_fd`, `-1` where the argument named a path rather than an open
-    /// descriptor. Only the entry points that pass `allow_fd` can set it, so a
-    /// caller that took a path-only boundary never has to test it.
+    /// `Path.as_fd`.  PyPy uses `-1` as the path sentinel, but CPython 3.14
+    /// exposes `-1` itself as a descriptor at every path-or-fd boundary.  Keep
+    /// the upstream field and carry its discriminant separately so the public
+    /// fd value is not conflated with the implementation sentinel.
     pub as_fd: i32,
+    pub is_fd: bool,
     pub as_bytes: Vec<u8>,
     w_path_slot: usize,
     _roots: pyre_object::gc_roots::RootScope,
@@ -2011,14 +2013,14 @@ fn path_or_fd_w(
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let obj = pyre_object::gc_roots::pin_root(obj);
-    let (data, w_path_slot, as_fd) = unsafe {
+    let (data, w_path_slot, as_fd, is_fd) = unsafe {
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         if nullable && pyre_object::is_none(obj) {
             // `_unwrap_path` answers the omitted argument itself, with the
             // directory it stands for (`interp_posix.py` `Path(-1, '.',
             // None, w_None)`), so no boundary has to spell that default again.
             // `None` is not bytes-like, so the names still come back as `str`.
-            (b".".to_vec(), obj_slot, -1)
+            (b".".to_vec(), obj_slot, -1, false)
         } else if pyre_object::bytesobject::is_bytes(obj) {
             // Only `bytes` itself. `_unwrap_path`'s buffer arm
             // (`interp_posix.py:188-198`) takes any readable buffer and reports
@@ -2029,9 +2031,10 @@ fn path_or_fd_w(
                 fs_arg_bytes(pyre_object::bytesobject::w_bytes_data(obj).to_vec())?,
                 obj_slot,
                 -1,
+                false,
             )
         } else if pyre_object::is_str(obj) {
-            (fsencode(obj)?, obj_slot, -1)
+            (fsencode(obj)?, obj_slot, -1, false)
         } else if allow_fd
             && (pyre_object::pyobject::is_int_or_long(obj)
                 || crate::baseobjspace::lookup(obj, "__index__").is_some())
@@ -2062,13 +2065,12 @@ fn path_or_fd_w(
             // `__fspath__` arm reads it after its call.
             let fd =
                 crate::baseobjspace::c_int_w(pyre_object::gc_roots::shadow_stack_get(obj_slot))?;
-            // interp_posix.py `unwrap_fd` — `-1` is the sentinel for
-            // "not a descriptor", so a caller naming it has to be turned away
-            // here rather than silently read as a path.
-            if fd == -1 {
-                return Err(crate::PyError::os_error("invalid file descriptor: -1"));
-            }
-            (Vec::new(), obj_slot, fd)
+            // [3.14-spec] PyPy `Path.as_fd` reserves -1 as the path sentinel.
+            // CPython 3.14's `path_converter` instead passes every integer,
+            // including -1, to the fd syscall and exposes its EBADF.  The
+            // separate `is_fd` discriminant preserves PyPy's storage shape
+            // without losing that observable descriptor value.
+            (Vec::new(), obj_slot, fd, true)
         } else {
             let Some(fspath_descr) = crate::typedef::r#type(obj)
                 .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
@@ -2110,9 +2112,10 @@ fn path_or_fd_w(
                     fs_arg_bytes(pyre_object::bytesobject::w_bytes_data(result).to_vec())?,
                     result_slot,
                     -1,
+                    false,
                 )
             } else if pyre_object::is_str(result) {
-                (fsencode(result)?, result_slot, -1)
+                (fsencode(result)?, result_slot, -1, false)
             } else {
                 // interp_posix.py:3053-3058 names both the object that was asked
                 // and the type its `__fspath__` answered with.
@@ -2133,7 +2136,7 @@ fn path_or_fd_w(
     // as `dst`. A boundary converting on nobody's behalf has neither to give
     // and reports the character alone, the way `PyUnicode_FSConverter` does
     // for the builtin `open`.
-    if as_fd == -1 && !nonstrict && data.contains(&0) {
+    if !is_fd && !nonstrict && data.contains(&0) {
         let text = match caller {
             Some((name, arg)) => format!("{name}: embedded null character in {arg}"),
             None => "embedded null byte".to_string(),
@@ -2149,6 +2152,7 @@ fn path_or_fd_w(
     fsdecode_filename_checked(&data)?;
     Ok(FsEncodedPath {
         as_fd,
+        is_fd,
         as_bytes: data,
         w_path_slot,
         _roots: roots,

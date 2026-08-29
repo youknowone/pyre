@@ -3006,6 +3006,12 @@ pub struct TlsConnection {
     /// `process_new_packets`, but only a call that consumed fresh
     /// ciphertext reaches it, so the latch is kept here too.
     peer_sent_fatal_alert: bool,
+    /// OpenSSL's `SSL_RECEIVED_SHUTDOWN` is sticky for the lifetime of the
+    /// connection.  rustls reports `peer_has_closed()` on the `IoState`
+    /// returned while the close_notify record is processed; a later
+    /// `process_new_packets()` call need not report that historical event.
+    /// Keep the state on the connection, where OpenSSL/PyPy keep it.
+    peer_sent_close_notify: bool,
 }
 
 impl TlsConnection {
@@ -3113,9 +3119,12 @@ impl TlsConnection {
                 Err(error) => return Err(rustls_error(error)),
             };
             self.pending_received_tls_start += read;
-            if let Err(error) = inner.process_new_packets() {
-                self.peer_sent_fatal_alert |= matches!(error, rustls::Error::AlertReceived(_));
-                return Err(rustls_protocol_error(error));
+            match inner.process_new_packets() {
+                Ok(state) => self.peer_sent_close_notify |= state.peer_has_closed(),
+                Err(error) => {
+                    self.peer_sent_fatal_alert |= matches!(error, rustls::Error::AlertReceived(_));
+                    return Err(rustls_protocol_error(error));
+                }
             }
             self.note_server_resumption();
             self.compact_received_tls();
@@ -3345,6 +3354,7 @@ pub unsafe fn connection_new(
         server_context: std::ptr::null(),
         server_hit_counted: false,
         peer_sent_fatal_alert: false,
+        peer_sent_close_notify: false,
     })))
 }
 
@@ -3627,7 +3637,10 @@ pub unsafe fn connection_read_plain(
         // A clean close_notify is EOF at the Python stream layer. CPython's
         // SSL_read wrapper returns b"" here; SSLZeroReturnError is reserved
         // for lower-level error reporting paths, not ordinary recv().
-        Ok(0) => Ok(Vec::new()),
+        Ok(0) => {
+            connection.peer_sent_close_notify = true;
+            Ok(Vec::new())
+        }
         Ok(read) => {
             output.truncate(read);
             Ok(output)
@@ -3679,10 +3692,17 @@ pub unsafe fn connection_pending_plaintext(connection: *mut TlsConnection) -> us
 /// `connection` must point to a live connection.
 #[inline(never)]
 pub unsafe fn connection_peer_closed(connection: *mut TlsConnection) -> bool {
-    unsafe { (&mut *connection).inner.as_mut() }
+    let connection = unsafe { &mut *connection };
+    if connection.peer_sent_close_notify {
+        return true;
+    }
+    let closed = connection
+        .inner
+        .as_mut()
         .and_then(|inner| inner.process_new_packets().ok())
-        .map(|state| state.peer_has_closed())
-        .unwrap_or(false)
+        .is_some_and(|state| state.peer_has_closed());
+    connection.peer_sent_close_notify |= closed;
+    connection.peer_sent_close_notify
 }
 
 /// # Safety

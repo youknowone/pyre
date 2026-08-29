@@ -58,19 +58,21 @@ def register_adapters_and_converters():
            "see the sqlite3 documentation for suggested replacement recipes")
 
     def adapt_date(val):
-        warn(msg.format(what="date adapter"), DeprecationWarning, stacklevel=2)
+        # PyPy's app-level `_sqlite3.py` adds one visible Python frame where
+        # CPython's C callback is hidden; preserve the caller-facing warning.
+        warn(msg.format(what="date adapter"), DeprecationWarning, stacklevel=8)
         return val.isoformat()
 
     def adapt_datetime(val):
-        warn(msg.format(what="datetime adapter"), DeprecationWarning, stacklevel=2)
+        warn(msg.format(what="datetime adapter"), DeprecationWarning, stacklevel=8)
         return val.isoformat(" ")
 
     def convert_date(val):
-        warn(msg.format(what="date converter"), DeprecationWarning, stacklevel=2)
+        warn(msg.format(what="date converter"), DeprecationWarning, stacklevel=5)
         return datetime.date(*map(int, val.split(b"-")))
 
     def convert_timestamp(val):
-        warn(msg.format(what="timestamp converter"), DeprecationWarning, stacklevel=2)
+        warn(msg.format(what="timestamp converter"), DeprecationWarning, stacklevel=5)
         datepart, timepart = val.split(b" ")
         year, month, day = map(int, datepart.split(b"-"))
         timepart_full = timepart.split(b".")

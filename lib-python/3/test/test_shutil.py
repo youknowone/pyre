@@ -3469,7 +3469,8 @@ class TestZeroCopyCopyFileRange(_ZeroCopyFileLinuxTest, unittest.TestCase):
                 self.zerocopy_fun(src, dst)
 
 
-@unittest.skipIf(not MACOS, 'macOS only')
+@unittest.skipUnless(MACOS and hasattr(posix, '_fcopyfile'),
+                     'requires the CPython-only posix._fcopyfile accelerator')
 class TestZeroCopyMACOS(_ZeroCopyFileTest, unittest.TestCase):
     PATCHPOINT = "posix._fcopyfile"
 

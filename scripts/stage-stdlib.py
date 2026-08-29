@@ -23,7 +23,11 @@ from __future__ import annotations
 import argparse
 import ast
 import os
+import platform
 import shutil
+import subprocess
+import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -34,6 +38,68 @@ ROOT = Path(__file__).resolve().parent.parent
 # `t` is the free-threaded ABI flag: `sysconfig` derives `abi_thread` from
 # `Py_GIL_DISABLED` and the posix schemes put it in the directory name.
 IMPLEMENTATION = "pyre3.14t"
+
+
+def extension_suffix() -> str:
+    """The suffix `cpyext::extension_suffix` publishes on supported hosts."""
+    if sys.platform == "darwin":
+        return ".pyre314-darwin.so"
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64"}:
+        return ".pyre314-x86_64-linux-gnu.so"
+    if machine in {"aarch64", "arm64"}:
+        return ".pyre314-aarch64-linux-gnu.so"
+    return ".pyre314-linux-gnu.so"
+
+
+def build_sqlite3_cffi(destination: Path) -> None:
+    """PyPy `package.py:create_package`'s `_sqlite3_build.py` entry.
+
+    The generated library must be compiled by PyPy so cffi selects its
+    `_cffi_pypyinit_*` form.  Pyre's extension loader consumes that immutable
+    type context directly; renaming only the import suffix does not alter the
+    native ABI.
+    """
+    if os.name == "nt":
+        # Pyre's cpyext/host-dlopen feature is currently enabled only on macOS
+        # and Linux, so publishing an un-loadable Windows extension would hide
+        # the clean public-module fallback failure.
+        return
+    pypy = os.environ.get("PYPY3") or shutil.which("pypy3")
+    if not pypy:
+        raise SystemExit("staging sqlite3 requires pypy3 (or PYPY3)")
+    helper = r"""
+import ctypes.util
+import sys
+
+source_root, output_root = sys.argv[1:]
+if sys.platform == "darwin":
+    original_find_library = ctypes.util.find_library
+    ctypes.util.find_library = lambda name: (
+        "/usr/lib/libsqlite3.dylib"
+        if name == "sqlite3" and original_find_library(name) is None
+        else original_find_library(name)
+    )
+sys.path.insert(0, source_root)
+import _sqlite3_build
+print("PYRE_SQLITE3_CFFI=" + _sqlite3_build._ffi.compile(
+    tmpdir=output_root,
+    verbose=True,
+))
+"""
+    with tempfile.TemporaryDirectory(prefix="pyre-sqlite3-cffi-") as temporary:
+        result = subprocess.run(
+            [pypy, "-c", helper, str(ROOT / "lib_pypy"), temporary],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        marker = "PYRE_SQLITE3_CFFI="
+        outputs = [line.removeprefix(marker) for line in result.stdout.splitlines() if line.startswith(marker)]
+        if len(outputs) != 1:
+            raise SystemExit("_sqlite3_build.py did not report exactly one extension path")
+        shutil.copy2(outputs[0], destination / f"_sqlite3_cffi{extension_suffix()}")
+    shutil.copy2(ROOT / "lib_pypy" / "_sqlite3.py", destination / "_sqlite3.py")
 
 
 def ignored(_directory: str, names: list[str]) -> set[str]:
@@ -107,12 +173,12 @@ def stage(assets_root: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     # pypy/tool/release/package.py copies lib-python first, then overlays
-    # lib_pypy into the same implementation-version directory.  pyre stages
-    # only `lib-python/3`: overlaying `lib_pypy` would put its cffi/pure-Python
-    # shims (`_testcapi`, `_md5`, `_sha*`, `_sqlite3`, ...) on the release
-    # import path, which is the same shadowing the source layout refuses.  What
-    # pyre still owns from `lib_pypy` is a builtin module, so it needs no file.
+    # lib_pypy into the same implementation-version directory.  Pyre selects
+    # only the app-level owners it still needs: overlaying all of lib_pypy
+    # would expose CPython-only test shims such as `_testcapi` and suppress
+    # intended fallbacks for modules pyre owns natively.
     shutil.copytree(ROOT / "lib-python" / "3", destination, ignore=ignored)
+    build_sqlite3_cffi(destination)
 
     if not (destination / "site.py").is_file():
         raise SystemExit("staged stdlib does not contain site.py")

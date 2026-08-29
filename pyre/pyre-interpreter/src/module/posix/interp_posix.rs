@@ -1253,7 +1253,7 @@ mod win_nt {
         // the thread that made it.
         let result = {
             let _blocked = crate::module::thread::before_external_block();
-            if path.as_fd != -1 {
+            if path.is_fd {
                 host_nt::test_file_type_by_handle(host_nt::handle_from_fd(path.as_fd), tested, true)
             } else {
                 tested_wide(&path).is_some_and(|wide| host_nt::test_file_type_by_name(&wide, tested))
@@ -1276,7 +1276,7 @@ mod win_nt {
         };
         let result = {
             let _blocked = crate::module::thread::before_external_block();
-            if path.as_fd != -1 {
+            if path.is_fd {
                 unsafe { rustpython_host_env::crt_fd::Borrowed::try_borrow_raw(path.as_fd) }
                     .is_ok_and(host_nt::fd_exists)
             } else {
@@ -3789,7 +3789,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             (None, None) => (true, UTime { sec: 0, nsec: 0 }, UTime { sec: 0, nsec: 0 }),
         };
 
-        if path.as_fd != -1 {
+        if path.is_fd {
             // interp_posix.py:1893-1900 — both modifiers reinterpret a *name*,
             // and a descriptor is not one. 3.14, which the parity suite reads
             // as the oracle, words the first "can't specify dir_fd without
@@ -4279,7 +4279,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             // its names come back as `str` whatever the caller held
             // (`interp_posix.py:1112-1121`).
             #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-            if resolved.as_fd != -1 {
+            if resolved.is_fd {
                 // The descriptor is what named the directory, so it is what
                 // names the failure.
                 let names = fdlistdir(resolved.as_fd)
@@ -4976,7 +4976,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // unwrapping it, a step earlier than this, so where `fstatat` does not
         // exist a descriptor passed with `dir_fd` reports the platform rather
         // than the conflict.
-        if path.as_fd != -1 {
+        if path.is_fd {
             if dir_fd.is_some() {
                 // 3.14 words this "can't specify dir_fd without matching
                 // path"; `interp_posix.py:639` says "can't specify both
@@ -6266,7 +6266,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // it (`-1` for the entries a name produced), so its own stat resolves
         // the bare name against that descriptor.
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-        let from_fd = Some(resolved.as_fd).filter(|&fd| fd != -1);
+        let from_fd = resolved.is_fd.then_some(resolved.as_fd);
         #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
         let from_fd: Option<i32> = None;
         match from_fd {
@@ -7541,7 +7541,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `allow_fd_fn=os.fchdir` when `rposix.HAVE_FCHDIR`.
                     let path =
                         crate::gateway::fsencode_path_or_fd_w(args[0], "chdir", HAVE_FCHDIR)?;
-                    if path.as_fd != -1 {
+                    if path.is_fd {
                         host_posix::fchdir(path.as_fd).map_err(|e| io_err(e, ""))?;
                         return Ok(pyre_object::w_none());
                     }
@@ -8416,7 +8416,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     let path =
                         crate::gateway::fsencode_path_or_fd_w(args[0], "truncate", HAVE_FTRUNCATE)?;
                     let length = truncate_length_w(args[1])?;
-                    if path.as_fd != -1 {
+                    if path.is_fd {
                         ftruncate_retry(path.as_fd, length, |e| errno_err(e, ""))?;
                         return Ok(pyre_object::w_none());
                     }
@@ -8749,6 +8749,26 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             );
         }
 
+        // interp_posix.py `abort`: send SIGABRT to ourselves.  A caller may
+        // install a handler, so preserve PyPy's kill-and-return control flow
+        // instead of calling libc::abort(), which unconditionally terminates.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "abort",
+            crate::make_builtin_function_with_arity(
+                "abort",
+                |_| {
+                    let r = unsafe { libc::kill(libc::getpid(), libc::SIGABRT) };
+                    if r < 0 {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                0,
+            ),
+        );
+
         // os.kill(pid, sig) / os.killpg(pgid, sig)
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
@@ -8836,7 +8856,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // with `allow_fd_fn=rposix_stat.fstatvfs`.
                     let path =
                         crate::gateway::fsencode_path_or_fd_w(args[0], "statvfs", HAVE_FSTATVFS)?;
-                    if path.as_fd != -1 {
+                    if path.is_fd {
                         let info = host_posix::statvfs_fd(path.as_fd).map_err(|e| io_err(e, ""))?;
                         return Ok(statvfs_to_obj(info));
                     }
@@ -9094,7 +9114,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 None => default_follow,
             };
             // interp_posix.py `chmod`: retry the selected syscall on EINTR.
-            if path.as_fd != -1 {
+            if path.is_fd {
                 // A descriptor answers before either modifier is consulted
                 // (`interp_posix.py:1233-1242`), so neither is an error here —
                 // unlike `chown`, which turns both away (`:2481-2486`). The
@@ -9309,7 +9329,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 None => default_follow,
             };
             // interp_posix.py `chown`: retry the selected syscall on EINTR.
-            if path.as_fd != -1 {
+            if path.is_fd {
                 // interp_posix.py:2481-2486 — a descriptor already names the
                 // file, so neither modifier, which each reinterpret a name, can
                 // apply. Upstream spells the second "cannnot"; 3.14, which the
@@ -10822,11 +10842,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     // interp_posix.py `path_or_fd(allow_fd=hasattr(os,
                     // 'fpathconf'))`, whose body converts the name before it
-                    // reads `path.as_fd != -1`.
+                    // reads the path/fd discriminant.
                     let path =
                         crate::gateway::fsencode_path_or_fd_w(args[0], "pathconf", HAVE_FPATHCONF)?;
                     let name = confname_arg(args[1], PATHCONF_NAMES)?;
-                    let limit = if path.as_fd != -1 {
+                    let limit = if path.is_fd {
                         host_posix::fpathconf(path.as_fd, name).map_err(|e| io_err(e, ""))?
                     } else {
                         let cpath =
@@ -11336,7 +11356,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     let path = crate::gateway::fsencode_path_or_fd_w(args[0], "truncate", true)?;
                     let length = truncate_length_w(args[1])?;
-                    if path.as_fd != -1 {
+                    if path.is_fd {
                         let bfd = unsafe { crt_fd::Borrowed::borrow_raw(path.as_fd) };
                         return crt_result(crt_fd::ftruncate(bfd, length));
                     }
@@ -11850,7 +11870,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // The descriptor form has no name to resolve, so neither
                 // modifier applies to it and it dispatches straight to
                 // `os.fchmod` (`interp_posix.py`).
-                if path.as_fd != -1 {
+                if path.is_fd {
                     let changed = {
                         let _blocked = crate::module::thread::before_external_block();
                         host_nt::fchmod(path.as_fd, mode, S_IWRITE)
