@@ -5459,40 +5459,45 @@ fn handle_fromlist(
     let fromlist_slot = shadow_stack_len();
     let _ = pin_root(w_fromlist);
 
-    // `for x in fromlist` — drained once, then every item pinned: the import
-    // below runs Python and can move all of them.
-    let items = crate::baseobjspace::unpackiterable(shadow_stack_get(fromlist_slot), -1)?;
-    let items_slot = shadow_stack_len();
-    for &w_item in &items {
-        let _ = pin_root(w_item);
-    }
+    // `for x in fromlist` — iterated lazily, one item fully processed before
+    // the next is requested.  A custom iterable is observable here: draining it
+    // up front lets a later `__next__` error preempt the TypeError an earlier
+    // item already owes, and hides an import an earlier item performed from the
+    // `__next__` that follows it.
+    let w_iter = crate::baseobjspace::iter(shadow_stack_get(fromlist_slot))?;
+    let iter_slot = shadow_stack_len();
+    let _ = pin_root(w_iter);
 
-    for index in 0..items.len() {
-        let w_x = shadow_stack_get(items_slot + index);
-        if !unsafe { pyre_object::is_str(w_x) } {
-            // The `__name__` lookup runs first: it can collect, and both the
-            // name and `type_name_of`'s view into the type object move under
-            // it, so the type name is read only once nothing else will run.
-            let where_ = if recursive {
+    loop {
+        let w_x = match crate::baseobjspace::next(shadow_stack_get(iter_slot)) {
+            Ok(item) => item,
+            Err(err) if err.kind == crate::PyErrorKind::StopIteration => break,
+            Err(err) => return Err(err),
+        };
+        let _item_roots = push_roots();
+        let x_slot = shadow_stack_len();
+        let _ = pin_root(w_x);
+
+        if !unsafe { pyre_object::is_str(shadow_stack_get(x_slot)) } {
+            // The `__name__` read runs first: it can collect, and both it and
+            // `type_name_of`'s view into the type object move under it.
+            let mut message: Wtf8Buf = "Item in ".into();
+            if recursive {
                 let w_name =
                     crate::baseobjspace::getattr_str(shadow_stack_get(mod_slot), "__name__")?;
-                let modname = unsafe { pyre_object::w_str_get_value(w_name) };
-                format!("{modname}.__all__")
+                message.push_wtf8(&unsafe { crate::display::py_str_wtf8(w_name) }?);
+                message.push_str(".__all__");
             } else {
-                "``from list''".to_string()
-            };
-            let type_name =
-                unsafe { pyre_object::type_name_of(shadow_stack_get(items_slot + index)) };
-            return Err(crate::PyError::type_error(format!(
-                "Item in {where_} must be str, not {type_name}"
-            )));
+                message.push_str("``from list''");
+            }
+            message.push_str(" must be str, not ");
+            message.push_str(unsafe { pyre_object::type_name_of(shadow_stack_get(x_slot)) });
+            return Err(crate::PyError::type_error(message));
         }
-        // Owned: the lookups below allocate, and the borrowed view dangles
-        // once the string moves.
-        let x = unsafe { pyre_object::w_str_get_value(w_x) }.to_string();
-        if x == "*" {
-            // `__all__` is expanded once; a name inside it that is itself `*`
-            // is an ordinary name, not a second expansion.
+
+        // `__all__` is expanded once; a name inside it that is itself `*` is an
+        // ordinary name, not a second expansion.
+        if unsafe { pyre_object::w_str_get_value_opt(shadow_stack_get(x_slot)) } == Some("*") {
             if !recursive
                 && let Some(w_all) =
                     crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__all__")?
@@ -5501,13 +5506,33 @@ fn handle_fromlist(
             }
             continue;
         }
-        if crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), &x)?.is_some() {
-            continue;
+
+        // `hasattr(module, x)` — keyed by the item object rather than a `&str`
+        // spelling of it, so a name carrying a lone surrogate is looked up as
+        // written instead of reaching an accessor that rejects it.
+        match crate::baseobjspace::getattr(shadow_stack_get(mod_slot), shadow_stack_get(x_slot)) {
+            Ok(_) => continue,
+            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
+            Err(err) => return Err(err),
         }
+
+        // `from_name = f'{module.__name__}.{x}'` — a formatted read.  A package
+        // object whose `__name__` is not a str is coerced the way the f-string
+        // coerces it, not handed to a str-only accessor: `sys.modules` can hold
+        // any object with a `__path__`.
         let w_name = crate::baseobjspace::getattr_str(shadow_stack_get(mod_slot), "__name__")?;
-        let modname = unsafe { pyre_object::w_str_get_value(w_name) };
-        let from_name = format!("{modname}.{x}");
-        if let Err(err) = absolute_import(&from_name, pyre_object::PY_NULL, execution_context) {
+        let mut from_name = unsafe { crate::display::py_str_wtf8(w_name) }?;
+        from_name.push_str(".");
+        from_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(shadow_stack_get(x_slot)) });
+        // The native importer names modules by `&str` throughout, so a child
+        // whose name has no UTF-8 spelling can be neither found, cached nor
+        // blocked here.  That is the outcome `_handle_fromlist` already
+        // swallows: the import raises `ModuleNotFoundError` for exactly this
+        // name and no `sys.modules` entry contradicts it.
+        let Ok(child) = from_name.as_str() else {
+            continue;
+        };
+        if let Err(err) = absolute_import(child, pyre_object::PY_NULL, execution_context) {
             // Backwards-compatibility dictates we ignore failed imports
             // triggered by fromlist for modules that don't exist:
             // `exc.name == from_name and sys.modules.get(from_name,
@@ -5515,8 +5540,8 @@ fn handle_fromlist(
             // sentinel, so the only entry that re-raises is an explicit
             // `None` block.
             if err.kind != crate::PyErrorKind::ModuleNotFoundError
-                || !error_names_module(&err, &from_name)
-                || sys_modules_blocks(&from_name)
+                || !error_names_module(&err, child)
+                || sys_modules_blocks(child)
             {
                 return Err(err);
             }

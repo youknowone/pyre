@@ -2928,7 +2928,7 @@ pub(crate) fn call_format_dispatch(
 }
 
 /// Whether the type-level `__format__` in `meth` is the shared builtin body
-/// that `int`, `bool`, `float` and `str` publish.
+/// that `int`, `bool`, `float` and `str` publish, *and* applies to `val`.
 ///
 /// The question the dispatch below has to answer is not how `__format__` is
 /// spelled but whether calling it is the same thing as calling
@@ -2946,11 +2946,31 @@ pub(crate) fn call_format_dispatch(
 /// walked the generic call path, and read the same bytes back out.
 ///
 /// # Safety
-/// `meth` must be a valid, non-null pointer to a `PyObject`.
-unsafe fn is_shared_builtin_format(meth: PyObjectRef) -> bool {
+/// `val` and `meth` must be valid, non-null pointers to a `PyObject`.
+unsafe fn is_shared_builtin_format(val: PyObjectRef, meth: PyObjectRef) -> bool {
     unsafe {
-        crate::jit_builtin_folds::builtin_code_fn_of(meth)
-            .is_some_and(|found| crate::gateway::builtin_code_fn_eq(found, builtin_value_format))
+        let Some(found) = crate::jit_builtin_folds::builtin_code_fn_of(meth) else {
+            return false;
+        };
+        if !crate::gateway::builtin_code_fn_eq(found, builtin_value_format) {
+            return false;
+        }
+        // `descr_check` — the descriptor a type-level lookup finds need not be
+        // the one that type publishes.  `class S(str): __format__ =
+        // int.__format__` installs `int`'s, and calling it owes the descriptor
+        // TypeError rather than formatting the receiver as a `str`.  Only a
+        // descriptor whose `__objclass__` the receiver satisfies is the
+        // inherited one whose call this path may stand in for.
+        let Ok(owner) = crate::function::fget_func_objclass(meth) else {
+            return false;
+        };
+        let Some(w_type) = crate::typedef::r#type(val) else {
+            return false;
+        };
+        // The exact builtin -- the whole of what this path exists for -- is one
+        // comparison; only a subclass pays the MRO scan.
+        let w_type = w_type.as_ptr();
+        std::ptr::eq(w_type, owner) || crate::baseobjspace::issubtype_w(w_type, owner)
     }
 }
 
@@ -2982,7 +3002,7 @@ pub fn format_value_dispatch(val: PyObjectRef, spec: &Wtf8) -> Result<Wtf8Buf, c
     // underlying value directly.  `__format__` is resolved on the type (not
     // the instance) so an instance-dict attribute does not shadow it.
     if let Some(meth) = unsafe { crate::baseobjspace::lookup(val, "__format__") }
-        && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(meth) })
+        && (unsafe { is_instance(val) } || !unsafe { is_shared_builtin_format(val, meth) })
     {
         let spec_obj = pyre_object::w_str_from_wtf8(spec.to_wtf8_buf());
         return call_format_dispatch(val, meth, spec_obj);

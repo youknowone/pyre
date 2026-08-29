@@ -15,7 +15,7 @@
 # calls a Python `__format__` every iteration and the trace does not inline it,
 # while pypy does: n is sized so pypy's execution-only time clears the floor
 # the harness clamps to, without which no ratio would be applied at all. The
-# reading is 60x/81x, and the ceiling is twice the slower of the two; that is
+# reading is 60-68x/81-89x, and the ceiling is twice the slowest; that is
 # the same band the other user-dunder-per-iteration fixtures sit in
 # (`getattribute_override_no_bind` 374, `property_protocol_hot` 364).
 N = 500000

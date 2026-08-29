@@ -17,6 +17,19 @@ import re
 
 results = []
 ADDRESS = re.compile(r"object at 0x[0-9a-fA-F]+")
+# CPython and PyPy word the descriptor-owner TypeError differently:
+#   descriptor '__format__' for 'int' objects doesn't apply to a 'S' object
+#   'int' object expected, got 'S' instead
+# Both name the owner and the receiver, which is the whole of what the rows
+# below assert; the wording is not their subject. Canonicalise it so PyPy keeps
+# grading the other 122 rows instead of the file going xfail over a message.
+# Neither pattern matches any other row's output.
+DESCR_OWNER = (
+    re.compile(
+        r"descriptor '__format__' for '(\w+)' objects doesn't apply to a '(\w+)' object"
+    ),
+    re.compile(r"'(\w+)' object expected, got '(\w+)' instead"),
+)
 
 
 def row(label, fn):
@@ -30,6 +43,8 @@ def row(label, fn):
     # outside the f-string: an expression part may not hold a backslash before
     # 3.12, and pypy3 is 3.11.
     out = ADDRESS.sub("object at 0xADDR", out)
+    for pattern in DESCR_OWNER:
+        out = pattern.sub(r"<descr __format__ owner=\1 receiver=\2>", out)
     results.append(label + " -> " + out)
 
 
@@ -143,6 +158,42 @@ row("int 'Q'", lambda: format(1, "Q"))
 row("str 'd'", lambda: format("a", "d"))
 row("int 's'", lambda: format(1, "s"))
 
+
+# A builtin subclass that installs another builtin's `__format__` descriptor.
+# The bodies `int`, `str` and `float` publish are one and the same, so the
+# descriptor cannot be recognised by its body alone: `__objclass__` is what
+# says whether it applies to the receiver, and here it does not.
+class StrWithIntFormat(str):
+    __format__ = int.__format__
+
+
+class IntWithStrFormat(int):
+    __format__ = str.__format__
+
+
+class PlainStrSub(str):
+    pass
+
+
+class PlainIntSub(int):
+    pass
+
+
+row("str sub w/ int.__format__ '>5'", lambda: format(StrWithIntFormat("x"), ">5"))
+row("str sub w/ int.__format__ ''", lambda: format(StrWithIntFormat("x"), ""))
+row("int sub w/ str.__format__ '>5'", lambda: format(IntWithStrFormat(3), ">5"))
+row("int sub w/ str.__format__ 'd'", lambda: format(IntWithStrFormat(3), "d"))
+row("str.__format__ unbound on int", lambda: str.__format__(3, ">5"))
+row("int.__format__ unbound on str", lambda: int.__format__("x", ">5"))
+row("plain str sub '>5'", lambda: format(PlainStrSub("x"), ">5"))
+row("plain int sub '>5'", lambda: format(PlainIntSub(3), ">5"))
+row("plain int sub 'x'", lambda: format(PlainIntSub(255), "x"))
+
+# The Windows runner's stdout is cp1252.  This matrix deliberately includes
+# both a non-ASCII format spec and the character produced by the integer `c`
+# presentation, so render the comparison protocol as ASCII independently of
+# the host console encoding.  `backslashreplace` preserves the exact codepoint
+# instead of discarding or substituting it.
 for line in results:
-    print(line)
+    print(line.encode("ascii", "backslashreplace").decode("ascii"))
 print("OK")

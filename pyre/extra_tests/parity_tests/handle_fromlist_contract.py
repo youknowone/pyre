@@ -93,6 +93,78 @@ got = __import__("json", {}, {}, ["decoder"], 0)
 assert not hasattr(got, "decoder"), "a fromlist rebound a cached submodule"
 assert sys.modules["json.decoder"] is decoder, "the cached submodule was reloaded"
 
+# A fromlist item is an arbitrary `str`, including one carrying a lone
+# surrogate. Such a name cannot be an importable module, so the optional-import
+# failure is swallowed and the package comes back.
+assert __import__("hflpkg", {}, {}, ["\ud800"], 0) is mod
+setattr(mod, "\ud800", 5)
+assert __import__("hflpkg", {}, {}, ["\ud800"], 0) is mod
+delattr(mod, "\ud800")
+
+# `sys.modules` may hold any object with a `__path__`. The child name is
+# formatted from `__name__`, so a non-str one is coerced rather than rejected,
+# and the resulting import failure names the parent -- not the child -- so it
+# is not the one a fromlist swallows.
+class Package:
+    __path__ = []
+    __name__ = 123
+
+
+sys.modules["hflfake"] = Package()
+try:
+    __import__("hflfake", {}, {}, ["x"], 0)
+except ModuleNotFoundError as exc:
+    assert exc.name == "123", exc.name
+else:
+    raise AssertionError("expected ModuleNotFoundError")
+del sys.modules["hflfake"]
+
+# The fromlist is iterated lazily. An item is fully processed before the next is
+# requested, so an error a later `__next__` raises cannot preempt the TypeError
+# an earlier item already owes...
+class NonStrThenRaise:
+    def __init__(self):
+        self.n = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.n += 1
+        if self.n == 1:
+            return 1
+        raise ValueError("must not be reached before the TypeError")
+
+
+try:
+    __import__("hflpkg", {}, {}, NonStrThenRaise(), 0)
+except TypeError as exc:
+    assert str(exc) == "Item in ``from list'' must be str, not int", str(exc)
+else:
+    raise AssertionError("expected TypeError")
+
+# ... and an import an earlier item performed is visible to the `__next__` that
+# follows it.
+class WatchAfterFirst:
+    def __init__(self):
+        self.n = 0
+        self.saw = None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.n += 1
+        if self.n == 1:
+            return "c"
+        self.saw = hasattr(sys.modules["hflpkg"], "c")
+        raise StopIteration
+
+
+watcher = WatchAfterFirst()
+__import__("hflpkg", {}, {}, watcher, 0)
+assert watcher.saw is True, "the earlier item's import was not visible"
+
 sys.path.remove(root)
 shutil.rmtree(root, ignore_errors=True)
 print("OK")

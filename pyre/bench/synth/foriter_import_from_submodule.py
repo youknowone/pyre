@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=70
+# pyre-check: max-pypy-ratio=120
 # The `IMPORT_FROM` submodule fallback, inside a `for` body.
 # `importing.rs import_from` falls through an AttributeError to a `sys.modules`
 # lookup for `<__name__>.<name>`. `import_from_name_path` never reaches that
@@ -19,8 +19,10 @@
 # has no `os`/`posix`. wasm is also the backend that answers this from the
 # native importer rather than `importlib._bootstrap`, so the printed `False` is
 # what holds the two implementations to the same answer.
-# Output verified against CPython/PyPy. The reading is 27x/33x and the ceiling
-# is twice the slower of the two natives.
+# Output verified against CPython/PyPy. The reading moved over 29x-33x-41x
+# across three runs -- this is startup-dominated and noisy -- so the ceiling is
+# three times the slowest of them, the headroom `import_from_hot` carries for
+# the same reason.
 import encodings
 
 N = 40000
