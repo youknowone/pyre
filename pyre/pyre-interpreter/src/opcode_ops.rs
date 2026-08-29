@@ -162,6 +162,10 @@ fn operator_symbol(op: BinaryOperator) -> &'static str {
     }
 }
 
+/// `inline(never)` is load-bearing: rustc otherwise folds this body into its
+/// one-call wrapper and the codewriter never mints the graph a trace descends
+/// (`specialize.rs try_walker_orthodox_binary_op`).
+#[inline(never)]
 pub fn binary_value_from_tag(
     a: PyObjectRef,
     b: PyObjectRef,
