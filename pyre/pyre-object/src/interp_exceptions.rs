@@ -832,11 +832,14 @@ pub fn register_exc_class_for_kind(kind: ExcKind, cls: PyObjectRef) -> PyObjectR
     }
 }
 
-/// Reads the process-global `EXC_CLASS_BY_KIND`, a runtime-mutable root the
-/// tracer cannot type; the JIT residualises the read instead of tracing into
-/// it (`@dont_look_inside`, `rlib/jit.py`). The residual call resolves its
-/// address by qualified path in `jit_trace_fnaddrs`.
-#[majit_macros::dont_look_inside]
+/// Reads the process-global `EXC_CLASS_BY_KIND`, a root the tracer cannot
+/// type, so the JIT residualises the read.  It is elidable: a slot is written
+/// once, by `register_exc_class_for_kind`'s first writer, and an instance of
+/// a kind exists only after its class was registered (the internal raise paths
+/// build instances of the init-time kinds only), so a read made for a live
+/// instance never observes the slot's empty state.  The residual call resolves
+/// its address by qualified path in `jit_trace_fnaddrs`.
+#[majit_macros::elidable]
 pub fn lookup_exc_class_for_kind(kind: ExcKind) -> PyObjectRef {
     EXC_CLASS_BY_KIND[kind as u8 as usize].load(std::sync::atomic::Ordering::Acquire) as PyObjectRef
 }
