@@ -6112,7 +6112,10 @@ impl<S: JitState> JitDriver<S> {
                 // for the same slot. Nothing between the two can replace the
                 // entry: `pre_run` cannot capture the driver and the
                 // `on_compiled_entry` hook is called through `&self.meta`.
-                std::sync::Arc::clone(&compiled_meta),
+                // Not carried: this entry reads its snapshot from
+                // `compiled_meta` on every arm below, so a copy on the result
+                // would ride out and drop unread.
+                None,
                 live_values,
                 selected_dispatch_key,
             );
@@ -6138,9 +6141,9 @@ impl<S: JitState> JitDriver<S> {
                 count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
                 for _ in 0..stage_repeats.marshal_out {
                     if !result.is_finish && !result.typed_values.is_empty() {
-                        state.restore_values(&result.meta, &result.typed_values);
+                        state.restore_values(&compiled_meta, &result.typed_values);
                     }
-                    self.sync_after(state, &result.meta, vable);
+                    self.sync_after(state, &compiled_meta, vable);
                     std::hint::black_box(&mut *state);
                 }
             }
@@ -6225,7 +6228,10 @@ impl<S: JitState> JitDriver<S> {
             // and the detailed run below read machine words, and building the
             // list on every entry charged the finish exit for both.
             let raw_values = crate::compile::raw_exit_values(&result.typed_values);
-            let descr_arc = std::sync::Arc::clone(&result.descr_arc);
+            let descr_arc = result
+                .descr_arc
+                .take()
+                .expect("a guard exit carries its descr");
             let guard_value_operand = result.guard_value_operand;
             // blackhole.py `_prepare_resume_from_failure(deadframe)`:
             // the pending exception grabbed at guard failure
@@ -7677,7 +7683,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
-        let exit_meta = result.meta.clone();
+        let exit_meta = result.meta.take().expect("a detailed run carries its meta");
         state.restore_values(&exit_meta, &result.typed_values);
         self.sync_after(state, &exit_meta, vable);
         DetailedDriverRunOutcome::Jump {
@@ -7815,10 +7821,11 @@ impl<S: JitState> JitDriver<S> {
 
         let is_finish = result.is_finish;
         let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
-        let exit_meta = result.meta.clone();
+        let exit_meta = result.meta.take().expect("a detailed run carries its meta");
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
-        let descr_arc = std::sync::Arc::clone(&result.descr_arc);
+        // Carried past the finish arm below, which is the one that has none.
+        let descr_arc = result.descr_arc.take();
         // The pointer travels; the layout behind it is opened past the finish
         // arm below, which is the one that carries none.
         let exit_layout = result.exit_layout.take();
@@ -7846,6 +7853,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
+        let descr_arc = descr_arc.expect("a guard exit carries its descr");
         // Normal loop back-edge JUMP, not a guard failure.
         if fail_index == u32::MAX {
             state.restore_values(&exit_meta, &typed_values);
@@ -8000,6 +8008,14 @@ impl<S: JitState> JitDriver<S> {
                 .meta
                 .warm_state_ref()
                 .confirm_compiled_entry_for_cell_key(green_key)
+    }
+
+    /// See [`MetaInterp::runnable_generation`]: a number that holds while
+    /// [`Self::resolved_runnable_procedure_token`] cannot change its answer
+    /// for any key, and moves when it may.
+    #[inline]
+    pub fn runnable_generation(&self) -> u64 {
+        self.meta.runnable_generation()
     }
 
     /// [`Self::resolve_cell_key`] and [`Self::runnable_procedure_token`] from
@@ -10507,6 +10523,42 @@ mod tests {
     }
 
     #[test]
+    fn compiling_a_loop_moves_the_runnable_generation() {
+        let mut driver = JitDriver::<NonTraceableState>::new(2);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let green_key = 405u64;
+        let cold = driver.runnable_generation();
+        assert!(matches!(
+            driver.meta.on_back_edge(green_key, &[0]),
+            BackEdgeAction::Interpret
+        ));
+        assert!(matches!(
+            driver.meta.on_back_edge(green_key, &[0]),
+            BackEdgeAction::StartedTracing
+        ));
+        {
+            let ctx = driver.meta.trace_ctx().expect("should be tracing");
+            let i0 = OpRef::input_arg_int(0);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
+            ctx.set_fail_args(g, &[]);
+        }
+        let tracing = driver.runnable_generation();
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(driver.has_runnable_compiled_loop(green_key));
+        let compiled = driver.runnable_generation();
+        assert_ne!(
+            compiled, tracing,
+            "the compile made the key runnable, so a reader caching the \
+             answer from the trace-time number must be told"
+        );
+        // Once compiled, asking is free of side effects on the number.
+        assert!(driver.has_runnable_compiled_loop(green_key));
+        assert_eq!(driver.runnable_generation(), compiled);
+        assert_ne!(cold, compiled);
+    }
+
+    #[test]
     fn test_start_bridge_tracing_skips_non_traceable_state() {
         let mut driver = JitDriver::<NonTraceableState>::new(2);
         driver.meta.finish_setup_descrs_for_jitdrivers();
@@ -10535,7 +10587,10 @@ mod tests {
             .run_compiled_detailed(green_key, &[0])
             .expect("guard should fail");
         let fail_values = crate::compile::raw_exit_values(&failure.typed_values);
-        let descr_arc = std::sync::Arc::clone(&failure.descr_arc);
+        let descr_arc = failure
+            .descr_arc
+            .clone()
+            .expect("a guard exit carries its descr");
         drop(failure);
 
         let started = driver.start_bridge_tracing(

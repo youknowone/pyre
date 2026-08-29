@@ -1731,10 +1731,55 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             }
         })
         .collect();
-    // Pairs the two halves above straight into the driver's entry buffer.
-    // Emitted under the same condition as `live_value_types_into` — without
-    // that override the type half falls back to an allocating default, which
-    // would leave this one allocating anyway.
+    // Writes the typed values straight into the driver's entry buffer, in
+    // `extract_live` order, each field as the `Value` its type routes it to.
+    // One pass over the state: the word half and the type half are what
+    // `extract_live_into` / `live_value_types_into` produce for readers that
+    // want them apart, and pairing the two here would fill both buffers and
+    // walk them again for every entry, so the pair is emitted directly.
+    // Emitted under the same condition as `live_value_types_into`, so a state
+    // with only int fields keeps the trait default.
+    let extract_live_value_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { out.push(majit_ir::Value::Int(self.#fname as i64)); }
+        })
+        .collect();
+    let extract_live_value_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! {
+                for elem in &self.#fname {
+                    out.push(majit_ir::Value::Int(*elem as i64));
+                }
+            }
+        })
+        .collect();
+    let extract_live_value_vable_identity_part: TokenStream = if has_vable_identity {
+        quote! {
+            out.push(majit_ir::Value::Ref(majit_ir::GcRef(self as *const Self as usize)));
+        }
+    } else {
+        quote! {}
+    };
+    let extract_live_value_ref_scalar_parts: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            quote! { out.push(majit_ir::Value::Ref(majit_ir::GcRef(self.#fname as usize))); }
+        })
+        .collect();
+    let extract_live_value_float_scalar_parts: Vec<TokenStream> = float_scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            // Widened to f64 exactly as the word form widens before taking
+            // bits, so the two forms carry the same value.
+            quote! { out.push(majit_ir::Value::Float(self.#fname as f64)); }
+        })
+        .collect();
     let extract_live_values_into_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
             quote! {
@@ -1745,17 +1790,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     raw: &mut ::std::vec::Vec<i64>,
                     types: &mut ::std::vec::Vec<majit_ir::Type>,
                 ) {
-                    self.extract_live_into(_meta, raw);
-                    self.live_value_types_into(_meta, types);
-                    out.extend(raw.iter().zip(types.iter()).map(|(&__v, &__t)| match __t {
-                        majit_ir::Type::Float => {
-                            majit_ir::Value::Float(f64::from_bits(__v as u64))
-                        }
-                        majit_ir::Type::Ref => {
-                            majit_ir::Value::Ref(majit_ir::GcRef(__v as usize))
-                        }
-                        _ => majit_ir::Value::Int(__v),
-                    }));
+                    let _ = (raw, types);
+                    #(#extract_live_value_scalar_parts)*
+                    #(#extract_live_value_array_parts)*
+                    #extract_live_value_vable_identity_part
+                    #(#extract_live_value_ref_scalar_parts)*
+                    #(#extract_live_value_float_scalar_parts)*
                 }
             }
         } else {

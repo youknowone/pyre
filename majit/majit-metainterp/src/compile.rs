@@ -265,7 +265,12 @@ pub struct CompileResult<M> {
     /// `loop_token` object itself alive across `execute_assembler`, and an
     /// `Arc` gives the same "this exact metadata, for the whole run" guarantee
     /// without paying a struct copy per entry.
-    pub meta: std::sync::Arc<M>,
+    ///
+    /// Carried only for the caller that asked for it. The detailed runs read
+    /// it back off the result; the warm entry in `jitdriver` already holds
+    /// the same snapshot across the run and never reads this field, so it
+    /// hands in `None` and pays no refcount pair for the round trip.
+    pub meta: Option<std::sync::Arc<M>>,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
@@ -273,7 +278,12 @@ pub struct CompileResult<M> {
     /// currently has split metainterp/backend descr objects, so this is
     /// the runtime descr carrying the same `rd_loop_token_clt` /
     /// `fail_index_per_trace` identity used for bridge routing.
-    pub descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
+    ///
+    /// Carried for a guard exit only. Every reader of it is a bridge or
+    /// blackhole consumer, and a final descr resumes nothing, so the finish
+    /// arm reads the descr off the frame by reference and never takes the
+    /// shared hold on it.
+    pub descr_arc: Option<std::sync::Arc<dyn majit_ir::Descr>>,
     pub is_finish: bool,
     /// compile.py ExitFrameWithExceptionDescrRef parity:
     /// true when the FINISH descriptor was

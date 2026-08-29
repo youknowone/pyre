@@ -439,7 +439,7 @@ impl Drop for ResumeRefRootScope {
     reason = "this C-ABI trampoline is called only by generated machine code, which guarantees that the embedded CPU handle and jitframe pointers remain live; making the symbol unsafe does not express that foreign-call contract"
 )]
 pub extern "C" fn call_assembler_helper_trampoline(
-    cpu_handle: *const std::sync::RwLock<guard::CpuDescrAttachments>,
+    cpu_handle: *const guard::CpuDescrCell,
     callee_jf_ptr: *mut jitframe::JitFrame,
     green_key: u64,
 ) -> i64 {
@@ -458,7 +458,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
     // `compile.py:665-674` parity: resolve the attached `DoneWithThisFrame*`
     // + `ExitFrameWithExceptionDescrRef` identities from the cpu instance
     // that emitted the CALL_ASSEMBLER.  `cpu_handle` is the heap-pinned
-    // `Arc<RwLock<CpuDescrAttachments>>` address baked as a compile-time
+    // `Arc<CpuDescrCell>` address baked as a compile-time
     // constant into the emitted call site — same role as RPython's
     // `self.cpu` closure capture in the translated code.  A compiled
     // trace keeps an `Arc` clone alive alongside its executable buffer
@@ -471,7 +471,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
     let attached = if cpu_handle.is_null() {
         majit_backend::AttachedDescrPtrs::default()
     } else {
-        unsafe { (*cpu_handle).read().unwrap().descr_ptrs() }
+        unsafe { (*cpu_handle).read().descr_ptrs() }
     };
     // warmspot.py:1023-1028 `fail_descr.handle_fail(deadframe, ...)`.
     // Callee jitframe is GC-managed by the rewriter's

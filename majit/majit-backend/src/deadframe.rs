@@ -110,9 +110,74 @@ impl Drop for FrameHeapOwner {
 /// footprint without costing the ordinary one anything.
 const FRAME_POOL_CAPACITY: usize = 8;
 
-#[derive(Default)]
+/// A buffer parked on the free list: a `Vec<i64>` taken apart into its three
+/// words, and put back together exactly as it was.
+#[derive(Clone, Copy)]
+struct ParkedBuf {
+    ptr: *mut i64,
+    len: usize,
+    cap: usize,
+}
+
+impl ParkedBuf {
+    const EMPTY: ParkedBuf = ParkedBuf {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
+
+    fn park(buf: Vec<i64>) -> Self {
+        let mut buf = std::mem::ManuallyDrop::new(buf);
+        ParkedBuf {
+            ptr: buf.as_mut_ptr(),
+            len: buf.len(),
+            cap: buf.capacity(),
+        }
+    }
+
+    fn unpark(self) -> Vec<i64> {
+        // Safety: `park` took these three from a live `Vec<i64>` and nothing
+        // else has owned them since.
+        unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) }
+    }
+}
+
+/// Frees a thread's parked buffers when the thread exits.
+///
+/// `FRAME_POOL` has no destructor so that its access path stays the direct
+/// one; this key has one, and is touched exactly once per thread, on the
+/// first park, which is what registers it. Thread-local destructors run in
+/// no fixed order, but a key without one stays readable throughout, so the
+/// pool is still there when this runs. A buffer parked after it ran — a
+/// deadframe dropped during thread teardown — is the one case that leaks.
+struct PoolReaper;
+
+impl Drop for PoolReaper {
+    fn drop(&mut self) {
+        let _ = FRAME_POOL.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            for parked in &pool.free[..pool.free_len] {
+                drop(parked.unpark());
+            }
+            pool.free_len = 0;
+        });
+    }
+}
+
+thread_local! {
+    static POOL_REAPER: PoolReaper = const { PoolReaper };
+}
+
+/// `Copy`, and so without a destructor: that is what lets `FRAME_POOL` be a
+/// `const`-initialised thread-local with no lazy state and no registered
+/// destructor, which is the fast access path. `POOL_REAPER` is the destructor,
+/// kept on a key the hot path never touches.
+#[derive(Clone, Copy)]
 struct FramePool {
-    free: Vec<Vec<i64>>,
+    free: [ParkedBuf; FRAME_POOL_CAPACITY],
+    free_len: usize,
+    /// Whether `POOL_REAPER` has been registered on this thread.
+    reaper_armed: bool,
     /// Buffers the owned arm asked the allocator for.
     owned: u64,
     /// Buffers the pooled arm handed out.
@@ -129,15 +194,13 @@ thread_local! {
     /// threads costs an uncontended atomic read-modify-write pair to take and to
     /// return a buffer, which is the same order as the saving, so a process-wide
     /// free list would hand back what it was built to remove. Sharding by thread
-    /// is what leaves the take and the return as plain `Vec` pops and pushes.
+    /// is what leaves the take and the return as plain pops and pushes.
     ///
     /// A field would be the alternative to a `thread_local!`, and there is no
     /// object to make it a field of: `run_compiled_code` and
-    /// `run_compiled_code_inner` (`majit-backend-cranelift/src/compiler.rs`) are
-    /// free functions whose only context is a `&CpuDescrAttachments`, a shared
-    /// reference. Compiled entries also nest — `execute_bridge` recurses and
-    /// CALL_ASSEMBLER hops re-enter — so a `&mut` owner threaded down to the
-    /// allocation could not be re-borrowed by the inner entry.
+    /// `FrameHeapOwner::drop` share no owner, and the buffer is taken by one
+    /// and returned by the other, in a different scope and after the caller
+    /// has moved on.
     ///
     /// Per-thread is also the right scope for the lifetime, not merely a cheap
     /// one. A buffer is taken and returned inside one compiled entry, which runs
@@ -150,7 +213,14 @@ thread_local! {
     /// TLS teardown would otherwise panic inside a `Drop`, and falling back to
     /// the allocator is the answer there.
     static FRAME_POOL: RefCell<FramePool> = const {
-        RefCell::new(FramePool { free: Vec::new(), owned: 0, taken: 0, misses: 0 })
+        RefCell::new(FramePool {
+            free: [ParkedBuf::EMPTY; FRAME_POOL_CAPACITY],
+            free_len: 0,
+            reaper_armed: false,
+            owned: 0,
+            taken: 0,
+            misses: 0,
+        })
     };
 }
 
@@ -158,12 +228,12 @@ fn take_pooled_frame_buf(words: usize) -> Vec<i64> {
     let pooled = FRAME_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
         pool.taken += 1;
-        match pool.free.pop() {
-            Some(buf) => Some(buf),
-            None => {
-                pool.misses += 1;
-                None
-            }
+        if pool.free_len == 0 {
+            pool.misses += 1;
+            None
+        } else {
+            pool.free_len -= 1;
+            Some(pool.free[pool.free_len].unpark())
         }
     });
     match pooled {
@@ -182,10 +252,18 @@ fn take_pooled_frame_buf(words: usize) -> Vec<i64> {
 }
 
 fn give_back_pooled_frame_buf(buf: Vec<i64>) {
+    // A full list, or no list: `buf` drops and the allocator takes it back.
     let _ = FRAME_POOL.try_with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.free.len() < FRAME_POOL_CAPACITY {
-            pool.free.push(buf);
+        if pool.free_len < FRAME_POOL_CAPACITY {
+            if !pool.reaper_armed {
+                pool.reaper_armed = true;
+                // First touch registers its destructor for this thread.
+                let _ = POOL_REAPER.try_with(|_| ());
+            }
+            let at = pool.free_len;
+            pool.free[at] = ParkedBuf::park(buf);
+            pool.free_len += 1;
         }
     });
 }
@@ -381,6 +459,96 @@ impl JitFrameRoot {
     }
 }
 
+/// The descr a compiled exit names: `jf_descr` as an object.
+///
+/// Owned for a guard exit, whose descr lives in the trace's `FailDescrCell`
+/// and is reached through `recover_fail_descr_cell`. Borrowed for a finish
+/// exit: that descr is one of the six the metainterp attached to the cpu at
+/// `finish_setup` (`compile.py:665 setattr(cpu, name, descr)`), read out of
+/// a `CpuDescrCell` copy, and those copies are `'static` — the cell leaks
+/// every copy it publishes so that this borrow needs no count. Cloning the
+/// `Arc` into every deadframe and dropping it again was measured at 3.2 ns
+/// per entry on cel's entry probe, on the arm every finished entry takes.
+pub struct ExitDescr {
+    ptr: *const dyn majit_ir::Descr,
+    owned: bool,
+}
+
+// The pointee is an `Arc<dyn Descr>` payload and `Descr: Send + Sync`; the
+// raw pointer only records whether this handle holds a count on it.
+unsafe impl Send for ExitDescr {}
+unsafe impl Sync for ExitDescr {}
+
+impl ExitDescr {
+    /// Hold a strong count on `descr`.
+    pub fn owned(descr: DescrRef) -> Self {
+        ExitDescr {
+            ptr: std::sync::Arc::into_raw(descr),
+            owned: true,
+        }
+    }
+
+    /// Point at `descr` without a count. `'static` is the whole argument.
+    pub fn borrowed(descr: &'static DescrRef) -> Self {
+        ExitDescr {
+            ptr: std::sync::Arc::as_ptr(descr),
+            owned: false,
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> &dyn majit_ir::Descr {
+        // Live by construction: owned handles hold a count, borrowed ones
+        // point into a `'static`.
+        unsafe { &*self.ptr }
+    }
+
+    #[inline]
+    pub fn as_fail_descr(&self) -> &dyn crate::FailDescr {
+        self.get()
+            .as_fail_descr()
+            .expect("a compiled exit's descr always implements FailDescr")
+    }
+
+    /// A strong `Arc` to the descr, whichever way this handle holds it.
+    pub fn to_arc(&self) -> DescrRef {
+        unsafe {
+            std::sync::Arc::increment_strong_count(self.ptr);
+            std::sync::Arc::from_raw(self.ptr)
+        }
+    }
+}
+
+impl Clone for ExitDescr {
+    fn clone(&self) -> Self {
+        if self.owned {
+            ExitDescr::owned(self.to_arc())
+        } else {
+            ExitDescr {
+                ptr: self.ptr,
+                owned: false,
+            }
+        }
+    }
+}
+
+impl Drop for ExitDescr {
+    fn drop(&mut self) {
+        if self.owned {
+            drop(unsafe { std::sync::Arc::from_raw(self.ptr) });
+        }
+    }
+}
+
+impl std::fmt::Debug for ExitDescr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExitDescr")
+            .field("owned", &self.owned)
+            .field("descr", &self.get())
+            .finish()
+    }
+}
+
 /// The deadframe of a backend whose frames are jitframes.
 pub struct JitFrameDeadFrame {
     /// The JitFrame this deadframe reads through.
@@ -389,7 +557,7 @@ pub struct JitFrameDeadFrame {
     /// (`Arc<dyn Descr>`) so the deadframe carries the same Arc identity
     /// the metainterp stamps onto `op.descr` — matching `frame.jf_descr =
     /// descr` (llmodel.py:270) line-by-line.
-    pub fail_descr: DescrRef,
+    pub fail_descr: ExitDescr,
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
@@ -422,7 +590,7 @@ impl JitFrameDeadFrame {
     /// always handed `None`.
     pub fn new(
         jf_gcref: GcRef,
-        fail_descr: DescrRef,
+        fail_descr: ExitDescr,
         latest_descr: Option<DescrRef>,
         heap_owner: Option<FrameHeapOwner>,
     ) -> Self {
@@ -453,7 +621,7 @@ impl JitFrameDeadFrame {
     /// are still the only reference to their objects.
     pub fn borrowing(
         jf_gcref: GcRef,
-        fail_descr: DescrRef,
+        fail_descr: ExitDescr,
         latest_descr: Option<DescrRef>,
     ) -> Self {
         JitFrameDeadFrame {
@@ -571,7 +739,7 @@ mod tests {
         unsafe { (*frame).jf_gcmap = sentinel };
         drop(JitFrameDeadFrame::borrowing(
             GcRef(frame as usize),
-            a_descr(),
+            ExitDescr::owned(a_descr()),
             None,
         ));
         assert_eq!(
@@ -583,7 +751,7 @@ mod tests {
         unsafe { (*frame).jf_gcmap = sentinel };
         drop(JitFrameDeadFrame::new(
             GcRef(frame as usize),
-            a_descr(),
+            ExitDescr::owned(a_descr()),
             None,
             None,
         ));
@@ -594,4 +762,37 @@ mod tests {
 
         unsafe { free_off_gc_jitframe(frame) };
     }
+}
+
+/// Which fixed cost of a compiled entry the probe repeats beside the frame
+/// build, selected once per process from `MAJIT_PROBE_EXTRA`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeExtraStage {
+    None,
+    /// `JittedGuard::enter` and its drop.
+    Guard,
+    /// The jitframe heap selector's thread-local read.
+    Heap,
+    /// The three `Once`-guarded flag reads.
+    Flags,
+    /// `cpu_attachments.read()`.
+    Attach,
+    /// The `jf_descr` word to `(fail_index, descr)`.
+    Descr,
+    /// One clone and drop of the exit descr's `Arc`.
+    Arc,
+}
+
+/// `MAJIT_PROBE_EXTRA`, read once.
+pub fn probe_extra_stage() -> ProbeExtraStage {
+    static STAGE: std::sync::OnceLock<ProbeExtraStage> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("MAJIT_PROBE_EXTRA").as_deref() {
+        Ok("guard") => ProbeExtraStage::Guard,
+        Ok("heap") => ProbeExtraStage::Heap,
+        Ok("flags") => ProbeExtraStage::Flags,
+        Ok("attach") => ProbeExtraStage::Attach,
+        Ok("descr") => ProbeExtraStage::Descr,
+        Ok("arc") => ProbeExtraStage::Arc,
+        _ => ProbeExtraStage::None,
+    })
 }

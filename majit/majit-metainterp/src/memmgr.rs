@@ -54,6 +54,13 @@ pub struct MemoryManager {
     /// `-1` is "uninitialized"; `set_max_age` derives a real value
     /// (`int(sqrt(max_age))` by default per `memmgr.py:47-48`).
     pub check_frequency: i64,
+    /// How many times this manager has let go of loops: each
+    /// `_kill_old_loops_now` that evicted something, and each
+    /// `release_all_loops`. A strong handle dropped here can be a cell's last,
+    /// after which its weak reference no longer upgrades and the cell stops
+    /// answering runnable — so this is one input of
+    /// `MetaInterp::runnable_generation`.
+    evictions: u64,
 
     /// `memmgr.py` `self.alive_loops = {}` — a dict keyed on the
     /// looptoken object itself.  In Rust the dict key uses the Arc's
@@ -99,6 +106,7 @@ impl MemoryManager {
             check_frequency: -1,
             max_age: 0,
             alive_loops: indexmap::IndexMap::new(),
+            evictions: 0,
             // rlib/jit.py PARAMETERS defaults.
             retrace_limit: 0,
             max_retrace_guards: 15,
@@ -263,6 +271,9 @@ impl MemoryManager {
             }
             !evict
         });
+        if !evicted_tokens.is_empty() {
+            self.evictions = self.evictions.wrapping_add(1);
+        }
         if log {
             let newtotal = self.alive_loops.len();
             crate::debug::debug_print(&format!("Loop tokens freed: {}", oldtotal - newtotal));
@@ -283,6 +294,12 @@ impl MemoryManager {
         let _scope = crate::debug::scope("jit-mem-releaseall");
         crate::debug::debug_print(&format!("Loop tokens cleared: {}", self.alive_loops.len()));
         self.alive_loops.clear();
+        self.evictions = self.evictions.wrapping_add(1);
+    }
+
+    /// The counter [`Self::evictions`] documents.
+    pub fn eviction_generation(&self) -> u64 {
+        self.evictions
     }
 
     /// Number of loops currently tracked.  Test/debug accessor; no

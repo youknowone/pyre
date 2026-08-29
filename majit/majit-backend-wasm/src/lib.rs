@@ -4996,11 +4996,19 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
+        // The same selection as `get_latest_descr_arc` below: the metainterp
+        // descr when the optimizer stamped one, since that is the object
+        // carrying `is_exit_frame_with_exception` / `get_status` /
+        // `rd_loop_token_clt`, and the backend descr only for synthetic exits.
         let data = frame
             .boxed_data()
             .and_then(|d| d.downcast_ref::<WasmFrameData>())
             .expect("not WasmFrameData");
-        data.fail_descr.as_ref()
+        data.fail_descr
+            .meta_descr
+            .as_ref()
+            .and_then(|meta| meta.as_fail_descr())
+            .unwrap_or(data.fail_descr.as_ref())
     }
 
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {

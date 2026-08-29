@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, OpRc, Type, Value};
@@ -1688,6 +1688,23 @@ pub struct LoopInvalidation {
     bridge_flags: Arc<parking_lot::Mutex<Vec<Arc<AtomicBool>>>>,
 }
 
+/// How many loop invalidations this process has performed, over every
+/// backend and every driver.
+///
+/// One input of `MetaInterp::runnable_generation`: an invalidated token is
+/// one `get_procedure_token` stops returning, so a reader caching a
+/// runnable-or-not answer across calls has to learn of it. Invalidation
+/// funnels through [`LoopInvalidation::invalidate`], which is where the count
+/// moves, and it moves from whichever thread performs the invalidation, so it
+/// lives here as a process-wide atomic rather than on a driver.
+static TOKEN_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The current value of the process-wide invalidation count.
+#[inline]
+pub fn token_invalidation_generation() -> u64 {
+    TOKEN_INVALIDATIONS.load(Ordering::Acquire)
+}
+
 impl LoopInvalidation {
     /// quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
     /// followed by `cpu.invalidate_loop(looptoken)`.  Both projections happen
@@ -1699,6 +1716,12 @@ impl LoopInvalidation {
         for flag in self.bridge_flags.lock().iter() {
             flag.store(true, Ordering::Release);
         }
+        // After the flags, not before: a reader that keys a cache on the
+        // generation pairs the value it read with the answer it computed, so
+        // the new value must not be observable while the flags still say the
+        // token is live. Read with acquire, this orders the flag stores ahead
+        // of any computation keyed on the new generation.
+        TOKEN_INVALIDATIONS.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1872,7 +1895,7 @@ impl AttachedDescrPtrs {
 /// the six descrs the metainterp attaches to each cpu instance at
 /// `MetaInterpStaticData.finish_setup`.
 ///
-/// Stored inside a heap-pinned `Arc<RwLock<CpuDescrAttachments>>` on every
+/// Stored inside a heap-pinned `Arc<CpuDescrCell>` on every
 /// `Backend` impl ([`CpuDescrHandle`] below):
 ///
 ///   * The `Arc` allocation address stays stable when the `Backend`
@@ -1884,14 +1907,14 @@ impl AttachedDescrPtrs {
 ///     so the attachments outlive the owning backend — the JIT-emitted
 ///     CALL_ASSEMBLER slow path dereferences the baked handle pointer
 ///     long after `compile_loop` returns.
-///   * The `RwLock` permits `Backend::set_done_with_this_frame_descr_*`
-///     to mutate through `&Backend` (via the Arc) without requiring
-///     `&mut self` access to the inner; the extern-C trampoline takes a
-///     read lock to snapshot pointers for dispatch.
+///   * `CpuDescrCell::update` lets `Backend::set_done_with_this_frame_descr_*`
+///     publish through `&Backend` (via the Arc) without `&mut self` access to
+///     the inner; the extern-C trampoline reads the current copy through one
+///     pointer load to snapshot pointers for dispatch.
 ///
 /// Field names mirror the RPython attribute names 1:1 for parity with
 /// `compile.make_and_attach_done_descrs` targets.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CpuDescrAttachments {
     pub done_with_this_frame_descr_void: Option<majit_ir::DescrRef>,
     pub done_with_this_frame_descr_int: Option<majit_ir::DescrRef>,
@@ -1921,11 +1944,70 @@ impl CpuDescrAttachments {
 }
 
 /// Heap-pinned handle for the six per-cpu descr attachments.  The
-/// `Arc`'s payload (the `RwLock<CpuDescrAttachments>`) lives at a
+/// `Arc`'s payload (the `CpuDescrCell`) lives at a
 /// stable heap address so `compile_loop` can bake that address as an
 /// immediate in the JIT-emitted CALL_ASSEMBLER helper call site and
 /// the extern-C trampoline can dereference it later.
-pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
+pub type CpuDescrHandle = Arc<CpuDescrCell>;
+
+/// The six attachments behind one pointer load.
+///
+/// Every compiled entry reads the attachments once, and the six setters run
+/// during `MetaInterpStaticData.finish_setup`, before any compiled code, and
+/// never again. A `RwLock` priced that read at two atomic read-modify-writes
+/// per entry — measured 7.8 ns on cel's entry probe, the largest single fixed
+/// cost of the call. A write here publishes a fresh copy and keeps every
+/// earlier one alive, so a reader holds a plain reference and the swap
+/// costs the writer, not the entry.
+///
+/// A published copy is never freed, not even with the cell: a finish exit's
+/// deadframe borrows its descr straight out of the copy (`ExitDescr`), and a
+/// deadframe can outlive the backend and the token through the safe
+/// `Backend::execute_token` API. `'static` is what makes that borrow sound
+/// without a count. What leaks is one small struct of six `Option<Arc>`s per
+/// publication, at most seven per cpu (the initial copy and six setters).
+pub struct CpuDescrCell {
+    current: std::sync::atomic::AtomicPtr<CpuDescrAttachments>,
+    /// Serializes writers; the copies themselves are leaked, see the type.
+    publish: std::sync::Mutex<()>,
+}
+
+impl CpuDescrCell {
+    pub fn new(attachments: CpuDescrAttachments) -> Self {
+        let first: &'static CpuDescrAttachments = Box::leak(Box::new(attachments));
+        CpuDescrCell {
+            current: std::sync::atomic::AtomicPtr::new(
+                first as *const CpuDescrAttachments as *mut CpuDescrAttachments,
+            ),
+            publish: std::sync::Mutex::new(()),
+        }
+    }
+
+    /// The attachments as last published. One acquire load.
+    #[inline]
+    pub fn read(&self) -> &'static CpuDescrAttachments {
+        // Every pointer ever stored came from `Box::leak`.
+        unsafe { &*self.current.load(std::sync::atomic::Ordering::Acquire) }
+    }
+
+    /// Publish a copy with `f` applied. Writers serialize on `publish`.
+    pub fn update(&self, f: impl FnOnce(&mut CpuDescrAttachments)) {
+        let _writer = self.publish.lock().unwrap();
+        let mut next = Box::new(self.read().clone());
+        f(&mut next);
+        let next: &'static CpuDescrAttachments = Box::leak(next);
+        self.current.store(
+            next as *const CpuDescrAttachments as *mut CpuDescrAttachments,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+impl Default for CpuDescrCell {
+    fn default() -> Self {
+        Self::new(CpuDescrAttachments::default())
+    }
+}
 
 /// `llsupport/asmmemmgr.py:AsmMemoryManager` accounting owned by one CPU.
 /// `total_memory_allocated` is the mapped capacity and never shrinks
@@ -2887,6 +2969,11 @@ pub trait Backend: Send {
     fn clear_stored_exception(&self) {}
 
     /// Read the FailDescr from the last guard failure.
+    ///
+    /// The same object `get_latest_descr_arc` hands out, borrowed from the
+    /// frame instead of shared: a reader that only needs the descr's fields
+    /// for as long as it holds the frame takes this and pays no reference
+    /// count.
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr;
 
     /// Owned Arc counterpart of `get_latest_descr`.
@@ -3896,25 +3983,34 @@ pub fn set_jitted(jitted: bool) {
 ///
 /// Sets `we_are_jitted()` to `true` on creation, restores the previous
 /// value on drop.
+///
+/// Holds the flag's address rather than resolving the thread-local twice:
+/// `JIT_MODE_FLAG` is a `const`-initialised cell with no destructor, so it
+/// sits in the thread's static TLS block and its address holds for the life
+/// of the thread. The raw pointer keeps the guard `!Send`, which is what makes
+/// that address the right one on drop.
 pub struct JittedGuard {
+    flag: *const Cell<bool>,
     prev: bool,
 }
 
 impl JittedGuard {
     /// Create a new guard, setting `we_are_jitted()` to `true`.
     ///
-    /// Read and set in one thread-local access rather than through the two
-    /// public accessors: this runs on every entry into compiled code, and the
-    /// pair resolved the same key twice.
+    /// One thread-local resolution per entry into compiled code, shared with
+    /// the drop; measured 2.4 ns for the pair on cel's entry probe when each
+    /// side resolved its own.
     pub fn enter() -> Self {
-        let prev = JIT_MODE_FLAG.with(|f| f.replace(true));
-        JittedGuard { prev }
+        let flag = JIT_MODE_FLAG.with(|f| f as *const Cell<bool>);
+        // The cell outlives the guard: see the type's doc.
+        let prev = unsafe { (*flag).replace(true) };
+        JittedGuard { flag, prev }
     }
 }
 
 impl Drop for JittedGuard {
     fn drop(&mut self) {
-        set_jitted(self.prev);
+        unsafe { (*self.flag).set(self.prev) };
     }
 }
 

@@ -323,19 +323,53 @@ pub fn reset_call_shot_totals() {
 /// nanoseconds — the floor under every single-shot figure.
 ///
 /// Measured HERE rather than in the harness so it is the same clock, the same
-/// crate and the same optimization settings as the reading it corrects. Taking
-/// the minimum rather than the mean: the pair cannot run faster than it is, so
-/// the smallest of many readings is the least contaminated one, and subtracting
-/// a mean inflated by scheduler noise would under-report the call.
+/// crate and the same optimization settings as the reading it corrects.
+///
+/// ⚠ THE MINIMUM OF SINGLE READINGS CANNOT BE USED, and the reason is a
+/// property of the clock rather than of the pair. `Instant` is backed by a
+/// counter whose tick is coarse compared with the pair — 41.67 ns on Apple
+/// silicon's 24 MHz counter, against a pair that reads about 15 ns — so a pair
+/// whose two reads land inside one tick reports exactly `0`. Over thousands of
+/// tries such a pair occurs on essentially every batch, so `min` converges to
+/// zero and the "floor" stops being a cost at all: it becomes a measurement of
+/// the granularity. Subtracting it then corrects nothing, and the whole clock
+/// pair stays inside the single-shot figure it was supposed to be removed
+/// from — which shows up downstream as a residual stage going NEGATIVE, the
+/// parts of the call summing to more than the call.
+///
+/// So each batch is AMORTIZED first: `PER_BATCH` pairs are accumulated before
+/// anything is divided, which is what makes a batch mean immune to the
+/// granularity — quantization is unbiased when the start phase is uniform, so
+/// it averages out of a sum while it dominates any single term.
+///
+/// The MEDIAN batch is then taken, not the smallest. On a big.LITTLE part the
+/// pair's cost is bimodal — measured at 13.5 ns and 20.4 ns on the two core
+/// classes of one machine, with both modes appearing among the batches of a
+/// single call — and the reading being corrected was taken on whichever core
+/// the run landed on. A minimum answers "the cheapest this pair can be", which
+/// is the wrong question: it pins the correction to the fast class and so
+/// under-corrects every reading taken on the other one.
+///
+/// What is subtracted is what the pair adds to a READING, not what it costs to
+/// execute — those differ, because the pair's own latency partly overlaps
+/// whatever sits between its two reads. An empty bracket has nothing to overlap
+/// with, so this remains an upper bound on the correction, and the figure it
+/// corrects a lower bound on the stage.
 #[cfg(feature = "__execute-stage-probe")]
 pub fn execute_stage_clock_floor_ns() -> f64 {
-    let mut best = u128::MAX;
-    for _ in 0..4096 {
-        let start = std::time::Instant::now();
-        let seen = start.elapsed().as_nanos();
-        best = best.min(seen);
+    const BATCHES: usize = 32;
+    const PER_BATCH: u32 = 4096;
+    let mut means = [0.0f64; BATCHES];
+    for slot in &mut means {
+        let mut acc = 0u128;
+        for _ in 0..PER_BATCH {
+            let start = std::time::Instant::now();
+            acc += start.elapsed().as_nanos();
+        }
+        *slot = acc as f64 / f64::from(PER_BATCH);
     }
-    best as f64
+    means.sort_by(f64::total_cmp);
+    means[BATCHES / 2]
 }
 
 /// compile.py `forget_optimization_info` — discard optimizer-only
@@ -1576,6 +1610,9 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
     pub(crate) compiled_loops: indexmap::IndexMap<u64, CompiledEntry<M>>,
+    /// Bumped by every insertion into and removal from `compiled_loops`, in
+    /// this file's non-test code. One input of [`Self::runnable_generation`].
+    compiled_loops_generation: u64,
     /// warmstate.py `JitCell.get_jit_cell_at_key` analog for the
     /// merge-point green vocabulary: the header greens (`(ints, refs,
     /// floats)`) each compiled loop was traced under, keyed by its green key.
@@ -3395,6 +3432,7 @@ impl<M: Clone> MetaInterp<M> {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
             compiled_loops: indexmap::IndexMap::new(),
+            compiled_loops_generation: 0,
             loop_header_greens: indexmap::IndexMap::new(),
             cut_compiled_keys: indexmap::IndexSet::new(),
             speculative_cut_owned_key: None,
@@ -7877,6 +7915,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 token.set_retraced_count(unroll_opt.retraced_count);
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -8115,6 +8154,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         green_key: u64,
     ) -> Option<(CompiledEntry<M>, CarriedFields)> {
+        self.note_compiled_loops_changed();
         let old_entry = self.compiled_loops.swap_remove(&green_key)?;
         let carried = old_entry.carried_fields();
         Some((old_entry, carried))
@@ -9257,6 +9297,7 @@ impl<M: Clone> MetaInterp<M> {
                 };
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
                 token.set_retraced_count(unroll_opt.retraced_count);
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -10198,6 +10239,7 @@ impl<M: Clone> MetaInterp<M> {
                         token.record_target_token(target_token.as_jump_target_descr());
                     }
                     let front_entry_index = Self::front_entry_index_for(&ft);
+                    self.note_compiled_loops_changed();
                     self.compiled_loops.insert(
                         green_key,
                         CompiledEntry {
@@ -10584,6 +10626,7 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 let front_target_tokens = vec![target_token];
                 let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     green_key,
                     CompiledEntry {
@@ -10687,6 +10730,41 @@ impl<M: Clone> MetaInterp<M> {
                 green_key,
             ),
         }
+    }
+
+    fn note_compiled_loops_changed(&mut self) {
+        self.compiled_loops_generation = self.compiled_loops_generation.wrapping_add(1);
+    }
+
+    /// A number that moves whenever [`Self::resolved_entry_procedure_token`]
+    /// may answer differently for some key than it did, and stays put while
+    /// it cannot.
+    ///
+    /// The answer is a conjunction of four things a caller can watch: the cell
+    /// chain and the tokens attached to it (`WarmEnterState::cell_generation`),
+    /// the `compiled_loops` map (`compiled_loops_generation`), the strong
+    /// handles the memory manager holds — the last of which going is what
+    /// stops a cell's weak reference from upgrading — and the invalidation
+    /// flag on any token, which is set from whichever thread performs it. The
+    /// four counters are summed, so a change in any one moves the whole.
+    ///
+    /// Only "may": running a loop, tracing one that does not finish, and
+    /// ticking a counter all leave it alone, and an eviction that touched no
+    /// cell of interest still moves it. A caller keying a cache on it
+    /// re-derives on a move and reads the cache on a hold, and both are the
+    /// answer the four reads would give.
+    ///
+    /// No upstream counterpart: `warmstate.py` walks the cell on every ask.
+    /// A driver whose portal asks about several sibling loops on every call
+    /// pays one walk per sibling per call for an answer that changes only at
+    /// the events above, which is what this exists to let it skip.
+    #[inline]
+    pub fn runnable_generation(&self) -> u64 {
+        self.warm_state
+            .cell_generation()
+            .wrapping_add(self.compiled_loops_generation)
+            .wrapping_add(self.warm_state.memory_manager.eviction_generation())
+            .wrapping_add(majit_backend::token_invalidation_generation())
     }
 
     /// The function-entry door's whole answer, from one walk of the cell chain
@@ -11239,10 +11317,10 @@ impl<M: Clone> MetaInterp<M> {
 
         Some(CompileResult {
             typed_values,
-            meta,
+            meta: Some(meta),
             fail_index,
             trace_id,
-            descr_arc,
+            descr_arc: (!is_finish).then_some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
             exit_layout: exit_layout.map(Box::new),
@@ -11285,7 +11363,7 @@ impl<M: Clone> MetaInterp<M> {
         Some(self.execute_assembler_at_dispatch_key(
             &token,
             green_key,
-            meta,
+            Some(meta),
             live_values,
             dispatch_key,
         ))
@@ -11356,7 +11434,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
         green_key: u64,
-        meta: std::sync::Arc<M>,
+        meta: Option<std::sync::Arc<M>>,
         live_values: &[Value],
         dispatch_key: u32,
     ) -> CompileResult<M> {
@@ -11404,10 +11482,11 @@ impl<M: Clone> MetaInterp<M> {
         // RPython: bridge compilation happens synchronously inside
         // assembler_call_helper (called from compiled code). No deferred queue.
 
-        let descr_arc = self.backend.get_latest_descr_arc(&frame);
-        let descr: &dyn majit_ir::FailDescr = descr_arc
-            .as_fail_descr()
-            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
+        // Borrowed off the frame, not shared: a final descr is read here and
+        // returned, so the entry that runs one compiled body to completion
+        // pays no reference count for it. The guard arm below takes the
+        // shared hold, since that is the arm whose result outlives the frame.
+        let descr: &dyn majit_ir::FailDescr = self.backend.get_latest_descr(&frame);
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -11432,10 +11511,7 @@ impl<M: Clone> MetaInterp<M> {
         {
             count_execute_stage_passes(ExecuteStage::Decode, stage_repeats.decode);
             for _ in 0..stage_repeats.decode {
-                let repeat_descr = self.backend.get_latest_descr_arc(&frame);
-                let repeat_fail = repeat_descr
-                    .as_fail_descr()
-                    .expect("get_latest_descr_arc returned a non-FailDescr Descr");
+                let repeat_fail = self.backend.get_latest_descr(&frame);
                 let repeat_types: &[Type] = repeat_fail.fail_arg_types();
                 let decoded = Self::decode_exit_slots(&self.backend, &frame, repeat_types);
                 std::hint::black_box((
@@ -11476,7 +11552,7 @@ impl<M: Clone> MetaInterp<M> {
                 meta,
                 fail_index,
                 trace_id,
-                descr_arc,
+                descr_arc: None,
                 is_finish,
                 is_exit_frame_with_exception,
                 exit_layout: None,
@@ -11491,6 +11567,15 @@ impl<M: Clone> MetaInterp<M> {
             };
         }
 
+        // The shared hold, taken only here: the result of a guard exit carries
+        // the descr past this frame's life to the bridge and blackhole readers.
+        // The borrow above ends with the rebinding, which is what lets the
+        // counter tick below take `self` mutably.
+        let descr_arc = self.backend.get_latest_descr_arc(&frame);
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
+        let exit_types: &[Type] = descr.fail_arg_types();
         let status = descr.get_status();
         let guard_value_operand = self.resolve_guard_value_operand(descr, &frame);
         // compile.py `descr.rd_loop_token` — see `run_compiled_detailed`.
@@ -11501,9 +11586,7 @@ impl<M: Clone> MetaInterp<M> {
         // in handle_fail → must_compile (compile.py).
         // must_compile handles tick.
         if Self::should_record_guard_failure(is_finish, fail_index) {
-            let back_edge_poll = descr_arc
-                .as_fail_descr()
-                .is_some_and(|fd| fd.is_back_edge_poll());
+            let back_edge_poll = descr.is_back_edge_poll();
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
 
@@ -11567,7 +11650,7 @@ impl<M: Clone> MetaInterp<M> {
             meta,
             fail_index,
             trace_id,
-            descr_arc,
+            descr_arc: Some(descr_arc),
             is_finish,
             is_exit_frame_with_exception,
             exit_layout: Some(Box::new(exit_layout)),
@@ -11739,6 +11822,7 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     pub fn remove_compiled_loop(&mut self, green_key: u64) {
+        self.note_compiled_loops_changed();
         self.compiled_loops.swap_remove(&green_key);
         self.pending_preamble_tokens.swap_remove(&green_key);
         self.forget_loop_side_tables(green_key);
@@ -11754,6 +11838,7 @@ impl<M: Clone> MetaInterp<M> {
             .map(|(green_key, _)| *green_key)
             .collect();
         for green_key in stale {
+            self.note_compiled_loops_changed();
             self.compiled_loops.swap_remove(&green_key);
             self.forget_loop_side_tables(green_key);
         }
@@ -11863,6 +11948,7 @@ impl<M: Clone> MetaInterp<M> {
                 // including every previous-token predecessor on the
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
+                self.note_compiled_loops_changed();
                 self.compiled_loops.swap_remove(&gk);
                 self.forget_loop_side_tables(gk);
                 if crate::debug::have_debug_prints() {
@@ -12516,6 +12602,7 @@ impl<M: Clone> MetaInterp<M> {
     /// is left alone: it is keyed by green key but holds tokens for a
     /// recompile that has not happened yet, not for the loops being dropped.
     pub fn clear_compiled_loops(&mut self) {
+        self.note_compiled_loops_changed();
         self.compiled_loops.clear();
         self.loop_header_greens.clear();
         self.cut_compiled_keys.clear();
@@ -13481,6 +13568,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_loop`. The count read at the top of this function is
                 // the one `unroll.py optimize_bridge` charges, and it stays on the
                 // token it was read from.
+                self.note_compiled_loops_changed();
                 self.compiled_loops.insert(
                     original_green_key,
                     CompiledEntry {
@@ -14930,7 +15018,10 @@ impl<M: Clone> MetaInterp<M> {
         let typed_values = result.typed_values.clone();
         let savedata = result.savedata;
         let exception = result.exception.clone();
-        let meta = result.meta.clone();
+        let meta = result
+            .meta
+            .clone()
+            .expect("a detailed run carries its meta");
 
         if is_finish {
             // Normal finish (not a guard failure)
@@ -23223,6 +23314,33 @@ mod metainterp_static_data_tests {
         assert_eq!(sd.jitdrivers_sd[idx].index, Some(idx));
     }
 
+    /// The clock floor must be a cost, not the clock's granularity.
+    ///
+    /// A pair of `Instant` reads cannot be free, so a floor of zero does not
+    /// mean "the clock is fast" — it means every candidate reading collapsed
+    /// into one tick of a coarse counter and the minimum found one of them.
+    /// That is how this function read for as long as it took its minimum over
+    /// single readings, and the correction it feeds silently subtracted
+    /// nothing. Pin the property rather than a number: the tick differs per
+    /// platform, but "an empty bracket costs something" does not.
+    #[cfg(feature = "__execute-stage-probe")]
+    #[test]
+    fn the_clock_floor_measures_the_pair_and_not_the_counters_tick() {
+        let floor = super::execute_stage_clock_floor_ns();
+        assert!(
+            floor > 0.0,
+            "clock floor read {floor} ns; a zero floor means the minimum found \
+             a bracket whose two reads shared one counter tick, so the figure \
+             is the tick and not the pair"
+        );
+        // A pair that reads as microseconds is a broken clock, not a slow one,
+        // and would over-subtract every single-shot figure into nonsense.
+        assert!(
+            floor < 1_000.0,
+            "clock floor read {floor} ns, implausibly slow"
+        );
+    }
+
     #[test]
     fn register_jitdriver_sd_replaces_translation_placeholder() {
         // RPython's CallControl owns one list throughout translation, so the
@@ -26751,6 +26869,46 @@ mod loop_side_table_tests {
 
         assert!(!has_side_tables(&meta, 7));
         assert!(has_side_tables(&meta, 8));
+    }
+
+    #[test]
+    fn the_runnable_generation_moves_at_every_event_that_can_change_an_answer() {
+        let mut meta = MetaInterp::<()>::new(1);
+        let start = meta.runnable_generation();
+
+        // Reads leave it alone.
+        assert!(meta.get_compiled_meta(7).is_none());
+        assert_eq!(meta.runnable_generation(), start);
+
+        // A loop leaving the map, both ways. (The fixture insert above writes
+        // the map directly; a loop ENTERING it through `compile_loop` is
+        // `jitdriver::tests::compiling_a_loop_moves_the_runnable_generation`.)
+        record_loop(&mut meta, 7, 100);
+        let after_insert = meta.runnable_generation();
+        meta.remove_compiled_loop(7);
+        let after_remove = meta.runnable_generation();
+        assert_ne!(after_remove, after_insert);
+        record_loop(&mut meta, 8, 101);
+        let before_clear = meta.runnable_generation();
+        meta.clear_compiled_loops();
+        assert_ne!(meta.runnable_generation(), before_clear);
+
+        // A token invalidated anywhere, including one this driver never held.
+        let before_invalidate = meta.runnable_generation();
+        JitCellToken::new(4242).invalidate();
+        assert_ne!(meta.runnable_generation(), before_invalidate);
+
+        // A cell attached through the warm state.
+        let before_attach = meta.runnable_generation();
+        let number = meta.warm_state.alloc_token_number();
+        meta.warm_state
+            .attach_procedure_to_interp(9, JitCellToken::new(number));
+        assert_ne!(meta.runnable_generation(), before_attach);
+
+        // The memory manager letting every loop go.
+        let before_release = meta.runnable_generation();
+        meta.warm_state.memory_manager.release_all_loops();
+        assert_ne!(meta.runnable_generation(), before_release);
     }
 
     #[test]
