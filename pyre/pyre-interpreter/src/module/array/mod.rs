@@ -621,15 +621,34 @@ fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_none())
 }
 
+/// The index gateway for `array.insert` / `array.pop`.
+///
+/// PyPy's `W_ArrayBase.descr_insert` and `descr_pop` use `@unwrap_spec(...=int)`
+/// before entering the method body.  CPython 3.14 exposes the narrower
+/// `__index__` protocol and its Py_ssize_t overflow wording, so keep PyPy's
+/// gateway-before-body ordering while applying the 3.14 observable contract.
+fn array_ssize_index_w(w_index: PyObjectRef) -> Result<i64, PyError> {
+    let w_index = crate::baseobjspace::space_index(w_index)?;
+    crate::baseobjspace::int_w(w_index).map_err(|error| {
+        if error.kind == PyErrorKind::OverflowError
+            && error.message_text() == "int too large to convert to int"
+        {
+            PyError::overflow_error("Python int too large to convert to C ssize_t")
+        } else {
+            error
+        }
+    })
+}
+
 fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 3, "array.insert")?;
-    let obj = args[0];
-    array_check_resize(obj)?;
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "insert")?;
+    crate::type_methods::arity_exact_unpack(args, "insert", 2)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    // `@unwrap_spec(idx=int)` runs before PyPy's `descr_insert` reads len.
+    let mut i = array_ssize_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
-    let tc = unsafe { arr::w_array_typecode(obj) };
-    // Clamp index like list.insert.
-    let mut i = crate::builtins::getindex_w(args[1])?;
     if i < 0 {
         i += len as i64;
         if i < 0 {
@@ -639,18 +658,40 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
     if i > len as i64 {
         i = len as i64;
     }
+    // `W_Array.descr_insert` converts `w_val` before `setlen`; conversion may
+    // resize the receiver, create an export, or collect it.  Preserve the
+    // index computed from the pre-conversion length, then re-read all live
+    // receiver state from the rooted object.
+    let tc = unsafe { arr::w_array_typecode(obj) };
     let mut buf: Bytes = [0u8; 8];
-    let n = pack_into(tc, args[2], &mut buf)?;
+    let n = pack_into(
+        tc,
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &mut buf,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    array_check_resize(obj)?;
+    let isz = unsafe { arr::w_array_itemsize(obj) };
+    let len = unsafe { arr::w_array_len(obj) };
     let vec = unsafe { arr::w_array_vec_mut(obj) };
-    let at = i as usize * isz;
+    let at = (i as usize).min(len) * isz;
     vec.splice(at..at, buf[..n].iter().copied());
     Ok(pyre_object::w_none())
 }
 
 fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity_range(args, 1, 2, "array.pop")?;
-    let obj = args[0];
-    array_check_resize(obj)?;
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "pop")?;
+    crate::type_methods::arity_at_most(args, "pop", 1)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    // `@unwrap_spec(i=int)` runs before PyPy's `descr_pop`, including for an
+    // empty receiver.  Re-read the receiver after this user-code boundary.
+    let mut i = if args.len() >= 2 {
+        array_ssize_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?
+    } else {
+        -1
+    };
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let len = unsafe { arr::w_array_len(obj) };
     if len == 0 {
         return Err(PyError::new(
@@ -658,11 +699,6 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
             "pop from empty array".to_string(),
         ));
     }
-    let mut i = if args.len() >= 2 {
-        crate::builtins::getindex_w(args[1])?
-    } else {
-        -1
-    };
     if i < 0 {
         i += len as i64;
     }
@@ -672,6 +708,7 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
             "pop index out of range".to_string(),
         ));
     }
+    array_check_resize(obj)?;
     let isz = unsafe { arr::w_array_itemsize(obj) };
     let w_val = unsafe { arr::w_array_unpack_item(obj, i as usize) };
     let vec = unsafe { arr::w_array_vec_mut(obj) };
@@ -731,18 +768,20 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     } else {
         0
     };
+    // [3.14-spec] CPython `array_array_index_impl` uses PY_SSIZE_T_MAX for an
+    // omitted stop and re-reads Py_SIZE(self) on every iteration, so growth
+    // from `__eq__` remains searchable.  PyPy's `index_count_array` has the
+    // same live `while i < arr.len` source shape, although the installed
+    // PyPy oracle snapshots this re-entrant case.
     let mut stop = if args.len() >= 4 {
         crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
             base + 3,
         ))?
     } else {
-        0
+        i64::MAX
     };
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let len = unsafe { arr::w_array_len(obj) } as i64;
-    if args.len() < 4 {
-        stop = len;
-    }
     if start < 0 {
         start += len;
         if start < 0 {
@@ -754,9 +793,6 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
         if stop < 0 {
             stop = 0;
         }
-    }
-    if stop > len {
-        stop = len;
     }
     let mut i = start;
     while i < stop {
@@ -1586,7 +1622,15 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "__reduce_ex__", array_reduce_ex_method, 2);
     m(ns, "append", array_append_method, 2);
     m(ns, "extend", array_extend_method, 2);
-    m(ns, "insert", array_insert_method, 3);
+    // `insert` uses the PyArg_UnpackTuple arity wording and the fixed
+    // `array.insert` keyword owner, both supplied by its gateway body.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "insert",
+            crate::make_builtin_function("insert", array_insert_method),
+        )
+    };
     m(ns, "remove", array_remove_method, 2);
     // `index` accepts optional start/stop.
     unsafe {

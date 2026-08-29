@@ -101,6 +101,23 @@ class CollectingNeedle:
 
 assert array("i", [1, 2]).index(CollectingNeedle()) == 1
 
+growing_search = array("i", [1])
+
+
+class GrowingNeedle:
+    def __eq__(self, other):
+        if other == 1:
+            growing_search.append(2)
+            return False
+        return other == 2
+
+
+# PyPy's index_count_array source reads arr.len at its loop boundary.  The
+# installed PyPy oracle snapshots this case, while CPython 3.14's
+# array_array_index_impl explicitly re-reads Py_SIZE(self) and finds the new
+# item.  Keep the PyPy loop shape and take the 3.14 observable result.
+assert growing_search.index(GrowingNeedle()) == 1
+
 shrinking = array("i", [1, 2])
 
 
@@ -113,6 +130,102 @@ class ShrinkingNeedle:
 with assert_raises(ValueError):
     shrinking.index(ShrinkingNeedle())
 assert shrinking == array("i")
+
+# PyPy's unwrap_spec gateway converts insert/pop indexes before their method
+# bodies inspect the receiver.  The callbacks can therefore resize or collect
+# the array before its effective length is read.
+inserted = array("i", [1, 2])
+
+
+class GrowingInsertIndex:
+    def __index__(self):
+        inserted.append(3)
+        gc.collect()
+        return -1
+
+
+inserted.insert(GrowingInsertIndex(), 9)
+assert inserted == array("i", [1, 2, 9, 3])
+
+popped = array("i", [1, 2])
+
+
+class GrowingPopIndex:
+    def __index__(self):
+        popped.append(3)
+        gc.collect()
+        return -1
+
+
+assert popped.pop(GrowingPopIndex()) == 3
+assert popped == array("i", [1, 2])
+
+cleared = array("i", [1, 2])
+
+
+class ClearingPopIndex:
+    def __index__(self):
+        del cleared[:]
+        return 0
+
+
+with assert_raises(IndexError) as error:
+    cleared.pop(ClearingPopIndex())
+assert str(error.exception) == "pop from empty array"
+assert cleared == array("i")
+
+
+class HugeArrayIndex:
+    def __index__(self):
+        return 1 << 100
+
+
+for method in (
+    lambda: array("i").insert(HugeArrayIndex(), 1),
+    lambda: array("i", [1]).pop(HugeArrayIndex()),
+):
+    with assert_raises(OverflowError) as error:
+        method()
+    assert str(error.exception) == "Python int too large to convert to C ssize_t"
+
+with assert_raises(TypeError) as error:
+    array("i").insert(i=0, x=1)
+assert str(error.exception) == "array.insert() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i", [1]).pop(i=0)
+assert str(error.exception) == "array.pop() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").insert(0)
+assert str(error.exception) == "insert expected 2 arguments, got 1"
+with assert_raises(TypeError) as error:
+    array("i", [1]).pop(0, 1)
+assert str(error.exception) == "pop expected at most 1 argument, got 2"
+
+conversion_order = []
+exported = array("i", [1])
+exported_view = memoryview(exported)
+
+
+class ExportingIndex:
+    def __index__(self):
+        conversion_order.append("index")
+        return 0
+
+
+class ExportingValue:
+    def __index__(self):
+        conversion_order.append("value")
+        return 2
+
+
+with assert_raises(BufferError):
+    exported.insert(ExportingIndex(), ExportingValue())
+assert conversion_order == ["index", "value"]
+conversion_order.clear()
+with assert_raises(BufferError):
+    exported.pop(ExportingIndex())
+assert conversion_order == ["index"]
+exported_view.release()
 
 # slice assignment step overflow behaviour test
 T = "I"
