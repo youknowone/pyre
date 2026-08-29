@@ -434,6 +434,10 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if n < 0 {
         return Err(PyError::value_error("negative size"));
     }
+    // `@unwrap_spec(n=int)` binds a machine word, so a size that does not fit
+    // one is refused rather than truncated into the checks and the copy.
+    let n = usize::try_from(n)
+        .map_err(|_| PyError::value_error("size does not fit in a machine word"))?;
     let mut dest_buffer = None;
     let dest = if let Some(cdata) = W_CData::from_obj(args[0]) {
         unsafe_escaping_ptr_for_ptr_or_array(cdata)?
@@ -444,7 +448,7 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         // refuses an index past the end, so a request longer than the buffer
         // is an error rather than a write past it. The cdata arm stays
         // unchecked: a bare pointer carries no length.
-        if n as usize > slice.len() {
+        if n > slice.len() {
             return Err(PyError::value_error(
                 "destination buffer is smaller than the requested size",
             ));
@@ -459,7 +463,7 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             return Err(PyError::type_error("expected a readable buffer"));
         };
         // `getslice(0, 1, n)` bounds the same read upstream.
-        if n as usize > buffer.as_bytes().len() {
+        if n > buffer.as_bytes().len() {
             buffer.release();
             return Err(PyError::value_error(
                 "source buffer is smaller than the requested size",
@@ -469,7 +473,7 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         source_buffer = Some(buffer);
         ptr
     };
-    unsafe { std::ptr::copy(src, dest, n as usize) };
+    unsafe { std::ptr::copy(src, dest, n) };
     if let Some(buffer) = source_buffer {
         buffer.release();
     }
