@@ -401,6 +401,26 @@ fn chase_pinned(l: u64, defs: &HashMap<u64, PinSrc>, out: &mut HashSet<u64>, dep
 /// separately, so the contents are read off these and not off the opener.
 /// `publish_roots` is `pin_roots` without the normalize half, and pins just
 /// the same.
+///
+/// The free functions only. `RootScope`'s inherent `publish` / `get` / `set`
+/// (`pyre-object/src/gc_roots.rs:500-559`) are the same operations reached
+/// through the guard, and none of them ends with a suffix here — `::publish`
+/// is not `::publish_roots`. Counted over the four files that use them:
+///
+/// * 26 bodies use only the methods. `saw_pin_call` stays false for those, so
+///   they are withheld as unreadable rather than graded — the conservative
+///   answer, and part of what the census reports as "could not be read".
+/// * 3 bodies use both a free pin and a method (`baseobjspace::next`,
+///   `dictmultiobject::w_dict_setdefault_checked`, `builtins::builtin_print`).
+///   Those are graded with the method-published roots missing from `held`, so
+///   they can be reported SHORT while actually covered.
+///
+/// Recognizing the methods here without also modelling `RootScope`'s `Drop`
+/// (gc_roots.rs:587-598, which truncates the shadow stack) would move the
+/// error the wrong way: a call after the guard is dropped would inherit a
+/// stale pinned set and read as covered. A false SHORT asks for a look; a
+/// false covered hides a missing root. So the pair lands together or not at
+/// all, and until then those 3 bodies are the known skew in the SHORT count.
 fn is_pin_fn(name: &str) -> bool {
     name.ends_with("::pin_root")
         || name.ends_with("::pin_roots")

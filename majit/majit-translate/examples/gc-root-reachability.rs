@@ -474,6 +474,23 @@ fn main() {
                 r.pin_name.rsplit("::").next().unwrap_or("?")
             );
         }
+        // Two filters sit between the count above and the rows just printed:
+        // only a non-empty `movable` column prints, and only the first 20 of
+        // those. A run whose stale pins are all non-movable prints the count
+        // and no rows at all, so say where the rest are — the short-bracket
+        // block above owes and prints the same hint.
+        let stale_pins_shown = stats
+            .stale_pin_reads
+            .iter()
+            .filter(|r| !r.movable.is_empty())
+            .count()
+            .min(20);
+        if stats.stale_pin_reads.len() > stale_pins_shown {
+            println!(
+                "           ... and {} more (set GC_STALE_PIN_JSON to read them all)",
+                stats.stale_pin_reads.len() - stale_pins_shown
+            );
+        }
         if let Ok(path) = std::env::var("GC_STALE_PIN_JSON") {
             let mut out = String::new();
             for r in &stats.stale_pin_reads {

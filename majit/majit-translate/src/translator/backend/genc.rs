@@ -318,8 +318,9 @@ impl CBuilder {
             &db.gcpolicy.policy_class,
             GcPolicyClass::FrameworkShadowStack
         ) {
-            // Placeholder, not a port. `framework.py:258` builds this as
-            // `inputconst(r_gc_data, self.gcdata)`, whose concretetype is the
+            // Placeholder, not a port. `BaseFrameworkGCTransformer.__init__`
+            // builds `c_const_gcdata` as
+            // `rmodel.inputconst(r_gc_data, self.gcdata)`, whose concretetype is the
             // rtyper repr of the `gctypelayout.GCData` instance -- a pointer.
             // Neither `gctypelayout.GCData` nor a repr for it exists on this
             // side yet, so the constant stands in as an opaque host object
