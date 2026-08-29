@@ -10,6 +10,10 @@
 //! publishes the part that is left -- the type `socket.py` subclasses and the
 //! numbers it reads.
 
+// The text half of the address converters compiles everywhere so its corpus
+// runs with the unit tests, on hosts whose entry points reach libc instead.
+#[cfg(any(test, not(any(unix, windows))))]
+mod inet_text;
 #[cfg(not(any(unix, windows)))]
 mod interp_socket_wasm;
 #[cfg(any(unix, windows))]
