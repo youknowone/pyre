@@ -8144,6 +8144,43 @@ impl<'a> Lowering<'a> {
                         .expect("a materialized GC root stays a Variable")
                         .clone();
                 }
+                // `core::intrinsics::transmute::<A, B>(x)` is a bitwise
+                // move.  When both Rust types lower to the same JIT register
+                // bank and Charon's type/layout data proves their byte sizes
+                // equal, the move is the bank's ordinary copy (`same_as`).
+                // This includes `u8 -> #[repr(u8)]` fieldless enums: the enum
+                // is already modelled as its integer tag by
+                // `tyref_to_value_type`, and its `TypeDecl` layout supplies
+                // the matching one-byte size.  A bank crossing or an unknown
+                // / unequal size keeps the existing residual call.
+                if args.len() == 1
+                    && let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+                    && let Some(fd) = self.llbc.fn_by_id(*id)
+                    && matches!(
+                        fd.item_meta.name_path().as_str(),
+                        "core::intrinsics::transmute" | "core::mem::transmute"
+                    )
+                    && first_arg_ty.as_ref().is_some_and(|src_ty| {
+                        transmute_is_same_layout_bank(src_ty, &call.dest.ty, self.llbc)
+                    })
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::UnaryOp {
+                            op: "same_as".to_string(),
+                            operand: args[0].clone(),
+                            result_ty: result_ty.clone(),
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py:355-358); the rtyper folds the surviving
                 // `_we_are_jitted` symbolic to a constant True
@@ -19825,6 +19862,87 @@ fn value_type_bank(ty: &ValueType) -> u8 {
     }
 }
 
+/// Whether `transmute::<A, B>` is an ordinary copy in the lowered graph.
+///
+/// The predicate is deliberately the conjunction of two independent facts:
+///
+/// * `A` and `B` occupy the same real JIT register bank (`Int`/`Unsigned`/
+///   `Bool`, `Ref`/`Str`/`StringBuilder`, or `Float`); and
+/// * the exact sizes recovered from Charon's serialized scalar type or the
+///   target-selected `TypeDecl` layout are both known and equal.
+///
+/// Unknown layouts decline.  In particular, matching `ValueType`s alone is
+/// insufficient because that projection intentionally erases scalar widths
+/// and aggregate sizes.
+fn transmute_is_same_layout_bank(src: &TyRef, dst: &TyRef, llbc: &Llbc) -> bool {
+    let src_bank = value_type_bank(&tyref_to_value_type(src, llbc));
+    let dst_bank = value_type_bank(&tyref_to_value_type(dst, llbc));
+    matches!((src_bank, dst_bank), (0, 0) | (1, 1) | (2, 2))
+        && matches!(
+            (tyref_exact_layout_size(src, llbc), tyref_exact_layout_size(dst, llbc)),
+            (Some(src_size), Some(dst_size)) if src_size == dst_size
+        )
+}
+
+/// Exact byte size encoded by a Charon [`TyRef`].
+///
+/// Named ADTs use the target-selected LLBC layout.  Primitive widths are part
+/// of the serialized LLBC type itself; references/raw pointers/function
+/// pointers have the target word size when their representation is known to
+/// be thin.  Every other shape returns `None`, keeping the transmute residual.
+fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let obj = node.as_object()?;
+
+    if let Some(lit) = obj.get("Literal") {
+        if let Some(atom) = lit.as_str() {
+            return match atom {
+                "Bool" => Some(1),
+                "Char" => Some(4),
+                _ => None,
+            };
+        }
+        let lit = lit.as_object()?;
+        let scalar_size = |kind: &str| match kind {
+            "I8" | "U8" => Some(1),
+            "I16" | "U16" | "F16" => Some(2),
+            "I32" | "U32" | "F32" => Some(4),
+            "I64" | "U64" | "F64" => Some(8),
+            "I128" | "U128" | "F128" => Some(16),
+            "Isize" | "Usize" => Some(crate::layout::target_word_size() as u64),
+            _ => None,
+        };
+        for key in ["Int", "UInt", "Integer", "Float"] {
+            if let Some(kind) = lit.get(key).and_then(serde_json::Value::as_str) {
+                return scalar_size(kind);
+            }
+        }
+        return None;
+    }
+
+    if let Some(def_id) = adt_node_def_id(node) {
+        let target = std::env::var("TARGET").unwrap_or_default();
+        return llbc.type_by_id(def_id)?.layout_for_target(&target)?.size;
+    }
+
+    let pointee = obj
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parts| parts.get(1))
+        .or_else(|| {
+            obj.get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|parts| parts.first())
+        });
+    if pointee.is_some_and(|pointee| json_ty_is_statically_sized(pointee, llbc))
+        || obj.contains_key("FnPtr")
+    {
+        return Some(crate::layout::target_word_size() as u64);
+    }
+
+    None
+}
+
 /// The fully-qualified host-callable path for a bank-crossing cast, or
 /// `None` when `src` and `dst` share a bank (a JIT no-op aliased to the
 /// operand) or the bank pair has no host cast callable.  A bank crossing
@@ -30041,6 +30159,233 @@ mod tests {
         .expect("fixture trait call parses");
 
         assert_eq!(super::abstract_trait_call_target(&call, &llbc), None);
+    }
+
+    /// Two one-call graphs sharing a synthetic `core::intrinsics::transmute`
+    /// declaration.  The first has the portal's scalar-to-fieldless-enum
+    /// shape; the second is an equal-size register-bank crossing.
+    fn transmute_lowering_fixture() -> Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str], is_local: bool| {
+            serde_json::json!({
+                "name": path
+                    .iter()
+                    .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                    .collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let u8_ty = serde_json::json!({"Literal": {"UInt": "U8"}});
+        let u64_ty = serde_json::json!({"Literal": {"UInt": "U64"}});
+        let f64_ty = serde_json::json!({"Literal": {"Float": "F64"}});
+        let instruction_ty = serde_json::json!({
+            "Adt": {
+                "id": {"Adt": 0},
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let caller = |def_id: u64,
+                      name: &str,
+                      src_ty: serde_json::Value,
+                      dst_ty: serde_json::Value| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta(&["fixture", name], true),
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [src_ty.clone()],
+                    "output": dst_ty.clone()
+                },
+                "body": {
+                    "Unstructured": {
+                        "span": span(),
+                        "locals": {
+                            "arg_count": 1,
+                            "locals": [
+                                {"index": 0, "name": null, "span": span(), "ty": dst_ty.clone()},
+                                {"index": 1, "name": "value", "span": span(), "ty": src_ty.clone()}
+                            ]
+                        },
+                        "body": [
+                            {
+                                "statements": [],
+                                "terminator": {
+                                    "span": span(),
+                                    "kind": {
+                                        "Call": {
+                                            "call": {
+                                                "func": {
+                                                    "Regular": {
+                                                        "kind": {"Fun": {"Regular": 2}},
+                                                        "generics": {
+                                                            "regions": [],
+                                                            "types": [src_ty.clone(), dst_ty.clone()],
+                                                            "const_generics": [],
+                                                            "trait_refs": []
+                                                        }
+                                                    }
+                                                },
+                                                "args": [{
+                                                    "Copy": {"kind": {"Local": 1}, "ty": src_ty.clone()}
+                                                }],
+                                                "dest": {"kind": {"Local": 0}, "ty": dst_ty.clone()}
+                                            },
+                                            "target": 2,
+                                            "on_unwind": 1
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "UnwindResume"}
+                            },
+                            {
+                                "statements": [],
+                                "terminator": {"span": span(), "kind": "Return"}
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        let instruction = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta(&["fixture", "Instruction"], true),
+            "kind": {
+                "Enum": [
+                    {"name": "LoadConst", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "0"]}}},
+                    {"name": "ReturnValue", "fields": [], "discriminant": {"Scalar": {"Unsigned": ["U8", "1"]}}}
+                ]
+            },
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "size": 1,
+                    "align": 1,
+                    "variant_layouts": [
+                        {"field_offsets": []},
+                        {"field_offsets": []}
+                    ],
+                    "repr": {"transparent": false}
+                }
+            }]
+        });
+        let transmute = serde_json::json!({
+            "def_id": 2,
+            "item_meta": item_meta(&["core", "intrinsics", "transmute"], false),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [{"TypeVar": {"Free": 0}}],
+                "output": {"TypeVar": {"Free": 1}}
+            },
+            "body": {"Intrinsic": {"name": "transmute", "arg_names": ["src"]}}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [instruction],
+                "fun_decls": [
+                    caller(0, "transmute_u8_to_instruction", u8_ty, instruction_ty),
+                    caller(1, "transmute_u64_to_f64", u64_ty, f64_ty),
+                    transmute
+                ],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        Llbc::from_slice(file.to_string().as_bytes()).expect("transmute fixture Llbc parses")
+    }
+
+    #[test]
+    fn same_size_int_bank_transmute_lowers_to_same_as() {
+        let llbc = transmute_lowering_fixture();
+        let graph = super::lower_function(&llbc, "transmute_u8_to_instruction")
+            .expect("lower u8-to-Instruction transmute");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+
+        assert!(!ops.iter().any(|op| matches!(op.kind, OpKind::Call { .. })));
+        let copies: Vec<_> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::UnaryOp {
+                    op,
+                    operand,
+                    result_ty,
+                } if op == "same_as" => Some((operand, result_ty)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies.len(), 1, "transmute must become one scalar copy");
+        assert_eq!(*copies[0].1, ValueType::Int);
+        let input = ops
+            .iter()
+            .find_map(|op| match (&op.result, &op.kind) {
+                (Some(result), OpKind::Input { name, .. }) if name == "value" => Some(result),
+                _ => None,
+            })
+            .expect("value input");
+        assert_eq!(copies[0].0.id(), input.id());
+    }
+
+    #[test]
+    fn equal_size_int_to_float_transmute_stays_residual() {
+        let llbc = transmute_lowering_fixture();
+        let graph = super::lower_function(&llbc, "transmute_u64_to_f64")
+            .expect("lower u64-to-f64 transmute");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+
+        assert!(
+            !ops.iter()
+                .any(|op| { matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") })
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &["core", "intrinsics", "transmute"]
+                    )
+                })
+                .count(),
+            1,
+            "bank-crossing transmute must retain the residual intrinsic call"
+        );
     }
 
     #[test]
