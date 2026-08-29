@@ -265,7 +265,12 @@ pub struct CompileResult<M> {
     /// `loop_token` object itself alive across `execute_assembler`, and an
     /// `Arc` gives the same "this exact metadata, for the whole run" guarantee
     /// without paying a struct copy per entry.
-    pub meta: std::sync::Arc<M>,
+    ///
+    /// Carried only for the caller that asked for it. The detailed runs read
+    /// it back off the result; the warm entry in `jitdriver` already holds
+    /// the same snapshot across the run and never reads this field, so it
+    /// hands in `None` and pays no refcount pair for the round trip.
+    pub meta: Option<std::sync::Arc<M>>,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the

@@ -6074,7 +6074,10 @@ impl<S: JitState> JitDriver<S> {
                 // for the same slot. Nothing between the two can replace the
                 // entry: `pre_run` cannot capture the driver and the
                 // `on_compiled_entry` hook is called through `&self.meta`.
-                std::sync::Arc::clone(&compiled_meta),
+                // Not carried: this entry reads its snapshot from
+                // `compiled_meta` on every arm below, so a copy on the result
+                // would ride out and drop unread.
+                None,
                 live_values,
                 selected_dispatch_key,
             );
@@ -6100,9 +6103,9 @@ impl<S: JitState> JitDriver<S> {
                 count_back_edge_stage_passes(BackEdgeStage::MarshalOut, stage_repeats.marshal_out);
                 for _ in 0..stage_repeats.marshal_out {
                     if !result.is_finish && !result.typed_values.is_empty() {
-                        state.restore_values(&result.meta, &result.typed_values);
+                        state.restore_values(&compiled_meta, &result.typed_values);
                     }
-                    self.sync_after(state, &result.meta, vable);
+                    self.sync_after(state, &compiled_meta, vable);
                     std::hint::black_box(&mut *state);
                 }
             }
@@ -7642,7 +7645,7 @@ impl<S: JitState> JitDriver<S> {
             };
         }
 
-        let exit_meta = result.meta.clone();
+        let exit_meta = result.meta.take().expect("a detailed run carries its meta");
         state.restore_values(&exit_meta, &result.typed_values);
         self.sync_after(state, &exit_meta, vable);
         DetailedDriverRunOutcome::Jump {
@@ -7780,7 +7783,7 @@ impl<S: JitState> JitDriver<S> {
 
         let is_finish = result.is_finish;
         let is_exit_frame_with_exception = result.is_exit_frame_with_exception;
-        let exit_meta = result.meta.clone();
+        let exit_meta = result.meta.take().expect("a detailed run carries its meta");
         let fail_index = result.fail_index;
         let trace_id = result.trace_id;
         // Carried past the finish arm below, which is the one that has none.

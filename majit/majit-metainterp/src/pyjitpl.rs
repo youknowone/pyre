@@ -11317,7 +11317,7 @@ impl<M: Clone> MetaInterp<M> {
 
         Some(CompileResult {
             typed_values,
-            meta,
+            meta: Some(meta),
             fail_index,
             trace_id,
             descr_arc: (!is_finish).then_some(descr_arc),
@@ -11363,7 +11363,7 @@ impl<M: Clone> MetaInterp<M> {
         Some(self.execute_assembler_at_dispatch_key(
             &token,
             green_key,
-            meta,
+            Some(meta),
             live_values,
             dispatch_key,
         ))
@@ -11434,7 +11434,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         procedure_token: &std::sync::Arc<JitCellToken>,
         green_key: u64,
-        meta: std::sync::Arc<M>,
+        meta: Option<std::sync::Arc<M>>,
         live_values: &[Value],
         dispatch_key: u32,
     ) -> CompileResult<M> {
@@ -15018,7 +15018,10 @@ impl<M: Clone> MetaInterp<M> {
         let typed_values = result.typed_values.clone();
         let savedata = result.savedata;
         let exception = result.exception.clone();
-        let meta = result.meta.clone();
+        let meta = result
+            .meta
+            .clone()
+            .expect("a detailed run carries its meta");
 
         if is_finish {
             // Normal finish (not a guard failure)
