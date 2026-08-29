@@ -518,6 +518,9 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_is_nursery_object(Some(gc_is_nursery_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
+    majit_gc::set_active_write_barrier_before_move(Some(
+        gc_write_barrier_before_move_via_active_runtime,
+    ));
     majit_gc::set_active_finalizer_hooks(
         Some(register_finalizer_via_active_runtime),
         Some(finalizer_next_dead_via_active_runtime),
@@ -2046,6 +2049,15 @@ fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
 
 /// Host-side write-barrier trampoline for GC-managed objects updated
 /// outside compiled code.
+fn gc_write_barrier_before_move_via_active_runtime(obj: GcRef) {
+    if gc_box::present() {
+        with_cranelift_gc(|gc| gc.writebarrier_before_move(obj));
+    } else if majit_gc::gc_sync::is_initialized() {
+        // Root-free, for the reason `MiniMarkGc::write_barrier` (majit-gc/src/lib.rs) states.
+        majit_gc::gc_sync::gc_op(|g| g.writebarrier_before_move(obj.0));
+    }
+}
+
 fn gc_write_barrier_via_active_runtime(obj: GcRef) {
     if gc_box::present() {
         with_cranelift_gc(|gc| gc.write_barrier(obj));

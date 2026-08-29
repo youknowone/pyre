@@ -352,6 +352,10 @@ fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
 
+fn pyre_object_gc_write_barrier_before_move_trampoline(obj: *mut u8) {
+    majit_gc::gc_write_barrier_before_move(majit_ir::GcRef(obj as usize));
+}
+
 fn pyre_object_gc_write_barrier_managed_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier_managed(majit_ir::GcRef(obj as usize));
 }
@@ -5040,6 +5044,9 @@ fn install_pyre_object_hooks() {
     );
     pyre_object::register_gc_owns_object_hook(pyre_object_gc_owns_object_trampoline);
     pyre_object::register_gc_write_barrier_hook(pyre_object_gc_write_barrier_trampoline);
+    pyre_object::register_gc_write_barrier_before_move_hook(
+        pyre_object_gc_write_barrier_before_move_trampoline,
+    );
     pyre_object::register_gc_write_barrier_managed_hook(
         pyre_object_gc_write_barrier_managed_trampoline,
     );

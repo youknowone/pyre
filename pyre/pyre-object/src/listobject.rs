@@ -668,7 +668,10 @@ impl W_ListObject {
         };
         let obj = crate::gc_roots::shadow_stack_get(root_base);
         let value = prepare_list_ref_store(obj, value);
-        let obj = crate::gc_roots::shadow_stack_get(root_base);
+        // The shift below moves items across card pages; generalize first.
+        // The barrier answers with the list's post-barrier address, so this is
+        // the reload the following store needs as well.
+        let obj = list_before_move_barrier(crate::gc_roots::shadow_stack_get(root_base));
         let list = &mut *(obj as *mut W_ListObject);
         let base = items_block_items_base(list.items);
         let p = base.add(index);
@@ -679,14 +682,18 @@ impl W_ListObject {
 
     unsafe fn object_remove(&mut self, index: usize) -> PyObjectRef {
         assert!(index < self.length_relaxed());
-        let base = items_block_items_base(self.items);
+        // The barrier's ownership query is a safepoint, so `self` is reloaded
+        // through the address it answers with rather than reused.
+        let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
+        let this = &mut *(obj as *mut W_ListObject);
+        let base = items_block_items_base(this.items);
         let value = *base.add(index);
         let p = base.add(index);
-        std::ptr::copy(p.add(1), p, self.length_relaxed() - index - 1);
+        std::ptr::copy(p.add(1), p, this.length_relaxed() - index - 1);
         // Phase L2: the varsize walker forwards items[0..capacity], so clear the
         // vacated tail slot the shift left holding a stale duplicate.
-        *base.add(self.length_relaxed() - 1) = PY_NULL;
-        self.set_length_relaxed(self.length_relaxed() - 1);
+        *base.add(this.length_relaxed() - 1) = PY_NULL;
+        this.set_length_relaxed(this.length_relaxed() - 1);
         value
     }
 
@@ -700,7 +707,11 @@ impl W_ListObject {
     }
 
     unsafe fn object_reverse(&mut self) {
-        self.object_items_slice_mut().reverse();
+        // A permutation moves pointers across card pages without storing any
+        // new reference, so it owes the same barrier as the shifts above.
+        let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
+        let this = &mut *(obj as *mut W_ListObject);
+        this.object_items_slice_mut().reverse();
     }
 
     unsafe fn object_drain(&mut self, range: std::ops::Range<usize>) {
@@ -711,14 +722,18 @@ impl W_ListObject {
         if count == 0 {
             return;
         }
-        let base = items_block_items_base(self.items);
+        // The barrier's ownership query is a safepoint, so `self` is reloaded
+        // through the address it answers with rather than reused.
+        let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
+        let this = &mut *(obj as *mut W_ListObject);
+        let base = items_block_items_base(this.items);
         let p = base.add(start);
-        std::ptr::copy(p.add(count), p, self.length_relaxed() - end);
-        let old_len = self.length_relaxed();
-        self.set_length_relaxed(self.length_relaxed() - count);
+        std::ptr::copy(p.add(count), p, this.length_relaxed() - end);
+        let old_len = this.length_relaxed();
+        this.set_length_relaxed(this.length_relaxed() - count);
         // Phase L2: clear the vacated tail [new_len..old_len] the shift left
         // holding stale duplicates, so the varsize walker (0..capacity) skips them.
-        for i in self.length_relaxed()..old_len {
+        for i in this.length_relaxed()..old_len {
             *base.add(i) = PY_NULL;
         }
     }
@@ -1490,6 +1505,38 @@ fn list_write_barrier_impl(obj: PyObjectRef, managed: bool) {
         let items = unsafe { (*(obj as *const W_ListObject)).items };
         crate::gc_hook::try_gc_write_barrier(items as *mut u8);
     }
+}
+
+/// Generalize the items block's cards before its items are permuted in place,
+/// and answer with the list at its post-barrier address.
+///
+/// A move stores no new reference, so `list_write_barrier` does not answer for
+/// it: the referenced set is unchanged and only which card page holds each
+/// pointer moves. A minor reaches a carded array through its dirty pages
+/// alone, so a young pointer shifted into a clean page would not be scanned.
+///
+/// The ownership query is a safepoint and the barrier reads a header, so the
+/// block cannot be handed over unchecked and the caller cannot keep its own
+/// reference across the call — hence the root bracket here and the returned
+/// address rather than a `()`.
+#[majit_macros::dont_look_inside]
+pub fn list_before_move_barrier(obj: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _obj = crate::gc_roots::pin_root(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = unsafe { &*(obj as *const W_ListObject) };
+    if list.strategy == ListStrategy::Object
+        && !list.items.is_null()
+        && crate::gc_hook::try_gc_owns_object(list.items as *mut u8)
+    {
+        // The ownership query is a safepoint. Reload the field it may have
+        // forwarded instead of barriering the pre-collection array address.
+        let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+        let items = unsafe { (*(obj as *const W_ListObject)).items };
+        crate::gc_hook::try_gc_write_barrier_before_move(items as *mut u8);
+    }
+    crate::gc_roots::shadow_stack_get(obj_slot)
 }
 
 /// Run the list's pre-write barrier while keeping the value in a relocatable

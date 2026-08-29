@@ -692,6 +692,14 @@ pub trait GcAllocator: Send {
         self.write_barrier(obj);
     }
 
+    /// incminimark.py `writebarrier_before_move`: generalize `obj`'s cards
+    /// before its items are permuted in place.  A move stores no new
+    /// reference, so [`Self::write_barrier`] does not answer for it; what
+    /// changes is which card page holds each pointer, and a minor reaches a
+    /// carded array only through its dirty pages.  The default is the no-op a
+    /// collector without card marking wants.
+    fn writebarrier_before_move(&mut self, _obj: GcRef) {}
+
     /// incminimark.py jit_remember_young_pointer_from_array:
     /// Called by JIT when TRACK_YOUNG_PTRS set but CARDS_SET not.
     /// Tries to set CARDS_SET if HAS_CARDS; else generic barrier.
@@ -3388,6 +3396,7 @@ pub type WriteBarrierFn = fn(obj: GcRef);
 
 global_hook!(static ACTIVE_WRITE_BARRIER: WriteBarrierFn);
 global_hook!(static ACTIVE_WRITE_BARRIER_MANAGED: WriteBarrierFn);
+global_hook!(static ACTIVE_WRITE_BARRIER_BEFORE_MOVE: WriteBarrierFn);
 
 /// Install the active backend's write-barrier callback. Pass `None` to clear.
 pub fn set_active_write_barrier(hook: Option<WriteBarrierFn>) {
@@ -3399,6 +3408,11 @@ pub fn set_active_write_barrier_managed(hook: Option<WriteBarrierFn>) {
     ACTIVE_WRITE_BARRIER_MANAGED.set(hook);
 }
 
+/// Install the active backend's before-move barrier. Pass `None` to clear.
+pub fn set_active_write_barrier_before_move(hook: Option<WriteBarrierFn>) {
+    ACTIVE_WRITE_BARRIER_BEFORE_MOVE.set(hook);
+}
+
 /// Perform a write barrier through the active backend.
 ///
 /// Calling convention: callers must invoke this before storing a GC reference
@@ -3407,6 +3421,20 @@ pub fn set_active_write_barrier_managed(hook: Option<WriteBarrierFn>) {
 /// [`WriteBarrierFn`]; this is a no-op when no barrier is installed.
 pub fn gc_write_barrier(obj: GcRef) {
     if let Some(f) = ACTIVE_WRITE_BARRIER.get() {
+        f(obj)
+    }
+}
+
+/// Generalize `obj`'s cards before its items are permuted in place.
+///
+/// The ordinary barrier answers "a reference was stored into `obj`", which a
+/// move does not do: the set of referenced objects is unchanged and only which
+/// card page holds each pointer changes. A minor scans a carded array's dirty
+/// pages alone, so a young pointer shifted into a clean page is not reached.
+/// Calling convention: invoke this before the move, matching
+/// [`MiniMarkGC::writebarrier_before_move`].
+pub fn gc_write_barrier_before_move(obj: GcRef) {
+    if let Some(f) = ACTIVE_WRITE_BARRIER_BEFORE_MOVE.get() {
         f(obj)
     }
 }

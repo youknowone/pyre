@@ -686,10 +686,16 @@ pub type GcWriteBarrierHookFn = fn(obj: *mut u8);
 
 majit_gc::global_hook!(static GC_WRITE_BARRIER_HOOK: GcWriteBarrierHookFn);
 majit_gc::global_hook!(static GC_WRITE_BARRIER_MANAGED_HOOK: GcWriteBarrierHookFn);
+majit_gc::global_hook!(static GC_WRITE_BARRIER_BEFORE_MOVE_HOOK: GcWriteBarrierHookFn);
 
 /// Install the write-barrier callback.
 pub fn register_gc_write_barrier_hook(hook: GcWriteBarrierHookFn) {
     GC_WRITE_BARRIER_HOOK.set(Some(hook));
+}
+
+/// Install the callback run before an object's items are permuted in place.
+pub fn register_gc_write_barrier_before_move_hook(hook: GcWriteBarrierHookFn) {
+    GC_WRITE_BARRIER_BEFORE_MOVE_HOOK.set(Some(hook));
 }
 
 /// Install the callback for objects returned by a managed allocation hook.
@@ -714,6 +720,24 @@ pub fn clear_gc_write_barrier_managed_hook() {
 #[majit_macros::dont_look_inside]
 pub extern "C" fn try_gc_write_barrier(obj: *mut u8) -> bool {
     match GC_WRITE_BARRIER_HOOK.get() {
+        Some(f) => {
+            f(obj);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Generalize `obj`'s cards before its items are permuted in place.
+///
+/// A move stores no new reference, so [`try_gc_write_barrier`] does not answer
+/// for it: the referenced set is unchanged and only which card page holds each
+/// pointer moves. A minor reaches a carded array through its dirty pages
+/// alone, so a young pointer shifted into a clean page is not scanned.
+// `dont_look_inside`: host hook dispatch, as for `try_gc_write_barrier`.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn try_gc_write_barrier_before_move(obj: *mut u8) -> bool {
+    match GC_WRITE_BARRIER_BEFORE_MOVE_HOOK.get() {
         Some(f) => {
             f(obj);
             true

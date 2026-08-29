@@ -1002,6 +1002,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
     majit_gc::set_active_gc_id_or_identityhash(Some(wasm_id_or_identityhash));
     majit_gc::set_active_write_barrier(Some(wasm_active_gc_write_barrier));
+    majit_gc::set_active_write_barrier_before_move(Some(wasm_active_gc_write_barrier_before_move));
     majit_gc::set_active_get_objects(Some(wasm_get_objects));
     majit_gc::set_active_get_referents(Some(wasm_get_referents));
     majit_gc::set_active_is_tracked(Some(wasm_is_tracked));
@@ -1756,6 +1757,10 @@ pub(crate) fn wasm_gc_remove_roots(slots: impl Iterator<Item = usize>) {
 /// set / dict stores route through `majit_gc::gc_write_barrier`). Mirrors
 /// `dynasm_gc_write_barrier`; without it every interpreter ref-store is a
 /// silent no-op, so a collecting nursery loses old→young pointers.
+fn wasm_active_gc_write_barrier_before_move(obj: GcRef) {
+    with_wasm_active_gc_mut(|gc| gc.writebarrier_before_move(obj));
+}
+
 fn wasm_active_gc_write_barrier(obj: GcRef) {
     with_wasm_active_gc_mut(|gc| gc.write_barrier(obj));
 }

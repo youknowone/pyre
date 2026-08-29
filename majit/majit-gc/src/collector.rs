@@ -8152,6 +8152,10 @@ impl Default for MiniMarkGC {
 }
 
 impl GcAllocator for MiniMarkGC {
+    fn writebarrier_before_move(&mut self, obj: GcRef) {
+        MiniMarkGC::writebarrier_before_move(self, obj.0);
+    }
+
     fn debug_validate_oldgen_freeblocks(&self, site: &str) {
         self.oldgen.debug_validate_freeblocks(site);
     }
@@ -14291,6 +14295,24 @@ cache size\t: 8192 kB\n";
 
         assert_eq!(gc.old_objects_pointing_to_young.len(), before + 1);
         assert!(gc.old_objects_pointing_to_young.contains(&array.0));
+    }
+
+    /// The host reaches this barrier as a `GcAllocator`, never as a
+    /// `MiniMarkGC`, so the forwarding impl is what production actually runs.
+    /// The trait's own default is a no-op, which would silently drop the call.
+    #[test]
+    fn the_trait_entry_reaches_the_collectors_before_move_barrier() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(8, 8, 0, true, vec![]));
+        let array = gc.alloc_in_oldgen_with_cards(tid, GcHeader::SIZE + 8 + 8 * 64, 64, true);
+        unsafe { (*header_of(array.0)).set_flag(flags::CARDS_SET) };
+        let before = gc.remembered_set.len();
+
+        let dynamic: &mut dyn crate::GcAllocator = &mut gc;
+        dynamic.writebarrier_before_move(array);
+
+        assert_eq!(gc.remembered_set.len(), before + 1);
+        assert!(gc.remembered_set.contains(&array.0));
     }
 
     /// An array with no card marked has nothing the move could invalidate.
