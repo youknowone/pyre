@@ -41,10 +41,80 @@ fn offset_in_bytes_type() -> PyObjectRef {
     }) as PyObjectRef
 }
 
+/// The positional-or-keyword binding a `gateway.py` `unwrap_spec` wrapper does
+/// for a module-level entry point that carries a default, and so cannot
+/// declare a fixed arity at registration.  `argnames` is the whole parameter
+/// list and `required` how many of them have no default; a parameter that was
+/// not supplied comes back as `PY_NULL`, which [`optional`] reads as absent.
+fn bind_entry_point(
+    args: &[PyObjectRef],
+    name: &'static str,
+    argnames: &[&'static str],
+    required: usize,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > argnames.len() {
+        let takes = if required == argnames.len() {
+            format!("takes {} positional arguments", argnames.len())
+        } else {
+            format!(
+                "takes from {required} to {} positional arguments",
+                argnames.len()
+            )
+        };
+        let given = positional.len();
+        let were = if given == 1 { "was" } else { "were" };
+        return Err(PyError::type_error(format!(
+            "{name}() {takes} but {given} {were} given"
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(kwargs, argnames, name)?;
+    let mut bound = Vec::with_capacity(argnames.len());
+    for (index, argname) in argnames.iter().enumerate() {
+        let value =
+            crate::builtins::bind_pos_or_kw(positional, kwargs, index, argname, name, index + 1)?;
+        bound.push(value.unwrap_or(pyre_object::PY_NULL));
+    }
+    let missing: Vec<&str> = argnames[..required]
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| bound[*index].is_null())
+        .map(|(_, argname)| *argname)
+        .collect();
+    if !missing.is_empty() {
+        let plural = if missing.len() == 1 { "" } else { "s" };
+        return Err(PyError::type_error(format!(
+            "{name}() missing {} required positional argument{plural}: {}",
+            missing.len(),
+            join_argnames(&missing)
+        )));
+    }
+    Ok(bound)
+}
+
+/// `argument.py ArgErrCount`'s name list: `'a'`, `'a' and 'b'`, `'a', 'b', and
+/// 'c'`.
+fn join_argnames(names: &[&str]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+    match quoted.as_slice() {
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [head @ .., last] => format!("{}, and {last}", head.join(", ")),
+        [] => String::new(),
+    }
+}
+
+/// One optional slot of [`bind_entry_point`]'s result.
+fn optional(bound: &[PyObjectRef], index: usize) -> Option<PyObjectRef> {
+    let value = bound[index];
+    (!value.is_null()).then_some(value)
+}
+
 /// `func.py newp`.
 pub fn newp(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_init = args.get(1).copied().unwrap_or_else(pyre_object::w_none);
-    ctypeobj::newp(args[0], w_init)
+    let a = bind_entry_point(args, "newp", &["ctype", "init"], 1)?;
+    let w_init = optional(&a, 1).unwrap_or_else(pyre_object::w_none);
+    ctypeobj::newp(a[0], w_init)
 }
 
 /// `func.py cast`.
@@ -121,11 +191,12 @@ pub fn getcname(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py string`.
 pub fn string(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let maxlen = match args.get(1) {
-        Some(&w_maxlen) => crate::baseobjspace::int_w(w_maxlen)?,
+    let a = bind_entry_point(args, "string", &["cdata", "maxlen"], 1)?;
+    let maxlen = match optional(&a, 1) {
+        Some(w_maxlen) => crate::baseobjspace::int_w(w_maxlen)?,
         None => -1,
     };
-    ctypeobj::string(args[0], maxlen)
+    ctypeobj::string(a[0], maxlen)
 }
 
 /// `func.py unpack`.
@@ -135,11 +206,17 @@ pub fn unpack(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py typeoffsetof`.
 pub fn typeoffsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let following = match args.get(2) {
-        Some(&w_following) => crate::baseobjspace::int_w(w_following)? != 0,
+    let a = bind_entry_point(
+        args,
+        "typeoffsetof",
+        &["ctype", "field_or_index", "following"],
+        2,
+    )?;
+    let following = match optional(&a, 2) {
+        Some(w_following) => crate::baseobjspace::int_w(w_following)? != 0,
         None => false,
     };
-    let (w_ctype, offset) = direct_typeoffsetof(args[0], args[1], following)?;
+    let (w_ctype, offset) = direct_typeoffsetof(a[0], a[1], following)?;
     let roots = pyre_object::gc_roots::push_roots();
     let field_slot = roots.base();
     let _ = roots.pin_root(w_ctype);
@@ -204,11 +281,12 @@ pub fn direct_typeoffsetof(
 
 /// `func.py rawaddressof`.
 pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let ct = ctypeobj::ctype_arg(args[0])?;
+    let a = bind_entry_point(args, "rawaddressof", &["ctype", "cdata", "offset"], 3)?;
+    let ct = ctypeobj::ctype_arg(a[0])?;
     if ct.kind != ctypeobj::KIND_POINTER {
         return Err(PyError::type_error("expected a pointer ctype"));
     }
-    let cdata = cdataobj::cdata_arg(args[1])?;
+    let cdata = cdataobj::cdata_arg(a[1])?;
     let source_ct = ctypeobj::ctype_at(cdata.ctype)
         .ok_or_else(|| PyError::system_error("cdata without a ctype"))?;
     if !source_ct.is_ptr_or_array() && !source_ct.is_struct_or_union() {
@@ -216,17 +294,15 @@ pub fn rawaddressof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
             "expected a cdata struct/union/array/pointer object",
         ));
     }
-    let offset = match args.get(2) {
-        Some(&w_offset) => crate::baseobjspace::int_w(w_offset)?,
-        None => 0,
-    };
+    let offset = crate::baseobjspace::int_w(a[2])?;
     let ptr = unsafe { cdata.ptr.offset(offset as isize) };
-    Ok(cdataobj::new_cdata(ptr, args[0]))
+    Ok(cdataobj::new_cdata(ptr, a[0]))
 }
 
 /// `func.py from_buffer`.
 pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let w_ctype = args[0];
+    let a = bind_entry_point(args, "from_buffer", &["ctype", "x", "require_writable"], 2)?;
+    let w_ctype = a[0];
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     if !ct.is_ptr_or_array() {
         return Err(PyError::type_error(format!(
@@ -236,14 +312,14 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     }
     let roots = pyre_object::gc_roots::push_roots();
     let object_slot = roots.base();
-    let _ = roots.pin_root(args[1]);
+    let _ = roots.pin_root(a[1]);
     if unsafe { pyre_object::unicodeobject::is_str(roots.get(object_slot)) } {
         return Err(PyError::type_error(
             "from_buffer() cannot return the address of a unicode object",
         ));
     }
-    let require_writable = match args.get(2) {
-        Some(&w) => crate::baseobjspace::int_w(w)? != 0,
+    let require_writable = match optional(&a, 2) {
+        Some(w) => crate::baseobjspace::int_w(w)? != 0,
         None => false,
     };
     let (ptr, buffersize, owner) = if require_writable {
@@ -306,13 +382,14 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py gcp`.
 pub fn gcp(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let a = bind_entry_point(args, "gcp", &["cdata", "destructor", "size"], 2)?;
     let roots = pyre_object::gc_roots::push_roots();
     let cdata_slot = roots.base();
-    let _ = roots.pin_root(args[0]);
+    let _ = roots.pin_root(a[0]);
     let destructor_slot = cdata_slot + 1;
-    let _ = roots.pin_root(args[1]);
-    let size = match args.get(2) {
-        Some(&w_size) => crate::baseobjspace::int_w(w_size)?,
+    let _ = roots.pin_root(a[1]);
+    let size = match optional(&a, 2) {
+        Some(w_size) => crate::baseobjspace::int_w(w_size)?,
         None => 0,
     };
     cdataobj::with_gc(roots.get(cdata_slot), roots.get(destructor_slot), size)
@@ -320,17 +397,18 @@ pub fn gcp(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `func.py offset_in_bytes`.
 pub fn offset_in_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    if !unsafe { pyre_object::bytesobject::is_bytes(args[0]) } {
+    let a = bind_entry_point(args, "_offset_in_bytes", &["bytes", "offset"], 2)?;
+    if !unsafe { pyre_object::bytesobject::is_bytes(a[0]) } {
         return Err(PyError::type_error(format!(
             "must be bytes, not {}",
-            crate::type_methods::arg_type_name(args[0])
+            crate::type_methods::arg_type_name(a[0])
         )));
     }
     let _ = offset_in_bytes_type();
     let roots = pyre_object::gc_roots::push_roots();
     let bytes_slot = roots.base();
-    let _ = roots.pin_root(args[0]);
-    let offset = crate::baseobjspace::int_w(args[1])?;
+    let _ = roots.pin_root(a[0]);
+    let offset = crate::baseobjspace::int_w(a[1])?;
     let obj = OffsetInBytes::allocate_stable(OffsetInBytes {
         offset,
         ..Default::default()
@@ -459,15 +537,29 @@ pub fn new_union_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `newtype.py complete_struct_or_union` — the third argument is ignored, as
 /// its name says, and the last four carry defaults.
 pub fn complete_struct_or_union(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let a = bind_entry_point(
+        args,
+        "complete_struct_or_union",
+        &[
+            "ctype",
+            "fields",
+            "ignored",
+            "totalsize",
+            "totalalignment",
+            "sflags",
+            "pack",
+        ],
+        2,
+    )?;
     let int_arg = |i: usize, default: i64| -> Result<i64, PyError> {
-        match args.get(i) {
-            Some(&w) => crate::baseobjspace::int_w(w),
+        match optional(&a, i) {
+            Some(w) => crate::baseobjspace::int_w(w),
             None => Ok(default),
         }
     };
     newtype::complete_struct_or_union(
-        args[0],
-        args[1],
+        a[0],
+        a[1],
         int_arg(3, -1)?,
         int_arg(4, -1)?,
         int_arg(5, 0)?,
@@ -484,22 +576,29 @@ pub fn new_enum_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 
 /// `newtype.py new_function_type`.
 pub fn new_function_type(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let ellipsis = match args.get(2) {
-        Some(&w) => crate::baseobjspace::int_w(w)? != 0,
+    let a = bind_entry_point(
+        args,
+        "new_function_type",
+        &["fargs", "fresult", "ellipsis", "abi"],
+        2,
+    )?;
+    let ellipsis = match optional(&a, 2) {
+        Some(w) => crate::baseobjspace::int_w(w)? != 0,
         None => false,
     };
-    let abi = match args.get(3) {
-        Some(&w) => crate::baseobjspace::int_w(w)?,
+    let abi = match optional(&a, 3) {
+        Some(w) => crate::baseobjspace::int_w(w)?,
         None => super::interp_cffi_backend::default_abi() as i64,
     };
-    newtype::new_function_type(args[0], args[1], ellipsis, abi)
+    newtype::new_function_type(a[0], a[1], ellipsis, abi)
 }
 
 /// `libraryobj.py load_library`.
 pub fn load_library(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
-    let flags = match args.get(1) {
-        Some(&w) => crate::baseobjspace::int_w(w)?,
+    let a = bind_entry_point(args, "load_library", &["filename", "flags"], 1)?;
+    let flags = match optional(&a, 1) {
+        Some(w) => crate::baseobjspace::int_w(w)?,
         None => 0,
     };
-    super::libraryobj::load_library(args[0], flags)
+    super::libraryobj::load_library(a[0], flags)
 }

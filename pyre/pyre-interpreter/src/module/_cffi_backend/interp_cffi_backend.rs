@@ -38,7 +38,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("alignof", super::func::alignof, 1),
         ("getcname", super::func::getcname, 2),
         ("unpack", super::func::unpack, 2),
-        ("memmove", super::func::memmove, 3),
         ("release", super::func::release, 1),
         ("newp_handle", super::handle::newp_handle, 2),
         ("from_handle", super::handle::from_handle, 1),
@@ -81,6 +80,21 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::gateway::with_module(MODULE, crate::make_module_builtin_function(name, f)),
         );
     }
+    // `func.py memmove(dest, src, n)` — a fixed arity, but its parameters are
+    // positional-or-keyword upstream, so the registration carries the names.
+    crate::module_ns_store(
+        ns,
+        "memmove",
+        crate::gateway::with_module(
+            MODULE,
+            crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                "memmove",
+                super::func::memmove as crate::gateway::BuiltinCodeFn,
+                3,
+                crate::gateway::Signature::new(vec!["dest", "src", "n"], None, None, 0, 0),
+            ),
+        ),
+    );
     // The types `moduledef.py` publishes.
     crate::module_ns_store(ns, "CType", super::ctypeobj::ctype_type());
     crate::module_ns_store(ns, "_CDataBase", super::cdataobj::cdata_type());
