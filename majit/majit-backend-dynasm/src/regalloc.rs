@@ -6589,6 +6589,58 @@ mod tests {
         );
     }
 
+    /// `prepare_op_call_malloc_nursery_varsize` reads `lengthloc` only after
+    /// `spill_or_move_registers_before_call(SAVE_ALL_REGS)` has popped every
+    /// register binding, so a length that outlives the allocation reaches the
+    /// assembler in its frame slot, not in a register. Upstream says the same
+    /// out loud — x86/assembler.py:2617-2621 loads a non-`RegLoc` `lengthloc`
+    /// with `MOV(edx, lengthloc)`, and aarch64/assembler.py:745-751 asserts
+    /// `lengthloc.is_stack()` before `regalloc_mov`.
+    ///
+    /// Both backends carry an arm for this shape. Neither may substitute an
+    /// immediate 0, which sizes the block for no items while the
+    /// `gen_initialize_len` store that follows stamps the real length into it.
+    #[test]
+    fn call_malloc_nursery_varsize_hands_over_a_frame_resident_length() {
+        let i0 = OpRef::int_op(0);
+        let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
+
+        // arglocs = [lengthloc, imm(itemsize), imm(kind)] is built from
+        // args [kind, itemsize, length].
+        let malloc = Op::new(
+            OpCode::CallMallocNurseryVarsize,
+            &[rb(OpRef::const_int(0)), rb(OpRef::const_int(8)), rb(i0)],
+        );
+        malloc.pos.set(OpRef::ref_op(1));
+        // The length outlives the allocation, which is the case upstream calls
+        // typical: "it's typically also present in the next operation that will
+        // copy it inside the new array".
+        let finish = Op::new(OpCode::Finish, &[rb(i0)]);
+        finish.pos.set(OpRef::void_op(2));
+        let ops = vec![malloc, finish];
+
+        let mut ra = RegAlloc::new(indexmap::IndexMap::new(), &inputargs, &ops);
+        ra.prepare_loop();
+        let ra_ops = ra.walk_operations();
+
+        let lengthloc = ra_ops
+            .iter()
+            .find_map(|ra_op| match ra_op {
+                RegAllocOp::Perform {
+                    op_index, arglocs, ..
+                } if ops[*op_index].opcode == OpCode::CallMallocNurseryVarsize => {
+                    arglocs.first().copied()
+                }
+                _ => None,
+            })
+            .expect("the varsize allocation reached the assembler");
+        assert!(
+            matches!(lengthloc, Loc::Frame(_) | Loc::Ebp(_)),
+            "the length is spilled before it is read, so the assembler needs a \
+             memory arm for it; got {lengthloc:?}"
+        );
+    }
+
     #[test]
     fn test_j2_guard_dispatch_uses_lir_operands() {
         let i0 = OpRef::int_op(0);
