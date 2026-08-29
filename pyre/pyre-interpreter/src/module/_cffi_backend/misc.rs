@@ -435,7 +435,7 @@ pub fn dlopen_w(w_filename: PyObjectRef, flags: i64) -> Result<(String, usize, b
             return Err(PyError::runtime_error("cannot call dlopen(NULL)"));
         }
         let fname = unsafe { ct.extra_repr(cdata.ptr)? };
-        return Ok((fname, adopt_raw_handle(cdata.ptr), false));
+        return Ok((fname, adopt_raw_handle(cdata.ptr)?, false));
     }
     let is_none = unsafe { pyre_object::pyobject::is_none(w_filename) };
     let fname = if is_none {
@@ -462,14 +462,23 @@ fn filename_of(w_filename: PyObjectRef) -> Result<std::ffi::OsString, PyError> {
     ))
 }
 
+/// `rffi.cast(DLLHANDLE, handle)` — the raw address becomes the key the rest
+/// of this module looks symbols up under, which here means entering it in the
+/// loader's own table.
 #[cfg(all(feature = "host_env", unix))]
-fn adopt_raw_handle(handle: *mut u8) -> usize {
-    rustpython_host_env::ctypes::insert_raw_library_handle(handle.cast::<std::ffi::c_void>())
+fn adopt_raw_handle(handle: *mut u8) -> Result<usize, PyError> {
+    Ok(rustpython_host_env::ctypes::insert_raw_library_handle(
+        handle.cast::<std::ffi::c_void>(),
+    ))
 }
 
+/// A build without that table has no key to hand back, and answering `0` would
+/// name a library whose every symbol is missing.
 #[cfg(not(all(feature = "host_env", unix)))]
-fn adopt_raw_handle(_handle: *mut u8) -> usize {
-    0
+fn adopt_raw_handle(_handle: *mut u8) -> Result<usize, PyError> {
+    Err(PyError::os_error(
+        "dlopen() cannot adopt a raw 'void *' handle in this build",
+    ))
 }
 
 /// `rdynload.dlopen`, whose mode defaults to resolving everything now.
