@@ -364,6 +364,10 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
 /// registers no finalizer here, so there is nothing for it to withhold.  `_io`
 /// wants the other guard and carries its own
 /// (`_io::maybe_unregister_rpython_finalizer_io`).
+// `rgc.py`'s `may_ignore_finalizer` carries `@jit.dont_look_inside`.  Its
+// collector hook is runtime state, so the translated trace must retain one
+// residual call instead of reading the process-global hook while translating.
+#[majit_macros::dont_look_inside]
 pub fn may_ignore_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_ignore_finalizer(obj);
 }
@@ -1668,10 +1672,11 @@ impl ExecutionContext {
         // Enumerating a dict materialises key objects and can collect.  Keep
         // only owned key strings across that operation; raw values must be
         // looked up again after the module allocation.
-        let keys: Vec<String> = unsafe { pyre_object::w_dict_str_entries(self.builtins_module) }
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
+        let entries = unsafe { pyre_object::w_dict_str_entries(self.builtins_module) };
+        let mut keys = Vec::with_capacity(entries.len());
+        for (key, _) in entries {
+            keys.push(key);
+        }
         let module = pyre_object::w_module_new_aliasing_dict("builtins", self.builtins_module);
         // function.py BuiltinFunction.w_moduleobj. The defining
         // module object does not exist while `new_builtin_module_dict` fills

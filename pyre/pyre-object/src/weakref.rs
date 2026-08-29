@@ -166,33 +166,27 @@ pub unsafe fn w_weakref_object_set_hash(obj: PyObjectRef, value: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// Address of `W_Weakref::w_slots` for the shared slot helpers.
-///
-/// # Safety
-/// `obj` must point to a valid `W_Weakref`.
-unsafe fn weakref_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
-    unsafe { &mut (*(obj as *mut W_Weakref)).w_slots }
-}
-
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_weakref_object_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    unsafe { crate::slots::slot_get(obj, index, weakref_slots_field) }
+    let slots = unsafe { (*(obj as *const W_Weakref)).w_slots };
+    unsafe { crate::slots::slot_get(slots, index) }
 }
 
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_weakref_object_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    unsafe { crate::slots::slot_set(obj, index, value, weakref_slots_field) }
+    crate::slot_set_direct!(obj, index, value, W_Weakref, w_slots)
 }
 
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_weakref_object_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    unsafe { crate::slots::slot_del(obj, index, weakref_slots_field) }
+    let slots = unsafe { (*(obj as *const W_Weakref)).w_slots };
+    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 /// GC type id for the WEAKREF GcStruct. Registered by

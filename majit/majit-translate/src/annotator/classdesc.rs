@@ -2927,9 +2927,13 @@ impl ClassDef {
 
         // upstream: remove attribute from subclasses, merging into newattr.
         for subdef in Self::getallsubdefs(this) {
-            let existing = subdef.borrow_mut().attrs.remove(attr);
+            // classdesc.py merges before `del subdef.attrs[attr]`. Clone the
+            // existing value to release the RefCell borrow, but preserve that
+            // ordering: a failed union must not delete shared ClassDef state.
+            let existing = subdef.borrow().attrs.get(attr).cloned();
             if let Some(subattr) = existing {
                 newattr.merge(&subattr, this)?;
+                subdef.borrow_mut().attrs.remove(attr);
             }
             // accumulate attr_sources from all subclasses.
             let taken = subdef.borrow_mut().attr_sources.remove(attr);
@@ -3878,6 +3882,42 @@ mod tests {
         ClassDef::generalize_attr(&cd, "x", Some(SomeValue::Integer(SomeInteger::default())))
             .expect("generalize_attr must succeed without sources");
         assert!(cd.borrow().attrs.contains_key("x"));
+    }
+
+    #[test]
+    fn classdef_failed_generalize_preserves_subclass_attribute() {
+        let bk = make_bk();
+        let base_desc = make_classdesc(&bk, "pkg.Base");
+        let base = ClassDesc::getuniqueclassdef(&base_desc).expect("base classdef");
+        let child_desc = make_classdesc(&bk, "pkg.Child");
+        child_desc.borrow_mut().basedesc = Some(base_desc);
+        let child = ClassDesc::getuniqueclassdef(&child_desc).expect("child classdef");
+
+        let mut existing = Attribute::new("payload");
+        existing.s_value = SomeValue::Integer(SomeInteger::default());
+        child
+            .borrow_mut()
+            .attrs
+            .insert("payload".to_string(), existing);
+
+        let result = ClassDef::generalize_attr(
+            &base,
+            "payload",
+            Some(SomeValue::String(SomeString::default())),
+        );
+        assert!(result.is_err(), "int and string attrs must not unify");
+        assert!(
+            matches!(
+                child
+                    .borrow()
+                    .attrs
+                    .get("payload")
+                    .map(|attr| &attr.s_value),
+                Some(SomeValue::Integer(_))
+            ),
+            "classdesc.py merges before deleting the subclass attr, so a failed union must preserve it"
+        );
+        assert!(!base.borrow().attrs.contains_key("payload"));
     }
 
     #[test]

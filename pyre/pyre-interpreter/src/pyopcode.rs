@@ -592,6 +592,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
                 items.push(load_const_value(handler, element)?);
             }
             if items.len() == 3 {
+                let items = items.as_slice();
                 handler.slice_constant(items[0], items[1], items[2])
             } else {
                 handler.build_tuple(&items)

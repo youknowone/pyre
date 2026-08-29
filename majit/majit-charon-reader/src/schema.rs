@@ -17,6 +17,12 @@ pub struct LlbcFile {
 #[derive(Debug, Deserialize)]
 pub struct Translated {
     pub crate_name: String,
+    /// Extraction target metadata. Charon serializes this as an ordered
+    /// sequence because one artefact can in principle name several targets;
+    /// preserving that shape lets consumers require one unambiguous pointer
+    /// width instead of silently choosing a map winner.
+    #[serde(default)]
+    pub target_information: Vec<TargetInformationEntry>,
     pub fun_decls: Vec<Option<crate::ullbc::FunDecl>>,
     /// Static / const items the MIR references via `Place::Global` and
     /// `Operand::Const(Global { ... })`. Indexed by `def_id` (the same
@@ -40,7 +46,7 @@ pub struct Translated {
     /// trait-associated-type resolution.
     ///
     /// Every other top-level surface Charon emits (`ordered_decls`,
-    /// `options`, `target_information`, `item_names`,
+    /// `options`, `item_names`,
     /// `assoc_item_names`, `short_names`, …) is intentionally not
     /// modelled: serde skips unknown fields without allocating, which
     /// both keeps the loader resilient to Charon's release-to-release
@@ -71,4 +77,16 @@ pub struct SourceFile {
     /// [`crate::Llbc::file_path`] so a variant this crate has never seen
     /// loads rather than failing the whole artefact.
     pub name: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TargetInformationEntry {
+    pub key: String,
+    pub value: TargetInformation,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TargetInformation {
+    pub target_pointer_size: u8,
+    pub is_little_endian: bool,
 }

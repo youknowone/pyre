@@ -559,6 +559,9 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
 fn infer_concrete_from_op(kind: &OpKind) -> ConcreteType {
     match kind {
         OpKind::ConstInt(_) => ConcreteType::Signed,
+        // Unsigned shares the JIT integer register bank with Signed; the
+        // annotation/repr distinction is carried separately.
+        OpKind::ConstUInt(_) => ConcreteType::Signed,
         // RPython `getkind(lltype.Bool) == 'int'` (flatten.py:getkind);
         // codewriter folds Bool storage to int kind.
         OpKind::ConstBool(_) => ConcreteType::Signed,

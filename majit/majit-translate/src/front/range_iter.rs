@@ -58,17 +58,13 @@ use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, V
 /// A recognized exclusive int-`Range { start, end }` aggregate captured
 /// during body lowering (`front::mir`'s `Rvalue::Aggregate` arm).  Carries
 /// the ctor result (the range value the reflexive `into_iter` aliases into
-/// the loop iterator) and the two int bounds threaded into the `range()`
-/// builtin call.
+/// the loop iterator). The bounds are read from the live post-simplify
+/// FieldWrite chain when the pass runs.
 #[derive(Clone)]
 pub(crate) struct RangeNewSite {
     /// The `SyntheticTransparentCtor` result (the `Range` value) — locates
     /// the ctor op and the `next` iterator's backward-traced origin.
     pub result_var: Variable,
-    /// Lower bound `a` — the `range(a, b)` start argument.
-    pub start: Variable,
-    /// Upper bound `b` — the `range(a, b)` stop argument.
-    pub end: Variable,
 }
 
 /// Rewrite every captured exclusive-int-`Range` aggregate that feeds a
@@ -196,12 +192,20 @@ fn rewire_one_range_iter_site(
         ));
     }
 
-    // 4. The bounds must be defined so the `range()` call is well-formed.
-    if !graph_defines(graph, &site.start) || !graph_defines(graph, &site.end) {
+    // 4. Re-read the bounds from the live FieldWrite chain.  The capture is
+    //    made while lowering the MIR aggregate, but `simplify_lowered_graph`
+    //    runs before this pass and can replace a bound Variable while
+    //    updating its consumers.  The surviving FieldWrites are therefore
+    //    the authoritative post-simplify flow-graph values — exactly the
+    //    graph the annotator will consume.  Keeping the captured Variables
+    //    here made a valid loop decline when (for example) `save_point` was
+    //    forwarded through an emptied block in `w_method_new`.
+    let (start, end) = live_range_bounds(graph, &res).ok_or_else(|| {
+        format!("{name}: range construction has no unique live start/end FieldWrite pair")
+    })?;
+    if !graph_defines(graph, &start) || !graph_defines(graph, &end) {
         return Err(format!("{name}: range bounds are not defined in the graph"));
     }
-    let start = site.start.clone();
-    let end = site.end.clone();
 
     // 5. Remove every `start` / `end` `FieldWrite` on the range value (any
     //    block): after the divert `res` is a `SomeIterator`, so a surviving
@@ -367,6 +371,41 @@ fn graph_defines(graph: &FunctionGraph, var: &Variable) -> bool {
     })
 }
 
+/// The unique post-simplification `start` / `end` values written into one
+/// captured `Range` shell.  A duplicate, missing, or non-variable field value
+/// declines: the consumer rewrite is valid only for the exact two-field Rust
+/// `Range { start, end }` construction shape.
+fn live_range_bounds(
+    graph: &FunctionGraph,
+    range_result: &Variable,
+) -> Option<(Variable, Variable)> {
+    let mut start = None;
+    let mut end = None;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldWrite {
+            base,
+            field,
+            value: LinkArg::Value(value),
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if base != range_result {
+            continue;
+        }
+        let slot = match field.name.as_str() {
+            "start" => &mut start,
+            "end" => &mut end,
+            _ => continue,
+        };
+        if slot.replace(value.clone()).is_some() {
+            return None;
+        }
+    }
+    Some((start?, end?))
+}
+
 /// `t = range(start, end)` — the `range` builtin call the adapter resolves
 /// through `HOST_ENV.lookup_builtin("range")` → `SomeBuiltin("range")` →
 /// `builtin_range` (a `SomeList` carrying `range_step`).
@@ -517,8 +556,6 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
-                start: a,
-                end: b,
             }],
             &[opt],
         );
@@ -592,8 +629,6 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
-                start: a,
-                end: b,
             }],
             &[opt],
         );
@@ -671,8 +706,6 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range.clone(),
-                start: a,
-                end: b,
             }],
             &[opt],
         );

@@ -438,6 +438,41 @@ impl CallTarget {
     }
 }
 
+/// Split a Rust-qualified type path at top-level `::` separators while
+/// preserving separators inside generic arguments as part of the owning
+/// segment.  Charon's named owner is already a structural path; reconstructing
+/// a synthetic ctor from a rendered instantiation such as
+/// `core::option::Option<Result<*mut m::Object, e::Error>>` must therefore
+/// yield `core`, `option`, `Option<Result<*mut m::Object, e::Error>>`, not
+/// split the payload's module paths into false owner segments.
+pub(crate) fn split_qualified_path(path: &str) -> Vec<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 && bytes.get(i + 1) == Some(&b':') => {
+                if start < i {
+                    out.push(path[start..i].to_string());
+                }
+                i += 2;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < path.len() {
+        out.push(path[start..].to_string());
+    }
+    out
+}
+
 impl fmt::Display for CallTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -679,6 +714,11 @@ pub enum OpKind {
         class_root: Option<String>,
     },
     ConstInt(i64),
+    /// Word-sized unsigned integer constant. RPython stores the same Python
+    /// integer value as `ConstInt`, but its `Constant.concretetype` is
+    /// `lltype.Unsigned`; keeping the source tag prevents `r_uint ∪ int`
+    /// merges when MIR joins an unsigned literal with another `usize` value.
+    ConstUInt(u64),
     /// Translation-time `r_longlonglong` constant. This carrier may
     /// appear in flow/rtyping graphs but must never be coerced into a
     /// JIT register-kind `ConstInt`.
@@ -2802,6 +2842,9 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         let (bool_case, int_case) = match kind {
             Some(OpKind::ConstBool(b)) => (Some(*b), Some(i64::from(*b))),
             Some(OpKind::ConstInt(n)) => ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n)),
+            Some(OpKind::ConstUInt(n)) => {
+                ((*n == 0 || *n == 1).then_some(*n != 0), Some(*n as i64))
+            }
             _ => continue,
         };
         let block = &graph.blocks[block_idx];
@@ -2821,7 +2864,8 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
         // one survivor (`assert len(newexits) == 1`), falling back to the
         // `"default"` catch-all only when none match: a constant matching
         // two arms is a malformed switch that checkgraph's exitcase
-        // uniqueness invariant (`flowspace/model.py:686`) forbids.
+        // uniqueness invariant (`flowspace/model.py`, `checkgraph`:
+        // `assert len(allexitcases) == len(block.exits)`) forbids.
         let matching: Vec<usize> = block
             .exits
             .iter()
@@ -3059,6 +3103,247 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
     total_removed
 }
 
+/// Lower `core::ptr::write(raw as *mut T, T { fields... })` to field stores.
+///
+/// This is the Rust-source spelling of RPython's ordinary alloc-then-init
+/// graph shape: after `malloc(T)`, each member is written with its own
+/// `setfield`.  Charon extracts `ptr::write` as one generic FunDecl plus a
+/// concrete `generics.types[0]` at every call site.  Routing all those calls
+/// through one `FunctionPath(["core", "ptr", "write"])` therefore collapses
+/// the monomorphisations onto one `FunctionDesc`; the whole-program annotator
+/// then tries to union unrelated aggregate arguments (observed first as
+/// `W_LongObject ∪ Cell`).  RPython has no corresponding callable or union:
+/// the stores are operations in each caller graph.
+///
+/// The MIR front has already made the concrete type explicit on both sides:
+/// the destination is a `__cast_instance_intrinsic(T)` result and the value is a
+/// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  Calls in
+/// the source often split the aggregate from the stable allocation with
+/// residual GC hooks; resolve only phis whose every incoming path reaches the
+/// same constructor, then re-emit the registered complete field layout in
+/// declaration order at the destination.  The call's unit result, when still
+/// carried by MIR bookkeeping, becomes a `ConstNone` with the same `Void`
+/// representation.  Any indirect, disagreeing-phi, mismatched-owner, or
+/// incomplete spelling is left untouched to fail loud rather than guessing at
+/// a memory layout.
+pub fn lower_struct_ptr_writes(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> usize {
+    use crate::flowspace::model::Variable;
+
+    fn registered_layout<'a>(
+        owner: &str,
+        struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    ) -> Option<&'a Vec<(String, ValueType)>> {
+        if let Some(exact) = struct_field_attrs.get(owner) {
+            return Some(exact);
+        }
+        let mut leaf_matches = struct_field_attrs
+            .iter()
+            .filter(|(key, _)| key.rsplit("::").next() == Some(owner));
+        let (_, only) = leaf_matches.next()?;
+        (leaf_matches.next().is_none()).then_some(only)
+    }
+
+    fn producer_root(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<Variable> {
+        if depth == 0 {
+            return None;
+        }
+        if graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| op.result.as_ref() == Some(var))
+        {
+            return Some(var.clone());
+        }
+        let (target, slot) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|input| input == var)
+                .map(|slot| (block.id, slot))
+        })?;
+        let mut root: Option<Variable> = None;
+        let mut saw_predecessor = false;
+        for link in graph.blocks.iter().flat_map(|block| &block.exits) {
+            if link.target != target {
+                continue;
+            }
+            saw_predecessor = true;
+            let incoming = link.args.get(slot)?.as_variable()?;
+            let incoming_root = producer_root(graph, incoming, depth - 1)?;
+            match &root {
+                None => root = Some(incoming_root),
+                Some(seen) if seen == &incoming_root => {}
+                Some(_) => return None,
+            }
+        }
+        saw_predecessor.then_some(root).flatten()
+    }
+
+    #[derive(Clone)]
+    struct Rewrite {
+        block: usize,
+        op: usize,
+        destination: Variable,
+        stores: Vec<(FieldDescriptor, LinkArg, ValueType)>,
+        result: Option<Variable>,
+    }
+
+    let mut rewrites = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                args,
+                result_ty: ValueType::Void,
+            } = &op.kind
+            else {
+                continue;
+            };
+            if args.len() != 2
+                || !segments
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["core", "ptr", "write"])
+            {
+                continue;
+            }
+            let destination = &args[0];
+            let Some(aggregate) = producer_root(graph, &args[1], 16) else {
+                continue;
+            };
+            let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
+                match (&candidate.result, &candidate.kind) {
+                    (
+                        Some(result),
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            args,
+                            ..
+                        },
+                    ) if result == destination
+                        && args.len() == 1
+                        && segments.first().map(String::as_str)
+                            == Some("__cast_instance_intrinsic")
+                        && segments.len() == 2 =>
+                    {
+                        Some(segments[1].as_str())
+                    }
+                    _ => None,
+                }
+            });
+            let aggregate_owner = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find_map(|candidate| match (&candidate.result, &candidate.kind) {
+                    (
+                        Some(result),
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        },
+                    ) if result == &aggregate => Some(name.as_str()),
+                    _ => None,
+                });
+            if destination_owner.is_none() || destination_owner != aggregate_owner {
+                continue;
+            }
+            // KNOWN GAP: this scans EVERY block, and each matched store's
+            // `value` is spliced verbatim into the call's block below. Only
+            // the `base` is proven in scope (`producer_root`); the `value` is
+            // not. `checkgraph` (`flowspace/model.py`) resets its `vars` per
+            // block and errors on a cross-block use, so a store whose value is
+            // defined in a block that does not reach the call builds a graph
+            // the port's own checker rejects — and nothing in `front::mir`
+            // calls `checkgraph`, so it surfaces later in `translator`.
+            // Restricting the scan to the call's own block is the fail-closed
+            // fix, but it also drops the multi-block shape this pass exists
+            // for; the real fix is a dominance test on each `value`.
+            let stores: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter_map(|candidate| match &candidate.kind {
+                    OpKind::FieldWrite {
+                        base,
+                        field,
+                        value,
+                        ty,
+                    } if producer_root(graph, base, 16).as_ref() == Some(&aggregate) => {
+                        Some((field.clone(), value.clone(), ty.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let Some(layout) = registered_layout(
+                destination_owner.expect("owner equality checked"),
+                struct_field_attrs,
+            ) else {
+                continue;
+            };
+            if stores.len() != layout.len() {
+                continue;
+            }
+            let mut ordered_stores = Vec::with_capacity(layout.len());
+            let mut complete = true;
+            for (name, _) in layout {
+                let mut matches = stores.iter().filter(|(field, _, _)| &field.name == name);
+                let Some(store) = matches.next() else {
+                    complete = false;
+                    break;
+                };
+                if matches.next().is_some() {
+                    complete = false;
+                    break;
+                }
+                ordered_stores.push(store.clone());
+            }
+            if !complete {
+                continue;
+            }
+            rewrites.push(Rewrite {
+                block: bi,
+                op: oi,
+                destination: destination.clone(),
+                stores: ordered_stores,
+                result: op.result.clone(),
+            });
+        }
+    }
+
+    let rewritten = rewrites.len();
+    for rewrite in rewrites.into_iter().rev() {
+        let block = &mut graph.blocks[rewrite.block];
+        let mut replacement: Vec<_> = rewrite
+            .stores
+            .into_iter()
+            .map(|(field, value, ty)| SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: rewrite.destination.clone(),
+                    field,
+                    value,
+                    ty,
+                },
+            })
+            .collect();
+        if let Some(result) = rewrite.result {
+            replacement.push(SpaceOperation {
+                result: Some(result),
+                kind: OpKind::ConstNone,
+            });
+        }
+        block
+            .operations
+            .splice(rewrite.op..=rewrite.op, replacement);
+    }
+    rewritten
+}
+
 /// Fuse the boxing-constructor idiom into a native GC allocation.
 ///
 /// pyre's boxing constructors (`floatobject::w_float_new` etc.) are written
@@ -3169,12 +3454,15 @@ pub fn fuse_boxing_alloc(
         Some(only)
     }
 
-    let is_malloc_typed = |target: &CallTarget| -> bool {
+    let is_gc_malloc = |target: &CallTarget| -> bool {
         matches!(target, CallTarget::FunctionPath { segments }
             if segments.len() >= 2
                 && matches!(
                     segments[segments.len() - 1].as_str(),
-                    "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+                    "malloc"
+                        | "malloc_typed"
+                        | "malloc_typed_managed"
+                        | "malloc_typed_stable"
                 )
                 && segments[segments.len() - 2] == "lltype")
     };
@@ -3592,7 +3880,7 @@ pub fn fuse_boxing_alloc(
             let OpKind::Call { target, args, .. } = &op.kind else {
                 continue;
             };
-            if !is_malloc_typed(target) || args.len() != 1 {
+            if !is_gc_malloc(target) || args.len() != 1 {
                 continue;
             }
             let Some(result) = &op.result else {
@@ -6773,6 +7061,20 @@ mod tests {
     }
 
     #[test]
+    fn qualified_path_split_preserves_paths_inside_generic_arguments() {
+        assert_eq!(
+            split_qualified_path(
+                "core::option::Option<Result<*mut pyobject::PyObject,error::PyError>>"
+            ),
+            vec![
+                "core",
+                "option",
+                "Option<Result<*mut pyobject::PyObject,error::PyError>>",
+            ]
+        );
+    }
+
+    #[test]
     fn graph_allocates_values_and_blocks() {
         let mut graph = FunctionGraph::new("demo");
         let entry = graph.startblock;
@@ -9136,7 +9438,7 @@ mod tests {
                         segments: vec![
                             crate::runtime_names::crates::OBJECT.into(),
                             "lltype".into(),
-                            "malloc_typed".into(),
+                            "malloc".into(),
                         ],
                     },
                     args: vec![agg.clone()],

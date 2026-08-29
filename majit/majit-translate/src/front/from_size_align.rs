@@ -212,6 +212,9 @@ fn rewire_one_from_size_align_site(
         .flat_map(|b| &b.operations)
         .find_map(|op| match &op.kind {
             OpKind::ConstInt(n) if op.result.as_ref() == Some(&align_arg) => Some(*n),
+            OpKind::ConstUInt(n) if op.result.as_ref() == Some(&align_arg) => {
+                i64::try_from(*n).ok()
+            }
             _ => None,
         })
         .ok_or_else(|| format!("{name}: from_size_align align arg is not a folded ConstInt"))?;
@@ -394,6 +397,9 @@ fn rewire_one_from_size_align_expect_site(
         .flat_map(|b| &b.operations)
         .find_map(|op| match &op.kind {
             OpKind::ConstInt(n) if op.result.as_ref() == Some(&align_arg) => Some(*n),
+            OpKind::ConstUInt(n) if op.result.as_ref() == Some(&align_arg) => {
+                i64::try_from(*n).ok()
+            }
             _ => None,
         })
         .ok_or_else(|| format!("{name}: from_size_align align arg is not a folded ConstInt"))?;
@@ -510,7 +516,7 @@ fn build_layout_aggregate(
     size: Variable,
     align: Variable,
 ) {
-    let mut owner_path: Vec<String> = layout_owner.split("::").map(str::to_string).collect();
+    let mut owner_path = crate::model::split_qualified_path(layout_owner);
     let ctor_name = owner_path.pop().unwrap_or_default();
     let ctor_target = if owner_path.is_empty() {
         CallTarget::synthetic_transparent_ctor(ctor_name)

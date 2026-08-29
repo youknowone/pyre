@@ -72,7 +72,8 @@
 //!   - `Assert` — strip and forward to the success target.
 //!
 //! ### Constants
-//!   - `Scalar(Signed|Unsigned|Isize|Usize)` → `ConstInt`.
+//!   - `Scalar(Signed|Isize)` → `ConstInt`; `Scalar(Unsigned|Usize)` →
+//!     `ConstUInt`.
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
 //!   - `Str` / `Char` / `ByteStr` → synthetic `Call(__str_const)`.
 //!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
@@ -307,6 +308,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
             &mut acc.struct_fields,
             &mut acc.struct_origins,
             &mut acc.enum_variant_by_discriminant,
+            Some(&acc.struct_ids),
         );
     }
     Ok(
@@ -840,6 +842,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         &mut struct_fields,
         &mut struct_origins,
         &mut enum_variant_by_discriminant,
+        Some(&struct_ids),
     );
 
     // Per-instantiation enum-variant pre-registration source (#100): a
@@ -1051,7 +1054,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             .and_then(|p| p.rsplit("::").next())
             .map(str::to_string)
             .or_else(|| trait_default_owner_for_fundecl(fd, &known_trait_names));
-        let returns_objectptr = output_type_is_objectptr(&fd.signature.output, llbc);
+        let gcref_result = gc_root_gcref_result_path(&fn_path);
+        let returns_objectptr =
+            output_type_is_objectptr(&fd.signature.output, llbc) && !gcref_result;
         // Stamp the FUNC.RESULT token for `dont_look_inside` callees only
         // (keyed exactly as `merge_hints_from_llbcs`), so the narrow
         // codewriter surface stays restricted to opaque stubs; every
@@ -1065,7 +1070,9 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         let stamp_return_token = dont_look_inside.contains(&fn_path)
             || elidable_residual.contains(&fn_path)
             || (trait_root.is_some() && self_ty_root.is_none());
-        let return_type = if stamp_return_token {
+        let return_type = if gcref_result {
+            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
+        } else if stamp_return_token {
             dont_look_inside_return_token(&fd.signature.output, llbc, static_addrs.error_carrier)
         } else {
             None
@@ -1499,16 +1506,20 @@ fn derive_program_metadata(
                         (fname, field_ty)
                     })
                     .collect();
+                let canonical_name = strip_crate_prefix(&name);
                 struct_fields.fields.insert(name.clone(), rows.clone());
+                struct_fields
+                    .fields
+                    .insert(canonical_name.clone(), rows.clone());
                 struct_fields.fields.insert(leaf.clone(), rows);
                 // Object identity for this struct type, minted from the
                 // crate-stripped qualified path — the spelling the descr
                 // layer keys `LLType::Struct` on and the runtime macro
                 // publishes.  Every name spelling (full-crate, stripped,
                 // bare leaf) resolves to it through the resolver table.
-                let sid = majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name));
+                let sid = majit_ir::descr::StructId::from_canonical(&canonical_name);
                 record_struct_id(&mut struct_ids, name.clone(), sid);
-                record_struct_id(&mut struct_ids, strip_crate_prefix(&name), sid);
+                record_struct_id(&mut struct_ids, canonical_name.clone(), sid);
                 record_struct_id(&mut struct_ids, leaf.clone(), sid);
                 // Exact field byte offsets from Charon's resolved layout
                 // (the true Rust layout, not the heuristic).  Field index
@@ -1559,8 +1570,9 @@ fn derive_program_metadata(
                         (fname, tyref_to_attr_value_type(&f.ty, llbc))
                     })
                     .collect();
-                struct_field_attrs.insert(strip_crate_prefix(&name), attr_rows);
+                struct_field_attrs.insert(canonical_name.clone(), attr_rows);
                 known_struct_names.insert(name);
+                known_struct_names.insert(canonical_name);
                 known_struct_names.insert(leaf);
             }
             TypeDeclKind::Enum(variants) => {
@@ -1599,7 +1611,7 @@ fn derive_program_metadata(
                 // Register the enum base class in `struct_fields` with
                 // only the synthetic `__discriminant` tag — the sum-type
                 // base carries the discriminant, each variant subclass
-                // carries its OWN payload fields (`rclass.py:82-88`,
+                // carries its OWN payload fields (`rclass.py:499-518`,
                 // registered below under `{enum}::{variant}` keys and
                 // projected onto the variant classdef by
                 // `getuniqueclassdef_for_enum_variant`).
@@ -1661,7 +1673,7 @@ fn derive_program_metadata(
                 // Per-variant field rows + exact offsets under
                 // `{enum}::{variant}` keys — the RPython sum-type subclass
                 // layout where each variant carries its OWN fields, the base
-                // only the discriminant (`rclass.py:82-88`).  These feed the
+                // only the discriminant (`rclass.py:499-518`).  These feed the
                 // variant subclasses (their `getuniqueclassdef_for_enum_variant`
                 // attr projection) and the per-variant runtime offsets.
                 // Dual-published under the qualified and bare-leaf spellings
@@ -1971,9 +1983,10 @@ fn derive_program_metadata(
 /// are distinct entries by construction and there is no bare alias to
 /// withdraw.
 ///
-/// Derived purely from the current qualified (`::`-containing) keys, so
-/// the pass is idempotent and safe to re-run after the cross-LLBC
-/// merge re-introduces a per-crate-unique alias.
+/// Derived from the current qualified (`::`-containing) keys after collapsing
+/// their full/canonical spellings through the existing `StructId` object
+/// identity.  The pass is therefore idempotent and safe to re-run after the
+/// cross-LLBC merge re-introduces a per-crate-unique alias.
 fn harden_duplicate_leaf_metadata(
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     struct_origins: &mut std::collections::HashMap<String, String>,
@@ -1981,7 +1994,29 @@ fn harden_duplicate_leaf_metadata(
         String,
         std::collections::HashMap<i64, String>,
     >,
+    struct_ids: Option<&std::collections::HashMap<String, Option<majit_ir::descr::StructId>>>,
 ) {
+    // RPython groups aliases by the live class object, never by spelling.
+    // `StructId` is pyre's existing object-identity carrier: discard a
+    // crate-included/canonical duplicate before comparing declaration rows,
+    // and discard a resolver-tombstoned alias (`None`) because it denotes no
+    // unique declaration.  Tests that exercise this helper in isolation pass
+    // no identity table and retain the original spelling-based behavior.
+    fn unique_declarations<'a>(
+        keys: &[&'a str],
+        struct_ids: Option<&std::collections::HashMap<String, Option<majit_ir::descr::StructId>>>,
+    ) -> Vec<&'a str> {
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::with_capacity(keys.len());
+        for key in keys {
+            match struct_ids.and_then(|ids| ids.get(*key)) {
+                Some(Some(id)) if seen.insert(*id) => unique.push(*key),
+                Some(Some(_)) | Some(None) => {}
+                None => unique.push(*key),
+            }
+        }
+        unique
+    }
     let mut by_leaf: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for key in struct_fields.fields.keys() {
         if let Some((head, leaf)) = key.rsplit_once("::") {
@@ -2005,7 +2040,8 @@ fn harden_duplicate_leaf_metadata(
     }
     let mut drop_field_aliases: Vec<String> = Vec::new();
     let mut tombstone_origins: Vec<String> = Vec::new();
-    for (leaf, quals) in &by_leaf {
+    for (leaf, aliases) in &by_leaf {
+        let quals = unique_declarations(aliases, struct_ids);
         if quals.len() < 2 {
             continue;
         }
@@ -2016,17 +2052,23 @@ fn harden_duplicate_leaf_metadata(
         {
             drop_field_aliases.push((*leaf).to_string());
         }
-        let first_module = strip_crate_prefix(quals[0])
-            .rsplit_once("::")
-            .map(|(m, _)| m.to_string())
-            .unwrap_or_default();
-        if quals[1..].iter().any(|q| {
-            strip_crate_prefix(q)
+        // Two surviving identity-backed keys are necessarily two distinct
+        // declarations.  The fallback module comparison preserves the
+        // isolated helper tests and metadata without a resolver table.
+        let distinct_identity = struct_ids.is_some() || {
+            let first_module = strip_crate_prefix(quals[0])
                 .rsplit_once("::")
-                .map(|(m, _)| m)
-                .unwrap_or_default()
-                != first_module
-        }) {
+                .map(|(m, _)| m.to_string())
+                .unwrap_or_default();
+            quals[1..].iter().any(|q| {
+                strip_crate_prefix(q)
+                    .rsplit_once("::")
+                    .map(|(m, _)| m)
+                    .unwrap_or_default()
+                    != first_module
+            })
+        };
+        if distinct_identity {
             tombstone_origins.push((*leaf).to_string());
         }
     }
@@ -2064,7 +2106,8 @@ fn harden_duplicate_leaf_metadata(
         }
     }
     let mut drop_variant_aliases: Vec<String> = Vec::new();
-    for (alias, quals) in &variant_by_alias {
+    for (alias, aliases) in &variant_by_alias {
+        let quals = unique_declarations(aliases, struct_ids);
         if quals.len() < 2 {
             continue;
         }
@@ -2093,7 +2136,8 @@ fn harden_duplicate_leaf_metadata(
         }
     }
     let mut drop_enum_aliases: Vec<String> = Vec::new();
-    for (leaf, quals) in &enum_by_leaf {
+    for (leaf, aliases) in &enum_by_leaf {
+        let quals = unique_declarations(aliases, struct_ids);
         if quals.len() < 2 {
             continue;
         }
@@ -2212,8 +2256,8 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
 }
 
 /// The MIR locals that can be a fresh string-builder accumulator: the
-/// destination of a `Wtf8Buf` / `String` `new` / `with_capacity` CALL
-/// terminator in the accumulator range `(arg_count+1..n_locals)`.
+/// destination of an [`is_str_builder_ctor`] CALL terminator in the
+/// accumulator range `(arg_count+1..n_locals)`.
 ///
 /// [`is_fresh_str_builder`] sets its `ctor_def` flag only in the
 /// call-terminator arm, so no other local can pass it — iterating these
@@ -2230,10 +2274,7 @@ fn builder_ctor_dest_locals<'a>(
         if let Ok(TermKind::Call { call, .. }) = bb.term()
             && let PlaceKind::Local(i) = call.dest.kind
             && (arg_count + 1..n_locals).contains(&(i as usize))
-            && matches!(
-                wtf8buf_method_leaf(llbc, &call),
-                Some("new") | Some("with_capacity")
-            )
+            && is_str_builder_ctor(wtf8buf_method_leaf(llbc, &call))
         {
             Some(i as usize)
         } else {
@@ -2289,10 +2330,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc);
     let finish = |lo: &mut Lowering<'_>| -> Result<(), LowerError> {
         if !lo.result_exc_call_results.is_empty()
+            || !lo.option_ok_or_else_try_sites.is_empty()
             || result_exc_callee
             || !lo.next_call_results.is_empty()
             || !lo.checked_arith_call_results.is_empty()
             || !lo.option_try_sites.is_empty()
+            || !lo.slice_index_rangefrom_sites.is_empty()
             || !lo.slice_index_range_sites.is_empty()
             || !lo.slice_index_rangeto_sites.is_empty()
         {
@@ -2307,6 +2350,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
         }
         let mut tail_forwarded_returns = 0usize;
+        if !lo.slice_index_rangefrom_sites.is_empty() {
+            crate::front::slice_index::rewire_slice_index_rangefrom_sites(
+                &mut lo.graph,
+                &lo.slice_index_rangefrom_sites,
+            );
+        }
         if !lo.slice_index_range_sites.is_empty() {
             crate::front::slice_index::rewire_slice_index_range_sites(
                 &mut lo.graph,
@@ -2329,6 +2378,16 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
         }
+        let option_ok_or_else_try_rewritten = if lo.option_ok_or_else_try_sites.is_empty() {
+            0
+        } else {
+            crate::front::result_exc::rewire_option_ok_or_else_try_sites(
+                &mut lo.graph,
+                &lo.option_ok_or_else_try_sites,
+                result_exc_callee,
+                static_addrs.error_carrier,
+            )
+        };
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
@@ -2470,10 +2529,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // the suffixed producers reaching the returnblock (ref/str/float
             // payloads); the `Int`/`Unsigned`/niche carve-out stays bare.
             let return_owner = lo.resolve_option_return_owner(&fd.signature.output);
+            let return_niche = lo.tyref_is_niche_option_ptr(&fd.signature.output);
+            let return_narrow_root = lo.option_niche_payload_class_root(&fd.signature.output);
             crate::front::option_try::rewire_option_try_call_sites(
                 &mut lo.graph,
                 &lo.option_try_sites,
                 return_owner.as_deref(),
+                return_niche,
+                return_narrow_root.as_deref(),
             )
         };
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
@@ -2583,14 +2646,30 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // `__discriminant` diamond, same post-lowering shape and fail-safe
         // contract as `map_or`; gate the reachability sweep on an actual
         // rewrite.
-        let closure_select_rewritten = if lo.closure_select_sites.is_empty() {
-            0
+        let closure_select_outcome = if lo.closure_select_sites.is_empty() {
+            crate::front::option_closure_select::ClosureSelectRewriteOutcome::default()
         } else {
             crate::front::option_closure_select::rewire_closure_select_call_sites(
                 &mut lo.graph,
                 &lo.closure_select_sites,
             )
         };
+        // This late combinator pass synthesizes `call_once` sites after the
+        // first Result-exception pass.  A closure returning
+        // `Result<T, PyError>` uses the translated exception ABI, while
+        // `map`/`unwrap_or_else` retain that Result as an ordinary value.
+        // Apply the same custom-consumer catch-and-rewrap rule as a source MIR
+        // call so the combinator receives an `Ok`/`Err` shell again.
+        if !closure_select_outcome.result_exc_calls.is_empty() {
+            crate::front::result_exc::rewire_result_exc_call_sites(
+                &mut lo.graph,
+                &closure_select_outcome.result_exc_calls,
+                result_exc_callee,
+                static_addrs.error_carrier,
+            )
+            .map_err(LowerError::Unsupported)?;
+        }
+        let closure_select_rewritten = closure_select_outcome.rewritten;
         // The `(a..=b).contains(&x)` fold (`front::range_contains`) splices
         // the residual `contains` method call in place with native
         // `bitand(le(a, x), ge(b, x))` compares and removes the paired
@@ -2619,6 +2698,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
+            || option_ok_or_else_try_rewritten > 0
             || next_rewritten > 0
             || checked_arith_rewritten > 0
             || checked_arith_uint_rewritten > 0
@@ -2645,6 +2725,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // the legacy walker and codewriter already handle, so it runs
         // unconditionally.
         let mut fmt_collapsed = collapse_fmt_chains(&mut lo.graph);
+        // The bytearray repr's sole non-default format is `\\x{c:02x}`.
+        // PyPy spells it as two nibble lookups in a constant hex table; lower
+        // the proven-u8 Rust fmt shell to that same source-level shape.
+        fmt_collapsed += collapse_lower_hex_byte_fmt_chains(&mut lo.graph);
         // Constant `format!("literal")` — a zero-placeholder format charon has
         // already folded to the fully-rendered constant string, so the format
         // op's argument is a bare `__str_const` with no pieces/args chain.
@@ -2858,11 +2942,17 @@ fn simplify_lowered_graph(
     // eagerly so the direct-scan passes see the same surface
     // `iterblocks()` exposes upstream.
     crate::model::clear_unreachable_blocks(graph);
-    // Lower the boxing-constructor idiom `malloc_typed(W_FloatObject{…})`
-    // to a native `NewWithVtable` + payload store before the dead-aggregate
-    // sweep, which then reclaims the orphaned construct-on-stack ctor and
-    // header field writes.
-    let mut dirty = crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    // Rust's `ptr::write(raw as *mut T, T { .. })` is the source spelling of
+    // RPython's already-allocated object followed by one setfield per member.
+    // Lower that aggregate copy before allocation fusion so generic
+    // `core::ptr::write<T>` never becomes one shared FunctionDesc whose `T`
+    // argument would merge unrelated object classes.
+    let mut dirty = crate::model::lower_struct_ptr_writes(graph, struct_field_attrs) > 0;
+    // Lower the allocation idiom `malloc[_typed](W_Object { ... })` to a
+    // native `NewWithVtable` + payload stores before the dead-aggregate sweep,
+    // which then reclaims the orphaned construct-on-stack ctor and header
+    // field writes.
+    dirty |= crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py) with the
@@ -3004,6 +3094,12 @@ impl std::error::Error for LowerError {}
 /// returns no descr-set key, `canonicalize_keyed_descrs` drops the whole
 /// set, and the callee's `EffectInfo` degrades to `EF_RANDOM_EFFECTS`.
 const OBJECT_REF_GCARRAY_TYPE_ID: &str = "majit::object_ref_gcarray";
+/// PyPy `BytesListStrategy` / `AsciiListStrategy` expose `SomeString`
+/// elements, while `rmodel.externalvsinternal(..., gcref=True)` stores those
+/// GC pointers in `GcArray(GCREF)`.  The logical list identity must therefore
+/// remain `[str]`; the rtyper's ordinary ListRepr recast supplies the
+/// STRPTR↔GCREF conversion at each item boundary.
+const STRING_GCREF_GCARRAY_TYPE_ID: &str = "[str]";
 
 /// The `(base, index)` operands of a devirtualized workspace index call,
 /// recorded for the paired `*p = v` write.  Each operand keeps the
@@ -3017,6 +3113,10 @@ struct IndexElemAlias {
     base_var: Variable,
     index_local: Option<usize>,
     index_var: Variable,
+    /// External item bank the source-level list exposes.  This can differ
+    /// from the Rust pointee spelling: `[str]` is physically `GcArray(GCREF)`
+    /// but its get/set boundary is `StringRepr`.
+    item_ty: ValueType,
     /// Identity the paired write must repeat, so `arr[i] = v` keys the
     /// same ARRAY as the `arr[i]` read that recorded this alias.
     array_type_id: Option<String>,
@@ -3091,7 +3191,7 @@ struct Lowering<'a> {
     binop_result_locals: std::collections::HashSet<usize>,
     /// Whether this function contains a builder-form accumulator. The canonical
     /// lowering sets it directly from [`graph_has_builder_accumulator`]; ctor /
-    /// append / terminal-`move` sites then emit the
+    /// append / terminal-materialisation sites then emit the
     /// `__majit_stringbuilder_{new,append,build}` markers (`flowspace_adapter` →
     /// `newstringbuilder` / `append` / `build`) instead of a parallel
     /// `ll_strconcat` graph. Whether a given local *is* such an
@@ -3162,6 +3262,25 @@ struct Lowering<'a> {
     /// (statement assigns + call destinations).  Guard set for
     /// [`Lowering::const_discriminant_locals`].
     multi_assigned_locals: std::collections::HashSet<usize>,
+    /// String variables whose Rust source obtained a `&[u8]` through
+    /// `str`/`Wtf8::as_bytes`. RPython stores UTF-8/WTF-8 in a byte string,
+    /// where `ord(s[i])` is the scalar byte read; the consumer gate below
+    /// uses this provenance to emit exactly that pair of flowspace ops.
+    string_byte_view_locals: Vec<usize>,
+    /// MIR locals holding the `ll_items(l)` view returned by the string-list
+    /// slice adapters, each paired with the list's LOGICAL length.  Rust
+    /// spells the element as a concrete raw pointer, but both byte and
+    /// unicode strategies expose the same external `str` over one internal
+    /// `GcArray(GCREF)`.
+    ///
+    /// The pair exists because the fold drops the fat slice's second word.
+    /// That word is `l.length`, which upstream keeps strictly apart from the
+    /// array header's `ll_fixed_length` / `arraylen_gc`
+    /// (`rlist.py:365-375, 395-397`: `ll_length` reads `l.length` while
+    /// `ll_getitem_fast` asserts against it).  A `Rvalue::Len` over one of
+    /// these locals answers with the recorded length, never with `__len` of
+    /// the header, which is the CAPACITY.
+    string_array_view_locals: Vec<(usize, Variable)>,
     /// Result `Variable`s of calls to callees whose declared result is
     /// `Result<T, PyError>`.  Each
     /// heads a `Try::branch` diamond that
@@ -3171,6 +3290,13 @@ struct Lowering<'a> {
     /// per-instantiation `<…>` suffix (Ref-shaped payloads only) keying
     /// the rebuilt `Ok`/`Err` shells' ClassDef per instantiation.
     result_exc_call_results: Vec<(Variable, Option<String>, ValueType)>,
+    /// Foreign `Option::ok_or_else(opt, closure)` results consumed immediately
+    /// by `?`, recorded for the combined value-or-exception rewrite in
+    /// [`crate::front::result_exc::rewire_option_ok_or_else_try_sites`].
+    /// This cannot share `result_exc_call_results`: the Option combinator is
+    /// not itself a translated scoped callee, so its `Result` shell must be
+    /// removed together with the Option select.
+    option_ok_or_else_try_sites: Vec<crate::front::result_exc::OptionOkOrElseTrySite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
     /// after the body lowering completes.  The paired [`ValueType`] is the
@@ -3234,6 +3360,11 @@ struct Lowering<'a> {
     /// `front::range_iter` post-pass synthesizes so the `next`-diamond folds
     /// the loop (see [`crate::front::range_iter::RangeNewSite`]).
     range_iter_new_sites: Vec<crate::front::range_iter::RangeNewSite>,
+    /// RangeFrom aggregates retained for the orthodox
+    /// `getslice(start, None)` rewrite. The slice-index consumer proves the
+    /// bound is a `usize`, hence non-negative as required by RPython's
+    /// `decompose_slice_args`.
+    slice_index_rangefrom_sites: Vec<crate::front::slice_index::SliceIndexRangeFromSite>,
     /// RangeTo aggregates retained as candidates for the slice-index
     /// recognizer. The end's unsigned coloring is captured from MIR here,
     /// before the operand can become a block inputarg.
@@ -3343,44 +3474,63 @@ impl<'a> Lowering<'a> {
             // trait's qualified path instead, which the adapter
             // resolves through the unique-impl map
             // (`trait_unique_impls`, keyed by qualified path).
-            let class_root = match &ty {
-                ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc)
-                    // A `&str` / `str` param strips to the `str` builtin
-                    // (not an ADT), so `tyref_class_root` answers `None`;
-                    // name it `"str"` so `derive_subject_inputcells` seeds
-                    // the byte `SomeString` (`s_str0`) instead of the
-                    // abstract `SomeInstance(None)` a `Ref(None)` projects
-                    // to.  A string param compared against a string literal
-                    // then rtypes as `pair(StringRepr, StringRepr)` rather
-                    // than walling at `pair(InstanceRepr, StringRepr)`.
-                    .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
-                    .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
-                    // A list-typed param (`Vec<T>`, `&[T]`, …) has no
-                    // named-ADT leaf — `tyref_class_root` answers `None`
-                    // because `adt_node_class_root` excludes the
-                    // core/std/alloc container family from classdef
-                    // minting.  Carry its full monomorphic spelling so
-                    // `derive_subject_inputcells` projects it through the
-                    // annotator's list model (`project_struct_field_type`)
-                    // instead of the classdef-less `SomeInstance(None)`
-                    // shell, on which a `len()` / iteration would wall at
-                    // `getattr` over a classdef-less instance.
-                    .or_else(|| {
-                        let spelling = tyref_to_ast_string(&local.ty, llbc);
-                        majit_ir::descr::is_list_container_spelling(&spelling).then_some(spelling)
-                    }),
-                // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
-                // so it takes the non-`Ref` arm and would otherwise carry no
-                // `class_root`.  Its variant-name metadata is a side table
-                // keyed by the enum type (the RPython "names by int" model),
-                // not a field on the value; carry the crate-stripped enum
-                // path so the `Debug`-fmt collapse can recover the enum
-                // identity from the value's origin (`debug_enum_disc_owner`)
-                // now that no `__discriminant` field read remains to scavenge.
-                // `derive_subject_inputcells` only consumes `class_root` on
-                // the `Ref` arm, so the annotation seed stays a plain
-                // `SomeInteger`.
-                _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+            // RPython's GC transformer casts a GC helper's pointer *argument*
+            // to `llmemory.GCREF` before the call — `gct_gc_identityhash`
+            // (`framework.py:1174-1182`) does
+            // `[v_ptr] = hop.spaceop.args; v_ptr = hop.genop("cast_opaque_ptr",
+            // [v_ptr], resulttype=llmemory.GCREF)`.  Rust's `PyObjectRef`
+            // parameter is the physical carrier for that opaque slot, not a
+            // W_Root instance.  Preserve the GCREF input boundary explicitly so
+            // StringRepr and InstanceRepr callers never meet in one
+            // source-level FunctionDesc cell.
+            //
+            // Key it on the LAST parameter, never on index 1: both spellings
+            // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+            // `RootScope` method form puts `&self` first, so stamping index 1
+            // there annotates the receiver and leaves the GC pointer untouched.
+            let class_root = if i == arg_count && gc_root_pin_path(&graph.name) {
+                Some("GCREF".to_string())
+            } else {
+                match &ty {
+                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc)
+                        // A `&str` / `str` param strips to the `str` builtin
+                        // (not an ADT), so `tyref_class_root` answers `None`;
+                        // name it `"str"` so `derive_subject_inputcells` seeds
+                        // the byte `SomeString` (`s_str0`) instead of the
+                        // abstract `SomeInstance(None)` a `Ref(None)` projects
+                        // to.  A string param compared against a string literal
+                        // then rtypes as `pair(StringRepr, StringRepr)` rather
+                        // than walling at `pair(InstanceRepr, StringRepr)`.
+                        .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
+                        .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
+                        // A list-typed param (`Vec<T>`, `&[T]`, …) has no
+                        // named-ADT leaf — `tyref_class_root` answers `None`
+                        // because `adt_node_class_root` excludes the
+                        // core/std/alloc container family from classdef
+                        // minting.  Carry its full monomorphic spelling so
+                        // `derive_subject_inputcells` projects it through the
+                        // annotator's list model (`project_struct_field_type`)
+                        // instead of the classdef-less `SomeInstance(None)`
+                        // shell, on which a `len()` / iteration would wall at
+                        // `getattr` over a classdef-less instance.
+                        .or_else(|| {
+                            let spelling = tyref_to_ast_string(&local.ty, llbc);
+                            majit_ir::descr::is_list_container_spelling(&spelling)
+                                .then_some(spelling)
+                        }),
+                    // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
+                    // so it takes the non-`Ref` arm and would otherwise carry no
+                    // `class_root`.  Its variant-name metadata is a side table
+                    // keyed by the enum type (the RPython "names by int" model),
+                    // not a field on the value; carry the crate-stripped enum
+                    // path so the `Debug`-fmt collapse can recover the enum
+                    // identity from the value's origin (`debug_enum_disc_owner`)
+                    // now that no `__discriminant` field read remains to scavenge.
+                    // `derive_subject_inputcells` only consumes `class_root` on
+                    // the `Ref` arm, so the annotation seed stays a plain
+                    // `SomeInteger`.
+                    _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+                }
             };
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
@@ -3467,7 +3617,10 @@ impl<'a> Lowering<'a> {
             atomic_ordering_locals: std::collections::HashMap::new(),
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(body),
+            string_byte_view_locals: Vec::new(),
+            string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
+            option_ok_or_else_try_sites: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
             checked_arith_uint_sites: Vec::new(),
@@ -3480,6 +3633,7 @@ impl<'a> Lowering<'a> {
             saturating_sub_sites: Vec::new(),
             range_inclusive_new_sites: Vec::new(),
             range_iter_new_sites: Vec::new(),
+            slice_index_rangefrom_sites: Vec::new(),
             slice_index_rangeto_sites: Vec::new(),
             slice_index_range_sites: Vec::new(),
             range_contains_sites: Vec::new(),
@@ -3494,7 +3648,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Switch this lowering to builder form so the ctor / append /
-    /// terminal-`move` sites of a builder-mode accumulator
+    /// terminal materialisation sites of a builder-mode accumulator
     /// ([`is_builder_mode_accumulator`]) emit the `StringBuilder` markers
     /// instead of `ll_strconcat`. The canonical frontend selects this before
     /// lowering whenever [`graph_has_builder_accumulator`] succeeds.
@@ -4506,7 +4660,7 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         inner: Place,
         elem: ProjectionElem,
-        value: LinkArg,
+        mut value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
         // A plain `*p = v` (`__deref_write` Call below) reads a
@@ -4555,12 +4709,91 @@ impl<'a> Lowering<'a> {
                     // to the recorded Variable for a constant operand.
                     let arr = self.realias_operand(alias.base_local, alias.base_var);
                     let idx = self.realias_operand(alias.index_local, alias.index_var);
+                    if alias.array_type_id.as_deref() == Some(STRING_GCREF_GCARRAY_TYPE_ID) {
+                        // The manual Rust shadow-stack reload is the internal
+                        // GCREF word. At the source graph boundary RPython's
+                        // rlist recasts it to the external StringRepr before
+                        // setitem; the typer lowers this marker back to the
+                        // exact cast_opaque_ptr operation.
+                        value = self.narrow_value_to_instance_root(bb_id, value, "str");
+                    }
+                    let arr = if matches!(
+                        alias.array_type_id.as_deref(),
+                        Some("[i64]" | "[f64]" | STRING_GCREF_GCARRAY_TYPE_ID)
+                    ) {
+                        self.narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(arr),
+                            alias.array_type_id.as_deref().expect("matched Some above"),
+                        )
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone()
+                    } else {
+                        arr
+                    };
                     OpKind::ArrayWrite {
                         base: arr,
                         index: idx,
                         value: value.clone(),
-                        item_ty: tyref_to_value_type(dest_ty, self.llbc),
+                        item_ty: alias.item_ty,
                         array_type_id: alias.array_type_id.clone(),
+                        nolength: false,
+                    }
+                } else if let Some(owner) = self.string_array_remove_owner() {
+                    // Tail of RPython `ll_delitem_nonneg`: after
+                    // `ll_arraymove`, clear `l[newlength]` to the null GC
+                    // pointer before shrinking the logical length.  Rust
+                    // spells this one site as `*p = null_mut()`, but the
+                    // translated operation is a setitem on the same
+                    // GcArray(GCREF) as the move.
+                    let list = self
+                        .local_var
+                        .get(1)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: string-array remove lost self before null clear"
+                            ))
+                        })?;
+                    let block = self.emit_string_array_items_read(bb_id, list.clone(), owner);
+                    let arr = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(block),
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )
+                        .as_variable()
+                        .expect("a string-items view stays a Variable")
+                        .clone();
+                    let length = self.emit_string_array_len_read(bb_id, list, owner);
+                    let one = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(one.clone()),
+                        kind: OpKind::ConstUInt(1),
+                    });
+                    let newlength = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(newlength.clone()),
+                        kind: OpKind::BinOp {
+                            op: "sub".to_string(),
+                            lhs: length,
+                            rhs: one,
+                            result_ty: ValueType::Unsigned,
+                        },
+                    });
+                    value = self.narrow_value_to_instance_root(bb_id, value, "str");
+                    OpKind::ArrayWrite {
+                        base: arr,
+                        index: newlength,
+                        value: value.clone(),
+                        item_ty: ValueType::Str,
+                        array_type_id: Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
                         nolength: false,
                     }
                 } else {
@@ -4603,12 +4836,28 @@ impl<'a> Lowering<'a> {
                     // fallback keeps non-Adt containers lowering as
                     // before.
                     let (field, ty) = match self.resolve_adt_field(field_payload) {
-                        Some((owner_root, field_name, _field_ty, owner_id)) => (
-                            FieldDescriptor::new(field_name, Some(owner_root))
-                                .with_owner_id(owner_id)
-                                .with_base_is_deref(base_is_deref),
-                            tyref_to_value_type(dest_ty, self.llbc),
-                        ),
+                        Some((owner_root, field_name, _field_ty, owner_id)) => {
+                            // Rust type-checks every assignment against the
+                            // projected place's substituted field type.  A
+                            // raw pointer to a named ADT is therefore the
+                            // same typed nullable instance slot as a field
+                            // initialized by an aggregate: preserve that
+                            // class on ordinary `self.field = value` writes
+                            // too.  Otherwise one classdef-less raw value
+                            // generalizes the session-global ClassDef attr to
+                            // the root object repr before a later getattr is
+                            // rtyped.  RPython's SomeNone union instead keeps
+                            // the declared SomeInstance class and merely sets
+                            // `can_be_None`.
+                            value =
+                                self.narrow_typed_nullable_field_value(bb_id, value, Some(dest_ty));
+                            (
+                                FieldDescriptor::new(field_name, Some(owner_root))
+                                    .with_owner_id(owner_id)
+                                    .with_base_is_deref(base_is_deref),
+                                tyref_to_value_type(dest_ty, self.llbc),
+                            )
+                        }
                         None => (
                             FieldDescriptor::new(field_label_from_payload(field_payload), None),
                             ValueType::Int,
@@ -4647,6 +4896,62 @@ impl<'a> Lowering<'a> {
             kind: op,
         });
         Ok(())
+    }
+
+    /// Preserve the declared class of a raw-pointer field value.
+    ///
+    /// RPython represents a nullable instance attribute as
+    /// `SomeInstance(classdef, can_be_None=True)`.  Rust spells the same slot
+    /// as `*mut/*const NamedAdt`, but a producer such as `null_mut()` begins as
+    /// a classdef-less pointer.  The Rust field type-check is the proof needed
+    /// to narrow that producer before `setattr`; this is an identity cast for
+    /// non-null values and a typed null for null values.
+    fn narrow_typed_nullable_field_value(
+        &mut self,
+        bb_id: BlockId,
+        value: LinkArg,
+        declared_ty: Option<&TyRef>,
+    ) -> LinkArg {
+        let Some(root) = declared_ty.and_then(|ty| {
+            tyref_node(ty, self.llbc)
+                .and_then(|n| strip_ty_wrappers(n, self.llbc))
+                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
+        }) else {
+            return value;
+        };
+        self.narrow_value_to_instance_root(bb_id, value, &root)
+    }
+
+    /// Re-express a GC-reference value at a statically-known RPython
+    /// instance boundary.  Rust raw pointers erase the pointee in
+    /// [`ValueType::Ref(None)`], while the corresponding RPython value keeps
+    /// its `SomeInstance(classdef)` (for example `PyObjectRef` is W_Root).
+    /// The marker is a same-bank identity and rtypes to `cast_opaque_ptr`.
+    fn narrow_value_to_instance_root(
+        &mut self,
+        bb_id: BlockId,
+        value: LinkArg,
+        root: &str,
+    ) -> LinkArg {
+        let LinkArg::Value(value) = value else {
+            // Ref-kind constants are materialized calls in this frontend;
+            // only scalar constants can remain inline in a FieldWrite.
+            return value;
+        };
+        let narrowed = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(narrowed.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__cast_instance_intrinsic".to_string(), root.to_string()],
+                },
+                args: vec![value],
+                result_ty: ValueType::Ref(Some(root.to_string())),
+            },
+        });
+        LinkArg::Value(narrowed)
     }
 
     /// Extract the `offset` operand from an `Index { offset, from_end }`
@@ -4795,6 +5100,15 @@ impl<'a> Lowering<'a> {
                     let src_root = self.operand_class_root(&operand);
                     let arg = self.resolve_operand(mir_bb, operand)?;
                     let dst_kind = tyref_to_value_type(dest_ty, self.llbc);
+                    // The Rust-only current-address adapter is erased as a
+                    // whole GCREF identity.  Its `ptr -> usize -> ptr`
+                    // round-trip exists only to call the host GC query; once
+                    // that query is replaced by RPython's root-reload model,
+                    // retaining either bank crossing would manufacture an
+                    // address integer absent from the upstream graph.
+                    if self.is_gc_current_object_address_adapter_graph() {
+                        return Ok((None, arg));
+                    }
                     // Signedness-flipping int cast (`w_tuple_len(obj) as i64`)
                     // — aliasing keeps the source `r_uint` annotation on the
                     // signed destination, tripping the SomeInteger signedness
@@ -4851,6 +5165,26 @@ impl<'a> Lowering<'a> {
                             }),
                             res,
                         ));
+                    }
+                    // Pointer -> unsigned-word cast is two operations in
+                    // RPython, not a `cast_ptr_to_int` whose result is merely
+                    // labelled Unsigned.  `rbuiltin.py`'s `gen_cast` (which
+                    // `rtype_cast_primitive` delegates to) first emits
+                    // `cast_ptr_to_int(..., resulttype=Signed)` and then
+                    // `gen_cast(..., TGT=Unsigned)`.  Rust's `p as usize`
+                    // reaches this arm directly, so materialise that same
+                    // sequence: the inner call produces the orthodox Signed
+                    // address integer and `r_uint` performs the second,
+                    // same-word retype.  Omitting it leaves `p as usize`
+                    // annotated `SomeInteger()` and makes it fail to join a
+                    // genuine `0usize` (`SomeInteger(unsigned=True)`).
+                    if matches!(src_kind, Some(ValueType::Ref(_)))
+                        && matches!(dst_kind, ValueType::Unsigned)
+                    {
+                        let bb_id = self.block_id[mir_bb];
+                        let (retype, result) =
+                            push_ptr_to_unsigned_cast(&mut self.graph, bb_id, arg);
+                        return Ok((Some(retype), result));
                     }
                     return Ok(
                         match src_kind
@@ -5052,6 +5386,18 @@ impl<'a> Lowering<'a> {
             // `Len(place)` — slice / array length. Synthetic 1-arg
             // call; needs no descriptor for now.
             Rvalue::Len(place) => {
+                // A string-list items view is one word — the `GcArray` header
+                // — so `__len` over it is `ll_fixed_length` / `arraylen_gc`,
+                // the CAPACITY.  `ll_length` reads the list's own `l.length`
+                // (`rlist.py:365-366`), which the fold recorded; answer with
+                // that, and keep the two apart exactly as upstream does.
+                if let Some((_, logical_len)) = self
+                    .string_array_view_locals
+                    .iter()
+                    .find(|(local, _)| place_references_local(&place, *local))
+                {
+                    return Ok((None, logical_len.clone()));
+                }
                 let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
@@ -5207,7 +5553,7 @@ impl<'a> Lowering<'a> {
                                 tyref_positional_aggregate_suffix(dest_ty, self.llbc)
                             );
                             let positional = (0..arg_vars.len())
-                                .map(|i| (format!("__pos_{i}"), String::new()))
+                                .map(|i| (format!("__pos_{i}"), String::new(), None))
                                 .collect();
                             // Not an Adt at all, so there is no struct decl to
                             // stand behind an allocation rewrite.
@@ -5272,8 +5618,6 @@ impl<'a> Lowering<'a> {
                     self.range_iter_new_sites
                         .push(crate::front::range_iter::RangeNewSite {
                             result_var: res.clone(),
-                            start: arg_vars[0].clone(),
-                            end: arg_vars[1].clone(),
                         });
                     self.slice_index_range_sites.push(
                         crate::front::slice_index::SliceIndexRangeSite {
@@ -5294,8 +5638,17 @@ impl<'a> Lowering<'a> {
                         },
                     );
                 }
-                // RangeFrom alone stays dormant: its Void ConstNone stop has
-                // no regalloc coloring on the legacy-walker path.
+                if owner_path.as_slice() == ["core", "ops", "range"]
+                    && ctor_name == "RangeFrom"
+                    && arg_vars.len() == 1
+                {
+                    self.slice_index_rangefrom_sites.push(
+                        crate::front::slice_index::SliceIndexRangeFromSite {
+                            range_result: res.clone(),
+                            start: arg_vars[0].clone(),
+                        },
+                    );
+                }
                 // Surface every operand through a separate FieldWrite so
                 // the field-to-value binding survives into the
                 // codewriter / annotator.  Field names default to
@@ -5305,9 +5658,11 @@ impl<'a> Lowering<'a> {
                 for (i, value) in arg_vars.into_iter().enumerate() {
                     let (name, field_ty) = field_rows
                         .get(i)
-                        .cloned()
+                        .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
                         .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
-                    // `_names_without_voids()` / `heaptracker.py:104-105`: a
+                    let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
+                    // `_names_without_voids()` (`lltype.py:333`) /
+                    // `heaptracker.py:100-101`: a
                     // zero-sized field occupies no storage and gets no slot,
                     // so no write is generated for it.
                     if crate::codewriter::call::get_type_flag(&field_ty).1
@@ -5315,6 +5670,15 @@ impl<'a> Lowering<'a> {
                     {
                         continue;
                     }
+                    let value = self
+                        .narrow_typed_nullable_field_value(
+                            bb_id,
+                            LinkArg::Value(value),
+                            declared_ty,
+                        )
+                        .as_variable()
+                        .expect("aggregate field operand stays materialized")
+                        .clone();
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: None,
                         kind: OpKind::FieldWrite {
@@ -5504,8 +5868,9 @@ impl<'a> Lowering<'a> {
             Operand::Copy(place) => self.resolve_place(mir_bb, place),
             Operand::Move(place) => {
                 // A `move c` of a builder-mode accumulator is its single
-                // `ll_build` materialisation point (`accumulator_move_site_count
-                // == 1`).  Emit the `__majit_stringbuilder_build` marker
+                // `ll_build` materialisation point
+                // (`accumulator_materialization_site_count == 1`). Emit the
+                // `__majit_stringbuilder_build` marker
                 // (`flowspace_adapter` → getattr("build") + simple_call →
                 // `SomeString`) instead of moving the concat accumulator out.
                 // Only a bare `Local(c)` move qualifies; a projection falls
@@ -5653,6 +6018,7 @@ impl<'a> Lowering<'a> {
     ) -> Result<Variable, LowerError> {
         let op = match decode_constant(self.llbc, value)? {
             DecodedConst::Int(n) => OpKind::ConstInt(n),
+            DecodedConst::UInt(n) => OpKind::ConstUInt(n),
             DecodedConst::Int128(n) => OpKind::ConstInt128(n),
             DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
@@ -5965,22 +6331,49 @@ impl<'a> Lowering<'a> {
                     && let Some(index_payload) = v.as_object().and_then(|m| m.get("Index"))
                 {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
-                    let (array_type_id, nolength) = array_projection_metadata(&inner.ty, self.llbc);
+                    let string_byte_view = self
+                        .string_byte_view_locals
+                        .iter()
+                        .any(|&local| place_references_local(&inner, local));
+                    let string_array_view = self
+                        .string_array_view_locals
+                        .iter()
+                        .any(|(local, _)| place_references_local(&inner, *local));
+                    let (mut array_type_id, nolength) =
+                        array_projection_metadata(&inner.ty, self.llbc);
+                    if string_array_view {
+                        array_type_id = Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string());
+                    }
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.block_id[mir_bb];
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ArrayRead {
+                    let kind = if string_byte_view {
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__string_byte_getitem".to_string()],
+                            },
+                            args: vec![base, idx_var],
+                            result_ty: ValueType::Int,
+                        }
+                    } else {
+                        OpKind::ArrayRead {
                             base,
                             index: idx_var,
-                            item_ty: tyref_to_value_type(&place_ty, self.llbc),
+                            item_ty: if string_array_view {
+                                ValueType::Str
+                            } else {
+                                tyref_to_value_type(&place_ty, self.llbc)
+                            },
                             array_type_id,
                             nolength,
                             pure: false,
-                        },
+                        }
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind,
                     });
                     return Ok(res);
                 }
@@ -6159,6 +6552,40 @@ impl<'a> Lowering<'a> {
                     return Ok(res);
                 }
                 let segments = self.global_segments(mir_bb, id)?;
+                // `pyre_object::pyobject::PY_NULL` is the Rust spelling of
+                // the `None` stored in PyPy's `locals_cells_stack_w` slots
+                // (`pyframe.py`: `[None] * size`, plus the pop/drop clears).
+                // Preserve the high-level W_Root boundary: construct the
+                // repr-adaptive nullable pointer, then narrow it to the
+                // declared `PyObjectRef` pointee class.  Leaving the computed
+                // const to `const_eval_global` produces a bare nullable
+                // `SomeInstance(None)`; unioning that into the fixed object
+                // array erases its `PyObject` external item repr, whereas
+                // upstream's `SomeNone ∪ SomeInstance(W_Root)` keeps W_Root
+                // and only sets `can_be_None`.
+                if fmt_path_ends_with(&segments, &["pyobject", "PY_NULL"])
+                    && tyref_class_root(&place_ty, self.llbc).as_deref() == Some("PyObject")
+                {
+                    let bb_id = self.block_id[mir_bb];
+                    let raw = self.graph.push_null_mut_ptr(bb_id);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "__cast_instance_intrinsic".to_string(),
+                                    "PyObject".to_string(),
+                                ],
+                            },
+                            args: vec![raw],
+                            result_ty: ValueType::Ref(Some("PyObject".to_string())),
+                        },
+                    });
+                    return Ok(res);
+                }
                 // A class-singleton static (`&SLICE_TYPE`, `&CEL_INT_CLASS`):
                 // narrow the raw address through
                 // `__cast_instance_intrinsic[<root>]` so the read types
@@ -6297,6 +6724,7 @@ impl<'a> Lowering<'a> {
                 let op = self
                     .static_addr_op(&segments)
                     .or_else(|| self.static_int_value_op(&segments))
+                    .or_else(|| known_array_layout_const(&segments))
                     .or_else(|| self.const_eval_global(id))
                     .or_else(|| self.fold_size_const_global(id))
                     .or_else(|| self.fold_named_const_int_array_global(id))
@@ -6461,7 +6889,7 @@ impl<'a> Lowering<'a> {
     ) -> Option<(
         Vec<String>,
         String,
-        Vec<(String, String)>,
+        Vec<(String, String, Option<TyRef>)>,
         majit_ir::descr::StructId,
         bool,
     )> {
@@ -6490,13 +6918,14 @@ impl<'a> Lowering<'a> {
         let owner_path = segments;
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) | (TypeDeclKind::Struct(fields), Some(_)) => {
-                let field_rows: Vec<(String, String)> = fields
+                let field_rows: Vec<(String, String, Option<TyRef>)> = fields
                     .iter()
                     .enumerate()
                     .map(|(i, f)| {
                         (
                             f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
                             tyref_to_ast_string(&f.ty, self.llbc),
+                            Some(clone_tyref(&f.ty)),
                         )
                     })
                     .collect();
@@ -6528,7 +6957,7 @@ impl<'a> Lowering<'a> {
                     None => type_leaf,
                 };
                 variant_owner.push(leaf);
-                let field_rows: Vec<(String, String)> = v
+                let field_rows: Vec<(String, String, Option<TyRef>)> = v
                     .fields
                     .iter()
                     .enumerate()
@@ -6536,6 +6965,7 @@ impl<'a> Lowering<'a> {
                         (
                             f.name.clone().unwrap_or_else(|| format!("__pos_{i}")),
                             tyref_to_ast_string(&f.ty, self.llbc),
+                            Some(clone_tyref(&f.ty)),
                         )
                     })
                     .collect();
@@ -6823,6 +7253,7 @@ impl<'a> Lowering<'a> {
         }
         match decode_literal(found?).ok()? {
             DecodedConst::Int(n) => Some(OpKind::ConstInt(n)),
+            DecodedConst::UInt(n) => Some(OpKind::ConstUInt(n)),
             DecodedConst::Int128(n) => Some(OpKind::ConstInt128(n)),
             DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
             DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
@@ -6845,7 +7276,8 @@ impl<'a> Lowering<'a> {
     }
 
     /// Fold a `NamedConst` global whose initializer builds a fixed-size
-    /// array of integer literals (`OP_STACKDEL: [i32; N] = [c0, c1, …]`)
+    /// array of integer literals (`OP_STACKDEL: [i32; N] = [c0, c1, …]`),
+    /// or borrows that literal (`HEX: &[u8; N] = b"..."`),
     /// into the synthetic prebuilt-constant-array define-op the adapter
     /// re-folds to `Constant(list)`
     /// (`flowspace_adapter.rs::is_const_int_array_define`).  A
@@ -6855,13 +7287,21 @@ impl<'a> Lowering<'a> {
     /// literals here lets that read resolve against a constant base
     /// instead of a residual accessor `Call` no registry can bind.
     ///
-    /// Accepts only the exact `_0 = [c0, c1, …]; return` shape: a single
-    /// `Array` aggregate assigned to `_0` whose operands are all integer
-    /// literals, over linear `Goto`s to a `Return`.  Anything richer
-    /// (computed elements, non-integer items, a `Repeat` fill, a second
-    /// `_0` write) returns `None` and keeps the residual accessor path;
-    /// so does a foreign const whose init body Charon left opaque (no
-    /// readable body to bake).
+    /// Accepts only the exact `_0 = [c0, c1, …]; return` shape, or the
+    /// borrow spelling Charon emits for a byte string:
+    ///
+    /// ```text
+    /// _array = [c0, c1, …]
+    /// _borrow = &_array
+    /// _0 = move _borrow
+    /// return
+    /// ```
+    ///
+    /// The array operands must all be integer literals and control flow may
+    /// contain only linear `Goto`s to a `Return`.  Anything richer (computed
+    /// elements, non-integer items, a `Repeat` fill, an extra assignment)
+    /// returns `None` and keeps the residual accessor path; so does a foreign
+    /// const whose init body Charon left opaque (no readable body to bake).
     fn fold_named_const_int_array_global(&self, def_id: u64) -> Option<OpKind> {
         let gd = self.llbc.global_by_id(def_id)?;
         if gd
@@ -6874,20 +7314,23 @@ impl<'a> Lowering<'a> {
         }
         let init_id = gd.rest.get("init")?.as_u64()?;
         let body = self.llbc.fn_by_id(init_id)?.unstructured()?;
-        let mut items: Option<Vec<i64>> = None;
+        let mut array: Option<(u64, Vec<i64>)> = None;
+        let mut borrow: Option<(u64, u64)> = None;
+        let mut return_alias: Option<u64> = None;
         for block in &body.body {
             for stmt in &block.statements {
                 match stmt.stmt_kind() {
                     Ok(StmtKind::StorageLive(_))
                     | Ok(StmtKind::StorageDead(_))
                     | Ok(StmtKind::PlaceMention(_)) => {}
-                    Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands)))
-                        if matches!(place.kind, PlaceKind::Local(0)) =>
-                    {
+                    Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands))) => {
                         // Only a fixed-size `Array` aggregate of integer
                         // literals; a `Repeat` fill or an Adt aggregate is
-                        // out of scope, as is a second `_0`-defining assign.
-                        if aggregate_ctor_name(&kind) != "Array" || items.is_some() {
+                        // out of scope, as is a second array definition.
+                        let PlaceKind::Local(dst) = place.kind else {
+                            return None;
+                        };
+                        if aggregate_ctor_name(&kind) != "Array" || array.is_some() {
                             return None;
                         }
                         let mut vals = Vec::with_capacity(operands.len());
@@ -6895,17 +7338,46 @@ impl<'a> Lowering<'a> {
                             let Operand::Const(value) = op else {
                                 return None;
                             };
-                            let DecodedConst::Int(n) = decode_constant(self.llbc, value).ok()?
-                            else {
-                                return None;
+                            let n = match decode_constant(self.llbc, value).ok()? {
+                                DecodedConst::Int(n) => n,
+                                // Current Charon preserves a byte-string
+                                // aggregate's `u8` bank. The RPython
+                                // prebuilt ll_array constant uses the same
+                                // signed integer literal carrier after the
+                                // checked, value-preserving conversion.
+                                DecodedConst::UInt(n) => i64::try_from(n).ok()?,
+                                _ => return None,
                             };
                             vals.push(n);
                         }
-                        items = Some(vals);
+                        array = Some((dst, vals));
                     }
-                    // Any other statement (a write to a temporary or a
-                    // richer `_0` definition) means the array is computed,
-                    // not a literal aggregate.
+                    Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) => {
+                        let (PlaceKind::Local(dst), PlaceKind::Local(source)) =
+                            (place.kind, source.kind)
+                        else {
+                            return None;
+                        };
+                        if borrow.replace((dst, source)).is_some() {
+                            return None;
+                        }
+                    }
+                    Ok(StmtKind::Assign(place, Rvalue::Use(operand)))
+                        if matches!(place.kind, PlaceKind::Local(0)) =>
+                    {
+                        let source = match operand {
+                            Operand::Copy(place) | Operand::Move(place) => match place.kind {
+                                PlaceKind::Local(source) => source,
+                                _ => return None,
+                            },
+                            Operand::Const(_) => return None,
+                        };
+                        if return_alias.replace(source).is_some() {
+                            return None;
+                        }
+                    }
+                    // Any other statement means the array is computed, or
+                    // the borrow escapes through a shape we cannot prove.
                     _ => return None,
                 }
             }
@@ -6914,7 +7386,15 @@ impl<'a> Lowering<'a> {
                 _ => return None,
             }
         }
-        let items = items?;
+        let (array_local, items) = array?;
+        match (borrow, return_alias) {
+            // Direct fixed-size array constant: `_0 = [..]`.
+            (None, None) if array_local == 0 => {}
+            // Borrowed byte-string constant: `_borrow = &_array; _0 = _borrow`.
+            (Some((borrow_local, borrowed_local)), Some(returned_local))
+                if borrowed_local == array_local && returned_local == borrow_local => {}
+            _ => return None,
+        }
         // The annotator infers the list's element type from the baked
         // literals, so an empty array carries no element type; leave it
         // to the residual path.
@@ -7285,6 +7765,12 @@ impl<'a> Lowering<'a> {
         on_unwind: usize,
     ) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
+        let callee_pin_gcref_arg = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(gc_root_pin_path),
+            _ => false,
+        };
 
         // Destination must be a plain `Local(i)` — projection-typed
         // destinations are not produced for monomorphized calls in any
@@ -7335,7 +7821,7 @@ impl<'a> Lowering<'a> {
                 // `SomeInstance(Struct, can_be_None=True)`: narrow to the
                 // payload class directly so a generated gateway wrapper's
                 // successful match arm can dispatch `self.method()`.
-                .or_else(|| self.option_ref_payload_class_root(&call.dest.ty))
+                .or_else(|| self.option_niche_payload_class_root(&call.dest.ty))
                 // A `dont_look_inside` residual returning `Option<*mut PyObject>`
                 // erases the same way — `dont_look_inside_return_token` maps it to
                 // the `ref` GCREF token, so `result_ty` is `Ref(None)` too — but its
@@ -7392,9 +7878,31 @@ impl<'a> Lowering<'a> {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
+        // A literal scalar index (`slice.get(1)`) has no Place type to retain
+        // in `second_arg_ty`.  Charon still records the method's `I` type in
+        // the regular-call generics, so classify the `get` before consuming
+        // `call.func`.  This is the same two-source type test used for
+        // `SliceIndex::index` below and keeps Range* implementations on the
+        // separate getslice lowering.
+        let (slice_get_index_is_scalar, slice_get_element) = match &call.func {
+            CallFunc::Regular(reg) => {
+                let scalar = self.is_slice_get_scalar_call(reg, second_arg_ty.as_ref());
+                let element = scalar.then(|| self.slice_get_element(reg)).flatten();
+                (scalar, element)
+            }
+            _ => (false, None),
+        };
         for op in call.args {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
+        let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
+            self.string_array_view_locals.iter().any(|(local, _)| {
+                self.local_var
+                    .get(*local)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|current| current == arg)
+            })
+        });
 
         let class = call.func.classify();
         // Full `name_path()` of a `CallKind::Fun` callee, captured for the
@@ -7449,6 +7957,31 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                // Rust exposes RPython's generated shadow-stack publication as
+                // a normal `pin_root(PyObjectRef)` call.  Its pointer argument
+                // is actually `llmemory.GCREF`, irrespective of the source
+                // pointer's external repr, so cast it the way
+                // `gct_gc_identityhash` casts a GC helper's pointer argument
+                // (`framework.py:1174-1182`) — before FunctionDesc propagation,
+                // so strings, W_Root instances, and other GC pointers do not
+                // union at the helper's single input cell.
+                //
+                // The pointer is the LAST argument: the `RootScope` method form
+                // `gc_root_pin_path` also admits passes `&self` first, and
+                // gating on `args.len() == 1` skipped it entirely, leaving the
+                // definition-side stamp and the call site disagreeing about the
+                // same callee.
+                if callee_pin_gcref_arg && let Some(last) = args.len().checked_sub(1) {
+                    args[last] = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(args[last].clone()),
+                            "GCREF",
+                        )
+                        .as_variable()
+                        .expect("a materialized GC root stays a Variable")
+                        .clone();
+                }
                 // `we_are_jitted()` is true during tracing and blackholing
                 // (rlib/jit.py:355-358); the rtyper folds the surviving
                 // `_we_are_jitted` symbolic to a constant True
@@ -7474,6 +8007,27 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ConstBool(true),
                     });
                     self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `gc_alloc_storage_box(Wtf8Buf, tid) -> *mut Wtf8Buf` is
+                // only the Rust ownership spelling of PyPy's direct `_utf8`
+                // RPython-string field.  The input value has already become
+                // the allocated `rpy_string`; a second nominal Wtf8Buf box
+                // does not exist in the translated object model.  Alias this
+                // one specialization to its value, exactly like
+                // `malloc_raw_alloc` round-trips a `SomeString`.  Every other
+                // `gc_alloc_storage_box<T>` keeps its translated GC-box body.
+                if args.len() == 2
+                    && self.is_string_storage_box_identity(
+                        &reg,
+                        first_arg_ty.as_ref(),
+                        &call.dest.ty,
+                    )
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -7621,18 +8175,15 @@ impl<'a> Lowering<'a> {
                 // receiver (the `Cannot find attribute "as_bytes" on String`
                 // wall).
                 //
-                // Sound only for len / equality / iteration consumers.  A
-                // scalar index (`as_bytes()[i]`) lowers to `getitem` on
-                // `StringRepr`, which yields a `Char`, not the `u8` the Rust
-                // source expects; that mismatch currently fails rtype — there
-                // is no `(CharRepr, IntegerRepr)` eq/arithmetic pairtype — so
-                // the subject fail-safe residualizes rather than miscompiling.
-                // Do NOT add a `(CharRepr, IntegerRepr)` eq arm (or otherwise
-                // let a char read byte-compare) without lowering a real
-                // byte-slice view here first, or those indexed uses would
-                // silently gain character semantics.
+                // Scalar consumers are recorded as byte views and lower to
+                // RPython's literal `ord(s[i])` pair below. This is distinct
+                // from unicode code-point indexing: the receiver here is the
+                // UTF-8/WTF-8 storage exposed explicitly by `as_bytes`.
                 if args.len() == 1 && self.is_string_as_bytes_identity(&reg, first_arg_ty.as_ref())
                 {
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -7697,17 +8248,94 @@ impl<'a> Lowering<'a> {
                 // escape guard (a failing shape stays residual — safe).  The
                 // read leaf (`index`, a value copy) needs no such guard.
                 let workspace_index = self.is_workspace_index_call(&reg);
+                // `&vec[..]` / `&mut vec[..]` is Rust's whole-list borrowed
+                // view (`Index<RangeFull>`). RPython has no borrow wrapper:
+                // both sides are the same `SomeList` value.  Preserve that
+                // identity before the scalar element arm; Range/RangeFrom/
+                // RangeTo remain real getslice operations.
+                if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // RPython's UTF-8 carrier is a byte string. A Rust
+                // `as_bytes()[i]` over the frontend's string identity is
+                // therefore `ord(s[i])`, not a list/array element load and
+                // not unicode code-point indexing. Keep it as a synthetic
+                // marker until the flowspace adapter can create the Char
+                // intermediate required by `ord`.
+                if args.len() == 2
+                    && arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+                    && self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
+                    && !self.is_slice_scalar_index_mut_call(&reg)
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__string_byte_getitem".to_string()],
+                            },
+                            args: vec![args[0].clone(), args[1].clone()],
+                            // `ord` returns RPython Signed. Rust's `u8`
+                            // spelling is representation detail here.
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    // No `index_elem_alias` entry.  That table exists so a
+                    // paired `*p = v` becomes an `ArrayWrite` over the same
+                    // base, and this base is a `StringRepr` value — upstream
+                    // has no `setitem` on one (`rstr.py` offers only
+                    // `ll_str2mutable` / `mutable_str` for writes), so the
+                    // write half cannot exist.  The arm is already guarded by
+                    // `!is_slice_scalar_index_mut_call`, but recording an
+                    // alias whose pairing would mint an op RPython does not
+                    // have is a latent illegal-op source, and it also feeds
+                    // `compute_index_write_extra_live`'s liveness reasoning.
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `ArrayRead` addresses its element as `base + index *
-                // itemsize`.  RPython can leave that width implicit — every
-                // non-primitive there IS a one-word GC pointer — but a Rust
-                // `Vec<T>` stores `T` inline, so a `Vec<u8>` strides 1 and a
-                // `Vec<String>` strides 24.  An element that is neither a
-                // sizable scalar nor a thin pointer falls through to the
-                // residual call, where Rust computes the address itself.
+                // itemsize`.  A scalar host element carries its spelling as
+                // the array identity so the descr computes the exact width;
+                // a thin pointer, or a source value translated to RPython's
+                // one-word GC pointer repr, needs only that pointer identity.
+                // Any other inline Rust ADT falls through to the residual
+                // call: assigning it a target-word stride would be false.
+                // The workspace arm asks nothing: its `pyre_` fence admits
+                // exactly the three element banks named below, all one word.
                 let element_node = tyref_index_element_node(&call.dest.ty, self.llbc);
                 let element_scalar =
                     element_node.and_then(|elem| json_ty_scalar_element_spelling(elem, self.llbc));
-                let element_is_addressable = element_scalar.is_some()
+                // A string-family or tuple element gets NO spelling here, even
+                // though `StringRepr.lowleveltype = Ptr(STR)` (`rstr.py`,
+                // `StringRepr`) and `TUPLE_TYPE` (`rtuple.py`) really are one
+                // GC pointer inside an RPython list.  Those describe the repr
+                // of a list the translation BUILDS; the container under this
+                // arm is a host Rust one that no translation replaces, and the
+                // read strides over its real memory.  `&str` is two words
+                // there, `String`/`Wtf8Buf` three, and `(Wtf8Buf,
+                // PyObjectRef)` four, so naming any of them a one-word item
+                // reads the wrong address from the second element on.  The
+                // managed `GcArray(GCREF)` items view — the one container that
+                // IS one word per item — carries its own proof
+                // (`first_arg_is_string_array_view`) and mints
+                // `STRING_GCREF_GCARRAY_TYPE_ID` below without asking here;
+                // routing host containers through the same `[str]` identity
+                // would also alias them into that array's `_cache_array` slot.
+                let element_spelling = element_scalar;
+                let element_is_addressable = element_spelling.is_some()
                     || element_node
                         .is_some_and(|elem| json_ty_is_thin_pointer_element(elem, self.llbc));
                 let index_leg = args.len() == 2
@@ -7755,6 +8383,12 @@ impl<'a> Lowering<'a> {
                 // ([`narrow_item_array_type_id`]); a `Vec<u8>` read strides by
                 // 8 without it.
                 let index_element = index_leg.then(|| {
+                    if first_arg_is_string_array_view {
+                        return (
+                            ValueType::Str,
+                            Some(STRING_GCREF_GCARRAY_TYPE_ID.to_string()),
+                        );
+                    }
                     let item_ty = tyref_deref_value_type(&call.dest.ty, self.llbc);
                     // The `pyre_`-fenced workspace arm has exactly three
                     // element banks — `FixedObjectArray`, `IntArray`,
@@ -7794,7 +8428,7 @@ impl<'a> Lowering<'a> {
                         // non-`Ref` element at 8 bytes, so a narrow int read
                         // through such a receiver would stride past its
                         // neighbours.
-                        element_scalar
+                        element_spelling
                             .as_deref()
                             .map(|elem| format!("[{elem}]"))
                             .or_else(|| {
@@ -7835,6 +8469,17 @@ impl<'a> Lowering<'a> {
                 if let Some((item_ty, array_type_id)) = index_element
                     && (workspace_index || array_type_id.is_some() || element_is_addressable)
                 {
+                    // A trait-associated `Index::Output` can stay a TypeVar
+                    // in this call's destination even though the workspace
+                    // gate has resolved the concrete receiver. In that case
+                    // `result_narrow_root` cannot recover the pointee name,
+                    // but the canonical object-array identity is already the
+                    // positive proof that the element is `PyObjectRef` (the
+                    // int/float workspaces have non-Ref banks).
+                    let item_narrow_root = result_narrow_root.clone().or_else(|| {
+                        (array_type_id.as_deref() == Some(OBJECT_REF_GCARRAY_TYPE_ID))
+                            .then(|| "PyObject".to_string())
+                    });
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -7843,7 +8488,7 @@ impl<'a> Lowering<'a> {
                         kind: OpKind::ArrayRead {
                             base: args[0].clone(),
                             index: args[1].clone(),
-                            item_ty,
+                            item_ty: item_ty.clone(),
                             array_type_id: array_type_id.clone(),
                             nolength: false,
                             pure: false,
@@ -7856,10 +8501,35 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            item_ty,
                             array_type_id,
                         },
                     );
-                    self.local_var[dest_local] = Some(res);
+                    // This intercept returns before the generic call-result
+                    // tail below.  Repeat its registered-pointee narrow so
+                    // `rlist.py:recast` exposes the concrete W_Root-equivalent
+                    // repr after the GCREF-backed getarrayitem.
+                    if let Some(root) = item_narrow_root {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec![
+                                        "__cast_instance_intrinsic".to_string(),
+                                        root.clone(),
+                                    ],
+                                },
+                                args: vec![res],
+                                result_ty: ValueType::Ref(Some(root)),
+                            },
+                        });
+                        self.local_var[dest_local] = Some(narrowed);
+                    } else {
+                        self.local_var[dest_local] = Some(res);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -7893,6 +8563,104 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `BytesArray::remove` / `UnicodeArray::remove` spell
+                // `rlist.ll_delitem_nonneg`'s overlap-safe
+                // `ll_arraymove(l, index + 1, index, newlength - index)` as
+                // raw `ptr::copy(src, dst, count)`.  Recover the logical
+                // GcArray plus those three indices here and route the call to
+                // the exact RPython helper marker.  The match is both
+                // graph-scoped and callee-exact; an arbitrary raw copy keeps
+                // its Rust semantics.
+                if args.len() == 3 && self.is_string_array_remove_ptr_copy(&reg) {
+                    let owner = self
+                        .string_array_remove_owner()
+                        .expect("ptr-copy gate proved a string-array remove owner");
+                    let list = self
+                        .local_var
+                        .get(1)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: string-array remove lost self before ll_arraymove"
+                            ))
+                        })?;
+                    let index = self
+                        .local_var
+                        .get(2)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: string-array remove lost index before ll_arraymove"
+                            ))
+                        })?;
+                    let block = self.emit_string_array_items_read(bb_id, list, owner);
+                    let array = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(block),
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )
+                        .as_variable()
+                        .expect("a string-items view stays a Variable")
+                        .clone();
+                    let one = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(one.clone()),
+                        kind: OpKind::ConstUInt(1),
+                    });
+                    let source_start = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(source_start.clone()),
+                        kind: OpKind::BinOp {
+                            op: "add".to_string(),
+                            lhs: index.clone(),
+                            rhs: one,
+                            result_ty: ValueType::Unsigned,
+                        },
+                    });
+                    let result = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    crate::runtime_names::shims::LL_ARRAYMOVE.to_string(),
+                                ],
+                            },
+                            args: vec![array, source_start, index, args[2].clone()],
+                            result_ty: ValueType::Void,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(result);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Every raw pointer offset in those same adapters feeds only
+                // the `ptr::copy` or the final null clear reconstructed above
+                // and below.  Once the logical indices are recovered, the
+                // interior pointer has no translated value of its own; alias
+                // it to its base so no Rust pointer arithmetic leaks into the
+                // RPython graph.
+                if args.len() == 2
+                    && self.string_array_remove_owner().is_some()
+                    && regular_call_is_ptr_add(&reg, self.llbc)
+                {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `*items_block_items_base(block).add(idx)` — a list /
                 // tuple element load or store through an `ItemsBlock`
                 // items pointer.  The same getarrayitem / setarrayitem
@@ -7909,6 +8677,61 @@ impl<'a> Lowering<'a> {
                 // pointer-walking callers (`object_insert` / `_remove` /
                 // `_splice`) keep their `add` and fall to the legacy
                 // walker.
+                // `BytesArray::base` / `UnicodeArray::base` address the same
+                // physical `ItemsBlock` as the object arm below, but PyPy's
+                // `BytesListStrategy` and `AsciiListStrategy` expose an
+                // RPython `str` item.  `rmodel.externalvsinternal` stores that
+                // GC pointer as GCREF; it does not erase the ListDef's
+                // external SomeString annotation.  Recover `[str]` here so
+                // getitem/setitem use StringRepr at the graph boundary and
+                // GCRefRepr only inside the ARRAY.
+                if let Some((item_ty, array_type_id)) = self.string_items_elem_ptr_add(
+                    &reg,
+                    args.len(),
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                ) {
+                    let base = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(args[0].clone()),
+                            &array_type_id,
+                        )
+                        .as_variable()
+                        .expect("a materialized string-items base stays a Variable")
+                        .clone();
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: args[1].clone(),
+                            item_ty: item_ty.clone(),
+                            array_type_id: Some(array_type_id.clone()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: base,
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            item_ty,
+                            array_type_id: Some(array_type_id),
+                        },
+                    );
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 if self.is_list_items_elem_ptr_add(
                     &reg,
                     args.len(),
@@ -7937,7 +8760,63 @@ impl<'a> Lowering<'a> {
                             base_var: args[0].clone(),
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
+                            item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                        },
+                    );
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // Scalar twin of the object-items arm above:
+                // `*typed_items_block_items_base(block).cast::<i64|f64>()
+                // .add(idx)` is RPython's getarrayitem on
+                // `GcArray(Signed|Float)`. The accessor has already collapsed
+                // its interior pointer to the block header, so use the typed
+                // array identity to restore both header offset and item bank.
+                // The shared escape gate proves the `.add` result is consumed
+                // by exactly one dereference and never used as a raw pointer.
+                if let Some((item_ty, array_type_id)) = self.typed_items_elem_ptr_add(
+                    &reg,
+                    args.len(),
+                    &arg_locals,
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                ) {
+                    let base = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(args[0].clone()),
+                            &array_type_id,
+                        )
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone();
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: args[1].clone(),
+                            item_ty: item_ty.clone(),
+                            array_type_id: Some(array_type_id.clone()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    });
+                    self.index_elem_alias.insert(
+                        dest_local,
+                        IndexElemAlias {
+                            base_local: arg_locals.first().copied().flatten(),
+                            base_var: base,
+                            index_local: arg_locals.get(1).copied().flatten(),
+                            index_var: args[1].clone(),
+                            item_ty,
+                            array_type_id: Some(array_type_id),
                         },
                     );
                     self.local_var[dest_local] = Some(res);
@@ -7963,12 +8842,23 @@ impl<'a> Lowering<'a> {
                 // annotator.  The call returns `()`; its dead destination
                 // binds to a fresh Void var.
                 if args.len() == 3 && self.is_object_array_set_ref_call(&reg) {
+                    // `FixedObjectArray._items` is `[PyObjectRef; 0]`, the
+                    // Rust storage spelling of PyPy's fixed `[W_Root]` list.
+                    // Preserve that external item annotation before the
+                    // setitem generalizes its ListDef.  The internal list
+                    // repr remains GCREF and rlist's recast lowers this marker
+                    // to the same `cast_opaque_ptr` PyPy emits.
+                    let value = self.narrow_value_to_instance_root(
+                        bb_id,
+                        LinkArg::Value(args[2].clone()),
+                        "PyObject",
+                    );
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: None,
                         kind: OpKind::ArrayWrite {
                             base: args[0].clone(),
                             index: args[1].clone(),
-                            value: LinkArg::Value(args[2].clone()),
+                            value,
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
@@ -8084,7 +8974,8 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // Builder-mode ctor. In the canonical builder-form lowering, the
-                // single `Wtf8Buf`/`String` `new`/`with_capacity` def of a
+                // single `Wtf8Buf`/`String` `new`/`with_capacity`/`from_string`
+                // def of a
                 // builder-mode accumulator (its dest local, proven single-def
                 // by that ctor in [`is_fresh_str_builder`]) mints the
                 // `StringBuilder` once via the `__majit_stringbuilder_new`
@@ -8101,6 +8992,7 @@ impl<'a> Lowering<'a> {
                 // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py) —
                 // no arg selects `ll_new(INIT_SIZE)`, the size arg threads
                 // `ll_new(n)`.
+                let builder_ctor_leaf = str_builder_ctor_leaf(self.llbc, &reg);
                 if self.builder_mode
                     && is_builder_mode_accumulator(self.body, self.llbc, dest_local)
                 {
@@ -8115,19 +9007,53 @@ impl<'a> Lowering<'a> {
                                     crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                 ],
                             },
-                            args,
+                            args: if builder_ctor_leaf == Some("with_capacity") {
+                                args.clone()
+                            } else {
+                                Vec::new()
+                            },
                             result_ty: ValueType::Ref(None),
                         },
                     });
+                    // `Wtf8Buf::from_string(initial)` is the Rust ownership
+                    // spelling of an RPython builder followed by its first
+                    // append.  Keep the initial value as an append operand;
+                    // passing it to `new` would misread it as the optional
+                    // integer capacity argument.
+                    //
+                    // So the builder is born at `INIT_SIZE`, not at
+                    // `len(initial)`.  That is the size RPython source with
+                    // this shape gets: `b = StringBuilder(); b.append(s)`
+                    // reaches `rtyper_new` with `len(hop.args_v) == 0`
+                    // (`rtyper/rbuilder.py:8-14`).  `convert_const`'s
+                    // `ll_new(len(s))` (`:57-63`) is the PREBUILT-constant
+                    // path — a builder already built at translation time —
+                    // and is not this callsite.
+                    if builder_ctor_leaf == Some("from_string") {
+                        let void = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Void);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(void),
+                            kind: OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__majit_stringbuilder_append".to_string()],
+                                },
+                                args: vec![res.clone(), args[0].clone()],
+                                result_ty: ValueType::Void,
+                            },
+                        });
+                    }
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Wtf8Buf` / `String`::push_str(&mut buf, s) / push_wtf8(&mut
-                // buf, w) — and the argument-swapped `Wtf8Piece::push_onto(&s,
-                // &mut buf)` — an accumulator append.  A `Wtf8Buf` / `String`
+                // `String::push(&mut buf, ch)`, `Wtf8Buf` /
+                // `String`::push_str(&mut buf, s), or push_wtf8(&mut buf, w) —
+                // and the argument-swapped `Wtf8Piece::push_onto(&s, &mut
+                // buf)` — an accumulator append.  A `Wtf8Buf` / `String`
                 // lifts to the single immutable `ValueType::Str`, so there is
                 // no builder to mutate in place; model the append functionally
                 // as `buf = ll_strconcat(buf, piece)` (the `add` BinOp the
@@ -8135,7 +9061,7 @@ impl<'a> Lowering<'a> {
                 // MIR local so its later reads — and the loop-header phi that
                 // threads it across the back-edge — observe the concatenated
                 // string.  `str_builder_append_args` gives the accumulator and
-                // piece arg positions (push_str / push_wtf8: acc 0, piece 1;
+                // piece arg positions (push / push_str / push_wtf8: acc 0, piece 1;
                 // push_onto: acc 1, piece 0).  The `&mut buf` accumulator
                 // arrives as a per-site ref-temp; `append_accumulator_of_arg_temp`
                 // traces it back to `buf` on demand from the MIR body, resolving
@@ -8162,6 +9088,15 @@ impl<'a> Lowering<'a> {
                     let acc_val = self.local_var[buf_local]
                         .clone()
                         .unwrap_or_else(|| args[acc_i].clone());
+                    let piece_val = if self.builder_mode
+                        && let Some(piece_temp) = arg_locals.get(piece_i).copied().flatten()
+                        && let Some(piece_builder) =
+                            append_piece_accumulator_of_arg_temp(self.body, self.llbc, piece_temp)
+                    {
+                        self.resolve_builder_build(mir_bb, piece_builder)?
+                    } else {
+                        args[piece_i].clone()
+                    };
                     if self.builder_mode
                         && is_builder_mode_accumulator(self.body, self.llbc, buf_local)
                     {
@@ -8182,12 +9117,12 @@ impl<'a> Lowering<'a> {
                                             .to_string(),
                                     ],
                                 },
-                                args: vec![acc_val, args[piece_i].clone()],
+                                args: vec![acc_val, piece_val],
                                 result_ty: ValueType::Void,
                             },
                         });
                     } else {
-                        let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &args[piece_i]);
+                        let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &piece_val);
                         self.local_var[buf_local] = Some(concat);
                     }
                     self.local_var[dest_local] = Some(
@@ -8238,6 +9173,37 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.local_var[dest_local] = Some(args[0].clone());
                     }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `try_gc_current_object_address(p)` is a Rust-interpreter
+                // adapter for the root reload RPython inserts after a
+                // collecting call (`gc_pop_roots` -> `gc_restore_root`,
+                // `memory/gctransform/shadowcolor.py`).  The translated JIT
+                // graph already carries `p` as a GC reference whose backend
+                // root map is rewritten when an object moves, so tracing the
+                // forwarding-stub query would duplicate the GC transform and
+                // expose a Rust-only `majit_gc` helper that has no PyPy graph
+                // counterpart.  Erase only the adapter's own one-call body;
+                // integer/raw-address uses elsewhere must keep their runtime
+                // normalization.
+                if args.len() == 1 && self.is_gc_current_object_address_adapter(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Atomic*::from_ptr(p)` creates a borrowed atomic view over
+                // the same address; it neither allocates nor changes the
+                // pointer representation.  The translated object model keeps
+                // these slots as their upstream scalar fields (for example
+                // unicode `hash`, `rstr.py:1238`), so alias the view to the
+                // field pointer exactly like the raw-pointer casts above.
+                if args.len() == 1 && self.is_atomic_from_ptr_identity(&reg) {
+                    self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -8348,6 +9314,58 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `bytes_block_chars` is the Rust storage adapter for
+                // RPython's `STR.chars`: its `BytesBlock.length` is exactly
+                // the gcarray descr's `len_offset`, and `chars` begins at the
+                // descr's `base_size`.  Recover the owning block from the
+                // address-taken `chars` FieldRead and alias the returned slice
+                // to that header.  This is deliberately function-scoped;
+                // arbitrary `from_raw_parts(p, n)` cannot discard `n` (for
+                // example a list's logical length may be below capacity).
+                if args.len() == 2
+                    && let Some(block) =
+                        self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0])
+                {
+                    self.local_var[dest_local] = Some(block);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `BytesArray::as_slice` / `UnicodeArray::as_slice` are the
+                // Rust fat-slice spelling around RPython's `ll_items(l)`.
+                // Their caller keeps the separate logical `l.length`; the
+                // one-word translated value is therefore the backing
+                // `GcArray(GCREF)`, with its external item kept as `str`.
+                // Fold only these two adapter bodies: an arbitrary
+                // `from_raw_parts(base, logical_len)` cannot discard its
+                // second word.
+                if args.len() == 2 && self.is_string_array_view_from_raw_parts(&reg) {
+                    let view = self.narrow_value_to_instance_root(
+                        bb_id,
+                        LinkArg::Value(args[0].clone()),
+                        STRING_GCREF_GCARRAY_TYPE_ID,
+                    );
+                    self.local_var[dest_local] = Some(
+                        view.as_variable()
+                            .expect("a string-items view stays a Variable")
+                            .clone(),
+                    );
+                    // The dropped second word IS `l.length`; keep it so a
+                    // `Rvalue::Len` over the view answers with it.
+                    if !self
+                        .string_array_view_locals
+                        .iter()
+                        .any(|(local, _)| *local == dest_local)
+                    {
+                        self.string_array_view_locals
+                            .push((dest_local, args[1].clone()));
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `RBigInt::digits{,_mut}` is a Rust view adapter around a
                 // typed-items GcArray:
                 // `slice::from_raw_parts(items_base(block), capacity)`.  The
@@ -8356,8 +9374,8 @@ impl<'a> Lowering<'a> {
                 // therefore the same array value in the translated model, and its
                 // length is the block capacity the descr reports.  Fold only these
                 // capacity-length enclosing accessors, not arbitrary raw slices
-                // (`object_items_slice` uses the logical list length, not the
-                // capacity — see [`is_container_items_view_from_raw_parts`]).
+                // (an object list's logical length can differ from its items
+                // block capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.local_var[dest_local] = Some(args[0].clone());
                     let target_bb = self.block_id[target];
@@ -8487,6 +9505,52 @@ impl<'a> Lowering<'a> {
                             op: "lt".to_string(),
                             lhs: bits.clone(),
                             rhs: zero.clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(res);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `f64::is_sign_positive(x)` is the complementary sign-bit
+                // test, `float2longlong(x) >= 0`. PyPy spells the complex repr
+                // decision as `math.copysign(1.0, x) == 1.0`; both must inspect
+                // the sign bit so +0.0/-0.0 remain distinct.
+                if args.len() == 1 && self.is_f64_is_sign_positive(&reg) {
+                    let bits = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(bits.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec![
+                                    "longlong2float".to_string(),
+                                    "float2longlong".to_string(),
+                                ],
+                            },
+                            args: vec![args[0].clone()],
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    let zero = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(zero.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "ge".to_string(),
+                            lhs: bits,
+                            rhs: zero,
                             result_ty: ValueType::Int,
                         },
                     });
@@ -8664,6 +9728,43 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `BytesArray::as_slice` / `UnicodeArray::as_slice` expose
+                // the backing items field, not the enclosing `{ block, len }`
+                // storage record.  This is RPython `ll_items(l)`: read the
+                // `block` field and project it to the logical `[str]` array
+                // before the consumer's getitem.  The caller's explicit
+                // `self.len` check remains the logical-length guard.
+                if args.len() == 1
+                    && let Some(owner) = self.string_array_slice_view_owner(&reg)
+                {
+                    let block = self.emit_string_array_items_read(bb_id, args[0].clone(), owner);
+                    let logical_len =
+                        self.emit_string_array_len_read(bb_id, args[0].clone(), owner);
+                    let view = self.narrow_value_to_instance_root(
+                        bb_id,
+                        LinkArg::Value(block),
+                        STRING_GCREF_GCARRAY_TYPE_ID,
+                    );
+                    self.local_var[dest_local] = Some(
+                        view.as_variable()
+                            .expect("a string-items view stays a Variable")
+                            .clone(),
+                    );
+                    // Same pairing as the `from_raw_parts` fold above: the
+                    // view is the header, `l.length` is its own field.
+                    if !self
+                        .string_array_view_locals
+                        .iter()
+                        .any(|(local, _)| *local == dest_local)
+                    {
+                        self.string_array_view_locals
+                            .push((dest_local, logical_len));
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `Vec::as_slice` / `<[T]>::as_slice` borrows the same
                 // elements over shared storage — identity on the list
                 // model.  Alias the result to the receiver so the consumer
@@ -8818,7 +9919,23 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_word_rotate(
+                    mir_bb, &reg.kind, &segments, &args, dest_local, target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_usize_try_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_i64_to_i32_try_from(
                     mir_bb,
                     &reg.kind,
                     &segments,
@@ -8854,6 +9971,16 @@ impl<'a> Lowering<'a> {
                 if self.try_lower_bigint_i64_try_from(
                     mir_bb,
                     &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_wtf8_as_str(
+                    mir_bb,
                     &segments,
                     &args,
                     dest_local,
@@ -9263,6 +10390,29 @@ impl<'a> Lowering<'a> {
             OpKind::Hint {
                 value: args[0].clone(),
                 kind,
+            }
+        } else {
+            op_kind
+        };
+
+        // PyPy float repr and each complex repr component call
+        // `rfloat.formatd`, an external returning one low-level `STR` GC
+        // pointer. RustPython's equivalent host formatters return a three-word
+        // Rust `String`, which the residual ABI cannot express. Retarget only
+        // those exact formatting boundaries to one-word `BytesBlock*`
+        // wrappers; the complex sign/parenthesis builder remains in its graph.
+        let op_kind = if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 1
+            && let Some(residual) = crate::front::rfloat_call::repr_residual_path(segments)
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments: residual },
+                args: args.clone(),
+                result_ty: ValueType::Ref(None),
             }
         } else {
             op_kind
@@ -9857,10 +11007,35 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // `Option::ok_or_else(opt, closure)?` is one combined value-or-raise
+        // boundary in the translated graph.  Record it separately from an
+        // ordinary scoped `Result` call: `ok_or_else` is a foreign core
+        // combinator, and lowering only the downstream `?` would leave that
+        // unregistered residual (while lowering only the Option select would
+        // materialise the Result shell RPython never has).
+        let captured_option_ok_or_else_try = if let OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            args,
+            ..
+        } = &op_kind
+            && name == "ok_or_else"
+            && args.len() == 2
+            && let Some(site) = self.recognize_option_ok_or_else_try_site(
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            ) {
+            self.option_ok_or_else_try_sites.push(site);
+            true
+        } else {
+            false
+        };
         // Capture scoped `Result<T, PyError>` call results for the
         // `?`-diamond rewiring pass (`front::result_exc`) that runs
         // after the body lowering completes.
         if let OpKind::Call { .. } = &op_kind
+            && !captured_option_ok_or_else_try
             && callee_name_path.is_some()
             && crate::front::result_exc::tyref_is_result_of_carrier(
                 &call.dest.ty,
@@ -10097,10 +11272,38 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && args.len() == 2
             && fmt_path_ends_with(segments, &["slice", "<Impl>", "get"])
+            && slice_get_index_is_scalar
+            && let Some((item_ty, array_type_id)) = slice_get_element.clone()
             && let Some(site) =
-                self.recognize_slice_get_site(&call.dest.ty, second_arg_ty.as_ref(), &result_var)
+                self.recognize_slice_get_site(&call.dest.ty, &result_var, item_ty, array_type_id)
         {
             self.slice_get_sites.push(site);
+        }
+        // `<[T]>::get(slice, start..)` returns an Option subslice.  Preserve
+        // that Option shape with the same guarded diamond as scalar `get`, but
+        // make the successful payload RPython's `getslice(start, None)`.  The
+        // RangeFrom aggregate was captured at construction time; exact value
+        // identity keeps this arm separate from arbitrary SliceIndex impls.
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments },
+            args,
+            ..
+        } = &op_kind
+            && args.len() == 2
+            && fmt_path_ends_with(segments, &["slice", "<Impl>", "get"])
+            && !slice_get_index_is_scalar
+            && let Some(range_site) = self
+                .slice_index_rangefrom_sites
+                .iter()
+                .find(|range_site| range_site.range_result == args[1])
+                .cloned()
+            && let Some(mut site) = self.recognize_slice_first_site(&call.dest.ty, &result_var)
+        {
+            site.access = crate::front::slice_first::SliceAccess::RangeFrom {
+                range: range_site.range_result,
+                start: range_site.start,
+            };
+            self.slice_first_sites.push(site);
         }
         // Capture `{uN}::saturating_sub(a, b)` sites for the unsigned clamp
         // diamond `front::saturating_sub` synthesizes.  `saturating_sub` is a
@@ -10203,13 +11406,15 @@ impl<'a> Lowering<'a> {
         {
             self.unwrap_or_sites.push(site);
         }
-        // Capture `Option::unwrap(opt)` sites for the discriminant guard
-        // `front::option_unwrap` synthesizes.  Like `unwrap_or`, `unwrap`'s body
-        // is Opaque (foreign `core`) and its receiver is the `Option` ADT, so
-        // `first_is_self` routes it to a `CallTarget::Method` (receiver in
-        // `args[0]`, the sole argument).  `recognize_unwrap_site` confirms the
-        // receiver is an `Option` (not `Result`).  A resolution miss leaves the
-        // residual call — an unregistered callee the rtyper census Skips.
+        // Capture `Option::unwrap(opt)` / plain-error `Result::unwrap(res)`
+        // sites for the discriminant guard `front::option_unwrap` synthesizes.
+        // Like `unwrap_or`, `unwrap`'s body is Opaque (foreign `core`) and its
+        // receiver is the enum ADT, so `first_is_self` routes it to a
+        // `CallTarget::Method` (receiver in `args[0]`, the sole argument).
+        // `recognize_unwrap_site` records the payload-tag polarity and excludes
+        // the exception carrier Result owned by `front::result_exc`. A
+        // resolution miss leaves the residual call — an unregistered callee
+        // the rtyper census Skips.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,
@@ -10786,6 +11991,60 @@ impl<'a> Lowering<'a> {
         is_index && callsite_index_is_scalar
     }
 
+    /// `<[T]>::get::<I>(slice, index)` with a scalar `I`.  For a local index,
+    /// MIR supplies the type through the operand Place; for a literal index it
+    /// only survives in Charon's method generics (`[T, I]`).  Preserve that
+    /// distinction so `get(1)` takes the guarded-item Option diamond while
+    /// `get(1..)` continues through `front::slice_index` as a subslice.
+    fn is_slice_get_scalar_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let is_get = self
+            .llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::slice::<Impl>::get");
+        let callsite_index_is_scalar = index_ty
+            .is_some_and(|ty| vec_index_type_is_scalar(ty, self.llbc))
+            || reg
+                .generics
+                .get("types")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|types| types.get(1))
+                .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
+                .is_some_and(|ty| vec_index_type_is_scalar(&ty, self.llbc));
+        is_get && callsite_index_is_scalar
+    }
+
+    /// ARRAY identity proof for the scalar-index `<[T]>::get` rewrite.
+    ///
+    /// This is the `get` counterpart of the `Index::index` element gate: a
+    /// scalar carries an element spelling so the descr computes its exact
+    /// stride; a thin pointer is already one word and needs no identity. Any
+    /// other inline Rust aggregate declines — including a string or tuple
+    /// element, which is one GC pointer only inside a list the translation
+    /// builds, never inside the host slice this call reads.
+    /// The outer `Option` is the proof, while the inner one is the optional
+    /// ARRAY identity (`Some(None)` means the proven thin-pointer case).
+    fn slice_get_element(&self, reg: &RegularCall) -> Option<(ValueType, Option<String>)> {
+        let element_ty = reg
+            .generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.first())
+            .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())?;
+        let element = tyref_node(&element_ty, self.llbc)?;
+        // `get` returns `Option<&T>`, but its devirtualized ArrayRead is the
+        // same RPython getarrayitem operation as `Index::index`: it produces
+        // T, not a Rust slot reference.  Read the bank from the call's T
+        // generic before looking at the reference-wrapped destination.
+        let item_ty = tyref_to_value_type(&element_ty, self.llbc);
+        if let Some(spelling) = json_ty_scalar_element_spelling(element, self.llbc) {
+            return Some((item_ty, Some(format!("[{spelling}]"))));
+        }
+        json_ty_is_thin_pointer_element(element, self.llbc).then_some((item_ty, None))
+    }
+
     fn is_slice_scalar_index_mut_call(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -10957,6 +12216,20 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// `core::sync::atomic::Atomic*::from_ptr(p)` is a layout-transparent
+    /// pointer view.  Match the exact core associated function and require an
+    /// atomic output wrapper so unrelated `from_ptr` constructors (notably
+    /// `CStr::from_ptr`) keep their own semantics.
+    fn is_atomic_from_ptr_identity(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "core::sync::atomic::<Impl>::from_ptr"
+                && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
+        })
+    }
+
     /// `<*mut T>::add` / `<*const T>::add` inside an `ItemsBlock` or
     /// `TypedItemsBlock` items-base accessor (`items_block_items_base` /
     /// `items_block_items_ptr` / `typed_items_block_items_base`), whose
@@ -10980,7 +12253,9 @@ impl<'a> Lowering<'a> {
     /// descr-based consumption is safe to alias to its receiver.
     fn is_items_block_base_ptr_add(&self, reg: &RegularCall) -> bool {
         graph_is_items_block_base_accessor(&self.graph.name)
-            && regular_call_is_ptr_add(reg, self.llbc)
+            && (regular_call_is_ptr_add(reg, self.llbc)
+                || (is_typed_array_base_adapter(&self.graph.name)
+                    && regular_call_is_ptr_wrapping_add(reg, self.llbc)))
     }
 
     /// `slice::from_raw_parts{,_mut}` inside a container's items-view adapter:
@@ -10993,13 +12268,12 @@ impl<'a> Lowering<'a> {
     /// Only capacity-length views qualify: `digits` builds its slice with
     /// `from_raw_parts(base, capacity)` (the block header's own length), so the
     /// header-alias descr (which reports capacity) preserves the length exactly.
-    /// `W_ListObject::object_items_slice{,_mut}` is deliberately EXCLUDED — it
-    /// uses `from_raw_parts(base, self.length)`, the *logical* list length,
-    /// which is `< capacity` when the block is over-allocated (e.g. after
-    /// `pop`).  Aliasing it to the header would make `items.len()` report
-    /// capacity, so `w_list_getitem` would accept an index in
-    /// `[length, capacity)` and return a stale slot instead of raising.  Fold
-    /// only the capacity-length enclosing accessors, not arbitrary raw slices.
+    /// Object-list storage is deliberately excluded: its *logical* list
+    /// length is `< capacity` when the block is over-allocated (e.g. after
+    /// `pop`). Aliasing a logical-length view to the header would make a
+    /// consumer observe capacity and accept an index in `[length, capacity)`.
+    /// The object-list port therefore follows `rlist.ll_getitem_fast` and
+    /// reads `length` plus the indexed item directly, without a raw slice.
     fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
             || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
@@ -11015,6 +12289,72 @@ impl<'a> Lowering<'a> {
                 "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
             )
         })
+    }
+
+    /// Return the owning `BytesBlock` for the exact
+    /// `bytes_block_chars(block)` raw-slice constructor.
+    ///
+    /// RPython's `STR` is a length-prefixed GC struct with a variable-sized
+    /// `chars` array (`rpython/rtyper/lltypesystem/rstr.py`).  pyre's
+    /// `BytesBlock` deliberately has the same descr-visible shape: `length`
+    /// is the array length and the address-taken `chars` field is item zero.
+    /// The lifted value is therefore the block header, not the interior
+    /// `chars` address.  Matching the defining FieldRead also proves this is
+    /// that layout adapter rather than an unrelated raw slice in the helper.
+    fn bytes_block_header_from_raw_parts(
+        &self,
+        bb_id: BlockId,
+        reg: &RegularCall,
+        chars: &Variable,
+    ) -> Option<Variable> {
+        if self.graph.name != "pyre_object::bytesobject::bytes_block_chars" {
+            return None;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        if self.llbc.fn_by_id(*id)?.item_meta.name_path() != "core::slice::raw::from_raw_parts" {
+            return None;
+        }
+        self.graph
+            .block(bb_id)
+            .operations
+            .iter()
+            .rev()
+            .find_map(|op| match (&op.result, &op.kind) {
+                (Some(result), OpKind::FieldRead { base, field, .. })
+                    if result == chars
+                        && field.name == "chars"
+                        && field.owner_root.as_deref() == Some("BytesBlock")
+                        && field.taken_by_address =>
+                {
+                    Some(base.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Whether this is the sole Rust-only forwarding query inside
+    /// `pyre_object::gc_hook::try_gc_current_object_address`.
+    ///
+    /// RPython never emits such a source-level helper: its GC transformer
+    /// reloads every live GC variable from the shadow stack after a safepoint.
+    /// Keep the match graph-scoped so runtime consumers that deliberately
+    /// normalize a stored raw address are not rewritten as identities.
+    fn is_gc_current_object_address_adapter(&self, reg: &RegularCall) -> bool {
+        if !self.is_gc_current_object_address_adapter_graph() {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "majit_gc::gc_current_object_address")
+    }
+
+    fn is_gc_current_object_address_adapter_graph(&self) -> bool {
+        self.graph.name == "pyre_object::gc_hook::try_gc_current_object_address"
     }
 
     /// `*items_block_items_base(block).add(idx)` — a list / tuple
@@ -11054,6 +12394,62 @@ impl<'a> Lowering<'a> {
             self.body,
             self.llbc,
         )
+    }
+
+    /// PyPy's unwrapped byte / ASCII list storage.  Rust reaches the shared
+    /// `ItemsBlock` through `BytesArray::base` / `UnicodeArray::base`, but the
+    /// source-level element remains `str`: `AbstractUnwrappedStrategy`
+    /// appends the result of `bytes_w` / `utf8_w`, and
+    /// `externalvsinternal(..., gcref=True)` alone changes its physical
+    /// storage to GCREF.  Return the logical `[str]` ARRAY identity so the
+    /// ordinary ListRepr performs that recast.
+    fn string_items_elem_ptr_add(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> Option<(ValueType, String)> {
+        is_string_items_elem_ptr_add_parts(
+            reg,
+            args_len,
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+        )
+        .then(|| (ValueType::Str, STRING_GCREF_GCARRAY_TYPE_ID.to_string()))
+    }
+
+    /// Scalar `GcArray(Signed|Float)` counterpart of
+    /// [`Self::is_list_items_elem_ptr_add`]. Returns the RPython item bank and
+    /// ARRAY identity when the pointer traces to
+    /// `typed_items_block_items_base`, names an `i64`/`f64` element, and is
+    /// consumed by one immediate dereference.
+    fn typed_items_elem_ptr_add(
+        &self,
+        reg: &RegularCall,
+        args_len: usize,
+        arg_locals: &[Option<usize>],
+        first_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+    ) -> Option<(ValueType, String)> {
+        if !is_typed_items_elem_ptr_add_parts(
+            reg,
+            args_len,
+            arg_locals.first().copied().flatten(),
+            first_arg_ty,
+            arg_locals.get(1).copied().flatten(),
+            dest_local,
+            self.body,
+            self.llbc,
+        ) {
+            return None;
+        }
+        raw_ptr_typed_items_element(first_arg_ty?, self.llbc)
     }
 
     /// `<*const T>::cast_mut` / `<*mut T>::cast_const` — pointer casts that
@@ -11279,6 +12675,28 @@ impl<'a> Lowering<'a> {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
+    }
+
+    /// `pyre_object::gc_storage::gc_alloc_storage_box::<Wtf8Buf>` is the
+    /// physical Rust owner for a value that the translated model already
+    /// represents as one RPython string.  Admit only the exact string-family
+    /// input and exactly-one-raw-pointer string-family result; other storage
+    /// boxes retain their allocation body.
+    fn is_string_storage_box_identity(
+        &self,
+        reg: &RegularCall,
+        first_arg_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+    ) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        fd.item_meta.name_path() == "pyre_object::gc_storage::gc_alloc_storage_box"
+            && first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
+            && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
     }
 
     /// `Option::<&T>::copied` / `Option::<T: Clone>::cloned` — reads the
@@ -11559,6 +12977,134 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Return the source owner for the string-list items-view adapters.
+    /// RPython's `ll_items(l)` reads the `items` field from the resized list;
+    /// pyre's source spelling calls that field `block`.
+    fn string_array_slice_view_owner(&self, reg: &RegularCall) -> Option<&'static str> {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
+            "pyre_object::bytes_array::<Impl>::as_slice"
+            | "pyre_object::bytes_array::<Impl>::as_mut_slice" => Some("BytesArray"),
+            "pyre_object::unicode_array::<Impl>::as_slice"
+            | "pyre_object::unicode_array::<Impl>::as_mut_slice" => Some("UnicodeArray"),
+            _ => None,
+        }
+    }
+
+    /// Owner of the two Rust storage adapters whose `remove` body is the
+    /// concrete spelling of RPython `rlist.ll_delitem_nonneg`.
+    fn string_array_remove_owner(&self) -> Option<&'static str> {
+        match self.graph.name.as_str() {
+            "pyre_object::bytes_array::<Impl>::remove" => Some("BytesArray"),
+            "pyre_object::unicode_array::<Impl>::remove" => Some("UnicodeArray"),
+            _ => None,
+        }
+    }
+
+    /// `std::ptr::copy` inside the exact string-list `remove` adapters.  The
+    /// caller reconstructs the logical array and indices and emits the
+    /// RPython `rgc.ll_arraymove` marker; no arbitrary raw copy qualifies.
+    fn is_string_array_remove_ptr_copy(&self, reg: &RegularCall) -> bool {
+        if self.string_array_remove_owner().is_none() {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::ptr::copy")
+    }
+
+    /// The body-side `from_raw_parts` half of
+    /// [`Self::string_array_slice_view_owner`].
+    fn is_string_array_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
+        if !(self.graph.name.ends_with("bytes_array::<Impl>::as_slice")
+            || self
+                .graph
+                .name
+                .ends_with("bytes_array::<Impl>::as_mut_slice")
+            || self.graph.name.ends_with("unicode_array::<Impl>::as_slice")
+            || self
+                .graph
+                .name
+                .ends_with("unicode_array::<Impl>::as_mut_slice"))
+        {
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
+            )
+        })
+    }
+
+    fn emit_string_array_items_read(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        owner: &str,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let canonical_owner = match owner {
+            "BytesArray" => "bytes_array::BytesArray",
+            "UnicodeArray" => "unicode_array::UnicodeArray",
+            _ => unreachable!("string array owner is closed"),
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("block", Some(owner.to_string())).with_owner_id(Some(
+                    majit_ir::descr::StructId::from_canonical(canonical_owner),
+                )),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        result
+    }
+
+    /// The logical `l.length` of a string-list storage record — the second
+    /// word the `from_raw_parts` view fold drops.  Upstream reads it as the
+    /// list's own field (`ll_length`, `rlist.py:365-366`), strictly apart
+    /// from the array header's `ll_fixed_length` / `arraylen_gc`.
+    fn emit_string_array_len_read(
+        &mut self,
+        bb_id: BlockId,
+        base: Variable,
+        owner: &str,
+    ) -> Variable {
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let canonical_owner = match owner {
+            "BytesArray" => "bytes_array::BytesArray",
+            "UnicodeArray" => "unicode_array::UnicodeArray",
+            _ => unreachable!("string array owner is closed"),
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new("len", Some(owner.to_string())).with_owner_id(Some(
+                    majit_ir::descr::StructId::from_canonical(canonical_owner),
+                )),
+                ty: ValueType::Unsigned,
+                pure: false,
+            },
+        });
+        result
+    }
+
     /// `<[T]>::as_ptr` — the data-pointer projection of a slice receiver.  In
     /// the erased value-model a `&[T]` collapses to a single GC array pointer
     /// (its length is read from the array header by `ArrayLen`, not a companion
@@ -11771,6 +13317,19 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_negative")
+    }
+
+    /// `f64::is_sign_positive(self)` — the positive half of the same sign-bit
+    /// primitive as [`Self::is_f64_is_sign_negative`]. Reinterpret the f64 as
+    /// a signed i64 and test `>= 0`; a numerical comparison with zero would
+    /// incorrectly classify `-0.0` and sign-bit-set NaN.
+    fn is_f64_is_sign_positive(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_positive")
     }
 
     /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
@@ -12401,13 +13960,14 @@ impl<'a> Lowering<'a> {
         ))
     }
 
-    /// Registered ADT pointee of `Option<&T>` / `Option<&mut T>`.
+    /// Registered ADT pointee of a one-word niche `Option<&T>` /
+    /// `Option<&mut T>` / `Option<*mut T>`.
     ///
     /// Rust uses the null pointer niche for this Option shape. It therefore
     /// maps to RPython's nullable `SomeInstance(T)`, not to an Option
     /// container class with `__discriminant` / `__pos_0` fields.
-    fn option_ref_payload_class_root(&self, dest_ty: &TyRef) -> Option<String> {
-        if !crate::front::result_exc::tyref_is_option(dest_ty, self.llbc) {
+    fn option_niche_payload_class_root(&self, dest_ty: &TyRef) -> Option<String> {
+        if !self.tyref_is_niche_option_ptr(dest_ty) {
             return None;
         }
         let mut payload = tyref_node(dest_ty, self.llbc)?
@@ -12430,8 +13990,13 @@ impl<'a> Lowering<'a> {
                 payload = &parts[1];
                 continue;
             }
+            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
+                return Some(root);
+            }
             let pointee = obj.get("Ref")?.as_array()?.get(1)?;
-            return adt_node_class_root(strip_ty_wrappers(pointee, self.llbc)?, self.llbc);
+            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
+            return raw_ptr_pointee_class_root(pointee, self.llbc)
+                .or_else(|| adt_node_class_root(pointee, self.llbc));
         }
     }
 
@@ -12525,6 +14090,10 @@ impl<'a> Lowering<'a> {
         result_var: &Variable,
     ) -> Option<crate::front::bool_then::BoolThenSite> {
         let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         // Closure env ADT → its `name_path` is the `call_once` inherent
         // method owner (`resolve_impl_owner_adt_def_id_free` records the
         // same spelling for the closure's transparent `call_once` body).
@@ -12537,6 +14106,8 @@ impl<'a> Lowering<'a> {
             option_owner,
             some_owner,
             payload_ty,
+            niche,
+            payload_narrow_root,
         })
     }
 
@@ -12552,37 +14123,50 @@ impl<'a> Lowering<'a> {
         result_var: &Variable,
     ) -> Option<crate::front::bool_then::BoolThenSite> {
         let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         Some(crate::front::bool_then::BoolThenSite {
             result_var: result_var.clone(),
             call_once_owner: None,
             option_owner,
             some_owner,
             payload_ty,
+            niche,
+            payload_narrow_root,
         })
     }
 
     /// Resolve a recognized `<[T]>::first(slice)` call into a
     /// [`crate::front::slice_first::SliceFirstSite`] — the `Option` enum root +
     /// `Some` variant owners the length-checked diamond post-pass spells its
-    /// arms with.  Gated on [`Self::option_residual_narrow_root`] returning
-    /// `Some`: that is exactly the shape `lower_call` appends a trailing
-    /// `__cast_instance_intrinsic` narrowing to (the cast the post-pass absorbs and
-    /// re-applies per arm), and it declines a value-slice `Option<u8>` /
-    /// `Option<i64>` (no registered pointee root) cleanly, leaving the residual
-    /// call for the census Skip.  `None` when the destination is not a
-    /// resolvable narrow-root `Option`.
+    /// arms with.  The post-pass accepts both representations that
+    /// `lower_call` can produce: a reference-payload result followed by
+    /// `__cast_instance_intrinsic`, and a value-payload `Option<u8>` / `Option<i64>`
+    /// with no trailing cast.  Reuse the consumer-owner spelling so unsigned
+    /// payloads stay on the bare `Option` root used by checked arithmetic,
+    /// while other payloads keep their per-instantiation class.  `None` when
+    /// the destination is not a resolvable `Option`.
     fn recognize_slice_first_site(
         &self,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::slice_first::SliceFirstSite> {
-        self.option_residual_narrow_root(dest_ty)?;
-        let (option_owner, some_owner, payload_ty) = self.resolve_bool_then_option_dest(dest_ty)?;
+        let (option_owner, some_owner, payload_ty) =
+            self.resolve_option_consumer_owners(dest_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         Some(crate::front::slice_first::SliceFirstSite {
             result_var: result_var.clone(),
+            access: crate::front::slice_first::SliceAccess::First,
             option_owner,
             some_owner,
             payload_ty,
+            niche,
+            payload_narrow_root,
         })
     }
 
@@ -12591,49 +14175,22 @@ impl<'a> Lowering<'a> {
     /// + `Some` variant owners [`Self::recognize_slice_first_site`] resolves,
     /// plus the `SliceIndex` instantiation gate `first` has no need of.
     ///
-    /// `<[T]>::get` is generic over `SliceIndex`, and only its scalar
-    /// instantiation returns `Option<&T>`.  Every range one (`Range`,
-    /// `RangeTo`, `RangeFrom`, `RangeFull`, `RangeInclusive`,
-    /// `RangeToInclusive`) returns `Option<&[T]>`, whose payload is a
-    /// SUB-SLICE: an element read at the range's start would hand the consumer
-    /// a `T` where a `[T]` is expected.  Pin the scalar one by the index
-    /// operand's declared `usize` — the same discriminator
-    /// [`Self::is_slice_scalar_index_call`] uses to separate `<[T]>::index`'s
-    /// scalar impl from its range ones.  A literal subscript arrives as an
-    /// `Operand::Const`, for which no `index_ty` is captured, so it declines
-    /// too: the residual call and its census Skip both survive.
-    ///
-    /// [`Self::option_residual_narrow_root`] refuses the range forms a second
-    /// time — a `[T]` payload is the `Slice` builtin, which has no ADT def-id
-    /// and so no registered narrow root — and is load-bearing for `get` for
-    /// the reason it is for `first`: it is exactly the shape `lower_call`
-    /// appends a trailing `__pyre_cast_instance` narrowing to, the cast the
-    /// post-pass absorbs and re-applies per arm.  It also declines a
-    /// value-slice `Option<u8>` / `Option<i64>` cleanly.
+    /// The call site has already proved the `SliceIndex` instantiation is
+    /// scalar through [`Self::is_slice_get_scalar_call`], using either the
+    /// operand Place type or (for a literal index) the method generic.  Resolve
+    /// the destination with the same consumer-owner rule used by checked
+    /// arithmetic and `Option` consumers: reference payloads may carry the
+    /// trailing narrowing cast the post-pass absorbs, while scalar payloads
+    /// (`Option<u8>`, `Option<i64>`, …) remain value-banked and have no cast.
     fn recognize_slice_get_site(
         &self,
         dest_ty: &TyRef,
-        index_ty: Option<&TyRef>,
         result_var: &Variable,
+        item_ty: ValueType,
+        array_type_id: Option<String>,
     ) -> Option<crate::front::slice_get::SliceGetSite> {
-        if index_ty.and_then(|ty| self.tyref_literal_uint_atom(ty)) != Some("Usize") {
-            crate::decline::record_named(
-                crate::decline::gate::SLICE_GET_SITE,
-                "index-not-usize",
-                &self.graph.name,
-            );
-            return None;
-        }
-        if self.option_residual_narrow_root(dest_ty).is_none() {
-            crate::decline::record_named(
-                crate::decline::gate::SLICE_GET_SITE,
-                "payload-has-no-narrow-root",
-                &self.graph.name,
-            );
-            return None;
-        }
-        let Some((option_owner, some_owner, payload_ty)) =
-            self.resolve_bool_then_option_dest(dest_ty)
+        let Some((option_owner, some_owner, _reference_payload_ty)) =
+            self.resolve_option_consumer_owners(dest_ty)
         else {
             crate::decline::record_named(
                 crate::decline::gate::SLICE_GET_SITE,
@@ -12647,11 +14204,18 @@ impl<'a> Lowering<'a> {
             "site-recognized (ACCEPT, not a decline)",
             &self.graph.name,
         );
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         Some(crate::front::slice_get::SliceGetSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
-            payload_ty,
+            payload_ty: item_ty,
+            array_type_id,
+            niche,
+            payload_narrow_root,
         })
     }
 
@@ -12767,30 +14331,56 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve a recognized `Option::unwrap(opt)` call into an
-    /// [`crate::front::option_unwrap::UnwrapSite`] — the `Option` enum root +
-    /// `Some` variant owners and the payload type the discriminant-guard
-    /// post-pass needs.  `None` (leaving the residual call) when the receiver
-    /// type is not a resolvable `Option`.  Guards on `Option` specifically —
-    /// `Result::unwrap` shares the method name but its `Ok`/`Err` tags do not
-    /// match `Some`=1/`None`=0.
+    /// Resolve a recognized `Option::unwrap(opt)` / plain-error
+    /// `Result::unwrap(res)` call into an
+    /// [`crate::front::option_unwrap::UnwrapSite`] — the enum root, payload
+    /// variant owner, payload type, and discriminant polarity the guard
+    /// post-pass needs. `Result<T, PyError>` remains the exception transform's
+    /// domain and is deliberately excluded. `None` leaves the residual call.
     fn recognize_unwrap_site(
         &self,
         recv_ty: Option<&TyRef>,
         result_var: &Variable,
     ) -> Option<crate::front::option_unwrap::UnwrapSite> {
         let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
+        let is_option = crate::front::result_exc::tyref_is_option(recv_ty, self.llbc);
+        let (enum_owner, payload_owner, payload_on_disc_true, niche) = if is_option {
+            let (option_owner, some_owner, _) = self.resolve_option_consumer_owners(recv_ty)?;
+            (
+                option_owner,
+                some_owner,
+                true,
+                self.tyref_is_niche_option_ptr(recv_ty),
+            )
+        } else if crate::front::result_exc::tyref_is_result(recv_ty, self.llbc)
+            && !crate::front::result_exc::tyref_is_result_of_carrier(
+                recv_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
+            let def_id = self.tyref_adt_def_id(recv_ty)?;
+            let td = self.llbc.type_by_id(def_id)?;
+            // Match the per-instantiation owner minted by checked conversion
+            // producers (`Result<usize, TryFromIntError>`, etc.). A bare
+            // Result root would split the producer and consumer classdefs.
+            let enum_owner = format!(
+                "{}{}",
+                td.item_meta.name_path(),
+                tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            );
+            let payload_owner = Self::tagged_pair_payload_owner(td, &enum_owner, 0)?;
+            (enum_owner, payload_owner, false, false)
+        } else {
             return None;
-        }
-        let (option_owner, some_owner, payload_ty) =
-            self.resolve_option_consumer_owners(recv_ty)?;
-        let niche = self.tyref_is_niche_option_ptr(recv_ty);
+        };
+        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
         Some(crate::front::option_unwrap::UnwrapSite {
             result_var: result_var.clone(),
-            option_owner,
-            some_owner,
+            enum_owner,
+            payload_owner,
             payload_ty,
+            payload_on_disc_true,
             niche,
         })
     }
@@ -13003,6 +14593,48 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Resolve `Option::ok_or_else(opt, closure) -> Result<T, E>` for the
+    /// combined Option-select + immediate-`?` exception rewrite.
+    ///
+    /// The destination must use the configured exception carrier; this keeps
+    /// ordinary `ok_or_else` values and non-Python error domains as residual
+    /// Rust combinators.  The post-pass additionally proves the compiler's
+    /// private `Try::branch` diamond before it mutates the graph.
+    fn recognize_option_ok_or_else_try_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::result_exc::OptionOkOrElseTrySite> {
+        let recv_ty = recv_ty?;
+        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc)
+            || !crate::front::result_exc::tyref_is_result_of_carrier(
+                dest_ty,
+                self.llbc,
+                self.static_addrs.error_carrier,
+            )
+        {
+            return None;
+        }
+        let (option_owner, some_owner, payload_ty) =
+            self.resolve_option_consumer_owners(recv_ty)?;
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        let error_ty = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)
+            .map(|ty| tyref_to_value_type(&ty, self.llbc))
+            .unwrap_or(ValueType::Ref(None));
+        Some(crate::front::result_exc::OptionOkOrElseTrySite {
+            result_var: result_var.clone(),
+            option_owner,
+            some_owner,
+            call_once_owner,
+            payload_ty,
+            error_ty,
+            niche: self.tyref_is_niche_option_ptr(recv_ty),
+        })
+    }
+
     /// Resolve a recognized `Option::map`/`and_then`/`unwrap_or_else(opt,
     /// closure)` call into a
     /// [`crate::front::option_closure_select::ClosureSelectSite`] — the `Option`
@@ -13050,13 +14682,32 @@ impl<'a> Lowering<'a> {
         // is `Option<T>` and its closure returns that same `Option<T>`;
         // `unwrap_or_else`'s dest is the bare `T`; `is_some_and`'s closure and
         // dest are both `bool`.
-        let call_result_ty = match kind {
-            ClosureCombinator::Map => self.tyref_option_payload_value_type(dest_ty)?,
+        let call_result_tyref = match kind {
+            ClosureCombinator::Map => {
+                crate::front::result_exc::tyref_option_payload(dest_ty, self.llbc)?
+            }
             ClosureCombinator::AndThen
             | ClosureCombinator::OrElse
             | ClosureCombinator::UnwrapOrElse
-            | ClosureCombinator::IsSomeAnd => tyref_to_value_type(dest_ty, self.llbc),
+            | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
         };
+        let call_result_ty = tyref_to_value_type(&call_result_tyref, self.llbc);
+        let call_once_result_exc = crate::front::result_exc::tyref_is_result_of_carrier(
+            &call_result_tyref,
+            self.llbc,
+            self.static_addrs.error_carrier,
+        )
+        .then(|| {
+            let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+                &call_result_tyref,
+                self.llbc,
+            );
+            let payload_ty =
+                crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
+                    .map(|ty| tyref_to_value_type(&ty, self.llbc))
+                    .unwrap_or(ValueType::Ref(None));
+            (suffix, payload_ty)
+        });
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
         // build none.  `U` is the dest payload, not the receiver's `T`, so the
@@ -13088,6 +14739,7 @@ impl<'a> Lowering<'a> {
             call_result_ty,
             args_tuple_suffix,
             niche,
+            call_once_result_exc,
         })
     }
 
@@ -13217,17 +14869,32 @@ impl<'a> Lowering<'a> {
         // `getdebug_data() -> Option<&FrameDebugData>` is a live shared-ref
         // producer reaching here; its `FrameDebugData` pointee is Sized
         // (carries a concrete layout size).
-        if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc)
-            && let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc)
-            && let Some(def_id) = adt_node_def_id(stripped)
-            && self
-                .llbc
-                .type_by_id(def_id)
-                .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
-                .and_then(|l| l.size)
-                .is_some()
-        {
-            return true;
+        if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc) {
+            let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc) else {
+                return false;
+            };
+            // `&*mut T` is a thin shared reference even though its pointee is
+            // itself a raw pointer rather than a nominal ADT.  This is the
+            // shape of `<[*mut PyObject]>::get`: `Option<&PyObjectRef>` is one
+            // nullable reference word, and its successful value is the list
+            // item pointer.  RPython has no Option aggregate here; it is the
+            // same `SomeInstance(T, can_be_None=True)` pointer lattice as the
+            // direct `&T` nominal-ADT arm below.
+            if type_node_raw_ptr_pointee(stripped, self.llbc).is_some() {
+                return true;
+            }
+            if let Some(def_id) = adt_node_def_id(stripped)
+                && self
+                    .llbc
+                    .type_by_id(def_id)
+                    .and_then(|td| {
+                        td.layout_for_target(&std::env::var("TARGET").unwrap_or_default())
+                    })
+                    .and_then(|l| l.size)
+                    .is_some()
+            {
+                return true;
+            }
         }
         // A direct raw pointer to a nominal ADT is the one-word address of
         // that aggregate in these graphs. Keep the concrete-layout gate even
@@ -13405,6 +15072,126 @@ impl<'a> Lowering<'a> {
             },
         });
         self.local_var[dest_local] = Some(res);
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Lower a constant `u64`/`usize::rotate_left` to the unsigned
+    /// shift/or expansion used by PyPy's 64-bit tuple hash
+    /// (`tupleobject.py:370-374`, `xxrotate`).  Core integer method bodies are
+    /// opaque in LLBC; leaving this as a call therefore hides a primitive
+    /// RPython operation behind an unregistrable Rust helper.
+    ///
+    /// Keep the gate deliberately narrow: the receiver must be a word-sized
+    /// unsigned integer and the count must be a graph constant.  A signed
+    /// receiver would require an explicit unsigned reinterpretation before
+    /// the right shift, and a variable Rust count needs the full modulo-word
+    /// normalization.  Neither is present in the current RPython-shaped
+    /// source, so those forms remain residual instead of being guessed at.
+    fn try_lower_word_rotate(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "rotate_left"
+        {
+            return Ok(false);
+        }
+        let [value, count] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(receiver_ty) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        // Upstream picks the rotate constants from the word width
+        // (`tupleobject.py`: `if sys.maxint == 2 ** 31 - 1` chooses
+        // `(x << 13) | (x >> 19)`, the else arm `(x << 31) | (x >> 33)`).
+        // The fold below is that 64-bit arm, so `u64` always qualifies and
+        // `usize` only where the target word IS eight bytes.
+        let width_matches_the_64_bit_arm = match self.tyref_literal_uint_atom(receiver_ty) {
+            Some("U64") => true,
+            Some("Usize") => crate::layout::target_word_size() == 8,
+            _ => false,
+        };
+        if !width_matches_the_64_bit_arm {
+            return Ok(false);
+        }
+        let Some(raw_count) = self
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| {
+                (op.result.as_ref() == Some(count))
+                    .then(|| match &op.kind {
+                        OpKind::ConstInt(n) if *n >= 0 => Some(*n as u64),
+                        OpKind::ConstUInt(n) => Some(*n),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+        else {
+            return Ok(false);
+        };
+        let count = (raw_count & 63) as i64;
+        let complement = (64 - count) & 63;
+        let bb_id = self.block_id[mir_bb];
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(result.clone()),
+                kind,
+            });
+            result
+        };
+        let count = push_op(&mut self.graph, OpKind::ConstInt(count));
+        let left = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "lshift".to_string(),
+                lhs: value.clone(),
+                rhs: count,
+                result_ty: ValueType::Unsigned,
+            },
+        );
+        let complement = push_op(&mut self.graph, OpKind::ConstInt(complement));
+        let right = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "rshift".to_string(),
+                lhs: value.clone(),
+                rhs: complement,
+                result_ty: ValueType::Unsigned,
+            },
+        );
+        let result = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "or".to_string(),
+                lhs: left,
+                rhs: right,
+                result_ty: ValueType::Unsigned,
+            },
+        );
+        self.local_var[dest_local] = Some(result);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -13769,7 +15556,126 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
-    /// Lower the infallible `usize::try_from(<u8|u16|u32>)`
+    /// Lower `Wtf8::as_str() -> Result<&str, Utf8Error>` to the same
+    /// runtime-tagged aggregate a translated RPython validity test followed
+    /// by the string value would produce.
+    ///
+    /// PyPy's unicode value can carry lone surrogates, while the Rust host
+    /// API exposes that distinction through `Result`.  The validity decision
+    /// therefore remains a red residual scalar (`wtf8_key_is_utf8`), and only
+    /// the `Ok` payload is the identity string value.  Folding the whole call
+    /// to the receiver would incorrectly delete the lone-surrogate arm.
+    ///
+    /// This lowering is restricted to the current interpreter shape, whose
+    /// `Wtf8::as_str` callers inspect only the tag and the `Ok` string.  A
+    /// caller that consumes `Utf8Error` would require a separate
+    /// foreign-boundary port of `valid_up_to` / `error_len`; this adapter must
+    /// not be generalized to such a call site by pretending that payload has
+    /// an RPython layout.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_wtf8_as_str(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if segments != ["Wtf8", "as_str"] {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let Some(ok_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if !tyref_strips_to_str(&ok_ty, self.llbc) {
+            return Ok(false);
+        }
+        let Some(err_ty) = self.tyref_adt_type_arg(dest_ty, 1) else {
+            return Ok(false);
+        };
+        let err_is_utf8 = self
+            .tyref_adt_def_id(&err_ty)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .is_some_and(|td| td.item_meta.name_path().ends_with("::Utf8Error"));
+        if !err_is_utf8 {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let bb_id = self.block_id[mir_bb];
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind,
+            });
+            res
+        };
+        let valid = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_object".to_string(),
+                        "dictmultiobject".to_string(),
+                        "wtf8_key_is_utf8".to_string(),
+                    ],
+                },
+                args: vec![arg.clone()],
+                result_ty: ValueType::Bool,
+            },
+        );
+        // Result convention is Ok=0 / Err=1.  Comparing the validity bool
+        // with False therefore has exactly the required integer tag while
+        // preserving the runtime arm.  This is the same flowspace shape as
+        // the ordinary Rust `!bool` lowering above: RPython has no logical
+        // `not` operation, because `UNARY_NOT` becomes a truth test plus a
+        // branch in `flowcontext.py`; a scalar negation is `eq(b, False)`.
+        let false_var = push_op(&mut self.graph, OpKind::ConstBool(false));
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: valid,
+                rhs: false_var,
+                result_ty: ValueType::Int,
+            },
+        );
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate_typed(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            arg.clone(),
+            ValueType::Str,
+            dest_local,
+            target,
+        )?;
+        Ok(true)
+    }
+
+    /// Lower Rust's checked integer-to-`usize` shell to the same primitive
+    /// comparisons and cast operations RPython emits for integer reprs.
+    ///
+    /// The infallible `usize::try_from(<u8|u16|u32>)`
     /// (`core::convert::num::ptr_try_from_impls::<Impl>::try_from`,
     /// Opaque in the LLBC like every core fn) to its decomposed
     /// always-`Ok` shape: `__discriminant = 0` (`Result`'s `Ok` tag)
@@ -13780,10 +15686,14 @@ impl<'a> Lowering<'a> {
     /// (`pyopcode.rs` `u32_as_usize` / `raise_kind_as_usize`), whose
     /// `Err` arm is statically dead for the `U8`/`U16`/`U32` sources
     /// filtered on below — narrower than `usize` on every target pyre
-    /// builds for, wasm32 included.  Impls with word-sized-or-wider
-    /// inputs — the genuinely fallible directions of the same impl
-    /// group — keep the `Call` form, so this filter must not be
-    /// widened to `U64` on the strength of the host being 64-bit.
+    /// builds for, wasm32 included.  A same-width signed source (`isize`, or
+    /// `i64` in a 64-bit LLBC corpus) is fallible only for negative values.
+    /// Preserve Rust's observable `Result` branch as a runtime tag and cast
+    /// its success payload with RPython's `cast_int_to_uint` spelling
+    /// (`rint.py:200-205`).  The cast is total and may run eagerly on the Err
+    /// arm because that payload is dead there.  Fixed-width `i64` is admitted
+    /// only when Charon's target metadata proves an eight-byte pointer; wider
+    /// signed sources on a narrower target remain fail-closed.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -13820,10 +15730,22 @@ impl<'a> Lowering<'a> {
         let Some(src) = fd.signature.inputs.first() else {
             return Ok(false);
         };
-        if !matches!(
+        let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")
-        ) {
+        );
+        let src_is_signed_word = match self.tyref_literal_int_atom(src) {
+            Some("Isize") => true,
+            Some("I64") => self.llbc.target_pointer_size() == Some(8),
+            _ => false,
+        };
+        if !src_is_small_uint && !src_is_signed_word {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if self.tyref_literal_uint_atom(&success_ty) != Some("Usize") {
             return Ok(false);
         }
         let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
@@ -13843,6 +15765,56 @@ impl<'a> Lowering<'a> {
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
         let arg = arg.clone();
+        if src_is_signed_word {
+            let bb_id = self.block_id[mir_bb];
+            let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+                let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(result.clone()),
+                    kind,
+                });
+                result
+            };
+            let zero = push_op(&mut self.graph, OpKind::ConstInt(0));
+            // Result convention: Ok=0, Err=1.  For equal-width signed →
+            // unsigned conversion the sign test is the complete overflow
+            // predicate.
+            let disc = push_op(
+                &mut self.graph,
+                OpKind::BinOp {
+                    op: "lt".to_string(),
+                    lhs: arg.clone(),
+                    rhs: zero,
+                    result_ty: ValueType::Int,
+                },
+            );
+            let payload = push_op(
+                &mut self.graph,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    },
+                    args: vec![arg],
+                    result_ty: ValueType::Unsigned,
+                },
+            );
+            let payload_owner =
+                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+            self.emit_tagged_pair_aggregate_typed(
+                mir_bb,
+                &owner,
+                &payload_owner,
+                disc,
+                payload,
+                ValueType::Unsigned,
+                dest_local,
+                target,
+            )?;
+            return Ok(true);
+        }
         if self.multi_assigned_locals.contains(&dest_local) {
             // A re-bindable local may later carry a runtime `Result`,
             // so the constant tag can't be recorded and consumers
@@ -13884,6 +15856,132 @@ impl<'a> Lowering<'a> {
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Lower the fallible `i32::try_from(i64)` core shell to the checked
+    /// narrowing shape PyPy writes directly in
+    /// `ObjSpace.c_int_w` (`baseobjspace.py:2062-2068`): the value succeeds
+    /// exactly when `INT_MIN <= value <= INT_MAX`. Rust carries the two
+    /// branches in a `Result<i32, TryFromIntError>`, so preserve that source
+    /// CFG by materializing `Ok=0` / `Err=1` and leaving the caller's match
+    /// arms untouched.
+    ///
+    /// The payload aliases the i64 carrier. Narrow integer widths do not have
+    /// a distinct JIT register bank, and it is read only on the proven-in-range
+    /// Ok arm; this is the same value-preserving representation rule used by
+    /// [`Self::try_lower_usize_try_from`]. Other source/destination pairs stay
+    /// residual until their own bounds and signedness rules are ported.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn try_lower_i64_to_i32_try_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [first, .., module, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if first.as_str() != "core"
+            || module.as_str() != "num"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "try_from"
+        {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !matches!(self.tyref_literal_int_atom(src), Some("I64" | "Isize")) {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if self.tyref_literal_int_atom(&success_ty) != Some("I32") {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let bb_id = self.block_id[mir_bb];
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(result.clone()),
+                kind,
+            });
+            result
+        };
+        let min = push_op(&mut self.graph, OpKind::ConstInt(i32::MIN as i64));
+        let below = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "lt".to_string(),
+                lhs: arg.clone(),
+                rhs: min,
+                result_ty: ValueType::Int,
+            },
+        );
+        let max = push_op(&mut self.graph, OpKind::ConstInt(i32::MAX as i64));
+        let above = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "gt".to_string(),
+                lhs: arg.clone(),
+                rhs: max,
+                result_ty: ValueType::Int,
+            },
+        );
+        // `c_int_w` joins the two bound tests with `or`
+        // (`baseobjspace.py:2066`), so join them with the registered `or_`
+        // operator (`operation.py:486`) rather than with arithmetic: the
+        // result is the Result discriminant, 0 in range (Ok), 1 out of range
+        // (Err).
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "or".to_string(),
+                lhs: below,
+                rhs: above,
+                result_ty: ValueType::Int,
+            },
+        );
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            arg.clone(),
+            dest_local,
+            target,
+        )?;
         Ok(true)
     }
 
@@ -14450,6 +16548,17 @@ impl<'a> Lowering<'a> {
     /// `Result::Ok`) — so its runtime offset matches the
     /// `resolve_adt_field` read, which is variant-qualified
     /// (`{enum_leaf}::{variant}`).
+    ///
+    /// **Precondition on the caller.**  The write is unconditional: the
+    /// payload lands under the success variant on the failure arm too.  The
+    /// tagged pair has one payload slot, so nothing is corrupted, but a
+    /// failure variant whose payload some consumer READS would read this
+    /// value under a variant-qualified key that was never written.  Every
+    /// caller here fails with a payload no consumer reads —
+    /// `Option::None` carries none, and `i32::try_from`'s
+    /// `TryFromIntError(())` is the unit — so the read cannot occur.  A new
+    /// caller whose failure arm carries live data must branch instead of
+    /// reusing this tail.
     #[expect(
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
@@ -14464,8 +16573,35 @@ impl<'a> Lowering<'a> {
         dest_local: usize,
         target: usize,
     ) -> Result<(), LowerError> {
+        self.emit_tagged_pair_aggregate_typed(
+            mir_bb,
+            owner,
+            payload_owner,
+            disc,
+            payload,
+            ValueType::Int,
+            dest_local,
+            target,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    fn emit_tagged_pair_aggregate_typed(
+        &mut self,
+        mir_bb: usize,
+        owner: &str,
+        payload_owner: &str,
+        disc: Variable,
+        payload: Variable,
+        payload_ty: ValueType,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<(), LowerError> {
         let bb_id = self.block_id[mir_bb];
-        let mut owner_path: Vec<String> = owner.split("::").map(str::to_string).collect();
+        let mut owner_path = crate::model::split_qualified_path(owner);
         let ctor_name = owner_path.pop().unwrap_or_default();
         let ctor_target = if owner_path.is_empty() {
             CallTarget::synthetic_transparent_ctor(ctor_name.clone())
@@ -14483,17 +16619,16 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Ref(Some(owner.to_string())),
             },
         });
-        // Both decomposed fields carry integers: the `__discriminant`
-        // tag is an `i64` (matching the `Rvalue::Discriminant`
-        // `FieldRead` and the `i64` field registration) and the
-        // `__pos_0` payload is the negated / widened integer the
-        // `checked_neg` / `usize::try_from` callers materialize.  A
-        // `Ref` field type here would disagree with that registration.
-        // `__discriminant` keys the root (tag offset 0); `__pos_0` keys
-        // the success variant so its exact offset matches the read.
-        for (name, value, field_owner) in [
-            ("__discriminant", disc, owner),
-            ("__pos_0", payload, payload_owner),
+        // The `__discriminant` tag is always an `i64` (matching the
+        // `Rvalue::Discriminant` `FieldRead` and field registration).
+        // The success payload keeps the producer's actual low-level type:
+        // integer for checked arithmetic / widening, string for the
+        // `Wtf8::as_str` validity decomposition.  `__discriminant` keys the
+        // root (tag offset 0); `__pos_0` keys the success variant so its exact
+        // offset and type match the read.
+        for (name, value, field_owner, ty) in [
+            ("__discriminant", disc, owner, ValueType::Int),
+            ("__pos_0", payload, payload_owner, payload_ty),
         ] {
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: None,
@@ -14507,7 +16642,7 @@ impl<'a> Lowering<'a> {
                         taken_by_address: false,
                     },
                     value: LinkArg::Value(value),
-                    ty: ValueType::Int,
+                    ty,
                 },
             });
         }
@@ -14927,42 +17062,85 @@ fn compute_multi_assigned_locals(body: &Unstructured) -> std::collections::HashS
 /// The owning type of a functional-concat string builder: `Wtf8Buf` (the
 /// interpreter's repr accumulator) or std `String` (the byte / leaf / module
 /// repr helpers).  Both annotate to the immutable `ValueType::Str`, so a
-/// `push_str` append models identically as `buf = ll_strconcat(buf, arg)`;
+/// `push` / `push_str` append models identically as
+/// `buf = ll_strconcat(buf, arg)`;
 /// `push_wtf8` is `Wtf8Buf`-only but the leaf gate never matches it on a
 /// `String`, so one owner set serves both.
 fn is_str_builder_owner(owner: Option<&str>) -> bool {
     matches!(owner, Some("Wtf8Buf") | Some("String"))
 }
 
+/// The owner of a *seed* constructor — one called on a borrowed string to
+/// build a fresh buffer, rather than one called on the buffer itself.
+///
+/// `Wtf8::to_wtf8_buf(&self) -> Wtf8Buf` is `Wtf8Buf { bytes:
+/// self.bytes.to_vec() }`: an unconditional fresh allocation holding a copy of
+/// the receiver, which is what `Wtf8Buf::from_string` already contributes on
+/// the owned side.  Seeding an accumulator from an existing string is the
+/// shape `do_stringformat` (`rstr.py`) builds, and a slice feeding one is
+/// sound because upstream's `getslice` is a copy, not a view
+/// (`ll_stringslice_startonly`, `rstr.py`).
+fn is_str_builder_seed_owner(owner: Option<&str>) -> bool {
+    matches!(owner, Some("Wtf8"))
+}
+
+/// Whether a [`str_builder_ctor_leaf`] leaf CONSTRUCTS a fresh buffer, as
+/// opposed to appending to one already built.
+///
+/// Named once because [`builder_ctor_dest_locals`] and
+/// [`is_fresh_str_builder`] must agree: the first selects the candidate
+/// locals, the second proves each one has no second definition.  Two
+/// hand-kept copies of this set would let a leaf be a candidate that can
+/// never pass, or pass a local the candidate scan never offers.
+fn is_str_builder_ctor(leaf: Option<&str>) -> bool {
+    matches!(
+        leaf,
+        Some("new") | Some("with_capacity") | Some("from_string") | Some("to_wtf8_buf")
+    )
+}
+
 /// The string-builder ctor leaf a MIR call resolves to, restricted to the
-/// fresh-buffer constructors this pass models (`new` / `with_capacity`) on a
-/// `Wtf8Buf` or `String`; `None` for any other callee.  The cheap leaf check
-/// runs before the impl-owner resolution so the type lookup only fires for the
-/// candidate names.  Appends are recognised separately by
+/// fresh-buffer constructors this pass models — `new` / `with_capacity` /
+/// `from_string` on a `Wtf8Buf` or `String`, and `to_wtf8_buf` on the borrowed
+/// `Wtf8` ([`is_str_builder_seed_owner`]); `None` for any other callee.  Each
+/// leaf carries the owner predicate it is admitted under, because a seed ctor
+/// is called on the borrowed string and the rest on the buffer.  The cheap
+/// leaf check runs before the impl-owner resolution so the type lookup only
+/// fires for the candidate names.  Appends are recognised separately by
 /// [`str_builder_append_args`].
 fn wtf8buf_method_leaf(llbc: &Llbc, call: &CallPayload) -> Option<&'static str> {
     let CallFunc::Regular(reg) = &call.func else {
         return None;
     };
+    str_builder_ctor_leaf(llbc, reg)
+}
+
+fn str_builder_ctor_leaf(llbc: &Llbc, reg: &RegularCall) -> Option<&'static str> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
     let fd = llbc.fn_by_id(*id)?;
     let np = fd.item_meta.name_path();
-    let leaf = match np.rsplit("::").next()? {
-        "new" => "new",
-        "with_capacity" => "with_capacity",
-        "push_str" => "push_str",
-        "push_wtf8" => "push_wtf8",
-        _ => return None,
-    };
-    is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
+    let (leaf, owner_accepted): (&'static str, fn(Option<&str>) -> bool) =
+        match np.rsplit("::").next()? {
+            "new" => ("new", is_str_builder_owner),
+            "with_capacity" => ("with_capacity", is_str_builder_owner),
+            "from_string" => ("from_string", is_str_builder_owner),
+            "to_wtf8_buf" => ("to_wtf8_buf", is_str_builder_seed_owner),
+            "push" => ("push", is_str_builder_owner),
+            "push_str" => ("push_str", is_str_builder_owner),
+            "push_wtf8" => ("push_wtf8", is_str_builder_owner),
+            _ => return None,
+        };
+    owner_accepted(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some(leaf)
 }
 
 /// If `reg` is a functional-concat string append, its `(accumulator, piece)`
-/// argument positions.  `push_str` / `push_wtf8` (on `Wtf8Buf` / `String`)
-/// take the accumulator as `&mut self` (arg 0) and the appended piece as
-/// arg 1.  `Wtf8Piece::push_onto(&self, out: &mut Wtf8Buf)` swaps them: the
+/// argument positions.  `push` / `push_str` / `push_wtf8` (on `String` /
+/// `Wtf8Buf`) take the accumulator as `&mut self` (arg 0) and the appended
+/// piece as arg 1.  `String::push(char)` is upstream
+/// `AbstractStringBuilderRepr.rtype_method_append`'s `SomeChar` arm;
+/// `Wtf8Piece::push_onto(&self, out: &mut Wtf8Buf)` swaps the arguments: the
 /// piece is `self` (arg 0) and the accumulator is `out` (arg 1).  Every
 /// `Wtf8Piece` impl body is `out.push_str(self)` / `out.push_wtf8(self)`, so
 /// `out = out ++ self` models all of them; the accumulator gate
@@ -14975,7 +17153,7 @@ fn str_builder_append_args(llbc: &Llbc, reg: &RegularCall) -> Option<(usize, usi
     let fd = llbc.fn_by_id(*id)?;
     let np = fd.item_meta.name_path();
     match np.rsplit("::").next()? {
-        "push_str" | "push_wtf8" => {
+        "push" | "push_str" | "push_wtf8" => {
             is_str_builder_owner(deref_impl_owner_leaf(llbc, fd).as_deref()).then_some((0, 1))
         }
         // `Wtf8Piece::push_onto`: the `str` / `String` / `Wtf8` impls live
@@ -15019,14 +17197,16 @@ fn operand_reads_local(op: &Operand, l: usize) -> bool {
     matches!(op, Operand::Copy(p) | Operand::Move(p) if place_references_local(p, l))
 }
 
-/// Whether a `&(mut) buf` ref-temp `rt` is used exactly once — as the
-/// accumulator argument of a recognised append (`push_str` / `push_wtf8`
-/// arg 0, or `Wtf8Piece::push_onto` arg 1) — and nowhere else, so rebinding
-/// `buf` to the concat captures the whole mutation.  A ref-temp that also
-/// escapes elsewhere would leave that other reader observing the pre-append
-/// buffer, so it declines.
-fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize) -> bool {
-    let mut receiver = 0usize;
+/// Whether a builder borrow temp is used exactly once in the selected role of
+/// a recognised append (`accumulator == true` selects the receiver, false the
+/// appended piece) and nowhere else.  A temp that also escapes declines.
+fn ref_temp_is_sole_append_arg(
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+    accumulator: bool,
+) -> bool {
+    let mut selected = 0usize;
     let mut other = 0usize;
     for bb in &body.body {
         for st in &bb.statements {
@@ -15053,10 +17233,9 @@ fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize)
         }
         match bb.term() {
             Ok(TermKind::Call { call, .. }) => {
-                let acc_idx = match &call.func {
-                    CallFunc::Regular(reg) => {
-                        str_builder_append_args(llbc, reg).map(|(acc, _)| acc)
-                    }
+                let selected_idx = match &call.func {
+                    CallFunc::Regular(reg) => str_builder_append_args(llbc, reg)
+                        .map(|(acc, piece)| if accumulator { acc } else { piece }),
                     _ => None,
                 };
                 if let CallFunc::Dynamic(op) = &call.func
@@ -15066,8 +17245,8 @@ fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize)
                 }
                 for (i, arg) in call.args.iter().enumerate() {
                     if operand_reads_local(arg, rt) {
-                        if acc_idx == Some(i) {
-                            receiver += 1;
+                        if selected_idx == Some(i) {
+                            selected += 1;
                         } else {
                             other += 1;
                         }
@@ -15087,7 +17266,7 @@ fn ref_temp_is_sole_append_receiver(body: &Unstructured, llbc: &Llbc, rt: usize)
             _ => {}
         }
     }
-    receiver == 1 && other == 0
+    selected == 1 && other == 0
 }
 
 /// Given a single-def `Wtf8Buf::new` / `with_capacity` accumulator local
@@ -15200,14 +17379,19 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
     }
     let mut receivers = Vec::with_capacity(ref_temps.len());
     for &rt in &ref_temps {
-        receivers.push(append_receiver_of_borrow(body, llbc, rt)?);
+        if let Some(receiver) = append_receiver_of_borrow(body, llbc, rt) {
+            receivers.push(receiver);
+        } else if append_piece_of_borrow(body, llbc, rt).is_none() {
+            return None;
+        }
     }
     Some(receivers)
 }
 
 /// Resolve a direct `&(mut) buf` borrow temp `rt` to the temp actually passed
 /// as the append's accumulator argument.  A method-autoref receiver
-/// (`buf.push_str(s)`) reaches the call unchanged, so `rt` is itself the sole
+/// (`buf.push(ch)` / `buf.push_str(s)`) reaches the call unchanged, so `rt` is
+/// itself the sole
 /// append receiver.  An explicit `&mut buf` argument (`Wtf8Piece::push_onto(&s,
 /// &mut buf)`) is a two-phase reborrow — `rt := &Mut buf; recv := &TwoPhaseMut
 /// *rt` — so the call receives `recv` instead; accept it when `rt`'s only use
@@ -15215,7 +17399,127 @@ fn clean_accumulator_ref_temps(body: &Unstructured, llbc: &Llbc, c: usize) -> Op
 /// returned temp is the call's accumulator-argument local the append arm
 /// resolves against ([`append_accumulator_of_arg_temp`]).
 fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    if ref_temp_is_sole_append_receiver(body, llbc, rt) {
+    append_arg_of_borrow(body, llbc, rt, true)
+}
+
+/// [`append_receiver_of_borrow`]'s twin for the appended PIECE: walk the
+/// reference/coercion shells the lowered string model aliases away
+/// ([`sole_string_alias_successor`]) until one of them is the sole
+/// non-accumulator argument of an append call, and return that temp.
+///
+/// The walk is bounded because it is a walk over MIR temps and nothing
+/// proves the alias chain acyclic; eight hops is far past every chain the
+/// real LLBC produces (`&Wtf8Buf` -> `&Wtf8` -> `&str` is three), and a
+/// chain longer than that simply declines the builder lift and leaves the
+/// residual — the same fail-safe every recognizer in this file takes.
+fn append_piece_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
+    let mut current = rt;
+    for _ in 0..ALIAS_WALK_HOPS {
+        if ref_temp_is_sole_append_arg(body, llbc, current, false) {
+            return Some(current);
+        }
+        current = sole_string_alias_successor(body, llbc, current)?;
+    }
+    None
+}
+
+/// Hop budget for a reference/coercion alias walk over MIR temps.  See
+/// [`append_piece_of_borrow`] for why it is bounded and why eight.
+const ALIAS_WALK_HOPS: usize = 8;
+
+/// Follow one Rust reference/coercion shell which the lowered string value
+/// model aliases away: an immediate reborrow, or `Deref::deref` between two
+/// string-family types.  The source temp must have exactly this one use.
+fn sole_string_alias_successor(body: &Unstructured, llbc: &Llbc, source: usize) -> Option<usize> {
+    fn record(slot: &mut Option<usize>, other: &mut usize, candidate: usize) {
+        if slot.replace(candidate).is_some() {
+            *other += 1;
+        }
+    }
+    let mut successor: Option<usize> = None;
+    let mut other = 0usize;
+    for block in &body.body {
+        for stmt in &block.statements {
+            match stmt.stmt_kind() {
+                Ok(StmtKind::Assign(place, rvalue)) => {
+                    if let Rvalue::Ref { place: inner, .. } | Rvalue::RawPtr { place: inner, .. } =
+                        &rvalue
+                        && place_is_immediate_deref_of(inner, source)
+                    {
+                        if let PlaceKind::Local(dest) = place.kind {
+                            record(&mut successor, &mut other, dest as usize);
+                        } else {
+                            other += 1;
+                        }
+                        continue;
+                    }
+                    let (mut derefs, mut others) = (0usize, 0usize);
+                    scan_rvalue_dest_ref(&rvalue, source, &mut derefs, &mut others);
+                    other += derefs + others;
+                    if matches!(&place.kind, PlaceKind::Projection(..))
+                        && place_references_local(&place, source)
+                    {
+                        other += 1;
+                    }
+                }
+                Ok(StmtKind::Assert(assert)) => {
+                    other += usize::from(operand_reads_local(&assert.cond, source));
+                }
+                _ => {}
+            }
+        }
+        match block.term() {
+            Ok(TermKind::Call { call, .. }) => {
+                let reads = call
+                    .args
+                    .iter()
+                    .filter(|arg| operand_reads_local(arg, source))
+                    .count();
+                let string_deref = if reads == 1 && call.args.len() == 1 {
+                    matches!(&call.func, CallFunc::Regular(reg) if is_deref_call(reg, llbc))
+                        && operand_tyref(&call.args[0])
+                            .is_some_and(|ty| tyref_is_string_value(ty, llbc))
+                        && tyref_is_string_value(&call.dest.ty, llbc)
+                } else {
+                    false
+                };
+                if string_deref {
+                    if let PlaceKind::Local(dest) = call.dest.kind {
+                        record(&mut successor, &mut other, dest as usize);
+                    } else {
+                        other += 1;
+                    }
+                } else {
+                    other += reads;
+                }
+                if let CallFunc::Dynamic(op) = &call.func {
+                    other += usize::from(operand_reads_local(op, source));
+                }
+            }
+            Ok(TermKind::Switch { discr, .. }) => {
+                other += usize::from(operand_reads_local(&discr, source));
+            }
+            Ok(TermKind::Assert { assert, .. }) => {
+                other += usize::from(operand_reads_local(&assert.cond, source));
+            }
+            _ => {}
+        }
+    }
+    (other == 0).then_some(successor?)
+}
+
+/// The shared body behind [`append_receiver_of_borrow`] (`accumulator =
+/// true`) and its piece-side caller: return `rt` when it already is the
+/// selected append argument, else the single temp that borrows it and is.
+/// More than one such borrower is ambiguous and declines.
+fn append_arg_of_borrow(
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+    accumulator: bool,
+) -> Option<usize> {
+    let is_selected = |candidate| ref_temp_is_sole_append_arg(body, llbc, candidate, accumulator);
+    if is_selected(rt) {
         return Some(rt);
     }
     let mut recv: Option<usize> = None;
@@ -15283,13 +17587,13 @@ fn append_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Opt
     if other != 0 {
         return None;
     }
-    ref_temp_is_sole_append_receiver(body, llbc, recv).then_some(recv)
+    is_selected(recv).then_some(recv)
 }
 
 /// Whether MIR local `c` is a fresh owned string-builder accumulator: it has
-/// exactly one def and that def is a `Wtf8Buf` / `String` `new` /
-/// `with_capacity` call.  A local with a second def, or one defined by a
-/// non-ctor rvalue, is not a fresh accumulator and keeps its residual.
+/// exactly one def and that def is an [`is_str_builder_ctor`] call.  A local
+/// with a second def, or one defined by a non-ctor rvalue, is not a fresh
+/// accumulator and keeps its residual.
 fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     let mut def_count = 0usize;
     let mut ctor_def = false;
@@ -15305,26 +17609,23 @@ fn is_fresh_str_builder(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
             && matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == c)
         {
             def_count += 1;
-            ctor_def = matches!(
-                wtf8buf_method_leaf(llbc, &call),
-                Some("new") | Some("with_capacity")
-            );
+            ctor_def = is_str_builder_ctor(wtf8buf_method_leaf(llbc, &call));
         }
     }
     def_count == 1 && ctor_def
 }
 
 /// Resolve the accumulator local a recognised append rebinds, given the MIR
-/// local `rt` passed as the append's accumulator argument (`push_str` /
+/// local `rt` passed as the append's accumulator argument (`push` / `push_str` /
 /// `push_wtf8` receiver, or `Wtf8Piece::push_onto` `&mut buf` argument).  `rt`
 /// borrows the accumulator directly (method autoref) or through a single
-/// two-phase reborrow; the owning `buf` is the fresh `new` / `with_capacity`
-/// local whose every borrow feeds such an append and whose append-receiver set
+/// two-phase reborrow; the owning `buf` is the [`is_str_builder_ctor`] local
+/// whose every borrow feeds such an append and whose append-receiver set
 /// ([`clean_accumulator_ref_temps`]) contains `rt`.  Resolved on demand from
 /// the MIR body, so the recognizer keeps no per-local side table; the append
 /// call-lowering arm then rebinds `buf`'s slot to `ll_strconcat(buf, piece)`.
 fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -> Option<usize> {
-    // Only a `Wtf8Buf` / `String` ctor dest can pass [`is_fresh_str_builder`]
+    // Only an [`is_str_builder_ctor`] dest can pass [`is_fresh_str_builder`]
     // ([`builder_ctor_dest_locals`], which already excludes locals 0 / the
     // parameters), and a ref-temp borrows exactly one local so at most one
     // accumulator's receiver set contains `rt`; check those candidates instead
@@ -15337,6 +17638,38 @@ fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -
     })
 }
 
+/// Resolve a shared-borrow temp used as an append piece to the completed
+/// inner builder it borrows.  Membership is proven from the MIR definition of
+/// `rt` and the same single-use append-piece test accepted by
+/// [`clean_accumulator_ref_temps`].
+fn append_piece_accumulator_of_arg_temp(
+    body: &Unstructured,
+    llbc: &Llbc,
+    rt: usize,
+) -> Option<usize> {
+    for candidate in builder_ctor_dest_locals(body, llbc) {
+        if !is_builder_mode_accumulator(body, llbc, candidate) {
+            continue;
+        }
+        for block in &body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Ref { place: source, .. })) =
+                    stmt.stmt_kind()
+                else {
+                    continue;
+                };
+                if matches!(source.kind, PlaceKind::Local(i) if i as usize == candidate)
+                    && let PlaceKind::Local(direct_borrow) = place.kind
+                    && append_piece_of_borrow(body, llbc, direct_borrow as usize) == Some(rt)
+                {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Count the by-value consumptions (`move c`) of a fresh accumulator local
 /// `c`.  [`clean_accumulator_ref_temps`] already proves every other use of `c`
 /// is the ctor def or an append borrow, so each `move c` is a terminal
@@ -15344,12 +17677,20 @@ fn append_accumulator_of_arg_temp(body: &Unstructured, llbc: &Llbc, rt: usize) -
 /// must run `ll_build`.  Counted so the builder lift only fires when the build
 /// point is unambiguous (see [`is_builder_mode_accumulator`]).
 #[allow(dead_code)] // wired into the ctor/append/terminal arms in this change
-fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
+fn accumulator_materialization_site_count(body: &Unstructured, llbc: &Llbc, c: usize) -> usize {
     let is_move = |op: &Operand| c_operand_kind(op, c) == Some(true);
     let mut moves = 0usize;
     for bb in &body.body {
         for st in &bb.statements {
             if let Ok(StmtKind::Assign(_, rvalue)) = st.stmt_kind() {
+                if let Rvalue::Ref { place: source, .. } = &rvalue
+                    && matches!(source.kind, PlaceKind::Local(i) if i as usize == c)
+                    && let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
+                    && let PlaceKind::Local(rt) = place.kind
+                    && append_piece_of_borrow(body, llbc, rt as usize).is_some()
+                {
+                    moves += 1;
+                }
                 match &rvalue {
                     Rvalue::Use(op)
                     | Rvalue::UnaryOp(_, op)
@@ -15391,8 +17732,9 @@ fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
 /// * a single-def `Wtf8Buf` / `String` `new` / `with_capacity` ctor
 ///   ([`is_fresh_str_builder`]),
 /// * every borrow of `c` an append ([`clean_accumulator_ref_temps`]), and
-/// * exactly one by-value terminal consumption ([`accumulator_move_site_count`])
-///   — the single `ll_build` materialisation point.
+/// * exactly one terminal consumption
+///   ([`accumulator_materialization_site_count`]) — a by-value move or an
+///   inner-builder append piece, both spelling the single `ll_build` point.
 ///
 /// Zero or several terminal moves keep the `ll_strconcat` fallback so the
 /// builder rewrite only fires where the ctor, the appends, and the one build
@@ -15402,7 +17744,7 @@ fn accumulator_move_site_count(body: &Unstructured, c: usize) -> usize {
 fn is_builder_mode_accumulator(body: &Unstructured, llbc: &Llbc, c: usize) -> bool {
     is_fresh_str_builder(body, llbc, c)
         && clean_accumulator_ref_temps(body, llbc, c).is_some()
-        && accumulator_move_site_count(body, c) == 1
+        && accumulator_materialization_site_count(body, llbc, c) == 1
 }
 
 /// Whether a statically-resolved [`RegularCall`] is a workspace
@@ -15464,10 +17806,25 @@ fn constants_call_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
 /// same gate is shared by the call-lowering intercept and the deferred-write
 /// liveness pre-pass.
 fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
+    let leaf = vec_index_regular_unchecked_leaf(reg, llbc)?;
+    let int_indexed = reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|tys| tys.get(1))
+        .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
+        .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
+    int_indexed.then_some(leaf)
+}
+
+/// The Vec Index/IndexMut leaf before classifying its index argument.  Scalar
+/// element access and the `RangeFull` whole-list identity share this exact
+/// owner proof but intentionally take different lowerings.
+fn vec_index_regular_unchecked_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
     };
-    let leaf = llbc.fn_by_id(*id).and_then(|fd| {
+    llbc.fn_by_id(*id).and_then(|fd| {
         impl_method_owner_for_fundecl(llbc, fd).and_then(|(owner, leaf)| {
             if owner != "vec::Vec" {
                 return None;
@@ -15478,15 +17835,23 @@ fn vec_index_regular_leaf(reg: &RegularCall, llbc: &Llbc) -> Option<&'static str
                 _ => None,
             }
         })
-    })?;
-    let int_indexed = reg
-        .generics
+    })
+}
+
+/// `Vec<T>::index(_mut)(RangeFull)` creates only a borrowed whole-list view.
+/// The translated RPython list model has no distinct borrow/slice wrapper, so
+/// the callsite aliases the receiver instead of residualizing a Rust trait
+/// shim.
+fn is_vec_rangefull_index_regular(reg: &RegularCall, llbc: &Llbc) -> bool {
+    if vec_index_regular_unchecked_leaf(reg, llbc).is_none() {
+        return false;
+    }
+    reg.generics
         .get("types")
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-        .is_some_and(|t| vec_index_type_is_scalar(&t, llbc));
-    int_indexed.then_some(leaf)
+        .is_some_and(|t| tyref_to_ast_string(&t, llbc) == "RangeFull")
 }
 
 /// Whether `ty` is an index type [`vec_index_regular_leaf`] may lower to a
@@ -15539,6 +17904,25 @@ fn regular_call_is_ptr_add(reg: &RegularCall, llbc: &Llbc) -> bool {
     })
 }
 
+/// The wrapping twin used only by `IntArray::base` / `FloatArray::base`.
+/// Their null storage form deliberately computes an aligned, non-null address
+/// for Rust's zero-length slice contract, while every live element access has
+/// first installed a real `TypedItemsBlock`.  In the translated graph that
+/// live path is RPython's `l.items` GcArray header, just like the direct
+/// `typed_items_block_items_base` accessor.
+fn regular_call_is_ptr_wrapping_add(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        matches!(
+            fd.item_meta.name_path().as_str(),
+            "core::ptr::mut_ptr::<Impl>::wrapping_add"
+                | "core::ptr::const_ptr::<Impl>::wrapping_add"
+        )
+    })
+}
+
 /// Whether a statically-resolved [`RegularCall`] is one of the two
 /// `ItemsBlock` items-base accessors brick 1 rewrites to return the
 /// block *header* pointer (`items_block_items_base` /
@@ -15558,6 +17942,70 @@ fn regular_call_is_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool 
     };
     llbc.fn_by_id(*id)
         .is_some_and(|fd| is_object_items_block_base_accessor(fd.item_meta.name_path().as_str()))
+}
+
+fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
+}
+
+/// True for the root-stack publication helper.  Both the free function and
+/// `RootScope` method spell the last two semantic components `gc_roots` and
+/// `pin_root`, with an optional `<Impl>` segment between them.
+fn gc_root_pin_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.last() == Some(&"pin_root") && segments.iter().any(|s| *s == "gc_roots")
+}
+
+/// Root-stack operations whose PyObjectRef return is the physical spelling
+/// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
+/// gives such a helper call a GCREF result and casts it back to the concrete
+/// repr at the use site — `gct_weakref_create` (`framework.py:1151-1154`)
+/// does `genop("direct_call", ..., resulttype=llmemory.GCREF)` followed by
+/// `genop("cast_opaque_ptr", [v_result], resulttype=WEAKREFPTR)`.
+///
+/// `RootScope::get` is admitted alongside `shadow_stack_get`: its own source
+/// doc calls it "scope-local [`shadow_stack_get`] using the cached cell", and
+/// it is the read half of the `pin_root` write half stamped above.  Leaving
+/// it out publishes a root through the opaque slot and reads it back as a
+/// W_Root instance, re-creating on the read side exactly the StringRepr-meets-
+/// InstanceRepr union the write-side stamp exists to remove.  `get` is the
+/// only such leaf in `gc_roots`, so the match stays unambiguous.
+fn gc_root_gcref_result_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    segments.iter().any(|s| *s == "gc_roots")
+        && matches!(
+            segments.last(),
+            Some(&"pin_root") | Some(&"shadow_stack_get") | Some(&"get")
+        )
+}
+
+/// The scalar `TypedItemsBlock` accessor, kept separate from the object-array
+/// pair because its consumers must emit `GcArray(Signed|Float)` operations,
+/// never reference-array operations.
+fn regular_call_is_typed_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id).is_some_and(|fd| {
+        let name = fd.item_meta.name_path();
+        is_typed_items_block_base_accessor(&name) || is_typed_array_base_adapter(&name)
+    })
+}
+
+/// The two unwrapped-string adapters whose Rust return type is the physical
+/// `*mut PyObjectRef`, while their RPython list item is externally `str` and
+/// internally GCREF.  Keep these out of the generic object-array predicate:
+/// sharing the machine word does not make `[str]` and `[W_Root]` the same
+/// ListDef / ARRAY identity upstream.
+fn regular_call_is_string_items_block_accessor(reg: &RegularCall, llbc: &Llbc) -> bool {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return false;
+    };
+    llbc.fn_by_id(*id)
+        .is_some_and(|fd| is_string_array_base_adapter(&fd.item_meta.name_path()))
 }
 
 /// The [`TyRef`] of a plain-place [`Operand`], or `None` for a
@@ -15596,6 +18044,58 @@ fn is_list_items_elem_ptr_add_parts(
         && add_dest_used_only_as_single_deref(body, dest_local)
 }
 
+/// Scalar half of brick 3. The physical `TypedItemsBlock` stores only the two
+/// RPython array families declared by `rlist.rs`: `GcArray(Signed)` (`i64`)
+/// and `GcArray(Float)` (`f64`). Other raw-pointer pointees remain residual.
+#[allow(clippy::too_many_arguments)]
+fn is_typed_items_elem_ptr_add_parts(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> bool {
+    args_len == 2
+        && regular_call_is_ptr_add(reg, llbc)
+        && base_ty.is_some_and(|ty| raw_ptr_typed_items_element(ty, llbc).is_some())
+        && index_local.is_some()
+        && base_local
+            .is_some_and(|base| base_traces_to_typed_items_block_accessor(body, base, llbc))
+        && add_dest_used_only_as_single_deref(body, dest_local)
+}
+
+/// String-list half of brick 3.  The pointee is physically PyObjectRef/GCREF,
+/// but only the two named adapters prove that it is the internal storage of a
+/// `SomeList(SomeString)` rather than a list of W_Root instances.
+#[allow(clippy::too_many_arguments)]
+fn is_string_items_elem_ptr_add_parts(
+    reg: &RegularCall,
+    args_len: usize,
+    base_local: Option<usize>,
+    base_ty: Option<&TyRef>,
+    index_local: Option<usize>,
+    dest_local: usize,
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> bool {
+    args_len == 2
+        && regular_call_is_ptr_add(reg, llbc)
+        && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
+        && index_local.is_some()
+        && base_local.is_some_and(|base| {
+            base_traces_to_items_block_accessor_matching(
+                body,
+                base,
+                llbc,
+                regular_call_is_string_items_block_accessor,
+            )
+        })
+        && add_dest_used_only_as_single_deref(body, dest_local)
+}
+
 /// Whether MIR local `base` — the receiver of a `*base.add(idx)` over
 /// `*mut PyObjectRef` — traces, through plain `Copy` / `Move` aliases,
 /// to the result of an `items_block_items_base` / `items_block_items_ptr`
@@ -15609,6 +18109,33 @@ fn is_list_items_elem_ptr_add_parts(
 /// `add` and falls to the legacy walker.  A multiply-defined or
 /// non-`Copy`-produced local is ambiguous and rejected.
 fn base_traces_to_items_block_accessor(body: &Unstructured, base: usize, llbc: &Llbc) -> bool {
+    base_traces_to_items_block_accessor_matching(
+        body,
+        base,
+        llbc,
+        regular_call_is_items_block_accessor,
+    )
+}
+
+fn base_traces_to_typed_items_block_accessor(
+    body: &Unstructured,
+    base: usize,
+    llbc: &Llbc,
+) -> bool {
+    base_traces_to_items_block_accessor_matching(
+        body,
+        base,
+        llbc,
+        regular_call_is_typed_items_block_accessor,
+    )
+}
+
+fn base_traces_to_items_block_accessor_matching(
+    body: &Unstructured,
+    base: usize,
+    llbc: &Llbc,
+    matches_accessor: fn(&RegularCall, &Llbc) -> bool,
+) -> bool {
     let mut cur = base;
     for _ in 0..32 {
         let mut producers = 0usize;
@@ -15617,11 +18144,46 @@ fn base_traces_to_items_block_accessor(body: &Unstructured, base: usize, llbc: &
         for bb in &body.body {
             for stmt in &bb.statements {
                 if let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind()
-                    && matches!(place.kind, PlaceKind::Local(i) if i as usize == cur)
+                    && matches!(&place.kind, PlaceKind::Local(i) if *i as usize == cur)
                 {
                     producers += 1;
-                    if let Rvalue::Use(op) = &rvalue {
-                        copy_src = operand_local(Some(op));
+                    match &rvalue {
+                        Rvalue::Use(op) => copy_src = operand_local(Some(op)),
+                        // `typed_items_block_items_base(..) as *const i64`
+                        // changes only the raw-pointer pointee spelling. The
+                        // address is identical, so follow it exactly as
+                        // RPython follows `cast_pointer` while retaining the
+                        // final pointee type for the array descr.
+                        Rvalue::Cast(_, op, target_ty)
+                            if tyref_node(target_ty, llbc)
+                                .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                .is_some()
+                                && operand_tyref(op).is_some_and(|source_ty| {
+                                    tyref_node(source_ty, llbc)
+                                        .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                        .is_some()
+                                }) =>
+                        {
+                            copy_src = operand_local(Some(op));
+                        }
+                        // Charon also serializes raw pointer casts through its
+                        // older `UnaryOp({Cast: RawPtr(..)}, operand)` form.
+                        // It is the same address-preserving cast as the
+                        // dedicated `Rvalue::Cast` arm above.
+                        Rvalue::UnaryOp(kind, op)
+                            if unary_op_is_cast(kind)
+                                && tyref_node(&place.ty, llbc)
+                                    .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                    .is_some()
+                                && operand_tyref(op).is_some_and(|source_ty| {
+                                    tyref_node(source_ty, llbc)
+                                        .and_then(|node| type_node_raw_ptr_pointee(node, llbc))
+                                        .is_some()
+                                }) =>
+                        {
+                            copy_src = operand_local(Some(op));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -15630,7 +18192,7 @@ fn base_traces_to_items_block_accessor(body: &Unstructured, base: usize, llbc: &
             {
                 producers += 1;
                 if let CallFunc::Regular(reg) = &call.func
-                    && regular_call_is_items_block_accessor(reg, llbc)
+                    && matches_accessor(reg, llbc)
                 {
                     is_accessor = true;
                 }
@@ -15875,6 +18437,26 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
             || (is_vec_index_mut_regular(reg, llbc)
                 && add_dest_used_only_as_single_deref(body, p as usize))
             || is_list_items_elem_ptr_add_parts(
+                reg,
+                call.args.len(),
+                operand_local(call.args.first()),
+                call.args.first().and_then(operand_tyref),
+                operand_local(call.args.get(1)),
+                p as usize,
+                body,
+                llbc,
+            )
+            || is_typed_items_elem_ptr_add_parts(
+                reg,
+                call.args.len(),
+                operand_local(call.args.first()),
+                call.args.first().and_then(operand_tyref),
+                operand_local(call.args.get(1)),
+                p as usize,
+                body,
+                llbc,
+            )
+            || is_string_items_elem_ptr_add_parts(
                 reg,
                 call.args.len(),
                 operand_local(call.args.first()),
@@ -16395,12 +18977,13 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
 /// `allocate_stable(payload: Self)`.
 ///
 /// Each builds `Self { ob: <header>, ..payload }` then calls
-/// `lltype::malloc_typed[_stable]` — a non-numeric boxing allocation with no
-/// ported general `malloc->new` lowering (`fuse_boxing_alloc` rewrites only
-/// the numeric boxes `W_Float`/`W_Int`/`W_Complex`/`W_Long`; every other
-/// mallocable struct hits the fail-closed `flowspace_adapter` guard).  So the
-/// constructor body cannot be traced; the faithful treatment is the
-/// `register_external` analog — residualize the whole `allocate` call.
+/// `lltype::malloc_typed[_stable]`.  The concrete caller-side allocation
+/// clusters now lower generically through `fuse_boxing_alloc`, but this shared
+/// `Self` body has no concrete registered struct layout/type identity at its
+/// own translation boundary.  It therefore cannot prove the malloc-to-new
+/// rewrite and hits the fail-closed `flowspace_adapter` guard.  The faithful
+/// treatment of that generic wrapper is the `register_external` analog —
+/// residualize the whole `allocate` call.
 /// [`Lowering::impl_method_owner`] declines the `CallTarget::Method` hint for
 /// the `payload`-named `Self` argument (routing through
 /// `CallTarget::FunctionPath`); this collection feeds the matching registry
@@ -17119,6 +19702,52 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
     }
 }
 
+/// Emit RPython's pointer-to-Unsigned primitive cast sequence.
+///
+/// `rbuiltin.py`'s `gen_cast` first produces a Signed address integer with
+/// `cast_ptr_to_int`, then applies `gen_cast(..., Unsigned)`.  The caller
+/// appends the returned `r_uint` operation after the Signed producer pushed
+/// here, preserving that ordering while fitting [`Lowering::build_rvalue`]'s
+/// one-returned-operation interface.
+fn push_ptr_to_unsigned_cast(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    arg: Variable,
+) -> (OpKind, Variable) {
+    let signed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(signed.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: [
+                    "rpython",
+                    "rtyper",
+                    "lltypesystem",
+                    "lltype",
+                    "cast_ptr_to_int",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            },
+            args: vec![arg],
+            result_ty: ValueType::Int,
+        },
+    });
+    let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    let retype = OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        },
+        args: vec![signed],
+        result_ty: ValueType::Unsigned,
+    };
+    (retype, result)
+}
+
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // The HashConsedValue arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
@@ -17240,15 +19869,15 @@ fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     }
     // A `str`/`String`/`Wtf8`/`Wtf8Buf` value is the single immutable
     // rpy_string in the value model (`tyref_is_string_value`), matching
-    // upstream's one string type (`rstr.py`).  A bare string-family value
-    // (parameter, return, local) seeds `SomeString` so it stays the string
-    // lattice node at every site instead of a classdef-carrying
-    // `SomeInstance(Wtf8Buf)`: a `Wtf8Buf` value stored into a `*mut Wtf8Buf`
-    // field flows `SomeString` through `malloc_raw` (which round-trips a
-    // non-`Instance` payload unchanged), keeping the field repr
-    // `Ptr(rpy_string)` consistent with the `getattr` + deref-to-`&Wtf8`
-    // read that reports the field as a string.
-    if tyref_is_string_value(ty, llbc) {
+    // upstream's one string type (`rstr.py`).  The exactly-one-raw-pointer
+    // form is the same translated value for pyre's owning storage spelling:
+    // both `malloc_raw(Wtf8Buf)` and `gc_alloc_storage_box(Wtf8Buf)` return
+    // `*mut Wtf8Buf`, while PyPy passes its `_utf8` RPython string through
+    // those sites directly.  Preserve `SomeString` on the return/phi as well
+    // as on the struct field; otherwise the GC-box success arm injects a
+    // nominal `SomeInstance(Wtf8Buf)` and generalizes `_utf8` away from its
+    // `StringRepr`.
+    if tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
         return ValueType::Str;
     }
     ValueType::Ref(None)
@@ -17758,8 +20387,12 @@ fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     // valuetype_to_someshell) instead of the classdef-less `Ref(None)`
     // SomeInstance the fallback yields; the latter walls when the first
     // typed string write unions `String ∪ Instance(classdef-less)` with no
-    // pair(SomeString, SomeInstance).union() handler.
-    if tyref_is_string_value(ty, llbc) {
+    // pair(SomeString, SomeInstance).union() handler.  The raw-pointer form
+    // is the same translated value when a Rust object field owns the buffer
+    // behind `*mut Wtf8Buf` (`W_UnicodeObject.value`): PyPy's corresponding
+    // `_utf8` field is an RPython string, while Charon's exact layout still
+    // records the physical pointer-sized slot independently.
+    if tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc) {
         return ValueType::Str;
     }
     ValueType::Ref(None)
@@ -17833,14 +20466,35 @@ fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
 
 /// Whether a `TyRef` resolves (behind `Ref` / dedup wrappers) to a
 /// string-family value: the `alloc::string::String` ADT, the
-/// `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, or the `{Builtin: "Str"}`
-/// node (the bare `str` deref destination).  All four project to the
+/// `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, pyre's `BytesBlock`
+/// owner for RPython `STR`, or the `{Builtin: "Str"}` node (the bare `str`
+/// deref destination).  All of them project to the
 /// single immutable `s_unicode0` value, so a `deref` between any two of
 /// them is value-identity.
 fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
         return false;
     };
+    node_is_string_value(node, llbc)
+}
+
+/// Whether the pointee of exactly one raw-pointer layer is a string-family
+/// value.  This is deliberately narrower than teaching
+/// [`strip_ty_wrappers`] to erase `RawPtr`: ordinary typed raw pointers retain
+/// their pointee identity; only field-annotation projection asks whether the
+/// pointer is the storage spelling of RPython's string value.
+fn tyref_raw_ptr_pointee_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(pointee) = tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(|n| n.as_object()?.get("RawPtr")?.as_array()?.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+    else {
+        return false;
+    };
+    node_is_string_value(pointee, llbc)
+}
+
+fn node_is_string_value(node: &serde_json::Value, llbc: &Llbc) -> bool {
     // `{Builtin: "Str"}` — the bare `str` value (no ADT def-id).
     if node
         .get("Adt")
@@ -17851,13 +20505,20 @@ fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
     {
         return true;
     }
-    // Named string ADTs: `alloc::string::String` and the WTF-8 wrappers.
+    // Named string ADTs: `alloc::string::String`, the WTF-8 wrappers, and
+    // pyre's variable-sized `BytesBlock` owner for RPython `STR.chars`.
+    // Bookkeeper::project_struct_field_type already makes this exact
+    // projection; keeping the MIR input classifier in sync prevents a
+    // function argument from reintroducing a nominal BytesBlock instance.
     adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|td| {
             let np = td.item_meta.name_path();
             np == "alloc::string::String"
-                || matches!(np.rsplit("::").next(), Some("Wtf8" | "Wtf8Buf"))
+                || matches!(
+                    np.rsplit("::").next(),
+                    Some("Wtf8" | "Wtf8Buf" | "BytesBlock")
+                )
         })
 }
 
@@ -18239,6 +20900,21 @@ fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     raw_ptr_pointee_class_root(inner, llbc).is_some()
+}
+
+/// RPython item bank and ARRAY identity carried by a raw pointer into a
+/// `TypedItemsBlock`. That block is exactly `GcArray(Signed)` or
+/// `GcArray(Float)`, so admit only the two source spellings its runtime layout
+/// documents; the ARRAY name supplies the 8-byte stride and header offset.
+fn raw_ptr_typed_items_element(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, String)> {
+    let pointee = type_node_raw_ptr_pointee(tyref_node(ty, llbc)?, llbc)?;
+    let spelling = json_ty_scalar_element_spelling(pointee, llbc)?;
+    if !matches!(spelling.as_str(), "i64" | "f64") {
+        return None;
+    }
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    let item_ty = tyref_to_value_type(&TyRef::Other(pointee.clone()), llbc);
+    Some((item_ty, format!("[{spelling}]")))
 }
 
 /// The `__cast_pointer/<Root>` marker call — front::mir's carrier for
@@ -18644,12 +21320,18 @@ fn typevar_bound_index(node: &serde_json::Value) -> Option<u64> {
 }
 
 /// True when fn-level type variable `var_index` carries an
-/// `Into<String>` trait clause.  The clause's trait generics spell
+/// `Into<String>` / `Into<Wtf8Buf>` trait clause.  The clause's trait generics spell
 /// `[<subject>, <target>]`; the subject must be our variable and the
-/// target must resolve to the `alloc::string::String` ADT, with the
+/// target must resolve to the translated string-value family, with the
 /// trait decl's leaf name `Into` (a `From<String>` bound has the same
 /// generics shape but means the *opposite* conversion).
-fn typevar_bounded_by_into_string(
+///
+/// The target test is [`node_is_string_value`], whose family is `str`,
+/// `String`, `Wtf8`, `Wtf8Buf` AND `BytesBlock` — so an `Into<BytesBlock>`
+/// bound would resolve here too.  No such bound exists in the source today;
+/// if one appears, note that `BytesBlock` is the low-level `STR` owner rather
+/// than a source-level message type and may want excluding.
+fn typevar_bounded_by_into_string_value(
     var_index: u64,
     fn_generics: &serde_json::Value,
     llbc: &Llbc,
@@ -18715,9 +21397,8 @@ fn typevar_bounded_by_into_string(
         }
         let target_is_string = types
             .get(1)
-            .and_then(|t| resolve_tyexpr_to_adt_def_id_free(llbc, t))
-            .and_then(|id| llbc.type_by_id(id))
-            .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String");
+            .and_then(|target| strip(llbc, target))
+            .is_some_and(|target| node_is_string_value(target, llbc));
         if target_is_string {
             return true;
         }
@@ -18757,14 +21438,15 @@ fn tyref_generic_trait_bound_root(
         TyRef::Dedup { id } => llbc.dedup_body(*id)?,
     };
     let param_index = typevar_bound_index(strip_ty_wrappers(node, llbc)?)?;
-    // `T: Into<String>` — the conventional message-parameter bound
-    // (`PyError::type_error(msg: impl Into<String>)`).  Such a variable
-    // is a string at the annotation level (the model maps `String` and
-    // `str` to one string type), so it resolves to the `"String"` root
+    // `T: Into<String>` / `T: Into<Wtf8Buf>` — the conventional
+    // message-parameter bound (`PyError::new(message: impl Into<Wtf8Buf>)`).
+    // Such a variable is a string at the annotation level (the model maps
+    // `String`, `str`, `Wtf8`, and `Wtf8Buf` to one string type), so it
+    // resolves to the `"String"` root
     // and the input-cell derivation seeds `s_unicode0` instead of a
     // classdef-less instance shell whose field writes would poison
     // classdef attr cells.
-    if typevar_bounded_by_into_string(param_index, generics, llbc) {
+    if typevar_bounded_by_into_string_value(param_index, generics, llbc) {
         return Some("String".to_string());
     }
     for clause in generics.get("trait_clauses")?.as_array()? {
@@ -20112,7 +22794,7 @@ fn transparent_inherent_method_path(reg: &RegularCall, llbc: &Llbc) -> Option<Ve
     if !llbc.type_by_id(owner_id)?.is_repr_transparent() {
         return None;
     }
-    let mut path = owner.split("::").map(str::to_string).collect::<Vec<_>>();
+    let mut path = crate::model::split_qualified_path(&owner);
     path.push(method);
     Some(path)
 }
@@ -20184,6 +22866,24 @@ fn is_object_items_block_base_accessor(name: &str) -> bool {
         || path_ends_with_segments(name, "object_array::items_block_items_ptr")
 }
 
+fn is_typed_items_block_base_accessor(name: &str) -> bool {
+    path_ends_with_segments(name, "rlist::typed_items_block_items_base")
+}
+
+/// Scalar storage adapters for PyPy's `GcArray(Signed|Float)` list items.
+/// These spell the physical header offset locally because their empty Rust
+/// arrays need a non-null zero-length-slice address; for every live element
+/// access the block is non-null and the translated value is still `l.items`.
+fn is_typed_array_base_adapter(name: &str) -> bool {
+    path_ends_with_segments(name, "int_array::<Impl>::base")
+        || path_ends_with_segments(name, "float_array::<Impl>::base")
+}
+
+fn is_string_array_base_adapter(name: &str) -> bool {
+    path_ends_with_segments(name, "bytes_array::<Impl>::base")
+        || path_ends_with_segments(name, "unicode_array::<Impl>::base")
+}
+
 /// True for the `ItemsBlock` / `TypedItemsBlock` items-base accessor bodies
 /// whose `.add(*_ITEMS_OFFSET)` the front-end collapses to the
 /// receiver (see [`Lowering::is_items_block_base_ptr_add`]).
@@ -20195,9 +22895,19 @@ fn is_object_items_block_base_accessor(name: &str) -> bool {
 /// invariant above from pulling a scalar block into the `Ref`-typed array ops
 /// — the element side is refused by [`is_object_ref_items_ptr`] as well, so the
 /// two gates agree by construction rather than by coincidence.
+/// The `is_string_array_base_adapter` arm is currently INERT through the sole
+/// consumer [`Lowering::is_items_block_base_ptr_add`], which also requires a
+/// `ptr::add` / `wrapping_add` in the same body: `BytesArray::base` /
+/// `UnicodeArray::base` are `items_block_items_base(self.block)`, a call, and
+/// carry no `.add` to collapse.  It is kept so the predicate answers the
+/// question its name asks for the whole family, and it becomes live the
+/// moment either body spells the offset itself — but do not read a passing
+/// `offset_leaf` assertion over those two graphs as evidence that it fired.
 fn graph_is_items_block_base_accessor(name: &str) -> bool {
     is_object_items_block_base_accessor(name)
-        || path_ends_with_segments(name, "rlist::typed_items_block_items_base")
+        || is_typed_items_block_base_accessor(name)
+        || is_typed_array_base_adapter(name)
+        || is_string_array_base_adapter(name)
 }
 
 /// One path segment, with a raw-identifier prefix removed.  `r#struct` and
@@ -20284,6 +22994,33 @@ fn primitive_float_const(segments: &[String]) -> Option<OpKind> {
     Some(OpKind::ConstFloat(bits))
 }
 
+/// Target-layout value of the scalar GcArray's items offset.  Charon leaves
+/// Rust's `offset_of!(TypedItemsBlock, items)` initializer opaque, but the
+/// translated lltype fixes the same layout structurally: a length header
+/// followed inline by the `GcArray(Signed|Float)` items
+/// (`get_itemarray_lowleveltype`, `rlist.py:84`).
+///
+/// The derivation is `align_of::<u64>()` padding of that header, not "one
+/// target word": the Rust body is `#[repr(C)] { capacity: usize, items:
+/// [u64; 0] }` (`majit/majit-rlib/src/lltypesystem/rlist.rs:165-171`), whose
+/// 8-byte item alignment rounds a 4- or 8-byte header up to the same 8.  The
+/// offset is therefore width-independent, which is why reading `word` from
+/// [`crate::layout::target_word_size`] here rather than from Charon's
+/// `target_pointer_size` cannot change the answer.
+///
+/// This is the front-end counterpart of `CallControl::array_items_base`; it
+/// derives the target value instead of importing a host-runtime constant or
+/// registering a fake residual getter.
+fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
+    let path = segments.join("::");
+    if !path_ends_with_segments(&path, "rlist::TYPED_ITEMS_BLOCK_ITEMS_OFFSET") {
+        return None;
+    }
+    let header = crate::layout::target_word_size();
+    let items_offset = header.next_multiple_of(align_of::<u64>());
+    Some(OpKind::ConstInt(items_offset as i64))
+}
+
 /// Supply the value of a `CodeFlags` associated constant. `bitflags!`
 /// generates each flag as an `impl CodeFlags { const NAME: Self }` whose
 /// initializer Charon records as an `Opaque` body (the `<Impl>` segment
@@ -20360,6 +23097,7 @@ fn rvalue_variant_name(rv: &Rvalue) -> &'static str {
 /// emit. Widen as the corpus grows past `straight_line_add`.
 enum DecodedConst {
     Int(i64),
+    UInt(u64),
     Int128(i128),
     UInt128(u128),
     Bool(bool),
@@ -20618,7 +23356,7 @@ fn const_eval_core_num_associated_const(llbc: &Llbc, def_id: u64) -> Option<Cons
 fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {
     match value {
         ConstLit::Int(n) => Some(OpKind::ConstInt(n)),
-        ConstLit::UInt(n) => Some(OpKind::ConstInt(n as i64)),
+        ConstLit::UInt(n) => Some(OpKind::ConstUInt(n)),
         ConstLit::Bool(b) => Some(OpKind::ConstBool(b)),
         ConstLit::Float(bits) => Some(OpKind::ConstFloat(bits)),
         ConstLit::Checked(..) | ConstLit::CheckedUInt(..) => None,
@@ -21019,11 +23757,10 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
                         .parse()
                         .map_err(|e| LowerError::Schema(format!("Scalar Signed parse: {e}")))?,
                 ),
-                "Unsigned" | "Usize" => DecodedConst::Int(
+                "Unsigned" | "Usize" => DecodedConst::UInt(
                     v_str
                         .parse::<u64>()
-                        .map_err(|e| LowerError::Schema(format!("Scalar Unsigned parse: {e}")))?
-                        as i64,
+                        .map_err(|e| LowerError::Schema(format!("Scalar Unsigned parse: {e}")))?,
                 ),
                 _ => {
                     return Err(LowerError::Unsupported(format!(
@@ -21234,30 +23971,42 @@ fn block_reachable(graph: &FunctionGraph, target: BlockId) -> bool {
 ///   current piece — the encoding a literal of 128+ bytes takes (a single
 ///   length byte tops out at `0x7F`), e.g. the 130-byte deprecation tail
 ///   in `space_int` / `space_index`;
-/// - sequential placeholder: the single byte `0xC0` — closes the current
-///   piece, begins the next, and renders the next argument in order (the
-///   Display-vs-Debug choice lives in the parallel args array, not in this
-///   template, so a placeholder carries no kind);
-/// - explicit / reused placeholder: `0xC8` followed by a little-endian
-///   `u16` argument index — a 3-byte token that renders `args[index]`, so
-///   a `{0}…{0}` template that names one argument twice packs two `0xC8`
-///   tokens pointing at index `0`;
+/// - placeholder: any byte `>= 0xC0`, whose low bits select which optional
+///   fields follow it, each little-endian: `0x01` a `u32` flag word, `0x02`
+///   a `u16` width, `0x04` a `u16` precision, `0x08` a `u16` argument index.
+///   Without `0x08` the placeholder is sequential and takes the next
+///   argument in order.  A bare `0xC0` is therefore the plain `{}` and
+///   `0xC8` + `u16` the explicit `{0}`, but they are two points in one
+///   grammar, not two tokens: every field length is decoded so an embedded
+///   zero byte is never mistaken for the terminator.  Bits `0x10` / `0x20`
+///   mark an indirect width / precision (`{:1$}`), whose encoding this
+///   decoder does not know, so it bails on them.  The Display-vs-Debug
+///   choice lives in the parallel args array, not in this template;
 /// - terminator: a `0x00` byte (only at a segment boundary; `0`/`0xC0`
 ///   bytes inside a literal are consumed by its length prefix).
 ///
-/// Returns `(pieces, arg_indices)` where `arg_indices` holds the argument
+/// Returns `(pieces, placeholders)` where each placeholder records its
+/// argument index plus the static formatting fields encoded in the template.
+/// `FmtPlaceholder::is_default()` is the old `0xC0`/`0xC8` subset; retaining
+/// the fields lets a later parity rewrite recognize the one non-default shape
+/// used by `bytearray_repr_string` without treating arbitrary Rust formatting
+/// as RPython string operations.
+///
+/// `placeholders[*].arg_index` holds the argument
 /// index each placeholder renders (one per placeholder, so `pieces.len() ==
-/// arg_indices.len() + 1`).  A sequential `0xC0` auto-increments; a reused
+/// placeholders.len() + 1`).  A sequential `0xC0` auto-increments; a reused
 /// `0xC8` index points back at an already-seen argument, so the distinct
 /// argument count is `max(arg_indices) + 1`, which can be less than the
 /// placeholder count.  Returns `None` (bail, leaving the graph untouched)
-/// on any high-bit control byte other than `0xC0`/`0xC8` — a format spec
-/// with width/precision/fill or a named argument — and on non-UTF-8
-/// literal bytes.
-fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)> {
+/// on `0x81..=0xBF` (neither a literal length nor a placeholder), on an
+/// indirect width/precision bit, on a truncated field, on a missing `0x00`
+/// terminator, and on non-UTF-8 literal bytes.  A placeholder that carries
+/// flags/width/precision is decoded rather than refused; refusing it is the
+/// job of `FmtPlaceholder::is_default()`, which every collapse consults.
+fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<FmtPlaceholder>)> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
-    let mut indices: Vec<usize> = Vec::new();
+    let mut placeholders: Vec<FmtPlaceholder> = Vec::new();
     let mut auto = 0usize; // next sequential argument index
     let mut i = 0;
     let mut terminated = false;
@@ -21270,19 +24019,68 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
             }
             terminated = true;
             break;
-        } else if b == 0xC0 {
-            // sequential placeholder: renders the next argument in order
+        } else if b >= 0xC0 {
+            // `core::fmt::Arguments`' packed placeholder grammar (the pinned
+            // Rust core `fmt/mod.rs`): low bits select optional u32 flags,
+            // u16 width, u16 precision, and u16 argument-index fields; bits
+            // 4/5 mark indirect width/precision.  Decode all field lengths so
+            // embedded zero bytes are never mistaken for the terminator.
             pieces.push(std::mem::take(&mut current));
-            indices.push(auto);
-            auto += 1;
             i += 1;
-        } else if b == 0xC8 {
-            // explicit / reused placeholder: `0xC8` + little-endian u16 index
-            let lo = *bytes.get(i + 1)? as usize;
-            let hi = *bytes.get(i + 2)? as usize;
-            pieces.push(std::mem::take(&mut current));
-            indices.push(lo | (hi << 8));
-            i += 3;
+            let read_u16 = |at: &mut usize| -> Option<u16> {
+                let lo = *bytes.get(*at)?;
+                let hi = *bytes.get(*at + 1)?;
+                *at += 2;
+                Some(u16::from_le_bytes([lo, hi]))
+            };
+            let read_u32 = |at: &mut usize| -> Option<u32> {
+                let b0 = *bytes.get(*at)?;
+                let b1 = *bytes.get(*at + 1)?;
+                let b2 = *bytes.get(*at + 2)?;
+                let b3 = *bytes.get(*at + 3)?;
+                *at += 4;
+                Some(u32::from_le_bytes([b0, b1, b2, b3]))
+            };
+            let flags = if b & 0x01 != 0 {
+                Some(read_u32(&mut i)?)
+            } else {
+                None
+            };
+            let width = if b & 0x02 != 0 {
+                Some(read_u16(&mut i)?)
+            } else {
+                None
+            };
+            let precision = if b & 0x04 != 0 {
+                Some(read_u16(&mut i)?)
+            } else {
+                None
+            };
+            let arg_index = if b & 0x08 != 0 {
+                usize::from(read_u16(&mut i)?)
+            } else {
+                let index = auto;
+                auto += 1;
+                index
+            };
+            // An indirect width/precision (`{:1$}`) names an argument for
+            // the field instead of inlining it, and this decoder does not
+            // know how many bytes that costs.  Guessing would desync the
+            // byte stream, and a desync that happened to land on one default
+            // placeholder would be accepted by the collapses downstream —
+            // so refuse the template outright.  No consumer accepts a
+            // non-default placeholder anyway.
+            if b & 0x30 != 0 {
+                return None;
+            }
+            placeholders.push(FmtPlaceholder {
+                arg_index,
+                flags,
+                width,
+                precision,
+                width_indirect: false,
+                precision_indirect: false,
+            });
         } else if b == 0x80 {
             // long literal segment: `0x80` + little-endian u16 length,
             // then that many UTF-8 bytes (a 128+ byte literal that the
@@ -21303,7 +24101,7 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
             current.push_str(std::str::from_utf8(seg).ok()?);
             i = end;
         } else {
-            // any other control byte = format spec / named arg: bail
+            // 0x81..0xBF are neither literal lengths nor placeholders.
             return None;
         }
     }
@@ -21314,7 +24112,45 @@ fn decode_packed_format_pieces(bytes: &[u8]) -> Option<(Vec<String>, Vec<usize>)
         return None;
     }
     pieces.push(current);
-    Some((pieces, indices))
+    Some((pieces, placeholders))
+}
+
+/// Static formatting fields carried by one packed `fmt::Arguments`
+/// placeholder.  This mirrors the storage shape documented in the pinned
+/// Rust core; it is a Vec entry in template order, not a side-table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FmtPlaceholder {
+    arg_index: usize,
+    flags: Option<u32>,
+    width: Option<u16>,
+    precision: Option<u16>,
+    width_indirect: bool,
+    precision_indirect: bool,
+}
+
+impl FmtPlaceholder {
+    fn is_default(self) -> bool {
+        self.flags.is_none()
+            && self.width.is_none()
+            && self.precision.is_none()
+            && !self.width_indirect
+            && !self.precision_indirect
+    }
+
+    /// Rust `{:02x}` as emitted for the `u8` in
+    /// `display::bytearray_repr_string`: space fill + unknown alignment,
+    /// sign-aware zero padding, width present and equal to two.
+    fn is_lower_hex_byte_02(self) -> bool {
+        const FILL_SPACE: u32 = b' ' as u32;
+        const ZERO_PAD: u32 = 1 << 24;
+        const WIDTH_PRESENT: u32 = 1 << 27;
+        const ALIGN_UNKNOWN: u32 = 3 << 29;
+        self.flags == Some(FILL_SPACE | ZERO_PAD | WIDTH_PRESENT | ALIGN_UNKNOWN)
+            && self.width == Some(2)
+            && self.precision.is_none()
+            && !self.width_indirect
+            && !self.precision_indirect
+    }
 }
 
 /// Read an `Array` aggregate literal: given the Variable holding a
@@ -21362,10 +24198,13 @@ fn read_array_literal_elements(
     Some(by_index.into_iter().map(|(_, v)| v).collect())
 }
 
-/// Resolve a Variable to the `i64` of the `ConstInt` op that produces it,
-/// following cross-block links via [`resolve_to_producer_op`]. Used to
-/// read the packed-format pieces byte array (each `__pos_i` element is a
-/// `ConstInt` byte).
+/// Resolve a Variable to the `i64` value of the integer constant op that
+/// produces it, following cross-block links via
+/// [`resolve_to_producer_op`].  Packed-format pieces are `[u8; N]`, so the
+/// ordinary lowering now preserves each byte as `ConstUInt`; older/synthetic
+/// fixtures may still spell the same in-range byte as `ConstInt`.  Accept both
+/// at this byte-decoding boundary without changing either SSA value's unsigned
+/// annotation.
 fn resolve_const_int(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
@@ -21375,6 +24214,7 @@ fn resolve_const_int(
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
     match &block.operations.get(idx)?.kind {
         OpKind::ConstInt(n) => Some(*n),
+        OpKind::ConstUInt(n) => i64::try_from(*n).ok(),
         _ => None,
     }
 }
@@ -21387,6 +24227,7 @@ fn resolve_const_int(
 enum FmtArgKind {
     Display,
     Debug,
+    LowerHex,
 }
 
 /// One placeholder argument recovered from a `format_args!` chain: the
@@ -21409,7 +24250,7 @@ struct FmtArg {
 struct FmtChain {
     pieces: Vec<String>,
     args: Vec<FmtArg>,
-    arg_indices: Vec<usize>,
+    placeholders: Vec<FmtPlaceholder>,
 }
 
 /// Match a `FunctionPath`'s trailing segments against `tail`, so a
@@ -21445,6 +24286,8 @@ fn fmt_argument_ctor_kind(segments: &[String]) -> Option<FmtArgKind> {
         Some(FmtArgKind::Display)
     } else if fmt_path_ends_with(segments, &["Argument", "new_debug"]) {
         Some(FmtArgKind::Debug)
+    } else if fmt_path_ends_with(segments, &["Argument", "new_lower_hex"]) {
+        Some(FmtArgKind::LowerHex)
     } else {
         None
     }
@@ -21560,18 +24403,25 @@ fn extract_fmt_chain(
     for v in &piece_byte_vars {
         bytes.push(u8::try_from(resolve_const_int(graph, v)?).ok()?);
     }
-    let (pieces, arg_indices) = decode_packed_format_pieces(&bytes)?;
+    let (pieces, placeholders) = decode_packed_format_pieces(&bytes)?;
     // Args: an `Array` of `Argument::new_display|new_debug(&v)` ctors, one
     // per *distinct* argument.  The args array holds the distinct arguments;
     // reused placeholders (`0xC8`) point back at an earlier index, so the
     // distinct count is `max(arg_indices) + 1` — bail unless it matches the
     // args array, and every placeholder index must be in range.
     let arg_elems = read_array_literal_elements(graph, &args_var)?;
-    let distinct = arg_indices.iter().map(|i| i + 1).max().unwrap_or(0);
+    let distinct = placeholders
+        .iter()
+        .map(|placeholder| placeholder.arg_index + 1)
+        .max()
+        .unwrap_or(0);
     if arg_elems.len() != distinct {
         return None;
     }
-    if arg_indices.iter().any(|&i| i >= arg_elems.len()) {
+    if placeholders
+        .iter()
+        .any(|placeholder| placeholder.arg_index >= arg_elems.len())
+    {
         return None;
     }
     let mut args = Vec::with_capacity(arg_elems.len());
@@ -21581,7 +24431,7 @@ fn extract_fmt_chain(
     Some(FmtChain {
         pieces,
         args,
-        arg_indices,
+        placeholders,
     })
 }
 
@@ -21651,7 +24501,8 @@ fn emit_fmt_concat(graph: &mut FunctionGraph, bb_id: BlockId, chain: &FmtChain) 
     // Walk placeholders in template order via `arg_indices`; a reused
     // argument re-renders the same recovered value (`str(&str)` is pure, so
     // referencing the value var twice is sound).
-    for (i, &ai) in chain.arg_indices.iter().enumerate() {
+    for (i, placeholder) in chain.placeholders.iter().enumerate() {
+        let ai = placeholder.arg_index;
         acc = emit_str_add(graph, bb_id, &acc, &chain.args[ai].value);
         let next_piece = emit_str_const(graph, bb_id, &chain.pieces[i + 1]);
         acc = emit_str_add(graph, bb_id, &acc, &next_piece);
@@ -21732,6 +24583,182 @@ fn emit_fmt_expansion_ops(
     ops
 }
 
+/// Expand a byte-only `{:02x}` placeholder to the nibble lookup PyPy uses in
+/// `bytearrayobject.py::descr_repr` (`bytearrayobject.py:286-290`):
+///
+/// ```python
+///             elif not '\x20' <= c < '\x7f':
+///                 n = ord(c)
+///                 buf.append('\\x')
+///                 buf.append("0123456789abcdef"[n >> 4])
+///                 buf.append("0123456789abcdef"[n & 0xF])
+/// ```
+///
+/// Upstream appends three values into a `StringBuilder`; the Rust shell this
+/// replaces is a `format!` that *returns* a `String`, so the same three values
+/// are folded left through `add` (`ll_strconcat`) into the displaced format
+/// result instead.  `pieces` carries the template's literal halves — for the
+/// `format!("\\x{c:02x}")` shell that is `["\\x", ""]`, and the leading `\x`
+/// is upstream's first `buf.append`, so it must be emitted, not merely
+/// matched.
+///
+/// The caller proves the formatted value came from a `(u8,)` argument tuple,
+/// so two digits are complete (never truncating a wider integer).  Each
+/// getitem annotates as `SomeChar`; `str(char)` follows
+/// `AbstractCharRepr.ll_str -> ll_chr2str` (`rstr.py:554-555`).  No Rust fmt
+/// runtime or new helper survives.
+fn emit_lower_hex_byte_02_ops(
+    graph: &mut FunctionGraph,
+    pieces: &[String],
+    value: &Variable,
+    result: Variable,
+) -> Vec<SpaceOperation> {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    let alloc = |graph: &mut FunctionGraph| {
+        graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown)
+    };
+    let mut ops = Vec::new();
+
+    let digits = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(digits.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: vec!["__str_const".to_string(), "0123456789abcdef".to_string()],
+            },
+            args: vec![],
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    let four = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(four.clone()),
+        kind: OpKind::ConstInt(4),
+    });
+    let fifteen = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(fifteen.clone()),
+        kind: OpKind::ConstInt(15),
+    });
+    let hi_index = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(hi_index.clone()),
+        kind: OpKind::BinOp {
+            op: "rshift".to_string(),
+            lhs: value.clone(),
+            rhs: four,
+            result_ty: ValueType::Int,
+        },
+    });
+    let lo_index = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(lo_index.clone()),
+        kind: OpKind::BinOp {
+            op: "and".to_string(),
+            lhs: value.clone(),
+            rhs: fifteen,
+            result_ty: ValueType::Int,
+        },
+    });
+    let hi_char = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(hi_char.clone()),
+        kind: OpKind::ArrayRead {
+            base: digits.clone(),
+            index: hi_index,
+            item_ty: ValueType::Int,
+            array_type_id: None,
+            nolength: false,
+            pure: true,
+        },
+    });
+    let lo_char = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(lo_char.clone()),
+        kind: OpKind::ArrayRead {
+            base: digits,
+            index: lo_index,
+            item_ty: ValueType::Int,
+            array_type_id: None,
+            nolength: false,
+            pure: true,
+        },
+    });
+    let hi = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(hi.clone()),
+        kind: OpKind::UnaryOp {
+            op: "str".to_string(),
+            operand: hi_char,
+            result_ty: ValueType::Str,
+        },
+    });
+    let lo = alloc(graph);
+    ops.push(SpaceOperation {
+        result: Some(lo.clone()),
+        kind: OpKind::UnaryOp {
+            op: "str".to_string(),
+            operand: lo_char,
+            result_ty: ValueType::Str,
+        },
+    });
+    // Upstream's `buf.append('\\x')` — the template's leading literal — comes
+    // first, then the two nibble characters.  A non-empty trailing piece is
+    // appended last; the `["\\x", ""]` shell has none.
+    let mut parts: Vec<Variable> = Vec::new();
+    if !pieces[0].is_empty() {
+        let literal = alloc(graph);
+        ops.push(SpaceOperation {
+            result: Some(literal.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), pieces[0].clone()],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        parts.push(literal);
+    }
+    parts.push(hi);
+    parts.push(lo);
+    if pieces.len() > 1 && !pieces[1].is_empty() {
+        let literal = alloc(graph);
+        ops.push(SpaceOperation {
+            result: Some(literal.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__str_const".to_string(), pieces[1].clone()],
+                },
+                args: vec![],
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        parts.push(literal);
+    }
+    // Left-fold the parts through `add` (`ll_strconcat`).
+    let mut acc = parts[0].clone();
+    for part in &parts[1..] {
+        let sum = alloc(graph);
+        ops.push(SpaceOperation {
+            result: Some(sum.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: acc.clone(),
+                rhs: part.clone(),
+                result_ty: ValueType::Str,
+            },
+        });
+        acc = sum;
+    }
+    // Reuse the displaced format result var on the final op so the downstream
+    // link still forwards the rendered String.
+    if let Some(last) = ops.last_mut() {
+        last.result = Some(result);
+    }
+    ops
+}
+
 /// The unique `Link` feeding `target`'s inputarg at `pos`: the source
 /// block id, its exit index, and the threaded value Variable. Returns
 /// `None` when `target` has more than one predecessor (a phi merge, so
@@ -21796,12 +24823,17 @@ struct FmtCollapse {
 struct SingleArgFmtChainNav {
     /// The render kind of the single argument (`Display` / `Debug`).
     kind: FmtArgKind,
+    /// Static options and argument index decoded from the packed template.
+    placeholder: FmtPlaceholder,
     /// The literal template pieces around the single placeholder.
     pieces: Vec<String>,
     /// The `alloc::fmt::format` result var.
     format_result: Variable,
     /// The single rendered value (the tuple field source).
     context: Variable,
+    /// The argument tuple is exactly Rust `(u8,)`; used by the LowerHex
+    /// parity collapse to prove that two hexadecimal digits cannot truncate.
+    context_is_u8: bool,
     /// `(block, exit_index, arg_pos, replacement)` — re-thread the deleted
     /// chain value the link forwarded onto a still-live value so no link
     /// references a deleted result var after the chain ops are removed.
@@ -21841,15 +24873,16 @@ fn navigate_single_arg_fmt_chain(
         _ => return None,
     };
     let chain = extract_fmt_chain(graph, &fmt_args)?;
-    if chain.args.len() != 1 || chain.arg_indices.len() != 1 {
+    if chain.args.len() != 1 || chain.placeholders.len() != 1 {
         // scope: exactly one argument rendered by exactly one placeholder.
         // A single argument reused across several placeholders (`{0}…{0}`)
-        // has `arg_indices.len() > 1` and stays residual here (none of the
+        // has `placeholders.len() > 1` and stays residual here (none of the
         // census walls), rather than mis-driving the single-placeholder
         // expansion below.
         return None;
     }
     let kind = chain.args[0].kind;
+    let placeholder = chain.placeholders[0];
     let pieces = chain.pieces.clone();
 
     // `fmt_args` reaches Bf as an inputarg threaded from Bp's
@@ -21907,6 +24940,13 @@ fn navigate_single_arg_fmt_chain(
     })?;
     // The rendered value written into the argument tuple field.
     let context = unwrap_fmt_arg_tuple_ref(graph, &arg_ref)?;
+    let context_is_u8 = block_0.operations.iter().any(|op| {
+        matches!(&op.kind,
+            OpKind::Call {
+                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                ..
+            } if op.result.as_ref().map(|r| r.id()) == Some(tuple_var.id()) && name == "Tuple<u8>")
+    });
 
     // Thread `context` straight through the slots the chain values used:
     // B0→Bp forwards `context` where it forwarded `new_*`, Bp→Bf forwards
@@ -21929,9 +24969,11 @@ fn navigate_single_arg_fmt_chain(
 
     Some(SingleArgFmtChainNav {
         kind,
+        placeholder,
         pieces,
         format_result,
         context,
+        context_is_u8,
         link_rewrites,
         dead_results,
         dead_bases,
@@ -21944,7 +24986,7 @@ fn navigate_single_arg_fmt_chain(
 /// leaves the graph untouched.
 fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option<FmtCollapse> {
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    if nav.kind != FmtArgKind::Display {
+    if nav.kind != FmtArgKind::Display || !nav.placeholder.is_default() {
         // `str(value)` renders Display; `{:?}` Debug has no native rstr
         // counterpart, so leave a Debug chain to `collapse_debug_enum_fmt_chains`.
         return None;
@@ -22049,6 +25091,132 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
             continue;
         };
         let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result);
+        graph
+            .block_mut(site.format_block)
+            .operations
+            .splice(idx..idx + 1, expansion);
+    }
+    sites.len()
+}
+
+/// A byte `{:02x}` chain whose Rust formatting shell can be replaced by
+/// PyPy's two-nibble lookup while reusing the common single-argument chain
+/// deletion plan.
+struct LowerHexByteFmtCollapse {
+    format_block: BlockId,
+    format_result: u64,
+    /// The template's literal halves, carried so the expansion re-emits the
+    /// leading `\x` — upstream's first `buf.append` — instead of consuming it
+    /// as a match condition only.
+    pieces: Vec<String>,
+    link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
+    dead_results: Vec<u64>,
+    dead_bases: Vec<u64>,
+}
+
+fn collect_lower_hex_byte_fmt_collapse(
+    graph: &FunctionGraph,
+    bf: BlockId,
+    fi: usize,
+) -> Option<LowerHexByteFmtCollapse> {
+    let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
+    if nav.kind != FmtArgKind::LowerHex
+        || !nav.placeholder.is_lower_hex_byte_02()
+        || !nav.context_is_u8
+        || nav.pieces != ["\\x".to_string(), String::new()]
+    {
+        return None;
+    }
+    Some(LowerHexByteFmtCollapse {
+        format_block: bf,
+        format_result: nav.format_result.id(),
+        pieces: nav.pieces,
+        link_rewrites: nav.link_rewrites,
+        dead_results: nav.dead_results,
+        dead_bases: nav.dead_bases,
+    })
+}
+
+/// Replace the exact `format!("\\x{c:02x}")` shell used by the bytearray
+/// repr loop with PyPy's `"0123456789abcdef"[c >> 4]` / `[c & 0xF]`
+/// implementation.  The packed template, `new_lower_hex` ctor, argument tuple
+/// and `alloc::fmt::format` all disappear; only RPython-native integer,
+/// string-getitem and string-concat operations remain.
+fn collapse_lower_hex_byte_fmt_chains(graph: &mut FunctionGraph) -> usize {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let sites: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .operations
+                .iter()
+                .enumerate()
+                .filter_map(move |(fi, op)| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if fmt_path_ends_with(segments, &["fmt", "format"]) => Some((block.id, fi)),
+                    _ => None,
+                })
+        })
+        .filter_map(|(bid, fi)| collect_lower_hex_byte_fmt_collapse(graph, bid, fi))
+        .collect();
+    if sites.is_empty() {
+        return 0;
+    }
+
+    for site in &sites {
+        for (bid, ei, pos, replacement) in &site.link_rewrites {
+            if let Some(link) = graph.block_mut(*bid).exits.get_mut(*ei)
+                && let Some(arg) = link.args.get_mut(*pos)
+            {
+                *arg = LinkArg::Value(replacement.clone());
+            }
+        }
+    }
+    let dead_results: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|site| site.dead_results.iter().copied())
+        .collect();
+    let dead_bases: std::collections::HashSet<u64> = sites
+        .iter()
+        .flat_map(|site| site.dead_bases.iter().copied())
+        .collect();
+    for block in &mut graph.blocks {
+        block.operations.retain(|op| {
+            if op
+                .result
+                .as_ref()
+                .is_some_and(|result| dead_results.contains(&result.id()))
+            {
+                return false;
+            }
+            !matches!(&op.kind, OpKind::FieldWrite { base, .. } if dead_bases.contains(&base.id()))
+        });
+    }
+    for site in &sites {
+        let Some((idx, value, result)) = graph
+            .blocks
+            .iter()
+            .find(|block| block.id == site.format_block)
+            .and_then(|block| {
+                let idx = block.operations.iter().position(|op| {
+                    op.result.as_ref().map(|result| result.id()) == Some(site.format_result)
+                })?;
+                let value = match &block.operations[idx].kind {
+                    OpKind::Call { args, .. } => args.first()?.clone(),
+                    _ => return None,
+                };
+                Some((idx, value, block.operations[idx].result.clone()?))
+            })
+        else {
+            continue;
+        };
+        // The original context value was defined in B0.  After link rewrites,
+        // the format op's own argument Variable is Bf's inputarg carrying that
+        // value; use it so every emitted operand is defined in this block.
+        let expansion = emit_lower_hex_byte_02_ops(graph, &site.pieces, &value, result);
         graph
             .block_mut(site.format_block)
             .operations
@@ -22500,7 +25668,12 @@ fn collect_fmt_collapse_multi(
     if chain.args.len() < 2 {
         return None; // single-argument chains handled by `collapse_fmt_chains`
     }
-    if chain.args.iter().any(|a| a.kind != FmtArgKind::Display) {
+    if chain.args.iter().any(|a| a.kind != FmtArgKind::Display)
+        || chain
+            .placeholders
+            .iter()
+            .any(|placeholder| !placeholder.is_default())
+    {
         // `{:?}` Debug over an enum has no native rstr render (no
         // `rtype_str` on enum reprs); leave Debug chains residual.
         return None;
@@ -22574,7 +25747,11 @@ fn collect_fmt_collapse_multi(
         args_block,
         arguments_var,
         arg_elem_vars,
-        arg_indices: chain.arg_indices,
+        arg_indices: chain
+            .placeholders
+            .iter()
+            .map(|placeholder| placeholder.arg_index)
+            .collect(),
         pieces,
         new_display_ops,
         format_block: bf,
@@ -22671,7 +25848,18 @@ fn collapse_fmt_chains_multi(graph: &mut FunctionGraph) -> usize {
                     kind: FmtArgKind::Display,
                 })
                 .collect(),
-            arg_indices: site.arg_indices.clone(),
+            placeholders: site
+                .arg_indices
+                .iter()
+                .map(|&arg_index| FmtPlaceholder {
+                    arg_index,
+                    flags: None,
+                    width: None,
+                    precision: None,
+                    width_indirect: false,
+                    precision_indirect: false,
+                })
+                .collect(),
         };
         let folded = emit_fmt_concat(graph, site.args_block, &fold_chain);
         // 4. Re-thread the folded String onto the link that forwarded the
@@ -22836,7 +26024,7 @@ fn collect_debug_enum_fmt_collapse(
     // gate below selects only the `{:?}` renders, and the navigation also
     // supplies the residual-chain delete / re-thread plan the switch needs.
     let nav = navigate_single_arg_fmt_chain(graph, bf, fi)?;
-    if nav.kind != FmtArgKind::Debug {
+    if nav.kind != FmtArgKind::Debug || !nav.placeholder.is_default() {
         return None; // Display is handled by `collapse_fmt_chains`
     }
     // The rendered value is the enum being `Debug`-formatted.
@@ -23141,6 +26329,7 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
     for op in &block.operations {
         let pure = match &op.kind {
             OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
             | OpKind::ConstRef(_)
@@ -23272,7 +26461,8 @@ mod tests {
         DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
         charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
         fn_ptr_family_for, json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
-        shaped_array_parts, simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
+        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
+        tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -23409,6 +26599,16 @@ mod tests {
         assert!(matches!(
             decode_literal(&unsigned).expect("decode U128"),
             DecodedConst::UInt128(value) if value == u128::MAX
+        ));
+
+        let word = serde_json::json!({
+            "Scalar": {
+                "Unsigned": ["Usize", "624"]
+            }
+        });
+        assert!(matches!(
+            decode_literal(&word).expect("decode usize"),
+            DecodedConst::UInt(624)
         ));
     }
 
@@ -23838,6 +27038,12 @@ mod tests {
         assert!(graph_is_items_block_base_accessor(
             "majit_rlib::lltypesystem::rlist::typed_items_block_items_base"
         ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::int_array::<Impl>::base"
+        ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::float_array::<Impl>::base"
+        ));
 
         // Bodies that dereference a `.add(NAMED_OFFSET)` interior pointer
         // in place must NOT be aliased — the offset is load-bearing.
@@ -23851,16 +27057,17 @@ mod tests {
         assert!(!graph_is_items_block_base_accessor(
             "pyre_object::other_mod::items_block_items_base_helper"
         ));
+        assert!(!graph_is_items_block_base_accessor(
+            "pyre_object::my_int_array::<Impl>::base"
+        ));
     }
 
     /// brick 1 collapses an accessor to its receiver — the block header — and
     /// only brick 3's `base_size`-bearing array descr adds the item offset
-    /// back. So every REFERENCE accessor brick 1 rewrites must also be one
-    /// brick 3 recognises, or the residual `.add` strides from the length
-    /// word. The typed accessor is the deliberate exception: brick 1 collapses
-    /// it, and its scalar element is refused on the element side instead
-    /// (`is_object_ref_items_ptr`), so no `Ref`-typed array op is minted for a
-    /// `u64` block.
+    /// back. Every accessor brick 1 rewrites must therefore have a matching
+    /// brick-3 family: object accessors use `GcArray(OBJECTPTR)`, while the
+    /// typed accessor is deliberately excluded from that predicate and uses
+    /// the separate `GcArray(Signed|Float)` gate.
     #[test]
     fn the_two_bricks_agree_on_every_reference_items_base_accessor() {
         use super::{graph_is_items_block_base_accessor, is_object_items_block_base_accessor};
@@ -23877,7 +27084,8 @@ mod tests {
             assert!(graph_is_items_block_base_accessor(name));
         }
 
-        // The typed block: brick 1 only.
+        // The typed block is not an object-array accessor; its own brick-3
+        // gate supplies the scalar array operation.
         let typed = "majit_rlib::lltypesystem::rlist::typed_items_block_items_base";
         assert!(graph_is_items_block_base_accessor(typed));
         assert!(!is_object_items_block_base_accessor(typed));
@@ -23931,7 +27139,10 @@ mod tests {
             pieces,
             vec!["stack underflow during ".to_string(), String::new()]
         );
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // `format!("{} indices must be integers or slices, not {}", ..)`
         let (pieces, indices) = decode_packed_format_pieces(&[
@@ -23948,7 +27159,10 @@ mod tests {
                 String::new(),
             ]
         );
-        assert_eq!(indices, vec![0, 1]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
 
         // `format!("'{}' object does not support item assignment", ..)`
         let (pieces, indices) = decode_packed_format_pieces(&[
@@ -23964,7 +27178,10 @@ mod tests {
                 "' object does not support item assignment".to_string(),
             ]
         );
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // `format!("__init__() should return None, not '{}'", ..)`
         let (pieces, indices) = decode_packed_format_pieces(&[
@@ -23980,7 +27197,10 @@ mod tests {
                 "'".to_string(),
             ]
         );
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // `format!("can only concatenate {a} (not \"{b}\") to {a}", ..)` —
         // the `add`-operand error tail (descroperation.rs), where the first
@@ -24002,24 +27222,41 @@ mod tests {
                 String::new(),
             ]
         );
-        assert_eq!(indices, vec![0, 1, 0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0, 1, 0]
+        );
 
         // A template naming arguments 1 and 3 explicitly (`0xC8` + u16 index
         // each): three sequential `0xC0` then two explicit reuses.
         let (pieces, indices) =
             decode_packed_format_pieces(&[192, 192, 192, 200, 1, 0, 200, 3, 0, 0]).unwrap();
         assert_eq!(pieces.len(), 6);
-        assert_eq!(indices, vec![0, 1, 2, 1, 3]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 1, 3]
+        );
     }
 
     #[test]
     fn decode_packed_format_pieces_bails_and_handles_edges() {
         use super::decode_packed_format_pieces;
 
-        // A control byte other than 0xC0 / 0xC8 (e.g. a width/precision
-        // format-spec) must bail so the recognizer leaves the graph alone.
+        // A flags-bearing placeholder truncated before its four-byte flags
+        // field, and the reserved 0x80 long-literal marker without a length,
+        // must bail.
         assert_eq!(decode_packed_format_pieces(&[0xC1, 0]), None);
         assert_eq!(decode_packed_format_pieces(&[0x80, 0]), None);
+
+        // Verbatim `format!("\\x{c:02x}")` template from the production
+        // LLBC.  0xC3 selects flags+width; 0x69000020 is space fill,
+        // sign-aware zero-pad, width-present, unknown alignment.
+        let (pieces, placeholders) =
+            decode_packed_format_pieces(&[2, b'\\', b'x', 0xC3, 0x20, 0, 0, 0x69, 2, 0, 0])
+                .unwrap();
+        assert_eq!(pieces, ["\\x".to_string(), String::new()]);
+        assert_eq!(placeholders.len(), 1);
+        assert!(placeholders[0].is_lower_hex_byte_02());
 
         // A literal length that overruns the buffer bails.
         assert_eq!(decode_packed_format_pieces(&[5, 65, 66, 0]), None);
@@ -24040,13 +27277,16 @@ mod tests {
         // Literal-only template (no placeholders) → single piece, no args.
         let (pieces, indices) = decode_packed_format_pieces(&[2, 104, 105, 0]).unwrap();
         assert_eq!(pieces, vec!["hi".to_string()]);
-        assert_eq!(indices, Vec::<usize>::new());
+        assert!(indices.is_empty());
 
         // Two consecutive literal segments accumulate into one piece
         // (how a >127-byte literal is split); one placeholder follows.
         let (pieces, indices) = decode_packed_format_pieces(&[1, 97, 1, 98, 192, 0]).unwrap();
         assert_eq!(pieces, vec!["ab".to_string(), String::new()]);
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
     }
 
     #[test]
@@ -24058,7 +27298,7 @@ mod tests {
         };
 
         // Build the pieces array the way the front-end lowers it: an
-        // `Array` ctor followed by `__pos_i` FieldWrites of ConstInt
+        // `Array` ctor followed by `__pos_i` FieldWrites of ConstUInt
         // bytes. Template for `format!("hi{}")` → pieces ["hi", ""],
         // one placeholder = bytes [2, 'h', 'i', 0xC0, 0].
         let mut graph = FunctionGraph::new("arraylit");
@@ -24072,12 +27312,12 @@ mod tests {
                 result_ty: ValueType::Ref(Some("Array".to_string())),
             },
         });
-        let bytes = [2i64, 104, 105, 0xC0, 0];
+        let bytes = [2u64, 104, 105, 0xC0, 0];
         for (i, b) in bytes.iter().enumerate() {
             let v = Variable::new();
             graph.block_mut(a).operations.push(SpaceOperation {
                 result: Some(v.clone()),
-                kind: OpKind::ConstInt(*b),
+                kind: OpKind::ConstUInt(*b),
             });
             graph.block_mut(a).operations.push(SpaceOperation {
                 result: None,
@@ -24099,7 +27339,10 @@ mod tests {
         assert_eq!(decoded, vec![2, 104, 105, 0xC0, 0]);
         let (pieces, indices) = decode_packed_format_pieces(&decoded).unwrap();
         assert_eq!(pieces, vec!["hi".to_string(), String::new()]);
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // A non-Array producer (plain ConstInt) is rejected.
         assert_eq!(read_array_literal_elements(&graph, &elements[0]), None);
@@ -25160,7 +28403,7 @@ mod tests {
 
     #[test]
     fn emit_fmt_concat_builds_interleaved_str_add_fold() {
-        use super::{FmtArg, FmtArgKind, FmtChain, emit_fmt_concat};
+        use super::{FmtArg, FmtArgKind, FmtChain, FmtPlaceholder, emit_fmt_concat};
         use crate::flowspace::model::Variable;
         use crate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -25181,7 +28424,24 @@ mod tests {
                     kind: FmtArgKind::Display,
                 },
             ],
-            arg_indices: vec![0, 1],
+            placeholders: vec![
+                FmtPlaceholder {
+                    arg_index: 0,
+                    flags: None,
+                    width: None,
+                    precision: None,
+                    width_indirect: false,
+                    precision_indirect: false,
+                },
+                FmtPlaceholder {
+                    arg_index: 1,
+                    flags: None,
+                    width: None,
+                    precision: None,
+                    width_indirect: false,
+                    precision_indirect: false,
+                },
+            ],
         };
         let result = emit_fmt_concat(&mut graph, bb, &chain);
 
@@ -25340,6 +28600,53 @@ mod tests {
         );
     }
 
+    /// Anchor PyPy's single string-valued `W_UnicodeObject._utf8` shape to
+    /// the real pyre-object LLBC.  Rust stores that value behind
+    /// `*mut Wtf8Buf`, but both its canonical annotation metadata and the
+    /// managed storage-box call must collapse to the one RPython string value.
+    #[test]
+    #[ignore]
+    fn unicode_storage_matches_real_object_llbc() {
+        use crate::model::{CallTarget, OpKind, ValueType};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(&llbc);
+        assert!(
+            fields
+                .fields
+                .get("pyre_object::unicodeobject::W_UnicodeObject")
+                .is_some_and(
+                    |rows| rows.contains(&("value".to_string(), "*mut Wtf8Buf".to_string()))
+                ),
+            "the declaration metadata must retain the physical storage row"
+        );
+        assert!(
+            attrs
+                .get("unicodeobject::W_UnicodeObject")
+                .is_some_and(|rows| rows.contains(&("value".to_string(), ValueType::Str))),
+            "W_UnicodeObject.value must project as PyPy's string-valued _utf8 field"
+        );
+
+        let graph = super::lower_function(&llbc, "w_str_from_wtf8_managed")
+            .expect("lower managed string constructor");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["gc_alloc_storage_box"])
+                )
+            }),
+            "the Wtf8 storage box must be an RPython-string identity"
+        );
+    }
+
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
     /// interpreter LLBC.  `constant_at` must project the wrapper's sole field
@@ -25415,7 +28722,6 @@ mod tests {
                 ("im".to_string(), ValueType::Float),
             ])
         );
-
         let constant_at = super::lower_function(&llbc, "constant_at")
             .expect("lower ConstantOpcodeHandler::constant_at");
         let constant_ops: Vec<_> = constant_at
@@ -25581,16 +28887,21 @@ mod tests {
             boxed_handlers, 1,
             "real LOAD_CONST bigint handler must use the RBigInt pointer boxing ABI"
         );
-        // Pins the whole ArrayRead population of `load_const_value`, not just
-        // its presence — so an added or removed indexed read reds here.
+        // PyPy walks `co_consts_w`, a list of GC pointers.  This function
+        // walks the compiler's `Vec<ConstantData>` instead, whose enum values
+        // are inline Rust aggregates and are wider than one target word.  No
+        // translation replaces that host container, so manufacturing a
+        // one-word ArrayRead would stride into the middle of an element.  Keep
+        // the Vec read residual until ConstantData is projected into the
+        // PyPy-shaped managed constants list.
         assert_eq!(
             load_ops
                 .iter()
                 .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
                 .count(),
-            3
+            0
         );
-        assert!(!load_ops.iter().any(|op| {
+        assert!(load_ops.iter().any(|op| {
             matches!(
                 &op.kind,
                 OpKind::Call {
@@ -26046,6 +29357,56 @@ mod tests {
             }),
             "u32 destination must not use the i64 fits/discriminant lowering"
         );
+    }
+
+    /// PyPy's `ObjSpace.c_int_w` performs the same signed 32-bit bounds
+    /// check explicitly. Anchor Rust's `i32::try_from(i64)` spelling in both
+    /// the interpreter helper and the int-or-float list strategy: neither may
+    /// retain an opaque core call, and both must keep a runtime Result tag.
+    #[test]
+    #[ignore]
+    fn i64_to_i32_try_from_real_sites_lower_to_checked_result() {
+        use crate::model::{CallTarget, OpKind};
+
+        for (relpath, fname) in [
+            ("/../../build/llbc/pyre-interpreter.ullbc", "index_c_int_w"),
+            (
+                "/../../build/llbc/pyre-object.ullbc",
+                "int_or_float_encode_int",
+            ),
+        ] {
+            let path = format!("{}{relpath}", env!("CARGO_MANIFEST_DIR"));
+            let llbc = Llbc::load(path).unwrap_or_else(|e| panic!("load {fname} LLBC: {e}"));
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|e| panic!("lower {fname}: {e:?}"));
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(
+                            segments,
+                            &["convert", "num", "<Impl>", "try_from"],
+                        ))
+                }),
+                "{fname}: checked narrowing must not remain an opaque core call"
+            );
+            // `or`, not a sum: `c_int_w` writes
+            // `value < INT_MIN or value > INT_MAX` (`baseobjspace.py:2066`).
+            for expected in ["lt", "gt", "or"] {
+                assert!(
+                    graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                        matches!(&op.kind, OpKind::BinOp { op, .. } if op == expected)
+                    }),
+                    "{fname}: missing checked-narrowing {expected} op"
+                );
+            }
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::FieldWrite { field, .. }
+                        if field.name == "__discriminant")
+                }),
+                "{fname}: Result discriminant must remain runtime data"
+            );
+        }
     }
 
     /// Minimal `Llbc` carrying only `trait_impls` — the surface
@@ -26759,6 +30120,56 @@ mod tests {
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!({"Scalar": []})));
     }
 
+    #[test]
+    fn pointer_to_usize_cast_keeps_rpython_signed_then_unsigned_sequence() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let ptr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+
+        let (retype, result) = push_ptr_to_unsigned_cast(&mut graph, entry, ptr.clone());
+        graph
+            .block_mut(entry)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: retype,
+            });
+
+        let ops = &graph.block(entry).operations;
+        let (signed, signed_arg) = match &ops[1] {
+            crate::model::SpaceOperation {
+                result: Some(signed),
+                kind:
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        result_ty: ValueType::Int,
+                    },
+            } if segments.last().map(String::as_str) == Some("cast_ptr_to_int") => {
+                (signed, &args[0])
+            }
+            other => panic!("first cast must be Signed cast_ptr_to_int: {other:?}"),
+        };
+        assert_eq!(signed_arg, &ptr);
+        match &ops[2] {
+            crate::model::SpaceOperation {
+                result: Some(actual_result),
+                kind:
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        result_ty: ValueType::Unsigned,
+                    },
+            } if segments.last().map(String::as_str) == Some("r_uint") => {
+                assert_eq!(actual_result, &result);
+                assert_eq!(&args[0], signed);
+            }
+            other => panic!("second cast must retype to Unsigned with r_uint: {other:?}"),
+        }
+    }
+
     /// Only a byte pointee spells the type-erased address; a pointee-typed
     /// raw pointer and a wider primitive array head must stay narrows /
     /// aliases, since erasing those would drop a pointee class the
@@ -26793,6 +30204,106 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn string_storage_pointer_seeds_the_rpython_string_field_repr() {
+        let wtf8buf = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["rustpython_wtf8", 0]},
+                    {"Ident": ["Wtf8Buf", 0]}
+                ],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 16}
+                }},
+                "source_text": "pub struct Wtf8Buf { ... }",
+                "attr_info": {
+                    "attributes": [], "inline": null, "rename": null, "public": true
+                },
+                "is_local": false
+            },
+            "kind": "Opaque",
+            "layout": null
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, wtf8buf],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [null, {
+                    "def_id": 1,
+                    "item_meta": {
+                        "name": [
+                            {"Ident": ["core", 0]},
+                            {"Ident": ["convert", 0]},
+                            {"Ident": ["Into", 0]}
+                        ],
+                        "span": {"data": {
+                            "file_id": 0,
+                            "beg": {"line": 1, "col": 0},
+                            "end": {"line": 1, "col": 16}
+                        }},
+                        "source_text": "pub trait Into<T> { ... }",
+                        "attr_info": {
+                            "attributes": [], "inline": null, "rename": null, "public": true
+                        },
+                        "is_local": false
+                    }
+                }],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let pointee = serde_json::json!({
+            "Adt": {"id": {"Adt": 1}, "generics": {"types": []}}
+        });
+        let storage_ptr = TyRef::Other(serde_json::json!({
+            "RawPtr": [pointee, "Mut"]
+        }));
+
+        assert_eq!(
+            super::tyref_to_attr_value_type(&storage_ptr, &llbc),
+            ValueType::Str,
+            "W_UnicodeObject.value is the Rust storage spelling of PyPy's string-valued _utf8 field"
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&storage_ptr, &llbc),
+            ValueType::Str,
+            "the owning storage pointer must remain the same RPython string at return and phi sites"
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&TyRef::Other(pointee.clone()), &llbc),
+            ValueType::Str,
+            "a bare Wtf8Buf value is the same RPython string representation"
+        );
+
+        let generic_message = TyRef::Other(serde_json::json!({
+            "TypeVar": {"Bound": [0, 0]}
+        }));
+        let generics = serde_json::json!({
+            "trait_clauses": [{
+                "trait_": {"skip_binder": {
+                    "id": 1,
+                    "generics": {"types": [
+                        {"TypeVar": {"Bound": [1, 0]}},
+                        pointee
+                    ]}
+                }}
+            }]
+        });
+        assert_eq!(
+            super::tyref_generic_trait_bound_root(&generic_message, &llbc, Some(&generics),)
+                .as_deref(),
+            Some("String"),
+            "impl Into<Wtf8Buf> message parameters seed the one RPython string input cell"
+        );
+    }
+
     fn rows(spec: &[(&str, &str)]) -> Vec<(String, String)> {
         spec.iter()
             .map(|(n, t)| (n.to_string(), t.to_string()))
@@ -26820,7 +30331,7 @@ mod tests {
         origins.insert("FrameBlock".to_string(), "pyopcode".to_string());
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert!(
             !reg.fields.contains_key("FrameBlock"),
@@ -26854,10 +30365,40 @@ mod tests {
         origins.insert("Point".to_string(), "eval".to_string());
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert_eq!(reg.fields.get("Point"), Some(&shape));
         assert_eq!(origins.get("Point").map(String::as_str), Some("eval"));
+    }
+
+    #[test]
+    fn harden_deduplicates_full_and_canonical_aliases_by_struct_identity() {
+        let mut reg = crate::front::semantic::StructFieldRegistry::default();
+        let shape = rows(&[("ob_header", "PyObject"), ("value", "*mut Wtf8Buf")]);
+        let full = "pyre_object::unicodeobject::W_UnicodeObject";
+        let canonical = "unicodeobject::W_UnicodeObject";
+        reg.fields.insert(full.to_string(), shape.clone());
+        reg.fields.insert(canonical.to_string(), shape.clone());
+        reg.fields
+            .insert("W_UnicodeObject".to_string(), shape.clone());
+        let mut origins = std::collections::HashMap::new();
+        origins.insert("W_UnicodeObject".to_string(), "unicodeobject".to_string());
+        let mut enums = std::collections::HashMap::new();
+        let sid = majit_ir::descr::StructId::from_canonical(canonical);
+        let ids = std::collections::HashMap::from([
+            (full.to_string(), Some(sid)),
+            (canonical.to_string(), Some(sid)),
+            ("W_UnicodeObject".to_string(), Some(sid)),
+        ]);
+
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, Some(&ids));
+
+        assert_eq!(reg.fields.get("W_UnicodeObject"), Some(&shape));
+        assert_eq!(
+            origins.get("W_UnicodeObject").map(String::as_str),
+            Some("unicodeobject"),
+            "two spellings of one StructId must not tombstone its origin"
+        );
     }
 
     #[test]
@@ -26883,7 +30424,7 @@ mod tests {
         reg.fields.insert("StepResult".to_string(), disc.clone());
         reg.fields.insert("Verdict".to_string(), disc.clone());
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert!(
             !enums.contains_key("StepResult"),
@@ -26922,7 +30463,7 @@ mod tests {
         origins.insert("W_IntObject".to_string(), "intobject".to_string());
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert_eq!(reg.fields.get("W_IntObject"), Some(&shape));
         assert_eq!(
@@ -26960,7 +30501,7 @@ mod tests {
         let mut origins = std::collections::HashMap::new();
         let mut enums = std::collections::HashMap::new();
 
-        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums);
+        harden_duplicate_leaf_metadata(&mut reg, &mut origins, &mut enums, None);
 
         assert!(
             !reg.fields.contains_key("Outcome::Ok"),
@@ -27155,7 +30696,10 @@ mod tests {
         bytes.push(0x00); // terminator
         let (pieces, indices) = decode_packed_format_pieces(&bytes).unwrap();
         assert_eq!(pieces, vec!["ab".to_string(), tail.to_string()]);
-        assert_eq!(indices, vec![0]);
+        assert_eq!(
+            indices.iter().map(|p| p.arg_index).collect::<Vec<_>>(),
+            vec![0]
+        );
 
         // A long-literal marker whose declared length overruns the buffer
         // bails (no OOB, fail-safe residual).
@@ -27276,6 +30820,82 @@ mod tests {
         assert!(
             niche_try_switches >= 1,
             "lookup: expected a niche `?` `ne` null-test switch block"
+        );
+
+        // The `?` break arm returns the enclosing `Option<PyObjectRef>`'s
+        // `None`.  That type is a nullable PyObject pointer, not a constructed
+        // Rust `Option::None` instance.  Pin both halves of the representation:
+        // no Option None ctor survives, and a null pointer narrowed to
+        // PyObject is forwarded to the return block.
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor {
+                            name,
+                            owner_path,
+                            ..
+                        },
+                        ..
+                    } if name == "None" && owner_path.iter().any(|part| part == "Option")
+                )
+            }),
+            "lookup: niche `?` break arm must not construct Option::None"
+        );
+        let null_results: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments
+                    == &[
+                        "core".to_string(),
+                        "ptr".to_string(),
+                        "null_mut".to_string(),
+                    ] =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        let narrowed_nulls: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if segments
+                    == &[
+                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                        "PyObject".to_string(),
+                    ]
+                    && args.len() == 1
+                    && null_results.contains(&args[0]) =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .any(|block| block.exits.iter().any(|link| {
+                    link.target == graph.returnblock
+                        && link.args.iter().any(
+                            |arg| matches!(arg, LinkArg::Value(v) if narrowed_nulls.contains(v)),
+                        )
+                })),
+            "lookup: niche `?` break arm must return a PyObject-narrowed null"
         );
     }
 
@@ -27426,6 +31046,21 @@ mod tests {
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "set_locals_w").expect("lower set_locals_w");
+        let value_input_root = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Input {
+                    name, class_root, ..
+                } if name == "value" => class_root.as_deref(),
+                _ => None,
+            });
+        assert_eq!(
+            value_input_root,
+            Some("PyObject"),
+            "PyObjectRef input must retain the W_Root-equivalent class identity"
+        );
         let residual = graph
             .blocks
             .iter()
@@ -27451,6 +31086,76 @@ mod tests {
         assert!(
             array_writes >= 1,
             "set_locals_w: expected at least one native ArrayWrite (setarrayitem_gc)"
+        );
+        let typed_store = graph.blocks.iter().any(|block| {
+            block.operations.windows(2).any(|ops| {
+                let Some(cast_result) = ops[0].result.as_ref() else {
+                    return false;
+                };
+                matches!(
+                    &ops[0].kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[
+                        "__cast_instance_intrinsic".to_string(),
+                        "PyObject".to_string(),
+                    ]
+                ) && matches!(
+                    &ops[1].kind,
+                    OpKind::ArrayWrite {
+                        value: crate::model::LinkArg::Value(value),
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if value == cast_result && array_type_id == super::OBJECT_REF_GCARRAY_TYPE_ID
+                )
+            })
+        });
+        assert!(
+            typed_store,
+            "set_locals_w: PyObjectRef store must preserve the W_Root external item repr"
+        );
+    }
+
+    /// PyPy's frame stack clears store `None` into a `W_Root` list.  The Rust
+    /// sentinel `PY_NULL` must therefore retain the `PyObject` class boundary
+    /// while becoming nullable; a classdef-less null would widen the shared
+    /// `FixedObjectArray` item to the erased top reference.
+    #[test]
+    #[ignore]
+    fn popvalue_py_null_narrows_to_nullable_instance() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::pyframe::<Impl>::popvalue_maybe_none",
+        )
+        .expect("lower PyFrame::popvalue_maybe_none");
+        let has_nullable_instance = graph.blocks.iter().any(|block| {
+            block.operations.windows(2).any(|ops| {
+                matches!(
+                    &ops[0].kind,
+                    OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_mut"
+                ) && matches!(
+                    &ops[1].kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.as_slice()
+                        == [
+                            "__cast_instance_intrinsic".to_string(),
+                            "PyObject".to_string(),
+                        ]
+                )
+            })
+        });
+        assert!(
+            has_nullable_instance,
+            "PY_NULL stack clear must lower as null_mut followed by a PyObject narrow"
         );
     }
 
@@ -27721,6 +31426,405 @@ mod tests {
         );
     }
 
+    /// Real-LLBC anchor for the `FixedObjectArray` Index intercept.  The
+    /// intercept returns before `lower_call`'s ordinary result-narrowing tail,
+    /// so an object element must carry its own `PyObject` narrow immediately
+    /// after the lifted ArrayRead.  Ignored by default because it loads the
+    /// large interpreter snapshot.
+    #[test]
+    #[ignore]
+    fn load_local_value_arrayread_narrows_instance_item() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph =
+            super::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::load_local_value")
+                .expect("lower eval::<Impl>::load_local_value");
+        let has_instance_narrow = graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.first().map(String::as_str) == Some("__cast_instance_intrinsic")
+                    && segments.get(1).is_some_and(|root| root.ends_with("PyObject"))
+            )
+        });
+        assert!(
+            has_instance_narrow,
+            "FixedObjectArray getitem must recast its GCREF item to PyObject"
+        );
+    }
+
+    /// A translated opcode helper is a PyPy frame method, not a generic
+    /// classdef-less reference.  Its receiver is the per-frame red argument
+    /// that owns `pycode`, globals, and locals, so the front must retain the
+    /// concrete `PyFrame` root on the corresponding Input operation.
+    #[test]
+    #[ignore]
+    fn opcode_impl_receiver_keeps_pyframe_input_root() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::pop_value")
+            .expect("lower eval::<Impl>::pop_value");
+        let receiver = graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Input { class_root, .. }
+                    if op.result.as_ref() == graph.block(graph.startblock).inputargs.first() =>
+                {
+                    class_root.as_deref()
+                }
+                _ => None,
+            });
+        assert_eq!(
+            receiver,
+            Some("PyFrame"),
+            "opcode impl receiver must retain the concrete per-frame red identity"
+        );
+
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                &[llbc],
+                crate::HostStaticAddrs::default(),
+                &[],
+                &["pop_value", "pop_top", "build_list", "opcode_build_list"],
+            )
+            .expect("build filtered opcode program");
+        let pyframe_roots: Vec<_> = program
+            .struct_fields
+            .fields
+            .keys()
+            .filter(|root| root.rsplit("::").next() == Some("PyFrame"))
+            .cloned()
+            .collect();
+        assert!(
+            pyframe_roots.len() > 1,
+            "fixture must exercise more than one lookup spelling"
+        );
+        let mut pyframe_ids: Vec<_> = pyframe_roots
+            .iter()
+            .map(|root| {
+                program
+                    .struct_ids
+                    .get(root)
+                    .copied()
+                    .flatten()
+                    .expect("every qualified PyFrame alias has an identity")
+            })
+            .collect();
+        pyframe_ids.sort();
+        pyframe_ids.dedup();
+        assert_eq!(
+            pyframe_ids.len(),
+            1,
+            "all PyFrame lookup spellings must name one class identity"
+        );
+
+        let mut trait_impl_owners = crate::TraitImplOwners::new();
+        for function in &program.functions {
+            let (Some(trait_qualified), Some(owner)) =
+                (&function.trait_qualified, &function.self_ty_root)
+            else {
+                continue;
+            };
+            trait_impl_owners
+                .entry(trait_qualified.clone())
+                .or_default()
+                .insert(owner.clone());
+        }
+        let unique_impls = crate::unique_trait_impl_roots(&program, trait_impl_owners);
+        let frame_owner = unique_impls
+            .iter()
+            .find(|(trait_name, _)| trait_name.ends_with("::OpcodeStepExecutor"))
+            .map(|(_, owner)| owner)
+            .expect("OpcodeStepExecutor has one concrete owner");
+        assert!(
+            frame_owner.ends_with("::PyFrame"),
+            "the production unique-impl census must preserve the qualified frame owner: \
+             {frame_owner:?}"
+        );
+        assert_eq!(
+            program.struct_ids.get(frame_owner).copied().flatten(),
+            Some(pyframe_ids[0]),
+            "the retained owner spelling must resolve to the frame's StructId"
+        );
+    }
+
+    /// `range_list_length` stores the PyPy strategy length in an RPython
+    /// Signed cell and converts it to Rust's indexing carrier.  The opaque
+    /// core `TryFrom` shell must be decomposed by the MIR front rather than
+    /// surviving as a residual foreign call that blocks the whole list
+    /// strategy closure.
+    #[test]
+    #[ignore]
+    fn range_list_length_lowers_signed_to_usize_try_from() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real object LLBC");
+        let source = super::lower_function(&llbc, "pyre_object::listobject::range_state_value")
+            .expect("lower listobject::range_state_value");
+        assert!(
+            source
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::ArrayRead {
+                        item_ty: ValueType::Int,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == "[i64]"
+                )),
+            "TypedItemsBlock i64 dereference must be a GcArray(Signed) read"
+        );
+        let graph = super::lower_function(&llbc, "pyre_object::listobject::range_list_length")
+            .expect("lower listobject::range_list_length");
+        let residuals: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments
+                    .iter()
+                    .any(|segment| segment == "ptr_try_from_impls") =>
+                {
+                    Some(segments.join("::"))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            residuals.is_empty(),
+            "signed-to-usize conversion must not leave an opaque core call: {residuals:?}"
+        );
+        let unwrap_residuals = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "unwrap"
+                )
+            })
+            .count();
+        assert_eq!(
+            unwrap_residuals, 0,
+            "checked conversion Result::unwrap must become a discriminant guard"
+        );
+    }
+
+    /// The unwrapped-list storage adapters are Rust spellings of
+    /// RPython's `l.items` GcArray.  A live `push` must therefore end in the
+    /// same `setarrayitem` shape as `rlist.ll_append_noresize`, never in the
+    /// synthetic raw-pointer write that blocks annotation.  The adapter body
+    /// itself must also be free of the opaque Rust `offset_of!` getter; its
+    /// target-layout constant is part of the translated GcArray shape.
+    #[test]
+    #[ignore]
+    fn unwrapped_array_pushes_lower_to_rpython_gcarray_writes() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real object LLBC");
+        // `offset_leaf` is `None` for the two string rows on purpose: their
+        // `base` is `items_block_items_base(self.block)`, a call with no
+        // offset constant in the body, so a "no surviving offset read"
+        // assertion over them would hold whatever the fold did.  Their real
+        // content is the `push` half below.
+        for (base, function, expected_array, expected_item, offset_leaf) in [
+            (
+                "pyre_object::int_array::<Impl>::base",
+                "pyre_object::int_array::<Impl>::push",
+                "[i64]",
+                ValueType::Int,
+                Some("TYPED_ITEMS_BLOCK_ITEMS_OFFSET"),
+            ),
+            (
+                "pyre_object::float_array::<Impl>::base",
+                "pyre_object::float_array::<Impl>::push",
+                "[f64]",
+                ValueType::Float,
+                Some("TYPED_ITEMS_BLOCK_ITEMS_OFFSET"),
+            ),
+            (
+                "pyre_object::bytes_array::<Impl>::base",
+                "pyre_object::bytes_array::<Impl>::push",
+                super::STRING_GCREF_GCARRAY_TYPE_ID,
+                ValueType::Str,
+                None,
+            ),
+            (
+                "pyre_object::unicode_array::<Impl>::base",
+                "pyre_object::unicode_array::<Impl>::push",
+                super::STRING_GCREF_GCARRAY_TYPE_ID,
+                ValueType::Str,
+                None,
+            ),
+        ] {
+            if let Some(offset_leaf) = offset_leaf {
+                let base_graph = super::lower_function(&llbc, base)
+                    .unwrap_or_else(|err| panic!("lower {base}: {err}"));
+                assert!(
+                    !base_graph
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.operations)
+                        .any(|op| matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments.last().is_some_and(|leaf| leaf == offset_leaf)
+                        )),
+                    "{base} must fold the target-layout items offset"
+                );
+            }
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|err| panic!("lower {function}: {err}"));
+            let operations: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .collect();
+            assert!(
+                operations.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::ArrayWrite {
+                        item_ty,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == expected_array && item_ty == &expected_item
+                )),
+                "{function} must write {expected_array}/{expected_item:?} through setarrayitem"
+            );
+            assert!(
+                !operations.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["__deref_write".to_string()]
+                )),
+                "{function} must not retain a raw-pointer write"
+            );
+        }
+
+        for function in [
+            "pyre_object::bytes_array::<Impl>::as_slice",
+            "pyre_object::unicode_array::<Impl>::as_slice",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|err| panic!("lower {function}: {err}"));
+            assert!(
+                !graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.last().is_some_and(|leaf| leaf == "from_raw_parts")
+                    )),
+                "{function} must be the direct RPython list-items view"
+            );
+        }
+
+        for function in [
+            "pyre_object::bytes_array::<Impl>::pop",
+            "pyre_object::unicode_array::<Impl>::pop",
+            "pyre_object::bytes_array::<Impl>::remove",
+            "pyre_object::unicode_array::<Impl>::remove",
+        ] {
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|err| panic!("lower {function}: {err}"));
+            let operations: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .collect();
+            assert!(
+                operations.iter().any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::ArrayRead {
+                        item_ty: ValueType::Str,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID
+                )),
+                "{function} must read its external string through GcArray(GCREF)"
+            );
+            assert!(
+                operations.iter().any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::ArrayWrite {
+                        item_ty: ValueType::Str,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == super::STRING_GCREF_GCARRAY_TYPE_ID
+                )),
+                "{function} must clear the released slot through the same GcArray(GCREF)"
+            );
+            assert!(
+                !operations.iter().any(|operation| matches!(
+                    &operation.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().is_some_and(|leaf| {
+                        leaf == "from_raw_parts" || leaf == "__deref_write"
+                    })
+                )),
+                "{function} must not retain a Rust raw-slice/read-write boundary"
+            );
+            if function.ends_with("::remove") {
+                assert!(
+                    operations.iter().any(|operation| matches!(
+                        &operation.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &[crate::runtime_names::shims::LL_ARRAYMOVE.to_string()]
+                    )),
+                    "{function} must restore ptr::copy to RPython rgc.ll_arraymove"
+                );
+                assert!(
+                    !operations.iter().any(|operation| matches!(
+                        &operation.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.as_slice() == ["core", "ptr", "copy"]
+                            || segments.as_slice() == ["core", "ptr", "mut_ptr", "<Impl>", "add"]
+                    )),
+                    "{function} must not retain Rust pointer-copy arithmetic"
+                );
+            }
+        }
+    }
+
     #[test]
     fn niche_option_raw_scalar_ptr_remains_aggregate() {
         let payload = serde_json::json!({
@@ -27984,9 +32088,13 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| b.operations.iter())
-            .filter(
-                |op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0"),
-            )
+            .filter(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. }
+                if field.name == "__pos_0"
+                    && field.owner_root.as_deref().is_some_and(|owner| {
+                        owner.contains("Option") && owner.ends_with("::Some")
+                    }))
+            })
             .count();
         assert_eq!(
             pos0_reads, 0,
@@ -27994,20 +32102,19 @@ mod tests {
         );
     }
 
-    /// `W_ListObject::object_items_slice` builds its slice with
-    /// `from_raw_parts(base, self.length)` (the LOGICAL list length, `<`
-    /// capacity for an over-allocated block), so it must NOT fold to the
-    /// items-block header (whose gcarray descr reports capacity). The residual
-    /// `from_raw_parts` call must survive. Loads the pyre-object LLBC (the
-    /// accessor lives in `pyre_object::listobject`), so ignored by default.
+    /// RPython `ll_getitem_fast` indexes a list's items array after checking
+    /// the list's logical length. The pyre object-list path must keep that
+    /// direct shape instead of manufacturing a Rust fat slice with
+    /// `from_raw_parts(base, self.length)`: such a slice is neither an RPython
+    /// source operation nor representable by the one-word GC-array model.
+    /// Loads the pyre-object LLBC, so ignored by default.
     #[test]
     #[ignore]
-    fn object_items_slice_keeps_residual_from_raw_parts_not_header_alias() {
+    fn object_list_getitem_keeps_logical_length_without_a_raw_slice() {
         use crate::model::{CallTarget, OpKind};
         let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
-        let graph =
-            super::lower_function(&llbc, "object_items_slice").expect("lower object_items_slice");
+        let graph = super::lower_function(&llbc, "w_list_getitem").expect("lower w_list_getitem");
         let from_raw_parts_calls = graph
             .blocks
             .iter()
@@ -28020,10 +32127,120 @@ mod tests {
                 )
             })
             .count();
+        assert_eq!(
+            from_raw_parts_calls, 0,
+            "object-list getitem must read logical length and items directly, \
+             like rlist.ll_getitem_fast"
+        );
+    }
+
+    /// PyPy `float_repr` reaches `rfloat.formatd`, whose translated return is
+    /// one low-level string pointer. The real interpreter LLBC must therefore
+    /// retarget RustPython's three-word `String` formatter to the one-word
+    /// `BytesBlock*` residual wrapper.
+    #[test]
+    #[ignore]
+    fn float_repr_uses_the_rpython_string_residual_abi() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let graph =
+            super::lower_function(&llbc, "format_float_repr").expect("lower format_float_repr");
+        let paths: Vec<Vec<String>> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(paths.iter().any(|segments| {
+            segments
+                == &[
+                    "pyre_interpreter".to_string(),
+                    "display".to_string(),
+                    "jit_format_float_repr_rstr".to_string(),
+                ]
+        }));
+        assert!(!paths.iter().any(|segments| {
+            segments
+                == &[
+                    "rustpython_literal".to_string(),
+                    "float".to_string(),
+                    "to_string".to_string(),
+                ]
+        }));
+    }
+
+    /// PyPy's complex repr keeps its positive-zero/sign branch in
+    /// `W_ComplexObject.descr_repr` and calls `repr_format` for each component.
+    /// The interpreter graph must retain that shape rather than collapsing the
+    /// whole operation into RustPython's foreign complex formatter.
+    #[test]
+    #[ignore]
+    fn complex_repr_keeps_the_pypy_builder_and_float_formatter_calls() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let graph =
+            super::lower_function(&llbc, "complex_repr_string").expect("lower complex repr");
+        let paths: Vec<Vec<String>> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(paths.iter().any(|segments| {
+            segments
+                == &[
+                    "pyre_interpreter".to_string(),
+                    "typedef".to_string(),
+                    "jit_format_complex_component_repr_rstr".to_string(),
+                ]
+        }));
+        assert!(!paths.iter().any(|segments| {
+            segments
+                == &[
+                    "rustpython_literal".to_string(),
+                    "complex".to_string(),
+                    "to_string".to_string(),
+                ]
+        }));
+        assert!(!paths.iter().any(|segments| {
+            segments
+                == &[
+                    "core".to_string(),
+                    "f64".to_string(),
+                    "<Impl>".to_string(),
+                    "is_sign_positive".to_string(),
+                ]
+        }));
+        assert!(paths.iter().any(|segments| {
+            segments == &["longlong2float".to_string(), "float2longlong".to_string()]
+        }));
         assert!(
-            from_raw_parts_calls >= 1,
-            "object_items_slice must keep its residual from_raw_parts (logical \
-             length != capacity), not alias to the items-block header"
+            !paths.iter().any(|segments| {
+                segments
+                    .last()
+                    .is_some_and(|leaf| leaf == "push" || leaf == "push_str")
+            }),
+            "complex repr String appends must use the RPython builder lift: {paths:#?}"
         );
     }
 
@@ -28056,6 +32273,113 @@ mod tests {
             from_raw_parts_calls, 0,
             "rbigint digits (capacity-length view) must still fold to the \
              items-block header, leaving no residual from_raw_parts"
+        );
+    }
+
+    /// `bytes_block_chars` exposes the variable-sized `chars` array whose
+    /// length is the same `BytesBlock.length` consumed by the gcarray descr.
+    /// It is therefore the bytes-string twin of RPython `STR.chars`: the
+    /// `from_raw_parts(chars, length)` view must fold to the managed block
+    /// instead of surviving as an opaque Rust call. Loads the real
+    /// pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn bytes_block_chars_folds_header_length_view() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph =
+            super::lower_function(&llbc, "bytes_block_chars").expect("lower bytes_block_chars");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str) == Some("from_raw_parts")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            residual.is_empty(),
+            "bytes_block_chars must lower to the managed bytes-block array; \
+             residual calls: {residual:#?}; graph: {graph:#?}"
+        );
+        let dead_storage_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.owner_root.as_deref() == Some("BytesBlock")
+                            && matches!(field.name.as_str(), "chars" | "length")
+                )
+            })
+            .count();
+        assert_eq!(
+            dead_storage_reads, 0,
+            "the owner alias must let the ordinary dead-op pass remove the \
+             interior chars/length shell; graph: {graph:#?}"
+        );
+    }
+
+    /// The Rust interpreter reloads a possibly-moved pointer explicitly;
+    /// RPython's translated graph instead gets the updated GCREF from
+    /// `gc_restore_root`.  The source adapter must therefore lower to an
+    /// identity graph and must not leak the `majit_gc` query into annotation.
+    /// Loads the real pyre-object LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn gc_current_object_address_adapter_folds_to_identity() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "try_gc_current_object_address")
+            .expect("lower try_gc_current_object_address");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments.last().map(String::as_str)
+                            == Some("gc_current_object_address")
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            residual.is_empty(),
+            "the RPython-shaped graph reloads its GCREF from the root map; \
+             residual forwarding queries: {residual:#?}; graph: {graph:#?}"
+        );
+
+        let input = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .expect("adapter input");
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first())
+            .expect("adapter return link");
+        assert!(
+            matches!(returned, LinkArg::Value(value) if value == input),
+            "the adapter must return its input GCREF unchanged; graph: {graph:#?}"
         );
     }
 
@@ -28192,12 +32516,12 @@ mod tests {
     /// to Charon and blocks the dispatcher from two-phase translation.
     #[test]
     #[ignore]
-    fn call_function_impl_result_has_no_residual_array_index() {
+    fn get_and_call_function_has_no_residual_array_index() {
         use crate::model::OpKind;
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "call_function_impl_result")
-            .expect("lower call_function_impl_result");
+        let graph = super::lower_function(&llbc, "get_and_call_function")
+            .expect("lower get_and_call_function");
         let calls_path = |want: &[&str]| -> usize {
             let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
             graph
@@ -28227,16 +32551,729 @@ mod tests {
         );
     }
 
-    /// PyPy's `_match_keywords` indexes its small signature and argument
-    /// lists with ordinary `getitem`.  The Rust `SliceIndex<usize>` shim must
-    /// lower to the same ArrayRead shape instead of remaining an opaque core
-    /// call that prevents the whole builtin-call chain from being annotated.
+    /// The generator throw producer validates its preserved positional count
+    /// as 1..=3.  Delegation must keep those fixed call shapes visible rather
+    /// than routing them through `<[T; 3]>::index(&args, ..argc)`.
     #[test]
     #[ignore]
-    fn bind_kwargs_scalar_slice_indexes_lower_to_array_reads() {
+    fn throw_yield_from_has_no_residual_array_index() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "throw_yield_from").expect("lower throw_yield_from");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["core", "array", "<Impl>", "index"]
+                )
+            })
+            .count();
+        assert_eq!(
+            residual, 0,
+            "fixed throw arities must not leave an array index"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn clear_references_niche_bool_then_has_no_option_aggregate() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "clear_references").expect("lower clear_references");
+        let option_aggregate_ops = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } => name == "Option<*mut PyObject>",
+                OpKind::FieldWrite { field, .. } => {
+                    field.name == "__discriminant"
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.contains("Option<*mut PyObject>"))
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            option_aggregate_ops, 0,
+            "bool::then producing Option<PyObjectRef> must use RPython's nullable-pointer \
+             representation (Some(ptr)=ptr, None=null), not an Option aggregate"
+        );
+        let is_instance_narrow = |op: &crate::model::SpaceOperation| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["__cast_instance_intrinsic", "PyObject"]
+            )
+        };
+        let join = graph.blocks.iter().find_map(|block| {
+            let has_call_once = block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "call_once"
+                )
+            });
+            (has_call_once && block.operations.iter().any(is_instance_narrow))
+                .then(|| block.exits.first().map(|link| link.target))
+                .flatten()
+        });
+        assert!(
+            join.is_some(),
+            "the niche Some payload must retain PyObject/W_Root class identity across call_once"
+        );
+        let narrowed_none = graph.blocks.iter().any(|block| {
+            block.exits.first().map(|link| link.target) == join
+                && block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &["core", "ptr", "null_mut"]
+                    )
+                })
+                && block.operations.iter().any(is_instance_narrow)
+        });
+        assert!(
+            narrowed_none,
+            "the niche None arm must be the same nullable PyObject/W_Root repr as the Some arm"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn struct_ptr_write_lowers_to_per_field_initialization() {
+        use crate::model::{CallTarget, OpKind};
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/llbc/");
+        let llbcs = [
+            Llbc::load(format!("{root}pyre-object.ullbc")).expect("load pyre-object LLBC"),
+            Llbc::load(format!("{root}pyre-interpreter.ullbc"))
+                .expect("load pyre-interpreter LLBC"),
+            Llbc::load(format!("{root}pyre-jit.ullbc")).expect("load pyre-jit LLBC"),
+        ];
+        let names = ["w_cell_new", "w_long_from_raw", "w_str_from_wtf8_managed"];
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                &llbcs,
+                crate::HostStaticAddrs::default(),
+                &[],
+                &names,
+            )
+            .expect("build production-shaped semantic program");
+        for (name, owner, expected_fields) in [
+            ("w_cell_new", "Cell", &["ob", "contents", "family"][..]),
+            (
+                "w_long_from_raw",
+                "W_LongObject",
+                &["ob_header", "value"][..],
+            ),
+            (
+                "w_str_from_wtf8_managed",
+                "W_UnicodeObject",
+                &[
+                    "ob_header",
+                    "value",
+                    "byte_len",
+                    "len",
+                    "w_slots",
+                    "index_storage",
+                    "hash",
+                ][..],
+            ),
+        ] {
+            let graph = &program
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing semantic function {name}"))
+                .graph;
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &["core", "ptr", "write"])
+                }),
+                "{name}: generic core::ptr::write must not survive as a shared callee"
+            );
+            let destination = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find_map(|op| match (&op.result, &op.kind) {
+                    (
+                        Some(result),
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        },
+                    ) if segments == &["__cast_instance_intrinsic", owner] => Some(result),
+                    _ => None,
+                })
+                .expect("typed raw allocation destination");
+            let fields: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldWrite { base, field, .. } if base == destination => {
+                        Some(field.name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(fields, expected_fields, "{name}: source field order");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn atomic_from_ptr_lowers_to_an_identity_view() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "hash_slot").expect("lower hash_slot");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().map(String::as_str) == Some("from_ptr"))
+            }),
+            "AtomicI64::from_ptr must not survive as a graph-less core call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "hash")
+            }),
+            "the identity view must retain its underlying unicode hash-field read"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn unicode_hash_atomic_store_is_the_exact_residual_choke_point() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let residuals = super::dont_look_inside_set_of(&llbc);
+        assert!(
+            residuals.contains("unicodeobject::w_str_set_hash"),
+            "the foreign AtomicI64::store must stay behind its pyre-owned wrapper"
+        );
+        assert!(
+            !residuals.contains("unicodeobject::w_str_get_hash"),
+            "the ordinary scalar memo read remains visible to the generated JIT"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn deque_compare_scalar_slice_get_lowers_to_a_guarded_item_read() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "deque_compare").expect("lower deque_compare");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["core".to_string(), "slice".to_string(), "<Impl>".to_string(), "get".to_string()])
+            }),
+            "scalar slice get must not survive as an opaque core call"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "the successful get arm must read the guarded element"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor {
+                            name,
+                            owner_path,
+                            ..
+                        },
+                        ..
+                    } if (name == "Some" || name == "None")
+                        && owner_path.iter().any(|part| part.contains("Option<*mut PyObject>"))
+                ) || matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. }
+                        if field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.starts_with("core::option::Option<"))
+                )
+            }),
+            "Option<&PyObjectRef> must stay a nullable PyObject pointer, not an Option aggregate"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["core", "ptr", "null_mut"]
+                )
+            }),
+            "the out-of-bounds arm must materialize the nullable pointer's null"
+        );
+    }
+
+    /// Slice `get` is not object-pointer-specific, and a literal index has no
+    /// Place type.  This production helper exercises both the generalized
+    /// Option payload recognizer and its generic-type fallback for `get(1)`.
+    #[test]
+    #[ignore]
+    fn slice_get_constant_index_lowers_to_a_guarded_item_read() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let name = "pyre_interpreter::module::unicodedata::char_and_default";
+        let graph = super::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["core", "slice", "<Impl>", "get"])
+            }),
+            "{name}: scalar slice get must not survive as an opaque core call"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "{name}: successful get arm must read the guarded item"
+        );
+    }
+
+    /// `args.get(1..).unwrap_or(&[])` is Rust's checked spelling of PyPy's
+    /// ordinary `args[1:]`.  Keep `get`'s Option semantics in a `start <= len`
+    /// diamond and materialize the successful payload as the deferred
+    /// `getslice(start, None)` marker.
+    #[test]
+    #[ignore]
+    fn slice_get_rangefrom_lowers_to_a_guarded_getslice() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let name = "pyre_interpreter::module::unicodedata::ucd_method_args";
+        let graph = super::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("lower {name}: {err:?}"));
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["core", "slice", "<Impl>", "get"])
+            }),
+            "{name}: RangeFrom slice get must not survive as an opaque core call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["__getslice_rangefrom"])
+            }),
+            "{name}: successful get arm must carry the deferred getslice"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "le")),
+            "{name}: RangeFrom get must guard start <= len"
+        );
+    }
+
+    /// `bytearrayobject.py:286-290` appends three values for a non-printable
+    /// byte — `'\\x'` and the two nibble characters.  The expansion consumed
+    /// the template's `\x` piece as a match condition only, so a JIT-compiled
+    /// repr rendered `bytearray(b'ff')` where CPython renders
+    /// `bytearray(b'\xff')`.  Assert the literal is emitted and folded first.
+    #[test]
+    fn lower_hex_byte_02_expansion_emits_the_backslash_x_literal() {
+        use crate::model::{CallTarget, ConcreteType, FunctionGraph, OpKind};
+        let mut graph = FunctionGraph::new("t");
+        let value = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let pieces = vec!["\\x".to_string(), String::new()];
+        let ops = super::emit_lower_hex_byte_02_ops(&mut graph, &pieces, &value, result.clone());
+
+        let literal = ops
+            .iter()
+            .find(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().is_some_and(|s| s == "__str_const")
+                        && segments.get(1).is_some_and(|s| s == "\\x"))
+            })
+            .expect("the template's leading `\\x` must be emitted, not only matched");
+        let literal = literal.result.clone().expect("__str_const has a result");
+
+        // `'\\x'` is upstream's FIRST buf.append, so it must be the left
+        // operand of the first concat.
+        let first_add = ops
+            .iter()
+            .find(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
+            .expect("the parts fold through add");
+        let OpKind::BinOp { lhs, .. } = &first_add.kind else {
+            unreachable!("matched an add above")
+        };
+        assert_eq!(lhs.id(), literal.id(), "`\\x` must be concatenated first");
+
+        assert_eq!(
+            ops.last().and_then(|op| op.result.clone()).map(|v| v.id()),
+            Some(result.id()),
+            "the final op must reuse the displaced format result var"
+        );
+    }
+
+    /// RPython `AbstractStringBuilderRepr.rtype_method_append` accepts both a
+    /// whole string and `SomeChar`.  `bytearray_repr_string` mixes
+    /// `String::push_str` and `String::push(char)` in one loop, so omitting the
+    /// char arm prevents the whole fresh accumulator from lifting.
+    #[test]
+    #[ignore]
+    fn bytearray_repr_mixed_string_appends_lift_to_rpython_builder() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "bytearray_repr_string")
+            .expect("lower bytearray_repr_string");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|leaf| leaf == "push" || leaf == "push_str"))
+            }),
+            "String::push/push_str must not survive the RPython builder lift"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.iter().any(|segment| segment == "fmt")
+                        || segments.last().is_some_and(|leaf| leaf == "new_lower_hex"))
+            }),
+            "Rust fmt shell must collapse to PyPy's two-nibble lookup"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.first().is_some_and(|s| s == "__str_const")
+                        && segments.get(1).is_some_and(|s| s == "\\x"))
+            }),
+            "the collapse must keep upstream's `buf.append('\\\\x')` \
+             (bytearrayobject.py:288), not drop it with the fmt shell"
+        );
+        for opname in ["rshift", "and"] {
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|op| { matches!(&op.kind, OpKind::BinOp { op, .. } if op == opname) }),
+                "missing PyPy byte-hex operation {opname}"
+            );
+        }
+        for marker in [
+            "__majit_stringbuilder_new",
+            "__majit_stringbuilder_append",
+            "__majit_stringbuilder_build",
+        ] {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &[marker])
+                }),
+                "missing builder marker {marker}"
+            );
+        }
+        for block in &graph.blocks {
+            let mut defined: std::collections::HashSet<u64> =
+                block.inputargs.iter().map(|var| var.id()).collect();
+            for op in &block.operations {
+                for operand in crate::inline::op_variable_refs(&op.kind) {
+                    assert!(
+                        defined.contains(&operand.id()),
+                        "block {:?} uses undefined operand {:?} in {:?}",
+                        block.id,
+                        operand,
+                        op.kind
+                    );
+                }
+                if let Some(result) = &op.result {
+                    defined.insert(result.id());
+                }
+            }
+        }
+    }
+
+    /// PyPy's `bytesobject.py::string_escape_encode` is an ordinary
+    /// StringBuilder loop.  The interpreter now carries that loop directly,
+    /// so the frozen production LLBC must lower without the former external
+    /// `rustpython_literal::escape::AsciiEscape` iterator.
+    #[test]
+    #[ignore]
+    fn bytes_repr_lifts_without_external_ascii_escape() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "bytes_repr_string").expect("lower bytes_repr_string");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.iter().any(|segment| segment == "AsciiEscape"))
+            }),
+            "external AsciiEscape must not survive the PyPy loop port"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|segment| segment == "HEX"))
+            }),
+            "the borrowed HEX table must be a prebuilt constant, not an accessor call"
+        );
+        for marker in [
+            "__majit_stringbuilder_new",
+            "__majit_stringbuilder_append",
+            "__majit_stringbuilder_build",
+        ] {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &[marker])
+                }),
+                "missing builder marker {marker}"
+            );
+        }
+    }
+
+    /// PyPy's `unicodeobject.py::_repr_function` is the ordinary
+    /// `rutf8.make_utf8_escape_function(pass_printable=True, quotes=True)`
+    /// StringBuilder loop.  The production graph must retain that loop and
+    /// its prebuilt lowercase-hex table without the former RustPython escape
+    /// iterator or a named-const accessor.
+    #[test]
+    #[ignore]
+    fn unicode_repr_lifts_without_external_unicode_escape() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "format_wtf8_repr").expect("lower format_wtf8_repr");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.iter().any(|segment| segment == "UnicodeEscape"))
+            }),
+            "external UnicodeEscape must not survive the PyPy loop port"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.last().is_some_and(|segment| segment == "HEX"))
+            }),
+            "the borrowed HEX table must be a prebuilt constant, not an accessor call"
+        );
+        for marker in [
+            "__majit_stringbuilder_new",
+            "__majit_stringbuilder_append",
+            "__majit_stringbuilder_build",
+        ] {
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &[marker])
+                }),
+                "missing builder marker {marker}"
+            );
+        }
+    }
+
+    /// `Wtf8::as_str` is fallible for a lone surrogate.  PyPy keeps the
+    /// unicode value plus the runtime validity branch; the lifted graph must
+    /// therefore contain the scalar validity residual and a tagged Result,
+    /// not a residual Rust `Result<&str, Utf8Error>` call or an unconditional
+    /// string identity.
+    #[test]
+    #[ignore]
+    fn wtf8_as_str_lowers_to_runtime_tagged_string_result() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "wtf8_display_string").expect("lower wtf8_display_string");
+
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["Wtf8", "as_str"])
+            }),
+            "the foreign Rust Result must not cross the translated graph: {graph:#?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, result_ty: ValueType::Bool, .. }
+                    if segments.last().map(String::as_str) == Some("wtf8_key_is_utf8"))
+            }),
+            "the lone-surrogate decision must remain a runtime scalar: {graph:#?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::FieldWrite { field, ty: ValueType::Str, .. }
+                    if field.name == "__pos_0" && field.owner_root.as_deref().is_some_and(|owner| owner.ends_with("::Ok")))
+            }),
+            "the Result Ok payload must keep the lifted string repr: {graph:#?}"
+        );
+    }
+
+    /// Every local UTF-8 accumulator in PyPy's repr helpers is a
+    /// `StringBuilder`; the large `py_repr_wtf8` dispatcher must therefore
+    /// eliminate the Rust `Wtf8Buf` mutation shell as well as the smaller
+    /// leaf helpers do.
+    #[test]
+    #[ignore]
+    fn py_repr_wtf8_lifts_owned_wtf8buf_appends() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
+        let residual: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| {
+                block.operations.iter().filter_map(move |op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &["Wtf8Buf", "push_wtf8"])
+                    .then_some((block.id, op))
+                })
+            })
+            .collect();
+        assert!(
+            residual.is_empty(),
+            "owned Wtf8Buf appends must lift to StringBuilder operations: {residual:#?}"
+        );
+        let residual_vec_indexes: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
+                )
+            })
+            .collect();
+        assert!(
+            residual_vec_indexes.is_empty(),
+            "repr string lists must iterate without a fat-pointer Vec::index: \
+             {residual_vec_indexes:#?}"
+        );
+        for block in &graph.blocks {
+            let mut defined: std::collections::HashSet<u64> =
+                block.inputargs.iter().map(|var| var.id()).collect();
+            for op in &block.operations {
+                for operand in crate::inline::op_variable_refs(&op.kind) {
+                    assert!(
+                        defined.contains(&operand.id()),
+                        "block {:?} uses undefined operand {:?} in {:?}",
+                        block.id,
+                        operand,
+                        op.kind
+                    );
+                }
+                if let Some(result) = &op.result {
+                    defined.insert(result.id());
+                }
+            }
+        }
+    }
+
+    /// PyPy's `_match_keywords` indexes its small argument lists with ordinary
+    /// `getitem`, while `Signature.find_argname` is `@jit.elidable`.  Pyre must
+    /// preserve both boundaries: the signature's host `Vec<&str>` stays behind
+    /// the pure residual call, and `keyword_names_w` / `keywords_w` remain
+    /// parallel one-word GC-pointer lists (represented by shadow-stack slot
+    /// indices in the hand-written root scaffold).  No fat-pointer
+    /// `Vec<Wtf8Buf>::index` may escape into the translated binder graph.
+    #[test]
+    #[ignore]
+    fn bind_kwargs_indexes_lower_to_array_reads() {
         use crate::model::{CallTarget, OpKind};
         let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
         let llbc = Llbc::load(path).expect("load real LLBC");
+        let hints = crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+        assert!(
+            hints
+                .get("gateway::<Impl>::find_argname")
+                .is_some_and(|values| values.iter().any(|hint| hint == "elidable")),
+            "Signature.find_argname must retain PyPy's @jit.elidable marker"
+        );
         let graph = super::lower_function(&llbc, "bind_kwargs_to_signature")
             .expect("lower bind_kwargs_to_signature");
 
@@ -28264,6 +33301,27 @@ mod tests {
             residual_scalar_indexes.len(),
             0,
             "scalar SliceIndex<usize> calls must become getitem operations"
+        );
+        let residual_vec_indexes: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
+                )
+            })
+            .collect();
+        assert_eq!(
+            residual_vec_indexes.len(),
+            0,
+            "keyword_names_w/keywords_w must lower through their one-word \
+             rooted-list representation; a residual Vec::index blocks the \
+             whole builtin-call chain: {residual_vec_indexes:#?}"
         );
         assert!(
             graph
@@ -28322,6 +33380,324 @@ mod tests {
         );
     }
 
+    /// Real-LLBC anchors for three roots that spell one PyPy operation —
+    /// an ordinary list read — over three different host containers.
+    ///
+    /// `combine_starargs_wrapped` lowers because its elements are object
+    /// pointers, one target word each. `dict_repr` must first flatten its
+    /// host-width key/value pairs into the same one-word rooted-list shape.
+    /// `bind_builtin_kwargs` remains the counter-example: being the same PyPy
+    /// shape is not what makes a read addressable, the element width is.
+    #[test]
+    #[ignore]
+    fn pypy_list_item_roots_have_no_residual_vec_index() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let residual_vec_indexes = |fname: &str| {
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if super::fmt_path_ends_with(segments, &["vec", "Vec", "index"])
+                    )
+                })
+                .count()
+        };
+        assert_eq!(
+            residual_vec_indexes("combine_starargs_wrapped"),
+            0,
+            "argument-list concatenation indexes object pointers, one target \
+             word each, so its getitems must not remain Vec::index"
+        );
+        assert_eq!(
+            residual_vec_indexes("load_const_value"),
+            0,
+            "slice-constant handler values must cross the scalar SliceIndex boundary"
+        );
+        assert_eq!(
+            residual_vec_indexes("dict_repr"),
+            0,
+            "dict_repr must flatten host-width pairs before translated reads"
+        );
+        // `bind_builtin_kwargs` indexes `names: &[&str]`. PyPy's
+        // `Signature.argnames` is a list of `Ptr(STR)`, but `&str` is a
+        // two-word fat pointer here, so a one-word getarrayitem would land
+        // mid-element from the second name on. Lowering it requires a managed
+        // string list, not a wider element gate.
+        assert!(
+            residual_vec_indexes("bind_builtin_kwargs") > 0,
+            "a wider-than-one-word host element must keep its residual Vec::index"
+        );
+    }
+
+    /// `exception_descr_str_wtf8` indexes the Python unicode carrier through
+    /// `Wtf8::index(RangeFrom)`. The frontend already models Wtf8 as
+    /// RPython's string repr, so this is its ordinary `getslice(start, None)`
+    /// and the Rust trait shim must be gone before annotation.
+    #[test]
+    #[ignore]
+    fn wtf8_rangefrom_lowers_to_getslice_marker() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "exception_descr_str_wtf8")
+            .expect("lower exception_descr_str_wtf8");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["Wtf8".to_string(), "index".to_string()])
+            }),
+            "Wtf8 RangeFrom index must not survive as an opaque foreign call"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments == &["__getslice_rangefrom".to_string()])
+            }),
+            "runtime RangeFrom should use the post-annotation getslice marker"
+        );
+    }
+
+    /// PyPy `typeobject._check_surrogate` delegates to the elidable
+    /// `rutf8.check_utf8`; it does not build a unicode iterator in the caller.
+    /// Keep that exact boundary visible in the real extracted graph.
+    #[test]
+    #[ignore]
+    fn check_surrogate_calls_rutf8_without_wtf8_iterator_next() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "check_surrogate").expect("lower check_surrogate");
+        let call_paths: Vec<&[String]> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            call_paths.iter().any(|segments| {
+                segments.ends_with(&["rutf8".to_string(), "check_utf8".to_string()])
+            }),
+            "PyPy's rutf8.check_utf8 boundary must remain in the caller"
+        );
+        assert!(
+            !call_paths
+                .iter()
+                .any(|segments| matches!(*segments, [owner, method]
+                    if owner == "Wtf8CodePoints" && (method == "next" || method == "nth"))),
+            "the local Wtf8 iterator reimplementation must not return: {call_paths:#?}"
+        );
+    }
+
+    /// RPython `rutf8.codepoint_at_pos` reads each encoded byte as
+    /// `ord(code[pos])`. The Rust byte view must retain that exact string
+    /// getitem + ord shape and never fall back to the crate iterator.
+    #[test]
+    #[ignore]
+    fn rutf8_codepoint_at_pos_lowers_byte_reads_to_ord() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "codepoint_at_pos").expect("lower rutf8.codepoint_at_pos");
+        let paths: Vec<&[String]> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } => Some(segments.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths
+                .iter()
+                .any(|segments| *segments == ["__string_byte_getitem"]),
+            "byte reads must reach the adapter's getitem + ord marker: {paths:#?}"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|segments| *segments == ["Wtf8CodePoints", "next"]),
+            "RPython's direct decoder must not be replaced by Wtf8 iteration"
+        );
+    }
+
+    /// The exception carrier's cached object is PyPy's `W_Root` field. Its
+    /// registry spelling must retain `PyObjectRef`; erasing it to a generic
+    /// reference makes `InstanceRepr._setup_repr` choose the root object
+    /// pointer while field reads expect the concrete PyObject repr.
+    #[test]
+    #[ignore]
+    fn pyerror_exc_object_registry_retains_instance_ref() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(&llbc);
+        let (owner, ty) = fields
+            .fields
+            .iter()
+            .filter(|(owner, _)| owner.ends_with("PyError"))
+            .find_map(|(owner, rows)| {
+                rows.iter()
+                    .find(|(name, _)| name == "exc_object")
+                    .map(|(_, ty)| (owner.as_str(), ty.as_str()))
+            })
+            .map(|(owner, ty)| (owner.to_string(), ty.to_string()))
+            .expect("PyError.exc_object registry row");
+        assert!(
+            ty == "PyObjectRef"
+                || ty.ends_with("::PyObjectRef")
+                || ty.ends_with("pyobject::PyObject")
+                || ty == "*mut PyObject",
+            "{owner}.exc_object must retain its concrete object-pointer spelling, got {ty}"
+        );
+        let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        bk.set_struct_fields(std::rc::Rc::new(fields));
+        let crate::annotator::model::SomeValue::Instance(projected) =
+            bk.project_struct_field_type(&ty)
+        else {
+            panic!("{owner}.exc_object field must project to an instance annotation")
+        };
+        assert!(
+            projected.classdef.is_some(),
+            "{owner}.exc_object field must project to the concrete PyObject class"
+        );
+    }
+
+    /// `PyError::new` initializes three `PyObjectRef` fields with
+    /// `null_mut()`. These are typed nullable W_Root slots, not erased root
+    /// references; each aggregate write must consume a PyObject-narrowed
+    /// value so `InstanceRepr._setup_repr` and later reads agree.
+    #[test]
+    #[ignore]
+    fn pyerror_new_narrows_null_object_fields() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::error::<Impl>::new")
+            .expect("lower PyError::new");
+        for field_name in ["exc_object", "w_name_context", "w_obj_context"] {
+            let value = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find_map(|op| match &op.kind {
+                    OpKind::FieldWrite { field, value, .. } if field.name == field_name => {
+                        match value {
+                            LinkArg::Value(value) => Some(value.clone()),
+                            LinkArg::Const(_) => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("PyError::{field_name} aggregate write"));
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    op.result.as_ref() == Some(&value)
+                        && matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if segments == &["__cast_instance_intrinsic", "PyObject"]
+                        )
+                }),
+                "PyError::{field_name} null must retain the declared PyObject class"
+            );
+        }
+    }
+
+    /// The same declared-slot rule applies after construction.  PyPy's
+    /// `OperationError` object attributes never lose their W_Root class when
+    /// assigned in a method, so an ordinary MIR projection write must carry
+    /// the same narrowing as a struct-literal initializer.
+    #[test]
+    #[ignore]
+    fn pyerror_projection_writes_retain_instance_class() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(
+            &llbc,
+            "pyre_interpreter::error::<Impl>::enrich_attribute_error",
+        )
+        .expect("lower PyError::enrich_attribute_error");
+        let mut writes = 0;
+        for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+            let OpKind::FieldWrite { field, value, .. } = &op.kind else {
+                continue;
+            };
+            if !matches!(field.name.as_str(), "w_name_context" | "w_obj_context") {
+                continue;
+            }
+            writes += 1;
+            let LinkArg::Value(value) = value else {
+                panic!(
+                    "PyError::{} write must use a materialized object value",
+                    field.name
+                )
+            };
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.operations)
+                    .any(|producer| {
+                        producer.result.as_ref() == Some(value)
+                            && matches!(
+                                &producer.kind,
+                                OpKind::Call {
+                                    target: CallTarget::FunctionPath { segments },
+                                    ..
+                                } if segments == &["__cast_instance_intrinsic", "PyObject"]
+                            )
+                    }),
+                "PyError::{} projection write must retain the declared PyObject class",
+                field.name
+            );
+        }
+        assert!(writes >= 2, "expected both PyError context-field writes");
+    }
+
     /// `split_builtin_kwargs` returns `&args[..args.len() - 1]` after proving
     /// the slice non-empty. MIR carries both the stop and receiver through
     /// block-link aliases, so the RangeTo proof must resolve those aliases
@@ -28363,6 +33739,467 @@ mod tests {
             calls_path(&["__getslice_minusone"]),
             1,
             "the marker strip must use the len-minus-one slice helper"
+        );
+    }
+
+    /// PyPy's rStringIO and buffered I/O implementations use ordinary
+    /// `buffer[start:end]` list slices. The Rust port spells those as a
+    /// `SliceIndex<Range<usize>>` call, which must recover RPython's direct
+    /// `getslice` operation without adding a non-upstream dominator proof.
+    #[test]
+    #[ignore]
+    fn pypy_buffer_ranges_lower_to_getslice() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for fname in ["read_bytes", "parse_length_prefixed_protocols"] {
+            let graph = super::lower_function(&llbc, fname)
+                .unwrap_or_else(|err| panic!("lower {fname}: {err}"));
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if super::fmt_path_ends_with(segments, &["core", "slice", "index", "<Impl>", "index"]))
+                }),
+                "{fname}: PyPy list slice must not remain an opaque Rust index"
+            );
+            assert!(
+                graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                        if segments == &["__getslice_range".to_string()])
+                }),
+                "{fname}: Range slice must use the RPython getslice marker"
+            );
+        }
+    }
+
+    /// `forwarded_exporter` uses
+    /// `W_PickleBuffer::from_obj(obj).map(|pb| -> Result<_, PyError> { ... })`.
+    /// The closure graph follows the uniform Result exception ABI, while
+    /// `Option::map` must retain that Result as data inside `Some`; anchor the
+    /// late synthesized call to the ordinary catch-and-rewrap caller rule.
+    #[test]
+    #[ignore]
+    fn forwarded_exporter_map_rewraps_scoped_result() {
+        use crate::model::{CallTarget, ExitSwitch, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        // `lower_function`'s default host table names NO error carrier, and
+        // the carrier is what `tyref_is_result_of_carrier` compares `E`
+        // against — with the default the closure's `Result<*mut PyObject,
+        // PyError>` is not a scoped result, `call_once_result_exc` stays
+        // `None`, and the rewrap this test grades can never be reached.
+        // Pass the same spec `pyre-jit-trace`'s prepass installs.
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "forwarded_exporter",
+            crate::HostStaticAddrs {
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_wrappers: &[],
+                    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                    from_exc_object: Some(("PyError", "from_exc_object")),
+                },
+                ..crate::HostStaticAddrs::default()
+            },
+        )
+        .expect("lower forwarded_exporter");
+
+        let call_block = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "call_once"
+                    )
+                })
+            })
+            .expect("Option::map closure call_once block");
+        assert!(
+            matches!(call_block.exitswitch, Some(ExitSwitch::LastException)),
+            "the Result-returning closure call must expose normal/exception successors"
+        );
+        for variant in ["Ok", "Err"] {
+            assert_eq!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .filter(|op| matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { name, .. },
+                            ..
+                        } if name == variant
+                    ))
+                    .count(),
+                1,
+                "the caller must rebuild one Result::{variant} shell"
+            );
+        }
+    }
+
+    /// PyPy's `_IOBase.writelines_w` receives `self` directly from the
+    /// gateway and raises on a missing receiver.  The Rust gateway spells the
+    /// same boundary as `args.first().copied().ok_or_else(...)?`; after the
+    /// combined lowering neither the foreign Option combinator nor the Result
+    /// `?` shell may survive, and the niladic closure's error must terminate on
+    /// the graph exception edge.
+    #[test]
+    #[ignore]
+    fn iobase_writelines_ok_or_else_try_is_value_or_exception() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function_with_static_addrs(
+            &llbc,
+            "iobase_writelines",
+            crate::HostStaticAddrs {
+                error_carrier: crate::ErrorCarrierSpec {
+                    carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_wrappers: &[],
+                    to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
+                    from_exc_object: Some(("PyError", "from_exc_object")),
+                },
+                ..crate::HostStaticAddrs::default()
+            },
+        )
+        .expect("lower iobase_writelines");
+
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "ok_or_else"
+                )
+            }),
+            "the foreign Option::ok_or_else residual must be gone"
+        );
+        let error_arm = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::Method { name, .. },
+                            ..
+                        } if name == "call_once"
+                    )
+                })
+            })
+            .expect("the None arm calls its error closure");
+        assert!(
+            error_arm
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock),
+            "the None arm must raise through the native graph exception edge"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn check_len_result_uint_format_template_collapses() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "_check_len_result").expect("lower _check_len_result");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["Argument", "new_display"])
+                        || super::is_arguments_new_path(segments)
+                        || super::fmt_path_ends_with(segments, &["fmt", "format"])
+                )
+            }),
+            "the unsigned `[u8; N]` template must collapse to native RPython string operations"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(&op.kind, OpKind::BinOp { op, result_ty: ValueType::Ref(None), .. }
+                    if op == "add")
+            }),
+            "the formatted overflow message must retain the native string-concat expansion"
+        );
+    }
+
+    /// A by-value fixed array is an RPython list-model iteration source, just
+    /// like the already-covered `&[T]` loop: its `IntoIter::next` must become
+    /// the native `iter`/`next` vertical rather than remain a foreign core
+    /// call.  Loads the real interpreter LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn fixed_array_for_loop_has_no_residual_into_iter_next() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "memoryview_is_native_buffer_descr")
+            .expect("lower memoryview_is_native_buffer_descr");
+        let residual: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("next") => Some(segments.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            residual.is_empty(),
+            "fixed-array for-loop left residual next calls: {residual:?}"
+        );
+    }
+
+    /// Native lock acquisition and the process-global method metadata lookup
+    /// are genuine runtime boundaries.  PyPy reaches the former through
+    /// `rthread.py`'s `llexternal` calls; none may expose Rust's
+    /// `Result<_, PoisonError<_>>::unwrap_or_else` shell to the source graph.
+    #[test]
+    #[ignore]
+    fn native_lock_and_method_metadata_leaves_are_residual() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let residuals = super::dont_look_inside_set_of(&llbc);
+        for expected in [
+            "module::_queue::queue_lock",
+            "module::_queue::simplequeue_wait_for_item",
+            "module::thread::lock_class::lock_state",
+            "module::thread::lock_class::<Impl>::acquire_timed",
+            "module::thread::rlock_class::lock_state",
+            "module::thread::rlock_class::<Impl>::acquire_timed",
+            "function::object_class_method_name",
+        ] {
+            assert!(
+                residuals.contains(expected),
+                "native/runtime leaf {expected} must remain residual; got {residuals:?}"
+            );
+        }
+    }
+
+    /// PyPy's deque mutation marker is an object-resident `lock` identity:
+    /// `modified` stores None, `getlock` lazily stores a new fieldless object,
+    /// and `checklock` compares that field by identity.  The Rust source graph
+    /// must therefore expose ordinary field traffic, never the former
+    /// counter's `core::ptr::read_volatile` shell.
+    #[test]
+    #[ignore]
+    fn deque_mutation_marker_uses_pypy_lock_identity_fields() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        for name in [
+            "pyre_interpreter::module::_collections::modified",
+            // `checklock`'s comparison half — the graph that carries the
+            // `self.lock` field read.  `checklock` itself only wraps it in
+            // the `RuntimeError` raise.
+            "pyre_interpreter::module::_collections::lock_valid",
+        ] {
+            let graph = super::lower_function(&llbc, name)
+                .unwrap_or_else(|error| panic!("lower {name}: {error}"));
+            assert!(
+                !graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath { segments },
+                                ..
+                            } if super::fmt_path_ends_with(segments, &["ptr", "read_volatile"])
+                                || super::fmt_path_ends_with(segments, &["ptr", "write_volatile"])
+                        )
+                    }),
+                "{name}: PyPy lock identity must not retain volatile-counter calls"
+            );
+            assert!(
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
+                                if field.name == "lock"
+                        )
+                    }),
+                "{name}: expected an object-resident W_Deque.lock access"
+            );
+        }
+    }
+
+    /// RPython evaluates `SHIFT`, `HASH_BITS`, `_HASH_SHIFT`, and
+    /// `HASH_MODULUS` while building `_hash_long`'s flow graph.  The extracted
+    /// Rust graph must likewise contain their integer literals, not synthetic
+    /// zero-argument accessors that the annotator cannot resolve.  Loads the
+    /// real interpreter LLBC, so ignored by default.
+    #[test]
+    #[ignore]
+    fn hash_long_has_no_residual_constant_accessors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "_hash_long").expect("lower _hash_long");
+        let residual: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if matches!(
+                    segments.last().map(String::as_str),
+                    Some("SHIFT" | "HASH_BITS" | "HASH_SHIFT" | "HASH_MODULUS")
+                ) =>
+                {
+                    Some(segments.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            residual.is_empty(),
+            "_hash_long left residual constant accessors: {residual:?}"
+        );
+    }
+
+    /// CPython 3.14's hashable-slice mixer spells PyPy's `xxrotate` expansion
+    /// as Rust `u64::rotate_left`.  The front must recover the same unsigned
+    /// shift/or graph rather than leave the opaque core method behind.
+    #[test]
+    #[ignore]
+    fn slice_hash_has_no_residual_rotate_left() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "slice_hash_value").expect("lower slice_hash_value");
+        let residual = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("rotate_left")
+                )
+            })
+            .count();
+        assert_eq!(residual, 0, "slice hash left rotate_left residuals");
+        assert!(
+            graph.blocks.iter().flat_map(|block| &block.operations).any(
+                |op| matches!(&op.kind, OpKind::BinOp { op, result_ty: ValueType::Unsigned, .. }
+                    if op == "or")
+            ),
+            "slice hash must contain PyPy's unsigned shift/or rotate expansion"
+        );
+    }
+
+    /// `w_method_new` pins three roots with `for slot in save_point..save_point
+    /// + 3`.  RPython represents that loop through `builtin_range` and
+    /// `RangeIteratorRepr`; the Rust `core::ops::range::Range<usize>` shell
+    /// must therefore be consumed by `front::range_iter`, not enter the
+    /// annotator as one shared foreign ClassDef whose `start` field can merge
+    /// with unrelated Range instantiations.  Loads the real object LLBC, so
+    /// ignored by default.
+    #[test]
+    #[ignore]
+    fn method_root_scan_uses_rpython_range_iterator() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real object LLBC");
+        let graph = super::lower_function(&llbc, "pyre_object::function::w_method_new")
+            .expect("lower w_method_new");
+        let operations: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+
+        let range_shells: Vec<_> = operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Ref(Some(owner)),
+                        ..
+                    } if owner.ends_with("ops::range::Range")
+                )
+            })
+            .collect();
+        assert!(
+            range_shells.is_empty(),
+            "the Rust Range shell must be consumed before annotation: {range_shells:#?}"
+        );
+        assert!(
+            operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &[crate::runtime_names::shims::RANGE.to_string()]
+            )),
+            "w_method_new must route its root scan through RPython builtin_range"
+        );
+        assert!(
+            operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["__iter_next".to_string()]
+            )),
+            "w_method_new must lower the range loop through the native next op"
         );
     }
 }

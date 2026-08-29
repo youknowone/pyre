@@ -4719,6 +4719,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     ));
     pyre_object::bytesobject::set_bytes_block_gc_type_id(bytes_block_tid);
 
+    // `interp_deque.py Lock` is a fieldless internal GC identity token, not a
+    // Python-visible rclass. Register it without a vtable or subclass-range
+    // alias; W_Deque and its iterators carry the token through their ordinary
+    // traced pointer fields. It must be at the absolute tail: unlike PyPy's
+    // symbolic gctypelayout ids, this collector's ids are registration-order
+    // positions, so inserting the internal token beside Block would renumber
+    // every established Python-visible rclass registered after it.
+    let deque_lock_descr =
+        <pyre_interpreter::module::_collections::deque_lock::W_DequeLock
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+    let deque_lock_tid = gc.register_type(TypeInfo::with_gc_ptrs(
+        deque_lock_descr.object_size,
+        deque_lock_descr.ptr_offsets.to_vec(),
+    ));
+    deque_lock_descr.gc_type_id.set(deque_lock_tid);
+
     // ── GC-root registration completeness oracle ─────────────────────────
     // Every `#[pyre_class]` type appends its descriptor to the whole-program
     // `PYRE_CLASS_DESCRIPTORS` slice. A type with inline managed children must

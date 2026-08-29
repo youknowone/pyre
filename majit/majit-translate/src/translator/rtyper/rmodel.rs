@@ -2729,6 +2729,10 @@ pub enum ReprKey {
     /// RPython `SomeType.rtyper_makekey = (self.__class__,)`
     /// (rclass.py:463-464).
     Type,
+    /// `SomeTypeOf` inherits `SomeType.rtyper_makekey`; because the method
+    /// returns `(self.__class__,)`, all `SomeTypeOf` annotations share their
+    /// own bucket, distinct from the `SomeType` bucket.
+    TypeOf,
     /// RPython `SomeIterator.rtyper_makekey` (rmodel.py).
     ///
     /// ```python
@@ -2919,6 +2923,10 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         }
         // rclass.py: SomeType.rtyper_makekey = (self.__class__,).
         SomeValue::Type(_) => ReprKey::Type,
+        // `SomeTypeOf(SomeType)` inherits the same method.  Upstream keys on
+        // `self.__class__`, so this is a separate singleton key even though
+        // both annotations select the same RootClassRepr.
+        SomeValue::TypeOf(_) => ReprKey::TypeOf,
         // rmodel.py — SomeIterator.rtyper_makekey recursively
         // keys on container + variant tuple.
         SomeValue::Iterator(s) => ReprKey::Iterator {
@@ -3281,9 +3289,10 @@ pub fn rtyper_makerepr(
         )),
         // rweakref.py:13-17
         SomeValue::WeakRef(_) => super::rweakref::weakref_makerepr(rtyper),
-        SomeValue::TypeOf(_) => Err(TyperError::missing_rtype_operation(
-            "SomeTypeOf.rtyper_makerepr — no direct upstream counterpart; host-language adaptation",
-        )),
+        // `SomeTypeOf` is a subclass of `SomeType` and inherits
+        // `rclass.py::__extend__(SomeType).rtyper_makerepr`, which returns
+        // `get_type_repr(rtyper)`.
+        SomeValue::TypeOf(_) => crate::translator::rtyper::rclass::get_type_repr(rtyper),
         SomeValue::Ptr(ptr) => {
             Ok(std::sync::Arc::new(PtrRepr::new(ptr.ll_ptrtype.clone()))
                 as std::sync::Arc<dyn Repr>)
@@ -4358,6 +4367,17 @@ mod tests {
     }
 
     #[test]
+    fn rtyper_makekey_sometypeof_is_distinct_variant_singleton() {
+        use crate::annotator::model::SomeTypeOf;
+        use crate::flowspace::model::Variable;
+        let first = SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::new(Variable::new())]));
+        let second = SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::new(Variable::new())]));
+        assert_eq!(rtyper_makekey(&first), ReprKey::TypeOf);
+        assert_eq!(rtyper_makekey(&second), ReprKey::TypeOf);
+        assert_ne!(rtyper_makekey(&first), ReprKey::Type);
+    }
+
+    #[test]
     fn rtyper_makerepr_someinstance_returns_instance_repr_when_initialized() {
         use crate::annotator::classdesc::ClassDef;
         use crate::annotator::model::SomeInstance;
@@ -4413,6 +4433,19 @@ mod tests {
         rtyper.initialize_exceptiondata().expect("init");
 
         let sv = SomeValue::Type(SomeType::new());
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert_eq!(repr.class_name(), "RootClassRepr");
+    }
+
+    #[test]
+    fn rtyper_makerepr_sometypeof_inherits_rootclass_repr() {
+        use crate::annotator::model::SomeTypeOf;
+        use crate::flowspace::model::Variable;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("init");
+
+        let sv = SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::new(Variable::new())]));
         let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
         assert_eq!(repr.class_name(), "RootClassRepr");
     }

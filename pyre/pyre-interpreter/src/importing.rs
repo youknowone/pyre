@@ -5231,15 +5231,17 @@ fn handle_fromlist_fast(
     };
     let import_slot = shadow_stack_len();
     let _ = pin_root(w_import);
-    crate::call::call_function_impl_result(
+    match crate::call::call_function_impl_result(
         shadow_stack_get(handle_slot),
         &[
             shadow_stack_get(mod_slot),
             shadow_stack_get(fromlist_slot),
             shadow_stack_get(import_slot),
         ],
-    )
-    .map(Some)
+    ) {
+        Ok(w_result) => Ok(Some(w_result)),
+        Err(err) => Err(err),
+    }
 }
 
 /// `builtins.__import__` — `interp___import__`: a fast path answering

@@ -48,9 +48,6 @@ pub fn binary_value(
     b: PyObjectRef,
     op: BinaryOperator,
 ) -> Result<PyObjectRef, PyError> {
-    if op == BinaryOperator::InplacePower {
-        return crate::objspace::descroperation::inplace_pow(a, b);
-    }
     // descroperation.py `inplace_impl` — consult the in-place
     // special first; fall through to the binary op below when absent or
     // `NotImplemented`.
@@ -80,21 +77,10 @@ pub fn binary_value(
         BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => mod_(a, b),
         BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => truediv(a, b),
         BinaryOperator::Power => pow(a, b),
-        BinaryOperator::InplacePower => match pow(a, b) {
-            Err(err)
-                if err.kind == crate::PyErrorKind::TypeError
-                    && err
-                        .message
-                        .starts_with("unsupported operand type(s) for ** or pow():") =>
-            {
-                Err(crate::PyError::type_error(format!(
-                    "unsupported operand type(s) for **=: '{}' and '{}'",
-                    crate::baseobjspace::object_functionstr_type_name(a),
-                    crate::baseobjspace::object_functionstr_type_name(b),
-                )))
-            }
-            result => result,
-        },
+        // PyPy `pyopcode.py:INPLACE_POWER` calls `space.inplace_pow`
+        // directly; unlike the generated `inplace_impl` family this operation
+        // has its own three-argument-aware dispatch in descroperation.py.
+        BinaryOperator::InplacePower => crate::objspace::descroperation::inplace_pow(a, b),
         BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lshift(a, b),
         BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => matmul(a, b),
         BinaryOperator::Rshift | BinaryOperator::InplaceRshift => rshift(a, b),
@@ -696,7 +682,11 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
             let dict_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(dict);
             let entries = pyre_object::w_dict_items(source);
-            let flat: Vec<PyObjectRef> = entries.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let mut flat = Vec::with_capacity(entries.len() * 2);
+            for &(key, value) in &entries {
+                flat.push(key);
+                flat.push(value);
+            }
             let pair_base = pyre_object::gc_roots::pin_roots(&flat);
             for index in 0..entries.len() {
                 pyre_object::w_dict_store(
@@ -734,8 +724,8 @@ pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), P
         let dict = pyre_object::gc_roots::pin_root(dict);
         let source = pyre_object::gc_roots::pin_root(source);
         let key_base = sp + 2;
-        for key in keys {
-            let _ = pyre_object::gc_roots::pin_root(key);
+        for index in 0..keys.len() {
+            let _ = pyre_object::gc_roots::pin_root(keys[index]);
         }
         let key_len = pyre_object::gc_roots::shadow_stack_len() - key_base;
         for i in 0..key_len {

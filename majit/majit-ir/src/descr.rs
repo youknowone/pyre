@@ -4831,8 +4831,19 @@ pub trait FieldDescr: Descr {
         ""
     }
 
-    /// descr.py:220-233 cache key (`fieldname`). Defaults to the
-    /// display name for descriptor implementations without a separate key.
+    /// The `fieldname` half of `get_field_descr`'s `cache[STRUCT][fieldname]`
+    /// key (`descr.py`). Defaults to the display name for descriptor
+    /// implementations without a separate key.
+    ///
+    /// That default is only right while every impl either overrides BOTH or
+    /// NEITHER. An impl overriding `field_name` alone would return the full
+    /// `STRUCT.fieldname` here and compare "apart" against a bare key in
+    /// `slot_holds_field`. Today that is latent: the two production impls are
+    /// `SimpleFieldDescr` (both) and `VRefFieldDescr` (neither, so both sides
+    /// are empty and the offset-only fallback applies), and every other
+    /// override is `#[cfg(test)]`. Defaulting to `""` instead would NOT be
+    /// the fix — the field lookups in this file compare `field_key()` to
+    /// select a field, and an empty key there collapses distinct fields.
     fn field_key(&self) -> &str {
         self.field_name()
     }

@@ -405,8 +405,8 @@ fn encode_errors(
                         return Err(crate::typedef::unicode_encode_error(
                             &encoding,
                             w_unicode,
-                            pos,
-                            pos + 1,
+                            pos as i64,
+                            (pos + 1) as i64,
                             "unable to encode error handler result to ASCII",
                         ));
                     }

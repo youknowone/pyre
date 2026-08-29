@@ -40,6 +40,7 @@ cover the condition they diagnose.
 | `MAJIT_PROBE_SUBSCR` | OFF | Reports subscription tracing and dispatch decisions; remove when the relevant opcode paths have focused coverage. |
 | `MAJIT_PROFILE_DRAIN` | OFF | Profiles codewriter queue draining; remove when pipeline performance no longer needs phase attribution. |
 | `MAJIT_PROFILE_PIPELINE` | OFF | Reports translation phase time and memory; retain while translation performance needs phase attribution. |
+| `MAJIT_RTYPER_FRONTIER` | OFF | Makes the flowspace adapter resume past an unresolvable call and report the subject's whole call-wall set instead of the first; remove when the census no longer needs sole-blocker ranking. |
 | `MAJIT_RTYPER_VERBOSE` | OFF | Emits per-graph rtyper failure census rows; remove when all supported graphs translate or fail through stable classifications. |
 | `MAJIT_S9_PROBE` | OFF | Records optimizer stage-nine diagnostics; remove when that stage has focused invariant coverage. |
 | `MAJIT_SIZE_SHELL_OWNERS` | OFF | Reports owners of size-descriptor shells; remove when shell identity is enforced structurally. |

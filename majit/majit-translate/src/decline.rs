@@ -7,14 +7,15 @@
 //! consulted and said no, or was never reached at all.  Reading a jitcode
 //! list by hand is currently the only way to tell those apart.
 //!
-//! Upstream is loud exactly where this pipeline is silent:
-//! `rpython/jit/codewriter/jtransform.py`'s `_handle_list_call` raises
-//! `NotImplementedError("prebuilt lists cannot be virtual")` rather than
-//! falling through to a residual, so an unhandled shape stops translation
-//! with its own name attached.  This module does NOT turn any decline into
-//! an error — every gate keeps its exact current control flow — it only
-//! records that the decline happened and why, so the same information
-//! upstream would have raised is at least countable here.
+//! Upstream does not stop translation either, but it carries the reason as
+//! a value: `_handle_list_call` raises `NotSupported(prefix + oopspec_name)`
+//! (`rpython/jit/codewriter/jtransform.py:1796`), naming the shape it
+//! refused, and `rewrite_op_direct_call` catches it and falls through to a
+//! residual call (`jtransform.py:512-520`).  The refusal is equally silent
+//! at the end — but at the point of refusal the reason existed.  This module
+//! does NOT turn any decline into an error — every gate keeps its exact
+//! current control flow — it only records the reason where it still exists,
+//! so it survives the fall through to a residual.
 //!
 //! # Contract
 //!

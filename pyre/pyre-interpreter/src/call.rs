@@ -405,6 +405,33 @@ pub fn get_eval_fn() -> EvalFn {
     }
 }
 
+/// Execute a newly-created frame through the process-selected evaluator using
+/// the one-word residual ABI.
+///
+/// PyPy's translated `Function.call_args` calls `new_frame.run()` directly;
+/// pyre's lower interpreter crate instead receives the JIT-aware evaluator
+/// through [`EVAL_OVERRIDE`]. That dependency seam is host plumbing, not a
+/// source-level PBC. Keep it opaque to the translated caller and publish the
+/// ordinary result/exception split through the same pending-error channel as
+/// the other bare-`PyObjectRef` call boundaries.
+///
+/// The native helper may enter `eval_with_jit`, and therefore the portal,
+/// while executing a residual call. This is the RPython
+/// `cpu.bh_call_r(translated_func, ...)` behavior: residual means opaque to
+/// the enclosing trace, not that nested translated execution has its JIT
+/// disabled.
+#[majit_macros::dont_look_inside]
+pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
+    clear_call_error();
+    match get_eval_fn()(frame, None) {
+        Ok(value) => value,
+        Err(error) => {
+            set_call_error(error);
+            PY_NULL
+        }
+    }
+}
+
 // ── JIT parameter injection ──────────────────────────────────────
 //
 // `pypy/interpreter/executioncontext.py settrace` invokes
@@ -834,14 +861,14 @@ fn builtin_keyword_failure(
 /// same graph boundary explicitly.
 #[inline(never)]
 fn make_user_call_frame(
-    w_code: *const (),
+    w_code: PyObjectRef,
     args: &[PyObjectRef],
     w_globals: PyObjectRef,
     execution_context: *const crate::PyExecutionContext,
     closure: PyObjectRef,
 ) -> Result<crate::pyframe::FrameBox, crate::PyError> {
     let frame = PyFrame::try_new_for_call_with_closure_and_globals_obj(
-        w_code,
+        w_code as *const (),
         args,
         w_globals,
         execution_context,
@@ -947,7 +974,12 @@ pub fn call_user_function_with_ctx(
     };
     func_frame.fix_array_ptrs();
     let _callee_locals_root = FrameLocalsRoot::new_mut(&mut func_frame);
-    get_eval_fn()(&mut func_frame, None)
+    let result = eval_current_frame_raw(&mut func_frame);
+    if result.is_null() {
+        Err(take_call_error().unwrap_or_else(|| crate::PyError::value_error("call failed")))
+    } else {
+        Ok(result)
+    }
 }
 
 /// Call a user function with pre-resolved args (scope already packed by
@@ -971,7 +1003,7 @@ pub fn call_user_function_resolved(
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame =
             crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code,
+                w_code as *const (),
                 args,
                 w_globals,
                 execution_context,
@@ -985,7 +1017,7 @@ pub fn call_user_function_resolved(
 
     let mut func_frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             args,
             w_globals,
             execution_context,
@@ -2026,9 +2058,12 @@ fn call_non_function_callable_with_mode(
         user_call_slot(pyre_object::gc_roots::shadow_stack_get(user_call_root_base))?
     {
         let current_callable = pyre_object::gc_roots::shadow_stack_get(user_call_root_base);
-        let current_args: Vec<PyObjectRef> = (0..args.len())
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(user_call_root_base + 1 + i))
-            .collect();
+        let mut current_args = Vec::with_capacity(args.len());
+        for i in 0..args.len() {
+            current_args.push(pyre_object::gc_roots::shadow_stack_get(
+                user_call_root_base + 1 + i,
+            ));
+        }
         if prepend_receiver {
             let mut call_args = Vec::with_capacity(1 + current_args.len());
             call_args.push(current_callable);
@@ -2118,7 +2153,7 @@ pub fn call_user_function_plain_with_ctx(
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame =
             crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code,
+                w_code as *const (),
                 &final_args,
                 w_globals,
                 execution_context,
@@ -2130,7 +2165,7 @@ pub fn call_user_function_plain_with_ctx(
 
     let mut func_frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             &final_args,
             w_globals,
             execution_context,
@@ -2605,18 +2640,48 @@ pub(crate) fn bind_kwargs_to_signature(
     // on the same call wins first.
     let too_many_args = n_pos > n_pos_params && !has_varargs;
 
-    let mut result = vec![pyre_object::PY_NULL; nparams];
+    // `argument.py` receives `arguments_w`, `keyword_names_w`, and
+    // `keywords_w` as three GC-pointer lists.  The public Rust call surface
+    // carries keyword names as host Wtf8 buffers instead, so materialise the
+    // wrapped-name list once and keep all three lists on the shadow stack.
+    // This is the manual counterpart of the GC transform rooting those live
+    // RPython lists across each name allocation.
+    let roots = pyre_object::gc_roots::push_roots();
+    let pos_args_slot = roots.base();
+    for &value in pos_args {
+        let _ = roots.pin_root(value);
+    }
+    let keyword_values_slot = pos_args_slot + pos_args.len();
+    for (_, value) in kwargs {
+        let _ = roots.pin_root(*value);
+    }
+    let keyword_names_slot = keyword_values_slot + kwargs.len();
+    for (key, _) in kwargs {
+        let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
+        let _ = roots.pin_root(w_key);
+    }
+    let result_slot = keyword_names_slot + kwargs.len();
+    for _ in 0..nparams {
+        let _ = roots.pin_root(pyre_object::PY_NULL);
+    }
     for i in 0..n_pos.min(n_pos_params) {
-        result[i] = pos_args[i];
+        roots.set(result_slot + i, roots.get(pos_args_slot + i));
     }
 
     // _match_keywords — match each keyword to a param name by index.
-    let mut extra_kwargs: Vec<(Wtf8Buf, PyObjectRef)> = Vec::new();
+    // `argument.py:_collect_keyword_args` keeps keyword names and values in
+    // parallel lists (`keyword_names_w`, `keywords_w`) and uses
+    // `kwds_mapping` only to select unmatched positions.  Preserve that
+    // storage shape by recording the unmatched indices into the two rooted
+    // lists above; an inline Rust `(Wtf8Buf, PyObjectRef)` tuple would become
+    // a list-of-inline-structs that RPython never has.
+    let mut extra_kw_indices: Vec<usize> = Vec::new();
     let mut unmatched_kw_names: Vec<Wtf8Buf> = Vec::new();
     // argument.py:469,481-484 — collected across the whole loop, reported
     // together instead of raising on the first violation found.
     let mut posonly_kwds: Vec<String> = Vec::new();
-    for (key, value) in kwargs {
+    let mut kw_index = 0usize;
+    for (key, _) in kwargs {
         // A lone-surrogate keyword name (not valid UTF-8) never equals a
         // source-level parameter name, so it falls straight to **kwargs or
         // the unexpected-keyword error below.
@@ -2625,44 +2690,43 @@ pub(crate) fn bind_kwargs_to_signature(
         } else {
             None
         };
+        // argument.py `_match_keywords` delegates this lookup to the
+        // elidable Signature method.  Keep that boundary: translating the
+        // host `Vec<&str>` iteration here would expose Rust's fat-pointer
+        // storage to the RPython-shaped low-level array model.
+        let pi = if let Some(name) = key_str {
+            sig.find_argname(name)
+        } else {
+            -1
+        };
         let mut matched = false;
-        for pi in 0..nparams {
-            if key_str == Some(sig.argnames[pi]) {
-                // argument.py:474 — positional-only param passed by keyword:
-                // absorb into **kwargs if present, else error.
-                if pi < posonly {
-                    if has_varkw {
-                        break;
-                    }
+        if pi >= 0 {
+            let pi = pi as usize;
+            // argument.py:474 — positional-only param passed by keyword:
+            // absorb into **kwargs if present, else error.
+            if pi < posonly {
+                if !has_varkw {
                     // argument.py:481-484 — collect and keep scanning
                     // remaining keywords instead of raising immediately.
                     posonly_kwds.push(key.to_string());
                     matched = true;
-                    break;
                 }
-                if !result[pi].is_null() {
-                    return Err(crate::PyError::type_error(format!(
-                        "{}() got multiple values for argument '{}'",
-                        fname, key
-                    )));
+            } else {
+                if !roots.get(result_slot + pi).is_null() {
+                    return builtin_multiple_values_failure(fname, key);
                 }
-                result[pi] = *value;
+                roots.set(result_slot + pi, roots.get(keyword_values_slot + kw_index));
                 matched = true;
-                break;
             }
         }
         if !matched {
             if has_varkw {
-                // The name stays a `Wtf8Buf` until the packing bracket below.
-                // Interning it here would allocate once per unmatched keyword,
-                // and every one of those is a safepoint that relocates the
-                // values already accumulated — and the bound parameters in
-                // `result` — while nothing names them.
-                extra_kwargs.push((key.clone(), *value));
+                extra_kw_indices.push(kw_index);
             } else {
                 unmatched_kw_names.push(key.clone());
             }
         }
+        kw_index += 1;
     }
 
     // argument.py — ArgErrPosonlyAsKwds, raised after the full
@@ -2685,37 +2749,32 @@ pub(crate) fn bind_kwargs_to_signature(
     // argument.py:289 — too-many-positionals is raised last, after the
     // keyword-matching errors above.
     if too_many_args {
-        return Err(crate::PyError::type_error(format!(
-            "{}() takes {} positional argument{} but {} {} given",
-            fname,
-            n_pos_params,
-            if n_pos_params != 1 { "s" } else { "" },
-            n_pos,
-            if n_pos != 1 { "were" } else { "was" },
-        )));
+        return builtin_too_many_positional_failure(fname, n_pos_params as i64, n_pos as i64);
     }
 
     // Pack `*args` / `**kwargs` tails — argument.py _match_signature 207-259.
-    // The bound parameters, the unmatched keyword pairs and both tail objects
-    // are all raw copies held across the packing allocations; see the same
-    // bracket in `resolve_kwargs`, including why a star-less signature returns
-    // before it.
+    // The bound parameters, keyword names, and keyword values are reloaded
+    // from their rooted parallel lists across the packing allocations.  Here
+    // the bracket starts before keyword matching because materialising PyPy's
+    // `keyword_names_w` list itself can collect.
     if !has_varargs && !has_varkw {
+        let mut result = Vec::with_capacity(nparams);
+        for i in 0..nparams {
+            result.push(roots.get(result_slot + i));
+        }
         return Ok(result);
     }
-    let roots = pyre_object::gc_roots::push_roots();
-    let result_slot = roots.base();
-    for &value in &result {
-        let _ = roots.pin_root(value);
-    }
-    let extra_slot = result_slot + result.len();
-    for &(_, value) in &extra_kwargs {
-        let _ = roots.pin_root(value);
-    }
-    let varargs_slot = extra_slot + extra_kwargs.len();
+    let varargs_slot = result_slot + nparams;
     if has_varargs {
         let extra_pos: Vec<PyObjectRef> = if n_pos > n_pos_params {
-            pos_args[n_pos_params..n_pos].to_vec()
+            // argument.py `_match_signature` slices `args_w[input_argcount:]`.
+            // Reload the rooted list first so the Rust slice contains the
+            // post-collection addresses, then preserve that upstream slice.
+            let mut rooted_pos_args = Vec::with_capacity(n_pos);
+            for i in 0..n_pos {
+                rooted_pos_args.push(roots.get(pos_args_slot + i));
+            }
+            rooted_pos_args.as_slice()[n_pos_params..n_pos].to_vec()
         } else {
             vec![]
         };
@@ -2724,22 +2783,22 @@ pub(crate) fn bind_kwargs_to_signature(
     let varkw_slot = varargs_slot + usize::from(has_varargs);
     if has_varkw {
         let _ = roots.pin_root(pyre_object::w_dict_new_kwargs());
-        // The index loop lowers to direct element loads; iterator adapters are residual calls.
+        // The index loop lowers to direct one-word element loads; iterator
+        // adapters are residual calls.
         #[allow(clippy::needless_range_loop)]
-        for i in 0..extra_kwargs.len() {
-            let key = &extra_kwargs[i].0;
+        for i in 0..extra_kw_indices.len() {
+            let kw_index = extra_kw_indices[i];
             unsafe {
-                // The key allocation runs first: as the second argument it
-                // would be evaluated after the receiver, handing
-                // `w_dict_store` the pre-collection dict address.
-                let w_key = pyre_object::w_str_from_wtf8_managed(key.clone());
-                pyre_object::w_dict_store(roots.get(varkw_slot), w_key, roots.get(extra_slot + i));
+                pyre_object::w_dict_store(
+                    roots.get(varkw_slot),
+                    roots.get(keyword_names_slot + kw_index),
+                    roots.get(keyword_values_slot + kw_index),
+                );
             }
         }
     }
-    let result_len = result.len();
-    let mut result: Vec<PyObjectRef> = Vec::with_capacity(result_len);
-    for i in 0..result_len {
+    let mut result: Vec<PyObjectRef> = Vec::with_capacity(nparams);
+    for i in 0..nparams {
         result.push(roots.get(result_slot + i));
     }
     if has_varargs {
@@ -2750,6 +2809,42 @@ pub(crate) fn bind_kwargs_to_signature(
     }
 
     Ok(result)
+}
+
+/// Cold `ArgErrMultipleValues.getmsg` materialisation.
+///
+/// PyPy's `_match_signature` returns `ArgErrMultipleValues(argname)` and
+/// `Arguments.parse_obj` formats it only on the rejected-call path.  Pyre's
+/// `PyError` carries the eager message, so centralize that materialisation in
+/// the corresponding rejected-call helper instead of duplicating it in every
+/// generated gateway graph that calls the matcher.
+#[cold]
+fn builtin_multiple_values_failure(
+    fname: &str,
+    key: &Wtf8Buf,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    Err(PyError::type_error(format!(
+        "{}() got multiple values for argument '{}'",
+        fname, key
+    )))
+}
+
+/// Cold `ArgErrTooMany.getmsg` materialisation; see
+/// [`builtin_multiple_values_failure`].
+#[cold]
+fn builtin_too_many_positional_failure(
+    fname: &str,
+    expected: i64,
+    given: i64,
+) -> Result<Vec<PyObjectRef>, PyError> {
+    Err(PyError::type_error(format!(
+        "{}() takes {} positional argument{} but {} {} given",
+        fname,
+        expected,
+        if expected != 1 { "s" } else { "" },
+        given,
+        if given != 1 { "were" } else { "was" },
+    )))
 }
 
 /// [`call_with_kwargs_in_ctx`] reached from a frame.  Installs the caller
@@ -3362,7 +3457,7 @@ fn call_with_kwargs_in_ctx_impl(
             let closure = unsafe { function_get_closure(current_callable()) };
             let mut func_frame = crate::pyframe::FrameBox::new(
                 crate::pyframe::PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                    w_code,
+                    w_code as *const (),
                     &final_args,
                     w_globals,
                     execution_context,
@@ -3649,6 +3744,18 @@ fn log_call_error(message: &str) {
     let _ = message;
 }
 
+/// Cold `descroperation.py call` non-callable error materialisation.
+///
+/// Upstream raises this through `oefmt("'%T' object is not callable")`; the
+/// translated dispatch keeps all successful callable arms visible while this
+/// eager Rust message remains on the rejected arm only.
+fn not_callable_error(callable: PyObjectRef) -> PyError {
+    let type_name = crate::typedef::r#type(callable)
+        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
+        .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
+    PyError::type_error(format!("'{type_name}' object is not callable"))
+}
+
 pub(crate) fn call_function_impl(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     call_function_impl_raw(callable, args)
 }
@@ -3833,12 +3940,7 @@ pub fn call_function_impl_result(
             return call_function_impl_result(call_fn, &current_args);
         }
     }
-    let type_name = crate::typedef::r#type(callable)
-        .map(|tp| unsafe { pyre_object::w_type_get_name(tp.as_ptr()) })
-        .unwrap_or_else(|| unsafe { (*(*callable).ob_type).name });
-    Err(PyError::type_error(format!(
-        "'{type_name}' object is not callable"
-    )))
+    Err(not_callable_error(callable))
 }
 
 /// CPython: typeobject.c calculate_metaclass
@@ -4168,7 +4270,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
     if crate::pyframe::code_flags_make_generator(code_ref.flags) {
         let gen_frame = crate::pyframe::FrameBox::new(
             match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-                w_code,
+                w_code as *const (),
                 &final_args,
                 w_globals,
                 exec_ctx,
@@ -4193,7 +4295,7 @@ fn call_user_function_with_args(func: PyObjectRef, args: &[PyObjectRef]) -> PyOb
 
     let mut frame = crate::pyframe::FrameBox::new(
         match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             &final_args,
             w_globals,
             exec_ctx,
@@ -4257,7 +4359,7 @@ fn call_user_function_resolved_frameless(func: PyObjectRef, args: &[PyObjectRef]
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             args,
             w_globals,
             exec_ctx,
@@ -5035,7 +5137,7 @@ fn build_class_inner(
 
     let mut frame =
         crate::pyframe::FrameBox::new(PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code,
+            w_code as *const (),
             &[],
             w_globals,
             exec_ctx,

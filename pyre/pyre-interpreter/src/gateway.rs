@@ -156,6 +156,7 @@ impl Signature {
     ///         pass
     ///     return -1
     /// ```
+    #[majit_macros::elidable]
     pub fn find_argname(&self, name: &str) -> isize {
         for (i, arg) in self.argnames.iter().enumerate() {
             if *arg == name {
@@ -179,6 +180,7 @@ impl Signature {
     /// raw `&str`; pyre delegates to `find_argname` after unwrapping the
     /// PyObject via `w_str_get_value`.  Non-string `w_name` returns `-1`
     /// (matches PyPy's RPython unwrap-or-fail semantics for strings).
+    #[majit_macros::elidable]
     pub fn find_w_argname(&self, w_name: PyObjectRef) -> isize {
         if w_name.is_null() {
             return -1;
@@ -513,7 +515,7 @@ pub type BuiltinCodeFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 pub fn method_arity_failure(
     name: &str,
     expected: &str,
-    given: usize,
+    given: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
     Err(crate::PyError::type_error(format!(
         "{name}() takes {expected} ({given} given)"
@@ -530,7 +532,7 @@ pub fn method_arity_failure(
 pub fn method_noarg_failure(
     args: &[PyObjectRef],
     name: &str,
-    receiver_slots: usize,
+    receiver_slots: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
     if crate::builtins::has_builtin_kwargs(args) {
         Err(crate::PyError::type_error(format!(
@@ -540,7 +542,7 @@ pub fn method_noarg_failure(
         method_arity_failure(
             name,
             "no arguments",
-            args.len().saturating_sub(receiver_slots),
+            (args.len() as i64 - receiver_slots).max(0),
         )
     }
 }
@@ -553,8 +555,8 @@ pub fn method_noarg_failure(
 #[majit_macros::dont_look_inside]
 pub fn method_min_arity_failure(
     name: &str,
-    min: usize,
-    given: usize,
+    min: i64,
+    given: i64,
 ) -> Result<PyObjectRef, crate::PyError> {
     Err(crate::PyError::type_error(format!(
         "{name} expected at least {min} argument{}, got {given}",
@@ -2080,8 +2082,8 @@ pub fn fsencode(obj: pyre_object::PyObjectRef) -> Result<Vec<u8>, crate::PyError
             return Err(crate::typedef::unicode_encode_error(
                 "utf-8",
                 obj,
-                pos,
-                pos + 1,
+                pos as i64,
+                (pos + 1) as i64,
                 "surrogates not allowed",
             ));
         }

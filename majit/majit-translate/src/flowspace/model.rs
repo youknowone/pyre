@@ -1734,6 +1734,15 @@ impl HostEnv {
             crate::runtime_names::shims::CAST_ADDRESS,
             HostObject::new_builtin_callable(crate::runtime_names::shims::CAST_ADDRESS),
         );
+        // Front-end spelling of the exact RPython `rgc.ll_arraymove` helper.
+        // Rust source reaches the same operation as `ptr::copy`; the MIR
+        // adapter reconstructs the array plus logical source/destination
+        // indices before resolving this singleton through the annotator and
+        // rtyper registries.
+        self.insert_builtin(
+            crate::runtime_names::shims::LL_ARRAYMOVE,
+            HostObject::new_builtin_callable(crate::runtime_names::shims::LL_ARRAYMOVE),
+        );
     }
 
     fn bootstrap_std_modules(&mut self) {
@@ -2323,7 +2332,7 @@ impl HostEnv {
                 .expect("core.ptr.null_mut bound above"),
         );
 
-        // `pyre_object::lltype::malloc_typed` — the GC allocation intrinsic
+        // `pyre_object::lltype::malloc[_typed]` — GC allocation intrinsics
         // (`lltype.malloc(STRUCT, flavor='gc')` parity).  Exposed as a host
         // builtin so its body is never looked-inside; the `malloc_typed_alloc`
         // analyzer types the result as `SomeInstance(T)`.  Callsites carry the
@@ -2331,6 +2340,10 @@ impl HostEnv {
         // which `translate_op`'s Layer-3b resolves via this module
         // (prefix `pyre_object.lltype`, leaf `malloc_typed`).
         let lltype_module = HostObject::new_module(crate::runtime_names::modules::OBJECT_LLTYPE);
+        lltype_module.module_set(
+            "malloc",
+            HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC),
+        );
         lltype_module.module_set(
             "malloc_typed",
             HostObject::new_builtin_callable(crate::runtime_names::modules::MALLOC_TYPED),

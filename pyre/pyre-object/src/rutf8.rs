@@ -53,7 +53,7 @@
 //! `not jit.we_are_jitted()`) is left out: it computes the same value as the
 //! comparison ladder it sits in front of.
 
-use rustpython_wtf8::{CodePoint, Wtf8};
+use rustpython_wtf8::Wtf8;
 
 /// `UTF8_INDEX_STORAGE`'s element (`rutf8.py`) — `baseindex` is the
 /// byte offset the 64-code-point group starts at, and `ofs[i]` the byte delta
@@ -114,14 +114,27 @@ pub fn prev_codepoint_pos(code: &Wtf8, pos: usize) -> usize {
 /// `codepoint_at_pos` (`rutf8.py`) — the code point starting at byte `pos`.
 ///
 /// Assumes valid WTF-8 with `pos` on a boundary before the end, as upstream
-/// does ("no checking!").  The decode itself goes through the crate rather than
-/// a second copy of its bit arithmetic.
+/// does ("no checking!"). Returns RPython's signed integer code point and
+/// keeps the upstream bit arithmetic literal so the JIT sees the same graph.
 #[inline]
-pub fn codepoint_at_pos(code: &Wtf8, pos: usize) -> CodePoint {
-    let end = next_codepoint_pos(code, pos);
-    code.get(pos..end)
-        .and_then(|one| one.code_points().next())
-        .expect("codepoint_at_pos: pos is not a code point boundary")
+pub fn codepoint_at_pos(code: &Wtf8, pos: usize) -> i64 {
+    let code = code.as_bytes();
+    let len = code.len();
+    let ordch1 = code[pos] as i64;
+    if ordch1 <= 0x7f || pos + 1 >= len {
+        return ordch1;
+    }
+    let ordch2 = code[pos + 1] as i64;
+    if ordch1 <= 0xdf || pos + 2 >= len {
+        return (ordch1 << 6) + ordch2 - ((0xc0 << 6) + 0x80);
+    }
+    let ordch3 = code[pos + 2] as i64;
+    if ordch1 <= 0xef || pos + 3 >= len {
+        return (ordch1 << 12) + (ordch2 << 6) + ordch3 - ((0xe0 << 12) + (0x80 << 6) + 0x80);
+    }
+    let ordch4 = code[pos + 3] as i64;
+    (ordch1 << 18) + (ordch2 << 12) + (ordch3 << 6) + ordch4
+        - ((0xf0 << 18) + (0x80 << 12) + (0x80 << 6) + 0x80)
 }
 
 /// `codepoint_before_pos` (`rutf8.py`) — the code point immediately before
@@ -132,14 +145,16 @@ pub fn codepoint_at_pos(code: &Wtf8, pos: usize) -> CodePoint {
 /// code point by construction, and inherits `prev_codepoint_pos`'s handling of
 /// a `pos` one past the end.
 #[inline]
-pub fn codepoint_before_pos(code: &Wtf8, pos: usize) -> CodePoint {
+pub fn codepoint_before_pos(code: &Wtf8, pos: usize) -> i64 {
     codepoint_at_pos(code, prev_codepoint_pos(code, pos))
 }
 
 /// `CheckError` (`rutf8.py`) — the byte position `check_utf8` stopped at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckError {
-    pub pos: usize,
+    /// RPython `CheckError.pos` is a normal Signed integer. Keep the stored
+    /// field signed; convert only at Rust slice-index API boundaries.
+    pub pos: i64,
 }
 
 /// `_invalid_cont_byte` (`rutf8.py`) — a byte outside `0x80..=0xBF`, which
@@ -180,12 +195,15 @@ pub fn invalid_byte_2_of_4(ch1: u8, ch2: u8) -> bool {
 /// `_check_utf8`'s ones'-complement return and the `CheckError` its caller
 /// raises from it are one `Result` here.  Upstream's `start`/`stop` window is
 /// left out: every pyre caller validates a whole buffer.
-pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError> {
-    let end = s.len();
-    let mut pos = 0;
-    let mut continuation_bytes = 0;
+#[majit_macros::elidable]
+pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<i64, CheckError> {
+    // RPython's `start`, `stop`, `pos`, and return value are all Signed.
+    // Convert only where Rust's slice API requires an unsigned index.
+    let end = s.len() as i64;
+    let mut pos = 0i64;
+    let mut continuation_bytes = 0i64;
     while pos < end {
-        let ordch1 = s[pos];
+        let ordch1 = s[pos as usize];
         pos += 1;
         // fast path for ASCII
         if ordch1 <= 0x7F {
@@ -198,7 +216,7 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError>
             if pos >= end {
                 return Err(CheckError { pos: pos - 1 });
             }
-            let ordch2 = s[pos];
+            let ordch2 = s[pos as usize];
             pos += 1;
             if invalid_cont_byte(ordch2) {
                 return Err(CheckError { pos: pos - 2 });
@@ -210,8 +228,8 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError>
             if pos + 2 > end {
                 return Err(CheckError { pos: pos - 1 });
             }
-            let ordch2 = s[pos];
-            let ordch3 = s[pos + 1];
+            let ordch2 = s[pos as usize];
+            let ordch3 = s[(pos + 1) as usize];
             pos += 2;
             if invalid_byte_2_of_3(ordch1, ordch2, allow_surrogates) || invalid_cont_byte(ordch3) {
                 return Err(CheckError { pos: pos - 3 });
@@ -223,9 +241,9 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<usize, CheckError>
             if pos + 3 > end {
                 return Err(CheckError { pos: pos - 1 });
             }
-            let ordch2 = s[pos];
-            let ordch3 = s[pos + 1];
-            let ordch4 = s[pos + 2];
+            let ordch2 = s[pos as usize];
+            let ordch3 = s[(pos + 1) as usize];
+            let ordch4 = s[(pos + 2) as usize];
             pos += 3;
             if invalid_byte_2_of_4(ordch1, ordch2)
                 || invalid_cont_byte(ordch3)
@@ -266,7 +284,7 @@ pub fn wtf8_from_bytes(s: &[u8], allow_surrogates: bool) -> Result<&Wtf8, CheckE
         return match std::str::from_utf8(s) {
             Ok(valid) => Ok(Wtf8::new(valid)),
             Err(error) => Err(CheckError {
-                pos: error.valid_up_to(),
+                pos: error.valid_up_to() as i64,
             }),
         };
     }
@@ -278,7 +296,7 @@ pub fn wtf8_from_bytes(s: &[u8], allow_surrogates: bool) -> Result<&Wtf8, CheckE
         // may follow before the scan resumes.
         match s[pos..] {
             [0xED, 0xA0..=0xBF, 0x80..=0xBF, ..] => pos += 3,
-            _ => return Err(CheckError { pos }),
+            _ => return Err(CheckError { pos: pos as i64 }),
         }
     }
     // SAFETY: every sequence in `s` is well formed, and admitting the
@@ -291,6 +309,7 @@ pub fn wtf8_from_bytes(s: &[u8], allow_surrogates: bool) -> Result<&Wtf8, CheckE
 ///
 /// Counts the bytes that are *not* continuation bytes, which upstream spells as
 /// a signed-char comparison against `-0x40`.
+#[majit_macros::elidable]
 pub fn codepoints_in_utf8(value: &Wtf8, start: usize, end: usize) -> usize {
     let value = value.as_bytes();
     let end = end.min(value.len());
@@ -351,6 +370,7 @@ pub fn create_utf8_index_storage(utf8: &Wtf8, utf8len: usize) -> Utf8IndexStorag
 /// `codepoint_position_at_index` (`rutf8.py`) — the byte offset of code
 /// point `index`, which must not exceed the string's code point count.
 #[inline]
+#[majit_macros::elidable]
 pub fn codepoint_position_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) -> usize {
     let elem = &storage[index >> 6];
     let bytepos = elem.baseindex as usize + elem.ofs[(index >> 2) & 0x0F] as usize;
@@ -369,7 +389,8 @@ pub fn codepoint_position_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: 
 /// elidable call; both spellings walk to the same byte offset, so this is the
 /// composition of the two.
 #[inline]
-pub fn codepoint_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) -> CodePoint {
+#[majit_macros::elidable]
+pub fn codepoint_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) -> i64 {
     codepoint_at_pos(utf8, codepoint_position_at_index(utf8, storage, index))
 }
 
@@ -380,6 +401,7 @@ pub fn codepoint_at_index(utf8: &Wtf8, storage: &[Utf8LocElem], index: usize) ->
 /// Upstream's leading `if bytepos < 0: return bytepos` guard carries `str.find`
 /// misses through; pyre's search returns `Option`, so the caller handles a miss
 /// and this takes an offset that is always real.
+#[majit_macros::elidable]
 pub fn codepoint_index_at_byte_position(
     utf8: &Wtf8,
     storage: &[Utf8LocElem],
@@ -446,7 +468,7 @@ pub fn codepoint_index_at_byte_position(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpython_wtf8::Wtf8Buf;
+    use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
     #[test]
     fn check_utf8_counts_code_points() {
@@ -567,11 +589,12 @@ mod tests {
         // walks to, which is the disagreement the whole check exists to stop.
         let buf = Wtf8Buf::from_string("a\u{e9}\u{4e2d}\u{10000}".repeat(40));
         let len = check_utf8(buf.as_bytes(), true).unwrap();
-        assert_eq!(len, buf.code_points().count());
+        assert_eq!(len, buf.code_points().count() as i64);
+        let len = len as usize;
         let storage = create_utf8_index_storage(&buf, len);
         assert_eq!(
             codepoint_at_index(&buf, &storage, len - 1),
-            buf.code_points().last().unwrap()
+            buf.code_points().last().unwrap().to_u32() as i64
         );
     }
 
@@ -672,8 +695,8 @@ mod tests {
                 let storage = create_utf8_index_storage(&buf, expected.len());
                 for (index, &cp) in expected.iter().enumerate() {
                     assert_eq!(
-                        codepoint_at_index(&buf, &storage, index).to_u32(),
-                        cp.to_u32(),
+                        codepoint_at_index(&buf, &storage, index),
+                        cp.to_u32() as i64,
                         "{kind} * {repeat}, index {index}",
                     );
                 }

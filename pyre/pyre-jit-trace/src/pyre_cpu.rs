@@ -282,7 +282,11 @@ impl Cpu for PyreCpu {
         if storage.is_null() {
             return s.code_points().nth(i).map(|c| c.to_u32() as i64);
         }
-        Some(pyre_object::rutf8::codepoint_at_index(s, unsafe { &*storage }, i).to_u32() as i64)
+        Some(pyre_object::rutf8::codepoint_at_index(
+            s,
+            unsafe { &*storage },
+            i,
+        ))
     }
 }
 

@@ -48,6 +48,26 @@ pub mod deque_block {
 
 use deque_block::W_DequeBlock;
 
+/// `interp_deque.py Lock`: a fieldless GC object used only as an identity
+/// token.  It is deliberately an object, not a counter — `W_Deque.lock` and
+/// each iterator hold the same token until a mutation replaces the deque field
+/// with `None`, exactly like PyPy.
+pub mod deque_lock {
+    use pyre_object::*;
+
+    #[crate::pyre_class("_collections._deque_lock")]
+    pub struct W_DequeLock {}
+
+    pub fn new() -> PyObjectRef {
+        W_DequeLock::allocate_stable(W_DequeLock {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+        })
+    }
+}
+
 /// `pypy/module/_collections/interp_deque.py` — `W_Deque` surface
 /// (append / appendleft / pop / popleft / clear / extend / extendleft /
 /// rotate / count / remove / reverse / index / copy + container and repr
@@ -63,8 +83,9 @@ pub struct W_Deque {
     len: i64,
     /// Bound: `-1` = unbounded, `>= 0` = the maxlen. Validated non-negative at `__init__`.
     maxlen: i64,
-    /// Lightweight iteration-lock counter (`interp_deque.py` `state`); bumped on every mutation.
-    state: i64,
+    /// `interp_deque.py W_Deque.lock`: `None` until observed, then a unique
+    /// fieldless `Lock` identity; every mutation stores `None` again.
+    lock: PyObjectRef,
     /// PyPy `BaseUserClassMapdict` indexed storage for a deque subclass's
     /// app-level `__slots__`.  The translated user layout owns these values;
     /// pyre's fixed native payload keeps the equivalent object-resident list.
@@ -147,22 +168,19 @@ pub(crate) fn is_deque(obj: PyObjectRef) -> bool {
 
 /// Read one app-level `__slots__` entry from a deque subclass.
 pub(crate) unsafe fn deque_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    unsafe { pyre_object::slots::slot_get(obj, index, deque_slots_field) }
+    let slots = unsafe { (*(obj as *const W_Deque)).w_slots };
+    unsafe { pyre_object::slots::slot_get(slots, index) }
 }
 
 /// Write one app-level `__slots__` entry on a deque subclass.
 pub(crate) unsafe fn deque_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    unsafe { pyre_object::slots::slot_set(obj, index, value, deque_slots_field) }
+    pyre_object::slot_set_direct!(obj, index, value, W_Deque, w_slots)
 }
 
 /// Clear one app-level `__slots__` entry on a deque subclass.
 pub(crate) unsafe fn deque_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    unsafe { pyre_object::slots::slot_del(obj, index, deque_slots_field) }
-}
-
-/// Address of `W_Deque::w_slots` for the shared native-subclass slot helpers.
-unsafe fn deque_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
-    unsafe { &mut (*(obj as *mut W_Deque)).w_slots }
+    let slots = unsafe { (*(obj as *const W_Deque)).w_slots };
+    unsafe { pyre_object::slots::slot_del(slots, index) }
 }
 
 /// Snapshot the backing list into a `Vec`.
@@ -237,47 +255,58 @@ fn clear_blocks(self_obj: PyObjectRef) {
     modified(self_obj);
 }
 
-/// `interp_deque.py modified` — lightweight iteration lock.  Any
-/// mutation invalidates the outstanding lock so an in-progress
-/// `count` / `index` / `remove` / `__contains__` / comparison detects
-/// it.  PyPy invalidates a `Lock` object identity; pyre realizes the
-/// same as a monotonic `state` counter: every mutation bumps it, and
-/// `checklock` raises when the snapshot no longer matches.
-fn lock_state(self_obj: PyObjectRef) -> i64 {
-    // Volatile read: a `checklock` re-read must observe a `state` bump made
-    // by a re-entrant mutation from an intervening user callback (`eq_w`).
-    // A plain field read is cached across that callback because the payload
-    // escaped and is mutated through a non-receiver pointer, which the
-    // `&self`/`&mut self` receiver's aliasing guarantee forbids the compiler
-    // from expecting.
-    let base = self_obj as *const W_Deque;
-    if base.is_null() {
-        return 0;
-    }
-    unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*base).state)) }
-}
-
+/// `interp_deque.py modified`: invalidate the current identity token.
 fn modified(self_obj: PyObjectRef) {
-    // Volatile bump paired with `lock_state`'s volatile read (see there).
     let base = self_obj as *mut W_Deque;
     if base.is_null() {
         return;
     }
-    unsafe {
-        let p = std::ptr::addr_of_mut!((*base).state);
-        std::ptr::write_volatile(p, std::ptr::read_volatile(p).wrapping_add(1));
+    unsafe { (*base).lock = PY_NULL };
+}
+
+/// `interp_deque.py getlock`: lazily install and return one identity token.
+///
+/// This STORES into `self.lock` on the first call, exactly as upstream's
+/// `self.lock = Lock()` does, so every method that reaches it owns the deque
+/// mutably — `_find_or_count`, `index`, `iter` and `compare` all call
+/// `self.getlock()` upstream.  A `&self` receiver here would let rustc mark
+/// the parameter `noalias readonly` and then store through it.
+fn getlock(self_obj: PyObjectRef) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let self_obj = pyre_object::gc_roots::pin_root(self_obj);
+    let _deque_guard = unsafe { w_deque_lock(self_obj) };
+    let base = self_obj as *mut W_Deque;
+    if base.is_null() {
+        return PY_NULL;
     }
+    let current = unsafe { (*base).lock };
+    if !current.is_null() {
+        return current;
+    }
+    let token = deque_lock::new();
+    unsafe { (*base).lock = token };
+    token
 }
 
-/// `interp_deque.py getlock` — snapshot the current lock token.
-fn getlock(self_obj: PyObjectRef) -> i64 {
-    lock_state(self_obj)
+/// `lock is not self.lock` — the identity test inside `interp_deque.py`'s
+/// `checklock`, split out so the raise can stay in the caller.
+// Keep the native interpreter's post-callback read out of the caller's alias
+// scope.  This is not a JIT opacity hint: source translation still sees the
+// ordinary field read below, exactly like PyPy's `lock is self.lock`.
+#[inline(never)]
+fn lock_valid(self_obj: PyObjectRef, lock: PyObjectRef) -> bool {
+    let current = if self_obj.is_null() {
+        PY_NULL
+    } else {
+        unsafe { (*(self_obj as *const W_Deque)).lock }
+    };
+    current == lock
 }
 
-/// `interp_deque.py checklock` — raise `RuntimeError` if the deque
-/// was mutated since `lock` was taken.
-fn checklock(self_obj: PyObjectRef, lock: i64) -> Result<(), crate::PyError> {
-    if lock_state(self_obj) != lock {
+/// `interp_deque.py checklock` — raise `RuntimeError` if the deque was
+/// mutated since `lock` was taken.
+fn checklock(self_obj: PyObjectRef, lock: PyObjectRef) -> Result<(), crate::PyError> {
+    if !lock_valid(self_obj, lock) {
         return Err(crate::PyError::runtime_error(
             "deque mutated during iteration",
         ));
@@ -319,7 +348,7 @@ pub mod deque_iter {
         block: PyObjectRef,
         index: i64,
         counter: i64,
-        lock: i64,
+        lock: PyObjectRef,
     }
 
     fn constructor_args(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
@@ -394,20 +423,20 @@ pub mod deque_iter {
 
     pub fn make(deque: PyObjectRef, requested: i64) -> PyObjectRef {
         let _ = type_object();
-        let (len, mut block_obj, mut index) = W_Deque::from_obj(deque)
-            .map(|deque| (deque.len, deque.leftblock, deque.leftindex))
-            .unwrap_or((0, PY_NULL, 0));
-        let requested_index = requested.max(0);
-        let mut remaining = requested_index;
-        while remaining > 0 && remaining < len {
-            let available = BLOCKLEN - index;
-            if remaining < available {
-                index += remaining;
-                remaining = 0;
-            } else {
-                remaining -= available;
-                block_obj = block(block_obj).rightlink;
-                index = 0;
+        // `W_DequeIter.__init__` receives an already-checked W_Deque and reads
+        // these attributes directly; do not manufacture an Option/tuple
+        // side-shape that has no counterpart in the RPython graph.
+        let deque_ref = unsafe { &*(deque as *const W_Deque) };
+        let len = deque_ref.len;
+        let mut block_obj = deque_ref.leftblock;
+        let mut index = deque_ref.leftindex;
+        let mut counter = len;
+        // `W_DequeIter._move_to`: a negative pickle index leaves the freshly
+        // initialized iterator alone; a live position is located in one step.
+        if requested >= 0 {
+            counter = len - requested;
+            if counter > 0 {
+                (block_obj, index) = super::locate(deque, requested);
             }
         }
         let _roots = pyre_object::gc_roots::push_roots();
@@ -420,7 +449,7 @@ pub mod deque_iter {
             deque,
             block: block_obj,
             index,
-            counter: len - requested_index,
+            counter,
             lock: getlock(deque),
         })
     }
@@ -447,7 +476,7 @@ pub mod deque_rev_iter {
         block: PyObjectRef,
         index: i64,
         counter: i64,
-        lock: i64,
+        lock: PyObjectRef,
     }
 
     #[crate::pyre_methods]
@@ -514,20 +543,18 @@ pub mod deque_rev_iter {
 
     pub fn make(deque: PyObjectRef, requested: i64) -> PyObjectRef {
         let _ = type_object();
-        let (len, mut block_obj, mut index) = W_Deque::from_obj(deque)
-            .map(|deque| (deque.len, deque.rightblock, deque.rightindex))
-            .unwrap_or((0, PY_NULL, 0));
-        let offset = requested.max(0);
-        let mut remaining = offset;
-        while remaining > 0 && remaining < len {
-            let available = index + 1;
-            if remaining < available {
-                index -= remaining;
-                remaining = 0;
-            } else {
-                remaining -= available;
-                block_obj = block(block_obj).leftlink;
-                index = BLOCKLEN - 1;
+        // PyPy's reverse iterator likewise reads its checked deque directly.
+        let deque_ref = unsafe { &*(deque as *const W_Deque) };
+        let len = deque_ref.len;
+        let mut block_obj = deque_ref.rightblock;
+        let mut index = deque_ref.rightindex;
+        let mut counter = len;
+        // `W_DequeRevIter._move_to` locates from the left using the remaining
+        // length, rather than maintaining a second reverse block walk.
+        if requested >= 0 {
+            counter = len - requested;
+            if counter > 0 {
+                (block_obj, index) = super::locate(deque, counter - 1);
             }
         }
         let _roots = pyre_object::gc_roots::push_roots();
@@ -540,7 +567,7 @@ pub mod deque_rev_iter {
             deque,
             block: block_obj,
             index,
-            counter: len - offset,
+            counter,
             lock: getlock(deque),
         })
     }
@@ -563,7 +590,7 @@ pub mod deque_rev_iter {
 fn extend_from_iterable(
     self_obj: PyObjectRef,
     iterable: PyObjectRef,
-    append: fn(PyObjectRef, PyObjectRef),
+    is_extend_right: bool,
 ) -> Result<(), crate::PyError> {
     let items = crate::builtins::collect_iterable(iterable)?;
     let _roots = pyre_object::gc_roots::push_roots();
@@ -571,10 +598,17 @@ fn extend_from_iterable(
     let _ = pyre_object::gc_roots::pin_root(self_obj);
     let item_base = pyre_object::gc_roots::pin_roots(&items);
     for index in 0..items.len() {
-        append(
-            pyre_object::gc_roots::shadow_stack_get(deque_slot),
-            pyre_object::gc_roots::shadow_stack_get(item_base + index),
-        );
+        let deque = pyre_object::gc_roots::shadow_stack_get(deque_slot);
+        let item = pyre_object::gc_roots::shadow_stack_get(item_base + index);
+        // interp_deque.py:_extend keeps `is_extend_right` as the green
+        // direction and performs the direct append/appendleft dispatch in
+        // the loop.  Preserve that shape instead of passing a Rust function
+        // pointer, which invents an indirect call that RPython never has.
+        if is_extend_right {
+            append_right(deque, item);
+        } else {
+            append_left(deque, item);
+        }
     }
     Ok(())
 }
@@ -915,7 +949,7 @@ impl W_Deque {
             rightindex: CENTER,
             len: 0,
             maxlen: -1,
-            state: 0,
+            lock: PY_NULL,
             w_slots: PY_NULL,
         })
     }
@@ -956,14 +990,14 @@ impl W_Deque {
         // Reinitialize by clearing, but only when non-empty (`init`:
         // `if self.len > 0: self.clear()`). `store` bumps the iteration lock
         // (`modified`) so an outstanding scan of an existing deque detects the
-        // reset; an already-empty deque leaves `state` untouched, so re-init
+        // reset; an already-empty deque leaves `lock` untouched, so re-init
         // while iterating an empty deque yields StopIteration, not a mutation
         // RuntimeError.
         if deque_len(self_obj) > 0 {
             clear_blocks(self_obj);
         }
         if let Some(it) = iterable {
-            extend_from_iterable(self_obj, it, append_right)?;
+            extend_from_iterable(self_obj, it, true)?;
         }
         Ok(())
     }
@@ -989,16 +1023,16 @@ impl W_Deque {
     }
     fn extend(&mut self, iterable: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
-        extend_from_iterable(self_obj, iterable, append_right)
+        extend_from_iterable(self_obj, iterable, true)
     }
     fn extendleft(&mut self, iterable: PyObjectRef) -> Result<(), crate::PyError> {
         let self_obj = self as *mut W_Deque as PyObjectRef;
         // Each element is appended on the left, so the result is
         // the reverse of `iterable`.
-        extend_from_iterable(self_obj, iterable, append_left)
+        extend_from_iterable(self_obj, iterable, false)
     }
-    fn count(&self, x: PyObjectRef) -> Result<i64, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn count(&mut self, x: PyObjectRef) -> Result<i64, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         let lock = getlock(self_obj);
         let mut n = 0i64;
         for it in snapshot(self_obj) {
@@ -1021,7 +1055,7 @@ impl W_Deque {
             // IndexError (PyPy's older block-list port reports RuntimeError).
             // The comparison may have cleared or otherwise resized the live
             // deque, so do not continue against the stale snapshot.
-            if lock_state(self_obj) != lock {
+            if !lock_valid(self_obj, lock) {
                 return Err(crate::PyError::index_error(
                     "deque mutated during iteration",
                 ));
@@ -1040,7 +1074,7 @@ impl W_Deque {
                 // so a mutation that landed after the last comparison is
                 // reported rather than silently overwritten by the snapshot.
                 let _deque_guard = unsafe { w_deque_lock(self_obj) };
-                if lock_state(self_obj) != lock {
+                if !lock_valid(self_obj, lock) {
                     return Err(crate::PyError::index_error(
                         "deque mutated during iteration",
                     ));
@@ -1054,8 +1088,8 @@ impl W_Deque {
             )),
         }
     }
-    fn __contains__(&self, x: PyObjectRef) -> Result<bool, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __contains__(&mut self, x: PyObjectRef) -> Result<bool, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         let lock = getlock(self_obj);
         for it in snapshot(self_obj) {
             let equal = crate::baseobjspace::eq_w(it, x)?;
@@ -1135,12 +1169,12 @@ impl W_Deque {
         Ok(())
     }
     fn index(
-        &self,
+        &mut self,
         x: PyObjectRef,
         start: Option<PyObjectRef>,
         stop: Option<PyObjectRef>,
     ) -> Result<i64, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         let items = snapshot(self_obj);
         let len = items.len() as i64;
         // `space.iter(self)` takes the lock before `unwrap_start_stop`,
@@ -1224,12 +1258,12 @@ impl W_Deque {
         let self_obj = self as *const W_Deque as PyObjectRef;
         deque_len(self_obj)
     }
-    fn __iter__(&self) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __iter__(&mut self) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         Ok(deque_iter::make(self_obj, 0))
     }
-    fn __reversed__(&self) -> PyObjectRef {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __reversed__(&mut self) -> PyObjectRef {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_rev_iter::make(self_obj, 0)
     }
     fn __getitem__(&self, index: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
@@ -1272,28 +1306,28 @@ impl W_Deque {
         store(self_obj, items);
         Ok(())
     }
-    fn __eq__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __eq__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Eq)
     }
-    fn __ne__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __ne__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Ne)
     }
-    fn __lt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __lt__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Lt)
     }
-    fn __le__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __le__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Le)
     }
-    fn __gt__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __gt__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Gt)
     }
-    fn __ge__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
-        let self_obj = self as *const W_Deque as PyObjectRef;
+    fn __ge__(&mut self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+        let self_obj = self as *mut W_Deque as PyObjectRef;
         deque_compare(self_obj, other, crate::baseobjspace::CompareOp::Ge)
     }
     fn __add__(&self, other: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {

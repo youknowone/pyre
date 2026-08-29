@@ -1935,6 +1935,7 @@ impl FlowContext {
                     BuiltinException::UnicodeDecodeError => "UnicodeDecodeError",
                     BuiltinException::ZeroDivisionError => "ZeroDivisionError",
                     BuiltinException::OverflowError => "OverflowError",
+                    BuiltinException::MemoryError => "MemoryError",
                     BuiltinException::IndexError => "IndexError",
                     BuiltinException::KeyError => "KeyError",
                     BuiltinException::StopIteration => "StopIteration",

@@ -345,20 +345,6 @@ impl W_ListObject {
         self.allocated = self.resized_allocation(old_size, self.live_len()) as isize;
     }
 
-    /// Borrow a slice over object-strategy items. Must only be called
-    /// when `self.strategy == ListStrategy::Object`.
-    #[inline]
-    unsafe fn object_items_slice(&self) -> &[PyObjectRef] {
-        let base = items_block_items_base(self.items);
-        std::slice::from_raw_parts(base, self.length_relaxed())
-    }
-
-    #[inline]
-    unsafe fn object_items_slice_mut(&mut self) -> &mut [PyObjectRef] {
-        let base = items_block_items_base(self.items);
-        std::slice::from_raw_parts_mut(base, self.length_relaxed())
-    }
-
     #[inline]
     unsafe fn object_items_capacity(&self) -> usize {
         items_block_capacity(self.items)
@@ -711,7 +697,26 @@ impl W_ListObject {
         // new reference, so it owes the same barrier as the shifts above.
         let obj = list_before_move_barrier(self as *mut W_ListObject as PyObjectRef);
         let this = &mut *(obj as *mut W_ListObject);
-        this.object_items_slice_mut().reverse();
+        // `rlist.py`'s `ll_reverse` operates on the logical list directly
+        // through ll_getitem_fast / ll_setitem_fast. Keep that shape here
+        // instead of manufacturing a Rust fat slice over the over-allocated
+        // items block.
+        //
+        // Its `@jit.look_inside_iff(lambda l: jit.isvirtual(l) and
+        // jit.isconstant(l.ll_length()))` is not carried: pyre has no
+        // `jit.isvirtual` / `jit.isconstant` intrinsic, so the predicate
+        // cannot be spelled — the same gap the four `look_inside_iff` notes
+        // in `dictmultiobject.rs` record.
+        let base = items_block_items_base(this.items);
+        let mut i = 0;
+        let mut length_1_i = this.length_relaxed() as isize - 1;
+        while i < length_1_i {
+            let tmp = *base.add(i as usize);
+            *base.add(i as usize) = *base.add(length_1_i as usize);
+            *base.add(length_1_i as usize) = tmp;
+            i += 1;
+            length_1_i -= 1;
+        }
     }
 
     unsafe fn object_drain(&mut self, range: std::ops::Range<usize>) {
@@ -806,7 +811,13 @@ impl W_ListObject {
     }
 
     unsafe fn object_to_vec(&self) -> Vec<PyObjectRef> {
-        self.object_items_slice().to_vec()
+        let base = items_block_items_base(self.items);
+        let length = self.length_relaxed();
+        let mut result = Vec::with_capacity(length);
+        for i in 0..length {
+            result.push(*base.add(i));
+        }
+        result
     }
 
     /// Free the current `items` block and install a freshly allocated
@@ -1098,22 +1109,23 @@ fn boxed_from_int_or_float(values: &[i64]) -> Vec<PyObjectRef> {
         };
         let _ = crate::gc_roots::pin_root(item);
     }
-    (0..values.len())
-        .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(crate::gc_roots::shadow_stack_get(root_base + i));
+    }
+    items
 }
 
 /// listobject.py IntegerListStrategy.switch_to_int_or_float_strategy.
 unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
-    let Some(values) = list
-        .int_items
-        .as_slice()
-        .iter()
-        .map(|&value| int_or_float_encode_int(value))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
+    let source = list.int_items.as_slice();
+    let mut values = Vec::with_capacity(source.len());
+    for &value in source {
+        let Some(encoded) = int_or_float_encode_int(value) else {
+            return false;
+        };
+        values.push(encoded);
+    }
     list.int_items.install(IntArray::from_vec(values));
     list.strategy = ListStrategy::IntOrFloat;
     true
@@ -1121,30 +1133,50 @@ unsafe fn integer_to_int_or_float(list: &mut W_ListObject) -> bool {
 
 /// listobject.py FloatListStrategy.switch_to_int_or_float_strategy.
 unsafe fn float_to_int_or_float(list: &mut W_ListObject) -> bool {
-    let Some(values) = list
-        .float_items
-        .as_slice()
-        .iter()
-        .map(|&value| int_or_float_encode_float(value))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
+    let source = list.float_items.as_slice();
+    let mut values = Vec::with_capacity(source.len());
+    for &value in source {
+        let Some(encoded) = int_or_float_encode_float(value) else {
+            return false;
+        };
+        values.push(encoded);
+    }
     list.int_items.install(IntArray::from_vec(values));
     list.float_items.install(FloatArray::from_vec(Vec::new()));
     list.strategy = ListStrategy::IntOrFloat;
     true
 }
 
+/// Wrap an unboxed run into objects, the preallocate-and-index shape
+/// `listobject.py`'s `getitems_copy` uses.
+///
+/// The loop shape matches; the BODY does not. Upstream reuses one wrapper
+/// across a run of consecutive-equal unwrapped values —
+/// `if jit.we_are_jitted() or not self._quick_cmp(item, prevvalue)` guards
+/// the re-wrap, with `_quick_cmp` being `a == b` for `IntegerListStrategy`
+/// and `a is b` for `ObjectListStrategy`. pyre wraps every element, so
+/// `[1000] * 3` promoted out of the integer strategy yields three distinct
+/// objects where upstream's interpreter yields three references to one.
+///
+/// Not ported here because upstream itself gives the reuse up under
+/// `jit.we_are_jitted()`, so the identity is not a stable observable to
+/// match; porting it means carrying `prevvalue`/`_quick_cmp` per strategy.
+/// The two hints on the same function — `getitems_unroll =
+/// jit.unroll_safe(...)` and `getitems_copy = jit.look_inside_iff(lambda
+/// self, w_list: w_list._unrolling_heuristic())(...)` — are likewise absent;
+/// `look_inside_iff` needs `jit.isvirtual`/`isconstant`, which pyre has no
+/// intrinsic for yet.
 fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     for &value in values {
         let _ = crate::gc_roots::pin_root(w_int_new(value));
     }
-    (0..values.len())
-        .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(crate::gc_roots::shadow_stack_get(root_base + i));
+    }
+    items
 }
 
 fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
@@ -1153,9 +1185,11 @@ fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
     for &value in values {
         let _ = crate::gc_roots::pin_root(w_float_new(value));
     }
-    (0..values.len())
-        .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-        .collect()
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(crate::gc_roots::shadow_stack_get(root_base + i));
+    }
+    items
 }
 
 #[inline]
@@ -1223,9 +1257,7 @@ unsafe fn boxed_from_ascii(obj_slot: usize) -> Vec<PyObjectRef> {
 /// non-numeric element, so its unboxed backing storage is bulk re-boxed into
 /// an Object-strategy items block one time.
 ///
-/// `dont_look_inside`: the transition drives Vec/collect allocation the tracer
-/// cannot model — `boxed_from_ints` / `boxed_from_floats` build a fresh
-/// `Vec<PyObjectRef>` via `.map(...).collect()`, and
+/// `dont_look_inside`: the transition drives bulk backing-storage replacement;
 /// `set_object_items_from_vec` / `IntArray::from_vec` / `FloatArray::from_vec`
 /// tear down the typed storage through raw-Vec construction. Residualize the
 /// whole cold transition via the registered fnaddr so the hot append/setitem
@@ -2227,13 +2259,13 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
             Some(w_int_new(range_list_item_unchecked(list, idx as usize)))
         }
         ListStrategy::Object => {
-            let items = list.object_items_slice();
-            let len = items.len() as i64;
+            let len = list.length_relaxed() as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
                 return None;
             }
-            Some(items[idx as usize])
+            let base = items_block_items_base(list.items);
+            Some(*base.add(idx as usize))
         }
         ListStrategy::Integer => {
             let len = ll_list_int_length(list) as i64;
@@ -2317,8 +2349,8 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             let value = prepare_list_ref_store(obj, value);
             let obj = crate::gc_roots::shadow_stack_get(root_base);
             let list = &mut *(obj as *mut W_ListObject);
-            let items = list.object_items_slice_mut();
-            items[idx as usize] = value;
+            let base = items_block_items_base(list.items);
+            *base.add(idx as usize) = value;
             true
         }
         ListStrategy::Integer => {
@@ -3160,10 +3192,7 @@ pub unsafe fn w_list_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
 pub unsafe fn w_list_object_items_ptr_len(obj: PyObjectRef) -> Option<(*const PyObjectRef, usize)> {
     let list = &*(obj as *const W_ListObject);
     match list.strategy {
-        ListStrategy::Object => {
-            let items = list.object_items_slice();
-            Some((items.as_ptr(), items.len()))
-        }
+        ListStrategy::Object => Some((items_block_items_base(list.items), list.length_relaxed())),
         _ => None,
     }
 }
@@ -3189,9 +3218,11 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
             for &v in items {
                 let _ = crate::gc_roots::pin_root(w_int_new(v));
             }
-            (0..items.len())
-                .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-                .collect()
+            let mut objects = Vec::with_capacity(items.len());
+            for i in 0..items.len() {
+                objects.push(crate::gc_roots::shadow_stack_get(root_base + i));
+            }
+            objects
         }
         ListStrategy::IntOrFloat => boxed_from_int_or_float(list.int_items.as_slice()),
         ListStrategy::Float => {
@@ -3201,9 +3232,11 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
             for &v in items {
                 let _ = crate::gc_roots::pin_root(w_float_new(v));
             }
-            (0..items.len())
-                .map(|i| crate::gc_roots::shadow_stack_get(root_base + i))
-                .collect()
+            let mut objects = Vec::with_capacity(items.len());
+            for i in 0..items.len() {
+                objects.push(crate::gc_roots::shadow_stack_get(root_base + i));
+            }
+            objects
         }
         ListStrategy::Bytes => {
             // The wraps allocate, so the list has to be reachable by slot for

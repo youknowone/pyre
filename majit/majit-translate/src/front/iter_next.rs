@@ -15,8 +15,11 @@
 //! lowered (in MIR) as a `__discriminant` read on `opt` plus a two-way
 //! `switchInt` (None = 0, Some = 1).  RPython's `next` op returns the
 //! element directly and raises `StopIteration` at exhaustion
-//! (`rpython/flowspace/operation.py` `next`; the annotator's
-//! `op.next.can_only_throw` is `[StopIteration, RuntimeError]`).  This
+//! (`Next.canraise = [StopIteration, RuntimeError]`,
+//! `rpython/flowspace/operation.py:594-599`; the annotator narrows that per
+//! container — `SomeIterator.next.can_only_throw` is the callable
+//! `_can_only_throw`, which appends `RuntimeError` only for a `SomeDict`
+//! container, `rpython/annotator/unaryop.py:811-829`).  This
 //! module rewrites the value-encoded Option diamond into that exception
 //! representation — the mirror of [`crate::front::result_exc`]'s
 //! `Result`/`?` rewrite.  The Option diamond is the same shape minus the
@@ -26,9 +29,9 @@
 //! gates on the iterator tracing back to an `iter` op
 //! (`originates_from_iter_op`), so only a list iterator reaches it, and
 //! `ListIteratorRepr::rtype_next` raises solely `StopIteration` — the
-//! block carries no catch-all propagation edge (the `RuntimeError` half
-//! of `next`'s conservative `can_only_throw` is dict-iterator mutation
-//! detection that never fires here, and `flowin` drops the unhandled
+//! block carries no catch-all propagation edge (the `RuntimeError` half is
+//! `Next.canraise`'s conservative pair, which `_can_only_throw` already
+//! drops for a non-dict container, and `flowin` drops the unhandled
 //! remainder).
 //!
 //! ## The rewrite (`rewire_one_next_site`)
@@ -332,8 +335,45 @@ fn stopiteration_exitcase() -> ExitCase {
     ExitCase::Const(ConstValue::builtin("StopIteration"))
 }
 
+/// Split the nullable-pointer form of an Option switch into `(None, Some)`.
+/// `front::mir::lower_niche_option_switch` closes `ptr != null` through
+/// `set_branch`, so false is None and true is Some.  This is the flow-graph
+/// shape RPython itself uses for a maybe-null pointer (`ptr_nonzero`).
+fn split_niche_bool_exits(exits: &[Link], name: &str) -> Result<(Link, Link), String> {
+    if exits.len() != 2 {
+        return Err(format!(
+            "{name}: niche Option switch has {} exits, expected 2",
+            exits.len()
+        ));
+    }
+    let mut none: Option<Link> = None;
+    let mut some: Option<Link> = None;
+    for link in exits {
+        match link.exitcase {
+            Some(ExitCase::Bool(false)) => none = Some(link.clone()),
+            Some(ExitCase::Bool(true)) => some = Some(link.clone()),
+            _ => {
+                return Err(format!(
+                    "{name}: niche Option switch has non-bool exit case {:?}",
+                    link.exitcase
+                ));
+            }
+        }
+    }
+    match (none, some) {
+        (Some(none), Some(some)) => Ok((none, some)),
+        _ => Err(format!(
+            "{name}: niche Option switch lacks the false/true pair"
+        )),
+    }
+}
+
 fn int_const(i: i64) -> LinkArg {
     LinkArg::Const(Constant::new(ConstValue::Int(i)))
+}
+
+fn bool_const(value: bool) -> LinkArg {
+    LinkArg::Const(Constant::new(ConstValue::Bool(value)))
 }
 
 /// Rewrite every recorded `next()` call site into the `next` op +
@@ -527,34 +567,132 @@ fn rewire_one_next_site(
         .map_err(|e| format!("{name}: next call block exit: {e}"))?;
     assert_single_pred(graph, c, &name)?;
 
-    // Block C: `d = opt.__discriminant`; `switch d { 0 → None, 1 → Some }`.
-    let (disc_idx, disc_var) = graph.blocks[c]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == opt_c && field.name == "__discriminant" =>
-            {
-                op.result.clone().map(|r| (i, r))
+    // Block C has one of the two representation-faithful Option tests:
+    //
+    // * aggregate Option: `d = opt.__discriminant`; switch 0/1;
+    // * one-word niche Option: `d = bool(opt != null_mut())`; switch false/true.
+    //
+    // The latter is `ptr_nonzero` in an RPython graph. Rust uses it for a
+    // by-value array/Vec iterator whose T is itself a non-null pointer. The
+    // front folds the niche before this post-pass runs, so accepting both
+    // shapes here is required for one list-iterator representation rather
+    // than a separate Rust-specific iterator path.
+    let aggregate_disc =
+        graph.blocks[c]
+            .operations
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if *base == opt_c && field.name == "__discriminant" =>
+                {
+                    op.result.clone().map(|r| (i, r))
+                }
+                _ => None,
+            });
+    let (none_link, some_link, aggregate_payload, branch_value_vars) = if let Some((
+        disc_idx,
+        disc_var,
+    )) = aggregate_disc
+    {
+        match &graph.blocks[c].exitswitch {
+            Some(ExitSwitch::Value(v)) if *v == disc_var => {}
+            other => {
+                return Err(format!(
+                    "{name}: block {c} exitswitch {other:?} is not the Option discriminant switch"
+                ));
             }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: block {c} lacks the Option __discriminant read"))?;
-    match &graph.blocks[c].exitswitch {
-        Some(ExitSwitch::Value(v)) if *v == disc_var => {}
-        other => {
-            return Err(format!(
-                "{name}: block {c} exitswitch {other:?} is not the Option discriminant switch"
-            ));
         }
-    }
-    // Block C is bypassed; only the discriminant read may carry an effect.
-    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
-
-    // Option discriminant: None = 0, Some = 1.  `split_diamond_exits`
-    // returns `(case 0, case 1)` = `(None arm, Some arm)`.
-    let (none_link, some_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+        // Block C is bypassed; only the discriminant read may carry an
+        // effect in the aggregate shape.
+        assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
+        let (none_link, some_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+        let branch_value_vars = vec![disc_var.clone()];
+        (none_link, some_link, true, branch_value_vars)
+    } else {
+        // Find `ne(opt_c, null)` and prove the other operand is the
+        // adjacent pure `core::ptr::null_mut` source the niche fold emits.
+        let (ne_idx, ne_var, null_var) = graph.blocks[c]
+                .operations
+                .iter()
+                .enumerate()
+                .find_map(|(i, op)| match (&op.kind, op.result.as_ref()) {
+                    (
+                        OpKind::BinOp {
+                            op,
+                            lhs,
+                            rhs,
+                            ..
+                        },
+                        Some(result),
+                    ) if op == "ne" && (*lhs == opt_c || *rhs == opt_c) => Some((
+                        i,
+                        result.clone(),
+                        if *lhs == opt_c {
+                            rhs.clone()
+                        } else {
+                            lhs.clone()
+                        },
+                    )),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{name}: block {c} lacks both an Option __discriminant read and a nullable-pointer test"
+                    )
+                })?;
+        let null_idx = graph.blocks[c]
+            .operations
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| {
+                (op.result.as_ref() == Some(&null_var)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            args,
+                            ..
+                        } if args.is_empty()
+                            && segments == &["core", "ptr", "null_mut"]
+                    ))
+                .then_some(i)
+            })
+            .ok_or_else(|| {
+                format!("{name}: block {c} nullable-pointer test has no null_mut source")
+            })?;
+        let (bool_idx, bool_var) = graph.blocks[c]
+            .operations
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| match (&op.kind, op.result.as_ref()) {
+                (OpKind::UnaryOp { op, operand, .. }, Some(result))
+                    if op == "bool" && *operand == ne_var =>
+                {
+                    Some((i, result.clone()))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| format!("{name}: block {c} nullable-pointer test lacks bool wrap"))?;
+        match &graph.blocks[c].exitswitch {
+            Some(ExitSwitch::Value(v)) if *v == bool_var => {}
+            other => {
+                return Err(format!(
+                    "{name}: block {c} exitswitch {other:?} is not the niche Option bool switch"
+                ));
+            }
+        }
+        assert_block_pure_besides(
+            graph,
+            c,
+            &[null_idx, ne_idx, bool_idx],
+            "nullable-pointer discriminant",
+            &name,
+        )?;
+        let (none_link, some_link) = split_niche_bool_exits(&graph.blocks[c].exits, &name)?;
+        let branch_value_vars = vec![ne_var, bool_var.clone()];
+        (none_link, some_link, false, branch_value_vars)
+    };
     let some_target = some_link.target;
     let none_target = none_link.target;
 
@@ -569,11 +707,21 @@ fn rewire_one_next_site(
             LinkArg::Value(v) => {
                 if *v == opt_c {
                     normal_args.push(LinkArg::Value(opt.clone()));
-                    payload_positions.push(i);
-                } else if *v == disc_var {
-                    normal_args.push(int_const(1));
+                    // Aggregate Some arms still read `__pos_0`; a nullable
+                    // pointer is already its payload, so there is no field
+                    // read to collapse in the niche form.
+                    if aggregate_payload {
+                        payload_positions.push(i);
+                    }
+                } else if branch_value_vars.contains(v) {
+                    normal_args.push(if aggregate_payload {
+                        int_const(1)
+                    } else {
+                        bool_const(true)
+                    });
                 } else {
-                    let v_a = back_substitute(graph, &[(a, c)], v, &name)?;
+                    let v_a = back_substitute(graph, &[(a, c)], v, &name)
+                        .map_err(|e| format!("{e}; Some-link source variable id {}", v.id()))?;
                     normal_args.push(LinkArg::Value(v_a));
                 }
             }
@@ -665,9 +813,16 @@ fn rewire_one_next_site(
         }
         match arg {
             LinkArg::Const(c0) => none_args.push(LinkArg::Const(c0.clone())),
-            LinkArg::Value(v) if *v == disc_var => none_args.push(int_const(0)),
+            LinkArg::Value(v) if branch_value_vars.contains(v) => {
+                none_args.push(if aggregate_payload {
+                    int_const(0)
+                } else {
+                    bool_const(false)
+                });
+            }
             LinkArg::Value(v) => {
-                let v_a = back_substitute(graph, &[(a, c)], v, &name)?;
+                let v_a = back_substitute(graph, &[(a, c)], v, &name)
+                    .map_err(|e| format!("{e}; None-link source variable id {}", v.id()))?;
                 none_args.push(LinkArg::Value(v_a));
             }
         }
@@ -844,5 +999,18 @@ mod tests {
                 "{recorded:?} element must not be retyped as a GC reference",
             );
         }
+    }
+
+    #[test]
+    fn nullable_pointer_option_exits_split_false_none_true_some() {
+        let none_target = crate::model::BlockId(3);
+        let some_target = crate::model::BlockId(4);
+        let exits = vec![
+            Link::new_mixed(Vec::new(), some_target, Some(ExitCase::Bool(true))),
+            Link::new_mixed(Vec::new(), none_target, Some(ExitCase::Bool(false))),
+        ];
+        let (none, some) = split_niche_bool_exits(&exits, "test").expect("split niche exits");
+        assert_eq!(none.target, none_target);
+        assert_eq!(some.target, some_target);
     }
 }

@@ -227,42 +227,6 @@ fn bigint_to_f64(a: BigInt) -> f64 {
     jit_bigint_to_f64_or_inf(&a)
 }
 
-/// `rbigint.bit_length` / `rbigint.bit_count` scalar residual core.
-///
-/// Both methods are `@jit.elidable` and can raise OverflowError through
-/// RPython's `ovfcheck`, so these wrappers publish the exception for the
-/// trailing `GUARD_NO_EXCEPTION` instead of using a cannot-raise residual.
-#[inline]
-fn bigint_checked_scalar(value: &BigInt, bit_count: bool) -> i64 {
-    let result = if bit_count {
-        value.bit_count()
-    } else {
-        value.bit_length()
-    };
-    match result {
-        Ok(value) => value,
-        Err(majit_rlib::rbigint::RBigIntError::Overflow) => {
-            crate::runtime_ops::jit_publish_exception(
-                PyError::overflow_error("too many digits in integer").to_exc_object(),
-            );
-            0
-        }
-        Err(_) => unreachable!("bit_length/bit_count only raise OverflowError"),
-    }
-}
-
-#[majit_macros::elidable]
-pub extern "C" fn jit_bigint_bit_length(value: i64) -> i64 {
-    let value = unsafe { &*(value as *const BigInt) };
-    bigint_checked_scalar(value, false)
-}
-
-#[majit_macros::elidable]
-pub extern "C" fn jit_bigint_bit_count(value: i64) -> i64 {
-    let value = unsafe { &*(value as *const BigInt) };
-    bigint_checked_scalar(value, true)
-}
-
 /// RPython `_divrem`'s truncated quotient over two bare RBigInt payloads.
 /// Allocates the result via the COLLECTING nursery (a gcmap-rooted residual,
 /// its operand pointers rooted across the alloc), matching the arithmetic
@@ -2186,10 +2150,11 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
         return Err(PyError::new(PyErrorKind::MemoryError, ""));
     }
-    let mut items: Vec<PyObjectRef> = Vec::new();
-    items
-        .try_reserve_exact(cap)
-        .map_err(|_| PyError::new(PyErrorKind::MemoryError, ""))?;
+    // RPython `ll_mul` allocates the result through `ll_newlist(resultlen)`;
+    // the fallible Rust helper is translated as `newlist_hint(cap)`, keeping
+    // both the preallocation and its MemoryError edge without exposing
+    // `Vec::try_reserve_exact` to source translation.
+    let mut items: Vec<PyObjectRef> = crate::builtins::try_pyobject_vec_with_capacity(cap)?;
     for _ in 0..count {
         for i in 0..len {
             if let Some(item) = w_list_getitem(list, i as i64) {
@@ -3463,8 +3428,8 @@ pub fn mul(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
         // sequences.  A sequence subclass that overrides `__mul__`/`__rmul__`
         // must reach its override first — `LM([1]) * 2` is `LM.__mul__`, not a
         // list repetition — the same gate the concat branches of `add` apply.
-        const MUL_SPECIALS: &[&str] = &["__mul__", "__rmul__"];
-        if (seq_repeat_override(a, MUL_SPECIALS) || seq_repeat_override(b, MUL_SPECIALS))
+        if (seq_repeat_override(a, &["__mul__", "__rmul__"])
+            || seq_repeat_override(b, &["__mul__", "__rmul__"]))
             && let Some(result) =
                 try_dispatch_binary_special(&mut a, &mut b, "__mul__", "__rmul__")?
         {

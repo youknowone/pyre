@@ -1425,13 +1425,13 @@ fn a_scalar_element_indexes_to_an_int_banked_array_read() {
 
     let got = slot_read_shape("scalar_slot_get");
     assert_eq!(
-        got.residual_gets, 1,
-        "the `get` spelling leaves its call residual for a scalar element too",
+        got.residual_gets, 0,
+        "the scalar `get` spelling lowers to the guarded item read",
     );
-    assert!(
-        got.array_reads.is_empty(),
-        "the `get` spelling emits no ArrayRead, got {:?}",
+    assert_eq!(
         got.array_reads,
+        vec![ValueType::Int],
+        "the scalar `get` spelling reads the i64 payload in the int bank",
     );
 }
 

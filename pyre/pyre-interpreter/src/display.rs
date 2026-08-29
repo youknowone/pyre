@@ -154,16 +154,78 @@ pub(crate) fn format_float_repr(val: f64) -> String {
     rustpython_literal::float::to_string(val)
 }
 
-/// `repr`-style string escaping: pick the outer quote (prefer `'`, switch
-/// to `"` when the value contains `'` but not `"`), escape the backslash,
-/// the chosen quote, whitespace and non-printable code points, and render
-/// lone surrogates as `\uXXXX`. Delegates to the shared escape engine in
-/// `rustpython_literal::escape`.
+/// RPython `rfloat.formatd` residual ABI for the generated JIT.
+///
+/// Upstream returns one low-level `STR` GC pointer. The host formatter returns
+/// a three-word Rust `String`, so the source translator retargets only that
+/// formatter call to this wrapper and keeps the bytes in the managed
+/// length-prefixed block used for translated RPython strings.
+#[majit_macros::dont_look_inside]
+pub fn jit_format_float_repr_rstr(val: f64) -> *mut pyre_object::bytesobject::BytesBlock {
+    let text = rustpython_literal::float::to_string(val);
+    pyre_object::bytesobject::alloc_bytes_block(text.as_bytes())
+}
+
+/// `unicodedb.isprintable` in PyPy's `rutf8.make_utf8_escape_function` is a
+/// pure generated-table lookup.  Keep the same scalar call boundary around
+/// pyre's Unicode database provider, including the upstream guarantee that a
+/// lone surrogate is not printable.
+#[majit_macros::elidable_cannot_raise]
+fn repr_codepoint_is_printable(code: u32) -> bool {
+    char::from_u32(code).is_some_and(rustpython_unicode::classify::is_printable)
+}
+
+/// `rutf8.make_utf8_escape_function(pass_printable=True, quotes=True)` —
+/// choose the outer quote, then append printable code points or lowercase
+/// `\x` / `\u` / `\U` escapes to a StringBuilder.  PyPy marks the generated
+/// `_repr_function` `@jit.elidable`; preserve that call policy and keep the
+/// loop in interpreter source so source translation sees its real semantics.
+#[majit_macros::elidable]
 pub(crate) fn format_wtf8_repr(s: &Wtf8) -> String {
-    use rustpython_literal::escape::{Quote, UnicodeEscape};
-    let escape = UnicodeEscape::with_preferred_quote(s, Quote::Single);
-    let mut out = String::new();
-    escape.str_repr().write(&mut out).unwrap();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let quote = if s.as_bytes().contains(&b'\'') && !s.as_bytes().contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote as char);
+    let mut pos = 0;
+    while pos < s.len() {
+        let code = pyre_object::rutf8::codepoint_at_pos(s, pos) as u32;
+        if code == quote as u32 || code == b'\\' as u32 {
+            out.push('\\');
+            out.push(code as u8 as char);
+        } else if code == b'\t' as u32 {
+            out.push_str("\\t");
+        } else if code == b'\n' as u32 {
+            out.push_str("\\n");
+        } else if code == b'\r' as u32 {
+            out.push_str("\\r");
+        } else if repr_codepoint_is_printable(code) {
+            // A printable code point is necessarily a Unicode scalar (the
+            // helper rejects surrogates), so the conversion cannot fail.
+            out.push(char::from_u32(code).expect("printable code point is a scalar"));
+        } else {
+            let digits = if code >= 0x10000 {
+                out.push_str("\\U");
+                8
+            } else if code >= 0x100 {
+                out.push_str("\\u");
+                4
+            } else {
+                out.push_str("\\x");
+                2
+            };
+            let mut shift = digits * 4;
+            while shift != 0 {
+                shift -= 4;
+                out.push(HEX[((code >> shift) & 0x0f) as usize] as char);
+            }
+        }
+        pos = pyre_object::rutf8::next_codepoint_pos(s, pos);
+    }
+    out.push(quote as char);
     out
 }
 
@@ -198,6 +260,46 @@ pub(crate) fn bytearray_repr_string(data: &[u8], class_name: &str) -> String {
     }
     out.push(quote as char);
     out.push(')');
+    out
+}
+
+/// `bytesobject.py::string_escape_encode(data, quotes=True)` — bytes repr.
+/// PyPy chooses `"` only when the input contains `'` and not `"`, escapes
+/// the chosen quote and backslash, names tab/newline/carriage-return, and
+/// renders every other non-printable byte through the constant lowercase hex
+/// table.  Keep this loop in interpreter source so translation sees the same
+/// StringBuilder/character operations as PyPy instead of an opaque external
+/// Rust formatting iterator.
+#[majit_macros::elidable]
+pub(crate) fn bytes_repr_string(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let quote = if data.contains(&b'\'') && !data.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut out = String::with_capacity(data.len() + 2);
+    out.push('b');
+    out.push(quote as char);
+    for &c in data {
+        if c == b'\\' || c == quote {
+            out.push('\\');
+            out.push(c as char);
+        } else if c == b'\t' {
+            out.push_str("\\t");
+        } else if c == b'\r' {
+            out.push_str("\\r");
+        } else if c == b'\n' {
+            out.push_str("\\n");
+        } else if !(0x20..0x7f).contains(&c) {
+            out.push_str("\\x");
+            out.push(HEX[(c >> 4) as usize] as char);
+            out.push(HEX[(c & 0x0f) as usize] as char);
+        } else {
+            out.push(c as char);
+        }
+    }
+    out.push(quote as char);
     out
 }
 
@@ -320,8 +422,7 @@ pub unsafe fn dict_repr(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // taken before a collection addresses the pre-move object.
     let _roots = pyre_object::gc_roots::push_roots();
     let mut flat: Vec<PyObjectRef> = Vec::with_capacity(entries.len() * 2);
-    for i in 0..entries.len() {
-        let (k, v) = entries[i];
+    for &(k, v) in entries.as_slice() {
         flat.push(k);
         flat.push(v);
     }
@@ -902,10 +1003,7 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 // shared bytes escaper cannot express it.
                 bytearray_repr_string(data, "bytearray")
             } else {
-                let escape = rustpython_literal::escape::AsciiEscape::new_repr(data);
-                let mut body = String::new();
-                escape.bytes_repr().write(&mut body).unwrap();
-                body
+                bytes_repr_string(data)
             }
         } else if pyre_object::is_set_or_frozenset(obj) {
             return set_repr_wtf8(obj);
@@ -1073,11 +1171,13 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
                 }
             }
             let mut joined = Wtf8Buf::new();
-            for (index, part) in parts.iter().enumerate() {
-                if index > 0 {
+            let mut first = true;
+            for part in parts.as_slice() {
+                if !first {
                     joined.push_str(" | ");
                 }
                 joined.push_wtf8(part);
+                first = false;
             }
             return Ok(joined);
         } else if std::ptr::eq(tp, &pyre_object::GENERIC_ALIAS_TYPE as *const PyType) {
@@ -1709,10 +1809,18 @@ fn nt_drive_len(path: &[u8]) -> usize {
 fn basename_start(path: &[u8]) -> usize {
     let windows = cfg!(windows);
     let drive = if windows { nt_drive_len(path) } else { 0 };
-    path[drive..]
-        .iter()
-        .rposition(|&b| b == b'/' || (windows && b == b'\\'))
-        .map_or(drive, |i| drive + i + 1)
+    // `os.path.basename` bottoms out at the last separator search. Spell the
+    // same reverse index walk directly, as RPython's string `rfind` does,
+    // rather than introducing Rust's closure-bearing `Iter::rposition` graph.
+    let mut i = path.len();
+    while i > drive {
+        i -= 1;
+        let b = path[i];
+        if b == b'/' || (windows && b == b'\\') {
+            return i + 1;
+        }
+    }
+    drive
 }
 
 /// The WTF-8 carrying subset of `W_BaseException.descr_str`: a base
@@ -2217,7 +2325,45 @@ impl fmt::Display for PyDisplay {
 
 #[cfg(test)]
 mod tests {
-    use super::nt_drive_len;
+    use super::{
+        basename_start, bytes_repr_string, format_float_repr, format_wtf8_repr,
+        jit_format_float_repr_rstr, nt_drive_len,
+    };
+    use rustpython_wtf8::{CodePoint, Wtf8Buf};
+
+    #[test]
+    fn bytes_repr_matches_pypy_quote_and_escape_edges() {
+        assert_eq!(bytes_repr_string(b""), "b''");
+        assert_eq!(bytes_repr_string(b"a'b"), "b\"a'b\"");
+        assert_eq!(bytes_repr_string(b"a\"b"), "b'a\"b'");
+        assert_eq!(bytes_repr_string(b"a'\"b"), "b'a\\'\"b'");
+        assert_eq!(
+            bytes_repr_string(&[0, 9, 10, 13, 31, 32, 92, 126, 127, 255]),
+            "b'\\x00\\t\\n\\r\\x1f \\\\~\\x7f\\xff'"
+        );
+    }
+
+    #[test]
+    fn unicode_repr_matches_pypy_quote_printable_and_surrogate_edges() {
+        assert_eq!(format_wtf8_repr(Wtf8Buf::from("a'b").as_ref()), "\"a'b\"");
+        assert_eq!(format_wtf8_repr(Wtf8Buf::from("a\"b").as_ref()), "'a\"b'");
+        assert_eq!(
+            format_wtf8_repr(Wtf8Buf::from("\0\t\n\r ☃\u{e0020}").as_ref()),
+            "'\\x00\\t\\n\\r ☃\\U000e0020'"
+        );
+        let mut surrogate = Wtf8Buf::from("x");
+        surrogate.push(CodePoint::from_u32(0xd800).unwrap());
+        assert_eq!(format_wtf8_repr(&surrogate), "'x\\ud800'");
+    }
+
+    #[test]
+    fn float_repr_residual_returns_the_same_lowlevel_string_bytes() {
+        for value in [0.0, -0.0, 1.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let block = jit_format_float_repr_rstr(value);
+            let bytes = unsafe { pyre_object::bytesobject::bytes_block_chars(block) };
+            assert_eq!(bytes, format_float_repr(value).as_bytes());
+        }
+    }
 
     /// Every expectation is `len(ntpath.splitdrive(p)[0].encode())` for the
     /// same input.
@@ -2260,5 +2406,15 @@ mod tests {
         assert_eq!(nt_drive_len(br"\dir\enc.py"), 0);
         assert_eq!(nt_drive_len(b"enc.py"), 0);
         assert_eq!(nt_drive_len(b""), 0);
+    }
+
+    #[test]
+    fn basename_start_matches_platform_separator_search() {
+        assert_eq!(basename_start(b"dir/enc.py"), 4);
+        assert_eq!(basename_start(b"enc.py"), 0);
+        assert_eq!(basename_start(b"dir/"), 4);
+        assert_eq!(basename_start(b""), 0);
+        #[cfg(not(windows))]
+        assert_eq!(basename_start(br"dir\enc.py"), 0);
     }
 }

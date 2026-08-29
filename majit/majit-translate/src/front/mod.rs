@@ -4,7 +4,7 @@
 //!
 //! This module bridges **Rust source (`syn::ItemFn`)** to the **`FunctionGraph`** type that the rest of the codewriter pipeline (`jtransform`, `flatten`, `regalloc`, `liveness`, `assembler`) consumes.
 //!
-//! RPython has no direct counterpart. In upstream, `rpython/jit/codewriter/codewriter.py CodeWriter.make_jitcodes()` is handed `translator.graphs` — graphs already produced by `rpython/rtyper/` from RPython source. The codewriter never sees interpreter source files.
+//! RPython has no direct counterpart. In upstream, `rpython/jit/codewriter/codewriter.py` `CodeWriter.make_jitcodes()` (`:74-79`) takes only `verbose`: the graphs reach it through `self.callcontrol.enum_pending_graphs()`, already rtyped by `rpython/rtyper/` from RPython source. The codewriter never sees interpreter source files.
 //!
 //! pyre cannot inherit that assumption. Rust functions must become `FunctionGraph`s somewhere, and this module is where. Every file under `front/` is Rust-specific lowering that has no RPython structural match.
 //!
@@ -86,6 +86,7 @@ pub(crate) mod range_contains;
 pub(crate) mod range_iter;
 pub(crate) mod rbigint_call;
 pub(crate) mod result_exc;
+pub(crate) mod rfloat_call;
 pub(crate) mod saturating_sub;
 pub mod semantic;
 pub(crate) mod slice_first;

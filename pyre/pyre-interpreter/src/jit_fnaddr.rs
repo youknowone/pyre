@@ -1781,6 +1781,15 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::try_gc_collect_oldgen",
         pyre_object::gc_hook::try_gc_collect_oldgen,
     );
+    // `rgc.may_ignore_finalizer` is itself `@jit.dont_look_inside`; publish
+    // the matching interpreter helper so its opaque graph becomes a real
+    // residual call rather than a symbolic placeholder.
+    pa1(
+        &mut entries,
+        "pyre_interpreter::executioncontext::may_ignore_finalizer",
+        "pyre_interpreter::may_ignore_finalizer",
+        crate::executioncontext::may_ignore_finalizer,
+    );
     pa0(
         &mut entries,
         "pyre_object::object_array::itemsblock_gc_enabled",
@@ -1791,6 +1800,21 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         &mut entries,
         "pyre_interpreter::call::bump_frame_entry_count",
         crate::call::bump_frame_entry_count,
+    );
+    p1(
+        &mut entries,
+        "pyre_interpreter::call::eval_current_frame_raw",
+        crate::call::eval_current_frame_raw,
+    );
+    p1(
+        &mut entries,
+        "pyre_interpreter::display::jit_format_float_repr_rstr",
+        crate::display::jit_format_float_repr_rstr,
+    );
+    p1(
+        &mut entries,
+        "pyre_interpreter::typedef::jit_format_complex_component_repr_rstr",
+        crate::typedef::jit_format_complex_component_repr_rstr,
     );
     p0(
         &mut entries,
@@ -2168,16 +2192,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::longobject::jit_bigint_hash",
         "pyre_object::jit_bigint_hash",
         pyre_object::jit_bigint_hash,
-    );
-    cp1(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_bit_length",
-        crate::objspace::descroperation::jit_bigint_bit_length,
-    );
-    cp1(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_bit_count",
-        crate::objspace::descroperation::jit_bigint_bit_count,
     );
     pa1(
         &mut entries,
@@ -3886,6 +3900,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             &crate::function::SLOT_WRAPPER_TYPE as *const _ as i64,
         ),
         (
+            "function::METHOD_WRAPPER_TYPE",
+            &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64,
+        ),
+        (
             "function::METHOD_DESCRIPTOR_TYPE",
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const _ as i64,
         ),
@@ -3989,13 +4007,55 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "dictmultiobject::INT_DICT_STRATEGY",
             dictmultiobject::INT_DICT_STRATEGY
         ),
+        // A translated `W_DictObject.dstrategy` holds the address of the
+        // non-zero-sized holder, not the zero-sized strategy implementation.
+        // These are the concrete prebuilt instances corresponding to PyPy's
+        // `space.fromcache(StrategyClass)` results and are therefore GCREF
+        // constants in the translated graph, exactly like the implementation
+        // rows above but with the identity the live dict slot actually reads.
+        ref_addr!(
+            "dictmultiobject::OBJECT_DICT_STRATEGY_REF",
+            dictmultiobject::OBJECT_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::EMPTY_DICT_STRATEGY_REF",
+            dictmultiobject::EMPTY_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF",
+            dictmultiobject::EMPTY_KWARGS_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::BYTES_DICT_STRATEGY_REF",
+            dictmultiobject::BYTES_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::UNICODE_DICT_STRATEGY_REF",
+            dictmultiobject::UNICODE_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
+            "dictmultiobject::INT_DICT_STRATEGY_REF",
+            dictmultiobject::INT_DICT_STRATEGY_REF
+        ),
         ref_addr!(
             "identitydict::IDENTITY_DICT_STRATEGY",
             identitydict::IDENTITY_DICT_STRATEGY
         ),
         ref_addr!(
+            "identitydict::IDENTITY_DICT_STRATEGY_REF",
+            identitydict::IDENTITY_DICT_STRATEGY_REF
+        ),
+        ref_addr!(
             "kwargsdict::KWARGS_DICT_STRATEGY",
             kwargsdict::KWARGS_DICT_STRATEGY
+        ),
+        ref_addr!(
+            "kwargsdict::KWARGS_DICT_STRATEGY_REF",
+            kwargsdict::KWARGS_DICT_STRATEGY_REF
+        ),
+        (
+            "objspace::std::mapdict::MAP_DICT_STRATEGY_REF",
+            &crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
         ),
         // Prebuilt object singletons (`None` / `NotImplemented` /
         // `Ellipsis` / `True` / `False`).  The accessors `w_none`,
@@ -4103,7 +4163,8 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         is_list_write_barrier, is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_trace_fnaddrs,
+        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
+        jit_trace_fnaddrs,
     };
     use std::collections::HashMap;
 
@@ -4281,6 +4342,32 @@ mod tests {
         assert_eq!(
             bindings["function::METHOD_DESCRIPTOR_TYPE"],
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const _ as i64
+        );
+        assert_eq!(
+            bindings["function::METHOD_WRAPPER_TYPE"],
+            &crate::function::METHOD_WRAPPER_TYPE as *const _ as i64
+        );
+    }
+
+    #[test]
+    fn jit_static_ref_addrs_covers_live_dict_strategy_holders() {
+        let bindings: HashMap<&'static str, i64> = jit_static_ref_addrs().into_iter().collect();
+
+        assert_eq!(
+            bindings["dictmultiobject::OBJECT_DICT_STRATEGY_REF"],
+            &pyre_object::dictmultiobject::OBJECT_DICT_STRATEGY_REF as *const _ as i64
+        );
+        assert_eq!(
+            bindings["identitydict::IDENTITY_DICT_STRATEGY_REF"],
+            &pyre_object::identitydict::IDENTITY_DICT_STRATEGY_REF as *const _ as i64
+        );
+        assert_eq!(
+            bindings["kwargsdict::KWARGS_DICT_STRATEGY_REF"],
+            &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF as *const _ as i64
+        );
+        assert_eq!(
+            bindings["objspace::std::mapdict::MAP_DICT_STRATEGY_REF"],
+            &crate::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64
         );
     }
 
@@ -4589,6 +4676,21 @@ mod tests {
         let safepoint = pyre_object::gc_interp::safepoint as *const () as usize as i64;
         assert_eq!(bindings["pyre_object::gc_interp::safepoint"], safepoint);
         assert_eq!(bindings["pyre_object::safepoint"], safepoint);
+    }
+
+    /// `rgc.py` keeps `may_ignore_finalizer` opaque with `@jit.dont_look_inside`.  Both names the
+    /// LLBC call-path resolver can produce must therefore bind the live helper
+    /// address or the residual call would carry an unpatchable symbolic hash.
+    #[test]
+    fn jit_trace_fnaddrs_covers_may_ignore_finalizer() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = crate::executioncontext::may_ignore_finalizer as *const () as usize as i64;
+
+        assert_eq!(
+            bindings["pyre_interpreter::executioncontext::may_ignore_finalizer"],
+            expected
+        );
+        assert_eq!(bindings["pyre_interpreter::may_ignore_finalizer"], expected);
     }
 
     /// `is_pyframe_operand_stack_accessor` must recognise the funcptr the

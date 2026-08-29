@@ -1,4 +1,4 @@
-//! `<[T]>::first(slice)` → length-checked `Option<&T>` diamond.
+//! `<[T]>::first(slice)` and checked `get(start..)` → `Option` diamonds.
 //!
 //! ## Positioning
 //!
@@ -25,31 +25,38 @@
 //! express `first`; a post-pass that splits block A into a guarded Some/None
 //! diamond can.
 //!
+//! The same control-flow skeleton handles the RangeFrom `get(start..)` form
+//! retained by the #346 slice-range port: its successful arm emits the
+//! ordinary RPython `getslice(start, None)` marker and its guard is
+//! `start <= len(slice)`.  Scalar `get(i)` belongs to the dedicated
+//! [`crate::front::slice_get`] pass from origin/main.
+//!
 //! ## Payload representation
 //!
 //! `first` returns `Option<&T>`, but the `Some` payload is materialised by
 //! `OpKind::ArrayRead` (element 0), which yields the element VALUE, not a
-//! pointer-to-slot.  In the list model a `&T` and a `T` are the same one GC
-//! pointer word, and no consumer derefs a slot-pointer (there is no `copied`
-//! pass that would; the front has no pointer-to-slot op at all).  So the
-//! `&T`-vs-`T` distinction collapses harmlessly, and the value payload is both
-//! the only representable and the correct choice.  The receiver is a
-//! `SomeList`-modelled slice (its `Input` op carries the list-container
-//! `class_root`), so `__len` and the element read repr-dispatch to
+//! pointer-to-slot.  RPython's list model likewise returns the item value from
+//! `getitem`; no surviving consumer dereferences a Rust slot pointer.  This is
+//! true for both GC-reference items and scalar items (`u8`, `i64`, …), and the
+//! site's `payload_ty` keeps their register bank exact.  The receiver is a
+//! `SomeList`-modelled slice, so `__len` and the element read repr-dispatch to
 //! `arraylen_gc` / `getarrayitem` on the underlying length-prefixed GcArray.
 //!
 //! ## The rewrite (`rewire_one_slice_first_site`)
 //!
 //! Block A holds the residual `first` call producing `opt`.  Because
-//! `Option<&PyObjectRef>` triggers `option_residual_narrow_root`, `lower_call`
-//! appends a trailing `__cast_instance_intrinsic` after the call, so the call is NOT
-//! A's last op — the block-A skeleton absorbs that optional cast, exactly as
+//! A reference-payload `Option<&PyObjectRef>` may append a trailing
+//! `__cast_instance_intrinsic` after the call, so the call is not A's last op; a
+//! scalar-payload `Option<u8>` has no such cast.  The block-A skeleton accepts
+//! both shapes and absorbs the optional cast, exactly as
 //! [`crate::front::option_map_or`] does.  The rewrite:
 //! 1. drops the `first` call (+ absorbed cast) and closes A with a
 //!    `bool(len(slice) > 0)` branch to two fresh arms;
-//! 2. the `then_bb` arm reads `slice[0]` and wraps it in `Some`
-//!    (`__discriminant = 1` / `__pos_0 = elem`);
-//! 3. the `else_bb` arm builds `None` (`__discriminant = 0`);
+//! 2. the `then_bb` arm reads `slice[0]` and wraps it in `Some`; a one-word
+//!    reference niche forwards the typed payload directly, while value
+//!    payloads build `__discriminant = 1` / `__pos_0 = elem`;
+//! 3. the `else_bb` arm emits a typed null for that niche, or an aggregate
+//!    `None` (`__discriminant = 0`) for value payloads;
 //! 4. both arms re-apply the absorbed narrowing and forward to B, reproducing
 //!    A's original exit args with the `opt` slot sourced from the arm's
 //!    `Some`/`None` value and every other live value threaded through.
@@ -74,6 +81,10 @@ pub(crate) struct SliceFirstSite {
     /// The `first` call result (the `Option<&T>` value) — locates block A.  The
     /// slice operand is read from that located call's `args[0]`.
     pub result_var: Variable,
+    /// The access performed in the successful arm.  `RangeFrom` retains both
+    /// the transparent range shell (for its exclusive-consumer proof/removal)
+    /// and its scalar start bound (for the RPython `getslice(start, None)`).
+    pub access: SliceAccess,
     /// The `Option` enum root `name_path` (per-instantiation, suffixed) — the
     /// ctor owner for the `Some`/`None` aggregates.
     pub option_owner: String,
@@ -83,6 +94,19 @@ pub(crate) struct SliceFirstSite {
     /// The `Option`'s payload `&T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` field kind (`Ref(None)` for `Option<&PyObjectRef>`).
     pub payload_ty: ValueType,
+    /// True when the result is the one-word nullable-reference Option niche.
+    /// RPython represents that as the payload instance with
+    /// `can_be_None=True`, without an Option aggregate.
+    pub niche: bool,
+    /// Concrete payload class retained on both the successful pointer and
+    /// the null arm of a niche result.
+    pub payload_narrow_root: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum SliceAccess {
+    First,
+    RangeFrom { range: Variable, start: Variable },
 }
 
 /// Rewrite every recorded `<[T]>::first` call site into the length-checked
@@ -168,15 +192,27 @@ fn rewire_one_slice_first_site(
         ));
     };
 
-    // Capture the slice receiver operand.
-    let slice = match &graph.blocks[a].operations[ci].kind {
-        OpKind::Call { args, .. } if args.len() == 1 => args[0].clone(),
+    // Capture the slice receiver and validate the recorded access operand.
+    let slice = match (&graph.blocks[a].operations[ci].kind, &site.access) {
+        (OpKind::Call { args, .. }, SliceAccess::First) if args.len() == 1 => args[0].clone(),
+        (OpKind::Call { args, .. }, SliceAccess::RangeFrom { range, .. })
+            if args.len() == 2 && args[1] == *range =>
+        {
+            args[0].clone()
+        }
         other => {
             return Err(format!(
-                "{name}: slice::first producer op is not a 1-arg call: {other:?}"
+                "{name}: slice first/get producer does not match its recorded operands: {other:?}"
             ));
         }
     };
+    if let SliceAccess::RangeFrom { range, .. } = &site.access
+        && !crate::front::slice_index::range_feeds_only_index(graph, range, &site.result_var, false)
+    {
+        return Err(format!(
+            "{name}: RangeFrom value has a non-get consumer — declining"
+        ));
+    }
 
     // A's single exit → B (the continuation consuming the Option).  Must be a
     // plain goto — `lower_call` closes with exactly this shape.
@@ -215,43 +251,73 @@ fn rewire_one_slice_first_site(
     if !then_sources.contains(&slice) {
         then_sources.push(slice.clone());
     }
+    let success_operand = match &site.access {
+        SliceAccess::First => None,
+        SliceAccess::RangeFrom { start, .. } => Some(start),
+    };
+    if let Some(operand) = success_operand
+        && !then_sources.contains(operand)
+    {
+        then_sources.push(operand.clone());
+    }
     let (then_bb, then_inputs) = graph.create_block_with_arg_vars(then_sources.len());
     let (else_bb, else_inputs) = graph.create_block_with_arg_vars(carried.len());
 
-    // `then_bb`: elem = slice[0]; opt = Some(elem).
+    // `then_bb`: item = slice[0] or slice[start..]; opt = Some(item).
     let slice_in_then = map_source(&then_sources, &then_inputs, &slice)
         .ok_or_else(|| format!("{name}: slice not threaded into Some arm"))?;
-    let idx0 = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(idx0.clone()),
-        kind: OpKind::ConstInt(0),
-    });
-    let elem = graph.alloc_value_var();
-    graph.block_mut(then_bb).operations.push(SpaceOperation {
-        result: Some(elem.clone()),
-        kind: OpKind::ArrayRead {
-            base: slice_in_then,
-            // The element read and the `Some::__pos_0` field write below
-            // consume the same `elem`, so the read's declared element type
-            // must be the payload type the field carries (`site.payload_ty`,
-            // `Ref(None)` for `Option<&PyObjectRef>`) — a hardcoded `Ref(None)`
-            // would disagree for any instantiation whose payload projects to
-            // another `ValueType`.
-            item_ty: site.payload_ty.clone(),
-            index: idx0,
-            array_type_id: None,
-            nolength: false,
-            pure: false,
-        },
-    });
-    let some_var = emit_option_variant(
-        graph,
-        then_bb,
-        &site.option_owner,
-        1,
-        Some((&site.some_owner, elem, site.payload_ty.clone())),
-    );
-    let then_result = emit_narrow(graph, then_bb, some_var, &narrow_root);
+    let elem = match &site.access {
+        SliceAccess::First => {
+            let item_index = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(item_index.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            let elem = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(elem.clone()),
+                kind: OpKind::ArrayRead {
+                    base: slice_in_then,
+                    // The element read and the `Some::__pos_0` field write
+                    // consume the same value, so their register banks match.
+                    item_ty: site.payload_ty.clone(),
+                    index: item_index,
+                    array_type_id: None,
+                    nolength: false,
+                    pure: false,
+                },
+            });
+            elem
+        }
+        SliceAccess::RangeFrom { start, .. } => {
+            let start_in_then = map_source(&then_sources, &then_inputs, start)
+                .ok_or_else(|| format!("{name}: RangeFrom start not threaded into Some arm"))?;
+            let subslice = graph.alloc_value_var();
+            graph.block_mut(then_bb).operations.push(SpaceOperation {
+                result: Some(subslice.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__getslice_rangefrom".to_string()],
+                    },
+                    args: vec![slice_in_then, start_in_then],
+                    result_ty: site.payload_ty.clone(),
+                },
+            });
+            subslice
+        }
+    };
+    let then_result = if site.niche {
+        emit_narrow(graph, then_bb, elem, &site.payload_narrow_root)
+    } else {
+        let some_var = emit_option_variant(
+            graph,
+            then_bb,
+            &site.option_owner,
+            1,
+            Some((&site.some_owner, elem, site.payload_ty.clone())),
+        );
+        emit_narrow(graph, then_bb, some_var, &narrow_root)
+    };
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -263,8 +329,13 @@ fn rewire_one_slice_first_site(
     close_goto_mixed(graph, then_bb, b_target, then_link_args);
 
     // `else_bb`: opt = None.
-    let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
-    let else_result = emit_narrow(graph, else_bb, none_var, &narrow_root);
+    let else_result = if site.niche {
+        let null = graph.push_null_mut_ptr(else_bb);
+        emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
+    } else {
+        let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
+        emit_narrow(graph, else_bb, none_var, &narrow_root)
+    };
     let else_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -296,21 +367,68 @@ fn rewire_one_slice_first_site(
             result_ty: ValueType::Int,
         },
     });
-    let zero = graph.alloc_value_var();
-    graph.block_mut(a_id).operations.push(SpaceOperation {
-        result: Some(zero.clone()),
-        kind: OpKind::ConstInt(0),
-    });
     let cond = graph.alloc_value_var();
-    graph.block_mut(a_id).operations.push(SpaceOperation {
-        result: Some(cond.clone()),
-        kind: OpKind::BinOp {
-            op: "gt".to_string(),
-            lhs: len,
-            rhs: zero,
-            result_ty: ValueType::Int,
-        },
-    });
+    if let SliceAccess::RangeFrom { start: index, .. } = &site.access {
+        // A RangeFrom start is `usize`.  Compare it with an unsigned view of
+        // the RPython list length; `start == len` is the valid empty suffix.
+        let len_u = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(len_u.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        "rpython".to_string(),
+                        "rlib".to_string(),
+                        "rarithmetic".to_string(),
+                        "r_uint".to_string(),
+                    ],
+                },
+                args: vec![len],
+                result_ty: ValueType::Unsigned,
+            },
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(cond.clone()),
+            kind: OpKind::BinOp {
+                op: "le".to_string(),
+                lhs: index.clone(),
+                rhs: len_u,
+                result_ty: ValueType::Int,
+            },
+        });
+    } else {
+        let zero = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(cond.clone()),
+            kind: OpKind::BinOp {
+                op: "gt".to_string(),
+                lhs: len,
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
+    }
+    if let SliceAccess::RangeFrom { range, .. } = &site.access {
+        for block in &mut graph.blocks {
+            block.operations.retain(|op| {
+                let is_field_write =
+                    matches!(&op.kind, OpKind::FieldWrite { base, .. } if base == range);
+                let is_ctor = op.result.as_ref() == Some(range)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::SyntheticTransparentCtor { .. },
+                            ..
+                        }
+                    );
+                !(is_field_write || is_ctor)
+            });
+        }
+    }
     graph.set_branch(a_id, cond, then_bb, then_sources, else_bb, carried);
     Ok(())
 }
@@ -323,9 +441,12 @@ mod tests {
     fn slice_first_site(result_var: Variable) -> SliceFirstSite {
         SliceFirstSite {
             result_var,
+            access: SliceAccess::First,
             option_owner: "core::option::Option".into(),
             some_owner: "core::option::Option::Some".into(),
             payload_ty: ValueType::Ref(None),
+            niche: false,
+            payload_narrow_root: None,
         }
     }
 

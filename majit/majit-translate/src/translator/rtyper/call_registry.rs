@@ -66,7 +66,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::annotator::bookkeeper::Bookkeeper;
-use crate::annotator::description::{DescEntry, FunctionDesc, GraphCacheKey};
+use crate::annotator::description::{AnnSignature, DescEntry, FunctionDesc, GraphCacheKey};
+use crate::annotator::model::{SomeInstance, SomeValue};
+use crate::annotator::signature::{ParamType, TypeMarker};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
 use crate::flowspace::pygraph::PyGraph;
@@ -97,6 +99,27 @@ impl FunctionPathKey {
     pub fn name(&self) -> &str {
         self.0.last().map(|s| s.as_str()).unwrap_or("")
     }
+}
+
+/// Whether `name` is one of the residual ABI shims that materialises the
+/// Python exception object carried by an `OperationError`.
+///
+/// Their Rust signatures use `*mut PyObject` so the residual trampoline stays
+/// one-word-in/one-word-out, but the value visible to the translated
+/// interpreter is an exception *instance*.  This is the same distinction
+/// RPython's `_signature_` makes between a low-level ABI spelling and the
+/// annotator-level result.
+pub(crate) fn is_exception_object_materializer(name: &str) -> bool {
+    matches!(
+        name,
+        "pyerror_to_exc_object" | "pyerror_type_error_to_exc_object"
+    )
+}
+
+/// The annotator-level result shared by the exception materialisers'
+/// `_signature_` and their `dont_look_inside` stub graph.
+pub(crate) fn exception_object_result_annotation() -> SomeValue {
+    SomeValue::Instance(SomeInstance::new(None, false, Default::default()))
 }
 
 /// Per-path registry entry.  Each entry owns:
@@ -457,7 +480,9 @@ impl CallRegistry {
                 continue;
             }
             let qualified_owner = segs[..segs.len() - 1].join("::");
-            if reg.fields.contains_key(&qualified_owner) {
+            if reg.fields.contains_key(&qualified_owner)
+                && !reg.owner_or_variant_has_field(&qualified_owner, method)
+            {
                 let class_host = self.bookkeeper.intern_class_by_qualname(&qualified_owner);
                 class_host.class_set(
                     method.clone(),
@@ -468,6 +493,9 @@ impl CallRegistry {
                 continue;
             }
             if leaf_struct_counts.get(owner.as_str()).copied().unwrap_or(0) > 1 {
+                continue;
+            }
+            if reg.owner_or_variant_has_field(owner, method) {
                 continue;
             }
             let class_host = self.bookkeeper.intern_class_by_qualname(owner);
@@ -885,14 +913,38 @@ impl CallRegistry {
             Constant::new(ConstValue::Dict(HashMap::new())),
         );
         let host_object = HostObject::new_user_function(graph_func);
-        let function_desc = Rc::new(RefCell::new(FunctionDesc::new(
+        let exception_object_result = is_exception_object_materializer(key.name());
+        let signature_arg_count = signature.argnames.len();
+        let mut function_desc = FunctionDesc::new(
             self.bookkeeper.clone(),
             Some(host_object.clone()),
             name,
             signature,
             None,
             None,
-        )));
+        );
+        if exception_object_result {
+            // These two `dont_look_inside` functions use raw pointers only
+            // for Rust's one-word residual-call ABI.  Semantically they
+            // return the normalized exception instance carried by
+            // `OperationError`, which is an RPython `SomeInstance` and whose
+            // low-level representation is still `OBJECTPTR`.
+            //
+            // Express that distinction through RPython's own `_signature_`
+            // path (`description.py FunctionDesc.pycall`): arguments remain
+            // unconstrained, while the result is the classdef-less root
+            // instance.  This lets `op.type(evalue)` dispatch through
+            // `InstanceRepr.rtype_type`, as it does upstream, without
+            // inventing a `PtrRepr.rtype_type` operation that RPython does
+            // not have.
+            function_desc.annsignature = Some(Rc::new(AnnSignature {
+                params: (0..signature_arg_count)
+                    .map(|_| ParamType::Marker(TypeMarker::AnyType))
+                    .collect(),
+                result: ParamType::Annotation(Box::new(exception_object_result_annotation())),
+            }));
+        }
+        let function_desc = Rc::new(RefCell::new(function_desc));
         // Pre-register in bookkeeper.descs so the rtyper's
         // getdesc(host_object) lookup short-circuits at the cache.
         self.bookkeeper.descs.borrow_mut().insert(
@@ -1080,6 +1132,42 @@ mod tests {
              through the is_user_function() arm (bookkeeper.rs:955-956)"
         );
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn exception_materializers_publish_instance_result_signature() {
+        let bk = Rc::new(Bookkeeper::new());
+        let registry = CallRegistry::new(bk);
+        for leaf in ["pyerror_to_exc_object", "pyerror_type_error_to_exc_object"] {
+            let entry = registry.get_or_register(
+                FunctionPathKey::from_segments(["pyre_interpreter", "error", leaf]),
+                signature(&["arg"]),
+            );
+            let fd = entry.function_desc.borrow();
+            let annsig = fd
+                .annsignature
+                .as_ref()
+                .expect("exception materializer needs an annotation signature");
+            assert_eq!(annsig.params.len(), 1);
+            assert!(matches!(
+                annsig.params[0],
+                ParamType::Marker(TypeMarker::AnyType)
+            ));
+            let ParamType::Annotation(result) = &annsig.result else {
+                panic!("exception materializer result must be an explicit annotation");
+            };
+            let SomeValue::Instance(instance) = result.as_ref() else {
+                panic!("exception materializer result must be SomeInstance");
+            };
+            assert!(instance.classdef.is_none());
+            assert!(!instance.can_be_none);
+        }
+
+        let ordinary = registry.get_or_register(
+            FunctionPathKey::from_segments(["pyre_interpreter", "other"]),
+            signature(&["arg"]),
+        );
+        assert!(ordinary.function_desc.borrow().annsignature.is_none());
     }
 
     #[test]

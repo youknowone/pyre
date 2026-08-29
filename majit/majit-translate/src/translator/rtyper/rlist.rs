@@ -90,6 +90,10 @@ impl FixedSizeListRepr {
             external_item_repr,
         })
     }
+
+    pub(crate) fn item_lowleveltype(&self) -> LowLevelType {
+        self.item_repr.lowleveltype().clone()
+    }
 }
 
 /// RPython `AbstractBaseListRepr.recast(self, llops, v)` (`rlist.py`):
@@ -447,6 +451,62 @@ pub fn rtype_newlist(hop: &HighLevelOp) -> RTypeResult {
     Err(TyperError::message(
         "rtype_newlist: hop.r_result is not a ListRepr or FixedSizeListRepr",
     ))
+}
+
+/// RPython `objectmodel.py`'s `newlist_hint` ExtRegistry specialization and
+/// `lltypesystem/rlist.py:ll_newlist_hint`:
+///
+/// ```python
+/// def specialize_call(self, hop):
+///     v_hint = hop.inputarg(lltype.Signed, 0)
+///     r_list = hop.r_result
+///     hop.exception_is_here()
+///     return hop.gendirectcall(r_list.LIST.ll_newlist_hint, v_hint)
+///
+/// def ll_newlist_hint(LIST, lengthhint):
+///     ll_assert(lengthhint >= 0, "negative list length")
+///     l = malloc(LIST)
+///     l.length = 0
+///     l.items = malloc(LIST.items.TO, lengthhint)
+///     return l
+/// ```
+///
+/// The annotator marks the result resized, so only [`ListRepr`] is valid.
+/// Capacity and logical length intentionally differ: the backing array uses
+/// `lengthhint`, while the list header starts at zero for subsequent append.
+pub fn rtype_newlist_hint(hop: &HighLevelOp) -> RTypeResult {
+    if hop.nb_args() != 1 {
+        return Err(TyperError::message(format!(
+            "rtype_newlist_hint: expected one size hint, got {}",
+            hop.nb_args()
+        )));
+    }
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_newlist_hint: r_result missing"))?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    let r_list = any_r.downcast_ref::<ListRepr>().ok_or_else(|| {
+        TyperError::message("rtype_newlist_hint: hop.r_result is not a resized ListRepr")
+    })?;
+    let v_hint = hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 0)?;
+    hop.exception_is_here()?;
+    let ptr_lltype = r_list.lltype.clone();
+    let item_lltype = r_list.item_repr.lowleveltype().clone();
+    let helper = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        hop.rtyper.lowlevel_helper_function_with_builder(
+            "ll_newlist_hint".to_string(),
+            vec![LowLevelType::Signed],
+            ptr_lltype,
+            move |_rtyper, _args, _result| {
+                build_ll_newlist_hint_helper_graph("ll_newlist_hint", ptr.clone(), item.clone())
+            },
+        )?
+    };
+    hop.gendirectcall(&helper, vec![v_hint])
 }
 
 /// Repr-generic body of [`rtype_newlist`], shared by the resized `ListRepr`
@@ -2617,7 +2677,7 @@ fn build_ll_arraycopy_helper_graph(
 /// fast-path machinery of upstream `rgc.ll_arraycopy` is a translation-time
 /// concern; the lowered body is the bare element loop (`getarrayitem` +
 /// `setarrayitem`).
-fn build_ll_arraycopy_general_helper_graph(
+pub(crate) fn build_ll_arraycopy_general_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -2790,6 +2850,222 @@ fn build_ll_arraycopy_general_helper_graph(
         vec![
             "source".to_string(),
             "dest".to_string(),
+            "source_start".to_string(),
+            "dest_start".to_string(),
+            "length".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Synthesise the `delta < 0` branch of `rgc.ll_arraymove`
+/// (`rpython/rlib/rgc.py`, `ll_arraymove`) with the upstream four-argument
+/// shape.
+///
+/// The caller proves `source_start > dest_start`, which is upstream's
+/// `delta < 0` case.  Copying from low to high indices is therefore the
+/// overlap-safe direction, and upstream spells it:
+///
+/// ```python
+/// delta = dest_start - source_start
+/// if delta < 0:
+///     i = source_start
+///     stop = source_start + length
+///     while i < stop:
+///         copy_item(array, array, i, i + delta)
+///         i += 1
+/// ```
+///
+/// The emitted loop rebases that induction variable to zero — `i` runs
+/// `0..length` and both ends are offset — instead of carrying `delta` and
+/// `stop`.  The two are equal at every index; the rebase exists because the
+/// caller already reconstructed `(source_start, dest_start, length)` from
+/// MIR and never materialised a `delta`.
+///
+/// Three parts of `ll_arraymove` are NOT emitted, and each is a named gap
+/// rather than a simplification:
+///
+/// * The `length <= 1` head.  Upstream's own comment says it is there "to
+///   ensure that we get a proper effectinfo.write_descrs_arrays", not for
+///   speed, and the minted helper carries no `list.ll_arraymove` oopspec
+///   either — the same pairing `ll_arraycopy` is still missing.
+/// * The `delta > 0` arm and the `raw_memmove_no_free` fast path.  Only the
+///   left move exists, which is why the helper is minted as
+///   `ll_arraymove_left`: the rtyper caches low-level helpers on
+///   `(name, args, result)`, and a right-move producer — `insert`'s
+///   `ll_arraymove(l, index, index + 1, length - index)` — would have the
+///   identical key and silently receive this graph.
+/// * The `must_split_gc_address_space()` / `_contains_gcptr` dispatch.  The
+///   body below IS upstream's split-address-space branch, taken
+///   unconditionally; note that this is exactly the branch in which upstream
+///   does not emit `gc_writebarrier_before_move`, since that call is the
+///   `elif`.  Per-item `setarrayitem` marks its own cards, so no card can go
+///   stale here, but the barrier llop does exist
+///   (`lltypesystem::lloperation`) and emitting the dispatch is the
+///   convergence path.
+pub(crate) fn build_ll_arraymove_left_helper_graph(
+    name: &str,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    let array = variable_with_lltype("array", items_ptr.clone());
+    let src_start = variable_with_lltype("source_start", LowLevelType::Signed);
+    let dst_start = variable_with_lltype("dest_start", LowLevelType::Signed);
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(array.clone()),
+        Hlvalue::Variable(src_start.clone()),
+        Hlvalue::Variable(dst_start.clone()),
+        Hlvalue::Variable(length.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // Loop blocks carry (array, source_start, dest_start, length, i).
+    let array_c = variable_with_lltype("array", items_ptr.clone());
+    let src_start_c = variable_with_lltype("source_start", LowLevelType::Signed);
+    let dst_start_c = variable_with_lltype("dest_start", LowLevelType::Signed);
+    let length_c = variable_with_lltype("length", LowLevelType::Signed);
+    let i_c = variable_with_lltype("i", LowLevelType::Signed);
+    let block_cond = Block::shared(vec![
+        Hlvalue::Variable(array_c.clone()),
+        Hlvalue::Variable(src_start_c.clone()),
+        Hlvalue::Variable(dst_start_c.clone()),
+        Hlvalue::Variable(length_c.clone()),
+        Hlvalue::Variable(i_c.clone()),
+    ]);
+
+    let array_b = variable_with_lltype("array", items_ptr.clone());
+    let src_start_b = variable_with_lltype("source_start", LowLevelType::Signed);
+    let dst_start_b = variable_with_lltype("dest_start", LowLevelType::Signed);
+    let length_b = variable_with_lltype("length", LowLevelType::Signed);
+    let i_b = variable_with_lltype("i", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(array_b.clone()),
+        Hlvalue::Variable(src_start_b.clone()),
+        Hlvalue::Variable(dst_start_b.clone()),
+        Hlvalue::Variable(length_b.clone()),
+        Hlvalue::Variable(i_b.clone()),
+    ]);
+
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(array),
+                Hlvalue::Variable(src_start),
+                Hlvalue::Variable(dst_start),
+                Hlvalue::Variable(length),
+                signed_const(0),
+            ],
+            Some(block_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
+    block_cond.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(i_c.clone()),
+            Hlvalue::Variable(length_c.clone()),
+        ],
+        Hlvalue::Variable(cond.clone()),
+    ));
+    block_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond));
+    block_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(array_c),
+                Hlvalue::Variable(src_start_c),
+                Hlvalue::Variable(dst_start_c),
+                Hlvalue::Variable(length_c),
+                Hlvalue::Variable(i_c),
+            ],
+            Some(block_body.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let source_index = variable_with_lltype("source_index", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![
+            Hlvalue::Variable(src_start_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+        ],
+        Hlvalue::Variable(source_index.clone()),
+    ));
+    let dest_index = variable_with_lltype("dest_index", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![
+            Hlvalue::Variable(dst_start_b.clone()),
+            Hlvalue::Variable(i_b.clone()),
+        ],
+        Hlvalue::Variable(dest_index.clone()),
+    ));
+    let item = variable_with_lltype("item", item_lltype);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "getarrayitem",
+        vec![
+            Hlvalue::Variable(array_b.clone()),
+            Hlvalue::Variable(source_index),
+        ],
+        Hlvalue::Variable(item.clone()),
+    ));
+    let store_void = variable_with_lltype("store", LowLevelType::Void);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(array_b.clone()),
+            Hlvalue::Variable(dest_index),
+            Hlvalue::Variable(item),
+        ],
+        Hlvalue::Variable(store_void),
+    ));
+    let i_next = variable_with_lltype("i", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(i_b), signed_const(1)],
+        Hlvalue::Variable(i_next.clone()),
+    ));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(array_b),
+                Hlvalue::Variable(src_start_b),
+                Hlvalue::Variable(dst_start_b),
+                Hlvalue::Variable(length_b),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(block_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "array".to_string(),
             "source_start".to_string(),
             "dest_start".to_string(),
             "length".to_string(),
@@ -3413,6 +3689,28 @@ pub(crate) fn build_ll_newlist_helper_graph(
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
+    build_ll_newlist_helper_graph_inner(name, layout, ptr_lltype, item_lltype, false)
+}
+
+/// Synthesise the resized-list-only `ll_newlist_hint` helper.  Kept separate
+/// from [`build_ll_newlist_helper_graph`] at the public surface because these
+/// are distinct ADT methods upstream and therefore distinct memoized helper
+/// graphs.
+fn build_ll_newlist_hint_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    build_ll_newlist_helper_graph_inner(name, ListLayout::Resized, ptr_lltype, item_lltype, true)
+}
+
+fn build_ll_newlist_helper_graph_inner(
+    name: &str,
+    layout: ListLayout,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    length_is_hint: bool,
+) -> Result<PyGraph, TyperError> {
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
     let length_arg = variable_with_lltype("length", LowLevelType::Signed);
     let startblock = Block::shared(vec![Hlvalue::Variable(length_arg.clone())]);
@@ -3423,6 +3721,31 @@ pub(crate) fn build_ll_newlist_helper_graph(
         Hlvalue::Variable(return_var),
     );
     let array_type = LowLevelType::Array(Box::new(Array::gc(item_lltype.clone())));
+
+    if length_is_hint {
+        // lltypesystem/rlist.py `ll_newlist_hint` begins with
+        // `ll_assert(lengthhint >= 0, "negative list length")`.
+        let nonnegative = variable_with_lltype("nonnegative", LowLevelType::Bool);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_ge",
+            vec![
+                Hlvalue::Variable(length_arg.clone()),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(nonnegative.clone()),
+        ));
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "debug_assert",
+            vec![
+                Hlvalue::Variable(nonnegative),
+                constant_with_lltype(
+                    ConstValue::byte_str("negative list length"),
+                    LowLevelType::Void,
+                ),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    }
 
     let new_lst = match layout {
         ListLayout::Fixed => {
@@ -3476,7 +3799,11 @@ pub(crate) fn build_ll_newlist_helper_graph(
                 vec![
                     Hlvalue::Variable(header.clone()),
                     void_field_const("length"),
-                    Hlvalue::Variable(length_arg),
+                    if length_is_hint {
+                        signed_const(0)
+                    } else {
+                        Hlvalue::Variable(length_arg)
+                    },
                 ],
                 Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
             ));
@@ -6867,7 +7194,7 @@ mod tests {
     use crate::annotator::model::{SomeInteger, SomeList, SomeValue};
     use crate::flowspace::model::Variable;
     use crate::translator::rtyper::pairtype::ReprClassId;
-    use crate::translator::rtyper::rint::{IntegerRepr, signed_repr};
+    use crate::translator::rtyper::rint::{IntegerRepr, signed_repr, unsigned_repr};
     use crate::translator::rtyper::rmodel::rtyper_makerepr;
     use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
 
@@ -6911,6 +7238,99 @@ mod tests {
             matches!(items_ptr.TO, PtrTarget::Array(_)),
             "items must point to a GcArray"
         );
+    }
+
+    #[test]
+    fn ll_newlist_hint_uses_hint_for_storage_but_zero_for_length() {
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let repr = ListRepr::new(&rtyper, r_int).expect("ListRepr::new");
+        let graph = build_ll_newlist_hint_helper_graph(
+            "ll_newlist_hint",
+            repr.lltype.clone(),
+            LowLevelType::Signed,
+        )
+        .expect("build ll_newlist_hint");
+        let block = graph.graph.borrow().startblock.clone();
+        let block = block.borrow();
+        assert!(
+            block
+                .operations
+                .iter()
+                .any(|op| op.opname == "debug_assert"),
+            "ll_newlist_hint must retain upstream's nonnegative assertion"
+        );
+        let malloc_items = block
+            .operations
+            .iter()
+            .find(|op| op.opname == "malloc_varsize")
+            .expect("hint helper allocates the backing array");
+        assert!(
+            matches!(&malloc_items.args[2], Hlvalue::Variable(v) if v.name().starts_with("length")),
+            "backing allocation must use the size hint: {:?}",
+            malloc_items.args
+        );
+        let set_length = block
+            .operations
+            .iter()
+            .find(|op| {
+                op.opname == "setfield"
+                    && matches!(&op.args[1], Hlvalue::Constant(c) if matches!(&c.value, ConstValue::ByteStr(name) if name == b"length"))
+            })
+            .expect("hint helper initializes the logical length");
+        assert!(
+            matches!(&set_length.args[2], Hlvalue::Constant(c) if c.value == ConstValue::Int(0)),
+            "logical length must start at zero: {:?}",
+            set_length.args
+        );
+    }
+
+    #[test]
+    fn translate_operation_newlist_hint_accepts_rust_usize_and_calls_helper() {
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_item: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_list: Arc<dyn Repr> =
+            Arc::new(ListRepr::new(&rtyper, r_item).expect("ListRepr::new"));
+        let r_hint: Arc<dyn Repr> = unsigned_repr();
+        let hint = Variable::new();
+        hint.set_concretetype(Some(LowLevelType::Unsigned));
+        let hint_h = Hlvalue::Variable(hint);
+        let result = Variable::new();
+        let spaceop = SpaceOperation::new(
+            "newlist_hint",
+            vec![hint_h.clone()],
+            Hlvalue::Variable(result),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(hint_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(true, true)));
+        hop.args_r.borrow_mut().push(Some(r_hint));
+        *hop.r_result.borrow_mut() = Some(r_list);
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("newlist_hint dispatch")
+            .expect("newlist_hint result");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "cast_uint_to_int"),
+            "Rust usize hint must enter upstream's Signed specialization"
+        );
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "direct_call"),
+            "newlist_hint must call ll_newlist_hint"
+        );
+        assert!(ops._called_exception_is_here_or_cannot_occur);
     }
 
     /// `translate_operation("newlist")` routes to [`rtype_newlist`], which

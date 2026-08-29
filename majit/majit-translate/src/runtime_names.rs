@@ -91,8 +91,16 @@ pub(crate) mod artifacts {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
 }
 
-/// Host shims — callables the consumer exports for the flowspace HOST_ENV that
-/// have no RPython counterpart, so no upstream name to port.
+/// Host adapter spellings — callables the consumer exports for the flowspace
+/// HOST_ENV when Rust source has no directly importable RPython callable.
+/// Most are translation-only shims. `LL_ARRAYMOVE` is the one exception: it
+/// names a callable RPython does have (`rpython/rtyper/rlist.py`,
+/// `ll_arraymove`, wrapping `rgc.ll_arraymove`), reached here through a
+/// proven adapter boundary because neither `rlist.ll_arraymove` nor its
+/// caller `ll_delitem_nonneg` is built yet. The restoration reaches the
+/// rtyper only: no `list.ll_arraymove` oopspec and no `OS_ARRAYMOVE`
+/// (`jit/codewriter/effectinfo.py`) are emitted, so the codewriter still
+/// produces a residual call where upstream produces the operation.
 ///
 /// Registered in `flowspace::model`, given an annotator in
 /// `annotator::builtin`, and resolved in `translator::rtyper`. All three must
@@ -104,6 +112,9 @@ pub(crate) mod shims {
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";
+    /// Rust `ptr::copy` at a proven list-storage adapter boundary, restored
+    /// to RPython `rgc.ll_arraymove(array, source_start, dest_start, length)`.
+    pub(crate) const LL_ARRAYMOVE: &str = "__majit_ll_arraymove";
     /// Prefix, not a whole name: the wrapping arithmetic shims are
     /// `__majit_wrap_<op>`, matched by prefix where the op is not known.
     pub(crate) const WRAP_PREFIX: &str = "__majit_wrap_";
@@ -118,6 +129,7 @@ pub(crate) mod modules {
     /// value.
     pub(crate) const OBJECT_MODEL: &str = "pyre_object.pyobject";
     pub(crate) const OBJECT_LLTYPE: &str = "pyre_object.lltype";
+    pub(crate) const MALLOC: &str = "pyre_object.lltype.malloc";
     pub(crate) const MALLOC_TYPED: &str = "pyre_object.lltype.malloc_typed";
     pub(crate) const MALLOC_TYPED_MANAGED: &str = "pyre_object.lltype.malloc_typed_managed";
     pub(crate) const MALLOC_TYPED_STABLE: &str = "pyre_object.lltype.malloc_typed_stable";

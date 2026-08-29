@@ -322,6 +322,15 @@ pub fn build_value_to_hlvalue_map(
                         )),
                     );
                 }
+                OpKind::ConstUInt(n) => {
+                    map.insert(
+                        result,
+                        Hlvalue::Constant(Constant::with_concretetype(
+                            ConstValue::Int(*n as i64),
+                            LowLevelType::Unsigned,
+                        )),
+                    );
+                }
                 OpKind::ConstBool(b) => {
                     map.insert(
                         result,
@@ -826,6 +835,21 @@ fn is_vec_ctor_segments(segments: &[String]) -> bool {
         && (segments[2] == "with_capacity" || segments[2] == "new")
 }
 
+/// `pyre_interpreter::builtins::try_pyobject_vec_with_capacity(sizehint)` is
+/// the Rust source spelling of RPython's `objectmodel.newlist_hint(sizehint)`.
+///
+/// The helper is deliberately an opaque source-translation boundary, just as
+/// upstream's function is handled by an ExtRegistryEntry instead of tracing
+/// its Python body.  Its ordinary interpreter body still performs the
+/// fallible Rust reservation; translated callers take this exact path into
+/// `rtype_newlist_hint` and therefore retain both the capacity hint and the
+/// MemoryError edge.
+fn is_runtime_newlist_hint_segments(segments: &[String]) -> bool {
+    segments.len() >= 2
+        && segments[segments.len() - 2] == "builtins"
+        && segments[segments.len() - 1] == "try_pyobject_vec_with_capacity"
+}
+
 /// `alloc::vec::from_elem(elem, count)` (Rust MIR `vec![elem; count]`) —
 /// the repeated resizable-list constructor.  Routed in [`translate_op`] to
 /// `newlist(elem)` + `mul(list, count)`, the same `[a] * b` shape that
@@ -1040,6 +1064,210 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+/// Census-only accumulation of a graph's *whole* unresolvable-callee set.
+///
+/// The adapter is first-fail: [`function_graph_to_flowspace`] returns on the
+/// first op it cannot translate, so `MAJIT_RTYPER_VERBOSE`'s
+/// `[PREPASS phaseA fail]` row names one wall per graph even when the graph
+/// stands behind several.  Ranking walls by that row therefore ranks *first*
+/// walls, and closing the top one relocates its graphs to their next wall
+/// instead of lifting them — measured on `Wtf8Buf::push_str`, where the wall
+/// fell 15 → 5 and the census total did not move.
+///
+/// `MAJIT_RTYPER_FRONTIER` keeps the scan going past a failed **call** op so
+/// the row can name the whole set.  Upstream spells the same distinction
+/// `keepgoing` (`annrpython.py`): its `flowin` records the error in
+/// `self.errors`, adds the block to `self.failed_blocks` and returns instead of
+/// raising, and `complete` reports every recorded error together.  Pyre's
+/// annotator ports that flag (`RPythonAnnotator::keepgoing`), but the walls
+/// counted here are raised one layer earlier — in this adapter, before the
+/// annotator sees the graph — so the same behaviour is spelled here.
+///
+/// **Only call ops resume.**  A call's resolution failure is a function of the
+/// callee path and the registry alone, so skipping it invents no wall; any
+/// other op's failure may be a consequence of an operand this scan skipped,
+/// and resuming past it would manufacture walls that do not exist.  The
+/// skipped call's result is bound to a placeholder so later ops still resolve
+/// their operands — a census-only graph that is discarded, since the adapter
+/// still returns the first error and the subject still fails exactly as it
+/// does with the gate off.
+mod frontier {
+    use super::TyperError;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Frame {
+        /// Every distinct wall seen in this adapter run, in discovery order.
+        walls: Vec<String>,
+        /// The wall the gate-off run would have stopped at.
+        first: Option<TyperError>,
+    }
+
+    thread_local! {
+        /// One frame per active adapter run.  A run is re-entrant: resolving a
+        /// call can lift the callee's source, which runs the adapter again, and
+        /// a flat slot would let the inner run adopt the outer run's `first`.
+        static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+        /// Walls of the last outermost run, awaiting [`super::take_frontier_walls`].
+        static LAST: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Whether `MAJIT_RTYPER_FRONTIER` is on.  Same `== "1"` contract as
+    /// `MAJIT_RTYPER_VERBOSE`, so a literal `0` stays off.
+    pub(super) fn enabled() -> bool {
+        std::env::var_os("MAJIT_RTYPER_FRONTIER").is_some_and(|v| v == "1")
+    }
+
+    /// Guard for one adapter run.  Collecting is scoped to its lifetime.
+    pub(super) struct Guard {
+        active: bool,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let frame = STACK.with(|s| s.borrow_mut().pop()).unwrap_or_default();
+            STACK.with(|s| {
+                let mut stack = s.borrow_mut();
+                match stack.last_mut() {
+                    // An inner run's walls block the outer run too — its
+                    // failure is what the outer call reports — so they join the
+                    // caller's set rather than being dropped.
+                    Some(outer) => {
+                        for wall in frame.walls {
+                            if !outer.walls.contains(&wall) {
+                                outer.walls.push(wall);
+                            }
+                        }
+                    }
+                    None => LAST.with(|l| *l.borrow_mut() = frame.walls),
+                }
+            });
+        }
+    }
+
+    /// Begin collecting for one adapter run.
+    pub(super) fn enter() -> Guard {
+        let active = enabled();
+        if active {
+            STACK.with(|s| {
+                let mut stack = s.borrow_mut();
+                // An outermost run owns the next census row: drop the previous
+                // run's set now, so a subject whose adapter is never reached
+                // reports nothing rather than its predecessor's walls.
+                if stack.is_empty() {
+                    LAST.with(|l| l.borrow_mut().clear());
+                }
+                stack.push(Frame::default());
+            });
+        }
+        Guard { active }
+    }
+
+    /// Whether `err`, raised on `op`, may be skipped and the run resumed.
+    /// Records the wall as a side effect when it may.
+    pub(super) fn resume(op: &super::SpaceOperation, err: &TyperError) -> bool {
+        if !matches!(op.kind, super::OpKind::Call { .. }) {
+            return false;
+        }
+        STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            let Some(frame) = stack.last_mut() else {
+                return false;
+            };
+            // One line per wall: the registry message is a paragraph, and a
+            // multi-line census record is unparseable without a banner to split
+            // on.
+            let text = err
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !frame.walls.contains(&text) {
+                frame.walls.push(text);
+            }
+            frame.first.get_or_insert_with(|| err.clone());
+            true
+        })
+    }
+
+    /// The error the gate-off run would have returned, if this run skipped a
+    /// wall.
+    pub(super) fn pending_error() -> Option<TyperError> {
+        STACK.with(|s| s.borrow().last().and_then(|f| f.first.clone()))
+    }
+
+    /// Take the wall set of the last completed outermost run.
+    pub(super) fn take_last() -> Vec<String> {
+        LAST.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+}
+
+/// Read the wall set [`frontier`] collected for the subject just translated.
+/// Empty unless `MAJIT_RTYPER_FRONTIER` is on.
+pub fn take_frontier_walls() -> Vec<String> {
+    frontier::take_last()
+}
+
+/// [`legacy_const_define_hlvalue`], resuming past a skippable call wall under
+/// [`frontier`].
+///
+/// The unresolvable fn-const is stood in for by a
+/// [`ConstValue::Placeholder`] constant rather than reported as "not a const
+/// define": the const-define pass is graph-wide, so demoting the value to a
+/// block-local Variable would leave every other block using it undefined.
+fn legacy_const_define_hlvalue_or_frontier(
+    op: &SpaceOperation,
+    call_registry: Option<&crate::translator::rtyper::call_registry::CallRegistry>,
+) -> Result<Option<Hlvalue>, TyperError> {
+    match legacy_const_define_hlvalue(op, call_registry) {
+        Err(err) if frontier::resume(op, &err) => Ok(Some(Hlvalue::Constant(
+            constant_from_constvalue(ConstValue::Placeholder),
+        ))),
+        other => other,
+    }
+}
+
+/// [`translate_op`], resuming past a skippable call wall under [`frontier`].
+///
+/// The skipped call is replaced by a `direct_call` on a
+/// [`ConstValue::Placeholder`] callee, not dropped.  Both halves are forced by
+/// [`crate::flowspace::model`]'s structural check: the caller has already
+/// seeded the call's result Variable and a later block reads it through a
+/// Link, so some op must define it; and a `canraise` block's last op may not
+/// be `same_as`, so the stand-in has to stay a call.  It is census-only —
+/// this graph is discarded, since [`function_graph_to_flowspace`] reports the
+/// wall.
+fn translate_op_or_frontier(
+    op: &SpaceOperation,
+    value_map: &HashMap<Variable, Hlvalue>,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    match translate_op(op, value_map, call_registry) {
+        Err(err) if frontier::resume(op, &err) => {
+            let Some(result) = op.result.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let result = lookup_operand(value_map, result, op, "result")?;
+            // Already stood in for by
+            // [`legacy_const_define_hlvalue_or_frontier`] — the constant needs
+            // no defining op.
+            if matches!(result, Hlvalue::Constant(_)) {
+                return Ok(Vec::new());
+            }
+            let placeholder = Hlvalue::Constant(constant_from_constvalue(ConstValue::Placeholder));
+            Ok(vec![FlowspaceOp::new(
+                "direct_call",
+                vec![placeholder],
+                result,
+            )])
+        }
+        other => other,
+    }
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -1084,6 +1312,7 @@ pub fn translate_op(
         // ─── Skipped: fully consumed by other adapter infrastructure ───
         OpKind::Input { .. } => Ok(Vec::new()),
         OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
         | OpKind::ConstRefNull
@@ -1644,13 +1873,44 @@ pub fn translate_op(
                             result,
                         )]);
                     }
+                    if segments.as_slice() == ["__getslice_rangefrom"] && arg_hls.len() == 2 {
+                        // slice, start -> getslice(slice, start, None).
+                        // RPython `decompose_slice_args` selects StartOnly;
+                        // the frontend records only SliceIndex<usize>
+                        // consumers, which prove the runtime start nonnegative.
+                        let mut args = arg_hls.into_iter();
+                        let slice = args.next().expect("slice arg");
+                        let start = args.next().expect("RangeFrom start arg");
+                        return Ok(vec![FlowspaceOp::new(
+                            "getslice",
+                            vec![
+                                slice,
+                                start,
+                                Hlvalue::Constant(Constant::new(ConstValue::None)),
+                            ],
+                            result,
+                        )]);
+                    }
                     if segments.as_slice() == ["__getslice_range"] && arg_hls.len() == 3 {
                         // slice, start, end -> getslice(slice, start, end)
-                        // The frontend plants this marker only after proving
-                        // `0 <= start <= end == len(slice)`, preserving Rust's
-                        // checked Range semantics before entering RPython's
-                        // startstop list-slice lowering.
+                        // This is the direct RPython flow-space shape for the
+                        // interpreter sites ported from `buffer[start:end]`.
                         return Ok(vec![FlowspaceOp::new("getslice", arg_hls, result)]);
+                    }
+                    // Rust `Wtf8::as_bytes()[i]` is the byte-string operation
+                    // PyPy writes as `ord(utf8[i])` throughout rutf8.py. The
+                    // string repr's `getitem` yields SomeChar; preserve that
+                    // intermediate and let the ordinary `ord` rtyper turn it
+                    // into Signed.
+                    if segments.as_slice() == ["__string_byte_getitem"] && arg_hls.len() == 2 {
+                        let mut args = arg_hls.into_iter();
+                        let string = args.next().expect("string byte-view arg");
+                        let index = args.next().expect("string byte index arg");
+                        let byte = Hlvalue::Variable(Variable::new());
+                        return Ok(vec![
+                            FlowspaceOp::new("getitem", vec![string, index], byte.clone()),
+                            FlowspaceOp::new("ord", vec![byte], result),
+                        ]);
                     }
                     // `[v; N]` array literal.  `front::mir` lowers
                     // `Rvalue::Repeat` to the `__array_repeat` synthetic
@@ -1819,6 +2079,32 @@ pub fn translate_op(
                             .ok_or_else(|| {
                                 TyperError::message(
                                     "__cast_address_intrinsic missing from HOST_ENV bootstrap"
+                                        .to_string(),
+                                )
+                            })?;
+                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                            callable_host,
+                        ))));
+                        call_args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
+                    }
+                    // Exact RPython `rgc.ll_arraymove` call reconstructed by
+                    // the MIR list-storage adapter from Rust `ptr::copy`.
+                    if segments.len() == 1
+                        && segments[0] == crate::runtime_names::shims::LL_ARRAYMOVE
+                    {
+                        if arg_hls.len() != 4 {
+                            return Err(TyperError::message(format!(
+                                "__majit_ll_arraymove requires exactly four args, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        let callable_host = HOST_ENV
+                            .lookup_builtin(crate::runtime_names::shims::LL_ARRAYMOVE)
+                            .ok_or_else(|| {
+                                TyperError::message(
+                                    "__majit_ll_arraymove missing from HOST_ENV bootstrap"
                                         .to_string(),
                                 )
                             })?;
@@ -2043,6 +2329,21 @@ pub fn translate_op(
                     if is_vec_ctor_segments(segments) {
                         return Ok(vec![FlowspaceOp::new("newlist", vec![], result)]);
                     }
+                    // `try_pyobject_vec_with_capacity(sizehint)?` is the
+                    // fallible Rust spelling of
+                    // `objectmodel.newlist_hint(sizehint)`. The
+                    // Result-to-exception pass has already made this call's
+                    // result the normal-edge Vec payload, so the synthetic op
+                    // has precisely the upstream one-argument/result shape.
+                    if is_runtime_newlist_hint_segments(segments) {
+                        if arg_hls.len() != 1 {
+                            return Err(TyperError::message(format!(
+                                "try_pyobject_vec_with_capacity requires exactly one size hint, got {}",
+                                arg_hls.len()
+                            )));
+                        }
+                        return Ok(vec![FlowspaceOp::new("newlist_hint", arg_hls, result)]);
+                    }
                     // `vec![elem; count]` lowers (in Rust MIR) to a call to
                     // `alloc::vec::from_elem(elem, count)`. Emit the same
                     // `newlist(elem)` + `mul(list, count)` shape as the
@@ -2169,7 +2470,7 @@ pub fn translate_op(
                             return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
                         }
                     }
-                    // Fail-closed on an UNFUSED `lltype::malloc_typed`.  A boxing
+                    // Fail-closed on an UNFUSED `lltype::malloc[_typed]`. A GC
                     // struct gets its `NewWithVtable` lowering before the rtyper
                     // runs only where `fuse_boxing_alloc` (`model.rs`) could
                     // resolve the cluster's header: a constant `ob_type`
@@ -2193,14 +2494,14 @@ pub fn translate_op(
                         && segments[segments.len() - 2] == "lltype"
                         && matches!(
                             segments[segments.len() - 1].as_str(),
-                            "malloc_typed" | "malloc_typed_managed"
+                            "malloc" | "malloc_typed" | "malloc_typed_managed"
                         )
                     {
                         return Err(TyperError::message(
-                            "`lltype::malloc_typed[_managed]` survived fuse_boxing_alloc unfused; \
+                            "`lltype::malloc[_typed/_managed]` survived fuse_boxing_alloc unfused; \
                              the cluster's header did not resolve to a constant type \
-                             pointer standing for its own `w_class`, and no general \
-                             malloc->new lowering is ported"
+                             pointer standing for its own `w_class`, so no safe \
+                             malloc->new lowering could be proven"
                                 .to_string(),
                         ));
                     }
@@ -2842,6 +3143,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Input { .. } => "Input",
         OpKind::ConstInt(_) => "ConstInt",
+        OpKind::ConstUInt(_) => "ConstUInt",
         OpKind::ConstBool(_) => "ConstBool",
         OpKind::ConstSymbolic { .. } => "ConstSymbolic",
         OpKind::ConstFloat(_) => "ConstFloat",
@@ -3026,6 +3328,10 @@ fn legacy_const_define_hlvalue(
         OpKind::ConstInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int(*n),
             LowLevelType::Signed,
+        )))),
+        OpKind::ConstUInt(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(*n as i64),
+            LowLevelType::Unsigned,
         )))),
         OpKind::ConstInt128(n) => Ok(Some(Hlvalue::Constant(Constant::with_concretetype(
             ConstValue::Int128(*n),
@@ -3344,11 +3650,11 @@ fn link_extravar_to_hlvalue(
 /// position order.
 ///
 /// Resolution order per inputarg `vid`:
-/// 1. `legacy.variable(vid).annotation` — minimal fixtures supply
-///    Variable-shape annotations explicitly via
+/// 1. Matching `OpKind::Input { ty, class_root }` op result == `vid` at the
+///    startblock — the source-typed production graph from `front::mir`.
+/// 2. `legacy.variable(vid).annotation` — fallback for minimal fixtures that
+///    have no production-shape Input op and explicitly seed the Variable via
 ///    `legacy_annotator::setbinding(&var, ty)`.
-/// 2. Matching `OpKind::Input { ty }` op result == `vid` at the
-///    startblock — production graphs from `front::mir`.
 ///
 /// Errors:
 ///
@@ -3397,15 +3703,12 @@ pub(crate) fn derive_subject_inputcells(
     }
     let mut cells = Vec::with_capacity(startblock.inputargs.len());
     for (idx, var) in startblock.inputargs.iter().enumerate() {
-        // 1. Explicit SomeValue seed published onto
-        //    `var.annotation` (test fixtures seed via
-        //    `legacy_annotator::setbinding(&var, ty)` before invoking
-        //    this function).
-        if let Some(rc) = var.annotation.borrow().as_ref() {
-            cells.push((**rc).clone());
-            continue;
-        }
-        // 2. Front-end Input op at the startblock.
+        // 1. Front-end Input op at the startblock.  This is the source-type
+        // authority, just as RPython seeds a function from its signature and
+        // then lets call propagation widen that cell.  In particular, do not
+        // let a classdef-less annotation left on the legacy graph erase a
+        // richer `PyObjectRef`/W_Root class_root: that stale slot is an input
+        // from the transitional walker, not an RPython annotation source.
         if let Some(&(ty, class_root)) = input_by_result.get(var) {
             let shell = valuetype_to_someshell(ty).ok_or_else(|| {
                 TyperError::message(format!(
@@ -3435,6 +3738,20 @@ pub(crate) fn derive_subject_inputcells(
             // classdef-less shell, narrowed by call-propagation as before
             // (`description.py FunctionDesc.pycall`).
             if matches!(ty, crate::model::ValueType::Ref(_)) {
+                // Rust's `gc_roots::pin_root(PyObjectRef)` parameter is the
+                // source spelling of RPython GC-transformer's opaque root
+                // slot.  The front marks that exact input as `GCREF`; seed a
+                // SomePtr(GCREF), not the W_Root-like SomeInstance fallback,
+                // so heterogeneous StringRepr / InstanceRepr livevars meet
+                // only after their ordinary cast_opaque_ptr conversion.
+                if class_root.as_deref() == Some("GCREF") {
+                    cells.push(
+                        crate::translator::rtyper::llannotation::lltype_to_annotation(
+                            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+                        ),
+                    );
+                    continue;
+                }
                 // A list-typed param (`Vec<T>`, `&[T]`, …) carries its
                 // full monomorphic spelling as `class_root` (the named-ADT
                 // root resolver excludes the core/std/alloc container
@@ -3465,6 +3782,17 @@ pub(crate) fn derive_subject_inputcells(
                 // field writes poison classdef attr cells with
                 // instance-annotated strings.
                 if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str") {
+                    cells.push(crate::annotator::model::s_str0());
+                    continue;
+                }
+                // `BytesBlock` is the low-level owner of Python bytes'
+                // RPython-shaped `STR.chars` storage, not a user-visible
+                // nominal instance.  The MIR front folds
+                // `bytes_block_chars`'s exact `(chars, length)` raw-slice
+                // view back to this header, so seed the header with the same
+                // `SomeString` cell that `project_struct_field_type` assigns it.
+                // A generic raw-slice owner does not take this path.
+                if class_root.as_deref() == Some("BytesBlock") {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
                 }
@@ -3550,6 +3878,13 @@ pub(crate) fn derive_subject_inputcells(
             cells.push(shell);
             continue;
         }
+        // 2. Explicit SomeValue fallback published onto `var.annotation`.
+        // Production front graphs always took the Input arm above; only
+        // hand-built fixtures without Input ops rely on this path.
+        if let Some(rc) = var.annotation.borrow().as_ref() {
+            cells.push((**rc).clone());
+            continue;
+        }
         // No further fallback: every typed parameter emits the Input
         // op alongside the inputargs registration; reaching here implies
         // the inputarg has neither a published `Variable.annotation`
@@ -3600,6 +3935,45 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
     seen
 }
 
+/// `RPythonTyper.specialize`'s per-graph entry: build the flowspace view of one
+/// legacy graph.
+///
+/// Under `MAJIT_RTYPER_FRONTIER` the run resumes past every unresolvable call
+/// instead of stopping at the first, so [`take_frontier_walls`] can report the
+/// subject's whole call-wall set.  Resuming is census-only: the graph it builds
+/// is discarded, and the error reported here is the one the gate-off run would
+/// have returned, so the subject fails identically either way.
+///
+/// **Only call ops resume.**  A call's resolution failure is a function of the
+/// callee path and the registry alone, so skipping it invents no wall; any
+/// other op's failure may be a consequence of an operand the run skipped, and
+/// resuming past it would manufacture walls that do not exist.  Such an op
+/// still stops the run — its error is then replaced by the recorded first wall,
+/// which is where the gate-off run stopped.
+///
+/// Measured on the `pyre-jit-trace` prepass census: the gate-off phase-A
+/// failure set is reproducible (1681 subjects, twice, byte-identical), and the
+/// gate moves exactly one of them — `_io::stringio::W_StringIO::default` stops
+/// panicking in annotate and reaches phase B instead.  Read the ranking as
+/// carrying that one-subject error bar.
+pub fn function_graph_to_flowspace(
+    legacy: &FunctionGraph,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<FlowspaceAdapterOutput, TyperError> {
+    let _guard = frontier::enter();
+    let result = function_graph_to_flowspace_inner(legacy, call_registry);
+    match frontier::pending_error() {
+        Some(first) => Err(first),
+        None => result,
+    }
+}
+
+/// Translate one legacy graph, reporting the first wall it hits.
+///
+/// Under [`frontier`] the run resumes past a skippable call wall, so the error
+/// this returns need not be the one it stopped at —
+/// [`function_graph_to_flowspace`] restores it.
+///
 /// One-way conversion from the legacy `crate::model::FunctionGraph`
 /// into a `flowspace::FunctionGraph` whose blocks carry `Hlvalue`
 /// operands and per-value `SomeValue` annotations on its `Variable`s.
@@ -3646,7 +4020,7 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-pub fn function_graph_to_flowspace(
+fn function_graph_to_flowspace_inner(
     legacy: &FunctionGraph,
     // Call resolution plumbing — see [`translate_op`].
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
@@ -3670,7 +4044,9 @@ pub fn function_graph_to_flowspace(
             continue;
         }
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op, Some(call_registry))? {
+            if let Some(hlvalue) =
+                legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))?
+            {
                 // `legacy_const_define_hlvalue` only returns `Some` for ops
                 // with a result Variable, so this is always present here.
                 let Some(result_var) = legacy_op.result.as_ref() else {
@@ -3921,14 +4297,20 @@ pub fn function_graph_to_flowspace(
             })
             .collect();
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op, Some(call_registry))? {
+            if let Some(hlvalue) =
+                legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))?
+            {
                 if let Some(result_var) = legacy_op.result.as_ref() {
                     value_map.insert(result_var.clone(), hlvalue.clone());
                     if let Some(name) = legacy.value_name_for(result_var) {
                         name_to_value.insert(name.to_string(), hlvalue);
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op_or_frontier(
+                    legacy_op,
+                    &value_map,
+                    call_registry,
+                )?);
                 continue;
             }
 
@@ -3992,7 +4374,11 @@ pub fn function_graph_to_flowspace(
                         )));
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op_or_frontier(
+                    legacy_op,
+                    &value_map,
+                    call_registry,
+                )?);
                 continue;
             }
 
@@ -4058,7 +4444,11 @@ pub fn function_graph_to_flowspace(
             {
                 continue;
             }
-            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+            translated_ops.extend(translate_op_or_frontier(
+                legacy_op,
+                &value_map,
+                call_registry,
+            )?);
             if let Some(result_var) = legacy_op.result.as_ref()
                 && let Some(name) = legacy.value_name_for(result_var)
                 && let Some(value) = value_map.get(result_var).cloned()
@@ -4089,7 +4479,7 @@ pub fn function_graph_to_flowspace(
                     legacy_link.target, legacy_block.id,
                 ))
             })?;
-            let args: Vec<Hlvalue> = legacy_link
+            let mut args: Vec<Hlvalue> = legacy_link
                 .args
                 .iter()
                 .enumerate()
@@ -4103,6 +4493,37 @@ pub fn function_graph_to_flowspace(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // RPython `FlowContext.exc_from_raise` always computes
+            // `w_type = op.type(w_value)` before constructing the
+            // `(w_type, w_value)` link to `exceptblock`
+            // (`flowspace/flowcontext.py:629-630`).  Pyre's pre-flowspace
+            // model historically elided that operation and used the
+            // exception value in both slots because `flatten.make_return`
+            // only emits the second slot.  The rtyper observes the link
+            // earlier, however: `_convert_link` assigns
+            // `ExceptionData.r_exception_type` to slot 0 and must therefore
+            // receive the class representation, not the instance
+            // representation.
+            //
+            // Restore the upstream flowspace shape at this adapter boundary.
+            // Limit the reconstruction to the exact legacy adaptation:
+            // a direct, non-LastException link to `exceptblock` whose two
+            // arguments are the same Variable.  Ordinary exception edges
+            // already carry their distinct link-scoped `(last_exception,
+            // last_exc_value)` variables and must remain untouched.
+            let duplicated_direct_raise = legacy_link.target == legacy.exceptblock
+                && legacy_link.last_exception.is_none()
+                && legacy_link.last_exc_value.is_none()
+                && matches!(
+                    legacy_link.args.as_slice(),
+                    [LinkArg::Value(etype), LinkArg::Value(evalue)] if etype == evalue
+                );
+            if duplicated_direct_raise {
+                let evalue = args[1].clone();
+                let etype = Hlvalue::Variable(Variable::new());
+                translated_ops.push(FlowspaceOp::new("type", vec![evalue], etype.clone()));
+                args[0] = etype;
+            }
             let exitcase = exitcase_to_hlvalue(legacy_link.exitcase.as_ref());
             let mut link = FlowspaceLink::new(args, Some(target), exitcase);
             // RPython `Link.__init__` (`flowspace/model.rs:Link::new`) leaves
@@ -4668,6 +5089,47 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_prefers_source_root_over_legacy_shell() {
+        let mut graph = LegacyGraph::new("set_locals_w");
+        let entry = graph.startblock;
+        let value = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "value".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, value.clone());
+
+        // Transitional legacy annotation loses the pointee class.  The
+        // source Input still says PyObjectRef, corresponding to W_Root in
+        // PyPy, and must be the authoritative initial cell.
+        setbinding(&value, ValueType::Ref(None));
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("source-typed PyObject input must seed a concrete class");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!("PyObjectRef must seed SomeInstance, got {:?}", cells[0])
+        };
+        let classdef = value
+            .classdef
+            .as_ref()
+            .expect("source class_root must replace the classdef-less legacy shell");
+        assert_eq!(classdef.borrow().name, "PyObject");
+    }
+
+    #[test]
     fn derive_subject_inputcells_fails_loud_on_inputarg_without_input_op() {
         let mut graph = LegacyGraph::new("subject");
         let entry = graph.startblock;
@@ -4913,6 +5375,38 @@ mod tests {
         assert_eq!(translated[1].result, result);
     }
 
+    #[test]
+    fn translate_runtime_capacity_helper_becomes_newlist_hint() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_newlist_hint_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let hint = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), hint.clone());
+        value_map.insert(vars[1].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        "pyre_interpreter".into(),
+                        "builtins".into(),
+                        "try_pyobject_vec_with_capacity".into(),
+                    ],
+                },
+                args: vec![vars[0].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("try_pyobject_vec_with_capacity must lower as the newlist_hint intrinsic");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "newlist_hint");
+        assert_eq!(translated[0].args, vec![hint]);
+        assert_eq!(translated[0].result, result);
+        assert!(op_canraise(&op.kind));
+    }
+
     /// The frontend cannot see the adapter's expansion: `lower_function`
     /// still contains the raw `alloc::vec::from_elem` call, while the
     /// flowspace graph must carry `newlist` + `mul` instead.  This real-LLBC
@@ -5032,6 +5526,40 @@ mod tests {
             Hlvalue::Constant(Constant::new(ConstValue::Int(0)))
         );
         assert_eq!(translated[0].args[2], end);
+        assert_eq!(translated[0].result, result);
+    }
+
+    #[test]
+    fn translate_op_getslice_rangefrom_expands_after_annotation() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_getslice_rangefrom_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        let slice = Hlvalue::Variable(Variable::new());
+        let start = Hlvalue::Variable(Variable::new());
+        let result = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), slice.clone());
+        value_map.insert(vars[1].clone(), start.clone());
+        value_map.insert(vars[2].clone(), result.clone());
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__getslice_rangefrom".into()],
+                },
+                args: vec![vars[0].clone(), vars[1].clone()],
+                result_ty: ValueType::Ref(None),
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RangeFrom marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getslice");
+        assert_eq!(translated[0].args[0], slice);
+        assert_eq!(translated[0].args[1], start);
+        assert_eq!(
+            translated[0].args[2],
+            Hlvalue::Constant(Constant::new(ConstValue::None))
+        );
         assert_eq!(translated[0].result, result);
     }
 
@@ -6527,6 +7055,66 @@ mod tests {
             exc_link.last_exc_value.as_ref(),
             "exception value arg must reuse link.last_exc_value Variable"
         );
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_restores_type_op_for_duplicated_direct_raise() {
+        // `front::exc_from_raise` / `front::result_exc` historically encode a
+        // direct raise as `(evalue, evalue)` because the final `raise`
+        // bytecode reads only slot 1.  RPython's rtyper sees this graph before
+        // flattening and requires slot 0 to be the result of `type(evalue)`.
+        let mut graph = LegacyGraph::new("direct_raise");
+        let vars = mint_vars(&mut graph, 5);
+        setbinding(&vars[1], ValueType::Ref(None));
+
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![crate::model::Link::new_mixed(
+                vec![
+                    LinkArg::Value(vars[1].clone()),
+                    LinkArg::Value(vars[1].clone()),
+                ],
+                graph.exceptblock,
+                None,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[2]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        let exceptblock = Block {
+            id: graph.exceptblock,
+            inputargs: block_inputargs(&vars, &[3, 4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock, exceptblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("direct raise graph assembles");
+        let flowspace_graph = output.graph.borrow();
+        let startblock = flowspace_graph.startblock.borrow();
+        let [type_op] = startblock.operations.as_slice() else {
+            panic!("direct raise must gain exactly one type operation");
+        };
+        assert_eq!(type_op.opname, "type");
+        let exc_link = startblock.exits[0].borrow();
+        assert_eq!(type_op.args, vec![exc_link.args[1].clone().unwrap()]);
+        assert_eq!(exc_link.args[0].as_ref(), Some(&type_op.result));
+        assert_ne!(exc_link.args[0], exc_link.args[1]);
     }
 
     #[test]

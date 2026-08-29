@@ -640,6 +640,7 @@ fn is_source_constant_variable(
             }
             match &op.kind {
                 OpKind::ConstInt(_)
+                | OpKind::ConstUInt(_)
                 | OpKind::ConstBool(_)
                 | OpKind::ConstFloat(_)
                 | OpKind::ConstStr(_)
@@ -7100,7 +7101,9 @@ fn array_has_nonconstant_index_read(
                         .iter()
                         .find(|block| block.id == block_id)
                         .and_then(|block| block.operations.get(op_index))
-                        .is_some_and(|op| matches!(op.kind, OpKind::ConstInt(_)))
+                        .is_some_and(|op| {
+                            matches!(op.kind, OpKind::ConstInt(_) | OpKind::ConstUInt(_))
+                        })
                 },
             )
         })
@@ -7209,6 +7212,7 @@ fn remap_op(
     let kind = match &op.kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
         | OpKind::ConstInt128(_)
         | OpKind::ConstUInt128(_)
         | OpKind::ConstBool(_)

@@ -3757,8 +3757,8 @@ pub(crate) fn encode_utf8_with_errors(
                     return Err(crate::typedef::unicode_encode_error(
                         "utf-8",
                         w_object,
-                        index,
-                        error_end,
+                        index as i64,
+                        error_end as i64,
                         "surrogates not allowed",
                     ));
                 }
@@ -3767,8 +3767,8 @@ pub(crate) fn encode_utf8_with_errors(
                 return Err(crate::typedef::unicode_encode_error(
                     "utf-8",
                     w_object,
-                    index,
-                    error_end,
+                    index as i64,
+                    error_end as i64,
                     "surrogates not allowed",
                 ));
             }
@@ -3801,8 +3801,8 @@ pub(crate) fn encode_utf8_with_errors(
                                 return Err(crate::typedef::unicode_encode_error(
                                     "utf-8",
                                     w_object,
-                                    index,
-                                    error_end,
+                                    index as i64,
+                                    error_end as i64,
                                     "surrogates not allowed",
                                 ));
                             }
@@ -4140,8 +4140,8 @@ fn encode_narrow(
                 return Err(crate::typedef::unicode_encode_error(
                     enc_name,
                     pyre_object::gc_roots::shadow_stack_get(source_slot),
-                    start,
-                    end,
+                    start as i64,
+                    end as i64,
                     range_msg,
                 ));
             }
@@ -4181,8 +4181,8 @@ fn encode_narrow(
                                 return Err(crate::typedef::unicode_encode_error(
                                     enc_name,
                                     pyre_object::gc_roots::shadow_stack_get(source_slot),
-                                    start,
-                                    end,
+                                    start as i64,
+                                    end as i64,
                                     range_msg,
                                 ));
                             }
@@ -4326,8 +4326,8 @@ fn encode_utf16_32_impl(
                 return Err(crate::typedef::unicode_encode_error(
                     codec,
                     pyre_object::gc_roots::shadow_stack_get(object_slot),
-                    index,
-                    index + 1,
+                    index as i64,
+                    (index + 1) as i64,
                     "surrogates not allowed",
                 ));
             }
@@ -4348,8 +4348,8 @@ fn encode_utf16_32_impl(
                                 return Err(crate::typedef::unicode_encode_error(
                                     codec,
                                     pyre_object::gc_roots::shadow_stack_get(object_slot),
-                                    index,
-                                    index + 1,
+                                    index as i64,
+                                    (index + 1) as i64,
                                     "surrogates not allowed",
                                 ));
                             }
@@ -4362,8 +4362,8 @@ fn encode_utf16_32_impl(
                             return Err(crate::typedef::unicode_encode_error(
                                 codec,
                                 pyre_object::gc_roots::shadow_stack_get(object_slot),
-                                index,
-                                index + 1,
+                                index as i64,
+                                (index + 1) as i64,
                                 "surrogates not allowed",
                             ));
                         }
@@ -4674,7 +4674,8 @@ pub(crate) fn call_registered_encode_error_handler(
     })?;
 
     let w_exc =
-        crate::typedef::unicode_encode_error(codec, source, start, end, reason).to_exc_object();
+        crate::typedef::unicode_encode_error(codec, source, start as i64, end as i64, reason)
+            .to_exc_object();
     let w_res = crate::baseobjspace::call_function(w_handler, &[w_exc]);
     if w_res.is_null() {
         return Err(crate::call::take_call_error()

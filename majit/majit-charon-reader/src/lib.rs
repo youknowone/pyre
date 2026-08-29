@@ -326,6 +326,18 @@ impl Llbc {
     pub fn crate_name(&self) -> &str {
         &self.file.translated.crate_name
     }
+
+    /// The one pointer width, in bytes, shared by every extraction target in
+    /// this artefact.  RPython's translator carries this on its target system
+    /// configuration; Charon's ordered `target_information` rows are the
+    /// corresponding source of truth here.  Missing or conflicting rows stay
+    /// unresolved so width-sensitive lowerings fail closed.
+    pub fn target_pointer_size(&self) -> Option<u8> {
+        let mut rows = self.file.translated.target_information.iter();
+        let width = rows.next()?.value.target_pointer_size;
+        rows.all(|row| row.value.target_pointer_size == width)
+            .then_some(width)
+    }
 }
 
 /// Scan the raw LLBC bytes for every inline

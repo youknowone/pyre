@@ -88,49 +88,29 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
     // keeps the built-in static `PyType` case (e.g. `INT_TYPE`) untouched.
     let _roots = crate::gc_roots::push_roots();
     let w_type = crate::gc_roots::pin_root(w_type);
-    let obj = alloc_instance_object(W_ObjectObject {
-        ob_header: PyObject {
-            ob_type: &INSTANCE_TYPE as *const PyType,
-            w_class: w_type,
-        },
-        // `mapdict.py user_setup` → `_mapdict_init_empty(
-        // w_subtype.terminator)` (`mapdict.py:908-910`): the instance map is
-        // the owning type's terminator from construction, and `storage = None`.
-        //
-        // Reading it here rather than installing it on first attribute access
-        // is what makes `_get_mapdict_map`'s `jit.promote(self.map)` promotable.
-        // A deferred install leaves every fresh instance at zero until the
-        // first access, so the promoted map guard the JIT bakes — recorded
-        // AFTER that install, hence naming the terminator — cannot hold on the
-        // next iteration's fresh instance. It then fails on every pass through
-        // a loop that constructs an object and touches an attribute, and each
-        // failure is a full deopt.
-        //
-        // Zero stays legal: `pyre-object` cannot build a terminator (it lives
-        // in the interpreter's mapdict layer and `pyre-object` must not depend
-        // on it), so a type whose terminator has not been created yet still
-        // gets one from `ensure_mapdict_initialized` on first access — which
-        // also stores it on the type, so every later instance is eager.
-        //
-        // The `is_type` test is what makes reading the field safe: `w_type` is
-        // a `W_TypeObject` on every interpreter path, but the allocator is also
-        // driven with a sentinel that has no type layout behind it, and the
-        // terminator field would be read off whatever that address points at.
-        map: unsafe {
-            if crate::typeobject::is_type(w_type) {
-                crate::typeobject::w_type_get_terminator(w_type) as usize
-            } else {
-                0
-            }
-        },
-        storage: std::ptr::null_mut(),
-    });
+    let obj = alloc_instance_object(w_type);
     // objspace.py `allocate_instance`: types with `hasuserdel` register the
     // fresh instance on `space.finalizer_queue` immediately after allocation.
     crate::gc_hook::maybe_register_finalizer(obj);
     obj
 }
 
+/// Keep construction at the allocation boundary, so the struct and its field
+/// stores stay in one graph for `jtransform.rewrite_op_malloc` to reach.
+///
+/// Upstream's `instantiate(cls)` is NOT typed by `rtype_malloc` (that one is
+/// `@typer_for(lltype.malloc)`); it goes `rtype_instantiate` ->
+/// `rclass.rtype_new_instance` -> `RInstance.new_instance`, which emits the
+/// `malloc` op itself and then stores each field one at a time
+/// (`rclass.py`, `new_instance`: `genop('malloc', ...)` followed by
+/// `self.setfield(vptr, '__class__', ...)` and one `setfield` per default).
+/// This function is not that shape: it still builds a whole
+/// `W_ObjectObject` and `ptr::write`s it into raw bytes obtained from
+/// `try_gc_alloc_stable_raw(id, size)`, which carries no `malloc(STRUCT)`
+/// operand for `heaptracker.get_vtable_for_gcstruct` to read. Converging
+/// means allocating zeroed and storing `ob_type`, `w_class`, `map` and
+/// `storage` individually, in `new_instance`'s order.
+///
 /// Allocate a `W_ObjectObject` through the GC. The header is stamped
 /// with [`W_OBJECT_OBJECT_GC_TYPE_ID`] so `object_object_custom_trace`
 /// roots the `storage` value slots and dead instances are reclaimed.
@@ -162,7 +142,37 @@ pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
 /// unchanged, and every non-microbenchmark fixture moves within noise.
 /// Real convergence needs host-side allocation that may collect, which in
 /// turn needs every allocation site to root the raw pointers it holds.
-fn alloc_instance_object(value: W_ObjectObject) -> PyObjectRef {
+fn alloc_instance_object(w_class: PyObjectRef) -> PyObjectRef {
+    // `mapdict.py user_setup` → `_mapdict_init_empty(
+    // w_subtype.terminator)` (`mapdict.py:908-910`): the instance map is
+    // the owning type's terminator from construction, and `storage = None`.
+    //
+    // Reading it before allocation rather than installing it on first
+    // attribute access is what makes `_get_mapdict_map`'s
+    // `jit.promote(self.map)` promotable. A deferred install leaves every
+    // fresh instance at zero until the first access, so the promoted map guard
+    // the JIT bakes cannot hold on the next iteration's fresh instance.
+    //
+    // Zero stays legal: `pyre-object` cannot build a terminator (it lives in
+    // the interpreter's mapdict layer), so a type whose terminator has not
+    // been created yet gets one on first access. The `is_type` test keeps the
+    // sentinel used by single-crate tests from being dereferenced as a type.
+    let map = unsafe {
+        if crate::typeobject::is_type(w_class) {
+            crate::typeobject::w_type_get_terminator(w_class) as usize
+        } else {
+            0
+        }
+    };
+    let value = W_ObjectObject {
+        ob_header: PyObject {
+            ob_type: &INSTANCE_TYPE as *const PyType,
+            w_class,
+        },
+        map,
+        storage: std::ptr::null_mut(),
+    };
+
     let raw =
         crate::gc_hook::try_gc_alloc_stable_raw(W_OBJECT_OBJECT_GC_TYPE_ID, W_OBJECT_OBJECT_SIZE);
     if !raw.is_null() {

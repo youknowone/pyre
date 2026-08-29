@@ -4790,7 +4790,7 @@ pub fn create_callee_frame_impl_pub(caller_frame: i64, callable: i64, args: &[Py
 
 fn fill_positional_defaults_for_jit_call<'a>(
     callable: PyObjectRef,
-    w_code: *const (),
+    w_code: PyObjectRef,
     args: &'a [PyObjectRef],
 ) -> Cow<'a, [PyObjectRef]> {
     let defaults = unsafe { function_get_defaults(callable) };
@@ -4799,8 +4799,7 @@ fn fill_positional_defaults_for_jit_call<'a>(
     }
 
     let code = unsafe {
-        &*(pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef)
-            as *const pyre_interpreter::CodeObject)
+        &*(pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject)
     };
     let nparams = code.arg_count as usize;
     if args.len() >= nparams {
@@ -4862,7 +4861,7 @@ fn create_callee_frame_impl_1_boxed(
     let args = args.as_ref();
 
     alloc_callee_frame(
-        w_code,
+        w_code as *const (),
         args,
         w_globals,
         pyre_interpreter::call::getexecutioncontext(),
@@ -4918,7 +4917,7 @@ fn create_callee_frame_in_ctx(
     let args = fill_positional_defaults_for_jit_call(callable, w_code, args);
     let args = args.as_ref();
 
-    alloc_callee_frame(w_code, args, w_globals, execution_context) as i64
+    alloc_callee_frame(w_code as *const (), args, w_globals, execution_context) as i64
 }
 
 #[majit_macros::dont_look_inside]
@@ -5146,7 +5145,7 @@ fn bh_call_self_recursive_portal(
     }
     let parent_frame = unsafe { &*parent_frame_ptr };
     let callable_code = unsafe { pyre_interpreter::getcode(callable) };
-    if parent_frame.pycode != callable_code {
+    if parent_frame.pycode != callable_code as *const () {
         return None;
     }
     if !recursive_force_cache_safe(callable) {

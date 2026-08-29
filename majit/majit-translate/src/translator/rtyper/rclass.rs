@@ -3311,6 +3311,79 @@ impl Repr for InstanceRepr {
         ReprClassId::InstanceRepr
     }
 
+    /// RPython `InstanceRepr.rtype_type(self, hop)` (rclass.py):
+    ///
+    /// ```python
+    /// def rtype_type(self, hop):
+    ///     if hop.s_result.is_constant():
+    ///         return hop.inputconst(hop.r_result, hop.s_result.const)
+    ///     instance_repr = self.common_repr()
+    ///     vinst, = hop.inputargs(instance_repr)
+    ///     if hop.args_s[0].can_be_none():
+    ///         return hop.gendirectcall(ll_inst_type, vinst)
+    ///     else:
+    ///         return instance_repr.getfield(vinst, '__class__', hop.llops)
+    /// ```
+    fn rtype_type(&self, hop: &HighLevelOp) -> RTypeResult {
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+
+        // upstream: `if hop.s_result.is_constant(): ...`.
+        let s_result = hop
+            .s_result
+            .borrow()
+            .clone()
+            .ok_or_else(|| TyperError::message("InstanceRepr.rtype_type: s_result missing"))?;
+        if s_result.is_constant() {
+            let r_result =
+                hop.r_result.borrow().clone().ok_or_else(|| {
+                    TyperError::message("InstanceRepr.rtype_type: r_result missing")
+                })?;
+            let value = s_result
+                .const_()
+                .expect("s_result.is_constant() implies const_() is Some");
+            return HighLevelOp::inputconst(ConvertedTo::Repr(r_result.as_ref()), value)
+                .map(Hlvalue::Constant)
+                .map(Some);
+        }
+
+        // upstream: `instance_repr = self.common_repr();
+        //            vinst, = hop.inputargs(instance_repr)`.
+        let instance_repr = self.common_repr()?;
+        let mut vinst =
+            hop.inputargs(vec![ConvertedTo::Repr(instance_repr.as_ref() as &dyn Repr)])?;
+        let vinst = vinst
+            .pop()
+            .expect("one converted argument for unary type operation");
+
+        // upstream: `if hop.args_s[0].can_be_none():
+        //                return hop.gendirectcall(ll_inst_type, vinst)`.
+        let can_be_none = hop
+            .args_s
+            .borrow()
+            .first()
+            .ok_or_else(|| TyperError::message("InstanceRepr.rtype_type: args_s[0] missing"))?
+            .can_be_none();
+        if can_be_none {
+            let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+                TyperError::message("InstanceRepr.rtype_type: rtyper weak ref expired")
+            })?;
+            let helper = rtyper.lowlevel_helper_function(
+                "ll_inst_type",
+                vec![instance_repr.lowleveltype().clone()],
+                CLASSTYPE.clone(),
+            )?;
+            return hop.gendirectcall(&helper, vec![vinst]);
+        }
+
+        // upstream non-null arm: read the root instance's `__class__`
+        // field directly.
+        let mut llops = hop.llops.borrow_mut();
+        let vtype =
+            instance_repr.getfield(vinst, "__class__", &mut llops, false, &Flags::default())?;
+        Ok(Some(Hlvalue::Variable(vtype)))
+    }
+
     /// RPython `InstanceRepr.rtype_getattr(self, hop)` (rclass.py):
     ///
     /// ```python
@@ -5518,6 +5591,65 @@ mod tests {
     }
 
     #[test]
+    fn preminted_generic_enum_variant_repr_contains_payload_field() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let root = "option::Option<Vec<u8>>";
+        let variant = "option::Option<Vec<u8>>::Some";
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "option::Option::Some".to_string(),
+            vec![("__pos_0".to_string(), "??T".to_string())],
+        );
+        fields.fields.insert(
+            variant.to_string(),
+            vec![("__pos_0".to_string(), "Vec<u8>".to_string())],
+        );
+        ann.bookkeeper.set_struct_fields(Rc::new(fields));
+
+        let mut variants = HashMap::new();
+        variants.insert(
+            root.to_string(),
+            HashMap::from([(0, "Some".to_string()), (1, "None".to_string())]),
+        );
+        ann.bookkeeper
+            .set_enum_variant_by_discriminant(Rc::new(variants));
+
+        // CallRegistry::ensure_session projects every registry root first,
+        // then pre-mints the enum subtree before any subject is rtyped.
+        for name in ann.bookkeeper.struct_root_names() {
+            ann.bookkeeper
+                .getuniqueclassdef_for_struct_root(&name)
+                .expect("project struct root");
+        }
+        ann.bookkeeper.pre_register_enum_variant_classes();
+
+        let classdef = ann
+            .bookkeeper
+            .getuniqueclassdef_for_enum_variant(root, "Some")
+            .expect("resolve preminted Some classdef");
+        let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)
+            .expect("build preminted Some repr");
+        Repr::setup(repr.as_ref()).expect("setup preminted Some repr");
+        assert!(
+            repr.fields().contains_key("__pos_0"),
+            "variant payload must be present when InstanceRepr is first set up"
+        );
+    }
+
+    #[test]
     fn instance_repr_pyerror_to_exc_object_emits_residual_direct_call() {
         use crate::annotator::annrpython::RPythonAnnotator;
         use crate::annotator::model::{SomeInstance, SomeObject, SomeValue};
@@ -5615,6 +5747,51 @@ mod tests {
         assert_eq!(mangled, "typeptr");
         assert_eq!(field_repr.lowleveltype(), &CLASSTYPE.clone());
         assert!(repr.allinstancefields().contains_key("__class__"));
+    }
+
+    #[test]
+    fn instance_repr_rtype_type_nonnull_reads_class_field() {
+        use crate::annotator::model::{SomeInstance, SomeObject, SomeTypeOf, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use std::cell::RefCell as StdRef;
+
+        let rtyper = fresh_rtyper();
+        let repr = getinstancerepr(&rtyper, None, Flavor::Gc).expect("root instance repr");
+        Repr::setup(repr.as_ref()).expect("setup root instance repr");
+
+        let v_obj = Variable::new();
+        v_obj.set_concretetype(Some(repr.lowleveltype().clone()));
+        let v_obj_h = Hlvalue::Variable(v_obj.clone());
+        let v_result = Variable::new();
+        let spaceop =
+            SpaceOperation::new("type", vec![v_obj_h.clone()], Hlvalue::Variable(v_result));
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_obj_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance {
+                base: SomeObject::default(),
+                classdef: None,
+                can_be_none: false,
+                flags: Default::default(),
+            }));
+        hop.args_r.borrow_mut().push(Some(repr.clone()));
+        *hop.s_result.borrow_mut() = Some(SomeValue::TypeOf(SomeTypeOf::new(vec![Rc::new(v_obj)])));
+        *hop.r_result.borrow_mut() = Some(get_type_repr(&rtyper).expect("type repr"));
+
+        let out = repr
+            .rtype_type(&hop)
+            .expect("nonnull instance type() must rtype")
+            .expect("type() returns a class pointer");
+        assert!(matches!(out, Hlvalue::Variable(_)));
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        let Hlvalue::Variable(result) = &ops.ops[0].result else {
+            panic!("getfield result must be a Variable")
+        };
+        assert_eq!(result.concretetype(), Some(CLASSTYPE.clone()));
     }
 
     #[test]

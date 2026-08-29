@@ -16143,13 +16143,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         && pyre_object::is_type(w_cls)
                         && !crate::baseobjspace::isinstance_w(obj, w_cls)
                     {
-                        let slot_name = pyre_object::w_member_get_name(descr);
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                            slot_name,
-                            pyre_object::w_type_get_name(w_cls),
-                            pyre_object::type_name_of(obj),
-                        )));
+                        return Err(crate::baseobjspace::member_typecheck_error(descr, obj));
                     }
                 }
                 if unsafe { pyre_object::w_member_is_direct(descr) } {
@@ -16195,13 +16189,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         && pyre_object::is_type(w_cls)
                         && !crate::baseobjspace::isinstance_w(obj, w_cls)
                     {
-                        let slot_name = pyre_object::w_member_get_name(descr);
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                            slot_name,
-                            pyre_object::w_type_get_name(w_cls),
-                            pyre_object::type_name_of(obj),
-                        )));
+                        return Err(crate::baseobjspace::member_typecheck_error(descr, obj));
                     }
                 }
                 if unsafe { pyre_object::w_member_is_direct(descr) } {
@@ -16246,13 +16234,7 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
                         && pyre_object::is_type(w_cls)
                         && !crate::baseobjspace::isinstance_w(obj, w_cls)
                     {
-                        let slot_name = pyre_object::w_member_get_name(descr);
-                        return Err(crate::PyError::type_error(format!(
-                            "descriptor '{}' for '{}' objects doesn't apply to '{}' object",
-                            slot_name,
-                            pyre_object::w_type_get_name(w_cls),
-                            pyre_object::type_name_of(obj),
-                        )));
+                        return Err(crate::baseobjspace::member_typecheck_error(descr, obj));
                     }
                 }
                 if unsafe { pyre_object::w_member_is_direct(descr) } {
@@ -18336,14 +18318,11 @@ type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 /// edge, in the same shape as `descroperation`'s `bigint_lshift_count` /
 /// `bigint_pow_nomod`.
 ///
-/// `RBigInt::bit_length` returns `Result<i64, RBigIntError>`, but
-/// `scalar_residual_for_method` retargets the call to the raising scalar
-/// residual `jit_bigint_bit_length`, whose result is a bare Signed word and
-/// whose error travels the implicit exception edge. A caller that destructures
-/// the pre-retarget `Result` in a lowered graph reads `__discriminant` /
-/// `__pos_0` off that erased word — an integer used as an aggregate base.
-/// Keeping the match behind this boundary converts the carrier to the
-/// `Result<_, PyError>` the exception transform models.
+/// `RBigInt::bit_length` returns `Result<i64, RBigIntError>` — `ovfcheck`'s
+/// value encoding — and the front's exception transform is scoped to the
+/// `Result<_, PyError>` carrier, so this converts the one to the other at a
+/// single place instead of leaving every `int.bit_length()` caller to
+/// destructure the rbigint-local error type.
 #[majit_macros::dont_look_inside]
 fn long_bit_length(value: &BigInt) -> Result<i64, crate::PyError> {
     match value.bit_length() {
@@ -19017,10 +18996,68 @@ fn init_int_type(ns: PyObjectRef) {
         unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
     }
 }
-/// Complex `repr` (`Xj` for a pure-`+0` real part, else `(re±imj)`),
-/// delegated to `rustpython_literal::complex::to_string`.
+/// `complexobject.py repr_format` — `format_float(x, 'r', 0)`, i.e.
+/// `rfloat.formatd(x, 'r', 0)` without the `DTSF_ADD_DOT_0` flag used by float
+/// repr.
+///
+/// `format_float` names the infinities and NaN itself and only then reaches
+/// `formatd`, so those three arms are spelled here rather than inherited from
+/// the Rust formatter. The finite case still selects a pure-imaginary value
+/// out of the complex formatter, which keeps the `formatd` spelling: `strip`
+/// rather than `pop`, because a `debug_assert` on the `j` compiles out in
+/// release and a bare `pop` would then truncate a real character.
+pub(crate) fn format_complex_component_repr(val: f64) -> String {
+    if val.is_infinite() {
+        return if val > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    if val.is_nan() {
+        return "nan".to_string();
+    }
+    let out = rustpython_literal::complex::to_string(0.0, val);
+    match out.strip_suffix('j') {
+        Some(component) => component.to_string(),
+        None => out,
+    }
+}
+
+/// RPython `rfloat.formatd` residual ABI for a complex repr component.
+///
+/// The translator replaces only the component-format call with this one-word
+/// low-level string result.  The surrounding positive-zero/sign/parenthesis
+/// builder remains visible in `complex_repr_string`, matching PyPy.
+#[majit_macros::dont_look_inside]
+pub fn jit_format_complex_component_repr_rstr(
+    val: f64,
+) -> *mut pyre_object::bytesobject::BytesBlock {
+    let text = format_complex_component_repr(val);
+    pyre_object::bytesobject::alloc_bytes_block(text.as_bytes())
+}
+
+/// `complexobject.py W_ComplexObject.descr_repr` — a pure positive-zero real
+/// part uses `Xj`; every other value uses `(re±imj)`.  Keep the branch and the
+/// two `repr_format` calls visible to source translation, just as PyPy does,
+/// instead of delegating the whole operation to a foreign Rust formatter.
 pub(crate) fn complex_repr_string(re: f64, im: f64) -> String {
-    rustpython_literal::complex::to_string(re, im)
+    if re == 0.0 && re.is_sign_positive() {
+        let mut out = String::new();
+        out.push_str(&format_complex_component_repr(im));
+        out.push_str("j");
+        return out;
+    }
+
+    let mut out = String::new();
+    out.push_str("(");
+    out.push_str(&format_complex_component_repr(re));
+    if im.is_sign_positive() || im.is_nan() {
+        out.push_str("+");
+    }
+    out.push_str(&format_complex_component_repr(im));
+    out.push_str("j)");
+    out
 }
 
 fn init_complex_type(ns: PyObjectRef) {
@@ -19979,7 +20016,7 @@ pub(crate) fn float_to_pyint(v: f64, mode: FloatToIntMode) -> Result<PyObjectRef
 /// IEEE-754 bits are decomposed directly: clearing the stored exponent
 /// to `0x3fe` lands the value in `[0.5, 1)`.  Subnormals are first
 /// scaled into the normal range by `2**54`.
-fn float_frexp(x: f64) -> (f64, i32) {
+pub(crate) fn float_frexp(x: f64) -> (f64, i32) {
     if x == 0.0 {
         return (x, 0);
     }
@@ -23782,42 +23819,6 @@ pub(crate) fn unicode_decode_error(
     }
 }
 
-/// interp_exceptions.py W_UnicodeEncodeError.descr_str format.
-/// `w_object` is the str being encoded; the bad code point is read at
-/// `start` through the surrogate-aware WTF-8 view.
-fn unicode_encode_error_msg(
-    codec: &str,
-    w_object: PyObjectRef,
-    start: usize,
-    end: usize,
-    reason: &str,
-) -> String {
-    if end == start + 1 {
-        let badchar = unsafe {
-            pyre_object::w_str_get_wtf8(w_object)
-                .code_points()
-                .nth(start)
-                .map(|c| c.to_u32())
-                .unwrap_or(0)
-        };
-        let badchar_repr = if badchar <= 0xff {
-            format!("'\\x{badchar:02x}'")
-        } else if badchar <= 0xffff {
-            format!("'\\u{badchar:04x}'")
-        } else {
-            format!("'\\U{badchar:08x}'")
-        };
-        format!(
-            "'{codec}' codec can't encode character {badchar_repr} in position {start}: {reason}"
-        )
-    } else {
-        format!(
-            "'{codec}' codec can't encode characters in position {start}-{}: {reason}",
-            end - 1
-        )
-    }
-}
-
 /// `str.encode('utf-8')` under the default error handler, for a consumer that
 /// can only hold a Rust `str` — the compiler's source text, the tokenizer's
 /// input line.
@@ -23836,8 +23837,8 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
     Err(unicode_encode_error(
         "utf-8",
         pyre_object::w_str_from_wtf8(text),
-        position,
-        position + 1,
+        position as i64,
+        (position + 1) as i64,
         "surrogates not allowed",
     ))
 }
@@ -23852,20 +23853,19 @@ pub(crate) fn utf8_strict_w(text: Wtf8Buf) -> Result<String, crate::PyError> {
 pub(crate) fn unicode_encode_error(
     encoding: &str,
     w_object: PyObjectRef,
-    start: usize,
-    end: usize,
+    start: i64,
+    end: i64,
     reason: &str,
 ) -> crate::PyError {
     let w_encoding = pyre_object::w_str_new(encoding);
-    let w_start = pyre_object::w_int_new(start as i64);
-    let w_end = pyre_object::w_int_new(end as i64);
+    let w_start = pyre_object::w_int_new(start);
+    let w_end = pyre_object::w_int_new(end);
     let w_reason = pyre_object::w_str_new(reason);
-    // Eager message for PyError.message; descr_str recomputes the same text
-    // from the fields (display.rs unicode_encode_error_str).
-    let msg = unicode_encode_error_msg(encoding, w_object, start, end, reason);
-    let exc = pyre_object::interp_exceptions::w_exception_new(
+    // PyPy stores the five fields/args here and formats them only from
+    // `W_UnicodeEncodeError.descr_str`. `PyError::from_exc_object` follows
+    // the same lazy display path, so do not precompute a parallel message.
+    let exc = pyre_object::interp_exceptions::w_exception_new_empty(
         pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
-        &msg,
     );
     unsafe {
         pyre_object::interp_exceptions::w_exception_set_encoding(exc, w_encoding);
@@ -31491,6 +31491,33 @@ fn descr_get_weakref(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn complex_repr_keeps_pypy_positive_zero_and_sign_rules() {
+        for (re, im, expected) in [
+            (0.0, 2.0, "2j"),
+            (-0.0, 2.0, "(-0+2j)"),
+            (1.0, 2.0, "(1+2j)"),
+            (1.0, -2.0, "(1-2j)"),
+            (1.0, f64::NAN, "(1+nanj)"),
+            (f64::INFINITY, f64::NEG_INFINITY, "(inf-infj)"),
+            (0.0, -0.0, "-0j"),
+        ] {
+            assert_eq!(super::complex_repr_string(re, im), expected);
+        }
+    }
+
+    #[test]
+    fn complex_component_residual_returns_the_same_lowlevel_string_bytes() {
+        for value in [0.0, -0.0, 1.5, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let block = super::jit_format_complex_component_repr_rstr(value);
+            let bytes = unsafe { pyre_object::bytesobject::bytes_block_chars(block) };
+            assert_eq!(
+                bytes,
+                super::format_complex_component_repr(value).as_bytes()
+            );
+        }
+    }
+
     #[test]
     fn module_init_retains_a_surrogate_name_object() {
         let module = pyre_object::w_module_new_managed("");

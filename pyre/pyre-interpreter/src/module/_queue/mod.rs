@@ -1,4 +1,14 @@
 //! `_queue` accelerator module.
+//!
+//! PRE-EXISTING-ADAPTATION: PyPy does NOT ship this module. `pypy/module/`
+//! has no `_queue`, and `lib-python/3/queue.py` falls back to its own
+//! `_PySimpleQueue` when the import fails, so upstream's `SimpleQueue` is
+//! pure Python. The spec here is therefore CPython's
+//! `Modules/_queuemodule.c`, not an RPython module.
+//!
+//! The `rthread` citations below are an ANALOGY for where the JIT boundary
+//! belongs — a native blocking primitive is residual in RPython too — and
+//! not a claim of provenance for this type.
 
 use pyre_object::*;
 use std::collections::VecDeque;
@@ -27,6 +37,14 @@ const _: () = assert!(
     "W_SimpleQueue must keep W_ObjectObject's storage offset"
 );
 
+/// Only the native acquire is opaque to the tracer; queue operations performed
+/// while the guard is held stay look-inside.  This is the same split as
+/// `pyre_object::listobject::w_list_lock` and PyPy's `rthread.Lock`: the
+/// wrapper remains RPython while `c_thread_acquirelock{,_timed}` is an
+/// `llexternal` (`rpython/rlib/rthread.py:60-90,160-200`).  Rust's
+/// `Result<Guard, PoisonError<Guard>>` is consequently an implementation ABI
+/// inside the residual native-lock leaf, not a trace-visible value shape.
+#[majit_macros::dont_look_inside]
 fn queue_lock<'a>(
     mutex: &'a Mutex<VecDeque<PyObjectRef>>,
 ) -> MutexGuard<'a, VecDeque<PyObjectRef>> {
@@ -109,20 +127,22 @@ fn simplequeue_put(queue: &W_SimpleQueue, item: PyObjectRef) -> PyObjectRef {
     w_none()
 }
 
-fn simplequeue_get(
+/// Wait until the native queue condition has made an item available.
+///
+/// This is the synchronization primitive, corresponding to the external
+/// acquire beneath PyPy's `rthread.Lock`/semaphore.  The caller keeps timeout
+/// parsing, the non-blocking fast path, and the eventual deque pop visible to
+/// the trace; only the host mutex/condvar wait and Rust poison ABI are opaque.
+#[majit_macros::dont_look_inside]
+fn simplequeue_wait_for_item(
     queue: &W_SimpleQueue,
-    block: bool,
-    timeout: PyObjectRef,
-) -> Result<PyObjectRef, crate::PyError> {
-    let timeout = parse_timeout(block, timeout)?;
+    timeout: Option<f64>,
+) -> Result<MutexGuard<'_, VecDeque<PyObjectRef>>, crate::PyError> {
     let mut guard = queue_lock(&queue.queue);
-    if !block {
-        return guard.pop_front().ok_or_else(empty_error);
-    }
     let deadline = deadline_from_timeout(timeout);
     loop {
-        if let Some(item) = guard.pop_front() {
-            return Ok(item);
+        if !guard.is_empty() {
+            return Ok(guard);
         }
         let blocked = crate::module::thread::before_external_block();
         if let Some(deadline) = deadline {
@@ -147,6 +167,24 @@ fn simplequeue_get(
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             drop(blocked);
         }
+    }
+}
+
+fn simplequeue_get(
+    queue: &W_SimpleQueue,
+    block: bool,
+    timeout: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let timeout = parse_timeout(block, timeout)?;
+    let mut guard = if block {
+        simplequeue_wait_for_item(queue, timeout)?
+    } else {
+        queue_lock(&queue.queue)
+    };
+    if let Some(item) = guard.pop_front() {
+        Ok(item)
+    } else {
+        Err(empty_error())
     }
 }
 

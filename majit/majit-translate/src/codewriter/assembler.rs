@@ -1521,6 +1521,21 @@ impl Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::ConstUInt(val) => {
+                let (idx, src_argcode) =
+                    self.emit_const_i_allow_short(*val as i64, use_c_form("int_copy"), state);
+                state.code.push(idx);
+                argcodes.push(src_argcode);
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("int_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
 
             // RPython folds `lltype.Bool` to kind `'int'` at codewriter
             // (`flatten.py:getkind`), so `ConstBool` materialises through
@@ -2881,6 +2896,7 @@ impl Assembler {
             match kind {
                 OpKind::Input { .. } => "Input",
                 OpKind::ConstInt(_) => "ConstInt",
+                OpKind::ConstUInt(_) => "ConstUInt",
                 OpKind::ConstInt128(_) => "ConstInt128",
                 OpKind::ConstUInt128(_) => "ConstUInt128",
                 OpKind::ConstBool(_) => "ConstBool",
@@ -4721,7 +4737,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::Input { ty, .. } => format!("input_{}", value_type_to_kind(ty)),
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.
-        OpKind::ConstInt(_) => "int_copy".into(),
+        OpKind::ConstInt(_) | OpKind::ConstUInt(_) => "int_copy".into(),
         OpKind::ConstInt128(_) | OpKind::ConstUInt128(_) => {
             panic!("getkind: 128-bit integer constant is too large (history.py:62)")
         }

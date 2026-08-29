@@ -1927,6 +1927,10 @@ impl Bookkeeper {
         self.getuniqueclassdef(&host)
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// Resolve the subclass `ClassDef` for one variant of a Rust enum —
     /// a subclass of the enum's discriminant-only base. Composes the canonical
     /// interning primitives rather than minting a parallel enum-class
@@ -1961,7 +1965,7 @@ impl Bookkeeper {
         let variant_host = self.intern_enum_variant_host(enum_root, variant_name);
         // Project the variant's OWN payload rows onto the subclass —
         // the RPython sum-type layout where each subclass carries its
-        // own fields (`rclass.py:82-88`), the base only the discriminant.
+        // own fields (`rclass.py:499-518`), the base only the discriminant.
         // A getattr on a narrowed `SomeInstance(variant)` then resolves
         // the payload on the variant via the MRO (variant → base), with
         // the variant's own field type.  The rows are registered under
@@ -1982,7 +1986,22 @@ impl Bookkeeper {
             let Some(n) = next else { break };
             self.project_struct_rows(&n)?;
         }
-        self.getuniqueclassdef(&variant_host)
+        let classdef = self.getuniqueclassdef(&variant_host)?;
+        // Every payload row on a Rust enum variant is assigned by that
+        // variant's constructor. In RPython terms these are mutable instance
+        // attributes, not readonly class attributes: `Attribute.modified`
+        // runs during annotation before `InstanceRepr._setup_repr` builds its
+        // field table. Pyre pre-mints variants at session start so inheritance
+        // ids stay stable; mark the projected payload rows at that same point
+        // to preserve RPython's attrs-before-repr ordering even when another
+        // subject caches the repr before this constructor is annotated.
+        {
+            let mut classdef_mut = classdef.borrow_mut();
+            for attr in classdef_mut.attrs.values_mut() {
+                attr.modified(Some(&classdef))?;
+            }
+        }
+        Ok(classdef)
     }
 
     /// Register a trait family for receiver-driven method dispatch: a base
@@ -2063,7 +2082,8 @@ impl Bookkeeper {
 
     /// Intern (first-mint-wins) and return the canonical variant-subclass
     /// `HostObject` for `{enum_root}::{variant_name}`, wiring the enum's
-    /// discriminant-only base as its sole `__bases__` (`rclass.py:82-88`).
+    /// discriminant-only base as its sole `__bases__` (`rclass.py:517-518`:
+    /// `self.rbase = getinstancerepr(rtyper, self.classdef.basedef, ...)`).
     ///
     /// Both the discriminant-narrowing path
     /// ([`Self::getuniqueclassdef_for_enum_variant`]) and the variant
@@ -2167,15 +2187,21 @@ impl Bookkeeper {
         Some(ktd)
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// Project one struct's registry rows into its `ClassDef.attrs`
     /// — the pass-2 body of [`Self::getuniqueclassdef_for_struct_root`].
     fn project_struct_rows(self: &Rc<Self>, n: &str) -> Result<(), AnnotatorError> {
         // A monomorphised generic spelling (`Option<*mut PyObject>`,
-        // `Result<Tuple>`) shares the bare template's rows; the registry
-        // only carries the un-suffixed key (`Option`/`option::Option`).
-        // Strip the `<…>` argument span so the lookup resolves under the
-        // template key — matching `StructFieldRegistry::lookup_fields`,
-        // which the bare-`reg.fields.get` here bypasses.
+        // `Result<Tuple>`) normally shares the bare template's rows. A
+        // payload variant is different: `register_ref_enum_instantiation_rows`
+        // publishes an exact suffixed key with its substituted payload type.
+        // Consult that exact key first, then strip the `<…>` argument span
+        // only as the template fallback — matching
+        // `StructFieldRegistry::lookup_fields` while preserving the concrete
+        // variant row RPython's completed ClassDef would carry.
         //
         // A per-shape positional aggregate (`Tuple<FrameDebugData>` or
         // `Array<PyObjectRef;2>`) is the exception: it has no template — its
@@ -2210,9 +2236,11 @@ impl Bookkeeper {
                 {
                     r.fields.get(n).cloned()
                 } else {
-                    r.fields
-                        .get(majit_ir::descr::strip_generic_args(n).as_ref())
-                        .cloned()
+                    r.fields.get(n).cloned().or_else(|| {
+                        r.fields
+                            .get(majit_ir::descr::strip_generic_args(n).as_ref())
+                            .cloned()
+                    })
                 }
             }) {
                 Some(f) => f,
@@ -2234,30 +2262,26 @@ impl Bookkeeper {
         }
         // A per-instantiation variant carries concrete payload rows keyed
         // under its full `<…>`-suffixed spelling
-        // (`Option<*mut PyObject>::Some` → `__pos_0: *mut PyObject`,
-        // registered by `register_ref_enum_instantiation_rows`), while the
-        // stripped template row is the generic `??TypeVar` that projects to
-        // `Impossible`.  Substitute a template field's type with the exact
-        // key's concrete type ONLY for a RAW-POINTER payload: a pointer
-        // resolves to its pointee struct root (`PyObject`) independent of
-        // spelling, so projecting it here needs no constructor to flow the
-        // value and cannot collide with a differently-spelled named-ADT
-        // payload at `generalize_attr`.  A named heap-ADT payload
-        // (`Result<_, DictKeyError>::Err`) keeps the template `Impossible`
-        // and is filled by the constructor's `setattr` under its own
-        // qualname spelling, unchanged.  Without this, a residual-return
-        // `Option<*mut PyObject>` narrowed to `SomeInstance(Some)` re-blocks
-        // its `__pos_0` payload read on an `Impossible` attr.
-        // The narrowed `Option<*mut PyObject>` residual result is the consumer
-        // of the per-instantiation raw-pointer payload row, so project the two
-        // as one slice.
+        // (`Option<Vec<u8>>::Some` → `__pos_0: Vec<u8>`, registered by
+        // `register_ref_enum_instantiation_rows`), while the stripped
+        // template row is the generic `??TypeVar` that projects to
+        // `Impossible`. Substitute that unresolved template field with the
+        // exact row. The registrar has already rejected unresolved,
+        // multi-word, and layout-ambiguous payloads, so every row reaching
+        // this point is safe to project.
+        //
+        // This ordering is load-bearing parity with RPython:
+        // `RPythonTyper.specialize` runs only after annotation has completed
+        // every `ClassDef.attrs` entry. Pyre's incremental session can cache
+        // an `InstanceRepr` before a later constructor flows its `setattr`;
+        // pre-projecting the concrete row keeps repr setup independent of
+        // subject order instead of relying on that constructor side effect.
         {
             let guard = self.struct_fields.borrow();
             if let Some(exact) = guard.as_ref().and_then(|r| r.fields.get(n)) {
                 for (fname, fty) in &mut fields {
                     if let Some((_, exact_ty)) = exact.iter().find(|(en, _)| en == fname) {
-                        let t = exact_ty.trim();
-                        if t.starts_with("*mut ") || t.starts_with("*const ") {
+                        if fty.contains("??") && !exact_ty.contains("??") {
                             *fty = exact_ty.clone();
                         }
                     }
@@ -2338,6 +2362,10 @@ impl Bookkeeper {
         Ok(())
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// Resolve a struct type-root name to its canonical host class
     /// `HostObject`, minting it on first sight and caching by name in
     /// [`Self::struct_root_classes`].  Because `HostObject`
@@ -2365,8 +2393,10 @@ impl Bookkeeper {
     /// one struct intern to one `HostObject` — name strings are a
     /// resolution input, never the identity itself
     /// (`getuniqueclassdef(cls)` keys by class object,
-    /// bookkeeper.py:339).  Dotted qualnames pass through unchanged; a
-    /// bare leaf whose origin was tombstoned by
+    /// bookkeeper.py:168).  Crate-included `::` names and dotted
+    /// constructor qualnames shed exactly one local-crate segment and
+    /// converge on the crate-relative key before this walk; a bare leaf
+    /// whose origin was tombstoned by
     /// `harden_duplicate_leaf_metadata` stays unresolved and keeps an
     /// attrs-empty classdef because the field registry withdrew the
     /// bare alias.
@@ -2391,7 +2421,7 @@ impl Bookkeeper {
         let mut chain: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut base_host: Option<HostObject> = None;
-        let mut cur = name.to_string();
+        let mut cur = normalize_class_qualname(name);
         loop {
             let key = majit_ir::descr::canonical_struct_name(&cur);
             if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
@@ -2404,20 +2434,14 @@ impl Bookkeeper {
             seen.insert(cur.rsplit("::").next().unwrap_or(&cur).to_string());
             chain.push(cur.clone());
             let next = self.struct_fields.borrow().as_ref().and_then(|reg| {
-                // A constructor mints its class under the dot-joined,
-                // crate-included qualname (`pyre_object.intobject.
-                // W_IntObject`, flowspace_adapter `SyntheticTransparentCtor`
-                // arm), but `struct_fields` is keyed by the `::` `name_path`
-                // (`pyre_object::intobject::W_IntObject`) and the bare leaf.
-                // Reduce `.`→`::` for the registry lookups ONLY, so the
-                // header chain resolves the base for a dot-joined ctor
-                // qualname too — the classdef cache key (`key` above) keeps
-                // the raw spelling, so this seeds the base without collapsing
-                // the ctor class onto the `::`-spelled field-read class.
+                // Constructor, crate-included, and crate-relative spellings
+                // have already converged before entering the walk.  Keep this
+                // reduction local too because subsequent header/enum links
+                // can still be emitted as dotted registry names.
                 let lookup = cur.replace('.', "::");
                 // An enum-variant key `{enum_base}::{variant}` subclasses its
                 // enum base — the discriminant-only sum-type root
-                // (`rclass.py:82-88`).  Checked before the header convention
+                // (`rclass.py:499-518`).  Checked before the header convention
                 // because a variant's first field is its payload, not a
                 // header: without this the session prologue
                 // (`CallRegistry::ensure_session`), which pre-mints every
@@ -2449,7 +2473,16 @@ impl Bookkeeper {
                         return Some(bare_leaf.to_string());
                     }
                 }
-                let (first_name, first_ty) = reg.fields.get(&lookup)?.first()?;
+                // The registry publishes a full declaration path and a bare
+                // convenience alias.  `harden_duplicate_leaf_metadata`
+                // withdraws the latter when it is not injective, so falling
+                // back to it is the name-carrier equivalent of resolving one
+                // live class object and fails closed on duplicate leaves.
+                let rows = reg.fields.get(&lookup).or_else(|| {
+                    let leaf = lookup.rsplit("::").next()?;
+                    reg.fields.get(leaf)
+                })?;
+                let (first_name, first_ty) = rows.first()?;
                 // Only header-conventional first fields mark subclassing
                 // (`ob_header: PyObject` / `base: FrameBlock`).  A
                 // by-value first field of another registered type is
@@ -2479,6 +2512,10 @@ impl Bookkeeper {
         base_host.expect("chain holds at least `name` itself")
     }
 
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
     /// [`Self::intern_class_by_qualname`] with explicit `__bases__` for
     /// the first mint.  First-mint wins: a cache hit returns the
     /// existing class regardless of `bases`, so every site minting a
@@ -2490,7 +2527,14 @@ impl Bookkeeper {
         name: &str,
         bases: Vec<HostObject>,
     ) -> HostObject {
-        let key = majit_ir::descr::canonical_struct_name(name);
+        // Same normalization as [`Self::intern_class_by_qualname`]: both
+        // entry points answer one identity question, so they must derive one
+        // key.  Keying only the base through the strip splits every enum
+        // variant in two — `pyre_object::m::E` and `m::E` intern to one base
+        // but to `pyre_object::m::E::Some` and `m::E::Some` — which is the
+        // sibling-classdef split `intern_enum_variant_host`'s contract
+        // forbids.
+        let key = majit_ir::descr::canonical_struct_name(&normalize_class_qualname(name));
         if let Some(existing) = self.struct_root_classes.borrow().get(&key) {
             return existing.clone();
         }
@@ -2515,17 +2559,22 @@ impl Bookkeeper {
             .is_some_and(|reg| reg.fields.contains_key(name))
     }
 
-    /// True when type-root `root`'s registry rows include a field named
-    /// `name`.  The cutover's class-dict method population consults this
-    /// so a method member never shadows a same-named instance field — a
-    /// function source for a field attribute would union-conflict in
-    /// `generalize_attr`.
+    /// TODO: no upstream equivalent.  The closest thing upstream,
+    /// `Bookkeeper.getdesc` / `getuniqueclassdef` (`bookkeeper.py:168-172`,
+    /// `:353-363`), keys identity on the Python object; pyre has no such
+    /// object and keys on a qualname.
+    /// True when type-root `root` OWNS a field named `name`, or when any
+    /// variant of it does — the enum sum-type layout puts a payload row on
+    /// the variant, not on the discriminant-only base, so an owner-only test
+    /// would miss it (`owner_or_variant_has_field`, `front/semantic.rs`).
+    /// The cutover's class-dict method population consults this so a method
+    /// member never shadows a same-named instance field — a function source
+    /// for a field attribute would union-conflict in `generalize_attr`.
     pub fn struct_root_has_field(&self, root: &str, name: &str) -> bool {
-        self.struct_fields.borrow().as_ref().is_some_and(|reg| {
-            reg.fields
-                .get(root)
-                .is_some_and(|rows| rows.iter().any(|(field, _)| field == name))
-        })
+        self.struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.owner_or_variant_has_field(root, name))
     }
 
     /// TODO: no upstream equivalent.  Project a Rust type
@@ -2540,6 +2589,19 @@ impl Bookkeeper {
     /// entry; unknown bare names fall to `Impossible`.
     pub fn project_struct_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
         let t = field_ty.trim();
+        // `pyre_object::PyObjectRef` is a Rust type alias for
+        // `*mut pyobject::PyObject`.  Charon expands aliases in MIR type
+        // nodes, but the source-derived struct-field registry deliberately
+        // keeps the source spelling, so flexible-array tails such as
+        // `FixedObjectArray._items: [PyObjectRef; 0]` reach this projector
+        // with the alias still intact.  RPython has no alias object at this
+        // point: the corresponding `W_Root` array item is the root instance
+        // annotation itself.  Resolve the alias before the ordinary named
+        // struct arm so list item repr construction sees that same root
+        // `ClassDef`, rather than minting a classdef-less placeholder.
+        if t == "PyObjectRef" || t.ends_with("::PyObjectRef") {
+            return self.project_struct_field_type("pyobject::PyObject");
+        }
         // A raw-pointer field (`*const T` / `*mut T`) holds a one-word
         // pointer, not a `T`.  Projecting the pointee is right for an
         // aggregate target (`*mut Vec<T>` / `*mut Struct`): the structural
@@ -2607,7 +2669,14 @@ impl Bookkeeper {
             // exact annotation too.  Leaving the dependency-opaque name to
             // the registered-struct arm below produces `Impossible` and
             // blocks `ConstantData::Str.value`.
-            "String" | "str" | "Wtf8" | "Wtf8Buf" => return super::model::s_str0(),
+            // `BytesBlock` is pyre's concrete storage port of RPython `STR`:
+            // a `hash` header (`STR.become(GcStruct('rpy_string', ('hash', Signed), ...)`, `rstr.py:1226-1228`) followed by the `chars` array, whose length is the array's own length word.
+            // `bytes_block_chars` folds the Rust raw-slice view back to this
+            // owner, so the owner must carry the same `SomeString` annotation
+            // as the slice it represents, not a nominal Rust-struct class.
+            "String" | "str" | "Wtf8" | "Wtf8Buf" | "BytesBlock" => {
+                return super::model::s_str0();
+            }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque
             // to translation.  Its sanctioned conversion seam is a residual
             // call, but the value occupying `ConstantData::Integer.value`
@@ -2737,7 +2806,11 @@ impl Bookkeeper {
         // array arm above to `SomeList(item=SomeInstance(PyObjectRef),
         // resized=false)`, giving a typed element rather than a
         // classdef-less stub.
-        if majit_ir::descr::canonical_struct_name(stripped) == "object_array::FixedObjectArray" {
+        let canonical_stripped = majit_ir::descr::canonical_struct_name(stripped);
+        if canonical_stripped == "FixedObjectArray"
+            || canonical_stripped == "object_array::FixedObjectArray"
+            || canonical_stripped.ends_with("::object_array::FixedObjectArray")
+        {
             let items_ty = self
                 .struct_fields
                 .borrow()
@@ -3729,6 +3802,34 @@ impl Default for Bookkeeper {
     }
 }
 
+/// One spelling rule for the class cache key, shared by
+/// [`Bookkeeper::intern_class_by_qualname`] and
+/// [`Bookkeeper::intern_class_by_qualname_with_bases`].
+///
+/// A Rust declaration reaches the annotator under three spellings:
+/// crate-included `pyre_object::unicodeobject::W_UnicodeObject`,
+/// crate-relative `unicodeobject::W_UnicodeObject`, and a dotted constructor
+/// qualname.  RPython keys all reads and constructors on the one live class
+/// object (`bookkeeper.py:361-363` — `obj_key = Constant(pyobj)`), so strip
+/// exactly one registered local-crate prefix and normalize dots.
+///
+/// Strip only while a module path survives.  Collapsing
+/// `pyre_object::PyObject` to the bare `PyObject` is what
+/// `harden_duplicate_leaf_metadata` exists to undo — the chain walk needs
+/// `ob_header` / `base` to reach the superclass, and a bare leaf collides
+/// across modules.
+pub(crate) fn normalize_class_qualname(name: &str) -> String {
+    let lookup = name.replace('.', "::");
+    lookup
+        .split_once("::")
+        .filter(|(root, rest)| {
+            rest.contains("::")
+                && (name.contains('.') || crate::local_crates::is_local_crate_root(root))
+        })
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or(lookup)
+}
+
 /// Walk `field_ty`'s type-string structure and collect every bare-named
 /// type that the `StructFieldRegistry` recognises.  Used by
 /// [`Bookkeeper::getuniqueclassdef_for_struct_root`]'s pass-1 discovery
@@ -4456,6 +4557,251 @@ mod tests {
     }
 
     #[test]
+    fn bytes_block_projects_to_rpython_string_storage() {
+        use crate::annotator::model::SomeValue;
+
+        let bk = bk();
+        assert!(
+            matches!(
+                bk.project_struct_field_type("BytesBlock"),
+                SomeValue::String(_)
+            ),
+            "BytesBlock is the owner of RPython STR.chars, not a nominal instance"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("*const BytesBlock"),
+                SomeValue::String(_)
+            ),
+            "a BytesBlock pointer must keep the same string annotation"
+        );
+    }
+
+    #[test]
+    fn struct_root_alias_and_registered_root_share_one_classdef() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "PyObject".to_string(),
+            reg.fields["pyobject::PyObject"].clone(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let SomeValue::Instance(alias_item) = bk.project_struct_field_type("PyObjectRef") else {
+            panic!("PyObjectRef must project to the PyObject instance annotation")
+        };
+        let alias_class = alias_item.classdef.expect("typed PyObjectRef classdef");
+        let root_classdef = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        assert!(
+            Rc::ptr_eq(&alias_class, &root_classdef),
+            "the source alias and registered PyObject root must share one ClassDef"
+        );
+
+        let SomeValue::List(array) = bk.project_struct_field_type("[PyObjectRef; 0]") else {
+            panic!("a PyObjectRef array tail must project to a list")
+        };
+        let SomeValue::Instance(array_item) = array.listdef.s_value() else {
+            panic!("the projected array item must be a PyObject instance")
+        };
+        assert!(
+            array_item
+                .classdef
+                .as_ref()
+                .is_some_and(|classdef| Rc::ptr_eq(classdef, &root_classdef))
+        );
+
+        let SomeValue::List(qualified_array) =
+            bk.project_struct_field_type("[pyre_object::PyObjectRef; 0]")
+        else {
+            panic!("a qualified PyObjectRef array tail must project to a list")
+        };
+        let SomeValue::Instance(qualified_item) = qualified_array.listdef.s_value() else {
+            panic!("the qualified array item must be a PyObject instance")
+        };
+        assert!(
+            qualified_item
+                .classdef
+                .as_ref()
+                .is_some_and(|classdef| Rc::ptr_eq(classdef, &root_classdef))
+        );
+    }
+
+    #[test]
+    fn qualified_fixed_object_array_projects_typed_instance_items() {
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyre_object::object_array::FixedObjectArray".to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                (
+                    "_items".to_string(),
+                    "[pyre_object::PyObjectRef; 0]".to_string(),
+                ),
+            ],
+        );
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let SomeValue::List(array) =
+            bk.project_struct_field_type("*mut pyre_object::object_array::FixedObjectArray")
+        else {
+            panic!("qualified FixedObjectArray pointer must project to its item list")
+        };
+        let SomeValue::Instance(item) = array.listdef.s_value() else {
+            panic!("FixedObjectArray item must be a PyObject instance")
+        };
+        assert!(
+            item.classdef.is_some(),
+            "PyObject item must keep its ClassDef"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn real_llbc_pyframe_locals_array_projects_typed_instance_items() {
+        use crate::annotator::model::SomeValue;
+        use majit_charon_reader::Llbc;
+
+        let interpreter_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let object_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let interpreter = Llbc::load(interpreter_path).expect("load real interpreter LLBC");
+        let object = Llbc::load(object_path).expect("load real object LLBC");
+        let program = crate::front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+            &[object, interpreter],
+            crate::HostStaticAddrs::default(),
+            &["pyframe"],
+            &["__metadata_only__"],
+        )
+        .expect("derive real interpreter metadata");
+        let field_ty = program
+            .struct_fields
+            .field_type("PyFrame", "locals_cells_stack_w")
+            .expect("PyFrame locals array field")
+            .to_string();
+        let fixed_array_rows: Vec<_> = program
+            .struct_fields
+            .fields
+            .iter()
+            .filter(|(key, _)| key.ends_with("FixedObjectArray"))
+            .map(|(key, rows)| (key.clone(), rows.clone()))
+            .collect();
+        majit_ir::descr::register_struct_origins(program.struct_origins);
+
+        let bk = bk();
+        bk.set_struct_fields(Rc::new(program.struct_fields));
+        let pyframe = bk
+            .getuniqueclassdef_for_struct_root("PyFrame")
+            .expect("PyFrame classdef");
+        let locals = pyframe
+            .borrow()
+            .attrs
+            .get("locals_cells_stack_w")
+            .expect("locals array attr")
+            .s_value
+            .clone();
+        let SomeValue::List(array) = locals else {
+            panic!(
+                "{field_ty} must project to a list, got {locals:?}; registry rows: {fixed_array_rows:?}"
+            )
+        };
+        let SomeValue::Instance(item) = array.listdef.s_value() else {
+            panic!("{field_ty} item must be an instance")
+        };
+        assert!(
+            item.classdef.is_some(),
+            "{field_ty} item must retain the PyObject ClassDef"
+        );
+    }
+
+    #[test]
+    fn nonheader_dotted_constructor_reuses_crate_relative_struct_identity() {
+        use crate::front::StructFieldRegistry;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![("__pos_0".to_string(), "u64".to_string())];
+        reg.fields.insert(
+            "pyre_object::celldict::VersionTag".to_string(),
+            rows.clone(),
+        );
+        reg.fields.insert("VersionTag".to_string(), rows);
+        bk.set_struct_fields(Rc::new(reg));
+
+        let from_field = bk.intern_class_by_qualname("celldict::VersionTag");
+        let from_ctor = bk.intern_class_by_qualname("pyre_object.celldict.VersionTag");
+        assert_eq!(from_field, from_ctor);
+        let field_class = bk
+            .getuniqueclassdef(&from_field)
+            .expect("field-side VersionTag classdef");
+        let ctor_class = bk
+            .getuniqueclassdef(&from_ctor)
+            .expect("constructor-side VersionTag classdef");
+        assert!(Rc::ptr_eq(&field_class, &ctor_class));
+    }
+
+    #[test]
+    fn header_struct_spellings_reuse_one_class_identity_and_base() {
+        use crate::front::StructFieldRegistry;
+
+        let previous_roots = crate::local_crates::local_crate_roots();
+        crate::local_crates::register_local_crate_roots(["fixture_crate".to_string()]);
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        let rows = vec![
+            ("ob_header".to_string(), "PyObject".to_string()),
+            ("value".to_string(), "*mut Wtf8Buf".to_string()),
+        ];
+        reg.fields.insert(
+            "fixture_crate::unicodeobject::W_UnicodeObject".to_string(),
+            rows.clone(),
+        );
+        reg.fields.insert("W_UnicodeObject".to_string(), rows);
+        reg.fields.insert(
+            "PyObject".to_string(),
+            vec![("ob_type".to_string(), "*const PyType".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+
+        let from_field = bk.intern_class_by_qualname("unicodeobject::W_UnicodeObject");
+        let from_full =
+            bk.intern_class_by_qualname("fixture_crate::unicodeobject::W_UnicodeObject");
+        let from_ctor = bk.intern_class_by_qualname("fixture_crate.unicodeobject.W_UnicodeObject");
+        assert_eq!(from_field, from_full);
+        assert_eq!(from_field, from_ctor);
+
+        let classdef = bk.getuniqueclassdef(&from_field).expect("header classdef");
+        assert!(
+            classdef.borrow().basedef.is_some(),
+            "normalizing the class identity must retain its embedded-header base"
+        );
+
+        crate::local_crates::register_local_crate_roots(previous_roots);
+    }
+
+    #[test]
     fn getuniqueclassdef_for_enum_variant_subclasses_the_base() {
         use crate::annotator::model::{SomeInstance, SomeValue};
         use crate::front::StructFieldRegistry;
@@ -4582,7 +4928,8 @@ mod tests {
         // `intern_enum_variant_host`) and the discriminant-NARROWING path
         // (`getuniqueclassdef_for_enum_variant`) must resolve the SAME
         // class object — RPython's single-class-per-variant identity
-        // (`rclass.py:82-88`) — and it must carry the variant's payload
+        // (`ClassDesc.getuniqueclassdef`, `classdesc.py:699-702`) — and it
+        // must carry the variant's payload
         // attr.  Before the unification the ctor minted a dotted-qualname
         // sibling classdef with no payload attrs.
         use crate::front::StructFieldRegistry;
@@ -6536,6 +6883,20 @@ mod tests {
         let ok_cd = bk
             .getuniqueclassdef_for_enum_variant("Result<Vec<*mut PyObject>,PyErr>", "Ok")
             .expect("Result::Ok");
+        for (name, classdef) in [("Option::Some", &some_cd), ("Result::Ok", &ok_cd)] {
+            let attrs = classdef.borrow();
+            assert!(
+                matches!(
+                    attrs.attrs.get("__pos_0").map(|attr| &attr.s_value),
+                    Some(SomeValue::List(_))
+                ),
+                "{name} concrete Vec payload must be projected before repr setup"
+            );
+            assert!(
+                !attrs.attrs["__pos_0"].readonly,
+                "{name} constructor payload must be an instance field before repr setup"
+            );
+        }
         for (field, classdef) in [("__pos_0", some_cd.clone()), ("__pos_1", ok_cd.clone())] {
             ClassDef::generalize_attr(
                 &tuple_cd,

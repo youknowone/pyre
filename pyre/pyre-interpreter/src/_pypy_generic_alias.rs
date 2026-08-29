@@ -1513,11 +1513,13 @@ pub(crate) unsafe fn repr(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, 
 /// `[Wtf8Buf]` has no `join` for.
 fn join_wtf8(parts: &[rustpython_wtf8::Wtf8Buf], sep: &str) -> rustpython_wtf8::Wtf8Buf {
     let mut out = rustpython_wtf8::Wtf8Buf::new();
-    for (index, part) in parts.iter().enumerate() {
+    let mut index = 0;
+    while index < parts.len() {
         if index > 0 {
             out.push_str(sep);
         }
-        out.push_wtf8(part);
+        out.push_wtf8(&parts[index]);
+        index += 1;
     }
     out
 }

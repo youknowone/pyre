@@ -142,20 +142,13 @@ pub unsafe fn w_array_setweakref(obj: PyObjectRef, lifeline: PyObjectRef) {
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
 }
 
-/// Address of `W_Array::w_slots` for the shared slot helpers.
-///
-/// # Safety
-/// `obj` must point to a valid `W_Array`.
-unsafe fn array_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
-    unsafe { &mut (*(obj as *mut W_Array)).w_slots }
-}
-
 /// Read one app-level `__slots__` entry from an array subclass.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    unsafe { crate::slots::slot_get(obj, index, array_slots_field) }
+    let slots = unsafe { (*(obj as *const W_Array)).w_slots };
+    unsafe { crate::slots::slot_get(slots, index) }
 }
 
 /// Write one app-level `__slots__` entry on an array subclass.
@@ -163,7 +156,7 @@ pub unsafe fn w_array_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjec
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    unsafe { crate::slots::slot_set(obj, index, value, array_slots_field) }
+    crate::slot_set_direct!(obj, index, value, W_Array, w_slots)
 }
 
 /// Clear one app-level `__slots__` entry on an array subclass.
@@ -171,7 +164,8 @@ pub unsafe fn w_array_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRe
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_array_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    unsafe { crate::slots::slot_del(obj, index, array_slots_field) }
+    let slots = unsafe { (*(obj as *const W_Array)).w_slots };
+    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 /// # Safety

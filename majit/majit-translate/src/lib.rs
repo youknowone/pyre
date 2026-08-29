@@ -795,6 +795,100 @@ fn struct_layout_census_enabled() -> bool {
         .is_some_and(|value| value == std::ffi::OsStr::new("1"))
 }
 
+/// Count distinct struct *identities* per bare leaf for unique trait-impl
+/// devirtualization.
+///
+/// RPython's bookkeeper keys classes by the class object itself, so several
+/// lookup spellings for one class never make it ambiguous.  The LLBC metadata
+/// deliberately publishes full-crate, crate-relative, and bare aliases for
+/// one Rust type; count their shared [`majit_ir::descr::StructId`] once.  A
+/// qualified spelling whose identity is missing remains fail-closed by using
+/// its own path-derived id.  The small per-leaf `Vec` mirrors identity lookup
+/// without introducing an unordered side set.
+///
+/// The caller drops any unique-impl entry whose owner collapses to a leaf
+/// this reports more than once: such an entry could seed the receiver with
+/// the OTHER same-named class.  Multiple lookup aliases of one `StructId`
+/// are one RPython class object and must not make that class ambiguous.
+fn distinct_struct_identities_by_leaf(
+    program: &front::SemanticProgram,
+) -> std::collections::HashMap<String, Vec<majit_ir::descr::StructId>> {
+    let mut by_leaf: std::collections::HashMap<String, Vec<majit_ir::descr::StructId>> =
+        std::collections::HashMap::new();
+    for key in program.struct_fields.fields.keys() {
+        let Some((_, leaf)) = key.rsplit_once("::") else {
+            continue;
+        };
+        let identity = program
+            .struct_ids
+            .get(key)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical(key));
+        let identities = by_leaf.entry(leaf.to_string()).or_default();
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+    }
+    by_leaf
+}
+
+type TraitImplOwners = std::collections::HashMap<String, std::collections::BTreeSet<String>>;
+
+/// Resolve a trait's sole concrete owner to the struct root used by the
+/// annotator, preserving class identity across the LLBC registry's aliases.
+fn unique_trait_impl_roots(
+    program: &front::SemanticProgram,
+    trait_impl_owners: TraitImplOwners,
+) -> std::collections::HashMap<String, String> {
+    let struct_leaf_identities = distinct_struct_identities_by_leaf(program);
+    trait_impl_owners
+        .into_iter()
+        .filter_map(|(trait_qualified, owners)| {
+            if owners.len() != 1 {
+                return None;
+            }
+            let owner = owners.into_iter().next().unwrap();
+            let leaf = owner.rsplit("::").next().unwrap_or(&owner).to_string();
+            let identities = struct_leaf_identities.get(leaf.as_str());
+            // A bare owner has no namespace left to disambiguate.  Accept it
+            // only when every qualified registry spelling resolves to one
+            // StructId; two identities sharing the leaf stay fail-closed.
+            if !owner.contains("::") && identities.is_some_and(|ids| ids.len() > 1) {
+                return None;
+            }
+            let owner_id = program
+                .struct_ids
+                .get(&owner)
+                .copied()
+                .flatten()
+                .or_else(|| identities.and_then(|ids| (ids.len() == 1).then_some(ids[0])))?;
+            // RPython carries the class / lltype object, so every spelling of
+            // one identity reaches one descriptor cache entry.  The Rust
+            // pipeline still transports a string at this seam; choose the
+            // fully crate-qualified registry spelling deterministically so a
+            // method owner such as `option::Option` and its SizeDescr owner
+            // `core::option::Option` cannot split one field object by name.
+            let canonical_owner = program
+                .struct_fields
+                .fields
+                .keys()
+                .filter(|candidate| {
+                    program.struct_ids.get(*candidate).copied().flatten() == Some(owner_id)
+                })
+                .max_by(|left, right| {
+                    left.matches("::")
+                        .count()
+                        .cmp(&right.matches("::").count())
+                        .then_with(|| left.len().cmp(&right.len()))
+                        .then_with(|| right.cmp(left))
+                })
+                .cloned()?;
+            Some((trait_qualified, canonical_owner))
+        })
+        .collect()
+}
+
 #[expect(
     clippy::arc_with_non_send_sync,
     reason = "Arc preserves shared runtime descriptor/JitCode identity while non-Send translator payload remains confined to the single-threaded build phase"
@@ -1593,10 +1687,7 @@ fn analyze_pipeline_from_module_paths(
     // through this map).  Unlike the direct-path registration below,
     // this is annotation-only metadata — it pulls no graph bodies into
     // callers.
-    let mut trait_impl_owners: std::collections::HashMap<
-        String,
-        std::collections::BTreeSet<String>,
-    > = std::collections::HashMap::new();
+    let mut trait_impl_owners: TraitImplOwners = std::collections::HashMap::new();
     for (_, trait_qualified, _, owner, _, _, _) in &concrete_trait_methods {
         // Keyed by the trait's qualified `name_path()` — two distinct
         // traits sharing a leaf name must not pool their impl owners
@@ -1606,19 +1697,6 @@ fn analyze_pipeline_from_module_paths(
             .entry(trait_qualified.clone())
             .or_default()
             .insert(owner.clone());
-    }
-    // Leaf names shared by more than one qualified struct in the
-    // field registry: a unique-impl entry whose owner collapses to
-    // such a leaf could seed the receiver with the OTHER same-named
-    // struct's classdef, so those entries are dropped (fail-safe: the
-    // receiver keeps the classdef-less shell and the block stays
-    // census-visible).
-    let mut struct_leaf_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
-    for key in program.struct_fields.fields.keys() {
-        if let Some((_, leaf)) = key.rsplit_once("::") {
-            *struct_leaf_counts.entry(leaf).or_default() += 1;
-        }
     }
     // Opt-in receiver-driven dispatch families (receiver-dispatch configuration): a consumer
     // names `>=2`-impl trait qualified paths
@@ -1697,23 +1775,7 @@ fn analyze_pipeline_from_module_paths(
         trait_family_registrations.extend(auto);
     }
     call_control.set_trait_family_registrations(trait_family_registrations);
-    let trait_unique_impls: std::collections::HashMap<String, String> = trait_impl_owners
-        .into_iter()
-        .filter_map(|(trait_qualified, owners)| {
-            if owners.len() != 1 {
-                return None;
-            }
-            let owner = owners.into_iter().next().unwrap();
-            // `self_ty_root` may be module-qualified
-            // (`pyframe::PyFrame`); the struct-field registry and
-            // `getuniqueclassdef_for_struct_root` key on the leaf.
-            let leaf = owner.rsplit("::").next().unwrap_or(&owner).to_string();
-            if struct_leaf_counts.get(leaf.as_str()).copied().unwrap_or(0) > 1 {
-                return None;
-            }
-            Some((trait_qualified, leaf))
-        })
-        .collect();
+    let trait_unique_impls = unique_trait_impl_roots(&program, trait_impl_owners);
     call_control.set_trait_unique_impls(trait_unique_impls);
     for (trait_leaf, _, method_name, _owner, return_type, hints, graph) in &concrete_trait_methods {
         let key = (trait_leaf.clone(), method_name.clone());
@@ -2418,6 +2480,57 @@ pub mod rlib;
 #[cfg(test)]
 mod portal_driver_tests {
     use super::*;
+
+    #[test]
+    fn unique_impl_leaf_census_deduplicates_aliases_by_struct_identity() {
+        let mut program = front::SemanticProgram::default();
+        let pyframe = majit_ir::descr::StructId::from_canonical("pyframe::PyFrame");
+        for alias in [
+            "PyFrame",
+            "pyframe::PyFrame",
+            "pyre_interpreter::pyframe::PyFrame",
+        ] {
+            program
+                .struct_fields
+                .fields
+                .insert(alias.to_string(), Vec::new());
+            program.struct_ids.insert(alias.to_string(), Some(pyframe));
+        }
+        let identities = distinct_struct_identities_by_leaf(&program);
+        assert_eq!(
+            identities.get("PyFrame").map(Vec::len),
+            Some(1),
+            "lookup aliases of one RPython class identity are not ambiguous"
+        );
+
+        let mut owners = TraitImplOwners::new();
+        owners
+            .entry("pyre_interpreter::pyopcode::OpcodeStepExecutor".to_string())
+            .or_default()
+            .insert("pyframe::PyFrame".to_string());
+        let unique = unique_trait_impl_roots(&program, owners);
+        assert_eq!(
+            unique.get("pyre_interpreter::pyopcode::OpcodeStepExecutor"),
+            Some(&"pyre_interpreter::pyframe::PyFrame".to_string()),
+            "one class identity uses its fully-qualified registry spelling"
+        );
+
+        let foreign = "other_runtime::PyFrame";
+        program
+            .struct_fields
+            .fields
+            .insert(foreign.to_string(), Vec::new());
+        program.struct_ids.insert(
+            foreign.to_string(),
+            Some(majit_ir::descr::StructId::from_canonical(foreign)),
+        );
+        let identities = distinct_struct_identities_by_leaf(&program);
+        assert_eq!(
+            identities.get("PyFrame").map(Vec::len),
+            Some(2),
+            "genuinely distinct same-leaf classes remain ambiguous"
+        );
+    }
 
     fn driver(portal: CallPath) -> pipeline::JitDriverSpec {
         pipeline::JitDriverSpec {

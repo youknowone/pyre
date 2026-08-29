@@ -5163,9 +5163,13 @@ pub(crate) fn split_builtin_kwargs(args: &[PyObjectRef]) -> (&[PyObjectRef], Opt
 /// every `__majit_wrap_*` shim its own closure type, and merging those
 /// distinct types on one `TakeWhile` graph's input has no common base class.
 #[majit_macros::unroll_safe]
-pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> usize {
-    let mut count = 0;
-    while count < args.len() && !args[count].is_null() {
+pub(crate) fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
+    // PyPy `argument.py:_match_signature` keeps `num_args`, `upfront`, and
+    // every derived argument count as ordinary RPython Signed values.  Rust
+    // slice indexing needs `usize`, but that is an indexing adapter, not the
+    // semantic type of the gateway count.
+    let mut count = 0i64;
+    while count < args.len() as i64 && !args[count as usize].is_null() {
         count += 1;
     }
     count
@@ -5994,25 +5998,38 @@ fn precheck_for_new(w_type: PyObjectRef) -> Result<(), crate::PyError> {
 }
 
 /// typeobject.py `_check_surrogate` — a type name may not contain a
-/// lone surrogate.  Scan the code points through the surrogate-aware WTF-8
-/// view (reading the name as `&str` would fail on the surrogate) and raise
+/// lone surrogate.  Validate through the surrogate-aware WTF-8 view (reading
+/// the name as `&str` would fail on the surrogate) and raise
 /// `UnicodeEncodeError('utf8', name, pos, pos + 1, 'surrogates not allowed')`
 /// at the first one, matching `check_utf8(name, allow_surrogates=False)`.
+/// Keep the call itself: upstream marks `_check_utf8` `jit.elidable`, so the
+/// validator is a load-bearing part of the JIT shape rather than an iterator
+/// scan to re-express locally.
+///
+/// `CheckError.pos` is a BYTE offset — `_check_utf8` walks `s[pos]` — and
+/// `_check_surrogate` forwards it unchanged, but `UnicodeEncodeError` is
+/// consumed as a code-point index: `descr_str` reads `self.object[self.start]`
+/// (`interp_exceptions.py`, `W_UnicodeEncodeError.descr_str`) and `.start` is
+/// user-visible. Upstream is inconsistent between the two, and CPython 3.14
+/// reports the code-point index, so convert here rather than propagate the
+/// byte offset.  Oracle evidence (pinned CPython 3.14.6 versus local PyPy):
+/// `type('\u00e9\ud800', (), {})` reports `.start/.end == (1, 2)` on CPython
+/// and `(2, 3)` on PyPy.  Those exception attributes are observable, so the
+/// CPython 3.14 specification wins while the surrounding PyPy call shape is
+/// retained.
 pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError> {
     let wtf8 = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    let mut pos = 0usize;
-    for cp in wtf8.code_points() {
-        let c = cp.to_u32();
-        if (0xd800..=0xdfff).contains(&c) {
-            return Err(crate::typedef::unicode_encode_error(
-                "utf8",
-                w_name,
-                pos,
-                pos + 1,
-                "surrogates not allowed",
-            ));
-        }
-        pos += 1;
+    if let Err(e) = pyre_object::rutf8::check_utf8(wtf8.as_bytes(), false) {
+        // RPython's CheckError position, `e.pos + 1`, and the exception's
+        // start/end fields are all Signed; keep that type through the call.
+        let pos = pyre_object::rutf8::codepoints_in_utf8(wtf8, 0, e.pos as usize) as i64;
+        return Err(crate::typedef::unicode_encode_error(
+            "utf8",
+            w_name,
+            pos,
+            pos + 1,
+            "surrogates not allowed",
+        ));
     }
     Ok(())
 }
@@ -10938,8 +10955,8 @@ fn unicode_to_decimal_w(
                 return Err(crate::typedef::unicode_encode_error(
                     "utf-8",
                     w_unistr,
-                    pos,
-                    pos + 1,
+                    pos as i64,
+                    (pos + 1) as i64,
                     "surrogates not allowed",
                 ));
             };
@@ -10955,8 +10972,8 @@ fn unicode_to_decimal_w(
             return Err(crate::typedef::unicode_encode_error(
                 "utf-8",
                 w_unistr,
-                pos,
-                pos + 1,
+                pos as i64,
+                (pos + 1) as i64,
                 "surrogates not allowed",
             ));
         };
@@ -11566,6 +11583,19 @@ pub fn try_vec_with_capacity<T>(count: usize) -> Result<Vec<T>, crate::PyError> 
     out.try_reserve_exact(count)
         .map_err(|_| reservation_failed())?;
     Ok(out)
+}
+
+/// `objectmodel.newlist_hint` for a `PyObjectRef` item list.
+///
+/// RPython handles `newlist_hint` through an ExtRegistry specialization:
+/// translation does not inspect the helper body, but emits
+/// `LIST.ll_newlist_hint` directly.  Rust generic calls are monomorphized into
+/// their caller before the LLBC front end sees them, so this non-generic seam
+/// carries the equivalent translation boundary. `flowspace_adapter` replaces
+/// the call with `newlist_hint`; generated JitCode never residualizes it.
+#[majit_macros::dont_look_inside]
+pub fn try_pyobject_vec_with_capacity(count: usize) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    try_vec_with_capacity(count)
 }
 
 /// The `Wtf8Buf` counterpart of [`try_vec_with_capacity`], for the str
@@ -15760,21 +15790,32 @@ fn unhashable_type_error(obj: PyObjectRef) -> crate::PyError {
 /// numeric values land on the same residue.
 const HASH_BITS: i64 = 61;
 const HASH_MODULUS: u64 = (1u64 << HASH_BITS) - 1;
-/// `floatobject.py` HASH_NAN sentinel.
-const HASH_NAN: i64 = 0;
-
-/// Numeric hash of a machine-word integer: reduce `a` modulo the
-/// Mersenne prime `HASH_MODULUS = 2**61 - 1` (the residue keeps `a`'s
-/// sign) and bump a `-1` result to `-2`.  Delegated to
-/// `rustpython_common::hash`; `mod_int` is `value % HASH_MODULUS` and
-/// `fix_sentinel` is the `-1 -> -2` guard.  Shares the reduction with
-/// `_hash_long`, so `hash(42) == hash(2**100 + 42)`-class invariants
-/// hold.  `mod_int`/`fix_sentinel` are `const fn`, so this inlines to
-/// the same arithmetic the hand-rolled port produced.
+const HASH_INF: i64 = 314_159;
+// tupleobject.py's 64-bit `r_ulonglong` xxHash constants.
+const XXPRIME_1: u64 = 11_400_714_785_074_694_791;
+const XXPRIME_2: u64 = 14_029_467_366_897_019_727;
+const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
+// pypy/objspace/std/longobject.py imports rbigint.SHIFT, then defines
+// `_HASH_SHIFT = SHIFT % HASH_BITS`.  RPython's flowspace receives both as
+// already-folded host integers; mirror that graph shape inside this LLBC
+// artefact because Charon keeps a cross-artefact const read opaque.
+const RBIGINT_SHIFT: i64 = 63;
+const HASH_SHIFT: i64 = RBIGINT_SHIFT % HASH_BITS;
+const _: () = assert!(RBIGINT_SHIFT == majit_rlib::rbigint::SHIFT);
+/// Numeric hash of a machine-word integer — the literal branch-free port of
+/// `pypy/objspace/std/intobject.py::_hash_int`.  Keep the Mersenne reduction
+/// in interpreter source: it is part of the translated RPython graph, not an
+/// opaque Rust-library helper.  The unsigned multiply computes `abs(a)` even
+/// for `i64::MIN`, the residue keeps the original sign, and the final subtract
+/// maps the reserved `-1` hash to `-2`.
 #[inline]
 pub(crate) fn _hash_int(a: i64) -> i64 {
-    use rustpython_common::hash;
-    hash::fix_sentinel(hash::mod_int(a))
+    let sign = 1 - ((a < 0) as i64 * 2);
+    let mut x = (a as u64).wrapping_mul(sign as u64);
+    x = (x & HASH_MODULUS) + (x >> HASH_BITS);
+    x -= HASH_MODULUS * ((x >= HASH_MODULUS) as u64);
+    let h = (x as i64) * sign;
+    h - ((h == -1) as i64)
 }
 
 /// pypy/objspace/std/longobject.py `_hash_long`.
@@ -15782,15 +15823,15 @@ pub(crate) fn _hash_int(a: i64) -> i64 {
 /// Reduce the 63-bit rbigint digits modulo the Mersenne prime
 /// `2**61 - 1`, then apply the sign and the `-1 -> -2` sentinel rule.
 #[inline]
+#[majit_macros::elidable]
 pub(crate) fn _hash_long(v: &BigInt) -> i64 {
-    const HASH_SHIFT: i64 = majit_rlib::rbigint::SHIFT % HASH_BITS;
     let mut i = v.numdigits();
     let mut x = 0_u64;
     while i > 0 {
         i -= 1;
         x = ((x << HASH_SHIFT) & HASH_MODULUS) + (x >> (HASH_BITS - HASH_SHIFT));
         x += v.udigit(i);
-        if majit_rlib::rbigint::SHIFT > HASH_BITS {
+        if RBIGINT_SHIFT > HASH_BITS {
             x = (x & HASH_MODULUS) + (x >> HASH_BITS);
         }
         if x >= HASH_MODULUS {
@@ -15801,38 +15842,98 @@ pub(crate) fn _hash_long(v: &BigInt) -> i64 {
     hash - (hash == -1) as i64
 }
 
-/// Numeric hash of a `float`.  `rustpython_common::hash::hash_float`
-/// reduces the mantissa/exponent modulo the Mersenne prime
-/// `HASH_MODULUS = 2**61 - 1` (keeping the sign), so `hash(2.0) == hash(2)`
-/// and the `±inf` sentinels are `±314159`; subnormals decompose exactly.
-/// It returns `None` for NaN.  Object-aware callers replace that case with
-/// `default_identity_hash`; `_hash_float` retains PyPy's internal sentinel
-/// for call sites that have no wrapped object.
+/// Literal port of `pypy/objspace/std/floatobject.py::_hash_float`.
+/// NaN identity hashing is handled by the wrapped-object caller, as in PyPy;
+/// this helper receives finite values or infinities only.
 #[inline]
+#[majit_macros::elidable]
 pub(crate) fn _hash_float(v: f64) -> i64 {
-    rustpython_common::hash::hash_float(v).unwrap_or(HASH_NAN)
+    if v.is_infinite() {
+        return if v > 0.0 { HASH_INF } else { -HASH_INF };
+    }
+
+    let (mut m, mut e) = crate::typedef::float_frexp(v);
+    let mut sign = 1_i64;
+    if m < 0.0 {
+        sign = -1;
+        m = -m;
+    }
+
+    let mut x = 0_u64;
+    while m != 0.0 {
+        x = ((x << 28) & HASH_MODULUS) | (x >> (HASH_BITS - 28));
+        m *= 268_435_456.0;
+        e -= 28;
+        let y = m as u64;
+        m -= y as f64;
+        x += y;
+        if x >= HASH_MODULUS {
+            x -= HASH_MODULUS;
+        }
+    }
+
+    let hash_bits = HASH_BITS as i32;
+    e = if e >= 0 {
+        e % hash_bits
+    } else {
+        hash_bits - 1 - ((-1 - e) % hash_bits)
+    };
+    x = ((x << e) & HASH_MODULUS) | (x >> (hash_bits - e));
+
+    let hash = (x as i64) * sign;
+    hash - (hash == -1) as i64
 }
 
-/// `tupleobject.py descr_hash` — the xxHash sequence hash, delegated
-/// to `rustpython_common::hash::hash_tuple`.  The caller has already computed
-/// each element's hash into `items`, so the fold is infallible here.
-///
-/// The shared fold reproduces the accumulator loop and length mangle exactly.
-/// It also corrects the `acc == (uint)-1` sentinel: `tupleobject.py:403`
-/// computes `acc += (acc == -1) * (1546275796 + 1)`, so a wrapped `acc` of
-/// `-1` becomes `1546275796` — the value CPython's `tuplehash` also returns.
-/// The prior local port set the result to `1546275796 + 1` instead of adding
-/// to `acc`, an off-by-one in that (2**-64-probability) case; delegation fixes
-/// it.
+/// Literal `tupleobject.py descr_hash` xxHash sequence fold over already
+/// computed element hashes.
 #[inline]
 fn _hash_tuple_xx(items: &[i64]) -> i64 {
-    _hash_tuple_xx_iter(items.iter().copied())
+    let mut acc = XXPRIME_5;
+    let mut i = 0_usize;
+    while i < items.len() {
+        let lane = items[i];
+        acc = acc.wrapping_add((lane as u64).wrapping_mul(XXPRIME_2));
+        acc = (acc << 31) | (acc >> 33);
+        acc = acc.wrapping_mul(XXPRIME_1);
+        i += 1;
+    }
+    acc = acc.wrapping_add((items.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
+    acc = acc.wrapping_add((acc == u64::MAX) as u64 * (1_546_275_796 + 1));
+    acc as i64
 }
 
-/// `_hash_tuple_xx` over element digests produced on the fly.
-fn _hash_tuple_xx_iter(items: impl Iterator<Item = i64>) -> i64 {
-    rustpython_common::hash::hash_tuple(items.map(Ok::<i64, ()>))
-        .expect("element hashes are precomputed, so the fold cannot fail")
+/// Hash the live wrapped-item storage with an explicit index loop, keeping
+/// the dynamic path out of Rust's generic `Iterator` hierarchy, which has no
+/// RPython owner/repr.
+///
+/// This is the BODY of `tupleobject.py`'s `_descr_hash_jitdriver`, not that
+/// method: the port carries neither its `hash_driver.jit_merge_point(w_type=
+/// space.type(self.wrappeditems[0]))` nor the `_unroll_condition()` fork that
+/// chooses between it and the `@jit.unroll_safe` `_descr_hash_unroll` arm.
+/// Restoring the fork needs `jit.loop_unrolling_heuristic` and an
+/// `UNROLL_CUTOFF`, neither of which exists here yet; until then the
+/// jitdriver arm is the only one, so the short-tuple unrolled path upstream
+/// takes is never taken.
+unsafe fn _hash_tuple_xx_storage(obj: PyObjectRef) -> i64 {
+    let len = w_tuple_len(obj);
+    let mut acc = XXPRIME_5;
+    let mut i = 0_usize;
+    while i < len {
+        // `i < len` bounds the read, so upstream's `wrappeditems[i]` cannot be
+        // absent.  Skipping the lane instead would fold a shorter sequence
+        // while the `acc += len` tail below still counts it, i.e. answer a
+        // hash for a tuple that does not exist.
+        let item = w_tuple_getitem(obj, i as i64)
+            .expect("tuple index below w_tuple_len is always present");
+        let lane = hash_value(item) as u64;
+        acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
+        acc = (acc << 31) | (acc >> 33);
+        acc = acc.wrapping_mul(XXPRIME_1);
+        i += 1;
+    }
+    acc = acc.wrapping_add((len as u64) ^ (XXPRIME_5 ^ 3_527_539));
+    acc = acc.wrapping_add((acc == u64::MAX) as u64 * (1_546_275_796 + 1));
+    acc as i64
 }
 
 /// CPython/PyPy's deterministic seed expansion
@@ -15980,22 +16081,24 @@ pub fn hash_str_bytes(bytes: &[u8]) -> i64 {
     _hash_unicode(wtf8)
 }
 
-/// `setobject.py W_FrozensetObject.descr_hash` — the order-independent
-/// XOR-fold, delegated to `rustpython_common::hash::FrozenSetHash`.  The caller
-/// has already computed each element's hash into `items`.
-///
-/// The shared accumulator is bit-identical: its `shuffle_bits`
-/// `((h ^ 89869747) ^ (h << 16)) * 3644798167` equals the port's
-/// `(h ^ (h << 16) ^ 89869747) * (1822399083 * 2 + 1)` (xor is associative;
-/// `3644798167 == 1822399083 * 2 + 1`), and the seed `(len + 1) * 1927868237`,
-/// the final dispersion, and the `-1 -> 590923713` sentinel all match.
+/// Literal `setobject.py W_FrozensetObject.descr_hash` order-independent
+/// XOR-fold.  The caller has already computed each element's hash into
+/// `items`; `u64` is RPython's `r_uint` on pyre's supported 64-bit target.
 #[inline]
 fn _hash_frozenset(items: &[i64]) -> i64 {
-    let mut acc = rustpython_common::hash::FrozenSetHash::new(items.len());
-    for &item_hash in items {
-        acc.add(item_hash);
+    let multi = 1_822_399_083_u64
+        .wrapping_add(1_822_399_083)
+        .wrapping_add(1);
+    let mut hash = 1_927_868_237_u64.wrapping_mul(items.len() as u64 + 1);
+    for &h in items {
+        let h = h as u64;
+        let value = (h ^ (h << 16) ^ 89_869_747).wrapping_mul(multi);
+        hash ^= value;
     }
-    acc.finish()
+    hash ^= (hash >> 11) ^ (hash >> 25);
+    hash = hash.wrapping_mul(69_069).wrapping_add(907_133_923);
+    let hash = hash as i64;
+    if hash == -1 { 590_923_713 } else { hash }
 }
 
 /// CPython 3.14 consumes the digests cached in the set table and caches the
@@ -16099,9 +16202,7 @@ pub fn hash_value(obj: PyObjectRef) -> i64 {
             if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
                 return hash;
             }
-            let n = w_tuple_len(obj) as i64;
-            let hash =
-                _hash_tuple_xx_iter((0..n).filter_map(|i| w_tuple_getitem(obj, i).map(hash_value)));
+            let hash = _hash_tuple_xx_storage(obj);
             pyre_object::w_tuple_set_cached_hash(obj, hash);
             return hash;
         }
@@ -21128,6 +21229,23 @@ static __majit_wrap_builtin_dunder_import_target: crate::gateway::BuiltinWrapper
 mod tests {
     use super::*;
 
+    #[test]
+    fn check_surrogate_reports_codepoint_position_like_cpython_314() {
+        let _ = new_builtin_module_dict();
+        let mut name = rustpython_wtf8::Wtf8Buf::new();
+        name.push(rustpython_wtf8::CodePoint::from_char('\u{e9}'));
+        name.push(rustpython_wtf8::CodePoint::from_u32(0xd800).unwrap());
+        let w_name = pyre_object::w_str_from_wtf8(name);
+
+        let error = check_surrogate(w_name).expect_err("a lone surrogate must be rejected");
+        assert_eq!(error.kind, crate::PyErrorKind::UnicodeEncodeError);
+        let start =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_start(error.exc_object) };
+        let end = unsafe { pyre_object::interp_exceptions::w_exception_get_end(error.exc_object) };
+        assert_eq!(unsafe { pyre_object::w_int_get_value(start) }, 1);
+        assert_eq!(unsafe { pyre_object::w_int_get_value(end) }, 2);
+    }
+
     /// Several threads installing the builtins at once all finish.
     ///
     /// `register_exc_class` used to hold its registry mutex across the method
@@ -21621,12 +21739,13 @@ mod tests {
         }
     }
 
-    /// `_hash_float` delegates to `rustpython_common::hash::hash_float`,
-    /// which reproduces the reference `hash(5e-324) == 16777216` for
-    /// subnormals, the `hash(2.0) == hash(2)` integral invariant, and the
-    /// `±inf`/NaN sentinels.
+    /// The literal PyPy `_hash_float` port reproduces the reference
+    /// `hash(5e-324) == 16777216` for subnormals, the
+    /// `hash(2.0) == hash(2)` integral invariant, and the `±inf` sentinels.
+    /// RustPython's implementation remains an independent finite-input
+    /// differential oracle, not part of the translated interpreter body.
     #[test]
-    fn float_hash_delegates_to_common() {
+    fn float_hash_matches_pypy_algorithm() {
         use rustpython_common::hash;
         // Subnormal reference point (the value that motivated the fix).
         assert_eq!(_hash_float(f64::from_bits(1)), 16777216);
@@ -21637,9 +21756,6 @@ mod tests {
         assert_eq!(_hash_float(-0.0), 0);
         assert_eq!(_hash_float(f64::INFINITY), 314159);
         assert_eq!(_hash_float(f64::NEG_INFINITY), -314159);
-        // NaN hashes to HASH_NAN here; common returns None for it.
-        assert_eq!(_hash_float(f64::NAN), HASH_NAN);
-        assert_eq!(hash::hash_float(f64::NAN), None);
         // Differential battery of tricky finite floats: `_hash_float` must
         // equal `Some(hash_float(f))` on every one.
         let cases = [
@@ -21704,9 +21820,9 @@ mod tests {
         );
     }
 
-    /// Tuple and frozenset hashes delegate to `rustpython_common::hash`
-    /// (`hash_tuple` / `FrozenSetHash`).  Both fold only element hashes and are
-    /// seed-independent, so the values are fixed and match CPython 3.14.
+    /// Tuple and frozenset hashes use their literal upstream folds. Both
+    /// consume only element hashes and are seed-independent, so the values are
+    /// fixed and match CPython 3.14.
     /// `_hash_tuple_xx` / `_hash_frozenset` take the already-computed element
     /// hashes; small ints hash to themselves and `hash(-1) == -2`.
     #[test]
