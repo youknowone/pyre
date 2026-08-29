@@ -407,11 +407,20 @@ fn run_startup_file(
 /// read off the interpreter's own `sys` for the reason `ps1` is; a missing one
 /// is not a failure, which is what an `-S` run relies on.
 fn run_interactive_hook(runtime: &ReplRuntime, canonical: pyre_object::PyObjectRef) {
-    let Ok(hook) =
-        pyre_interpreter::baseobjspace::getattr_str(runtime.sys_module, "__interactivehook__")
-    else {
-        return;
-    };
+    // `findattr`, which is `PyObject_GetOptionalAttr`: only a missing name reads
+    // as "no hook".  A `sys` whose lookup raises -- a module `__getattr__`, a
+    // descriptor -- has failed to produce the hook, and that is reported rather
+    // than passed off as an `-S` run's absence.
+    let hook =
+        match pyre_interpreter::baseobjspace::findattr(runtime.sys_module, "__interactivehook__") {
+            Ok(Some(hook)) => hook,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("Failed calling sys.__interactivehook__");
+                report_or_exit_before_prompt(error, canonical, runtime.ctx_ptr);
+                return;
+            }
+        };
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(hook);
     let hook_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
