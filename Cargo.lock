@@ -2232,6 +2232,7 @@ name = "majit-metainterp"
 version = "0.0.2"
 dependencies = [
  "bit-set",
+ "bitflags 2.13.0",
  "indexmap",
  "majit-backend",
  "majit-backend-cranelift",
