@@ -13715,7 +13715,7 @@ cache size\t: 8192 kB\n";
             });
         }
 
-        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        let _guard = SHADOW_STACK_TEST_LOCK.lock();
         crate::shadow_stack::clear();
         crate::shadow_stack::register_extra_root_walker(record);
         SEEN.with(|seen| seen.borrow_mut().clear());

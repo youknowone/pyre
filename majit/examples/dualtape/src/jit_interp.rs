@@ -262,7 +262,7 @@ mod tests {
     fn the_reserved_identity_trim_and_its_decline_are_unreached() {
         let blanked = majit_metainterp::mc_diag_slot("inline_frame_trim_blanked_live_int");
         let declined = majit_metainterp::mc_diag_slot("guard_resume_decline_reserved_identity");
-        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = PROBE_LOCK.lock();
         let before = (
             majit_metainterp::mc_diag(blanked),
             majit_metainterp::mc_diag(declined),

@@ -5855,7 +5855,7 @@ mod tests {
         for (_, force) in DECLARED_GROUPS {
             force();
         }
-        let gc = majit_ir::descr::gc_cache().lock().unwrap();
+        let gc = majit_ir::descr::gc_cache().lock();
         let unstamped: Vec<&str> = DECLARED_GROUPS
             .iter()
             .filter(|(def_path, _)| {
