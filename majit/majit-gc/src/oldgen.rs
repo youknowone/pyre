@@ -178,10 +178,21 @@ impl OldGen {
     /// `and not alloc_young`), because the arena's sweep is the major's and it
     /// has no per-object free — so this entry point never consults
     /// `SMALL_REQUEST_THRESHOLD`.
-    pub fn try_alloc_young(&mut self, total_size: usize) -> Option<*mut u8> {
+    ///
+    /// `card_header_bytes` is the same prefix `alloc_with_card_header`
+    /// reserves: `external_malloc` computes it before it branches on
+    /// `alloc_young`, so a young array carries cards exactly as an old one
+    /// does. The record keeps `alloc_start` from before the prefix, so the
+    /// free path needs no knowledge of it.
+    pub fn try_alloc_young(
+        &mut self,
+        total_size: usize,
+        card_header_bytes: usize,
+    ) -> Option<*mut u8> {
         let obj_size = try_round_up(total_size.max(GcHeader::MIN_NURSERY_OBJ_SIZE))?;
-        let alloc_size = try_round_up(obj_size)?;
-        let (header_ptr, record) = self.try_rawmalloc_block(alloc_size, 0)?;
+        let alloc_size = try_round_up(card_header_bytes.checked_add(obj_size)?)?;
+        debug_assert_eq!(card_header_bytes % OBJECT_ALIGN, 0);
+        let (header_ptr, record) = self.try_rawmalloc_block(alloc_size, card_header_bytes)?;
         self.young_rawmalloced_payloads
             .insert(header_ptr as usize + GcHeader::SIZE);
         self.young_rawmalloced_objects.push(record);
