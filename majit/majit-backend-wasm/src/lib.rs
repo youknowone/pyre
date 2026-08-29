@@ -175,6 +175,32 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "inline_deferred",
     "inline_trip_fired",
     "inline_decl_defer_invalidation_guard",
+    // 57-68: why `general_int_call_assembler_target` returned `None`, i.e.
+    // which of its guards left `allow_ca` false and so made
+    // `wasm_unsupported_trace_reason` decline a CALL_ASSEMBLER-bearing trace.
+    // `compile_loop` reports that decline as one `cl_decl_unsupported`, which
+    // is a `loops_aborted` bump and nothing more; the reason string cannot
+    // leave the guest, so the split has to be a counter like every other
+    // question this table answers.
+    //
+    // `ca_none_frame_bytes` is the one that separates a target still carrying
+    // `register_pending_call_assembler_target`'s all-zero geometry from a real
+    // disagreement: an entry whose input types match and whose frame bytes are
+    // zero IS that placeholder, and reaching the non-self arm with one means
+    // the trace baked a CALL_ASSEMBLER against a pending token that is not the
+    // token this compile runs under.
+    "ca_none_opcode",
+    "ca_none_descr",
+    "ca_none_types",
+    "ca_none_token",
+    "ca_none_unregistered",
+    "ca_none_self_bad",
+    "ca_none_materialize",
+    "ca_none_input_types",
+    "ca_none_declined",
+    "ca_none_frame_bytes",
+    "ca_none_gcmap",
+    "ca_none_not_compiled",
 ];
 
 #[repr(u8)]
@@ -2932,10 +2958,17 @@ fn general_int_call_assembler_target(
             op.opcode,
             majit_ir::OpCode::CallAssemblerI | majit_ir::OpCode::CallAssemblerR
         ) {
+            diag_bump(57);
             return None;
         }
-        let descr_ref = op.getdescr()?;
-        let descr = descr_ref.as_call_descr()?;
+        let Some(descr_ref) = op.getdescr() else {
+            diag_bump(58);
+            return None;
+        };
+        let Some(descr) = descr_ref.as_call_descr() else {
+            diag_bump(58);
+            return None;
+        };
         let arg_types = descr.arg_types();
         if !arg_types
             .iter()
@@ -2945,10 +2978,17 @@ fn general_int_call_assembler_target(
                 majit_ir::Type::Int | majit_ir::Type::Ref
             )
         {
+            diag_bump(59);
             return None;
         }
-        let target_token = descr.call_target_token()?;
-        let mut registered = call_assembler_target(target_token)?;
+        let Some(target_token) = descr.call_target_token() else {
+            diag_bump(60);
+            return None;
+        };
+        let Some(mut registered) = call_assembler_target(target_token) else {
+            diag_bump(61);
+            return None;
+        };
         let target = if let Some(self_) = pending_self.as_ref().filter(|self_| {
             target_token == self_.token_number
                 // A self target must be precisely the placeholder installed
@@ -2960,11 +3000,13 @@ fn general_int_call_assembler_target(
             // Keep the ordinary input validation, then use the current loop's
             // frozen geometry.
             if registered.input_types.as_slice() != arg_types || self_.frame.ca_frame_bytes == 0 {
+                diag_bump(62);
                 return None;
             }
             let callee_gcmap_ptr =
                 Box::leak(build_callee_gcmap(self_.input_types, self_.frame)).as_ptr() as i64;
             if callee_gcmap_ptr == 0 {
+                diag_bump(62);
                 return None;
             }
             CallAssemblerTarget {
@@ -2982,19 +3024,32 @@ fn general_int_call_assembler_target(
             if registered.func_handle == 0 && registered.compiled_ptr != 0 {
                 let loop_ =
                     unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() }?;
-                let handle = loop_.materialize_func_handle().ok()?;
+                let Ok(handle) = loop_.materialize_func_handle() else {
+                    diag_bump(63);
+                    return None;
+                };
                 if handle == 0 {
+                    diag_bump(63);
                     return None;
                 }
                 registered.func_handle = handle;
                 ca_dispatch_publish(target_token, handle, registered.compiled_ptr as u32);
                 publish_call_assembler_target(target_token, registered.clone());
             }
-            if registered.input_types.as_slice() != arg_types
-                || registered.callee_frame_bytes == 0
-                || registered.callee_gcmap_ptr == 0
-                || registered.compiled_ptr == 0
-            {
+            if registered.input_types.as_slice() != arg_types {
+                diag_bump(64);
+                return None;
+            }
+            if registered.callee_frame_bytes == 0 {
+                diag_bump(66);
+                return None;
+            }
+            if registered.callee_gcmap_ptr == 0 {
+                diag_bump(67);
+                return None;
+            }
+            if registered.compiled_ptr == 0 {
+                diag_bump(68);
                 return None;
             }
             // A successfully compiled loop is retained by its token while it
@@ -3006,6 +3061,7 @@ fn general_int_call_assembler_target(
                     .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
             };
             if !live {
+                diag_bump(65);
                 return None;
             }
             registered
