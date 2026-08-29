@@ -1000,6 +1000,20 @@ impl WarmEnterState {
         let Some(cell) = self.cell_by_key(cell_key) else {
             return false;
         };
+        Self::cell_is_ceiling_latched(cell)
+    }
+
+    /// Typed-key twin of [`Self::is_ceiling_latched`]. Resolves through the
+    /// same comparekey chain walk as [`Self::maybe_compile_decision_with_key`]
+    /// so a sibling at the bucket head cannot answer for `key`.
+    pub fn is_ceiling_latched_for_key(&self, key: &GreenKey) -> bool {
+        let Some(cell) = self.lookup_chain_with_key(key) else {
+            return false;
+        };
+        Self::cell_is_ceiling_latched(cell)
+    }
+
+    fn cell_is_ceiling_latched(cell: &BaseJitCell) -> bool {
         if cell.is_compiled() || cell.is_tracing() {
             return false;
         }
