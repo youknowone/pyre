@@ -9,7 +9,11 @@ description: Rebase the current working branch onto `upstream/main` (the remote 
 
 The working branch has drifted from `upstream/main` over time. Rebasing pulls `upstream/main`'s progress under our work so that subsequent merging, reviewing, and landing operate against an up-to-date base. Two things make this rebase non-routine:
 
-1. **The base is `upstream/main`, not local `main`.** Rebase onto the remote base `upstream/main` — the published main the branch will ultimately land against. Do **not** fall back to the local `main` branch, which may lag `upstream/main`; rebasing onto a stale local `main` leaves the branch still behind the real base. This skill does **not** auto-fetch — it uses the already-fetched `upstream/main` as-is (the user syncs the `upstream` remote manually).
+1. **The base is a freshly-fetched remote `main`, not local `main`.** Rebase onto the published main the branch will ultimately land against. Do **not** fall back to the local `main` branch, which only moves when pulled and so may lag the remote; rebasing onto a stale local `main` leaves the branch still behind the real base.
+
+   Fetch it first. A remote-tracking ref is only as current as the last fetch, and a stale one rebases the branch **backwards** onto a base that lacks already-merged work — silently, with zero conflicts, surfacing only as a compile error naming a symbol the dropped base provided.
+
+   `origin/main` is not banned. It is a remote-tracking ref of the same kind as `upstream/main`, updated by the same fetch, and in this repository `origin` and `upstream` are the **same URL** — so preferring one and forbidding the other forbids an alias of what it mandates. The lag argument is about local `main` alone. Resolve the base per Step 1.5 and verify, rather than assuming which remote the user keeps current.
 2. **Conflicts are not 50/50 choices.** A conflict usually means both sides edited the same region with different intents. The right answer is almost always "whichever side matches RPython/PyPy upstream more faithfully" — sometimes that's ours, sometimes it's `upstream/main`'s, and sometimes it's a blend taking individual lines from both. Picking a side wholesale loses information.
 
 Commit boundaries do not reliably align with these semantic units. A single commit can contain five unrelated hunks; one hunk in that commit may belong to us and four to `upstream/main`. Therefore conflict resolution must operate on the hunk/region level, not on `git checkout --ours` / `--theirs` at file level.
@@ -42,7 +46,31 @@ Goal: enter the rebase with a clean, conceptually-coherent commit history. Messy
 
 4. Confirm the squash plan with the user before rewriting history, especially if the branch is shared.
 
-5. Before invoking `git rebase`, ensure `upstream/main` exists and is at the tip the user intends. This skill does **not** auto-fetch — the user syncs the `upstream` remote manually, so `upstream/main` is whatever was last fetched. Do **not** fall back to local `main` (it may lag `upstream/main`) or `origin/main`. If `upstream/main` is missing, stop and ask the user to add the remote (`git remote add upstream <URL>`) and fetch it — do not silently rebase onto local `main`.
+5. Resolve the base before invoking `git rebase` — see Step 1.5. Never fall back to local `main`.
+
+## Step 1.5 — Fetch, then resolve the base
+
+The base is a remote `main`, and which remote holds the current one is a question to answer, not to assume.
+
+1. Fetch the candidates. This is cheap and it is what keeps a stale ref from silently rebasing the branch backwards:
+
+   ```bash
+   git fetch upstream 2>/dev/null; git fetch origin
+   ```
+
+2. Read both tips:
+
+   ```bash
+   git rev-parse upstream/main origin/main 2>&1
+   ```
+
+3. Choose:
+   - **They agree** — the common case here, where `origin` and `upstream` are the same URL. Either name works; use `upstream/main`.
+   - **They disagree** — do not pick silently. Show the user both tips and `git log --oneline upstream/main..origin/main` (and the reverse), and ask which is the base. One of them is ahead, and rebasing onto the other drops whatever it is ahead by.
+   - **`upstream` does not exist** — use `origin/main`. It is a remote-tracking ref of the same kind; there is no reason to stop.
+   - **Neither exists** — stop and ask the user to add and fetch a remote. Do not silently rebase onto local `main`.
+
+4. Record the resolved SHA. Step 5 verifies against it, and a peer rebase mid-run can move the branch under you.
 
 ## Step 2 — Start the rebase
 
@@ -50,7 +78,7 @@ Goal: enter the rebase with a clean, conceptually-coherent commit history. Messy
 git rebase upstream/main
 ```
 
-That's it — `upstream/main`, the already-fetched remote base. If the rebase completes cleanly with no conflicts, skip to Step 5.
+Substitute whichever base Step 1.5 resolved. If the rebase completes cleanly with no conflicts, skip to Step 5.
 
 If the rebase refuses to start because of a dirty working tree, go back to Step 1.
 
@@ -132,7 +160,8 @@ Do **not** push, merge, or force-push unless the user explicitly asks.
 
 ## Hard rules (recap)
 
-- Base is `upstream/main` (the remote base), never local `main` or `origin/main`.
+- Base is a remote `main` resolved and fetched per Step 1.5, never local `main`. Fetch before reading a tip; an unfetched ref is the one failure of this skill that produces no conflict and no error until compile time.
+- When `upstream/main` and `origin/main` disagree, ask which is the base — do not pick.
 - Every conflict region is judged individually. No bulk `--ours` / `--theirs`, no IDE "take all current", no trust-one-side-per-file shortcuts.
 - Every non-trivial resolution cites the upstream RPython/PyPy file:line it was judged against.
 - Commit any unstaged work (or explicitly stash with user consent) before starting the rebase.
