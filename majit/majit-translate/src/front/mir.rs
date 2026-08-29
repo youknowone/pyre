@@ -2551,6 +2551,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::checked_arith::rewire_checked_arith_call_sites(
                 &mut lo.graph,
                 &lo.checked_arith_call_results,
+                &lo.checked_arith_ok_or_else_sites,
             )
         };
         // The unsigned checked-arith rewrite (`front::checked_arith_uint`) runs
@@ -3399,6 +3400,11 @@ struct Lowering<'a> {
     /// (`front::checked_arith`) that runs after the body lowering
     /// completes, rewriting each into an `*_ovf` op + OverflowError edge.
     checked_arith_call_results: Vec<Variable>,
+    /// `Option::ok_or_else` continuations that may directly consume one of
+    /// the signed checked-arith results above.  Type-owned closure/Result
+    /// metadata is captured here so `front::checked_arith` can fuse that
+    /// continuation into the `*_ovf` normal/overflow edges.
+    checked_arith_ok_or_else_sites: Vec<crate::front::checked_arith::CheckedArithOkOrElseSite>,
     /// Unsigned `usize::checked_{add,mul}()` call sites (`Option<usize>`-
     /// typed) recorded for the native-overflow rewiring pass
     /// (`front::checked_arith_uint`) that runs after `front::checked_arith`,
@@ -3739,6 +3745,7 @@ impl<'a> Lowering<'a> {
             option_ok_or_else_try_sites: Vec::new(),
             next_call_results: Vec::new(),
             checked_arith_call_results: Vec::new(),
+            checked_arith_ok_or_else_sites: Vec::new(),
             checked_arith_uint_sites: Vec::new(),
             from_size_align_sites: Vec::new(),
             from_size_align_expect_sites: Vec::new(),
@@ -11309,6 +11316,33 @@ impl<'a> Lowering<'a> {
         {
             self.checked_arith_call_results.push(result_var.clone());
         }
+        // Capture `Option::ok_or_else(opt, closure)` as a possible immediate
+        // continuation of signed checked arithmetic.  The post-pass still
+        // validates the producer/consumer CFG adjacency; this site only keeps
+        // the closure and Result type ownership that is unavailable after MIR
+        // lowering.
+        if let OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name,
+                    receiver_root,
+                    ..
+                },
+            args,
+            ..
+        } = &op_kind
+            && name == "ok_or_else"
+            && receiver_root.as_deref() == Some("Option")
+            && args.len() == 2
+            && let Some(site) = self.recognize_checked_arith_ok_or_else_site(
+                first_arg_ty.as_ref(),
+                second_arg_ty.as_ref(),
+                &call.dest.ty,
+                &result_var,
+            )
+        {
+            self.checked_arith_ok_or_else_sites.push(site);
+        }
         // Capture UNSIGNED `usize::checked_{add,mul}()` results
         // (`Option<usize>`) for the native-overflow rewiring pass
         // (`front::checked_arith_uint`).  Signed arithmetic stays on
@@ -14624,6 +14658,38 @@ impl<'a> Lowering<'a> {
             some_owner,
             payload_ty,
             niche,
+        })
+    }
+
+    /// Resolve the type-owned parts of an `Option::ok_or_else` continuation
+    /// that `front::checked_arith` may fuse into a signed `*_ovf` edge.  The
+    /// receiver and destination gates keep unrelated same-named methods out;
+    /// the post-pass proves that this receiver is the checked result.
+    fn recognize_checked_arith_ok_or_else_site(
+        &self,
+        recv_ty: Option<&TyRef>,
+        env_ty: Option<&TyRef>,
+        dest_ty: &TyRef,
+        result_var: &Variable,
+    ) -> Option<crate::front::checked_arith::CheckedArithOkOrElseSite> {
+        if !crate::front::result_exc::tyref_is_option(recv_ty?, self.llbc)
+            || !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
+        {
+            return None;
+        }
+        let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
+        let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        let result_suffix =
+            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc)
+                .unwrap_or_default();
+        let ok_ty = self.tyref_adt_type_arg(dest_ty, 0)?;
+        let err_ty = self.tyref_adt_type_arg(dest_ty, 1)?;
+        Some(crate::front::checked_arith::CheckedArithOkOrElseSite {
+            result_var: result_var.clone(),
+            call_once_owner,
+            result_suffix,
+            ok_payload_ty: tyref_enum_payload_value_type(&ok_ty, self.llbc),
+            err_payload_ty: tyref_enum_payload_value_type(&err_ty, self.llbc),
         })
     }
 

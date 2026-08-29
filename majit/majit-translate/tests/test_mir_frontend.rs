@@ -1391,8 +1391,8 @@ fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
          ref bank",
     );
 
-    // The control: the `get` spelling is residual independently of the index
-    // arm's width proof, so it pins the same safe lowering from the other side.
+    // The control: an aggregate-reference payload has no scalar bank or
+    // element-layout descriptor, so the `get` spelling must stay residual too.
     let got = slot_read_shape("aggregate_slot_get");
     assert_eq!(
         got.residual_gets, 1,

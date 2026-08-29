@@ -93,6 +93,19 @@ pub(crate) fn is_checked_arith_target(target: &CallTarget) -> bool {
         && checked_arith_ovf_opname(leaf).is_some()
 }
 
+/// The `Option::ok_or_else` continuation paired with a signed checked-arith
+/// result.  The MIR collector resolves the type-owned names while the Rust
+/// types are still in hand; the post-pass validates that the call immediately
+/// consumes the checked result before using this metadata.
+#[derive(Clone)]
+pub(crate) struct CheckedArithOkOrElseSite {
+    pub result_var: Variable,
+    pub call_once_owner: String,
+    pub result_suffix: String,
+    pub ok_payload_ty: ValueType,
+    pub err_payload_ty: ValueType,
+}
+
 /// The typed `OverflowError` exitcase the `_ovf` block's overflow link
 /// carries — the handler analogue of [`crate::front::iter_next`]'s
 /// `StopIteration` exitcase, narrowed to the single exception `add_ovf` /
@@ -154,10 +167,11 @@ fn var_read_in_reachable(
 pub(crate) fn rewire_checked_arith_call_sites(
     graph: &mut FunctionGraph,
     sites: &[Variable],
+    ok_or_else_sites: &[CheckedArithOkOrElseSite],
 ) -> usize {
     let mut rewritten = 0;
     for opt in sites {
-        match rewire_one_checked_arith_site(graph, opt) {
+        match rewire_one_checked_arith_site(graph, opt, ok_or_else_sites) {
             Ok(()) => rewritten += 1,
             Err(_decline) => {
                 if std::env::var_os("MAJIT_MIR_FRONTEND_DEBUG").is_some() {
@@ -175,7 +189,11 @@ pub(crate) fn rewire_checked_arith_call_sites(
     rewritten
 }
 
-fn rewire_one_checked_arith_site(graph: &mut FunctionGraph, opt: &Variable) -> Result<(), String> {
+fn rewire_one_checked_arith_site(
+    graph: &mut FunctionGraph,
+    opt: &Variable,
+    ok_or_else_sites: &[CheckedArithOkOrElseSite],
+) -> Result<(), String> {
     let name = graph.name.clone();
     // Block A: the `checked_*()` residual call producing `opt`, closed by
     // lower_call with a single forwarding exit.
@@ -227,19 +245,36 @@ fn rewire_one_checked_arith_site(graph: &mut FunctionGraph, opt: &Variable) -> R
     assert_single_pred(graph, c, &name)?;
 
     // Block C: `d = opt.__discriminant`; `switch d { 0 → None, 1 → Some }`.
-    let (disc_idx, disc_var) = graph.blocks[c]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == opt_c && field.name == "__discriminant" =>
-            {
-                op.result.clone().map(|r| (i, r))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: block {c} lacks the Option __discriminant read"))?;
+    let Some((disc_idx, disc_var)) =
+        graph.blocks[c]
+            .operations
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if *base == opt_c && field.name == "__discriminant" =>
+                {
+                    op.result.clone().map(|r| (i, r))
+                }
+                _ => None,
+            })
+    else {
+        return rewire_checked_arith_ok_or_else(
+            graph,
+            a,
+            call_idx,
+            c,
+            opt,
+            &opt_c,
+            lhs,
+            rhs,
+            ovf_opname,
+            ok_or_else_sites,
+        )
+        .map_err(|reason| {
+            format!("{name}: block {c} lacks the Option __discriminant read; {reason}")
+        });
+    };
     match &graph.blocks[c].exitswitch {
         Some(ExitSwitch::Value(v)) if *v == disc_var => {}
         other => {
@@ -382,6 +417,237 @@ fn rewire_one_checked_arith_site(graph: &mut FunctionGraph, opt: &Variable) -> R
     Ok(())
 }
 
+/// Rewrite the signed-arithmetic `checked_*(lhs, rhs).ok_or_else(env)` shape.
+/// The `Option` is only an intermediate encoding: normal execution rebuilds
+/// `Result::Ok(sum)`, while the overflow edge invokes the existing niladic
+/// closure and rebuilds `Result::Err(error)`.  This is the same `*_ovf`
+/// exception edge as the direct-match route above, with the `ok_or_else`
+/// select fused into its two continuations.
+#[allow(clippy::too_many_arguments)]
+fn rewire_checked_arith_ok_or_else(
+    graph: &mut FunctionGraph,
+    a: usize,
+    call_idx: usize,
+    c: usize,
+    opt: &Variable,
+    opt_c: &Variable,
+    lhs: Variable,
+    rhs: Variable,
+    ovf_opname: &str,
+    sites: &[CheckedArithOkOrElseSite],
+) -> Result<(), String> {
+    let Some((site, ok_idx)) = sites.iter().find_map(|site| {
+        graph.blocks[c]
+            .operations
+            .iter()
+            .position(|op| op.result.as_ref() == Some(&site.result_var))
+            .map(|idx| (site.clone(), idx))
+    }) else {
+        return Err("no recorded Option::ok_or_else continuation".to_string());
+    };
+    if ok_idx + 1 != graph.blocks[c].operations.len() {
+        return Err("Option::ok_or_else is not the continuation block's last op".to_string());
+    }
+    let env = match &graph.blocks[c].operations[ok_idx].kind {
+        OpKind::Call {
+            target:
+                CallTarget::Method {
+                    name: method,
+                    receiver_root,
+                    ..
+                },
+            args,
+            ..
+        } if method == "ok_or_else"
+            && receiver_root.as_deref() == Some("Option")
+            && args.len() == 2
+            && args[0] == *opt_c =>
+        {
+            args[1].clone()
+        }
+        _ => return Err("recorded continuation is not ok_or_else(opt, env)".to_string()),
+    };
+    if site.ok_payload_ty != ValueType::Int {
+        return Err(format!(
+            "ok_or_else Ok payload is {:?}, expected signed Int",
+            site.ok_payload_ty
+        ));
+    }
+
+    // Constructing and filling the closure environment is the only work that
+    // may precede `ok_or_else`.  It is a fresh transparent aggregate, so
+    // executing it only on the overflow edge preserves all observable work;
+    // any other operation declines rather than being moved across `*_ovf`.
+    let Some(env_idx) = graph.blocks[c]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(&env))
+    else {
+        return Err("ok_or_else closure environment has no producer".to_string());
+    };
+    match &graph.blocks[c].operations[env_idx].kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { .. },
+            args,
+            result_ty: ValueType::Ref(Some(root)),
+            ..
+        } if root == &site.call_once_owner && args.is_empty() => {}
+        _ => {
+            return Err(
+                "ok_or_else environment is not its recorded transparent closure".to_string(),
+            );
+        }
+    }
+    for (idx, op) in graph.blocks[c].operations[..ok_idx].iter().enumerate() {
+        let recognized = idx == env_idx
+            || idx > env_idx
+                && matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, value, .. }
+                        if *base == env
+                            && !matches!(value, LinkArg::Value(value) if *value == *opt_c)
+                );
+        if !recognized {
+            return Err(format!(
+                "ok_or_else continuation carries an operation outside closure construction: {:?}",
+                op.kind
+            ));
+        }
+    }
+
+    if graph.blocks[c].exitswitch.is_some() {
+        return Err("ok_or_else continuation has an exitswitch".to_string());
+    }
+    let [c_exit] = graph.blocks[c].exits.as_slice() else {
+        return Err("ok_or_else continuation does not have one exit".to_string());
+    };
+    if c_exit.exitcase.is_some()
+        || c_exit.last_exception.is_some()
+        || c_exit.last_exc_value.is_some()
+    {
+        return Err("ok_or_else continuation exit is not a plain goto".to_string());
+    }
+    if c_exit
+        .args
+        .iter()
+        .any(|arg| matches!(arg, LinkArg::Value(value) if *value != site.result_var))
+    {
+        return Err("ok_or_else continuation forwards a non-result value".to_string());
+    }
+    let saved_c_exit = c_exit.clone();
+    let [a_exit] = graph.blocks[a].exits.as_slice() else {
+        return Err("checked-arith block does not have one exit".to_string());
+    };
+    let saved_a_exit = a_exit.clone();
+    let Some(opt_pos) = saved_a_exit
+        .args
+        .iter()
+        .position(|arg| matches!(arg, LinkArg::Value(value) if value == opt))
+    else {
+        return Err("checked result is not forwarded to ok_or_else".to_string());
+    };
+    if graph.blocks[c].inputargs.get(opt_pos) != Some(opt_c) {
+        return Err("checked result does not map to the ok_or_else receiver".to_string());
+    }
+
+    // --- All structural validation passed; mutate the graph. ---
+
+    // Normal edge: the raising op's result is the sum, wrapped as `Ok(sum)`.
+    let (normal_id, normal_inputs) = graph.create_block_with_arg_vars(1);
+    let ok_shell = crate::front::result_exc::build_shell(
+        graph,
+        normal_id,
+        "Ok",
+        normal_inputs[0].clone(),
+        site.ok_payload_ty.clone(),
+        &site.result_suffix,
+    );
+    let normal_exit_args = saved_c_exit
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Const(value) => LinkArg::Const(value.clone()),
+            LinkArg::Value(_) => LinkArg::Value(ok_shell.clone()),
+        })
+        .collect();
+    graph.set_control_flow_metadata(
+        normal_id,
+        None,
+        vec![Link::new_mixed(normal_exit_args, saved_c_exit.target, None)],
+    );
+
+    // Overflow edge: retain the captured closure aggregate, invoke it, and
+    // replace the opaque `ok_or_else` result with `Err(closure())`.
+    graph.blocks[c].operations.remove(ok_idx);
+    let err_value = crate::front::option_closure_select::emit_call_once(
+        graph,
+        graph.blocks[c].id,
+        env,
+        None,
+        &site.call_once_owner,
+        site.err_payload_ty.clone(),
+        "",
+    );
+    let err_shell = crate::front::result_exc::build_shell(
+        graph,
+        graph.blocks[c].id,
+        "Err",
+        err_value,
+        site.err_payload_ty,
+        &site.result_suffix,
+    );
+    let overflow_exit_args = saved_c_exit
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Const(value) => LinkArg::Const(value.clone()),
+            LinkArg::Value(_) => LinkArg::Value(err_shell.clone()),
+        })
+        .collect();
+    graph.set_control_flow_metadata(
+        graph.blocks[c].id,
+        None,
+        vec![Link::new_mixed(
+            overflow_exit_args,
+            saved_c_exit.target,
+            None,
+        )],
+    );
+
+    graph.blocks[a].operations[call_idx].kind = OpKind::BinOp {
+        op: ovf_opname.to_string(),
+        lhs: lhs.clone(),
+        rhs,
+        result_ty: ValueType::Int,
+    };
+    let overflow_args = saved_a_exit
+        .args
+        .iter()
+        .map(|arg| match arg {
+            LinkArg::Value(value) if value == opt => LinkArg::Value(lhs.clone()),
+            other => other.clone(),
+        })
+        .collect();
+    let ovf_etype = graph.alloc_value_var();
+    let ovf_evalue = graph.alloc_value_var();
+    let mut overflow_link = Link::new_mixed(
+        overflow_args,
+        graph.blocks[c].id,
+        Some(overflowerror_exitcase()),
+    );
+    overflow_link.last_exception = Some(LinkArg::Value(ovf_etype));
+    overflow_link.last_exc_value = Some(LinkArg::Value(ovf_evalue));
+    graph.set_control_flow_metadata(
+        graph.blocks[a].id,
+        Some(ExitSwitch::LastException),
+        vec![
+            Link::new_mixed(vec![LinkArg::Value(opt.clone())], normal_id, None),
+            overflow_link,
+        ],
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,7 +742,7 @@ mod tests {
             .with_prevblock(c),
         ];
 
-        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt));
+        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[]);
         assert_eq!(rewritten, 1, "the checked_add site must be rewritten");
 
         // Block A's last op is now `add_ovf(va, vb)`, reusing `opt`.
@@ -519,6 +785,96 @@ mod tests {
             exits[1].last_exception.is_some() && exits[1].last_exc_value.is_some(),
             "overflow link carries the last_exception / last_exc_value pair"
         );
+    }
+
+    #[test]
+    fn rewrite_lifts_checked_add_followed_by_ok_or_else() {
+        let mut g = FunctionGraph::new("test_checked_add_ok_or_else");
+        let a = g.startblock;
+        let lhs = g.push_op_var(a, OpKind::ConstInt(1), true).unwrap();
+        let rhs = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+        let opt = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: checked_target(),
+                    args: vec![lhs.clone(), rhs.clone()],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+
+        let (c, c_inputs) = g.create_block_with_arg_vars(3);
+        let opt_c = c_inputs[2].clone();
+        let env = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["test".into()],
+                        "closure",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("test::closure".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let result = g
+            .push_op_var(
+                c,
+                OpKind::Call {
+                    target: CallTarget::method("ok_or_else", Some("Option".into())),
+                    args: vec![opt_c, env],
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (ret, _) = g.create_block_with_arg_vars(1);
+        g.set_return(ret, None);
+        g.set_goto(a, c, vec![lhs, rhs, opt.clone()]);
+        g.set_goto(c, ret, vec![result.clone()]);
+
+        let paired = CheckedArithOkOrElseSite {
+            result_var: result,
+            call_once_owner: "test::closure".into(),
+            result_suffix: String::new(),
+            ok_payload_ty: ValueType::Int,
+            err_payload_ty: ValueType::Ref(None),
+        };
+        let rewritten =
+            rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[paired]);
+        assert_eq!(rewritten, 1);
+        assert!(matches!(
+            &g.blocks[a.0].operations.last().unwrap().kind,
+            OpKind::BinOp { op, .. } if op == "add_ovf"
+        ));
+        assert!(matches!(
+            g.blocks[a.0].exitswitch,
+            Some(ExitSwitch::LastException)
+        ));
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(&op.kind, OpKind::Call { target: CallTarget::Method { name, .. }, .. }
+                if name == "ok_or_else")
+                })
+        );
+        let result_variants: Vec<bool> = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => crate::front::result_exc::result_ctor_kind(target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(result_variants.iter().filter(|is_err| !**is_err).count(), 1);
+        assert_eq!(result_variants.iter().filter(|is_err| **is_err).count(), 1);
     }
 
     #[test]
@@ -595,7 +951,7 @@ mod tests {
             .with_prevblock(c),
         ];
 
-        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt));
+        let rewritten = rewire_checked_arith_call_sites(&mut g, std::slice::from_ref(&opt), &[]);
         assert_eq!(rewritten, 0, "a None arm that reads opt must decline");
         // The residual call survives untouched.
         let last = g.blocks[a.0].operations.last().unwrap();

@@ -54,7 +54,9 @@
 //! reference.  The receiver is a `SomeList`-modelled slice (its
 //! `Input` op carries the list-container `class_root`), so `__len` and the
 //! element read repr-dispatch to `arraylen_gc` / `getarrayitem` on the
-//! underlying length-prefixed GcArray.
+//! underlying length-prefixed GcArray.  A primitive `&T` payload needs no
+//! class narrowing: the rewrite's bare-call arm carries the element's scalar
+//! [`ValueType`] directly.
 //!
 //! ## The rewrite (`rewire_one_slice_get_site`)
 //!
@@ -368,6 +370,13 @@ mod tests {
         }
     }
 
+    fn scalar_slice_get_site(result_var: Variable) -> SliceGetSite {
+        SliceGetSite {
+            payload_ty: ValueType::Int,
+            ..slice_get_site(result_var)
+        }
+    }
+
     fn emit_call(g: &mut FunctionGraph, a: crate::model::BlockId, args: Vec<Variable>) -> Variable {
         g.push_op_var(
             a,
@@ -411,7 +420,7 @@ mod tests {
         g.set_return(b, None);
         g.set_goto(a, b, vec![opt.clone()]);
 
-        let rewritten = rewire_slice_get_call_sites(&mut g, &[slice_get_site(opt)]);
+        let rewritten = rewire_slice_get_call_sites(&mut g, &[scalar_slice_get_site(opt)]);
         assert_eq!(rewritten, 1, "the slice::get site must be rewritten");
 
         // The residual `get` call is gone from block A.
@@ -449,6 +458,18 @@ mod tests {
             })
             .collect();
         assert_eq!(elem_reads.len(), 1, "the Some arm reads slice[i]");
+        assert!(
+            g.blocks.iter().flat_map(|blk| &blk.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::ArrayRead {
+                        item_ty: ValueType::Int,
+                        ..
+                    }
+                )
+            }),
+            "a primitive-reference payload is read in the scalar bank"
+        );
         let then_inputs = &g.block(g.blocks[a.0].exits[1].target).inputargs;
         assert!(
             then_inputs.contains(elem_reads[0]),
