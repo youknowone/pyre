@@ -344,6 +344,12 @@ pub struct DescentBlockerSummary {
     /// scan never enters reports no blocker — so this cannot be expressed as
     /// one of the two above and declines on its own.
     pub body_not_walked: bool,
+    /// The byte position of the first op of this body that made some path
+    /// effectful — a residual call, a heap write, or an `inline_call` into a
+    /// callee that may execute an effect (a cycle or an unread body answers
+    /// so too).  Diagnostic only: it names what turned a body's blockers into
+    /// declines.
+    pub first_effect_pc: Option<usize>,
 }
 
 /// Answers computed on demand from an assembled [`JitCode`] body.
