@@ -213,8 +213,8 @@ fn encode_rust_codec_with_state(
                         return Err(crate::typedef::unicode_encode_error(
                             name,
                             roots.get(input_slot),
-                            position,
-                            end,
+                            position as i64,
+                            end as i64,
                             "illegal multibyte sequence",
                         ));
                     }

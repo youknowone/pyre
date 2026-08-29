@@ -242,25 +242,19 @@ pub unsafe fn w_bytearray_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
 /// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
 /// storage by `Member.index`; `PY_NULL` is the unbound-slot sentinel.
 pub unsafe fn w_bytearray_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-    unsafe { crate::slots::slot_get(obj, index, bytearray_slots_field) }
+    let slots = unsafe { (*(obj as *const W_BytearrayObject)).w_slots };
+    unsafe { crate::slots::slot_get(slots, index) }
 }
 
 /// Write one app-level `__slots__` entry on a `bytearray` subclass.
 pub unsafe fn w_bytearray_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
-    unsafe { crate::slots::slot_set(obj, index, value, bytearray_slots_field) }
+    crate::slot_set_direct!(obj, index, value, W_BytearrayObject, w_slots)
 }
 
 /// Clear one app-level `__slots__` entry on a `bytearray` subclass.
 pub unsafe fn w_bytearray_slot_del(obj: PyObjectRef, index: usize) -> bool {
-    unsafe { crate::slots::slot_del(obj, index, bytearray_slots_field) }
-}
-
-/// Address of `W_BytearrayObject::w_slots` for the shared slot helpers.
-///
-/// # Safety
-/// `obj` must point to a valid `W_BytearrayObject`.
-unsafe fn bytearray_slots_field(obj: PyObjectRef) -> *mut PyObjectRef {
-    unsafe { &mut (*(obj as *mut W_BytearrayObject)).w_slots }
+    let slots = unsafe { (*(obj as *const W_BytearrayObject)).w_slots };
+    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 #[inline]
