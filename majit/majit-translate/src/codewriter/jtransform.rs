@@ -778,6 +778,67 @@ fn split_args_by_kind(
     (ints, refs, floats)
 }
 
+/// `jtransform.py _rewrite_cmp_ptrs` (`rewrite_op_ptr_eq` /
+/// `rewrite_op_ptr_ne`): a pointer compared against NULL is the unary
+/// `ptr_iszero` / `ptr_nonzero` test over the other operand, not a
+/// two-operand `ptr_eq`.  Pyre's front materialises NULL as a Variable
+/// defined by [`OpKind::ConstRefNull`], so the constant is found through its
+/// definition.  The unary form is what `optimize_goto_if_not` fuses into
+/// `goto_if_not_ptr_iszero`, which the walker answers from the heap cache
+/// without recording once the nullity is known; `ptr_eq(x, NULL)` fused into
+/// `goto_if_not_ptr_eq` still recorded `ptr_eq` + `guard_false` per test.
+fn null_test_rewrite(
+    graph: &FunctionGraph,
+    op: &SpaceOperation,
+    eq: bool,
+    lhs: &crate::flowspace::model::Variable,
+    rhs: &crate::flowspace::model::Variable,
+) -> Option<RewriteResult> {
+    // The block under rewrite still holds its original operations, so a NULL
+    // defined there is the `ptr::null[_mut]()` / `PY_NULL` call the
+    // `rtype_ptr_null` arm of `rewrite_op_direct_call` has not yet folded.
+    let is_null_const = |variable: &crate::flowspace::model::Variable| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|def| {
+                def.result.as_ref() == Some(variable)
+                    && match &def.kind {
+                        OpKind::ConstRefNull => true,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            args,
+                            result_ty,
+                        } => {
+                            args.is_empty()
+                                && matches!(result_ty, ValueType::Ref(_))
+                                && resolves_to_null_ptr_builtin(segments)
+                        }
+                        _ => false,
+                    }
+            })
+        })
+    };
+    let operand = if is_null_const(rhs) {
+        lhs
+    } else if is_null_const(lhs) {
+        rhs
+    } else {
+        return None;
+    };
+    if let Some(result) = &op.result {
+        result.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+        ));
+    }
+    Some(RewriteResult::Replace(vec![SpaceOperation {
+        result: op.result.clone(),
+        kind: OpKind::UnaryOp {
+            op: if eq { "ptr_iszero" } else { "ptr_nonzero" }.into(),
+            operand: operand.clone(),
+            result_ty: ValueType::Int,
+        },
+    }]))
+}
+
 /// Pyre's frontend materialises source constants as SSA Variables. Recover
 /// the upstream `Constant`/`Variable` distinction at the graph boundary.
 fn is_source_constant_variable(
@@ -2553,6 +2614,12 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r' =>
             {
+                // jtransform.py `rewrite_op_ptr_eq`: `_rewrite_equality`
+                // (NULL → `ptr_iszero`) then the rclass-instance promotion.
+                if let Some(rewritten) = null_test_rewrite(graph, &op, binop_name == "eq", lhs, rhs)
+                {
+                    return rewritten;
+                }
                 let new_op = self.ptr_equality_opname(binop_name, lhs, rhs);
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result.clone(),
@@ -3039,6 +3106,43 @@ impl<'a> Transformer<'a> {
             // the canonical `float_ne` opname here rather than
             // leaving an intermediate op for the float-comparison
             // arm in `rewrite_operation`.
+            // `rtype_bool` per repr for the un-rtyped `bool` hop that
+            // `FunctionGraph::set_branch` puts before every exitswitch:
+            // `BoolRepr` is the identity, `IntegerRepr.rtype_bool` is
+            // `int_is_true` (`rint.py:200-205`), a nullable `PtrRepr` is
+            // `ptr_nonzero` (`rmodel.py:251-260`).  Naming the op here, ahead
+            // of `optimize_goto_if_not`, is what lets the fusion see it: that
+            // gate matches opnames, and `bool` is not one of them.  The
+            // identity arm is what fuses an `is_null` test -- its `ptr_iszero`
+            // result is Bool -- into `goto_if_not_ptr_iszero`, which the
+            // walker answers from the heap cache without recording once the
+            // nullity is known.  Left as `bool`, every null test of a traced
+            // operand cost `ptr_eq` + `int_is_true` + `guard_false`: six of
+            // them per `int + int` descent.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "bool" && self.get_value_kind_var(operand) != 'f' => {
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                if operand.concretetype() == Some(LowLevelType::Bool) {
+                    RewriteResult::Identity(operand.clone())
+                } else {
+                    let opname = if self.get_value_kind_var(operand) == 'r' {
+                        "ptr_nonzero"
+                    } else {
+                        "int_is_true"
+                    };
+                    RewriteResult::Replace(vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::UnaryOp {
+                            op: opname.into(),
+                            operand: operand.clone(),
+                            result_ty: ValueType::Int,
+                        },
+                    }])
+                }
+            }
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -4962,6 +5066,13 @@ impl<'a> Transformer<'a> {
             && matches!(receiver_root.as_str(), "mut_ptr" | "const_ptr")
             && args.len() == 1
         {
+            // `ptr_iszero` produces `lltype.Bool`; the Bool is what lets
+            // `optimize_goto_if_not` fuse the test into the exitswitch.
+            if let Some(result) = &op.result {
+                result.set_concretetype(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                ));
+            }
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::UnaryOp {
@@ -4990,6 +5101,11 @@ impl<'a> Transformer<'a> {
             // `_rewrite_equality` + `_rewrite_cmp_ptrs` — so
             // `ptr::eq(p, NULL)` becomes `ptr_iszero` and a two-variable
             // compare is fusable as `goto_if_not_ptr_eq`.
+            if let Some(result) = &op.result {
+                result.set_concretetype(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                ));
+            }
             let lowered = SpaceOperation {
                 result: op.result.clone(),
                 kind: OpKind::BinOp {
@@ -10667,6 +10783,13 @@ mod tests {
         );
 
         assert!(super::optimize_goto_if_not(&mut graph, start.0));
+        match &graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Fused { opname, args }) => {
+                assert_eq!(opname, "ptr_iszero");
+                assert_eq!(args, &vec![x]);
+            }
+            other => panic!("expected Fused exitswitch, got {other:?}"),
+        }
     }
 
     /// the GotoIfNotOp lowering Stage 1: a non-supported result op (`int_add`) is NOT
