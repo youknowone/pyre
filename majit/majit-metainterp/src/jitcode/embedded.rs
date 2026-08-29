@@ -124,6 +124,12 @@ impl EmbeddedJitCodeTable {
                         core.name,
                         core.try_index(),
                     );
+                    assert!(
+                        core.try_body().is_some(),
+                        "embedded all_jitcodes artefact contains bodyless jitcode {:?} at index \
+                         {index}; CodeWriter::make_jitcodes publishes only completed entries",
+                        core.name,
+                    );
                     let mut core = (**core).clone();
                     if let Some((_, runtime)) = replacements
                         .iter()
@@ -131,14 +137,12 @@ impl EmbeddedJitCodeTable {
                     {
                         core.fnaddr = *runtime;
                     }
-                    if core.try_body().is_some() {
-                        for constant in &mut core.body_mut().constants_i {
-                            if let Some((_, runtime)) = replacements
-                                .iter()
-                                .find(|(symbolic, _)| symbolic == constant)
-                            {
-                                *constant = *runtime;
-                            }
+                    for constant in &mut core.body_mut().constants_i {
+                        if let Some((_, runtime)) = replacements
+                            .iter()
+                            .find(|(symbolic, _)| symbolic == constant)
+                        {
+                            *constant = *runtime;
                         }
                     }
                     Arc::new(JitCode::from_canonical(core))
@@ -285,6 +289,18 @@ mod tests {
         let (mut canonical, descrs) = fixture();
         canonical.swap(0, 1);
         let _ = EmbeddedJitCodeTable::materialize(&canonical, descrs);
+    }
+
+    /// `all_jitcodes` is the codewriter's completed list; a numbered shell
+    /// with no body is a malformed embedded artefact, not a runtime bodyless
+    /// state for the materializer to preserve.
+    #[test]
+    #[should_panic(expected = "embedded all_jitcodes artefact contains bodyless jitcode")]
+    fn a_bodyless_all_jitcodes_entry_is_rejected_at_materialization() {
+        let core = Arc::new(CanonicalJitCode::new("bodyless"));
+        core.set_index(0);
+
+        let _ = EmbeddedJitCodeTable::materialize(&[core], Vec::new());
     }
 
     #[test]

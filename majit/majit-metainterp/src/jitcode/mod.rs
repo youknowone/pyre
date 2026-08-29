@@ -542,6 +542,29 @@ pub struct JitCode {
     /// `JitCodeBuilder` populates this during runtime per-CodeObject
     /// emission.
     pub exec: JitCodeExecState,
+    /// Reachable symbolic residual targets, computed after the runtime wrapper
+    /// has received its final function-address bindings and descriptor pool.
+    ///
+    /// This belongs to the JitCode it describes rather than to a side table.
+    /// `jitcode_runtime::load_jitcode` runs `patch_constants_i_fnaddrs` on the
+    /// canonical JitCode before any wrapper exists. Likewise,
+    /// `EmbeddedJitCodeTable::materialize_with_replacements` applies
+    /// replacements to a cloned canonical core before `JitCode::from_canonical`
+    /// constructs a fresh wrapper. No production path can therefore observe a
+    /// memo computed before a binding change. The only in-place mutations of a
+    /// wrapper's `constants_i` are five `#[test]` sites in `resume`, `frame`, and
+    /// `pyre-jit-trace::state`; a future non-test mutator would require an
+    /// invalidation hook here.
+    reachable_symbolic_residuals: std::sync::OnceLock<ReachableSymbolicResiduals>,
+}
+
+/// The static residual-call refusal facts reachable from one JitCode.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReachableSymbolicResiduals {
+    /// Distinct unbound symbolic function addresses, in numeric order.
+    pub targets: Vec<i64>,
+    /// Number of distinct JitCode objects visited through `inline_call*`.
+    pub visited_jitcodes: usize,
 }
 
 // SAFETY: `JitCallTarget` / `JitCallAssemblerTarget` carry `*const ()`
@@ -562,6 +585,7 @@ impl JitCode {
         Self {
             core: majit_translate::jitcode::JitCode::new(name),
             exec: JitCodeExecState::default(),
+            reachable_symbolic_residuals: std::sync::OnceLock::new(),
         }
     }
 
@@ -590,6 +614,7 @@ impl JitCode {
                 jit_merge_point_offset,
                 ..JitCodeExecState::default()
             },
+            reachable_symbolic_residuals: std::sync::OnceLock::new(),
         }
     }
 
@@ -619,7 +644,121 @@ impl Clone for JitCode {
         Self {
             core: self.core.clone(),
             exec: self.exec.clone(),
+            reachable_symbolic_residuals: self.reachable_symbolic_residuals.clone(),
         }
+    }
+}
+
+impl JitCode {
+    /// Decode this body and every JitCode named by an `inline_call*`, and
+    /// return the residual-call targets that are still symbolic addresses.
+    ///
+    /// A residual call whose funcptr operand names a runtime Int register is
+    /// deliberately absent: its target is not a static property of the body,
+    /// so the per-instruction refusal in `report_symbolic_residual_call_target`
+    /// remains its backstop. Assembled bodies carry `startpoints`, which lets
+    /// this scan distinguish opcode bytes from identical bytes in operands
+    /// without maintaining a second opcode table.
+    pub fn reachable_symbolic_residuals(&self) -> &ReachableSymbolicResiduals {
+        self.reachable_symbolic_residuals
+            .get_or_init(|| compute_reachable_symbolic_residuals(self))
+    }
+}
+
+fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolicResiduals {
+    fn is_residual_call(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            insns::BC_RESIDUAL_CALL_R_V
+                | insns::BC_RESIDUAL_CALL_IR_V
+                | insns::BC_RESIDUAL_CALL_IRF_V
+                | insns::BC_RESIDUAL_CALL_R_I
+                | insns::BC_RESIDUAL_CALL_IR_I
+                | insns::BC_RESIDUAL_CALL_IRF_I
+                | insns::BC_RESIDUAL_CALL_R_R
+                | insns::BC_RESIDUAL_CALL_IR_R
+                | insns::BC_RESIDUAL_CALL_IRF_R
+                | insns::BC_RESIDUAL_CALL_IRF_F
+        )
+    }
+
+    fn is_inline_call(opcode: u8) -> bool {
+        matches!(
+            opcode,
+            insns::BC_INLINE_CALL
+                | insns::BC_INLINE_CALL_R_I
+                | insns::BC_INLINE_CALL_R_R
+                | insns::BC_INLINE_CALL_R_V
+                | insns::BC_INLINE_CALL_IR_I
+                | insns::BC_INLINE_CALL_IR_R
+                | insns::BC_INLINE_CALL_IR_V
+                | insns::BC_INLINE_CALL_IRF_I
+                | insns::BC_INLINE_CALL_IRF_R
+                | insns::BC_INLINE_CALL_IRF_F
+                | insns::BC_INLINE_CALL_IRF_V
+        )
+    }
+
+    fn visit(
+        jitcode: &JitCode,
+        visited: &mut std::collections::BTreeSet<usize>,
+        targets: &mut std::collections::BTreeSet<i64>,
+    ) {
+        if !visited.insert(jitcode as *const JitCode as usize) {
+            return;
+        }
+        let Some(starts) = jitcode.startpoints.as_ref() else {
+            // Hand-built bodies that bypass the assembler do not identify
+            // instruction boundaries. Their runtime residuals remain guarded
+            // by the site-level refusal rather than guessing that an operand
+            // byte is an opcode.
+            return;
+        };
+        for &pc in starts {
+            let Some(&opcode) = jitcode.code.get(pc) else {
+                continue;
+            };
+            if is_residual_call(opcode) {
+                let Some(&funcptr_reg) = jitcode.code.get(pc + 1) else {
+                    continue;
+                };
+                let funcptr_reg = funcptr_reg as usize;
+                if funcptr_reg < jitcode.num_regs_i() {
+                    continue;
+                }
+                let Some(&target) = jitcode.constants_i.get(funcptr_reg - jitcode.num_regs_i())
+                else {
+                    continue;
+                };
+                if crate::pyjitpl::resolve_symbolic_fnaddr_path(target).is_some()
+                    || majit_translate::codewriter::call::is_symbolic_fnaddr(target)
+                {
+                    targets.insert(target);
+                }
+                continue;
+            }
+            if !is_inline_call(opcode) {
+                continue;
+            }
+            let Some((&lo, &hi)) = jitcode.code.get(pc + 1).zip(jitcode.code.get(pc + 2)) else {
+                continue;
+            };
+            let descr_index = u16::from_le_bytes([lo, hi]) as usize;
+            if let Some(callee) = jitcode
+                .descr_at(descr_index)
+                .and_then(RuntimeBhDescr::as_jitcode_owned)
+            {
+                visit(callee.as_ref(), visited, targets);
+            }
+        }
+    }
+
+    let mut visited = std::collections::BTreeSet::new();
+    let mut targets = std::collections::BTreeSet::new();
+    visit(root, &mut visited, &mut targets);
+    ReachableSymbolicResiduals {
+        targets: targets.into_iter().collect(),
+        visited_jitcodes: visited.len(),
     }
 }
 

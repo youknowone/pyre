@@ -855,7 +855,7 @@ fn kind_counts(vars: &[JitDriverVar], kind: VarKind) -> (usize, usize, usize) {
 /// start of the dispatch body, and the count check would only
 /// false-pass when the body coincidentally starts with a
 /// well-formed-looking 7-byte sequence at the same offset.  The
-/// check fires in release builds — `warmspot.py:660-666
+/// check fires in release builds — `warmspot.py
 /// make_args_specification` runs at translation time and asserts
 /// the marker op's args match the driver schema; the runtime
 /// version stays active in production for the same reason
@@ -2114,15 +2114,6 @@ impl<S: JitState> JitDriver<S> {
     /// RPython parity: `metainterp_sd.jitcodes[portal_jd.index]` global
     /// registry slot assignment, scoped to the per-`#[jit_interp]` driver.
     pub fn register_dispatch_jitcode(&mut self, jitcode: crate::jitcode::JitCode) {
-        // Slice (audit Issue #5) — cross-check the dispatch JitCode
-        // body's `BC_JIT_MERGE_POINT` payload partition against the
-        // declared driver schema (set via `declare_schema` at the
-        // macro-emitted install path).  The check fires only when a
-        // schema is non-empty AND the payload counts disagree, which
-        // indicates a codegen / `make_three_lists` regression.
-        // Production-active — `warmspot.py:660-666
-        // make_args_specification` translation-time assert parity.
-        validate_dispatch_jitcode_payload(self, &jitcode);
         let (registry, dispatch_arc) =
             build_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode);
         self.adopt_dispatch_registry(registry, dispatch_arc);
@@ -2146,7 +2137,6 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         jitcode: &std::sync::Arc<crate::jitcode::JitCode>,
     ) {
-        validate_dispatch_jitcode_payload(self, jitcode);
         let (registry, dispatch_arc) =
             build_seeded_jitcode_registry(crate::jitcode::global_build_jitcodes(), jitcode)
                 .unwrap_or_else(|| {
@@ -2165,6 +2155,14 @@ impl<S: JitState> JitDriver<S> {
         registry: Vec<std::sync::Arc<crate::jitcode::JitCode>>,
         dispatch_arc: std::sync::Arc<crate::jitcode::JitCode>,
     ) {
+        // Validate after `build_jitcode_registry` has selected the canonical
+        // indexed identity. A seeded caller is only a locator: name, index,
+        // and merge offset do not prove equal bodies, and validating that
+        // disposable shell before adopting `all_jitcodes[index]` would install
+        // unchecked bytecode. `codewriter.py CodeWriter.make_jitcodes` owns
+        // the identity invariant `all_jitcodes[jitcode.index] is jitcode`;
+        // validate that exact object before publishing it as `mainjitcode`.
+        validate_dispatch_jitcode_payload(self, &dispatch_arc);
         // call.py `grab_initial_jitcodes`:
         //
         //     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
@@ -2176,7 +2174,11 @@ impl<S: JitState> JitDriver<S> {
         // install pipeline runs `ensure_descriptor_registered` before reaching
         // here, so it is assigned. Fall back to the single-portal slot 0 only
         // when a consumer skipped that step.
-        self.ensure_descriptor_registered();
+        if let Some(seed_index) = dispatch_arc.jitdriver_sd() {
+            self.ensure_descriptor_registered_at(seed_index);
+        } else {
+            self.ensure_descriptor_registered();
+        }
         let portal_jd_index = self.index().unwrap_or(0);
         // The back-pointer is what makes this jitcode a *portal* jitcode to
         // every reader of `JitCode::jitdriver_sd`: `pyjitpl.py:2451
@@ -2463,14 +2465,29 @@ impl<S: JitState> JitDriver<S> {
     /// stub — pyre-only fail-soft, since PyPy's `jitdrivers_sd` list
     /// would never contain such an entry.
     pub fn ensure_descriptor_registered(&mut self) {
+        self.ensure_descriptor_registered_with_index(None);
+    }
+
+    fn ensure_descriptor_registered_at(&mut self, index: usize) {
+        self.ensure_descriptor_registered_with_index(Some(index));
+    }
+
+    fn ensure_descriptor_registered_with_index(&mut self, preinstalled_index: Option<usize>) {
         if self.index().is_some() {
+            if let Some(index) = preinstalled_index {
+                assert_eq!(
+                    self.index(),
+                    Some(index),
+                    "registered driver descriptor index disagrees with its seeded portal",
+                );
+            }
             return;
         }
         let jd = self
             .descriptor
             .take()
             .unwrap_or_else(|| JitDriverStaticData::new(vec![], vec![]));
-        let _ = self.register_descriptor(jd);
+        let _ = self.register_descriptor_with_index(jd, preinstalled_index);
     }
 
     /// Register `jd` with the embedded `MetaInterpStaticData` and stamp the
@@ -2484,6 +2501,14 @@ impl<S: JitState> JitDriver<S> {
     /// `jd.index` into `BC_JIT_MERGE_POINT` / `BC_LOOP_HEADER` payloads —
     /// see `jtransform.py:1704, :1716`).
     pub fn register_descriptor(&mut self, jd: JitDriverStaticData) -> usize {
+        self.register_descriptor_with_index(jd, None)
+    }
+
+    fn register_descriptor_with_index(
+        &mut self,
+        jd: JitDriverStaticData,
+        preinstalled_index: Option<usize>,
+    ) -> usize {
         let crate::pyjitpl::MetaInterp {
             staticdata,
             backend,
@@ -2491,7 +2516,10 @@ impl<S: JitState> JitDriver<S> {
         } = &mut self.meta;
         let sd_mut = std::sync::Arc::get_mut(staticdata)
             .expect("MetaInterpStaticData must be uniquely owned at register_descriptor time");
-        let idx = sd_mut.register_jitdriver_sd(jd, backend);
+        let idx = match preinstalled_index {
+            Some(index) => sd_mut.preinstall_jitdriver_sd(jd, index, backend),
+            None => sd_mut.register_jitdriver_sd(jd, backend),
+        };
         // Mirror onto self.descriptor so JitDriver::index() returns Some(idx)
         // — A.3.1a's accessor reads through descriptor, not the
         // staticdata Vec, so the stamped clone must live on the driver too.
@@ -5822,6 +5850,16 @@ impl<S: JitState> JitDriver<S> {
             carried_procedure_token.or_else(|| self.meta.entry_procedure_token(green_key))
             && let Some(compiled_meta) = self.meta.get_compiled_meta(green_key).cloned()
         {
+            // warmstate.py `WarmEnterState.make_entry_point` /
+            // `maybe_compile_and_run`: the confirmation veto sits between
+            // finding the procedure token and `EnterJitAssembler`.
+            if !self
+                .meta
+                .warm_state_ref()
+                .confirm_compiled_entry_for_cell_key(green_key)
+            {
+                return None;
+            }
             let descriptor = self.driver_descriptor_for(state, &compiled_meta);
             // Resolved here with the descriptor and carried to both ends of
             // the run; see `sync_before` for why it is not asked for twice.
@@ -9008,6 +9046,7 @@ mod tests {
     use super::*;
     use crate::resume::ReconstructedFrame;
     use majit_ir::{GcRef, OpCode, OpRef, Type, Value};
+    use std::sync::Arc;
 
     // `seed_deopt_vinfo_ptr` decides which guard-failure deopts hand the blackhole
     // a non-null `bh.virtualizable_info`. A state-field machine (no `vable_token`)
@@ -9219,6 +9258,132 @@ mod tests {
         fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
             true
         }
+    }
+
+    fn compiled_structured_back_edge_fixture() -> (
+        JitDriver<TypedRestoreState>,
+        u64,
+        GreenKey,
+        TypedRestoreState,
+    ) {
+        let code = 0x7100usize;
+        let pc = 19usize;
+        let key = GreenKey::with_types(
+            vec![pc as i64, 0, code as i64],
+            vec![Type::Int, Type::Int, Type::Ref],
+        );
+        let hash = key.get_uhash();
+        let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        driver.meta.finish_setup_descrs_for_jitdrivers();
+        let live = [Value::Int(1)];
+        assert!(matches!(
+            driver
+                .meta
+                .on_back_edge_typed(hash, (code, pc), None, None, &live),
+            BackEdgeAction::StartedTracing,
+        ));
+        {
+            let ctx = driver
+                .meta
+                .trace_ctx()
+                .expect("trace starts at threshold 1");
+            let i0 = OpRef::input_arg_int(0);
+            let guard = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[i0], 0, 0);
+            ctx.set_fail_args(guard, &[i0]);
+        }
+        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
+        assert!(driver.has_compiled_loop(hash));
+        let state = TypedRestoreState {
+            live_values: vec![1],
+            ..Default::default()
+        };
+        (driver, hash, key, state)
+    }
+
+    /// `warmstate.py maybe_compile_and_run` consults `confirm_enter_jit`
+    /// after finding a procedure token and before raising
+    /// `EnterJitAssembler`; the structured back-edge door owes the same veto.
+    #[test]
+    fn a_confirm_enter_jit_veto_stops_the_structured_back_edge_compiled_door() {
+        static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn refuse(_key: &GreenKey) -> bool {
+            CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }
+
+        CONFIRMS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (mut driver, hash, key, mut state) = compiled_structured_back_edge_fixture();
+        let compiled_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_entries = Arc::clone(&compiled_entries);
+        driver.set_on_compiled_entry(move |_, _| {
+            counted_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        driver
+            .meta
+            .warm_state_mut()
+            .set_confirm_enter_jit(Some(refuse));
+        let mut pre_ran = false;
+
+        let outcome = driver.back_edge_structured(
+            hash,
+            || key.clone(),
+            19,
+            &mut state,
+            &(),
+            || pre_ran = true,
+        );
+
+        assert_eq!(outcome, None);
+        assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!pre_ran, "a veto returns before the compiled-entry pre-run");
+        assert_eq!(
+            compiled_entries.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the rejected structured back edge must not enter compiled code",
+        );
+    }
+
+    /// The positive control distinguishes a working confirmation gate from a
+    /// door that never reaches compiled code at all.
+    #[test]
+    fn a_permissive_confirm_enter_jit_preserves_the_structured_back_edge_compiled_door() {
+        static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn allow(_key: &GreenKey) -> bool {
+            CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CONFIRMS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (mut driver, hash, key, mut state) = compiled_structured_back_edge_fixture();
+        let compiled_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_entries = Arc::clone(&compiled_entries);
+        driver.set_on_compiled_entry(move |_, _| {
+            counted_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        driver
+            .meta
+            .warm_state_mut()
+            .set_confirm_enter_jit(Some(allow));
+        let mut pre_ran = false;
+
+        let outcome = driver.back_edge_structured(
+            hash,
+            || key.clone(),
+            19,
+            &mut state,
+            &(),
+            || pre_ran = true,
+        );
+
+        assert!(outcome.is_some(), "the permissive door executes the loop");
+        assert_eq!(CONFIRMS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(pre_ran, "the permissive door reaches the compiled pre-run");
+        assert_eq!(
+            compiled_entries.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the permissive structured back edge must enter compiled code",
+        );
     }
 
     #[test]
@@ -11128,6 +11293,37 @@ mod jitcode_registry_tests {
     use crate::jitcode::{JitCode, RuntimeBhDescr};
     use std::sync::Arc;
 
+    #[derive(Default)]
+    struct RegistryState;
+
+    impl JitState for RegistryState {
+        type Meta = ();
+        type Sym = ();
+        type Env = ();
+
+        fn build_meta(&self, _header_pc: usize, _env: &Self::Env) -> Self::Meta {}
+
+        fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {}
+
+        fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+            true
+        }
+
+        fn restore(&mut self, _meta: &Self::Meta, _values: &[i64]) {}
+
+        fn collect_jump_args(_sym: &Self::Sym) -> Vec<OpRef> {
+            Vec::new()
+        }
+
+        fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+            true
+        }
+    }
+
     /// The arm a consumer holding only an `Arc` reaches through
     /// `register_dispatch_jitcode_shared`.
     ///
@@ -11159,6 +11355,27 @@ mod jitcode_registry_tests {
     /// build-time table numbers its entries.
     fn jitcode(name: &str, prenumbered: Option<usize>) -> Arc<JitCode> {
         Arc::new(jitcode_value(name, prenumbered))
+    }
+
+    fn seeded_portal(name: &str, index: usize, jitdriver_sd: usize) -> Arc<JitCode> {
+        let core = majit_translate::jitcode::JitCode::new(name);
+        core.set_body(majit_translate::jitcode::JitCodeBody {
+            code: vec![
+                majit_translate::codewriter::insns::BC_JIT_MERGE_POINT,
+                jitdriver_sd as u8,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            jit_merge_point_offset: Some(0),
+            ..Default::default()
+        });
+        core.set_index(index);
+        core.set_jitdriver_sd(jitdriver_sd);
+        Arc::new(JitCode::from_canonical(core))
     }
 
     /// The same, by value, for handing `build_jitcode_registry` the graph its
@@ -11345,6 +11562,29 @@ mod jitcode_registry_tests {
         assert!(std::sync::Arc::ptr_eq(&registry[2], &dispatch));
     }
 
+    /// A build-time portal retains the driver slot the codewriter recorded on
+    /// it. The second prepass driver is the first non-coincidental case: a
+    /// fresh run-time staticdata table would otherwise allocate slot 0 and try
+    /// to overwrite the seed's set-once `jitdriver_sd == 1` relationship.
+    #[test]
+    fn a_seeded_second_driver_registers_at_its_build_time_descriptor_index() {
+        let first = jitcode("first_portal", Some(0));
+        let second = seeded_portal("second_portal", 1, 1);
+        let seed = vec![first, Arc::clone(&second)];
+        let mut driver = JitDriver::<RegistryState>::new(2);
+        driver.declare_schema(Vec::new(), Vec::new());
+
+        driver.adopt_dispatch_registry(seed, Arc::clone(&second));
+
+        assert_eq!(driver.index(), Some(1));
+        assert!(Arc::ptr_eq(
+            driver
+                .dispatch_jitcode()
+                .expect("registration installs the seeded portal"),
+            &second,
+        ));
+    }
+
     /// Two graphs claiming one slot is not adoptable: the seed's entry and the
     /// registered portal would be different bodies under one number, and every
     /// `j` operand written against it resolves to whichever the registry holds.
@@ -11368,6 +11608,40 @@ mod jitcode_registry_tests {
         ))];
         let dispatch = jitcode_value_with_merge_offset("mainloop", Some(0), Some(7));
         build_jitcode_registry(&seed, dispatch);
+    }
+
+    /// Name, index, and merge offset can all agree while the bodies do not.
+    /// Registration therefore validates the seed entry selected by the
+    /// codewriter's indexed object identity, rather than the locator shell the
+    /// caller hands over and then drops.
+    #[test]
+    #[should_panic(expected = "payload slot 0 count 1 disagrees")]
+    fn adoption_validates_the_seeded_object_that_it_installs() {
+        let seeded_core = majit_translate::jitcode::JitCode::new("mainloop");
+        seeded_core.set_body(majit_translate::jitcode::JitCodeBody {
+            code: vec![
+                majit_translate::codewriter::insns::BC_JIT_MERGE_POINT,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            jit_merge_point_offset: Some(0),
+            ..Default::default()
+        });
+        seeded_core.set_index(0);
+        let seed = vec![Arc::new(JitCode::from_canonical(seeded_core))];
+        let locator = seeded_portal("mainloop", 0, 0);
+        let locator = Arc::try_unwrap(locator).expect("the locator has one owner");
+        let (registry, adopted) = build_jitcode_registry(&seed, locator);
+        let mut driver = JitDriver::<RegistryState>::new(2);
+        driver.declare_schema(Vec::new(), Vec::new());
+
+        driver.adopt_dispatch_registry(registry, adopted);
     }
 
     /// A dispatch numbered past the end of the seed names the method that

@@ -1,7 +1,117 @@
 use super::*;
 use crate::jitcode_runtime::{insns_opname_to_byte, named_jitcode};
 use majit_ir::Type;
-use majit_metainterp::{VableArrayStore, make_fail_descr};
+use majit_metainterp::{JitCodeSym, TraceAction, VableArrayStore, make_fail_descr};
+
+static STATIC_REFUSAL_PREFIX_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn count_static_refusal_prefix() {
+    STATIC_REFUSAL_PREFIX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+struct StaticRefusalSym;
+
+impl JitCodeSym for StaticRefusalSym {
+    fn total_slots(&self) -> usize {
+        0
+    }
+
+    fn loop_header_pc(&self) -> usize {
+        0
+    }
+
+    fn fail_args(&self) -> Option<Vec<OpRef>> {
+        Some(Vec::new())
+    }
+}
+
+/// The generated dispatch loop re-runs its source arm when a trace start
+/// returns no handoff. The static refusal must therefore happen before the
+/// bound prefix call: the arm itself then performs that side effect once.
+#[test]
+fn unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect() {
+    let before = STATIC_REFUSAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut builder = majit_metainterp::JitCodeBuilder::new();
+    let bound = builder.add_fn_ptr(count_static_refusal_prefix as *const ());
+    builder.residual_call_void_canonical_via_target_with_effect_info(
+        bound,
+        &[],
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    let symbolic = majit_translate::codewriter::call::symbolic_fnaddr_for_segments([
+        "unbound_symbolic_residual_refuses_before_a_bound_residual_side_effect",
+    ]);
+    let unbound = builder.add_fn_ptr(symbolic as usize as *const ());
+    builder.residual_call_void_canonical_via_target_with_effect_info(
+        unbound,
+        &[],
+        majit_ir::EffectInfo::const_new(
+            majit_ir::ExtraEffect::CannotRaise,
+            majit_ir::OopSpecIndex::None,
+        ),
+    );
+    builder.void_return();
+    let jitcode = builder.finish();
+
+    let scan = jitcode.reachable_symbolic_residuals();
+    assert_eq!(scan.visited_jitcodes, 1);
+    assert_eq!(scan.targets, vec![symbolic]);
+
+    let mut ctx = TraceCtx::for_test_types(&[]);
+    let action =
+        majit_metainterp::trace_jitcode(&mut ctx, &mut StaticRefusalSym, &jitcode, 0, |_pc| 0);
+    assert!(matches!(action, TraceAction::Abort));
+    assert_eq!(
+        STATIC_REFUSAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "the reachable-set refusal must run before the bound residual prefix",
+    );
+
+    // `None` from the generated merge wrapper falls through to this source-arm
+    // execution. It is the only execution of the prefix after the preflight.
+    count_static_refusal_prefix();
+    assert_eq!(
+        STATIC_REFUSAL_PREFIX_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        before + 1,
+        "the source arm must apply the observable side effect exactly once",
+    );
+}
+
+/// Pyre's runtime fnaddr patch must leave the portal closure free of symbolic
+/// residual targets. Keep the visited count and cold-scan duration visible so
+/// this trace-start gate has a measured cost on the table it protects.
+#[test]
+fn portal_reachable_symbolic_residual_scan_is_empty() {
+    let _ = crate::jitcode_runtime::all_jitcodes();
+    crate::jitcode_runtime::install_global_build_descr_pool();
+    let portal = crate::jitcode_runtime::portal_jitcode()
+        .expect("the build-time table registers the eval portal");
+    let portal = majit_metainterp::JitCode::from_canonical((*portal).clone());
+
+    let started = std::time::Instant::now();
+    let scan = portal.reachable_symbolic_residuals();
+    let elapsed = started.elapsed();
+    eprintln!(
+        "[symbolic-residual-scan] visited={} elapsed_ns={} unbound={}",
+        scan.visited_jitcodes,
+        elapsed.as_nanos(),
+        scan.targets.len(),
+    );
+
+    assert!(
+        scan.visited_jitcodes > 0,
+        "the portal itself must be visited"
+    );
+    assert_eq!(
+        scan.targets,
+        Vec::<i64>::new(),
+        "jit_fnaddr bindings must resolve every portal-reachable residual",
+    );
+}
 
 #[test]
 fn propagated_subwalk_abort_cannot_rebind_its_pc_to_a_caller_frame() {
@@ -7395,6 +7505,165 @@ fn unsupported_opname_surfaces_typed_error() {
     };
     let err = step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
     assert_eq!(err, DispatchError::UnsupportedOpname { pc: 0, key: opname },);
+}
+
+#[test]
+fn empty_str_concat_helper_aborts_before_the_unwired_op_is_dispatched() {
+    use majit_translate::codewriter::{call::CallControl, codewriter::CodeWriter};
+    use majit_translate::{
+        CallPath, ConcreteType, FunctionGraph, GraphTransformConfig, OpKind, ValueType,
+    };
+
+    let mut graph = FunctionGraph::new("empty_str_concat_helper");
+    let lhs = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "lhs".into(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    let rhs = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "rhs".into(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    let result = graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::BinOp {
+                op: "add".into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: ValueType::Ref(None),
+            },
+            true,
+        )
+        .unwrap();
+    graph.set_return(graph.startblock, Some(result.clone()));
+    FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::GcRef);
+    FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::GcRef);
+    FunctionGraph::set_concretetype_of_inline(&result, ConcreteType::GcRef);
+
+    let config = GraphTransformConfig {
+        str_concat_helper: String::new(),
+        ..Default::default()
+    };
+    let path = CallPath::from_segments(["empty_str_concat_helper"]);
+    let mut callcontrol = CallControl::new();
+    callcontrol.register_function_graph(path.clone(), graph);
+    let jitcode = callcontrol.get_jitcode(&path);
+    let mut codewriter = CodeWriter::new();
+    codewriter.drain_pending_graphs(&mut callcontrol, &config);
+    let body = jitcode
+        .try_body()
+        .expect("the public codewriter pipeline commits the concat graph");
+
+    let original_opname = "int_add/rr>r";
+    let original_byte = *codewriter
+        .assembler
+        .insns()
+        .get(original_opname)
+        .expect("the original Ref + Ref add remains after the refusal marker");
+    let original_pc = body
+        .code
+        .iter()
+        .enumerate()
+        .find_map(|(pc, candidate)| {
+            (*candidate == original_byte && jitcode.is_valid_startpoint(pc)).then_some(pc)
+        })
+        .expect("assembled body contains the Ref + Ref add byte");
+    let abort_byte = *codewriter
+        .assembler
+        .insns()
+        .get("abort/")
+        .expect("the empty helper emits the explicit abort opname");
+    let abort_pc = body
+        .code
+        .iter()
+        .enumerate()
+        .find_map(|(pc, candidate)| {
+            (*candidate == abort_byte && jitcode.is_valid_startpoint(pc)).then_some(pc)
+        })
+        .expect("assembled body contains the explicit abort byte");
+    assert!(
+        abort_pc < original_pc,
+        "the refusal must be reached before the handler-less original op",
+    );
+    let decoded = crate::jitcode_runtime::DecodedOp {
+        key: "abort/",
+        opname: "abort",
+        argcodes: "",
+        pc: abort_pc,
+        next_pc: abort_pc + 1,
+    };
+
+    let mut trace_ctx = fresh_trace_ctx();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut registers_r = vec![OpRef::NONE; body.c_num_regs_r as usize];
+    let mut concrete_registers_r = vec![ConcreteValue::Null; body.c_num_regs_r as usize];
+    let mut walk_ctx = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut registers_r,
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut concrete_registers_r,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut trace_ctx,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let trace_error = super::handle(&decoded, &body.code, &mut walk_ctx)
+        .expect_err("the walker stops at the explicit refusal marker");
+    assert_eq!(
+        trace_error,
+        DispatchError::AbortMarkerReached { pc: abort_pc },
+    );
+
+    let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+    builder.setup_insns(codewriter.assembler.insns());
+    majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+    assert_eq!(builder.unwired_opnames(), vec![original_opname]);
+    let mut bh = builder.acquire_interp();
+    assert!(
+        matches!(
+            builder.dispatch_loop(&mut bh, &body.code, abort_pc),
+            Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+        ),
+        "the blackhole exits at the refusal marker before the unwired add",
+    );
+    assert!(bh.aborted);
 }
 
 /// `ptr_nonzero/r>i` records `PtrNe(box, CONST_NULL)` into the
