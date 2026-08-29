@@ -708,26 +708,41 @@ fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, P
 }
 
 fn array_index_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity_range(args, 2, 4, "array.index")?;
-    let obj = args[0];
-    let len = unsafe { arr::w_array_len(obj) } as i64;
+    // PyPy's `W_ArrayBase.descr_index` keeps the search itself in
+    // `index_count_array`, with `start`/`stop` unwrapped as indexes.  Keep
+    // that shape below.  [3.14-spec] CPython 3.14's `array.array.index`
+    // exposes those arguments as positional-only, however, and its
+    // PyArg_UnpackTuple gateway reports the bare method name at the arity
+    // boundary.  Reject the trailing kwargs marker before it can be mistaken
+    // for `start` or `stop`.
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "index")?;
+    crate::type_methods::arity_between(args, "index", 1, 3)?;
     // Optional start/stop, unwrapped via __index__, clamped like descr_index.
-    // Their `__index__` is user code and `args` is the gateway's stack copy,
-    // so the searched-for value is read back from the shadow stack: the caller
-    // may have passed a list, which a minor moves.
+    // PyPy's interp2app gateway unwraps both bounds before `descr_index` reads
+    // `self.len`.  Their `__index__` is user code: it can resize the array and
+    // collect, so every later argument and the receiver itself is read back
+    // from the rooted gateway stack copy.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let mut start = if args.len() >= 3 {
-        crate::builtins::getindex_w(args[2])?
+        crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
+            base + 2,
+        ))?
     } else {
         0
     };
     let mut stop = if args.len() >= 4 {
-        crate::builtins::getindex_w(args[3])?
+        crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
+            base + 3,
+        ))?
     } else {
-        len
+        0
     };
-    let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let len = unsafe { arr::w_array_len(obj) } as i64;
+    if args.len() < 4 {
+        stop = len;
+    }
     if start < 0 {
         start += len;
         if start < 0 {
@@ -745,7 +760,17 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
     }
     let mut i = start;
     while i < stop {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        // `index_count_array` reads PyPy's separately allocated raw buffer;
+        // shrinking `self.len` from `__eq__` leaves that storage addressable.
+        // pyre's Vec length is the storage bound, so uphold
+        // `w_array_unpack_item`'s safety contract explicitly.  CPython 3.14
+        // likewise stops the search when comparison shrinks the array.
+        if i >= unsafe { arr::w_array_len(obj) } as i64 {
+            break;
+        }
         let w_item = unsafe { arr::w_array_unpack_item(obj, i as usize) };
+        let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if crate::baseobjspace::eq_w(w_item, w_value)? {
             return Ok(pyre_object::w_int_new(i));
         }

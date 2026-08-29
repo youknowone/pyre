@@ -1,3 +1,4 @@
+import gc
 from array import _array_reconstructor, array
 from io import BytesIO
 from pickle import dumps, loads
@@ -38,6 +39,80 @@ def test_float_with_integer_input():
 
 
 test_float_with_integer_input()
+
+# PyPy's W_ArrayBase.descr_index supplies the optional bounds to
+# index_count_array.  CPython 3.14 keeps the same observable positional search
+# but makes the public bounds positional-only.
+bounded = array("i", [1, 2, 1, 3])
+assert bounded.index(1, 1) == 2
+assert bounded.index(1, 1, 3) == 2
+with assert_raises(TypeError) as error:
+    bounded.index(1, start=1)
+assert str(error.exception) == "array.index() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    bounded.index(x=1)
+assert str(error.exception) == "array.index() takes no keyword arguments"
+
+
+class ArraySubclass(array):
+    pass
+
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i", [1]).index(1, start=0)
+assert str(error.exception) == "array.index() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    bounded.index()
+assert str(error.exception) == "index expected at least 1 argument, got 0"
+with assert_raises(TypeError) as error:
+    bounded.index(1, 0, 4, 5)
+assert str(error.exception) == "index expected at most 3 arguments, got 4"
+with assert_raises(TypeError) as error:
+    bounded.index(1, None)
+assert str(error.exception) == (
+    "slice indices must be integers or have an __index__ method"
+)
+with assert_raises(TypeError) as error:
+    bounded.index(1, 0, None)
+assert str(error.exception) == (
+    "slice indices must be integers or have an __index__ method"
+)
+
+
+# interp2app unwraps bounds before W_ArrayBase.descr_index reads self.len.
+reentered = array("i", [1])
+
+
+class GrowingStart:
+    def __index__(self):
+        reentered.append(2)
+        return -1
+
+
+assert reentered.index(2, GrowingStart()) == 1
+assert reentered == array("i", [1, 2])
+
+
+class CollectingNeedle:
+    def __eq__(self, other):
+        gc.collect()
+        return other == 2
+
+
+assert array("i", [1, 2]).index(CollectingNeedle()) == 1
+
+shrinking = array("i", [1, 2])
+
+
+class ShrinkingNeedle:
+    def __eq__(self, other):
+        del shrinking[:]
+        return False
+
+
+with assert_raises(ValueError):
+    shrinking.index(ShrinkingNeedle())
+assert shrinking == array("i")
 
 # slice assignment step overflow behaviour test
 T = "I"

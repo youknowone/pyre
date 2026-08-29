@@ -114,7 +114,7 @@ pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crat
 
 /// [`reject_kwargs`] for a method whose declaring class is fixed rather than
 /// read off the receiver — see [`arity_no_args_of`].
-fn reject_kwargs_of(
+pub(crate) fn reject_kwargs_of(
     owner: Option<&str>,
     args: &[PyObjectRef],
     name: &str,
