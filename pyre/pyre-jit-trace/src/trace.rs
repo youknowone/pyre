@@ -159,6 +159,18 @@ pub(crate) enum WalkEndCommitLeg {
     /// gap, and because the two take their operand stack from different
     /// sources — see `capture_frame_stack_from_mirror`.
     WalkAbort = 11,
+    /// `SwitchToBlackhole(ABORT_SEGMENTED_TRACE)`
+    /// (`pyjitpl.py _create_segmented_trace_and_blackhole`): the walk cut
+    /// itself at a merge point and the image latched before the cut was
+    /// converted to blackhole frames and run forward.  Upstream blackholes
+    /// here rather than jumping into the segment it just compiled, "because
+    /// we are at a really arbitrary place"; single-pass tracing owes the same
+    /// forward resume, having already executed everything the segment
+    /// records.  The cut refuses unless the image exists, so this leg is
+    /// preflighted like [`Self::TraceTooLong`] -- and unconditionally, since
+    /// a FOR_ITER consume is exempt from the effect odometer that gates the
+    /// too-long half.
+    SegmentTrace = 12,
 }
 
 /// Where a committing leg puts the interpreter, relative to the effects the
@@ -2667,26 +2679,28 @@ fn try_adopt_single_frame_blackhole(
     // A zero-effect overlong walk deliberately permits entry replay even when
     // no blackhole image was representable. Only an effectful TraceTooLong
     // carries the irrevocable, fully preflighted adoption contract.
-    let trace_too_long = commit_leg == WalkEndCommitLeg::TraceTooLong
-        && crate::jitcode_dispatch::fbw_executed_effect_count() != 0;
-    // All three full-image legs resume the blackhole at a pc it may leave by
+    let preflighted = (commit_leg == WalkEndCommitLeg::TraceTooLong
+        && crate::jitcode_dispatch::fbw_executed_effect_count() != 0)
+        || commit_leg == WalkEndCommitLeg::SegmentTrace;
+    // All four full-image legs resume the blackhole at a pc it may leave by
     // arbitrary control flow, including back around a loop header where the
     // jitcode reloads operands from the virtualizable array.  The root operand
     // stack therefore has to be published with the locals
     // (`fill_trace_too_long_register_banks`) for each leg.
     //
-    // `WalkAbort` deliberately does NOT join `trace_too_long` above: that flag
+    // `WalkAbort` deliberately does NOT join `preflighted` above: that flag
     // promotes a post-latch decline to a release assert, which the too-long arm
     // earns by aborting only once `latch_abort_blackhole` has succeeded
     // (`trace_too_long_abort_safe`).  A capability-gap abort fires regardless of
     // the latch, so its adopt must still be able to decline into legacy replay.
     let publishes_root_stack = commit_leg == WalkEndCommitLeg::TraceTooLong
         || commit_leg == WalkEndCommitLeg::WalkAbort
-        || commit_leg == WalkEndCommitLeg::VableEscape;
+        || commit_leg == WalkEndCommitLeg::VableEscape
+        || commit_leg == WalkEndCommitLeg::SegmentTrace;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         assert!(
-            !trace_too_long,
-            "preflighted trace-too-long blackhole image disappeared before adoption"
+            !preflighted,
+            "preflighted blackhole image disappeared before adoption"
         );
         return false;
     };
@@ -2711,16 +2725,16 @@ fn try_adopt_single_frame_blackhole(
         Ok(index) => index,
         Err(_) => {
             assert!(
-                !trace_too_long,
-                "preflighted trace-too-long jitcode index no longer fits i32"
+                !preflighted,
+                "preflighted blackhole jitcode index no longer fits i32"
             );
             return false;
         }
     };
     if ctx.virtualizable_info().is_none() {
         assert!(
-            !trace_too_long,
-            "preflighted trace-too-long virtualizable info disappeared"
+            !preflighted,
+            "preflighted blackhole virtualizable info disappeared"
         );
         return false;
     }
@@ -2732,8 +2746,8 @@ fn try_adopt_single_frame_blackhole(
     let virtualizable_info = std::sync::Arc::as_ptr(&pyframe_vinfo);
     let Some(stack_base) = crate::state::concrete_nlocals(cf_addr) else {
         assert!(
-            !trace_too_long,
-            "preflighted trace-too-long frame lost its concrete locals base"
+            !preflighted,
+            "preflighted blackhole frame lost its concrete locals base"
         );
         return false;
     };
@@ -2802,15 +2816,15 @@ fn try_adopt_single_frame_blackhole(
         .unwrap_or(0) as usize;
     if vable_frame == 0 || vable_frame != root_addr {
         assert!(
-            !trace_too_long,
-            "preflighted trace-too-long frame identity changed before adoption"
+            !preflighted,
+            "preflighted blackhole frame identity changed before adoption"
         );
         return false;
     }
     let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
         assert!(
-            !trace_too_long,
-            "preflighted trace-too-long frame locals became uncapturable"
+            !preflighted,
+            "preflighted blackhole frame locals became uncapturable"
         );
         return false;
     };
@@ -2820,27 +2834,35 @@ fn try_adopt_single_frame_blackhole(
         // in `list_length_hint_validate`: `snapshot-array=[0]` where
         // `mirror=[0x99651ab18]` — the array reads NULL, the mirror holds the
         // live operand.
-        if commit_leg == WalkEndCommitLeg::WalkAbort
-            && crate::jitcode_dispatch::fbw_debug_abort_enabled()
-        {
-            let from_array = crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
-                .map(|stack| stack.roots_snapshot());
-            let from_mirror = latched
-                .mirror_stack
-                .as_ref()
-                .map(|mirror| (mirror.py_pc, mirror.slots.clone()));
-            eprintln!("[wa-stack] snapshot-array={from_array:x?} mirror={from_mirror:x?}");
-        }
         // `ABORT_TOO_LONG` stops at an opcode boundary, where the snapshot
         // array is the image RPython would copy.  `WalkAbort` and
         // `VableEscape` stop INSIDE an opcode, and for a root walk that array
         // was never written at all — it still holds the pre-walk stack (see
         // `capture_frame_stack_from_mirror`). Take the walker's OpRef mirror,
         // which the latch resolved while the concrete side tables were still
-        // live.
-        let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
+        // live.  The segment cut stops at a boundary but at the merge point,
+        // where the array is equally unrefreshed, so it reads the mirror too.
+        let takes_mirror = commit_leg == WalkEndCommitLeg::WalkAbort
             || commit_leg == WalkEndCommitLeg::VableEscape
-        {
+            || commit_leg == WalkEndCommitLeg::SegmentTrace;
+        if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            let from_array = crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
+                .map(|stack| stack.roots_snapshot());
+            let from_mirror = latched
+                .mirror_stack
+                .as_ref()
+                .map(|mirror| (mirror.py_pc, mirror.slots.clone()));
+            let source = if takes_mirror {
+                "mirror"
+            } else {
+                "snapshot-array"
+            };
+            eprintln!(
+                "[adopt-stack] leg={commit_leg:?} source={source} \
+                 snapshot-array={from_array:x?} mirror={from_mirror:x?}"
+            );
+        }
+        let captured = if takes_mirror {
             latched.mirror_stack.as_ref().and_then(|mirror| {
                 crate::state::capture_frame_stack_from_mirror(
                     vable_frame,
@@ -2855,8 +2877,8 @@ fn try_adopt_single_frame_blackhole(
             Some(stack) => Some(stack),
             None => {
                 assert!(
-                    !trace_too_long,
-                    "preflighted trace-too-long operand stack became uncapturable"
+                    !preflighted,
+                    "preflighted blackhole operand stack became uncapturable"
                 );
                 if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                     eprintln!(
@@ -2903,8 +2925,8 @@ fn try_adopt_single_frame_blackhole(
         crate::state::restore_frame_locals(vable_frame, &locals_undo);
         majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
         assert!(
-            !trace_too_long,
-            "preflighted trace-too-long locals publication declined"
+            !preflighted,
+            "preflighted blackhole locals publication declined"
         );
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             eprintln!("[fbw-blackhole] single-frame locals publish declined — legacy replay kept");
@@ -2930,8 +2952,8 @@ fn try_adopt_single_frame_blackhole(
             crate::state::restore_frame_locals(committed_root_addr, &locals_undo);
             majit_gc::shadow_stack::pop_resume_ref_roots_to(root_depth);
             assert!(
-                !trace_too_long,
-                "preflighted trace-too-long operand-stack publication declined"
+                !preflighted,
+                "preflighted blackhole operand-stack publication declined"
             );
             return false;
         }
@@ -4624,6 +4646,24 @@ fn run_perfn_walk<Sym: WalkSym>(
                 &walk_result,
                 Err(crate::jitcode_dispatch::DispatchError::TraceTooLong { .. })
             ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::TraceTooLong);
+        // A successful segment cut arrives as `Ok`; a cut whose guard snapshot
+        // could not be represented arrives as the dedicated `Err` below so the
+        // partial segment is discarded. Both own the same already-preflighted
+        // forward image. Without the adopt the epilogue rolls the journals
+        // back and the interpreter replays the region the walk already ran.
+        let segment_adopted =
+            matches!(
+                &walk_result,
+                Ok((
+                    crate::jitcode_dispatch::DispatchOutcome::SegmentTrace { .. },
+                    _
+                )) | Err(
+                    crate::jitcode_dispatch::DispatchError::SegmentTraceSnapshotUnavailable { .. }
+                )
+            ) && try_adopt_blackhole(ctx, cf_addr, live_root_addr, WalkEndCommitLeg::SegmentTrace);
+        if segment_adopted && crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+            eprintln!("[fbw-blackhole] adopted ABORT_SEGMENTED_TRACE forward resume");
+        }
         // Every OTHER aborting error is the same situation: the walk executed
         // residuals concretely and then stopped, so replaying the region from
         // the trace entry re-applies those effects.  `convert_and_run_from_
@@ -4666,6 +4706,7 @@ fn run_perfn_walk<Sym: WalkSym>(
         // shape whose caller banks are incomplete and dies on an unwired
         // blackhole opcode.
         let walk_abort_adopted = !trace_too_long_adopted
+            && !segment_adopted
             && matches!(&walk_result, Err(error) if error.leaves_complete_image()
             && !matches!(
                 error,
