@@ -5373,12 +5373,6 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
 /// Comparison operation dispatch.
 
 pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
-    // RPython inserts a stack check on this recursive object-space call.
-    // Container comparisons recurse without pushing a Python frame (for
-    // example two distinct self-referential lists), so keep the same guard
-    // explicitly in the Rust port and raise RecursionError before exhausting
-    // the native stack.
-    crate::stack_check::stack_check()?;
     // A builtin subclass overriding the comparison dunder dispatches the
     // override first (with reflected-subclass priority); exact builtins and
     // non-overriding subclasses fall through to the by-layout comparison slot,
@@ -5390,13 +5384,14 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // `is_exact_builtin_instance` before it looks anything up.  Deciding
         // that here spares the pair a reverse-dunder resolution and two MRO
         // lookups, which is the whole of the probe for the commonest
-        // comparison there is.
+        // comparison there is.  The decision is promoted
+        // (`both_exact_builtin_instances_promoted`), so a traced comparison
+        // of two exact builtins records neither the probe nor this test.
         //
         // Only the probe is skipped.  The subtype ordering below still runs
         // for such a pair, because `bool` is a proper subclass of `int` and
         // both are exact builtin instances.
-        let pair_can_override = !pyre_object::is_exact_builtin_instance(a)
-            || !pyre_object::is_exact_builtin_instance(b);
+        let pair_can_override = !both_exact_builtin_instances_promoted(a, b);
         if pair_can_override && let Some(result) = try_compare_override(a, b, op)? {
             return Ok(result);
         }
@@ -5413,8 +5408,10 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
         // original operator and operand order.
         if !is_instance(a)
             && !is_instance(b)
-            && let (Some(a_type), Some(b_type)) =
-                (crate::typedef::r#type(a), crate::typedef::r#type(b))
+            // Two `let` chains, not one tuple pattern: a tuple of two
+            // `Option`s is an allocation on the walked path.
+            && let Some(a_type) = crate::typedef::r#type(a)
+            && let Some(b_type) = crate::typedef::r#type(b)
             // Spelled as a raw-pointer identity, the way this file spells every
             // other one.  `NonNull`'s own `!=` goes through `NonNull::ne`,
             // which is not a call a trace can lower, and this test now sits on
@@ -5435,6 +5432,11 @@ pub fn compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
 /// builtin comparison instead of re-entering override dispatch (which would
 /// recurse).
 pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    // The machine-int arm stands alone so that this function has no loop:
+    // the codewriter looks inside a loop-free graph only
+    // (`policy.py look_inside_graph`), and a traced `int < int` must reach
+    // `int_lt` through here.  Every other layout's comparison, several of
+    // which iterate, lives in [`compare_slot_rest`], a residual on the trace.
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -5446,6 +5448,22 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => int_ne(a, b),
             };
         }
+    }
+    compare_slot_rest(a, b, op)
+}
+
+/// [`compare_slot`] for every pair that is not two machine ints.
+#[inline(never)]
+fn compare_slot_rest(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    // RPython inserts a stack check on this recursive object-space call.
+    // Container comparisons recurse through [`compare`] without pushing a
+    // Python frame (for example two distinct self-referential lists), so keep
+    // the same guard explicitly in the Rust port and raise RecursionError
+    // before exhausting the native stack.  It sits on the recursive arm: a
+    // machine-int pair never recurses, and the check would otherwise be one
+    // residual call on every traced `int < int`.
+    crate::stack_check::stack_check()?;
+    unsafe {
         // longobject.py `_make_descr_cmp` and intobject.py
         // `_make_descr_cmp`: both mixed orders call an rbigint.int_* method
         // on the long payload. The int-left order uses the reversed relation.
