@@ -4188,44 +4188,53 @@ fn input_streams_are_std_tty(
     stdin: PyObjectRef,
     stdout: PyObjectRef,
 ) -> Result<bool, crate::PyError> {
+    // `fileno()`, the `__eq__` behind the comparisons and `isatty()` are
+    // ordinary Python calls, so both streams are read back from their slots
+    // rather than kept in the words this was entered with.
+    let roots = pyre_object::gc_roots::push_roots();
+    let stdin_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(stdin);
+    let stdout_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(stdout);
     let fileno = |stream| -> Option<PyObjectRef> {
         let method = crate::baseobjspace::getattr_str(stream, "fileno").ok()?;
         crate::call_and_check(method, &[]).ok()
     };
-    let Some(infileno) = fileno(stdin) else {
+    let Some(infileno) = fileno(roots.get(stdin_slot)) else {
         return Ok(false);
     };
-    let _ = pyre_object::gc_roots::pin_root(infileno);
-    let infileno_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let Some(outfileno) = fileno(stdout) else {
+    let infileno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(infileno);
+    let Some(outfileno) = fileno(roots.get(stdout_slot)) else {
         return Ok(false);
     };
-    let _ = pyre_object::gc_roots::pin_root(outfileno);
-    let outfileno_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let outfileno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(outfileno);
 
-    if !crate::baseobjspace::eq_w(
-        pyre_object::gc_roots::shadow_stack_get(infileno_slot),
-        pyre_object::w_int_new(0),
-    )? {
+    if !crate::baseobjspace::eq_w(roots.get(infileno_slot), pyre_object::w_int_new(0))? {
         return Ok(false);
     }
-    let isatty = crate::baseobjspace::getattr_str(stdin, "isatty")?;
+    let isatty = crate::baseobjspace::getattr_str(roots.get(stdin_slot), "isatty")?;
     let isatty = crate::call_and_check(isatty, &[])?;
     if !crate::baseobjspace::is_true(isatty)? {
         return Ok(false);
     }
-    crate::baseobjspace::eq_w(
-        pyre_object::gc_roots::shadow_stack_get(outfileno_slot),
-        pyre_object::w_int_new(1),
-    )
+    crate::baseobjspace::eq_w(roots.get(outfileno_slot), pyre_object::w_int_new(1))
 }
 
 /// `app_io.py _write_prompt`: call the live stream's `write`, then flush when
 /// the live object exposes a `flush` attribute.
 fn input_write_prompt(stdout: PyObjectRef, prompt: PyObjectRef) -> Result<(), crate::PyError> {
-    let write = crate::baseobjspace::getattr_str(stdout, "write")?;
-    crate::call_and_check(write, &[prompt])?;
-    match crate::baseobjspace::getattr_str(stdout, "flush") {
+    // The attribute lookups and `write` are ordinary Python calls; keep the
+    // stream and the prompt in slots across them.
+    let roots = pyre_object::gc_roots::push_roots();
+    let stdout_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(stdout);
+    let prompt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(prompt);
+    let write = crate::baseobjspace::getattr_str(roots.get(stdout_slot), "write")?;
+    crate::call_and_check(write, &[roots.get(prompt_slot)])?;
+    match crate::baseobjspace::getattr_str(roots.get(stdout_slot), "flush") {
         Ok(flush) => {
             crate::call_and_check(flush, &[])?;
         }
@@ -15254,45 +15263,43 @@ fn source_text(
         if pyre_object::is_str(source) {
             // A text source is encoded strictly and coding-cookie detection is
             // disabled, matching PyPy's unicode branch.
-            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
             *flags |= PYCF_IGNORE_COOKIE;
-            // PyPy `source_as_str` rejects a NUL in the unicode branch before
-            // the parser sees it.  Keeping that boundary also preserves the
-            // intentionally unlocated `SyntaxError` and its text-source
-            // wording; byte sources instead go through `PegParser.parse_source`
-            // and receive the located diagnostic from `decode_source_bytes`.
-            if *flags & PYCF_ACCEPT_NULL_BYTES == 0 && bytes.contains(&0) {
-                return Err(crate::PyError::syntax_error(
-                    "source code string cannot contain null bytes",
-                ));
-            }
-            return Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"));
+            crate::type_methods::encode_object(source, "utf-8", "strict")?
+        } else if pyre_object::bytesobject::is_bytes(source) {
+            pyre_object::bytesobject::bytes_like_data(source).to_vec()
+        } else {
+            let buffer = match crate::baseobjspace::simple_buffer_bytes(source) {
+                Ok(Some(buffer)) => buffer,
+                Ok(None) => {
+                    return Err(crate::PyError::type_error(format!(
+                        "{funcname}() arg 1 must be a {what} object"
+                    )));
+                }
+                Err(error) if error.kind == crate::PyErrorKind::TypeError => {
+                    return Err(crate::PyError::type_error(format!(
+                        "{funcname}() arg 1 must be a {what} object"
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
+            let bytes = buffer.as_bytes().to_vec();
+            buffer.release();
+            bytes
         }
-        if pyre_object::bytesobject::is_bytes(source) {
-            return crate::compile::decode_source_bytes(
-                pyre_object::bytesobject::bytes_like_data(source),
-                filename,
-                *flags & PYCF_IGNORE_COOKIE != 0,
-            );
-        }
-    }
-
-    let buffer = match crate::baseobjspace::simple_buffer_bytes(source) {
-        Ok(Some(buffer)) => buffer,
-        Ok(None) => {
-            return Err(crate::PyError::type_error(format!(
-                "{funcname}() arg 1 must be a {what} object"
-            )));
-        }
-        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
-            return Err(crate::PyError::type_error(format!(
-                "{funcname}() arg 1 must be a {what} object"
-            )));
-        }
-        Err(error) => return Err(error),
     };
-    let bytes = buffer.as_bytes().to_vec();
-    buffer.release();
+
+    // `source_as_str` applies this after its three branches, so it covers a
+    // text, a bytes and a buffer source alike, and its diagnostic is
+    // deliberately unlocated.  The located wording belongs to
+    // `pyparse.PegParser.parse_source`, which only a source file reaches.
+    if *flags & PYCF_ACCEPT_NULL_BYTES == 0 && bytes.contains(&0) {
+        return Err(crate::PyError::syntax_error(
+            "source code string cannot contain null bytes",
+        ));
+    }
+    if text_source {
+        return Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"));
+    }
     crate::compile::decode_source_bytes(&bytes, filename, *flags & PYCF_IGNORE_COOKIE != 0)
 }
 
