@@ -1064,6 +1064,210 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
+/// Census-only accumulation of a graph's *whole* unresolvable-callee set.
+///
+/// The adapter is first-fail: [`function_graph_to_flowspace`] returns on the
+/// first op it cannot translate, so `MAJIT_RTYPER_VERBOSE`'s
+/// `[PREPASS phaseA fail]` row names one wall per graph even when the graph
+/// stands behind several.  Ranking walls by that row therefore ranks *first*
+/// walls, and closing the top one relocates its graphs to their next wall
+/// instead of lifting them — measured on `Wtf8Buf::push_str`, where the wall
+/// fell 15 → 5 and the census total did not move.
+///
+/// `MAJIT_RTYPER_FRONTIER` keeps the scan going past a failed **call** op so
+/// the row can name the whole set.  Upstream spells the same distinction
+/// `keepgoing` (`annrpython.py`): its `flowin` records the error in
+/// `self.errors`, adds the block to `self.failed_blocks` and returns instead of
+/// raising, and `complete` reports every recorded error together.  Pyre's
+/// annotator ports that flag (`RPythonAnnotator::keepgoing`), but the walls
+/// counted here are raised one layer earlier — in this adapter, before the
+/// annotator sees the graph — so the same behaviour is spelled here.
+///
+/// **Only call ops resume.**  A call's resolution failure is a function of the
+/// callee path and the registry alone, so skipping it invents no wall; any
+/// other op's failure may be a consequence of an operand this scan skipped,
+/// and resuming past it would manufacture walls that do not exist.  The
+/// skipped call's result is bound to a placeholder so later ops still resolve
+/// their operands — a census-only graph that is discarded, since the adapter
+/// still returns the first error and the subject still fails exactly as it
+/// does with the gate off.
+mod frontier {
+    use super::TyperError;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct Frame {
+        /// Every distinct wall seen in this adapter run, in discovery order.
+        walls: Vec<String>,
+        /// The wall the gate-off run would have stopped at.
+        first: Option<TyperError>,
+    }
+
+    thread_local! {
+        /// One frame per active adapter run.  A run is re-entrant: resolving a
+        /// call can lift the callee's source, which runs the adapter again, and
+        /// a flat slot would let the inner run adopt the outer run's `first`.
+        static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+        /// Walls of the last outermost run, awaiting [`super::take_frontier_walls`].
+        static LAST: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Whether `MAJIT_RTYPER_FRONTIER` is on.  Same `== "1"` contract as
+    /// `MAJIT_RTYPER_VERBOSE`, so a literal `0` stays off.
+    pub(super) fn enabled() -> bool {
+        std::env::var_os("MAJIT_RTYPER_FRONTIER").is_some_and(|v| v == "1")
+    }
+
+    /// Guard for one adapter run.  Collecting is scoped to its lifetime.
+    pub(super) struct Guard {
+        active: bool,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            let frame = STACK.with(|s| s.borrow_mut().pop()).unwrap_or_default();
+            STACK.with(|s| {
+                let mut stack = s.borrow_mut();
+                match stack.last_mut() {
+                    // An inner run's walls block the outer run too — its
+                    // failure is what the outer call reports — so they join the
+                    // caller's set rather than being dropped.
+                    Some(outer) => {
+                        for wall in frame.walls {
+                            if !outer.walls.contains(&wall) {
+                                outer.walls.push(wall);
+                            }
+                        }
+                    }
+                    None => LAST.with(|l| *l.borrow_mut() = frame.walls),
+                }
+            });
+        }
+    }
+
+    /// Begin collecting for one adapter run.
+    pub(super) fn enter() -> Guard {
+        let active = enabled();
+        if active {
+            STACK.with(|s| {
+                let mut stack = s.borrow_mut();
+                // An outermost run owns the next census row: drop the previous
+                // run's set now, so a subject whose adapter is never reached
+                // reports nothing rather than its predecessor's walls.
+                if stack.is_empty() {
+                    LAST.with(|l| l.borrow_mut().clear());
+                }
+                stack.push(Frame::default());
+            });
+        }
+        Guard { active }
+    }
+
+    /// Whether `err`, raised on `op`, may be skipped and the run resumed.
+    /// Records the wall as a side effect when it may.
+    pub(super) fn resume(op: &super::SpaceOperation, err: &TyperError) -> bool {
+        if !matches!(op.kind, super::OpKind::Call { .. }) {
+            return false;
+        }
+        STACK.with(|s| {
+            let mut stack = s.borrow_mut();
+            let Some(frame) = stack.last_mut() else {
+                return false;
+            };
+            // One line per wall: the registry message is a paragraph, and a
+            // multi-line census record is unparseable without a banner to split
+            // on.
+            let text = err
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !frame.walls.contains(&text) {
+                frame.walls.push(text);
+            }
+            frame.first.get_or_insert_with(|| err.clone());
+            true
+        })
+    }
+
+    /// The error the gate-off run would have returned, if this run skipped a
+    /// wall.
+    pub(super) fn pending_error() -> Option<TyperError> {
+        STACK.with(|s| s.borrow().last().and_then(|f| f.first.clone()))
+    }
+
+    /// Take the wall set of the last completed outermost run.
+    pub(super) fn take_last() -> Vec<String> {
+        LAST.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+}
+
+/// Read the wall set [`frontier`] collected for the subject just translated.
+/// Empty unless `MAJIT_RTYPER_FRONTIER` is on.
+pub fn take_frontier_walls() -> Vec<String> {
+    frontier::take_last()
+}
+
+/// [`legacy_const_define_hlvalue`], resuming past a skippable call wall under
+/// [`frontier`].
+///
+/// The unresolvable fn-const is stood in for by a
+/// [`ConstValue::Placeholder`] constant rather than reported as "not a const
+/// define": the const-define pass is graph-wide, so demoting the value to a
+/// block-local Variable would leave every other block using it undefined.
+fn legacy_const_define_hlvalue_or_frontier(
+    op: &SpaceOperation,
+    call_registry: Option<&crate::translator::rtyper::call_registry::CallRegistry>,
+) -> Result<Option<Hlvalue>, TyperError> {
+    match legacy_const_define_hlvalue(op, call_registry) {
+        Err(err) if frontier::resume(op, &err) => Ok(Some(Hlvalue::Constant(
+            constant_from_constvalue(ConstValue::Placeholder),
+        ))),
+        other => other,
+    }
+}
+
+/// [`translate_op`], resuming past a skippable call wall under [`frontier`].
+///
+/// The skipped call is replaced by a `direct_call` on a
+/// [`ConstValue::Placeholder`] callee, not dropped.  Both halves are forced by
+/// [`crate::flowspace::model`]'s structural check: the caller has already
+/// seeded the call's result Variable and a later block reads it through a
+/// Link, so some op must define it; and a `canraise` block's last op may not
+/// be `same_as`, so the stand-in has to stay a call.  It is census-only —
+/// this graph is discarded, since [`function_graph_to_flowspace`] reports the
+/// wall.
+fn translate_op_or_frontier(
+    op: &SpaceOperation,
+    value_map: &HashMap<Variable, Hlvalue>,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    match translate_op(op, value_map, call_registry) {
+        Err(err) if frontier::resume(op, &err) => {
+            let Some(result) = op.result.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let result = lookup_operand(value_map, result, op, "result")?;
+            // Already stood in for by
+            // [`legacy_const_define_hlvalue_or_frontier`] — the constant needs
+            // no defining op.
+            if matches!(result, Hlvalue::Constant(_)) {
+                return Ok(Vec::new());
+            }
+            let placeholder = Hlvalue::Constant(constant_from_constvalue(ConstValue::Placeholder));
+            Ok(vec![FlowspaceOp::new(
+                "direct_call",
+                vec![placeholder],
+                result,
+            )])
+        }
+        other => other,
+    }
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<Variable, Hlvalue>,
@@ -3731,6 +3935,45 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
     seen
 }
 
+/// `RPythonTyper.specialize`'s per-graph entry: build the flowspace view of one
+/// legacy graph.
+///
+/// Under `MAJIT_RTYPER_FRONTIER` the run resumes past every unresolvable call
+/// instead of stopping at the first, so [`take_frontier_walls`] can report the
+/// subject's whole call-wall set.  Resuming is census-only: the graph it builds
+/// is discarded, and the error reported here is the one the gate-off run would
+/// have returned, so the subject fails identically either way.
+///
+/// **Only call ops resume.**  A call's resolution failure is a function of the
+/// callee path and the registry alone, so skipping it invents no wall; any
+/// other op's failure may be a consequence of an operand the run skipped, and
+/// resuming past it would manufacture walls that do not exist.  Such an op
+/// still stops the run — its error is then replaced by the recorded first wall,
+/// which is where the gate-off run stopped.
+///
+/// Measured on the `pyre-jit-trace` prepass census: the gate-off phase-A
+/// failure set is reproducible (1681 subjects, twice, byte-identical), and the
+/// gate moves exactly one of them — `_io::stringio::W_StringIO::default` stops
+/// panicking in annotate and reaches phase B instead.  Read the ranking as
+/// carrying that one-subject error bar.
+pub fn function_graph_to_flowspace(
+    legacy: &FunctionGraph,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<FlowspaceAdapterOutput, TyperError> {
+    let _guard = frontier::enter();
+    let result = function_graph_to_flowspace_inner(legacy, call_registry);
+    match frontier::pending_error() {
+        Some(first) => Err(first),
+        None => result,
+    }
+}
+
+/// Translate one legacy graph, reporting the first wall it hits.
+///
+/// Under [`frontier`] the run resumes past a skippable call wall, so the error
+/// this returns need not be the one it stopped at —
+/// [`function_graph_to_flowspace`] restores it.
+///
 /// One-way conversion from the legacy `crate::model::FunctionGraph`
 /// into a `flowspace::FunctionGraph` whose blocks carry `Hlvalue`
 /// operands and per-value `SomeValue` annotations on its `Variable`s.
@@ -3777,7 +4020,7 @@ fn reachable_block_ids(legacy: &FunctionGraph) -> std::collections::HashSet<Bloc
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-pub fn function_graph_to_flowspace(
+fn function_graph_to_flowspace_inner(
     legacy: &FunctionGraph,
     // Call resolution plumbing — see [`translate_op`].
     call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
@@ -3801,7 +4044,7 @@ pub fn function_graph_to_flowspace(
             continue;
         }
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op, Some(call_registry))? {
+            if let Some(hlvalue) = legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))? {
                 // `legacy_const_define_hlvalue` only returns `Some` for ops
                 // with a result Variable, so this is always present here.
                 let Some(result_var) = legacy_op.result.as_ref() else {
@@ -4052,14 +4295,14 @@ pub fn function_graph_to_flowspace(
             })
             .collect();
         for legacy_op in &legacy_block.operations {
-            if let Some(hlvalue) = legacy_const_define_hlvalue(legacy_op, Some(call_registry))? {
+            if let Some(hlvalue) = legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))? {
                 if let Some(result_var) = legacy_op.result.as_ref() {
                     value_map.insert(result_var.clone(), hlvalue.clone());
                     if let Some(name) = legacy.value_name_for(result_var) {
                         name_to_value.insert(name.to_string(), hlvalue);
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op_or_frontier(legacy_op, &value_map, call_registry)?);
                 continue;
             }
 
@@ -4123,7 +4366,7 @@ pub fn function_graph_to_flowspace(
                         )));
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op_or_frontier(legacy_op, &value_map, call_registry)?);
                 continue;
             }
 
@@ -4189,7 +4432,7 @@ pub fn function_graph_to_flowspace(
             {
                 continue;
             }
-            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+            translated_ops.extend(translate_op_or_frontier(legacy_op, &value_map, call_registry)?);
             if let Some(result_var) = legacy_op.result.as_ref()
                 && let Some(name) = legacy.value_name_for(result_var)
                 && let Some(value) = value_map.get(result_var).cloned()
