@@ -117,9 +117,18 @@ pub fn make_includes_from(
         let _ = roots.pin_root(w_lib1);
         let lib1 = lib_arg(roots.get(part_slot + 5))?;
         let _ = roots.pin_root(lib1.w_ffi);
-        let pair =
-            pyre_object::w_tuple_new(vec![roots.get(part_slot + 6), roots.get(part_slot + 5)]);
-        unsafe { pyre_object::listobject::w_list_append(roots.get(includes_slot), pair) };
+        // `w_list_append` can grow the items block, so the pair is rooted
+        // rather than held only in a Rust local across that allocation.
+        let _ = roots.pin_root(pyre_object::w_tuple_new(vec![
+            roots.get(part_slot + 6),
+            roots.get(part_slot + 5),
+        ]));
+        unsafe {
+            pyre_object::listobject::w_list_append(
+                roots.get(includes_slot),
+                roots.get(part_slot + 7),
+            )
+        };
         num += 1;
     }
     ffi_of(lib_arg(roots.get(lib_slot))?)?.included_ffis_libs = roots.get(includes_slot);

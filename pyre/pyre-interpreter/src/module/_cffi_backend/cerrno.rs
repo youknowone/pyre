@@ -70,9 +70,11 @@ pub fn getwinerror(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let code_slot = roots.base();
     let _ = roots.pin_root(pyre_object::w_int_new(code as i64));
     let message = crate::PyError::win32_strerror(code);
-    let w_message = pyre_object::w_str_new(&message);
+    // `w_tuple_new` allocates, so the message needs a root of its own rather
+    // than only the Rust local.
+    let _ = roots.pin_root(pyre_object::w_str_new(&message));
     Ok(pyre_object::w_tuple_new(vec![
         roots.get(code_slot),
-        w_message,
+        roots.get(code_slot + 1),
     ]))
 }

@@ -1229,9 +1229,13 @@ fn init_ffi_type(ns: PyObjectRef) {
     let roots = pyre_object::gc_roots::push_roots();
     let voidp_slot = roots.base();
     let _ = roots.pin_root(newtype::new_voidp_type().expect("void pointer type must build"));
-    let null = ctypeobj::cast(roots.get(voidp_slot), pyre_object::w_int_new(0))
-        .expect("zero must cast to void pointer");
-    store("NULL", null);
+    // `store` inserts into the module dict, which allocates, so the cdata is
+    // rooted rather than held only in a Rust local across it.
+    let _ = roots.pin_root(
+        ctypeobj::cast(roots.get(voidp_slot), pyre_object::w_int_new(0))
+            .expect("zero must cast to void pointer"),
+    );
+    store("NULL", roots.get(voidp_slot + 1));
     store("error", newtype::ffi_error());
     store("buffer", cbuffer::buffer_type());
     super::interp_cffi_backend::register_rtld_constants(ns);

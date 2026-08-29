@@ -220,10 +220,12 @@ pub fn typeoffsetof(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let field_slot = roots.base();
     let _ = roots.pin_root(w_ctype);
-    let w_offset = pyre_object::w_int_new(offset);
+    // The two-item `w_tuple_new` pins its first item, which is a collection
+    // point while an unrooted second item is still only a Rust local.
+    let _ = roots.pin_root(pyre_object::w_int_new(offset));
     Ok(pyre_object::w_tuple_new(vec![
         roots.get(field_slot),
-        w_offset,
+        roots.get(field_slot + 1),
     ]))
 }
 
@@ -432,18 +434,26 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     if n < 0 {
         return Err(PyError::value_error("negative size"));
     }
+    // `@unwrap_spec(n=int)` binds a machine word, so a size that does not fit
+    // one is refused rather than truncated into the checks and the copy.
+    let n = usize::try_from(n)
+        .map_err(|_| PyError::value_error("size does not fit in a machine word"))?;
     let mut dest_buffer = None;
     let dest = if let Some(cdata) = W_CData::from_obj(args[0]) {
         unsafe_escaping_ptr_for_ptr_or_array(cdata)?
     } else {
         dest_buffer = Some(unsafe { crate::builtins::WritableBuffer::acquire(args[0]) }?);
-        unsafe {
-            dest_buffer
-                .as_mut()
-                .expect("just filled")
-                .as_mut_slice()
-                .as_mut_ptr()
+        let slice = unsafe { dest_buffer.as_mut().expect("just filled").as_mut_slice() };
+        // `_fetch_as_write_buffer`'s non-raw arm writes with `setitem`, which
+        // refuses an index past the end, so a request longer than the buffer
+        // is an error rather than a write past it. The cdata arm stays
+        // unchecked: a bare pointer carries no length.
+        if n > slice.len() {
+            return Err(PyError::value_error(
+                "destination buffer is smaller than the requested size",
+            ));
         }
+        slice.as_mut_ptr()
     };
     let mut source_buffer = None;
     let src = if let Some(cdata) = W_CData::from_obj(roots.get(src_slot)) {
@@ -452,11 +462,18 @@ pub fn memmove(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(roots.get(src_slot))? else {
             return Err(PyError::type_error("expected a readable buffer"));
         };
+        // `getslice(0, 1, n)` bounds the same read upstream.
+        if n > buffer.as_bytes().len() {
+            buffer.release();
+            return Err(PyError::value_error(
+                "source buffer is smaller than the requested size",
+            ));
+        }
         let ptr = buffer.as_bytes().as_ptr();
         source_buffer = Some(buffer);
         ptr
     };
-    unsafe { std::ptr::copy(src, dest, n as usize) };
+    unsafe { std::ptr::copy(src, dest, n) };
     if let Some(buffer) = source_buffer {
         buffer.release();
     }

@@ -201,7 +201,13 @@ fn comparison(args: &[PyObjectRef], mode: fn(Ordering) -> bool) -> Result<PyObje
         return Ok(pyre_object::special::w_not_implemented());
     };
     let buffer = buffer_arg(args[0])?;
-    let mine = unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.size as usize) };
+    // A buffer over a NULL cdata is empty, and no slice may be built from a
+    // null address even at length zero.  `_comparison_helper` reads zero bytes.
+    let mine = if buffer.ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(buffer.ptr, buffer.size as usize) }
+    };
     let ordering = mine.cmp(other.as_bytes());
     other.release();
     Ok(pyre_object::boolobject::w_bool_from(mode(ordering)))

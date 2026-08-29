@@ -136,7 +136,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             crate::make_module_builtin_function("getwinerror", super::cerrno::getwinerror),
         ),
     );
-
     Ok(())
 }
 
