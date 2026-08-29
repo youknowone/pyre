@@ -2905,28 +2905,23 @@ pub unsafe fn w_list_int_or_float_setitem(
     true
 }
 
-/// Get the length of a list.
+/// Get the length of a list: `W_ListObject.length()`, a strategy-dispatched
+/// field read (`listobject.py EmptyListStrategy.length` returns 0).
+///
+/// Read without the list's lock, the way `PyList_GET_SIZE` reads `ob_size`
+/// and the way every compiled read of it already did: the `builtin_len`
+/// fold records `guard_value(strategy)` + `getfield(length)` and the walked
+/// `w_list_*_inner` bodies hold no guard.  The value only ever becomes an
+/// int, so a read that races a strategy switch yields a stale length, never
+/// an out-of-bounds access.  With no lock there is no collection point, so
+/// `obj` needs no root here.  Taking the lock instead made the acquire an
+/// opaque residual (`w_list_lock` is `dont_look_inside`) on every traced
+/// `len(list)`, which is what kept the generic builtin descent out of `len`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
 pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
-    let _roots = crate::gc_roots::push_roots();
-    let root_base = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
-    let _list_guard = w_list_lock(obj);
-    let obj = crate::gc_roots::shadow_stack_get(root_base);
-    let list = &*(obj as *const W_ListObject);
-    match list.strategy {
-        // listobject.py EmptyListStrategy.length returns 0.
-        ListStrategy::Empty | ListStrategy::Size => 0,
-        ListStrategy::SimpleRange | ListStrategy::Range => range_list_length(list),
-        ListStrategy::Object => list.length_relaxed(),
-        ListStrategy::Integer => ll_list_int_length(list),
-        ListStrategy::IntOrFloat => list.int_items.len(),
-        ListStrategy::Float => list.float_items.len(),
-        ListStrategy::Bytes => list.bytes_items.len(),
-        ListStrategy::Ascii => list.ascii_items.len(),
-    }
+    (*(obj as *const W_ListObject)).live_len()
 }
 
 /// CPython-visible `PyListObject.allocated` under the list's mutation lock.
