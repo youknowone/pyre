@@ -5563,6 +5563,9 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
         }
         return None;
     }
+    if crate::module::r#struct::W_Struct::from_obj(obj).is_some() {
+        return crate::module::r#struct::W_Struct::getweakref(obj);
+    }
     let w_type = crate::typedef::r#type(obj)?;
     if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
         crate::objspace::std::mapdict::getweakref(obj)
@@ -5615,6 +5618,9 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
     {
         unsafe { pyre_object::interp_array::w_array_setweakref(obj, weakreflifeline) };
+        return Ok(());
+    }
+    if crate::module::r#struct::W_Struct::setweakref(obj, weakreflifeline) {
         return Ok(());
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -5678,6 +5684,9 @@ pub fn delweakref(obj: PyObjectRef) {
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
     {
         unsafe { pyre_object::interp_array::w_array_setweakref(obj, PY_NULL) };
+        return;
+    }
+    if crate::module::r#struct::W_Struct::delweakref(obj) {
         return;
     }
     let w_type = match crate::typedef::r#type(obj) {
