@@ -242,6 +242,7 @@ fn build() -> AllJitCodes {
                     split_portal: false,
                 }],
                 register_trait_families: Vec::new(),
+                helper_graphs: Vec::new(),
             },
         },
         None,
