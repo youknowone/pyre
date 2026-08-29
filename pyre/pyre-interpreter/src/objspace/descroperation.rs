@@ -227,42 +227,6 @@ fn bigint_to_f64(a: BigInt) -> f64 {
     jit_bigint_to_f64_or_inf(&a)
 }
 
-/// `rbigint.bit_length` / `rbigint.bit_count` scalar residual core.
-///
-/// Both methods are `@jit.elidable` and can raise OverflowError through
-/// RPython's `ovfcheck`, so these wrappers publish the exception for the
-/// trailing `GUARD_NO_EXCEPTION` instead of using a cannot-raise residual.
-#[inline]
-fn bigint_checked_scalar(value: &BigInt, bit_count: bool) -> i64 {
-    let result = if bit_count {
-        value.bit_count()
-    } else {
-        value.bit_length()
-    };
-    match result {
-        Ok(value) => value,
-        Err(majit_rlib::rbigint::RBigIntError::Overflow) => {
-            crate::runtime_ops::jit_publish_exception(
-                PyError::overflow_error("too many digits in integer").to_exc_object(),
-            );
-            0
-        }
-        Err(_) => unreachable!("bit_length/bit_count only raise OverflowError"),
-    }
-}
-
-#[majit_macros::elidable]
-pub extern "C" fn jit_bigint_bit_length(value: i64) -> i64 {
-    let value = unsafe { &*(value as *const BigInt) };
-    bigint_checked_scalar(value, false)
-}
-
-#[majit_macros::elidable]
-pub extern "C" fn jit_bigint_bit_count(value: i64) -> i64 {
-    let value = unsafe { &*(value as *const BigInt) };
-    bigint_checked_scalar(value, true)
-}
-
 /// RPython `_divrem`'s truncated quotient over two bare RBigInt payloads.
 /// Allocates the result via the COLLECTING nursery (a gcmap-rooted residual,
 /// its operand pointers rooted across the alloc), matching the arithmetic

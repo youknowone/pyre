@@ -60,11 +60,10 @@ fn load_rbigint_llbcs() -> Option<Vec<Llbc>> {
 
 /// `_AsDouble` consumes `bit_length()` with `?`, so the `Result<i64,
 /// RBigIntError>` it returns is destructured by a live `Try::branch` /
-/// `from_residual` diamond.  The scalar residual returns a bare Signed word,
-/// which erases that `Result`: retargeting here leaves the diamond reading
-/// `__discriminant` off an integer.  This asserts the erasure does not happen
-/// — it fails as soon as `scalar_residual_for_method`'s gate stops declining,
-/// with `jit_bigint_bit_length` appearing beside the surviving `branch`.
+/// `from_residual` diamond.  A one-word scalar residual would erase that
+/// `Result` and leave the diamond reading `__discriminant` off an integer, so
+/// `scalar_residual_for_method` maps neither `bit_length` nor `bit_count` —
+/// matching upstream, which mints no residual for them either.
 #[test]
 fn as_double_effect_graph_keeps_upstream_bit_length_call() {
     let Some(llbcs) = load_rbigint_llbcs() else {
@@ -95,7 +94,46 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
     );
     assert!(
         calls.iter().all(|name| name != "jit_bigint_bit_length"),
-        "_AsDouble must not acquire the interpreter exception-publishing wrapper: {calls:?}",
+        "_AsDouble must not acquire a one-word residual for a Result-returning \
+         call: {calls:?}",
+    );
+}
+
+/// The same erasure, on the side the `?` diamond does not cover.
+/// `rbigint_to_compiler_bigint` spells its `bit_length()` consumption as
+/// `.expect(..)`, so a one-word residual leaves `Result::expect` applied to a
+/// machine word.  Unlike `_AsDouble` this graph carries no `dont_look_inside`
+/// marker, which is why the caller's hint could never have been the predicate
+/// that kept the mapping sound.
+#[test]
+fn compiler_bigint_conversion_keeps_upstream_bit_length_call() {
+    if !std::path::Path::new(INTERPRETER_LLBC).is_file() {
+        eprintln!(
+            "skipping: {INTERPRETER_LLBC} is missing; run \
+             `python3 scripts/extract-llbc.py pyre-interpreter`"
+        );
+        return;
+    }
+    let llbc = Llbc::load(INTERPRETER_LLBC).expect("load pyre-interpreter.ullbc");
+    let graph = lower_function(&llbc, "rbigint_to_compiler_bigint")
+        .expect("lower rbigint_to_compiler_bigint");
+    let residuals: Vec<String> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments },
+                ..
+            } => Some(segments.join("::")),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        residuals
+            .iter()
+            .all(|path| !path.ends_with("jit_bigint_bit_length")),
+        "an `.expect()` consumer must not receive a one-word residual: {residuals:?}",
     );
 }
 
@@ -1342,19 +1380,6 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         assert!(
             !values.iter().any(|hint| hint == "elidable_or_memerror"),
             "{path} comparison must not advertise an allocation edge: {values:?}"
-        );
-    }
-    for path in [
-        "objspace::descroperation::jit_bigint_bit_length",
-        "objspace::descroperation::jit_bigint_bit_count",
-    ] {
-        let values = hints
-            .get(path)
-            .unwrap_or_else(|| panic!("missing pointer-ABI wrapper hints for {path}"));
-        assert!(values.iter().any(|hint| hint == "elidable"));
-        assert!(
-            !values.iter().any(|hint| hint == "elidable_cannot_raise"),
-            "{path} must preserve rbigint ovfcheck's OverflowError edge, got {values:?}"
         );
     }
     let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(

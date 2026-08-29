@@ -18318,14 +18318,11 @@ type DunderFn = fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>;
 /// edge, in the same shape as `descroperation`'s `bigint_lshift_count` /
 /// `bigint_pow_nomod`.
 ///
-/// `RBigInt::bit_length` returns `Result<i64, RBigIntError>`, but
-/// `scalar_residual_for_method` retargets the call to the raising scalar
-/// residual `jit_bigint_bit_length`, whose result is a bare Signed word and
-/// whose error travels the implicit exception edge. A caller that destructures
-/// the pre-retarget `Result` in a lowered graph reads `__discriminant` /
-/// `__pos_0` off that erased word — an integer used as an aggregate base.
-/// Keeping the match behind this boundary converts the carrier to the
-/// `Result<_, PyError>` the exception transform models.
+/// `RBigInt::bit_length` returns `Result<i64, RBigIntError>` — `ovfcheck`'s
+/// value encoding — and the front's exception transform is scoped to the
+/// `Result<_, PyError>` carrier, so this converts the one to the other at a
+/// single place instead of leaving every `int.bit_length()` caller to
+/// destructure the rbigint-local error type.
 #[majit_macros::dont_look_inside]
 fn long_bit_length(value: &BigInt) -> Result<i64, crate::PyError> {
     match value.bit_length() {

@@ -8,11 +8,6 @@
 //! [`crate::front::bigint_binop`].
 
 const RESIDUAL_MODULE: [&str; 2] = [crate::runtime_names::crates::OBJECT, "longobject"];
-const RAISING_SCALAR_RESIDUAL_MODULE: [&str; 3] = [
-    crate::runtime_names::crates::INTERPRETER,
-    "objspace",
-    "descroperation",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScalarResult {
@@ -114,43 +109,20 @@ pub(crate) fn long_box_residual_path(segments: &[String]) -> Option<Vec<String>>
 
 /// Bare-payload residual for scalar RBigInt queries. The caller has already
 /// proved exact RBigInt receiver identity.
-pub(crate) fn scalar_residual_for_method(
-    leaf: &str,
-    inside_dont_look_inside: bool,
-) -> Option<(Vec<String>, ScalarResult)> {
-    // NEW-DEVIATION, with a convergence path.  Upstream reads
-    // `_jit_look_inside_` in exactly one place — `JitPolicy.look_inside_graph`
-    // (`rpython/jit/codewriter/policy.py`) — to decide trace-vs-call.  It never
-    // changes which operations a graph CONTAINS: `rbigint._AsDouble`'s
-    // flowgraph holds the same `direct_call(rbigint.bit_length)` whether or not
-    // `jit.dont_look_inside` (`rpython/rlib/jit.py`) marked it opaque.
-    // Branching the emitted callee on the hint, as below, has no upstream
-    // counterpart.
-    //
-    // Why it is here, measured: `bit_length` / `bit_count` are the only scalar
-    // queries whose Rust signature is `Result<i64, RBigIntError>` — the
-    // value-encoded `ovfcheck` idiom, since both are `@jit.elidable` and raise
-    // OverflowError (`rpython/rlib/rbigint.py`).  This mapper's residual
-    // returns a bare Signed word, so the retarget ERASES that `Result`, while
-    // the caller's `?` diamond survives untouched: with the gate lifted,
-    // `_AsDouble` holds `jit_bigint_bit_length -> Int` still feeding
-    // `Try::branch` / `from_residual`, i.e. a `__discriminant` read on an
-    // integer.  `pyre_interpreter::typedef::long_bit_length` records the same
-    // erasure from the caller's side and works around it with its own
-    // `dont_look_inside` boundary.  The defect is a MISCOMPILE, not merely the
-    // wrapper's effect classification.
-    //
-    // Converging is `simplify.transform_ovfcheck`'s move, which
-    // [`crate::front::checked_arith`] already performs for the
-    // `checked_*` + `Option` spelling of the same idiom: rewrite the caller's
-    // diamond into an `OverflowError` exception edge — normal exit to the `Ok`
-    // arm carrying the bare word, raising exit to the `Err` arm — and do it
-    // atomically with the retarget, so a shape the rewrite declines keeps the
-    // unerased `bit_length` call and no hint is consulted anywhere.  Until that
-    // lands the gate stays, because the alternative is a miscompiled graph.
-    if inside_dont_look_inside && matches!(leaf, "bit_length" | "bit_count") {
-        return None;
-    }
+///
+/// Every mapped method returns a plain machine word in Rust, so retargeting it
+/// to a one-word residual preserves the call's type.  `bit_length` /
+/// `bit_count` are deliberately absent even though `rbigint.bit_length` /
+/// `rbigint.bit_count` (`rpython/rlib/rbigint.py`) are `@jit.elidable` like the
+/// rest: both raise OverflowError through `ovfcheck`, so their Rust signature
+/// is `Result<i64, RBigIntError>` and a one-word residual would ERASE that
+/// `Result` under a caller that still destructures it.  Upstream mints no
+/// residual for them either — they are ordinary elidable graphs the codewriter
+/// traces — so the parity shape and the sound shape agree.  Converging further
+/// means `simplify.transform_ovfcheck`'s rewrite, which
+/// [`crate::front::checked_arith`] already performs for the `checked_*` +
+/// `Option` spelling of the same idiom.
+pub(crate) fn scalar_residual_for_method(leaf: &str) -> Option<(Vec<String>, ScalarResult)> {
     let (module, residual, result) = match leaf {
         "get_sign" => (
             RESIDUAL_MODULE.as_slice(),
@@ -185,16 +157,6 @@ pub(crate) fn scalar_residual_for_method(
         "hash" => (
             RESIDUAL_MODULE.as_slice(),
             "jit_bigint_hash",
-            ScalarResult::Int,
-        ),
-        "bit_length" => (
-            RAISING_SCALAR_RESIDUAL_MODULE.as_slice(),
-            "jit_bigint_bit_length",
-            ScalarResult::Int,
-        ),
-        "bit_count" => (
-            RAISING_SCALAR_RESIDUAL_MODULE.as_slice(),
-            "jit_bigint_bit_count",
             ScalarResult::Int,
         ),
         _ => return None,
@@ -542,7 +504,7 @@ mod tests {
     #[test]
     fn maps_scalar_queries_with_their_result_bank() {
         assert_eq!(
-            scalar_residual_for_method("get_sign", false),
+            scalar_residual_for_method("get_sign"),
             Some((
                 segs(&[
                     crate::runtime_names::crates::OBJECT,
@@ -553,7 +515,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            scalar_residual_for_method("is_zero", false),
+            scalar_residual_for_method("is_zero"),
             Some((
                 segs(&[
                     crate::runtime_names::crates::OBJECT,
@@ -563,22 +525,12 @@ mod tests {
                 ScalarResult::Bool
             ))
         );
-        assert_eq!(
-            scalar_residual_for_method("bit_length", false),
-            Some((
-                segs(&[
-                    crate::runtime_names::crates::INTERPRETER,
-                    "objspace",
-                    "descroperation",
-                    "jit_bigint_bit_length",
-                ]),
-                ScalarResult::Int
-            ))
-        );
-        assert_eq!(scalar_residual_for_method("bit_length", true), None);
-        assert_eq!(scalar_residual_for_method("bit_count", true), None);
-        assert!(scalar_residual_for_method("get_sign", true).is_some());
-        assert!(scalar_residual_for_method("add", false).is_none());
+        // `bit_length` / `bit_count` return `Result<i64, RBigIntError>` —
+        // `ovfcheck`'s value encoding — so no one-word residual may claim
+        // them; see this mapper's note.
+        assert_eq!(scalar_residual_for_method("bit_length"), None);
+        assert_eq!(scalar_residual_for_method("bit_count"), None);
+        assert!(scalar_residual_for_method("add").is_none());
     }
 
     #[test]

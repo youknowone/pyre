@@ -10402,9 +10402,6 @@ impl<'a> Lowering<'a> {
         // assignment nor descending into the classdef-less `_digits` field is
         // correct. Retarget the exact receiver/result pair to the GC-aware
         // shallow-clone residual.
-        let inside_dont_look_inside = self
-            .dont_look_inside
-            .contains(&strip_crate_prefix(&self.graph.name));
         let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 1
             && first_arg_ty
@@ -10803,17 +10800,11 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
             && let Some((segments, scalar_result)) = match target {
-                CallTarget::FunctionPath { segments } => segments.last().and_then(|leaf| {
-                    crate::front::rbigint_call::scalar_residual_for_method(
-                        leaf,
-                        inside_dont_look_inside,
-                    )
-                }),
+                CallTarget::FunctionPath { segments } => segments
+                    .last()
+                    .and_then(|leaf| crate::front::rbigint_call::scalar_residual_for_method(leaf)),
                 CallTarget::Method { name, .. } => {
-                    crate::front::rbigint_call::scalar_residual_for_method(
-                        name,
-                        inside_dont_look_inside,
-                    )
+                    crate::front::rbigint_call::scalar_residual_for_method(name)
                 }
                 _ => None,
             } {

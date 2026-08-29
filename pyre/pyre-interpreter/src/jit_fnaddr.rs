@@ -2193,16 +2193,6 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_bigint_hash",
         pyre_object::jit_bigint_hash,
     );
-    cp1(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_bit_length",
-        crate::objspace::descroperation::jit_bigint_bit_length,
-    );
-    cp1(
-        &mut entries,
-        "pyre_interpreter::objspace::descroperation::jit_bigint_bit_count",
-        crate::objspace::descroperation::jit_bigint_bit_count,
-    );
     pa1(
         &mut entries,
         "pyre_object::longobject::jit_bigint_to_i64_value",
