@@ -12804,9 +12804,6 @@ fn handle<Sym: WalkSym>(
                         w_class as pyre_object::PyObjectRef;
                 }
             }
-            // `class_now_known` takes the vtable address: pyre tracks the
-            // concrete class pointer where upstream only raises HF_KNOWN_CLASS.
-            let known_class = descr.as_size_descr().map(|size| size.vtable() as i64);
             // pyjitpl.py `execute_new_with_vtable`.
             ctx.trace_ctx
                 .profiler()
@@ -12819,13 +12816,6 @@ fn handle<Sym: WalkSym>(
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::NewWithVtable, &[], descr.clone());
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
-            if let Some(class) = known_class {
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(resbox, class);
-            }
-            // The allocation wrote the class word from the size descr (the
-            // `w_class` store above).
             crate::helpers::note_class_word_after_new(ctx.trace_ctx, resbox, &descr);
             let dst = code[op.pc + 3] as usize;
             if let Some(value) = concrete {

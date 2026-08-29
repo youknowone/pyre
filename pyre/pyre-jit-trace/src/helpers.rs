@@ -623,13 +623,18 @@ pub(crate) fn emit_untag_int(ctx: &mut TraceCtx, obj: OpRef, value: i64) -> OpRe
     raw
 }
 
-/// Teach the heap cache the class word a `NewWithVtable` writes from its
-/// size descr (`SizeDescr::w_class_obj`, the same answer `OptVirtualize`
-/// folds the header read off a virtual with), as it would learn a recorded
-/// `setfield`: a later `getfield_gc_r` of `w_class` on `new_op` yields the
-/// class constant and a `promote` of that read records no guard.  A size
-/// descr without a class word, or whose type has no canonical class, seeds
-/// nothing.
+/// Teach the heap cache what a `NewWithVtable` determined about `new_op`.
+///
+/// The class is known (`opimpl_new_with_vtable` → `class_now_known`;
+/// `class_now_known` here takes the vtable address, since pyre tracks the
+/// concrete class pointer where upstream only raises `HF_KNOWN_CLASS`), so a
+/// later `guard_class` on `new_op` records nothing.  The class word the
+/// allocation writes from its size descr (`SizeDescr::w_class_obj`, the
+/// same answer `OptVirtualize` folds the header read off a virtual with) is
+/// cached as a recorded `setfield` would be: a later `getfield_gc_r` of
+/// `w_class` on `new_op` yields the class constant and a `promote` of that
+/// read records no guard.  A size descr without a class word, or whose type
+/// has no canonical class, seeds only the class.
 pub fn note_class_word_after_new(
     ctx: &mut TraceCtx,
     new_op: OpRef,
@@ -638,6 +643,8 @@ pub fn note_class_word_after_new(
     let Some(size) = size_descr.as_size_descr() else {
         return;
     };
+    ctx.heap_cache_mut()
+        .class_now_known(new_op, size.vtable() as i64);
     let seed = size
         .class_word_field()
         .map(|field| field.index())
