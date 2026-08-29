@@ -4211,7 +4211,11 @@ fn input_streams_are_std_tty(
     let outfileno_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(outfileno);
 
-    if !crate::baseobjspace::eq_w(roots.get(infileno_slot), pyre_object::w_int_new(0))? {
+    // `w_int_new` allocates, and an argument list is evaluated left to right,
+    // so the wrapped number is built before the slot it is compared against
+    // is read.
+    let zero = pyre_object::w_int_new(0);
+    if !crate::baseobjspace::eq_w(roots.get(infileno_slot), zero)? {
         return Ok(false);
     }
     let isatty = crate::baseobjspace::getattr_str(roots.get(stdin_slot), "isatty")?;
@@ -4219,7 +4223,8 @@ fn input_streams_are_std_tty(
     if !crate::baseobjspace::is_true(isatty)? {
         return Ok(false);
     }
-    crate::baseobjspace::eq_w(roots.get(outfileno_slot), pyre_object::w_int_new(1))
+    let one = pyre_object::w_int_new(1);
+    crate::baseobjspace::eq_w(roots.get(outfileno_slot), one)
 }
 
 /// `app_io.py _write_prompt`: call the live stream's `write`, then flush when
