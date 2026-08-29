@@ -6795,11 +6795,16 @@ pub(crate) fn type_of_object(obj: PyObjectRef) -> PyObjectRef {
 /// `isinstance(obj, cls)` — pypy/module/__builtin__/abstractinst.py
 /// `app_isinstance` → `abstract_isinstance_w(allow_override=True)`.
 fn builtin_isinstance(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `isinstance` is registered with a fixed arity, so `builtin_code_call`
+    // rejects a wrong positional count before this body runs and the branch is
+    // unreachable today.  It is what `__majit_wrap_builtin_isinstance` falls
+    // back to, though, and the walker enters that wrapper directly rather than
+    // through `builtin_code_call` -- so the wording has to be the one
+    // `arity_mismatch` gives a two-argument builtin, which the hand-rolled
+    // message it replaces did not match, and the report has to be cold and
+    // residual the way every reporter in `gateway.rs` is.
     if args.len() != 2 {
-        return Err(crate::PyError::type_error(format!(
-            "isinstance() takes exactly two arguments ({} given)",
-            args.len()
-        )));
+        return crate::gateway::method_exact_arity_failure("isinstance", 2, args.len());
     }
     Ok(w_bool_from(crate::baseobjspace::isinstance(
         args[0], args[1],

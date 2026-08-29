@@ -547,6 +547,27 @@ pub fn method_noarg_failure(
     }
 }
 
+/// Cold `_PyArg_CheckPositional` exact-count failure.
+///
+/// The wording [`arity_mismatch`] gives a fixed-arity builtin of two or more
+/// arguments.  A hand-written `__majit_wrap_builtin_*` gateway never reaches
+/// `arity_mismatch`: the walker enters the wrapper directly, so the wrapper's
+/// own length test is what rejects the call, and the fallback it routes to has
+/// to report the same wording.  `dont_look_inside` for the reason
+/// [`method_arity_failure`] carries -- the rejected branch is cold, and its
+/// message names a runtime count, so building it in walked code drags
+/// formatting machinery into the JitCode.
+#[majit_macros::dont_look_inside]
+pub fn method_exact_arity_failure(
+    name: &str,
+    expected: usize,
+    given: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(format!(
+        "{name} expected {expected} arguments, got {given}"
+    )))
+}
+
 /// Cold gateway failure for a missing required argument.
 ///
 /// A wrapper whose optional trailing parameters turn the accepted count into a
