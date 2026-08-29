@@ -478,7 +478,7 @@ pub const fn subclass_range_alias(type_id: u32, pytype: &'static PyType) -> Subc
     SubclassRangeAlias { type_id, pytype }
 }
 
-/// Where `_cffi_backend`'s eight tail slots start.  The three Windows
+/// Where `_cffi_backend`'s tail slots start.  The three Windows
 /// payloads ahead of them exist only there, so the group begins three ids
 /// later on Windows than anywhere else.
 #[cfg(all(not(target_arch = "wasm32"), windows))]
