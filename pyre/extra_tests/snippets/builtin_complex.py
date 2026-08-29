@@ -1,6 +1,8 @@
 import testutils
 from testutils import assert_raises
 
+assert complex.__complex__.__doc__ == "Convert this value to exact type complex."
+
 # __abs__
 
 assert abs(complex(3, 4)) == 5

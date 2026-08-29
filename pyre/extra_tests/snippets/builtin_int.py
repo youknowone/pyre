@@ -1,5 +1,15 @@
 from testutils import assert_raises
 
+int_descriptor_docs = {
+    "__ceil__": "Ceiling of an Integral returns itself.",
+    "__floor__": "Flooring an Integral returns itself.",
+    "__trunc__": "Truncating an Integral returns itself.",
+    "conjugate": "Returns self, the complex conjugate of any int.",
+    "denominator": "the denominator of a rational number in lowest terms",
+}
+for method_name, expected_doc in int_descriptor_docs.items():
+    assert getattr(int, method_name).__doc__ == expected_doc
+
 # int to int comparisons
 
 assert 1 == 1

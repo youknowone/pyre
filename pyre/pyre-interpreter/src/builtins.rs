@@ -2900,9 +2900,6 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__gt__", memoryview_gt, 2),
         ("__ge__", memoryview_ge, 2),
         ("count", memoryview_count, 2),
-        ("tolist", memoryview_tolist, 1),
-        ("toreadonly", memoryview_toreadonly, 1),
-        ("release", memoryview_release, 1),
         ("__enter__", memoryview_enter, 1),
         ("__hash__", memoryview_hash, 1),
         ("_pypy_raw_address", memoryview_raw_address, 1),
@@ -2911,6 +2908,29 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
             ns_slot,
             name,
             make_builtin_function_with_arity(name, f, arity),
+        );
+    }
+    for (name, f, doc) in [
+        (
+            "tolist",
+            memoryview_tolist as MvFn,
+            "Return the data in the buffer as a list of elements.",
+        ),
+        (
+            "toreadonly",
+            memoryview_toreadonly,
+            "Return a readonly version of the memoryview.",
+        ),
+        (
+            "release",
+            memoryview_release,
+            "Release the underlying buffer exposed by the memoryview object.",
+        ),
+    ] {
+        type_ns_store(
+            ns_slot,
+            name,
+            crate::gateway::make_builtin_function_with_arity_and_doc(name, f, 1, doc),
         );
     }
     // Nothing references the two classmethod carriers until they are wrapped
@@ -2967,10 +2987,18 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__delitem__", memoryview_delitem),
         ("tobytes", memoryview_tobytes),
         ("hex", memoryview_hex),
-        ("cast", memoryview_cast),
     ] {
         type_ns_store(ns_slot, name, make_builtin_function(name, f));
     }
+    type_ns_store(
+        ns_slot,
+        "cast",
+        crate::gateway::make_builtin_function_with_doc(
+            "cast",
+            memoryview_cast,
+            "Cast a memoryview to a new format or shape.",
+        ),
+    );
     // memoryobject.py:777-788 — `format` / `itemsize` / … are
     // `GetSetProperty(W_MemoryView.w_get_*)`.  `fget` is called
     // `(descriptor, receiver)`.

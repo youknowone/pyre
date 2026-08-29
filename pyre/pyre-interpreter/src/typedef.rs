@@ -18706,7 +18706,7 @@ fn init_int_type(ns: PyObjectRef) {
     // int.__index__ / __int__ / __trunc__ / __floor__ / __ceil__ —
     // `_self_unaryop` → `self.int(space)`: exact ints preserve identity;
     // subclasses and bools are normalized by `int_as_plain_int`.
-    for method in ["__index__", "__int__", "__trunc__", "__floor__", "__ceil__"] {
+    for method in ["__index__", "__int__"] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -18715,12 +18715,35 @@ fn init_int_type(ns: PyObjectRef) {
             )
         };
     }
+    for (method, doc) in [
+        ("__trunc__", "Truncating an Integral returns itself."),
+        ("__floor__", "Flooring an Integral returns itself."),
+        ("__ceil__", "Ceiling of an Integral returns itself."),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                method,
+                crate::gateway::make_builtin_function_with_arity_and_doc(
+                    method,
+                    |args| Ok(int_as_plain_int(args)),
+                    1,
+                    doc,
+                ),
+            )
+        };
+    }
     // int.conjugate — identity (bool → int)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "conjugate",
-            make_builtin_function_with_arity("conjugate", |args| Ok(int_as_plain_int(args)), 1),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "conjugate",
+                |args| Ok(int_as_plain_int(args)),
+                1,
+                "Returns self, the complex conjugate of any int.",
+            ),
         )
     };
     // int.as_integer_ratio — (self, 1)
@@ -18788,7 +18811,13 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "denominator",
-            make_getset_descriptor(denom_getter),
+            make_getset_property_named_doc(
+                denom_getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "the denominator of a rational number in lowest terms",
+                "denominator",
+            ),
         )
     };
     // Unary / conversion slots exposed as callable dunders.  These have
@@ -19251,7 +19280,7 @@ fn init_complex_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__complex__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__complex__",
                 |args| {
                     // PyPy `W_ComplexObject.descr_complex` creates a base
@@ -19273,6 +19302,7 @@ fn init_complex_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_complex_new(re, im))
                 },
                 1,
+                "Convert this value to exact type complex.",
             ),
         )
     };
@@ -21345,7 +21375,12 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__bytes__",
-            make_builtin_function_with_arity("__bytes__", bytes_method_bytes, 1),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__bytes__",
+                bytes_method_bytes,
+                1,
+                "Convert this value to exact type bytes.",
+            ),
         )
     };
     unsafe {

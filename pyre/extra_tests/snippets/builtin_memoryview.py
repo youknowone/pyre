@@ -11,6 +11,15 @@ import weakref
 
 from testutils import assert_raises
 
+memoryview_descriptor_docs = {
+    "cast": "Cast a memoryview to a new format or shape.",
+    "release": "Release the underlying buffer exposed by the memoryview object.",
+    "tolist": "Return the data in the buffer as a list of elements.",
+    "toreadonly": "Return a readonly version of the memoryview.",
+}
+for method_name, expected_doc in memoryview_descriptor_docs.items():
+    assert getattr(memoryview, method_name).__doc__ == expected_doc
+
 obj = b"abcde"
 a = memoryview(obj)
 assert a.obj == obj

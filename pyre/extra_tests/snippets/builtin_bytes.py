@@ -2,6 +2,8 @@ import sys
 
 from testutils import assert_raises, skip_if_unsupported
 
+assert bytes.__bytes__.__doc__ == "Convert this value to exact type bytes."
+
 # new
 assert bytes([1, 2, 3])
 assert bytes((1, 2, 3))
