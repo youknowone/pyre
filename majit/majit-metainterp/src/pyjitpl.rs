@@ -15334,7 +15334,7 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
         argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
-        greenkey: Option<u64>,
+        greenkey: Option<PortalGreenKey>,
     ) -> Result<(), ChangeFrame> {
         // pyjitpl.py: f = self.newframe(jitcode, greenkey)
         let _ = self.newframe(jitcode, greenkey);
@@ -16272,7 +16272,7 @@ impl<M: Clone> MetaInterp<M> {
     pub fn newframe(
         &mut self,
         jitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        greenkey: Option<u64>,
+        greenkey: Option<PortalGreenKey>,
     ) -> usize {
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
         if let Some(jd_no) = jitcode.jitdriver_sd() {
@@ -16280,8 +16280,8 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2435: self.call_ids.append(self.current_call_id)
             self.call_ids.push(self.current_call_id);
             // pyjitpl.py: enter_portal_frame(jitdriver_sd.index, unique_id)
-            if let Some(unique_id) = greenkey {
-                self.enter_portal_frame(jd_no, unique_id);
+            if let Some((unique_id, _)) = greenkey.as_ref() {
+                self.enter_portal_frame(jd_no, *unique_id);
             }
             // pyjitpl.py:2442: self.current_call_id += 1
             self.current_call_id += 1;
@@ -16289,16 +16289,12 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2443-2445: `if greenkey is not None and
         // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
         //     (jitcode.jitdriver_sd, greenkey, self.history.get_trace_position()))`.
-        if let (Some(gk), Some(jd_no)) = (greenkey, jitcode.jitdriver_sd())
+        if let (Some(gk), Some(jd_no)) = (greenkey.as_ref(), jitcode.jitdriver_sd())
             && self.is_main_jitcode(&jitcode)
             && let (Some(positions), Some(ctx)) =
                 (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
         {
-            // This entry point is reached with a bare `u64` greenkey — it
-            // predates the raw `(code_ptr, pc)` key and operates on
-            // sub-jitcodes — so the typed half is unavailable here. A caller
-            // that holds the greens should use `push_portal_trace_position`.
-            positions.push((jd_no, Some((gk, None)), ctx.get_trace_position()));
+            positions.push((jd_no, Some(gk.clone()), ctx.get_trace_position()));
         }
         // Bump the existing TraceCtx inline-depth counter so trace
         // recorder bookkeeping (already wired through pyre's tracer)
@@ -16308,7 +16304,7 @@ impl<M: Clone> MetaInterp<M> {
         // project the u64 greenkey into the raw slot verbatim —
         // pyjitpl.py:1396-1401 element-wise parity still holds because
         // this caller doesn't feed the recursion-depth walk.
-        let raw = (greenkey.unwrap_or_default() as usize, 0);
+        let raw = (greenkey.as_ref().map_or(0, |(key, _)| *key) as usize, 0);
         let _ = self.enter_inline_frame(raw);
         // pyjitpl.py: reuse / allocate MIFrame, push onto framestack.
         let frame = crate::pyjitpl::MIFrame::setup(jitcode, 0, greenkey, self.tracing.as_mut());
@@ -16374,7 +16370,8 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2470-2472: `if frame.greenkey is not None and
             // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
             //     (jitcode.jitdriver_sd, None, self.history.get_trace_position()))`.
-            if let (Some(_gk), Some(jd_no)) = (frame.greenkey, frame.jitcode.jitdriver_sd())
+            if let (Some(_gk), Some(jd_no)) =
+                (frame.greenkey.as_ref(), frame.jitcode.jitdriver_sd())
                 && self.is_main_jitcode(&frame.jitcode)
                 && let (Some(positions), Some(ctx)) =
                     (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
@@ -20431,6 +20428,7 @@ mod metainterp_static_data_tests {
             is_recursive: false,
             mainjitcode: None,
             portal_runner_adr: 0,
+            portal_ptr_adr: 0,
             virtualizable_info: None,
             greenfield_info: None,
             index_of_virtualizable: -1,
@@ -22653,7 +22651,7 @@ mod metainterp_static_data_tests {
         jc.replace_jitdriver_sd(Some(5));
         let jc = std::sync::Arc::new(jc);
 
-        meta.newframe(jc, Some(0xfeed));
+        meta.newframe(jc, Some((0xfeed, None)));
         meta.popframe(true);
 
         let ctx = meta.trace_ctx().expect("tracing must be active");
@@ -22714,7 +22712,10 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some(0xcafe)).unwrap_err();
+        let typed = majit_ir::GreenKey::new(vec![0xcafe, 0xbeef]);
+        let hash = typed.get_uhash();
+        meta.perform_call(jc, &[], Some((hash, Some(typed.clone()))))
+            .unwrap_err();
         assert_eq!(
             meta.portal_trace_positions
                 .as_ref()
@@ -22724,7 +22725,7 @@ mod metainterp_static_data_tests {
         );
         let entry = &meta.portal_trace_positions.as_ref().unwrap()[0];
         assert_eq!(entry.0, idx);
-        assert_eq!(entry.1, Some((0xcafe, None)));
+        assert_eq!(entry.1, Some((hash, Some(typed))));
 
         meta.popframe(true);
         let positions = meta
@@ -22765,7 +22766,8 @@ mod metainterp_static_data_tests {
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
-        meta.perform_call(jc, &[], Some(0xbabe)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xbabe, None)))
+            .unwrap_err();
         assert!(
             meta.portal_trace_positions
                 .as_ref()
@@ -22860,11 +22862,12 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
         record_ops(&mut meta, 1);
         meta.popframe(true);
 
@@ -22883,11 +22886,12 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+            .unwrap_err();
         record_ops(&mut meta, 1);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
         record_ops(&mut meta, 5);
 
         assert_eq!(meta.find_biggest_function(), Some((0, (0xb22, None))));
@@ -22902,11 +22906,12 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
 
-        meta.perform_call(jc.clone(), &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc.clone(), &[], Some((0xa11, None)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
 
-        meta.perform_call(jc, &[], Some(0xb22)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xb22, None))).unwrap_err();
         record_ops(&mut meta, 1);
         // Left open, and the recorder retired under it.
         meta.tracing = None;
@@ -22951,7 +22956,8 @@ mod metainterp_static_data_tests {
         let (mut meta, jc) = meta_with_recursive_portal();
         start_tracing(&mut meta);
         // One inlined callee, sized by the ops recorded between its entries.
-        meta.perform_call(jc, &[], Some(CALLEE)).unwrap_err();
+        meta.perform_call(jc, &[], Some((CALLEE, None)))
+            .unwrap_err();
         record_ops(&mut meta, 5);
         meta.popframe(true);
         meta.tracing
@@ -23011,7 +23017,7 @@ mod metainterp_static_data_tests {
             Some(0),
             "the next trace starts from an empty log, not from None"
         );
-        meta.perform_call(jc, &[], Some(0xa11)).unwrap_err();
+        meta.perform_call(jc, &[], Some((0xa11, None))).unwrap_err();
         assert_eq!(
             meta.portal_trace_positions.as_ref().expect("Some").len(),
             1,

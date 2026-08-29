@@ -75,8 +75,9 @@ fn pop_n<H: SharedOpcodeHandler + ?Sized>(
 
 pub fn opcode_make_function<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> OpcodeResult<()> {
     let code_obj = handler.pop_value()?;
+    let anchor = handler.anchor();
     let func = handler.make_function(code_obj)?;
-    handler.push_value(func)
+    H::push_anchored(&anchor, func)
 }
 
 pub fn opcode_call<H: SharedOpcodeHandler + ?Sized>(
@@ -91,23 +92,26 @@ pub fn opcode_call<H: SharedOpcodeHandler + ?Sized>(
         0 => {
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
+            let anchor = handler.anchor();
             let result = handler.call_callable(callable, &[])?;
-            handler.push_value(result)
+            H::push_anchored(&anchor, result)
         }
         1 => {
             let a0 = handler.pop_value()?;
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
+            let anchor = handler.anchor();
             let result = handler.call_callable(callable, &[a0])?;
-            handler.push_value(result)
+            H::push_anchored(&anchor, result)
         }
         2 => {
             let a1 = handler.pop_value()?;
             let a0 = handler.pop_value()?;
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
+            let anchor = handler.anchor();
             let result = handler.call_callable(callable, &[a0, a1])?;
-            handler.push_value(result)
+            H::push_anchored(&anchor, result)
         }
         3 => {
             let a2 = handler.pop_value()?;
@@ -115,15 +119,17 @@ pub fn opcode_call<H: SharedOpcodeHandler + ?Sized>(
             let a0 = handler.pop_value()?;
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
+            let anchor = handler.anchor();
             let result = handler.call_callable(callable, &[a0, a1, a2])?;
-            handler.push_value(result)
+            H::push_anchored(&anchor, result)
         }
         _ => {
             let args = pop_n(handler, nargs)?;
             let _null_or_self = handler.pop_value()?;
             let callable = handler.pop_value()?;
+            let anchor = handler.anchor();
             let result = handler.call_callable(callable, &args)?;
-            handler.push_value(result)
+            H::push_anchored(&anchor, result)
         }
     }
 }
@@ -133,8 +139,9 @@ pub fn opcode_build_list<H: SharedOpcodeHandler + ?Sized>(
     size: usize,
 ) -> OpcodeResult<()> {
     let items = pop_n(handler, size)?;
+    let anchor = handler.anchor();
     let list = handler.build_list(&items)?;
-    handler.push_value(list)
+    H::push_anchored(&anchor, list)
 }
 
 pub fn opcode_build_tuple<H: SharedOpcodeHandler + ?Sized>(
@@ -142,8 +149,9 @@ pub fn opcode_build_tuple<H: SharedOpcodeHandler + ?Sized>(
     size: usize,
 ) -> OpcodeResult<()> {
     let items = pop_n(handler, size)?;
+    let anchor = handler.anchor();
     let tuple = handler.build_tuple(&items)?;
-    handler.push_value(tuple)
+    H::push_anchored(&anchor, tuple)
 }
 
 pub fn opcode_build_map<H: SharedOpcodeHandler + ?Sized>(
@@ -151,8 +159,9 @@ pub fn opcode_build_map<H: SharedOpcodeHandler + ?Sized>(
     size: usize,
 ) -> OpcodeResult<()> {
     let items = pop_n(handler, size * 2)?;
+    let anchor = handler.anchor();
     let dict = handler.build_map(&items)?;
-    handler.push_value(dict)
+    H::push_anchored(&anchor, dict)
 }
 
 pub fn opcode_store_subscr<H: SharedOpcodeHandler + ?Sized>(handler: &mut H) -> OpcodeResult<()> {
@@ -179,9 +188,10 @@ pub fn opcode_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
     count: usize,
 ) -> OpcodeResult<()> {
     let seq = handler.pop_value()?;
+    let anchor = handler.anchor();
     let items = handler.unpack_sequence(seq, count)?;
     for item in items.into_iter().rev() {
-        handler.push_value(item)?;
+        H::push_anchored(&anchor, item)?;
     }
     Ok(())
 }
@@ -191,8 +201,9 @@ pub fn opcode_load_attr<H: SharedOpcodeHandler + ?Sized>(
     name: &str,
 ) -> OpcodeResult<()> {
     let obj = handler.pop_value()?;
+    let anchor = handler.anchor();
     let attr = handler.load_attr(obj, name)?;
-    handler.push_value(attr)
+    H::push_anchored(&anchor, attr)
 }
 
 pub fn opcode_store_attr<H: SharedOpcodeHandler + ?Sized>(

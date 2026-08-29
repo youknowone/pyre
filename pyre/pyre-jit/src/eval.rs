@@ -202,11 +202,6 @@ fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
     majit_gc::gc_remove_root(slot as *mut majit_ir::GcRef);
 }
 
-struct FrameLocalsRoot {
-    slot: *mut *mut u8,
-    registered: bool,
-}
-
 /// A forwarding root for the red `frame` argument while native JIT glue is
 /// active.  `PyFrame.dispatch` keeps this identity as a GC reference; Rust
 /// callback parameters are raw addresses and must be reloaded after a moving
@@ -269,22 +264,6 @@ impl FrameRoot {
 impl Drop for FrameRoot {
     fn drop(&mut self) {
         self.release();
-    }
-}
-
-impl FrameLocalsRoot {
-    fn new(frame: &mut PyFrame) -> Self {
-        let slot = &mut frame.locals_cells_stack_w as *mut _ as *mut *mut u8;
-        let registered = unsafe { pyre_object::gc_hook::try_gc_add_root(slot) };
-        Self { slot, registered }
-    }
-}
-
-impl Drop for FrameLocalsRoot {
-    fn drop(&mut self) {
-        if self.registered {
-            pyre_object::gc_hook::try_gc_remove_root(self.slot);
-        }
     }
 }
 
@@ -5483,6 +5462,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.result_type = majit_ir::Type::Ref;
     jd.virtualizable_info = Some(info.clone());
     jd.portal_runner_adr = crate::call_jit::ll_portal_runner_shim as *const () as i64;
+    jd.portal_ptr_adr = crate::call_jit::portal_resume_shim as *const () as i64;
     d.meta_interp_mut().register_jitdriver_sd(jd);
     // baseobjspace.py `unpackiterable_driver = JitDriver(greens=['greenkey'],
     // reds='auto', ...)` — the second portal driver (jd1) for the
@@ -8915,7 +8895,18 @@ fn eval_with_jit_inner(
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
-    portal_activation_bracketed(&mut frame_root, resume)
+    portal_activation_bracketed(&mut frame_root, resume, PortalLeaveOwner::ExecutionContext)
+}
+
+#[derive(Clone, Copy)]
+enum PortalLeaveOwner {
+    /// The helper entered the execution-context chain and therefore owes the
+    /// complete `ExecutionContext.leave` finally.
+    ExecutionContext,
+    /// Compiled code recorded `ExecutionContext.enter` before calling the
+    /// portal and records the matching leave after it returns.  This helper
+    /// owns only the hook bracket that pyre's higher portal boundary skipped.
+    CompiledTrace,
 }
 
 /// `pyframe.py execute_frame`'s hook bracket around [`portal_runner_dispatch`],
@@ -8961,6 +8952,7 @@ fn eval_with_jit_inner(
 fn portal_activation_bracketed(
     frame_root: &mut FrameRoot,
     resume: Option<&mut pyre_interpreter::call::FrameResumeArgs>,
+    leave_owner: PortalLeaveOwner,
 ) -> PyResult {
     let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
     if ec.is_null() {
@@ -9017,32 +9009,25 @@ fn portal_activation_bracketed(
             }
         }
     };
-    // `setprofile`'s `return` is not `return_trace`'s — that one tests
-    // `gettrace() is not None`.  It comes from `executioncontext.py leave`,
-    // whose profile arm runs `_trace(frame, 'leaveframe', w_exitvalue)`, and
-    // this arm never reaches `leave`: the declining paths return through
-    // `execute_frame_plain`, which does, and the portal arms do not.
-    let leave_result =
-        unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) };
-    // `leave`'s frame-chain half, which the portal owed as much as the hook.  It
-    // is the `finally` of `leave`'s own `try`, so a profile hook that raised
-    // does not skip it, and it runs while `topframeref` still names this frame.
-    //
-    // The narrow form, not `leave`'s own: this closes a scope whose body ran as
-    // compiled code, so it is the same situation as a blackhole resume and is
-    // shared with it.  `leave_compiled_frame_chain` states why the identity
-    // guard and the absence of a force are load-bearing there.
-    //
-    // `got_exception` is `execute_frame`'s flag: false only when the body AND
-    // `return_trace` both completed, which is exactly `outer_result.is_ok()`.
-    // Without this a compiled frame that left escaped, or with an exception,
-    // returns to a caller that was never marked escaped — and `escaped()` is
-    // what the walker reads to decide whether that caller has to be
-    // materialised.
-    crate::call_jit::leave_portal_frame_chain(
-        frame_root.frame() as *mut PyFrame,
-        outer_result.is_err(),
-    );
+    // `setprofile`'s `return` comes from `ExecutionContext.leave`, not from
+    // `return_trace`.  A normal portal activation owns that complete finally:
+    // topframeref restore, caller escape propagation, force_vref and
+    // virtual_ref_finish included.  The compiled self-recursive fold is the
+    // one exception: its trace records enter/leave around CALL_ASSEMBLER, so
+    // this helper supplies the otherwise-skipped hook only and must not close
+    // the trace-owned chain a second time.
+    let leave_result = match leave_owner {
+        PortalLeaveOwner::ExecutionContext => unsafe {
+            (*ec).leave(
+                frame_root.frame() as *mut PyFrame,
+                w_exitvalue,
+                outer_result.is_err(),
+            )
+        },
+        PortalLeaveOwner::CompiledTrace => unsafe {
+            (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)
+        },
+    };
     let live = leave_result?;
     outer_result.map(|_| live)
 }
@@ -9380,9 +9365,25 @@ pub(crate) fn portal_activation_result(frame: &mut PyFrame) -> PyResult {
     /// resume payload: `execute_frame`'s `w_arg_or_err` is `None` and the
     /// bracket runs its body straight through.
     fn bracketed_without_resume(frame_root: &mut FrameRoot) -> PyResult {
-        portal_activation_bracketed(frame_root, None)
+        portal_activation_bracketed(frame_root, None, PortalLeaveOwner::ExecutionContext)
     }
     enter_portal(frame, bracketed_without_resume)
+}
+
+/// Activation whose execution-context vref bracket is emitted by compiled
+/// code around CALL_ASSEMBLER.
+///
+/// This is the `ll_portal_runner` door for the full-body walker's recursive
+/// call.  `record_ec_enter_frame_chain` has already published the frame vref;
+/// install only pyre's extra TLS root, then supply `execute_frame`'s hook
+/// bracket.  The compiled continuation records the matching chain restore and
+/// `virtual_ref_finish` after the call returns.
+pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
+    let _recursion_depth = pyre_interpreter::call::enter_recursive_frame(frame);
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().fix_array_ptrs();
+    let _frame_guard = pyre_interpreter::eval::install_current_frame_tls_only(frame_root.frame());
+    portal_activation_bracketed(&mut frame_root, None, PortalLeaveOwner::CompiledTrace)
 }
 
 /// warmspot.py ll_portal_runner:
@@ -10905,16 +10906,19 @@ fn execute_assembler(
     // one it was given either way.
     let _topframeref_guard = TopFrameRefGuard::new(ec_for_topframeref);
     // warmstate.py:395 func_execute_token(loop_token, *args) → deadframe
-    let outcome = {
-        let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
-        driver.run_compiled_detailed_with_bridge_keyed(
-            green_key,
-            entry_pc,
-            &mut jit_state,
-            env,
-            || {},
-        )
-    };
+    // `frame_root` is the translated live `frame` root.  Do not additionally
+    // register `&mut frame.locals_cells_stack_w`: that is an interior address
+    // of a movable nursery PyFrame, so after a collection the root registry
+    // itself points into the evacuated (and debug-poisoned) frame.  PyPy roots
+    // the frame object and lets its type tracer follow the locals-array field;
+    // `FrameRoot` plus `pyframe_object_custom_trace` is that same ownership.
+    let outcome = driver.run_compiled_detailed_with_bridge_keyed(
+        green_key,
+        entry_pc,
+        &mut jit_state,
+        env,
+        || {},
+    );
 
     // Bridges that reached their inline-trip threshold during this run asked
     // for their merge from inside compiled code, where the driver is already
@@ -11196,7 +11200,6 @@ fn compile_and_run_once(
             driver.bound_reached(green_key, target_pc, &mut jit_state, env);
         }
         CompileOnceStart::FunctionEntry => {
-            let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
             driver.force_start_tracing(green_key, target_pc, &mut jit_state, env);
         }
     }
@@ -11427,7 +11430,6 @@ fn bound_reached(
     // `EnterJitAssembler(procedure_token, ...)` does with it upstream; the run
     // resolves the key itself, so it is only the pin.
     let outcome = if procedure_token.is_some() {
-        let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
         Some(driver.run_compiled_detailed_with_bridge_keyed(
             green_key,
             loop_header_pc,
@@ -11726,16 +11728,13 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // callees and exits through the same guards.
         let _topframeref_guard =
             TopFrameRefGuard::new(jit_state.execution_context as *mut PyExecutionContext);
-        let outcome = {
-            let _frame_locals_root = FrameLocalsRoot::new(frame_root.frame());
-            driver.run_compiled_detailed_with_bridge_keyed(
-                green_key,
-                frame_root.frame().next_instr(),
-                &mut jit_state,
-                &env,
-                || {},
-            )
-        };
+        let outcome = driver.run_compiled_detailed_with_bridge_keyed(
+            green_key,
+            frame_root.frame().next_instr(),
+            &mut jit_state,
+            &env,
+            || {},
+        );
         // rstack.stack_check_slowpath → _StackOverflow parity: drain
         // the JIT-overflow flag the backend probe records when it
         // trips during compiled execution at function entry.

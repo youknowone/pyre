@@ -2176,6 +2176,11 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         // emits the outer `FINISH(exc)` (or an outer inline frame's
         // handler catches it).
         walker_record_guard_exception(ctx, op.pc);
+        // `ExecutionContext.leave` closes the vref after the exception guard.
+        // Keeping the pair open while that guard's resume data is captured is
+        // essential: if the runtime exception class differs, blackhole resume
+        // still owes `virtual_ref_finish` for this activation.
+        record_ec_finish_frame_vref(ctx.trace_ctx, callee_frame);
         let exc = ctx
             .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
@@ -2188,6 +2193,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // GUARD_NO_EXCEPTION on the non-raising recording path.
     ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
     walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+    // Same ordering as `ExecutionContext.leave` in the ordinary-return trace:
+    // a failing exception guard resumes with the vref scope still live;
+    // successful compiled execution closes it here.
+    record_ec_finish_frame_vref(ctx.trace_ctx, callee_frame);
 
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
@@ -2198,7 +2207,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
 ///
 /// The portal driver is the one with greens; `ensure_default_driver_sd`'s
 /// placeholder has none and carries no runner address.
-fn portal_runner_call_target() -> Option<(i64, majit_ir::DescrRef)> {
+fn portal_runner_call_target() -> Option<(i64, i64, majit_ir::DescrRef)> {
     let (driver, _) = crate::driver::try_driver_pair()?;
     let jd = driver
         .meta_interp()
@@ -2206,10 +2215,14 @@ fn portal_runner_call_target() -> Option<(i64, majit_ir::DescrRef)> {
         .jitdrivers_sd
         .iter()
         .find(|jd| jd.num_greens() > 0)?;
-    if jd.portal_runner_adr == 0 {
+    if jd.portal_runner_adr == 0 || jd.portal_ptr_adr == 0 {
         return None;
     }
-    Some((jd.portal_runner_adr, jd.portal_calldescr.clone()?))
+    Some((
+        jd.portal_runner_adr,
+        jd.portal_ptr_adr,
+        jd.portal_calldescr.clone()?,
+    ))
 }
 
 /// Walker mirror of `opimpl_recursive_call_assembler`
@@ -2248,7 +2261,8 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // `do_recursive_call`'s funcbox and ABI, resolved before the first
     // recorded op so an unwired driver declines the inline instead of
     // leaving a half-emitted CALL behind.
-    let Some((portal_runner_adr, portal_descr)) = portal_runner_call_target() else {
+    let Some((_portal_runner_adr, portal_ptr_adr, portal_descr)) = portal_runner_call_target()
+    else {
         return resolved_inline_decline(op.pc, line!());
     };
     let Some(portal_view) = portal_descr.as_call_descr() else {
@@ -2368,7 +2382,10 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     // stopped AT the merge point, before the opcode that would have spilled
     // `last_instr` for it.
     unsafe { (*concrete_callee_frame).last_instr = target_pc as isize - 1 };
-    let funcbox = ctx.trace_ctx.const_int(portal_runner_adr);
+    // Concrete tracing resumes the sub-walk's already-started activation via
+    // `portal_ptr`.  The runtime CALL_ASSEMBLER still targets the compiled
+    // loop or its `ll_portal_runner` temporary callback.
+    let funcbox = ctx.trace_ctx.const_int(portal_ptr_adr);
     let next_instr_box = ctx.trace_ctx.const_int(target_pc as i64);
     let profiled_box = ctx.trace_ctx.const_int(is_being_profiled as i64);
     let pycode_box = ctx.trace_ctx.const_ref(w_code as i64);
@@ -3417,32 +3434,12 @@ pub(crate) fn walker_ec_leave(
 /// ```
 ///
 /// [`walker_ec_enter`] is the seeded-callee form: it has a live callee frame
-/// at recording time, so it mirrors every store concretely and takes a real
-/// vref of the frame.  The CALL_ASSEMBLER folds build their callee frame out
-/// of recorded operations alone — `emit_new_pyframe_inline_with_params` never
-/// materializes one during the walk — so there is nothing to store into and
-/// nothing to take a vref of until the compiled loop runs.  What is recorded
-/// here is the interpreter-level reading of `jit.virtual_ref(frame)`, which
-/// is the frame pointer itself (`_jit_vref.py lowleveltype = OBJECTPTR`, no
-/// allocation) and is exactly what [`pyre_interpreter::PyExecutionContext::enter`]
-/// stores.
-///
-/// ⛔ Recording a `VIRTUAL_REF` here instead — the spelling
-/// [`walker_ec_enter`] uses — is not available to this fold, and the
-/// difference is the callee's exit, not the enter.  `optimize_VIRTUAL_REF`
-/// seeds the materialized `JitVirtualRef` with `forced = NULL`
-/// (`virtualize.py:129`), and pyre's two portal doors resolve `topframeref`
-/// through `executioncontext::vref_referent`, which reads `forced` WITHOUT
-/// forcing.  An unforced vref therefore answers NULL at both:
-/// `install_current_frame` (`pyre-interpreter/src/eval.rs`) reads that as
-/// "not yet entered" and re-links the callee onto its own vref, and
-/// `leave_compiled_frame_chain` (`pyre-jit/src/call_jit.rs`) reads it as
-/// "not my frame" and silently declines the restore.  [`walker_ec_enter`]'s
-/// callee is inlined and reaches neither door; this fold's callee reaches
-/// both — `compile_tmp_callback` routes its CALL_ASSEMBLER through
-/// `ll_portal_runner_shim`, and the force/deopt legs call
-/// `jit_force_callee_frame`.  Publishing a vref here needs a signal those
-/// doors can decide without forcing, which does not exist yet.
+/// at recording time and can also build the tracing-time concrete vref.  This
+/// fold constructs its callee only in trace IR, so it uses the symbolic form:
+/// the same runtime VIRTUAL_REF and the same metainterp pair stack, without
+/// inventing a recording-time pointer.  The portal entry is told explicitly
+/// that this trace owns the chain; it no longer guesses by forcing or reading
+/// TLS, so an unforced runtime vref is valid here.
 ///
 /// Upstream reaches `ec.enter` on this path too: `interp_jit.py` puts
 /// `jit_merge_point` on `PyFrame.dispatch`, so the CALL_ASSEMBLER that
@@ -3461,9 +3458,10 @@ fn record_ec_enter_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_e
         &[callee_frame, caller_topframeref],
         crate::descr::pyframe_f_backref_descr(),
     );
+    let frame_vref = ctx.opimpl_virtual_ref_symbolic(callee_frame);
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
-        &[callee_ec, callee_frame],
+        &[callee_ec, frame_vref],
         crate::descr::ec_topframeref_descr(),
     );
 }
@@ -3476,11 +3474,10 @@ fn record_ec_enter_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_e
 /// ```
 ///
 /// No parens on `f_backref`, so a caller frame that stayed virtual stays
-/// virtual.  The escape branch and `virtual_ref_finish` that [`walker_ec_leave`]
-/// carries have no counterpart here for the same reason the enter takes no
-/// vref: this level never held one.  The profile-hook half stays with
-/// [`pyre_interpreter::PyExecutionContext::leave`] — see [`walker_ec_leave`]
-/// for why the portal-driver GREEN makes that split sound.
+/// virtual.  The matching `virtual_ref_finish` is deliberately separate in
+/// [`record_ec_finish_frame_vref`]: the exception guard must capture resume
+/// data while the vref scope is still open, just as it does while tracing
+/// `ExecutionContext.leave` upstream.
 ///
 /// Record this at the earliest point the call is known to have returned, not
 /// on the trace's fall-through tail: a guard recorded ahead of it skips it on
@@ -3501,34 +3498,35 @@ fn record_ec_leave_frame_chain(ctx: &mut TraceCtx, callee_frame: OpRef, callee_e
     );
 }
 
+/// Record the final `jit.virtual_ref_finish(frame_vref, frame)` of
+/// `ExecutionContext.leave` after the call's exception guard has captured its
+/// resume data.
+fn record_ec_finish_frame_vref(ctx: &mut TraceCtx, callee_frame: OpRef) {
+    assert!(
+        ctx.opimpl_virtual_ref_finish(callee_frame),
+        "self-recursive portal leave must close its frame vref",
+    );
+}
+
 #[cfg(test)]
 mod portal_frame_chain_tests {
     use super::*;
 
-    /// The fold's recorded `enter` publishes the callee frame itself, and its
-    /// recorded `leave` restores `f_backref` — neither takes a vref.
-    ///
-    /// The op shape is the contract, because the two portal doors this fold's
-    /// callee reaches (`install_current_frame` and `leave_compiled_frame_chain`)
-    /// resolve `topframeref` through `vref_referent`, which reads
-    /// `JitVirtualRef.forced` without forcing.  `optimize_VIRTUAL_REF` seeds
-    /// that field with `CONST_NULL` (`virtualize.py:129`), so a `VIRTUAL_REF`
-    /// recorded here would answer NULL at both doors: the first re-links the
-    /// callee onto its own vref, the second declines the restore.  See
-    /// [`record_ec_enter_frame_chain`] for the full argument.
+    /// The self-recursive fold records the same virtual-ref bracket as
+    /// `ExecutionContext.enter` / `ExecutionContext.leave`.
     #[test]
-    fn the_recorded_enter_and_leave_take_no_virtual_ref() {
+    fn the_recorded_enter_and_leave_balance_one_virtual_ref() {
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
         let frame = OpRef::input_arg_ref(0);
         let ec = OpRef::input_arg_ref(1);
 
         record_ec_enter_frame_chain(&mut ctx, frame, ec);
         record_ec_leave_frame_chain(&mut ctx, frame, ec);
+        record_ec_finish_frame_vref(&mut ctx, frame);
         assert_eq!(
             ctx.virtualref_boxes_len(),
             0,
-            "this level holds no vref, so it owes no virtual_ref_finish and \
-             must not leave `virtualref_boxes` unbalanced at the loop header",
+            "the enter/leave pair must leave no virtualref open at the loop header",
         );
 
         let tree_loop = ctx.into_tree_loop();
@@ -3539,12 +3537,12 @@ mod portal_frame_chain_tests {
                 // `frame.f_backref = self.topframeref`
                 OpCode::GetfieldGcR,
                 OpCode::SetfieldGc,
-                // `self.topframeref = jit.virtual_ref(frame)`, whose
-                // interpreter-level reading is the frame pointer itself
+                OpCode::VirtualRefR,
                 OpCode::SetfieldGc,
                 // `self.topframeref = frame.f_backref`
                 OpCode::GetfieldGcR,
                 OpCode::SetfieldGc,
+                OpCode::VirtualRefFinish,
             ],
         );
     }

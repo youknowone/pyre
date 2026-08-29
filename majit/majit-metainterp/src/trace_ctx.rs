@@ -1482,6 +1482,26 @@ impl TraceCtx {
         (vref, vref_ptr)
     }
 
+    /// Record `jit.virtual_ref(obj)` when the full-body walker has the
+    /// object's box but no recording-time heap object.
+    ///
+    /// RPython's `MetaInterp.opimpl_virtual_ref` always has a concrete box
+    /// because it is tracing the interpreter.  Pyre's self-recursive
+    /// CALL_ASSEMBLER fold constructs the callee exclusively in trace IR, so
+    /// there is no honest pointer with which to call
+    /// `virtual_ref_during_tracing`.  The runtime operation and the
+    /// `[virtualbox, vrefbox]` stack entry are nevertheless both owed; a zero
+    /// concrete stamp means only that the tracing-time before/after-residual
+    /// probes must skip this pair.  The force guard carries the runtime force
+    /// protocol, and the matching finish below closes the symbolic scope.
+    pub fn opimpl_virtual_ref_symbolic(&mut self, virtual_obj: OpRef) -> OpRef {
+        let cindex = self.const_int((self.virtualref_boxes.len() / 2) as i64);
+        let vref = self.virtual_ref(virtual_obj, cindex);
+        self.virtualref_boxes.push((virtual_obj, 0));
+        self.virtualref_boxes.push((vref, 0));
+        vref
+    }
+
     /// `pyjitpl.py opimpl_virtual_ref_finish(box)` —
     /// `ExecutionContext.leave`'s `jit.virtual_ref_finish`
     /// (`executioncontext.py:107`).  The vrefbox is reconstituted by popping,
@@ -1537,12 +1557,18 @@ impl TraceCtx {
         // pyjitpl.py:1826-1832 `if vrefinfo.is_virtual_ref(vref): record
         // VIRTUAL_REF_FINISH`.  False once `stop_tracking_virtualref` has
         // replaced the box with ConstPtr(NULL) — the finish already ran.
-        let is_vref = vref_ptr != 0
-            && unsafe {
+        let is_vref = if vref_ptr == 0 {
+            // A non-constant box with no concrete stamp is the symbolic form
+            // opened by `opimpl_virtual_ref_symbolic`.  A stopped pair has
+            // already replaced this entry with CONST_NULL.
+            vrefbox.as_const_ptr().is_none_or(|ptr| ptr.0 != 0)
+        } else {
+            unsafe {
                 self.metainterp_sd
                     .virtualref_info
                     .is_virtual_ref(vref_ptr as *const u8)
-            };
+            }
+        };
         if is_vref {
             // pyjitpl.py:1831-1832 `VIRTUAL_REF_FINISH(vrefbox, nullbox)`.
             let null = self.const_ref(0);
@@ -1577,6 +1603,10 @@ impl TraceCtx {
         let mut i = 1;
         while i < self.virtualref_boxes.len() {
             let vref_ptr = self.virtualref_boxes[i].1;
+            if vref_ptr == 0 {
+                i += 2;
+                continue;
+            }
             // SAFETY: `vref_ptr` was registered by `opimpl_virtual_ref`
             // with a valid `JitVirtualRef*`; `tracing_before_residual_call`
             // only writes the token field.
@@ -1605,6 +1635,10 @@ impl TraceCtx {
         let mut i = 0;
         while i + 1 < self.virtualref_boxes.len() {
             let vref_ptr = self.virtualref_boxes[i + 1].1;
+            if vref_ptr == 0 {
+                i += 2;
+                continue;
+            }
             // SAFETY: `vref_ptr` was registered by `opimpl_virtual_ref`
             // with a valid `JitVirtualRef*`; `tracing_after_residual_call`
             // only reads the token field.

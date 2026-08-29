@@ -1072,7 +1072,16 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 
     // `assembler_call_helper` (warmspot.py) resumes the callee
     // frame the rewritten CALL_ASSEMBLER passed as arg 0.
-    run_frame_through_portal(frame_ptr)
+    run_frame_through_portal(frame_ptr, PortalEntry::Resume)
+}
+
+#[derive(Clone, Copy)]
+enum PortalEntry {
+    /// `ll_portal_runner`: compiled code owns the EC vref bracket and this
+    /// door supplies the activation's hook/recursion bracket.
+    TracedActivation,
+    /// `portal_ptr`: continue the body of an activation already in progress.
+    Resume,
 }
 
 /// warmspot.py `ll_portal_runner` core — run the frame the JIT handed
@@ -1091,7 +1100,7 @@ pub extern "C" fn jit_force_callee_frame(frame_ptr: i64) -> i64 {
 /// Rebuilding a frame here instead would drop the callee's arguments (its
 /// locals array) and its `last_instr`, and would run the interpreter on a
 /// frame that dies with the C stack.
-fn run_frame_through_portal(frame_ptr: i64) -> i64 {
+fn run_frame_through_portal(frame_ptr: i64, entry: PortalEntry) -> i64 {
     // `jit_drop_callee_frame` tolerates a tagged word on the same slot because
     // it only unroots; there is nothing sensible to run here for one. The
     // portal's result is a Ref whose NULL spelling means "exception stored",
@@ -1102,29 +1111,14 @@ fn run_frame_through_portal(frame_ptr: i64) -> i64 {
         "CALL_ASSEMBLER arg 0 must be the callee PyFrame"
     );
     let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-    // `ll_portal_runner` is an activation entry: it charges recursion,
-    // installs the frame, and consults function-entry warmstate, and that last
-    // step can run the very compiled function whose call arrived here.  When
-    // the frame handed over is the one this thread is already running, that is
-    // a second activation of one frame, and the compiled body reaching this
-    // call again opens a third: the nesting grows until the stack check
-    // raises, leaving the frame's `next_instr` past operands no activation
-    // pushed.  `warmspot.py handle_jitexception` draws the same distinction
-    // when it calls `portal_ptr` instead of `ll_portal_runner`; resume the
-    // body of the activation that already exists.
-    //
-    // `CURRENT_FRAME` is the test, not the `topframeref` chain: the trace
-    // records `ExecutionContext.enter` for the callee frame it builds, so a
-    // legitimately fresh callee IS the chain's top by the time it gets here,
-    // while only an interpreter or portal activation installs `CURRENT_FRAME`.
-    let already_running = std::ptr::eq(
-        pyre_interpreter::eval::current_frame(),
-        frame as *mut PyFrame,
-    );
-    let outcome = if already_running {
-        crate::eval::portal_body_result(frame)
-    } else {
-        crate::eval::portal_activation_result(frame)
+    // `warmspot.py` has two distinct functions: `ll_portal_runner` begins the
+    // portal call and `portal_ptr` resumes its body from CRN/force handoff.
+    // Keep that decision at the caller that knows which function it is
+    // invoking; CURRENT_FRAME is an extra pyre TLS root, not activation
+    // identity, and is neither complete nor stable enough to choose the door.
+    let outcome = match entry {
+        PortalEntry::TracedActivation => crate::eval::portal_traced_activation_result(frame),
+        PortalEntry::Resume => crate::eval::portal_body_result(frame),
     };
     let result = match outcome {
         Ok(r) => r,
@@ -1168,7 +1162,24 @@ pub extern "C" fn ll_portal_runner_shim(
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
         frame.set_last_instr_from_next_instr(next_instr as usize);
     }
-    run_frame_through_portal(frame_ptr)
+    run_frame_through_portal(frame_ptr, PortalEntry::TracedActivation)
+}
+
+/// `portal_ptr` ABI for concrete continuation of an activation whose prologue
+/// and hook bracket have already run.
+#[majit_macros::jit_may_force]
+pub extern "C" fn portal_resume_shim(
+    next_instr: i64,
+    _is_being_profiled: i64,
+    _pycode: i64,
+    frame_ptr: i64,
+    _ec: i64,
+) -> i64 {
+    if frame_ptr != 0 {
+        let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
+        frame.set_last_instr_from_next_instr(next_instr as usize);
+    }
+    run_frame_through_portal(frame_ptr, PortalEntry::Resume)
 }
 
 /// warmspot.py — assembler_call_helper.
@@ -2496,13 +2507,11 @@ fn leave_resumed_blackhole_frame(
 }
 
 /// `executioncontext.py ExecutionContext.leave`'s frame-chain half for a frame
-/// whose body ran as compiled code, shared by the blackhole resume above and by
-/// the JIT portal's own activation bracket
-/// (`eval::portal_activation_bracketed`).
+/// resumed by the blackhole interpreter after compiled code has gone away.
 ///
-/// Both close a scope whose `enter` ran somewhere the interpreter's `leave`
-/// never reaches, and both run once the compiled frame is gone — which is what
-/// makes this a narrower operation than `leave`'s own escape branch:
+/// It closes a scope whose `enter` ran somewhere the interpreter's `leave`
+/// never reaches, once the compiled frame is gone.  That is what makes this a
+/// narrower recovery operation than `leave` itself:
 ///
 /// * The identity guard. `leave` reads `frame_vref` off `topframeref` and
 ///   forces it; that word only names this frame while its scope is the open
@@ -2540,10 +2549,6 @@ fn leave_resumed_blackhole_frame(
 /// measured on a residual callee whose frame escapes into a traceback and which
 /// returns NORMALLY under an inlined caller.
 ///
-/// The `topframeref` restore is idempotent for the portal, whose
-/// `CurrentFrameGuard` writes back the same word from a shadow-stack slot when
-/// it drops: `install_current_frame` seeds `f_backref` from the `topframeref`
-/// it displaces, so the two agree by construction.
 fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
@@ -2576,15 +2581,6 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
             }
         }
     }
-}
-
-/// [`leave_compiled_frame_chain`] for the JIT portal, whose frame is a `&mut`
-/// borrow rather than a blackhole's virtualizable word.
-pub(crate) fn leave_portal_frame_chain(frame: *mut PyFrame, got_exception: bool) {
-    if frame.is_null() {
-        return;
-    }
-    leave_compiled_frame_chain(frame, got_exception);
 }
 
 /// resume.py blackhole_from_resumedata parity:
