@@ -6,7 +6,51 @@ use pyre_object::PyObjectRef;
 use super::cdataobj::{self, W_CData};
 use super::ctypeobj::{self, W_CType};
 
-const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<libffi::low::ffi_arg>();
+/// The libffi surface a callback needs, which is a dependency only where the
+/// crate declares it; `ctypefunc.rs` splits its `cif` module the same way.
+#[cfg(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ),
+    not(any(target_env = "musl", target_env = "sgx"))
+))]
+mod ffi {
+    /// The width libffi widens a return value narrower than a word to.
+    pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<libffi::low::ffi_arg>();
+
+    /// # Safety
+    /// `ptr` is null or a closure `ffi_closure_alloc` returned and nothing
+    /// else holds it.
+    pub unsafe fn closure_free(ptr: *mut libc::c_void) {
+        if !ptr.is_null() {
+            unsafe { libffi::raw::ffi_closure_free(ptr) };
+        }
+    }
+}
+
+#[cfg(not(all(
+    any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows",
+        target_os = "android"
+    ),
+    not(any(target_env = "musl", target_env = "sgx"))
+)))]
+mod ffi {
+    /// `ffi_arg` is a machine word on every target libffi defines it for, and
+    /// the result encoder below is shared with those targets.
+    pub const SIZE_OF_FFI_ARG: usize = std::mem::size_of::<usize>();
+
+    /// # Safety
+    /// No closure can be allocated here, so `ptr` is always null.
+    pub unsafe fn closure_free(_ptr: *mut libc::c_void) {}
+}
+
+use ffi::SIZE_OF_FFI_ARG;
 
 /// Raw state owned by one callback.  Keeping it out of [`W_CData`] leaves the
 /// common cdata layout unchanged; the callback flavor stores this block's
@@ -28,9 +72,7 @@ pub(crate) unsafe fn free_callback_side_block(raw: i64, code: *mut u8) {
     }
     let side = unsafe { Box::from_raw(raw as usize as *mut CallbackSideBlock) };
     debug_assert_eq!(side.raw_code.cast::<u8>(), code);
-    if !side.raw_closure.is_null() {
-        unsafe { libffi::raw::ffi_closure_free(side.raw_closure) };
-    }
+    unsafe { ffi::closure_free(side.raw_closure) };
 }
 
 fn callback_arg(w_callback: PyObjectRef) -> Result<&'static mut W_CData, PyError> {
@@ -47,9 +89,7 @@ struct UnpublishedClosure(*mut libc::c_void);
 
 impl Drop for UnpublishedClosure {
     fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { libffi::raw::ffi_closure_free(self.0) };
-        }
+        unsafe { ffi::closure_free(self.0) };
     }
 }
 
