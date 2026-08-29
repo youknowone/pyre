@@ -198,6 +198,7 @@ pub struct MethodInfo {
 fn build_semantic_program_via_active_frontend(
     module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     explicit_llbc_paths: Option<&[&str]>,
     prof: &mut PhaseProfiler,
 ) -> front::SemanticProgram {
@@ -245,10 +246,11 @@ fn build_semantic_program_via_active_frontend(
                 llbcs.iter().map(|l| l.crate_name().to_string()),
             );
             let mut program =
-                front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+                front::mir::build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
                     &llbcs,
                     static_addrs,
                     module_paths,
+                    jitdriver_receiver_roots,
                 )
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
             prof.mark("    build_semantic_program_from_llbcs");
@@ -959,6 +961,7 @@ fn analyze_pipeline_from_module_paths(
     let mut program = build_semantic_program_via_active_frontend(
         module_paths,
         static_addrs,
+        &config.pipeline.transform.jitdriver_receiver_roots,
         explicit_llbc_paths,
         &mut prof,
     );

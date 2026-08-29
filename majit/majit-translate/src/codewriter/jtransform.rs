@@ -175,7 +175,7 @@ pub struct GraphTransformConfig {
 
 /// The [`GraphTransformConfig::jitdriver_receiver_roots`] default: pyre's own
 /// two drivers.
-fn default_jitdriver_receiver_roots() -> Vec<String> {
+pub(crate) fn default_jitdriver_receiver_roots() -> Vec<String> {
     RECOGNIZED_JITDRIVER_RECEIVER_ROOTS
         .iter()
         .map(|s| (*s).to_string())

@@ -100,6 +100,16 @@ use crate::model::{
     LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
+/// Opaque non-null value for a prebuilt JIT-driver `NamedConst`.
+///
+/// The driver instance is only the receiver constant of its marker methods;
+/// rtyping erases that receiver to `Void`, and `jtransform` discards operand
+/// zero while rewriting the marker.  It therefore has no runtime address to
+/// preserve, but the front-end graph still needs one constant-producing
+/// operation until that rewrite.  Non-null keeps it distinct from the null
+/// reference representation on every backend.
+const JITDRIVER_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
 ///
@@ -141,7 +151,15 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs(
     llbcs: &[Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
-    build_semantic_program_from_llbcs_with_static_addrs_filtered(llbcs, static_addrs, None, None)
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    build_semantic_program_from_llbcs_with_static_addrs_filtered(
+        llbcs,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        None,
+        None,
+    )
 }
 
 pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
@@ -149,10 +167,27 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
     static_addrs: crate::HostStaticAddrs<'_>,
     module_paths: &[&str],
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
+        llbcs,
+        static_addrs,
+        module_paths,
+        &jitdriver_receiver_roots,
+    )
+}
+
+pub(crate) fn build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
+    llbcs: &[Llbc],
+    static_addrs: crate::HostStaticAddrs<'_>,
+    module_paths: &[&str],
+    jitdriver_receiver_roots: &[String],
+) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let module_filter = normalize_module_filter(module_paths);
     build_semantic_program_from_llbcs_with_static_addrs_filtered(
         llbcs,
         static_addrs,
+        jitdriver_receiver_roots,
         module_filter.as_ref(),
         None,
     )
@@ -180,9 +215,12 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
     let module_filter = normalize_module_filter(module_paths);
     let function_filter = normalize_function_filter(function_names);
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
     build_semantic_program_from_llbcs_with_static_addrs_filtered(
         llbcs,
         static_addrs,
+        &jitdriver_receiver_roots,
         module_filter.as_ref(),
         function_filter.as_ref(),
     )
@@ -191,6 +229,7 @@ pub fn build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
 fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
     llbcs: &[Llbc],
     static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -223,6 +262,7 @@ fn build_semantic_program_from_llbcs_with_static_addrs_filtered(
         let prog = build_semantic_program_from_llbc_with_static_addrs_filtered(
             llbc,
             static_addrs,
+            jitdriver_receiver_roots,
             module_filter,
             function_filter,
         )?;
@@ -721,7 +761,15 @@ pub fn build_semantic_program_from_llbc_with_static_addrs(
     // per-artefact builder below does not repeat it. A caller handing over a
     // single artefact has named its whole input here, so link it here.
     link_transparent_scalar_types(std::slice::from_ref(llbc));
-    build_semantic_program_from_llbc_with_static_addrs_filtered(llbc, static_addrs, None, None)
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    build_semantic_program_from_llbc_with_static_addrs_filtered(
+        llbc,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        None,
+        None,
+    )
 }
 
 /// One block's slot-indexed `Option<Variable>` row, stored by bound slot.
@@ -824,6 +872,7 @@ impl PackedFrameState {
 fn build_semantic_program_from_llbc_with_static_addrs_filtered(
     llbc: &Llbc,
     static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     module_filter: Option<&std::collections::HashSet<String>>,
     function_filter: Option<&std::collections::HashSet<String>>,
 ) -> Result<crate::front::semantic::SemanticProgram, LowerError> {
@@ -993,6 +1042,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             fd,
             &body,
             static_addrs,
+            jitdriver_receiver_roots,
             &struct_field_attrs,
             &dont_look_inside,
             builder_mode,
@@ -2197,7 +2247,15 @@ pub fn lower_fun_decl_with_static_addrs(
     // stand-alone entry (used by the reader / tests) derives it per call from
     // the same source of truth so the fusion fires identically.
     let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
-    lower_fun_decl_with_static_addrs_and_attrs(llbc, fd, static_addrs, &struct_field_attrs)
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+        llbc,
+        fd,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        &struct_field_attrs,
+    )
 }
 
 /// The `struct_field_attrs` projection of [`derive_program_metadata`] —
@@ -2224,10 +2282,29 @@ pub(crate) fn dont_look_inside_set_of(llbc: &Llbc) -> std::collections::HashSet<
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Result<FunctionGraph, LowerError> {
+    let jitdriver_receiver_roots =
+        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+        llbc,
+        fd,
+        static_addrs,
+        &jitdriver_receiver_roots,
+        struct_field_attrs,
+    )
+}
+
+fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> Result<FunctionGraph, LowerError> {
     let u = fd.unstructured().ok_or_else(|| {
@@ -2249,6 +2326,7 @@ pub(crate) fn lower_fun_decl_with_static_addrs_and_attrs(
         fd,
         &u,
         static_addrs,
+        jitdriver_receiver_roots,
         struct_field_attrs,
         &dont_look_inside,
         builder_mode,
@@ -2302,6 +2380,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     fd: &FunDecl,
     u: &Unstructured,
     static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     dont_look_inside: &std::collections::HashSet<String>,
     // When set, each strategy's `Lowering` is switched to builder form
@@ -2792,6 +2871,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             name.clone(),
             u,
             static_addrs,
+            jitdriver_receiver_roots,
             fd.generics.as_ref(),
             dont_look_inside,
         )?;
@@ -2834,6 +2914,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         name.clone(),
         u,
         static_addrs,
+        jitdriver_receiver_roots,
         fd.generics.as_ref(),
         dont_look_inside,
     )?;
@@ -2862,6 +2943,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 name,
                 u,
                 static_addrs,
+                jitdriver_receiver_roots,
                 fd.generics.as_ref(),
                 dont_look_inside,
             )?;
@@ -3137,6 +3219,12 @@ struct Lowering<'a> {
     dont_look_inside: &'a std::collections::HashSet<String>,
     body: &'a Unstructured,
     static_addrs: crate::HostStaticAddrs<'a>,
+    /// Configured receiver-type paths whose marker methods identify a
+    /// `JitDriver`.  The same roots feed `jit_marker_key_from_target` in the
+    /// codewriter; carrying them into the front end lets a read of the
+    /// corresponding prebuilt driver const become a value constant before
+    /// the nullary residual-call fallback.
+    jitdriver_receiver_roots: &'a [String],
     arg_count: usize,
     /// `local_var[i] = Some(var)` once MIR local `i` has been bound to
     /// a flowspace Variable. Slot 0 is the return value, 1..arg_count
@@ -3424,6 +3512,7 @@ impl<'a> Lowering<'a> {
         name: String,
         body: &'a Unstructured,
         static_addrs: crate::HostStaticAddrs<'a>,
+        jitdriver_receiver_roots: &'a [String],
         generics: Option<&serde_json::Value>,
         dont_look_inside: &'a std::collections::HashSet<String>,
     ) -> Result<Self, LowerError> {
@@ -3623,6 +3712,7 @@ impl<'a> Lowering<'a> {
             dont_look_inside,
             body,
             static_addrs,
+            jitdriver_receiver_roots,
             arg_count,
             local_var,
             block_id,
@@ -6739,36 +6829,24 @@ impl<'a> Lowering<'a> {
                     });
                     return Ok(res);
                 }
-                // A zero-field unit-struct `const` (the `unpackiterable_driver`
-                // JitDriver, baseobjspace.py:29) is inlined and has no
-                // registered address, so `static_addr_op` returned `None` and
-                // the addressed-singleton arm above declined.  The driver
-                // receiver of a `jit_merge_point` marker is erased to a `Void`
-                // constant at rtyping and to a `Signed` jitdriver index before
-                // the trace runs (`jtransform.py:1704`); `OpKind::Call` operands
-                // are Variables, so the receiver still materialises as a
-                // Variable the marker rewrite strips (autoreds redvar
-                // subtraction + `args.split_first()`).  Emit a single non-null
-                // sentinel `ConstRefAddr` — the same one-ref-result shape a
-                // 0-arg accessor call would have, but without the residual call
-                // whose funcptr constant degrades to a `symbolic_fnaddr_for_path`
-                // hash that SIGBUSes at trace time.  Deliberately NOT the
-                // `__cast_instance_intrinsic` narrowing the addressed siblings use:
-                // its extra cast Variable shifts the loop's ref-register
-                // allocation so a merge-point red lands past `num_regs_r`
-                // (seed-time out-of-bounds in `trace_jitcode_from_merge_point`).
-                // The receiver is stripped, so its `SomePtr` typing is never
-                // unioned downstream; the sentinel is non-null so it never
-                // trips the offset-0 null-Ref wasm silent-miscompile class.
-                if self.refs_static_zerofield_struct_root(&place_ty).is_some() {
-                    const ZEROFIELD_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+                // A prebuilt JitDriver `const` has no registered address. Its
+                // value exists in the flow graph only as operand zero of a
+                // marker method: `ExtEnterLeaveMarker.specialize_call` makes
+                // it a receiver Constant, rtyping erases it to `Void`, and
+                // `Transformer.try_handle_jit_marker` discards the receiver.
+                // Keep the producer constant-shaped so `split_block` can
+                // rematerialise it, without turning the const path into a
+                // nullary residual call. The declared ADT is matched against
+                // the same configured receiver roots the codewriter uses; the
+                // global's own name is deliberately irrelevant.
+                if self.is_jitdriver_named_const(id, &place_ty) {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let bb_id = self.block_id[mir_bb];
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: OpKind::ConstRefAddr(ZEROFIELD_NAMEDCONST_SENTINEL_ADDR),
+                        kind: OpKind::ConstRefAddr(JITDRIVER_NAMEDCONST_SENTINEL_ADDR),
                     });
                     return Ok(res);
                 }
@@ -7473,6 +7551,40 @@ impl<'a> Lowering<'a> {
             }
         }
         None
+    }
+
+    /// Whether `def_id` is an immutable prebuilt instance of a configured
+    /// JIT-driver receiver type.
+    ///
+    /// `GraphTransformConfig::jitdriver_receiver_roots` is the front-to-
+    /// codewriter registration of the types whose marker methods are handled
+    /// by `jit_marker_key_from_target`.  Match that set against the global's
+    /// declared ADT path, not against any particular global binding, so every
+    /// driver instance gets the same constant treatment.
+    fn is_jitdriver_named_const(&self, def_id: u64, ty: &TyRef) -> bool {
+        let Some(global) = self.llbc.global_by_id(def_id) else {
+            return false;
+        };
+        if global
+            .rest
+            .get("global_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("NamedConst")
+        {
+            return false;
+        }
+        let Some(type_path) = tyref_node(ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(adt_node_def_id)
+            .and_then(|id| self.llbc.type_by_id(id))
+            .map(|decl| decl.item_meta.name_path())
+        else {
+            return false;
+        };
+        let stripped = strip_crate_prefix(&type_path);
+        self.jitdriver_receiver_roots
+            .iter()
+            .any(|root| static_key_matches(&type_path, &stripped, root))
     }
 
     /// Value of an immutable size `const` baked at build time
@@ -29275,6 +29387,85 @@ mod tests {
         );
     }
 
+    /// The field-bearing primary driver const must lower exactly like the
+    /// zero-field unpack driver: one opaque constant receiver for each marker,
+    /// never a residual call to the const item's symbolic path.  Ignored by
+    /// default because it loads the extracted pyre-jit artefact; run with
+    /// `cargo test -p majit-translate --lib
+    /// pypyjitdriver_named_const_is_a_marker_receiver_constant -- --ignored`.
+    #[test]
+    #[ignore]
+    fn pypyjitdriver_named_const_is_a_marker_receiver_constant() {
+        use crate::model::{CallTarget, OpKind};
+
+        let llbc =
+            Llbc::load(crate::runtime_names::artifacts::JIT_ULLBC).expect("load pyre-jit LLBC");
+        let graph = super::lower_function(&llbc, "eval_loop_jit").expect("lower eval_loop_jit");
+        let driver_path = ["pyre_jit", "eval", "pypyjitdriver"];
+
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        args,
+                        ..
+                    } if args.is_empty()
+                        && super::fmt_path_ends_with(segments, &driver_path)
+                )),
+            "the driver const path must not survive as a nullary call"
+        );
+
+        let marker_receivers: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root: Some(root),
+                            ..
+                        },
+                    args,
+                    ..
+                } if root == "PyPyJitDriver"
+                    && matches!(name.as_str(), "jit_merge_point" | "can_enter_jit") =>
+                {
+                    args.first()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marker_receivers.len(),
+            2,
+            "eval_loop_jit must retain both source marker calls after MIR lowering"
+        );
+        for receiver in marker_receivers {
+            let (block_id, op_index) = super::resolve_to_producer_op(&graph, receiver)
+                .expect("marker receiver has one producer");
+            let producer = &graph
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .expect("producer block")
+                .operations[op_index];
+            assert!(
+                matches!(
+                    producer.kind,
+                    OpKind::ConstRefAddr(super::JITDRIVER_NAMEDCONST_SENTINEL_ADDR)
+                ),
+                "marker receiver producer must be the driver sentinel: {producer:?}"
+            );
+        }
+    }
+
     /// Anchor the `(a..=b).contains(&v)` fold to the real lowered IR of
     /// its int census callers — `setitem_bytearray` / `byte_w`
     /// (`(0..=255)`, constant bounds) and `c_int_w` (`(i32::MIN as
@@ -30051,9 +30242,12 @@ mod tests {
             Llbc::from_slice(artifact(serde_json::json!("Opaque")).to_string().as_bytes()).unwrap();
         let llbcs = vec![defining, opaque];
         super::link_transparent_scalar_types(&llbcs);
+        let jitdriver_receiver_roots =
+            crate::codewriter::jtransform::default_jitdriver_receiver_roots();
         super::build_semantic_program_from_llbc_with_static_addrs_filtered(
             &llbcs[1],
             crate::HostStaticAddrs::default(),
+            &jitdriver_receiver_roots,
             None,
             None,
         )

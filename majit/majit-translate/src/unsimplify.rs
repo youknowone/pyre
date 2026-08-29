@@ -708,15 +708,9 @@ mod tests {
         assert_eq!(graph.block(new).inputargs.len(), 2);
     }
 
-    #[test]
-    fn split_with_forcelink_rematerializes_nullary_marker_receiver() {
+    fn assert_split_rematerializes_marker_receiver(producer_kind: OpKind) {
         let receiver = Variable::named("pypyjitdriver");
         let marker_result = Variable::named("marker_result");
-        let producer_kind = OpKind::Call {
-            target: crate::model::CallTarget::function_path(["pyre_jit", "eval", "pypyjitdriver"]),
-            args: vec![],
-            result_ty: ValueType::Ref(Some("PyPyJitDriver".into())),
-        };
         let marker_kind = OpKind::Call {
             target: crate::model::CallTarget::method(
                 "jit_merge_point",
@@ -760,6 +754,20 @@ mod tests {
             panic!("moved marker must remain a Call")
         };
         assert_eq!(args, &[rematerialized.clone()]);
+    }
+
+    #[test]
+    fn split_with_forcelink_rematerializes_nullary_marker_receiver() {
+        assert_split_rematerializes_marker_receiver(OpKind::Call {
+            target: crate::model::CallTarget::function_path(["pyre_jit", "eval", "pypyjitdriver"]),
+            args: vec![],
+            result_ty: ValueType::Ref(Some("PyPyJitDriver".into())),
+        });
+    }
+
+    #[test]
+    fn split_with_forcelink_rematerializes_constref_marker_receiver() {
+        assert_split_rematerializes_marker_receiver(OpKind::ConstRefAddr(8));
     }
 
     #[test]
