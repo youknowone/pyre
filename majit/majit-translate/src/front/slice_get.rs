@@ -65,9 +65,11 @@
 //! [`crate::front::option_map_or`] does.  The rewrite:
 //! 1. drops the `get` call (+ absorbed cast) and closes A with a
 //!    `bool(i < len(slice))` branch to two fresh arms;
-//! 2. the `then_bb` arm reads `slice[i]` and wraps it in `Some`
-//!    (`__discriminant = 1` / `__pos_0 = elem`);
-//! 3. the `else_bb` arm builds `None` (`__discriminant = 0`);
+//! 2. the `then_bb` arm reads `slice[i]` and wraps it in `Some`; a one-word
+//!    reference niche forwards the typed payload directly, while value
+//!    payloads build `__discriminant = 1` / `__pos_0 = elem`;
+//! 3. the `else_bb` arm emits a typed null for that niche, or an aggregate
+//!    `None` (`__discriminant = 0`) for value payloads;
 //! 4. both arms re-apply the absorbed narrowing and forward to B, reproducing
 //!    A's original exit args with the `opt` slot sourced from the arm's
 //!    `Some`/`None` value and every other live value threaded through.
@@ -107,6 +109,14 @@ pub(crate) struct SliceGetSite {
     /// the descr, or `None` only for a proven thin-pointer element whose
     /// identity-less descr already has the correct one-word stride.
     pub array_type_id: Option<String>,
+    /// True when `Option<&T>` is Rust's one-word nullable-reference niche.
+    /// RPython carries this as the payload annotation with `can_be_None=True`,
+    /// not as an Option object with discriminant and payload fields.
+    pub niche: bool,
+    /// Concrete payload class for a niche reference.  In particular,
+    /// `<[*mut PyObject]>::get` returns `Option<&PyObjectRef>`: the successful
+    /// list item and the null arm must both retain the `PyObject` ClassDef.
+    pub payload_narrow_root: Option<String>,
 }
 
 /// Rewrite every recorded `<[T]>::get` call site into the bounds-checked
@@ -263,14 +273,18 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
             pure: false,
         },
     });
-    let some_var = emit_option_variant(
-        graph,
-        then_bb,
-        &site.option_owner,
-        1,
-        Some((&site.some_owner, elem, site.payload_ty.clone())),
-    );
-    let then_result = emit_narrow(graph, then_bb, some_var, &narrow_root);
+    let then_result = if site.niche {
+        emit_narrow(graph, then_bb, elem, &site.payload_narrow_root)
+    } else {
+        let some_var = emit_option_variant(
+            graph,
+            then_bb,
+            &site.option_owner,
+            1,
+            Some((&site.some_owner, elem, site.payload_ty.clone())),
+        );
+        emit_narrow(graph, then_bb, some_var, &narrow_root)
+    };
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -282,8 +296,13 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
     close_goto_mixed(graph, then_bb, b_target, then_link_args);
 
     // `else_bb`: opt = None.
-    let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
-    let else_result = emit_narrow(graph, else_bb, none_var, &narrow_root);
+    let else_result = if site.niche {
+        let null = graph.push_null_mut_ptr(else_bb);
+        emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
+    } else {
+        let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
+        emit_narrow(graph, else_bb, none_var, &narrow_root)
+    };
     let else_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -344,6 +363,8 @@ mod tests {
             some_owner: "core::option::Option::Some".into(),
             payload_ty: ValueType::Ref(None),
             array_type_id: None,
+            niche: false,
+            payload_narrow_root: None,
         }
     }
 
@@ -443,6 +464,71 @@ mod tests {
             })
             .count();
         assert_eq!(disc_writes, 2, "both arms write a discriminant");
+    }
+
+    /// `slice: &[*mut PyObject]` makes `get` return
+    /// `Option<&PyObjectRef>`, a nullable shared reference.  Its RPython shape
+    /// is one maybe-null `SomeInstance(PyObject)`, so neither arm may mint the
+    /// Rust Option aggregate used by scalar/value payloads.
+    #[test]
+    fn rewrite_niche_get_forwards_typed_payload_or_null() {
+        let mut g = FunctionGraph::new("test_slice_get_niche");
+        let a = g.startblock;
+        let slice = g.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let index = g.push_op_var(a, OpKind::ConstInt(3), true).unwrap();
+        let opt = emit_call(&mut g, a, vec![slice, index]);
+        let narrowed = emit_narrow(&mut g, a, opt.clone(), &Some("PyObject".into()));
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![narrowed]);
+
+        let mut site = slice_get_site(opt);
+        site.niche = true;
+        site.payload_narrow_root = Some("PyObject".into());
+        assert_eq!(rewire_slice_get_call_sites(&mut g, &[site]), 1);
+
+        assert!(
+            !g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. }
+                            if field.name == "__discriminant" || field.name == "__pos_0"
+                    )
+                }),
+            "a niche Option has no aggregate fields"
+        );
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments == &["core", "ptr", "null_mut"]
+                    )
+                })
+        );
+        let payload_narrows = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[crate::runtime_names::shims::CAST_INSTANCE, "PyObject"]
+                )
+            })
+            .count();
+        assert_eq!(payload_narrows, 2, "payload and null keep one ClassDef");
     }
 
     /// A scalar slice item uses the integer register bank throughout the

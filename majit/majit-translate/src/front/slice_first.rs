@@ -52,9 +52,11 @@
 //! [`crate::front::option_map_or`] does.  The rewrite:
 //! 1. drops the `first` call (+ absorbed cast) and closes A with a
 //!    `bool(len(slice) > 0)` branch to two fresh arms;
-//! 2. the `then_bb` arm reads `slice[0]` and wraps it in `Some`
-//!    (`__discriminant = 1` / `__pos_0 = elem`);
-//! 3. the `else_bb` arm builds `None` (`__discriminant = 0`);
+//! 2. the `then_bb` arm reads `slice[0]` and wraps it in `Some`; a one-word
+//!    reference niche forwards the typed payload directly, while value
+//!    payloads build `__discriminant = 1` / `__pos_0 = elem`;
+//! 3. the `else_bb` arm emits a typed null for that niche, or an aggregate
+//!    `None` (`__discriminant = 0`) for value payloads;
 //! 4. both arms re-apply the absorbed narrowing and forward to B, reproducing
 //!    A's original exit args with the `opt` slot sourced from the arm's
 //!    `Some`/`None` value and every other live value threaded through.
@@ -92,6 +94,13 @@ pub(crate) struct SliceFirstSite {
     /// The `Option`'s payload `&T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` field kind (`Ref(None)` for `Option<&PyObjectRef>`).
     pub payload_ty: ValueType,
+    /// True when the result is the one-word nullable-reference Option niche.
+    /// RPython represents that as the payload instance with
+    /// `can_be_None=True`, without an Option aggregate.
+    pub niche: bool,
+    /// Concrete payload class retained on both the successful pointer and
+    /// the null arm of a niche result.
+    pub payload_narrow_root: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -297,14 +306,18 @@ fn rewire_one_slice_first_site(
             subslice
         }
     };
-    let some_var = emit_option_variant(
-        graph,
-        then_bb,
-        &site.option_owner,
-        1,
-        Some((&site.some_owner, elem, site.payload_ty.clone())),
-    );
-    let then_result = emit_narrow(graph, then_bb, some_var, &narrow_root);
+    let then_result = if site.niche {
+        emit_narrow(graph, then_bb, elem, &site.payload_narrow_root)
+    } else {
+        let some_var = emit_option_variant(
+            graph,
+            then_bb,
+            &site.option_owner,
+            1,
+            Some((&site.some_owner, elem, site.payload_ty.clone())),
+        );
+        emit_narrow(graph, then_bb, some_var, &narrow_root)
+    };
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -316,8 +329,13 @@ fn rewire_one_slice_first_site(
     close_goto_mixed(graph, then_bb, b_target, then_link_args);
 
     // `else_bb`: opt = None.
-    let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
-    let else_result = emit_narrow(graph, else_bb, none_var, &narrow_root);
+    let else_result = if site.niche {
+        let null = graph.push_null_mut_ptr(else_bb);
+        emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
+    } else {
+        let none_var = emit_option_variant(graph, else_bb, &site.option_owner, 0, None);
+        emit_narrow(graph, else_bb, none_var, &narrow_root)
+    };
     let else_link_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -427,6 +445,8 @@ mod tests {
             option_owner: "core::option::Option".into(),
             some_owner: "core::option::Option::Some".into(),
             payload_ty: ValueType::Ref(None),
+            niche: false,
+            payload_narrow_root: None,
         }
     }
 

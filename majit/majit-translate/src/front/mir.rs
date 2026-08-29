@@ -13949,7 +13949,9 @@ impl<'a> Lowering<'a> {
                 return Some(root);
             }
             let pointee = obj.get("Ref")?.as_array()?.get(1)?;
-            return adt_node_class_root(strip_ty_wrappers(pointee, self.llbc)?, self.llbc);
+            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
+            return raw_ptr_pointee_class_root(pointee, self.llbc)
+                .or_else(|| adt_node_class_root(pointee, self.llbc));
         }
     }
 
@@ -14108,12 +14110,18 @@ impl<'a> Lowering<'a> {
     ) -> Option<crate::front::slice_first::SliceFirstSite> {
         let (option_owner, some_owner, payload_ty) =
             self.resolve_option_consumer_owners(dest_ty)?;
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         Some(crate::front::slice_first::SliceFirstSite {
             result_var: result_var.clone(),
             access: crate::front::slice_first::SliceAccess::First,
             option_owner,
             some_owner,
             payload_ty,
+            niche,
+            payload_narrow_root,
         })
     }
 
@@ -14151,12 +14159,18 @@ impl<'a> Lowering<'a> {
             "site-recognized (ACCEPT, not a decline)",
             &self.graph.name,
         );
+        let niche = self.tyref_is_niche_option_ptr(dest_ty);
+        let payload_narrow_root = niche
+            .then(|| self.option_niche_payload_class_root(dest_ty))
+            .flatten();
         Some(crate::front::slice_get::SliceGetSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty: item_ty,
             array_type_id,
+            niche,
+            payload_narrow_root,
         })
     }
 
@@ -14768,17 +14782,32 @@ impl<'a> Lowering<'a> {
         // `getdebug_data() -> Option<&FrameDebugData>` is a live shared-ref
         // producer reaching here; its `FrameDebugData` pointee is Sized
         // (carries a concrete layout size).
-        if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc)
-            && let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc)
-            && let Some(def_id) = adt_node_def_id(stripped)
-            && self
-                .llbc
-                .type_by_id(def_id)
-                .and_then(|td| td.layout_for_target(&std::env::var("TARGET").unwrap_or_default()))
-                .and_then(|l| l.size)
-                .is_some()
-        {
-            return true;
+        if let Some(shared_pointee) = type_node_shared_ref_pointee(payload, self.llbc) {
+            let Some(stripped) = strip_ty_wrappers(shared_pointee, self.llbc) else {
+                return false;
+            };
+            // `&*mut T` is a thin shared reference even though its pointee is
+            // itself a raw pointer rather than a nominal ADT.  This is the
+            // shape of `<[*mut PyObject]>::get`: `Option<&PyObjectRef>` is one
+            // nullable reference word, and its successful value is the list
+            // item pointer.  RPython has no Option aggregate here; it is the
+            // same `SomeInstance(T, can_be_None=True)` pointer lattice as the
+            // direct `&T` nominal-ADT arm below.
+            if type_node_raw_ptr_pointee(stripped, self.llbc).is_some() {
+                return true;
+            }
+            if let Some(def_id) = adt_node_def_id(stripped)
+                && self
+                    .llbc
+                    .type_by_id(def_id)
+                    .and_then(|td| {
+                        td.layout_for_target(&std::env::var("TARGET").unwrap_or_default())
+                    })
+                    .and_then(|l| l.size)
+                    .is_some()
+            {
+                return true;
+            }
         }
         // A direct raw pointer to a nominal ADT is the one-word address of
         // that aggregate in these graphs. Keep the concrete-layout gate even
@@ -32702,6 +32731,42 @@ mod tests {
                 .flat_map(|b| &b.operations)
                 .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
             "the successful get arm must read the guarded element"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor {
+                            name,
+                            owner_path,
+                            ..
+                        },
+                        ..
+                    } if (name == "Some" || name == "None")
+                        && owner_path.iter().any(|part| part.contains("Option<*mut PyObject>"))
+                ) || matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. }
+                        if field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.starts_with("core::option::Option<"))
+                )
+            }),
+            "Option<&PyObjectRef> must stay a nullable PyObject pointer, not an Option aggregate"
+        );
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &["core", "ptr", "null_mut"]
+                )
+            }),
+            "the out-of-bounds arm must materialize the nullable pointer's null"
         );
     }
 
