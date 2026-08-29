@@ -463,9 +463,18 @@ fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError
 // Indexing.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Normalize an integer index against `len`, raising IndexError out of range.
-fn index_in_range(w_index: PyObjectRef, len: usize, what: &str) -> Result<usize, PyError> {
-    let mut i = crate::builtins::getindex_w(w_index)?;
+/// Normalize an integer index against the receiver's live length.
+///
+/// PyPy `decode_index4(w_idx, self)` and CPython 3.14
+/// `array_subscr` / `array_ass_subscr` both run `__index__` before reading the
+/// length used for negative-index adjustment and bounds.  The conversion can
+/// resize and collect either input, so own both through that boundary and read
+/// the receiver back before consulting its length.
+fn index_in_range(obj: PyObjectRef, w_index: PyObjectRef, what: &str) -> Result<usize, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_index]);
+    let mut i = crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let len = unsafe { arr::w_array_len(pyre_object::gc_roots::shadow_stack_get(base)) };
     if i < 0 {
         i += len as i64;
     }
@@ -478,36 +487,38 @@ fn index_in_range(w_index: PyObjectRef, len: usize, what: &str) -> Result<usize,
     Ok(i as usize)
 }
 
-/// slice element count for `(start, stop, step)`.
-fn slice_length(start: i64, stop: i64, step: i64) -> i64 {
-    if step > 0 {
-        if stop > start {
-            (stop - start - 1) / step + 1
-        } else {
-            0
-        }
-    } else if start > stop {
-        (start - stop - 1) / (-step) + 1
-    } else {
-        0
-    }
+/// PyPy `W_SliceObject.unpack` followed by `adjust_indices(..., self.len)`.
+/// Bound conversions may resize the array, so the live length is deliberately
+/// read only after all three have completed.
+fn array_slice_indices(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Result<(i64, i64, i64, i64), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, key]);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let (start, stop, step) = crate::sliceobject::slice_unpack(
+        unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
+        unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
+        unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
+    )?;
+    let len = unsafe { arr::w_array_len(pyre_object::gc_roots::shadow_stack_get(base)) } as i64;
+    Ok(crate::sliceobject::slice_adjust_indices(
+        start, stop, step, len,
+    ))
 }
 
 fn array_getitem(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__getitem__")?;
-    let obj = args[0];
-    let key = args[1];
-    let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
-    let tc = unsafe { arr::w_array_typecode(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if unsafe { pyre_object::sliceobject::is_slice(key) } {
-        let (start, stop, step) = crate::sliceobject::indices3(
-            unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
-            len as i64,
-        )?;
-        let n = slice_length(start, stop, step);
+        let (start, _, step, n) = array_slice_indices(obj, key)?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let isz = unsafe { arr::w_array_itemsize(obj) };
+        let tc = unsafe { arr::w_array_typecode(obj) };
         let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
         let mut out: Vec<u8> = Vec::with_capacity(n as usize * isz);
         let mut i = start;
@@ -520,18 +531,18 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
         }
         return Ok(arr::w_array_from_bytes(tc, isz as u8, out));
     }
-    let i = index_in_range(key, len, "array")?;
+    let i = index_in_range(obj, key, "array")?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     Ok(unsafe { arr::w_array_unpack_item(obj, i) })
 }
 
 fn array_setitem(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 3, "array.__setitem__")?;
-    let obj = args[0];
-    let key = args[1];
-    let w_value = args[2];
-    let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
-    let tc = unsafe { arr::w_array_typecode(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let w_value = pyre_object::gc_roots::shadow_stack_get(base + 2);
     if unsafe { pyre_object::sliceobject::is_slice(key) } {
         // `array_ass_subscr` names the operand it was handed; an array of
         // another kind passed that test and is refused by `PyErr_BadArgument`
@@ -542,18 +553,16 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
                 unsafe { pyre_object::type_name_of(w_value) }
             )));
         }
+        let tc = unsafe { arr::w_array_typecode(obj) };
         if unsafe { arr::w_array_typecode(w_value) } != tc {
             return Err(PyError::type_error(
                 "bad argument type for built-in operation",
             ));
         }
-        let (start, stop, step) = crate::sliceobject::indices3(
-            unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
-            len as i64,
-        )?;
-        let n = slice_length(start, stop, step);
+        let (start, stop, step, n) = array_slice_indices(obj, key)?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let w_value = pyre_object::gc_roots::shadow_stack_get(base + 2);
+        let isz = unsafe { arr::w_array_itemsize(obj) };
         let src = unsafe { arr::w_array_bytes(w_value) }.to_vec();
         let src_len = src.len() / isz;
         if step == 1 {
@@ -584,12 +593,20 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
         }
         return Ok(pyre_object::w_none());
     }
-    let i = index_in_range(key, len, "array")?;
+    let i = index_in_range(obj, key, "array assignment")?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let tc = unsafe { arr::w_array_typecode(obj) };
+    let isz = unsafe { arr::w_array_itemsize(obj) };
     let mut buf: Bytes = [0u8; 8];
     // pack_into may run user code (`__index__`/`__int__`/`__float__`) that
     // resizes the array mid-assignment (gh-142555); re-validate the slot
     // against the current length before writing.
-    let n = pack_into(tc, w_value, &mut buf)?;
+    let n = pack_into(
+        tc,
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &mut buf,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     let end = i * isz + n;
     if end > vec.len() {
@@ -604,24 +621,21 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
 
 fn array_delitem(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__delitem__")?;
-    let obj = args[0];
-    let key = args[1];
-    let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if unsafe { pyre_object::sliceobject::is_slice(key) } {
-        let (start, stop, step) = crate::sliceobject::indices3(
-            unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
-            len as i64,
-        )?;
-        let n = slice_length(start, stop, step);
+        let (start, _, step, n) = array_slice_indices(obj, key)?;
         if n == 0 {
             // No elements removed: leave the backing storage (and any exported
             // views over it) untouched rather than rebuilding the buffer.
             return Ok(pyre_object::w_none());
         }
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
         array_check_resize(obj)?;
+        let len = unsafe { arr::w_array_len(obj) };
+        let isz = unsafe { arr::w_array_itemsize(obj) };
         // Collect element indices to drop, then rebuild the buffer.
         let mut drop_set: Vec<usize> = Vec::with_capacity(n as usize);
         let mut i = start;
@@ -646,8 +660,10 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
         *vec = out;
         return Ok(pyre_object::w_none());
     }
-    let i = index_in_range(key, len, "array")?;
+    let i = index_in_range(obj, key, "array assignment")?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     array_check_resize(obj)?;
+    let isz = unsafe { arr::w_array_itemsize(obj) };
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     vec.drain(i * isz..i * isz + isz);
     Ok(pyre_object::w_none())
@@ -766,34 +782,67 @@ fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
     // `@unwrap_spec(idx=int)` runs before PyPy's `descr_insert` reads len.
     let mut i = array_ssize_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
-    let len = unsafe { arr::w_array_len(obj) };
+    let old_len = unsafe { arr::w_array_len(obj) };
     if i < 0 {
-        i += len as i64;
+        i += old_len as i64;
         if i < 0 {
             i = 0;
         }
     }
-    if i > len as i64 {
-        i = len as i64;
+    if i > old_len as i64 {
+        i = old_len as i64;
     }
-    // `W_Array.descr_insert` converts `w_val` before `setlen`; conversion may
-    // resize the receiver, create an export, or collect it.  Preserve the
-    // index computed from the pre-conversion length, then re-read all live
-    // receiver state from the rooted object.
+    let i = i as usize;
+
+    // PyPy `W_Array.descr_insert` converts `w_val` before `setlen`, then moves
+    // the tail and writes that converted value.  [3.14-spec] CPython v3.14.6
+    // `arraymodule.c::ins1` exposes the same pre-resize validation as append,
+    // but validates a second time after resizing and moving the tail.  Keep
+    // PyPy's gateway/index structure and reproduce that observable two-call
+    // sequence.  In particular, a first conversion may mutate the receiver;
+    // the resize still targets the length captured before it ran.
     let tc = unsafe { arr::w_array_typecode(obj) };
-    let mut buf: Bytes = [0u8; 8];
-    let n = pack_into(
+    let itemsize = unsafe { arr::w_array_itemsize(obj) };
+    let mut validated: Bytes = [0u8; 8];
+    pack_into(
         tc,
         pyre_object::gc_roots::shadow_stack_get(base + 2),
-        &mut buf,
+        &mut validated,
     )?;
+
     let obj = pyre_object::gc_roots::shadow_stack_get(base);
     array_check_resize(obj)?;
-    let isz = unsafe { arr::w_array_itemsize(obj) };
-    let len = unsafe { arr::w_array_len(obj) };
+    let new_bytes = old_len
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(itemsize))
+        .ok_or_else(|| PyError::memory_error(""))?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
-    let at = (i as usize).min(len) * isz;
-    vec.splice(at..at, buf[..n].iter().copied());
+    if new_bytes > vec.len() {
+        vec.try_reserve(new_bytes - vec.len())
+            .map_err(|_| PyError::memory_error(""))?;
+    }
+    vec.resize(new_bytes, 0);
+    let start = i * itemsize;
+    let end = old_len * itemsize;
+    if i != old_len {
+        vec.copy_within(start..end, start + itemsize);
+    }
+
+    let mut packed: Bytes = [0u8; 8];
+    let packed_len = pack_into(
+        tc,
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &mut packed,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    if i >= unsafe { arr::w_array_len(obj) } {
+        return Err(PyError::new(
+            PyErrorKind::IndexError,
+            "array assignment index out of range",
+        ));
+    }
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
     Ok(pyre_object::w_none())
 }
 

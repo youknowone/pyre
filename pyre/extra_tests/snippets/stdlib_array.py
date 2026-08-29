@@ -219,6 +219,67 @@ with assert_raises(TypeError) as error:
     RawArraySubclass("i").extend(iterable=[])
 assert str(error.exception) == "extend() takes exactly 1 positional argument (0 given)"
 
+# PyPy W_Array.descr_insert converts the value before growing and shifting.
+# CPython 3.14's ins1 retains that order, then converts once more for the
+# destination slot; both callbacks and the pre-conversion length are visible.
+insert_target = array("i", [1, 2])
+
+
+class GrowingInsertItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        if self.calls == 1:
+            insert_target.append(9)
+        else:
+            insert_target.append(8)
+        return 7
+
+
+growing_insert_item = GrowingInsertItem()
+insert_target.insert(-1, growing_insert_item)
+assert growing_insert_item.calls == 2
+assert insert_target == array("i", [1, 7, 2, 8])
+
+insert_target = array("i", [1])
+insert_view = None
+
+
+class ExportingInsertItem:
+    def __index__(self):
+        global insert_view
+        insert_view = memoryview(insert_target)
+        return 2
+
+
+with assert_raises(BufferError):
+    insert_target.insert(0, ExportingInsertItem())
+assert insert_target == array("i", [1])
+insert_view.release()
+
+insert_target = array("i", [1, 2])
+
+
+class ClearingInsertItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        if self.calls == 2:
+            insert_target.clear()
+        return 7
+
+
+clearing_insert_item = ClearingInsertItem()
+with assert_raises(IndexError) as error:
+    insert_target.insert(0, clearing_insert_item)
+assert str(error.exception) == "array assignment index out of range"
+assert clearing_insert_item.calls == 2
+assert insert_target == array("i")
+
 # PyPy's W_ArrayBase.descr_index supplies the optional bounds to
 # index_count_array.  CPython 3.14 keeps the same observable positional search
 # but makes the public bounds positional-only.
@@ -640,6 +701,74 @@ assert str(error.exception) == "array.fromlist() takes exactly one argument (0 g
 with assert_raises(TypeError) as error:
     array("i").fromlist([], [])
 assert str(error.exception) == "array.fromlist() takes exactly one argument (2 given)"
+
+# PyPy decode_index4(w_idx, self) and CPython 3.14 array_subscr /
+# array_ass_subscr read the receiver length after an index conversion.  The
+# callback can resize and collect the receiver, so negative indexes follow the
+# new tail on get, set, and delete.
+indexed = array("i", [1, 2])
+
+
+class GrowingSubscriptionIndex:
+    def __index__(self):
+        indexed.append(3)
+        gc.collect()
+        return -1
+
+
+assert indexed[GrowingSubscriptionIndex()] == 3
+assert indexed == array("i", [1, 2, 3])
+
+indexed = array("i", [1, 2])
+indexed[GrowingSubscriptionIndex()] = 9
+assert indexed == array("i", [1, 2, 9])
+
+indexed = array("i", [1, 2])
+del indexed[GrowingSubscriptionIndex()]
+assert indexed == array("i", [1, 2])
+
+for operation in ("get", "delete"):
+    indexed = array("i", [1, 2])
+
+    class ClearingSubscriptionIndex:
+        def __index__(self):
+            indexed.clear()
+            return 0
+
+    with assert_raises(IndexError) as error:
+        if operation == "get":
+            indexed[ClearingSubscriptionIndex()]
+        else:
+            del indexed[ClearingSubscriptionIndex()]
+    expected = (
+        "array index out of range"
+        if operation == "get"
+        else "array assignment index out of range"
+    )
+    assert str(error.exception) == expected
+    assert indexed == array("i")
+
+# W_SliceObject.unpack likewise runs every bound conversion before
+# adjust_indices reads self.len.  A newly appended last item is therefore the
+# item selected by a -1 lower bound.
+class GrowingSliceStart:
+    def __index__(self):
+        sliced.append(3)
+        gc.collect()
+        return -1
+
+
+sliced = array("i", [1, 2])
+assert sliced[GrowingSliceStart() :] == array("i", [3])
+assert sliced == array("i", [1, 2, 3])
+
+sliced = array("i", [1, 2])
+sliced[GrowingSliceStart() :] = array("i", [9])
+assert sliced == array("i", [1, 2, 9])
+
+sliced = array("i", [1, 2])
+del sliced[GrowingSliceStart() :]
+assert sliced == array("i", [1, 2])
 
 # slice assignment step overflow behaviour test
 T = "I"
