@@ -40,6 +40,10 @@ impl<'a> StringDecoder<'a> {
 
     pub fn next_name(&mut self) -> Result<*const core::ffi::c_char, PyError> {
         let start = self.pos;
+        // A name with no terminator leaves the cursor one past the end, so the
+        // next read starts outside the buffer; `find` answers that with -1
+        // upstream, which is the same empty name this reports.
+        let start = start.min(self.string.len());
         let end = self.string[start..]
             .iter()
             .position(|&byte| byte == 0)
@@ -50,6 +54,18 @@ impl<'a> StringDecoder<'a> {
         unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), ptr, name.len()) };
         Ok(ptr.cast())
     }
+}
+
+/// `space.bytes_w` — every packed descriptor is read as raw bytes, so one
+/// that is not `bytes` has to be refused before the decoder sees it.
+fn packed_bytes(w_obj: PyObjectRef) -> Result<&'static [u8], PyError> {
+    if !unsafe { pyre_object::bytesobject::is_bytes(w_obj) } {
+        return Err(PyError::type_error(format!(
+            "expected bytes, got {} object",
+            crate::type_methods::arg_type_name(w_obj)
+        )));
+    }
+    Ok(unsafe { pyre_object::bytesobject::w_bytes_data(w_obj) })
 }
 
 fn allocate_array<T>(w_ffi: PyObjectRef, nitems: usize) -> Result<*mut T, PyError> {
@@ -166,7 +182,7 @@ pub fn ffiobj_init(
         let nglobs = block.cast::<parse_c_type::GlobalS>();
         let nintconsts = unsafe { block.add(globals_bytes) }.cast::<CdlIntConst>();
         for i in 0..n {
-            let packed = unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(base + i * 2)) };
+            let packed = packed_bytes(roots.get(base + i * 2))?;
             let mut decoder = StringDecoder::new(roots.get(ffi_slot), packed);
             let target = unsafe { &mut *nglobs.add(i) };
             target.type_op = decoder.next_opcode()?;
@@ -208,7 +224,7 @@ pub fn ffiobj_init(
                 let _ = roots.pin_root(item);
             }
             let nf1 = desc.len().saturating_sub(1);
-            let packed = unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(desc_base)) };
+            let packed = packed_bytes(roots.get(desc_base))?;
             let mut decoder = StringDecoder::new(roots.get(ffi_slot), packed);
             let target = unsafe { &mut *nstructs.add(i) };
             target.type_index = decoder.next_4bytes()?;
@@ -227,8 +243,7 @@ pub fn ffiobj_init(
                 target.num_fields = nf1 as core::ffi::c_int;
             }
             for j in 0..nf1 {
-                let packed =
-                    unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(desc_base + j + 1)) };
+                let packed = packed_bytes(roots.get(desc_base + j + 1))?;
                 let mut decoder = StringDecoder::new(roots.get(ffi_slot), packed);
                 let field = unsafe { &mut *nfields.add(nf) };
                 field.field_type_op = decoder.next_opcode()?;
@@ -261,7 +276,7 @@ pub fn ffiobj_init(
         let n = enums.len();
         let nenums = allocate_array::<parse_c_type::EnumS>(roots.get(ffi_slot), n)?;
         for i in 0..n {
-            let packed = unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(base + i)) };
+            let packed = packed_bytes(roots.get(base + i))?;
             let mut decoder = StringDecoder::new(roots.get(ffi_slot), packed);
             let target = unsafe { &mut *nenums.add(i) };
             target.type_index = decoder.next_4bytes()?;
@@ -285,7 +300,7 @@ pub fn ffiobj_init(
         let n = typenames.len();
         let ntypenames = allocate_array::<parse_c_type::TypenameS>(roots.get(ffi_slot), n)?;
         for i in 0..n {
-            let packed = unsafe { pyre_object::bytesobject::w_bytes_data(roots.get(base + i)) };
+            let packed = packed_bytes(roots.get(base + i))?;
             let mut decoder = StringDecoder::new(roots.get(ffi_slot), packed);
             let target = unsafe { &mut *ntypenames.add(i) };
             target.type_index = decoder.next_4bytes()?;
