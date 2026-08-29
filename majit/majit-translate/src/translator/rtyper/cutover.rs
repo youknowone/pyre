@@ -2029,6 +2029,12 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // is non-overwriting (skips keys the `function_graphs` pass already
     // registered) and idempotent.
     register_unsafe_fn_stubs(registry, unsafe_fn_stubs);
+    // `__deref_write(ptr, value)` is the MIR front end's opaque store
+    // marker.  Give the annotator the same declared-external carrier as the
+    // Rust-stdlib leaves below so one unfollowable store does not stop the
+    // whole graph; the marker is absent from `CallControl::function_graphs`,
+    // so the original call remains residual at the codewriter boundary.
+    register_deref_write_external(registry);
     // Foreign Rust-stdlib externals (`core::*` / `std::*` / `fmt::*`)
     // the interpreter calls inline.  Declared opaque here — the rtyper
     // residualizes them rather than tracing into low-level plumbing, the
@@ -2778,6 +2784,49 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
     ),
 ];
 
+/// Register one opaque external through the annotator-only stub carrier.
+/// The caller retains ownership of which table or synthetic path declares
+/// the external; this helper keeps their registration semantics identical.
+fn register_opaque_external(
+    registry: &CallRegistry,
+    segments: &[&str],
+    argnames: &[&str],
+    return_lltype: LowLevelType,
+) {
+    let signature = Signature::new(
+        argnames.iter().map(|n| (*n).to_string()).collect(),
+        None,
+        None,
+    );
+    let Some(stub_pygraph) = build_stub_pygraph_for_lltype(
+        segments.last().copied().unwrap_or_default().to_string(),
+        signature.clone(),
+        return_lltype,
+    ) else {
+        return;
+    };
+    let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
+    if registry.lookup(&key).is_some() {
+        return;
+    }
+    registry.register_callee(key, signature, stub_pygraph);
+}
+
+/// Declare the opaque MIR deref-write marker to the annotator.
+///
+/// This is a two-parameter, `Void` external.  It is intentionally registered
+/// only in the `CallRegistry`: the codewriter's graph registry has no body for
+/// it and therefore sends the original `Call(__deref_write)` through
+/// `handle_residual_call`, preserving the store as a carried side effect.
+pub(crate) fn register_deref_write_external(registry: &CallRegistry) {
+    register_opaque_external(
+        registry,
+        &["__deref_write"],
+        &["ptr", "value"],
+        LowLevelType::Void,
+    );
+}
+
 /// Register the [`FOREIGN_STDLIB_EXTERNALS`] table into `registry`.
 ///
 /// Faithful analog of `extfuncregistry.py`'s `_register` table being
@@ -2794,23 +2843,7 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
 /// `CallControl::function_graphs`, so they never compile into JITCode).
 pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     for (segments, argnames, return_lltype) in FOREIGN_STDLIB_EXTERNALS {
-        let signature = Signature::new(
-            argnames.iter().map(|n| (*n).to_string()).collect(),
-            None,
-            None,
-        );
-        let Some(stub_pygraph) = build_stub_pygraph_for_lltype(
-            segments.last().copied().unwrap_or_default().to_string(),
-            signature.clone(),
-            return_lltype.clone(),
-        ) else {
-            continue;
-        };
-        let key = FunctionPathKey::from_segments(segments.iter().map(|s| s.to_string()));
-        if registry.lookup(&key).is_some() {
-            continue;
-        }
-        registry.register_callee(key, signature, stub_pygraph);
+        register_opaque_external(registry, segments, argnames, return_lltype.clone());
     }
 }
 
@@ -5924,6 +5957,27 @@ mod tests {
                 ]))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn deref_write_external_has_two_parameter_void_stub() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::translator::rtyper::call_registry::CallRegistry;
+
+        let registry = CallRegistry::new(std::rc::Rc::new(Bookkeeper::new()));
+        register_deref_write_external(&registry);
+        let entry = registry
+            .lookup(&FunctionPathKey::from_segments(["__deref_write"]))
+            .expect("opaque deref-write marker must be registered");
+        assert_eq!(
+            entry.function_desc.borrow().signature.argnames,
+            vec!["ptr".to_string(), "value".to_string()]
+        );
+        assert!(
+            !entry.function_desc.borrow().cache.borrow().is_empty(),
+            "the annotator needs a cached stub graph for return inference"
+        );
+        assert_eq!(registry.len(), 1);
     }
 
     /// Pin the layering invariant
