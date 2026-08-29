@@ -758,6 +758,11 @@ pub fn clear_gc_write_barrier_hook() {
     GC_WRITE_BARRIER_HOOK.set(None);
 }
 
+/// Remove the before-move barrier callback.
+pub fn clear_gc_write_barrier_before_move_hook() {
+    GC_WRITE_BARRIER_BEFORE_MOVE_HOOK.set(None);
+}
+
 pub fn clear_gc_write_barrier_managed_hook() {
     GC_WRITE_BARRIER_MANAGED_HOOK.set(None);
 }
