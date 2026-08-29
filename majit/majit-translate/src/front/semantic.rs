@@ -549,17 +549,35 @@ impl<'a> MirGraphLookup<'a> {
 /// the `(receiver root, method leaf)` pair, and an ambiguous pair is treated
 /// as unresolved.
 ///
-/// The pass is inert in the production translation, and not for any reason
-/// inside it. A census over the build script's two pipeline invocations
-/// (489 and 4147 lowered functions) found **zero `OpKind::Hint` ops of any
-/// kind**, and neither frame constructor present in the set at all: the five
-/// hint sites are spelled in `pyre-interpreter` / `pyre-jit`, but nothing
-/// carrying one reaches the function set this pass runs over. So the seeds
-/// are empty before any of the machinery below gets a say, and every claim
-/// about which site seeds has to be re-measured once a hint does arrive —
-/// do not read a green gate here as agreement.
+/// The pass is inert in the production translation — it flags no graph at all
+/// — but the reason is inside it, not upstream of it.
 ///
-/// The two under-approximations that will bite first when one does:
+/// Re-measured by reproducing the prepass's own input: the canonical LLBC set
+/// (`majit-rlib`, `pyre-object`, `pyre-interpreter`, `pyre-jit`; no sidecars
+/// on a native build) and the module-path list derived from the same 296
+/// source files. That lowers 33,976 functions carrying **18 `OpKind::Hint`
+/// ops**, and every virtualizable hint site is present and correctly
+/// classified:
+///
+/// ```text
+/// pyframe::createframe_obj                     -> [AccessDirectly, FreshVirtualizable]
+/// pyframe::<Impl>::finish_for_call_with_globals_obj -> [AccessDirectly, FreshVirtualizable]
+/// eval::<Impl>::dispatch                       -> [AccessDirectly]
+/// executioncontext::app_profile_call           -> [NoAccessDirectly]
+/// executioncontext::<Impl>::_trace::<Impl>::call -> [NoAccessDirectly]
+/// ```
+///
+/// This pass runs over that finished list (`front::mir` calls it once, after
+/// the whole function set exists), so it sees all of them. With the roots
+/// registry seeded as production seeds it — `roots=1 ["PyFrame"]` — it still
+/// flags **zero** graphs. The hints arrive and the pass erases them.
+///
+/// An earlier census recorded here read zero `OpKind::Hint` ops and neither
+/// frame constructor in the set. Both halves are wrong: the constructors are
+/// in the set and carry their hints. Its conclusion survived its evidence,
+/// which is why the reason mattered — an absent hint would put the fix
+/// upstream, and an erased one puts it in the two under-approximations below.
+/// They are live suspects today, not contingencies:
 ///
 /// * `class_roots` answers with the ctor's own name for a struct literal,
 ///   because that is the spelling everything else uses — `adt_node_class_root`
@@ -568,6 +586,7 @@ impl<'a> MirGraphLookup<'a> {
 ///   reading that instead would answer with a spelling no comparison matches.
 ///   A root reachable only through `result_ty` is still unrecorded, and a hint
 ///   on an unrecorded or undeclared root seeds nothing — the erasing branch.
+///   This is the first thing to test against the five sites above.
 ///
 /// * One graph per function, where upstream keys a second on
 ///   `(AccessDirect, key)`. A callee reached by both a hinted and an unhinted
