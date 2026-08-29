@@ -398,8 +398,10 @@ this entry predicted. **The gate is no longer the implementation of frame
 events for JIT-eligible frames**, and a profiled call-free loop now measures
 the JIT.
 
-**The two hooks fail for different reasons, and the obvious repair of the
-second one is unsound.** Under `MAJIT_STATS=1` on the call-bearing loop,
+**The two hooks failed for different reasons, and the obvious repair of the
+second one is unsound.** Every number in the next three paragraphs is the
+diagnosis as it stood before the recorder landed; what replaced it is measured
+at the end of this section. Under `MAJIT_STATS=1` on the call-bearing loop,
 `sys.settrace` keeps its compilation — `loops_compiled=4`, `loops_aborted=0`,
 `guard_failures=3`, a summary line byte-identical to the bare arm's — so its
 whole cost is executed per-call dispatch inside compiled code. `sys.setprofile`
@@ -512,15 +514,25 @@ so it is never one. The per-opcode half is a different mechanism again —
 `dispatch_bytecode`'s explicit `we_are_jitted()` arm tests the *per-frame*
 `w_f_trace` through the virtualizable `debugdata`, not the global tracefunc.
 
-Where the green does pay is the profiled-call dispatch: `call_valuestack` and
-its keyword/ex siblings branch on `get_is_being_profiled()` before
-`call_args_and_c_profile`, and a real green folds those branches to nothing in
-the unprofiled trace while giving the profiled state its own cell, counter and
-procedure token. With the bracket landed and the call-free shape flat, this is
-now the remaining step rather than the last one, and the measurement above says
-which half to take first: `settrace` keeps its compilation, so its cost is
-entirely in that unfolded branch; `setprofile` aborts the recording before the
-branch can matter.
+**The green's two halves land differently here, and pyre already holds the one
+that survives.** `is_being_profiled` is a portal green
+(`pypyjit_driver_layout.rs`) and `driver.rs make_green_key(code_ptr, pc,
+is_being_profiled)` mints from it, so the profiled state does get its own cell,
+counter and procedure token: `profile_hook_c_call_is_bytecode_level_only`
+compiles 14 loops for its 7 arms, two keys each, which is that separation
+counted rather than assumed.
+
+The other half — folding `get_is_being_profiled()` out of the unprofiled trace
+— has nothing to fold. Upstream's branch is foldable because the JIT records
+through `call_valuestack` itself, so the test is an operation in the trace.
+pyre residualises the call, and the branch lives inside `call_jit.rs
+bh_call_fn_impl` where no recorded operation corresponds to it. Every read of
+the flag in `pyre-jit` and `pyre-jit-trace` sits at trace time, at green-key
+mint, or at portal entry — none per call in a compiled body — and
+`funccall_valuestack`, whose `PyFrame::call` conjunct is discussed above, is
+reached only from `pyre-interpreter`'s own CALL. This is §3.8's theme arriving
+at the cost model: the opaque objspace has already hidden the branch the fold
+was for, so the green cannot be where the remaining cost goes.
 
 **Falsification, run 2026-08-26 — passed.** The prediction was that restoring
 the activation bracket would leave event counts unchanged with the gate still
@@ -529,17 +541,50 @@ disjuncts be dropped without losing events. Both held: the gate now reads only
 the per-frame `w_f_trace` and the `call`/`return`/`c_call` multisets are
 unchanged, so the bracket was what the gate was standing in for.
 
-The successor claim, which this entry now stands or falls by: the two
-remaining costs are the unrecorded profile reporting and the unfolded per-call
-dispatch, in that order. The first is now bounded rather than guessed — the
-`setprofile` aborts DO survive a recorder that admits the profiled call, and
-`profile_hook_armed_before_a_hot_loop` is the instrument that says so. It is
-wrong if recording `c_call` / `c_return` into the builtin folds still leaves
-`setprofile` short of `settrace`'s regime, or if folding
-`get_is_being_profiled()` out of the unprofiled trace still leaves the
-call-bearing loop more than an order of magnitude off its bare arm — either
-would mean a third mechanism is in play that none of the bracket, the
-recorder, or the green accounts for.
+**The recorder landed, and a built control says it paid.** The decline is
+gone: `residual_call_c_profile_frame` gives the three CALL-family residual
+helpers `call_valuestack`'s C-profile diversion, and
+`walker_foldable_runtime_helper` withholds only the *fold identity* of those
+three helpers from a profiled walk, so the call is recorded as an opaque
+residual instead of aborting the trace. `DispatchError::ProfiledResidualCall`
+no longer exists.
+
+Measured against a binary built at this commit's own parent — the only valid
+control, since `PYRE_JIT=0` moves the bare arm as well as the profiled one and
+so is not one — on a hot profiled loop, five interleaved repetitions on a quiet
+machine, reported as ns/event because the bare arms are ~1 ms and divide out:
+
+| shape | control | with the recorder | |
+|---|---|---|---|
+| builtin callee (`len`) | 999–1019 | 788–826 | **1.27x** |
+| Python callee | 1305–1328 | 1136–1183 | **1.17x** |
+
+`MAJIT_STATS=1` on the same script gives the mechanism rather than the effect.
+The control reads `loops_compiled=3 loops_aborted=10`, with all ten on the
+reason ladder's fourth rung (`abrt_bridge=10`, `abrt_unclassified_default=10`)
+and two green keys banned outright (`abort_ceiling_banned=2`,
+`abort_ceiling_refused=2`). This tree reads `loops_compiled=5
+loops_aborted=0`, every abort counter at zero, and `caro_backedge` falls 12 → 4
+because a banned key keeps re-entering the merge point it can never compile.
+
+The successor claim this entry now stands or falls by: **the remaining cost is
+neither the bracket, the recorder, nor the green.** The bracket is landed and
+falsified-as-predicted; the recorder is landed and measured above; and the
+green cannot be it, for the reason given two paragraphs up — pyre has the half
+that separates cells and there is no per-call branch left to fold. Yet a
+profiled call-bearing loop still runs ~1.1 µs/event against pypy's 0.4 ns and
+CPython 3.14's 48.5, so the third mechanism the previous claim named as a
+falsifier IS in play, and naming it is the next step rather than a contingency.
+
+The first place to look is what a profiled compiled caller does with a callee
+it may not inline. `inline_call.rs` declines on `ec_hook_installed()` for any
+installed hook — correctly, since the walker has no route to record
+`executioncontext.py`'s `_trace`, which calls back into app-level Python — so
+the callee becomes a residual reaching `call_user_function_with_ctx`, where the
+plain interpreter's CALL would have taken `funccall_valuestack`'s
+`_flat_pycall`-shaped fast path. That is a hypothesis, not a measurement: the
+control above says compiling is better than not compiling, not that the
+compiled path is close to what it could be.
 
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
