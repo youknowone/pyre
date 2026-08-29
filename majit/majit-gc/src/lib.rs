@@ -554,7 +554,9 @@ pub trait GcAllocator: Send {
     /// the JIT allocation sites, it always is.
     fn alloc_varsize(&mut self, base_size: usize, item_size: usize, length: usize) -> GcRef;
 
-    /// Allocate a variable-size object with a known GC type id.
+    /// Allocate a variable-size object with a known GC type id. A collector
+    /// with a type table initializes that type's registered length field before
+    /// returning, matching `malloc_varsize`.
     fn alloc_varsize_typed(
         &mut self,
         type_id: u32,
@@ -714,7 +716,7 @@ pub trait GcAllocator: Send {
     /// allocates a smaller object and copies whenever the GC says no
     /// (`rgc.py:475-478`), so a collector that cannot resize anything is
     /// served by that path alone.
-    fn shrink_array(&self, _addr: usize, _smaller_length: usize) -> bool {
+    fn shrink_array(&mut self, _addr: usize, _smaller_length: usize) -> bool {
         false
     }
 
@@ -2941,6 +2943,12 @@ pub fn gc_owns_object(addr: usize) -> bool {
 /// "allocate a smaller object and copy into it" (`rgc.py:475-478`), and so must
 /// every caller here.
 pub fn gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
+    // A residual call copies its argument out of the jitframe before it enters
+    // host Rust.  A collection which ran at that boundary rewrites the
+    // jitframe/root slot but not the ABI copy, so follow the forwarding word
+    // before the backend reads the object's header.  RPython's GC transform
+    // makes the equivalent reload around `rgc.ll_shrink_array` automatically.
+    let addr = gc_current_object_address(addr);
     match ACTIVE_GC_SHRINK_ARRAY.get() {
         Some(f) => f(addr, smaller_length),
         None => false,

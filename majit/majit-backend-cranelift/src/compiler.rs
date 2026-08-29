@@ -2097,14 +2097,18 @@ fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
 }
 
-/// `llop.shrink_array`. Read-only on the collector, as
-/// `gc_owns_object_via_active_runtime` is.
+/// `llop.shrink_array`.  Mutates the GC-owned object's length word, so use the
+/// same exclusive collector path as allocation and write barriers.  The
+/// reentrant query path is only sound for read-only operations reached while a
+/// collection already owns the collector mutably.
 fn gc_shrink_array_via_active_runtime(addr: usize, smaller_length: usize) -> bool {
-    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.shrink_array(addr, smaller_length)) {
-        return r;
+    if gc_box::present() {
+        return gc_box::with_mut(|gc| gc.shrink_array(addr, smaller_length)).unwrap_or(false);
     }
-    majit_gc::gc_sync::is_initialized()
-        && majit_gc::gc_sync::gc_query_reentrant(|g| g.shrink_array(addr, smaller_length))
+    if majit_gc::gc_sync::is_initialized() {
+        return majit_gc::gc_sync::gc_op(|gc| gc.shrink_array(addr, smaller_length));
+    }
+    false
 }
 
 fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {
@@ -15347,20 +15351,13 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     let __descr_arc = op.getdescr();
-                    let (base_size, item_size, type_id) =
-                        if let Some(ad) = __descr_arc.as_ref().and_then(|d| d.as_array_descr()) {
-                            (
-                                builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
-                                builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
-                                builder.ins().iconst(cl_types::I64, ad.type_id() as i64),
-                            )
-                        } else {
-                            (
-                                builder.ins().iconst(cl_types::I64, 16),
-                                builder.ins().iconst(cl_types::I64, 8),
-                                builder.ins().iconst(cl_types::I64, 0),
-                            )
-                        };
+                    let ad = __descr_arc
+                        .as_ref()
+                        .and_then(|d| d.as_array_descr())
+                        .expect("NewArray/NewArrayClear requires an ArrayDescr");
+                    let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
+                    let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
+                    let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
                     let result = emit_collecting_gc_call(
                         &mut builder,
                         ptr_type,
@@ -25095,7 +25092,21 @@ mod tests {
 
     #[test]
     fn test_gc_call_malloc_array_helper_with_configured_runtime() {
-        let mut backend = make_gc_backend();
+        // The production helper receives a layout-registry type id.  Keep the
+        // fixture subject to that same contract: a header carrying an
+        // unregistered `7` is not a typed array and becomes an out-of-bounds
+        // type-table read as soon as a collection traces it.
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        for _ in 0..7 {
+            gc.register_type(TypeInfo::simple(16));
+        }
+        let array_tid = gc.register_type(TypeInfo::varsize(8, 8, 0, false, Vec::new()));
+        assert_eq!(array_tid, 7);
+        let mut backend = backend_with_gc(gc);
         let mut consts: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
         consts.insert(10000, gc_malloc_array_helper as *const () as i64);
         consts.insert(10001, 8_i64);

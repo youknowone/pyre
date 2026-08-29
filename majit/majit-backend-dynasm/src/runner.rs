@@ -1042,15 +1042,13 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
         && majit_gc::gc_sync::gc_query_reentrant(|g| g.is_managed_heap_object(addr))
 }
 
-/// `llop.shrink_array`. Read-only on the collector — it writes the object's
-/// length field, not the GC's own state — so both arms take a shared borrow,
-/// as `dynasm_gc_owns_object` does.
+/// `llop.shrink_array`.  This mutates a GC-owned object's length word, so it
+/// follows allocation and write barriers through the exclusive GC-operation
+/// path.  In particular, it must not use `gc_query_reentrant`: that helper is
+/// reserved for bounded read-only queries made while a collection may already
+/// hold the collector's `&mut`.
 fn dynasm_gc_shrink_array(addr: usize, smaller_length: usize) -> bool {
-    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.shrink_array(addr, smaller_length)) {
-        return r;
-    }
-    majit_gc::gc_sync::is_initialized()
-        && majit_gc::gc_sync::gc_query_reentrant(|g| g.shrink_array(addr, smaller_length))
+    with_dynasm_active_gc_mut(|gc| gc.shrink_array(addr, smaller_length)).unwrap_or(false)
 }
 
 fn dynasm_gc_is_nursery_object(addr: usize) -> bool {
