@@ -9663,6 +9663,13 @@ pub(crate) fn try_walker_orthodox_unary_positive<Sym: WalkSym>(
 }
 
 /// `-x`: descend `neg`.  See [`try_walker_orthodox_unary`].
+///
+/// `-INT_MIN` is the one operand `descr_neg` promotes, and it belongs to the
+/// [`try_walker_specialize_unary_negative_int`] fold behind this descent: the
+/// descent records the promotion's two `rbigint` calls as hoisted `CallPure*`
+/// short boxes, so the promoted long crosses the LABEL as a loop argument and
+/// `compare_op_long`'s `jit_bigint_cmp` is re-emitted in the loop body; the
+/// fold's `guard_value` on the operand makes that chain constant instead.
 pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9670,6 +9677,11 @@ pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if let Some((x, _)) = walker_unary_int_operand(ctx, operand)
+        && x == i64::MIN
+    {
+        return Ok(None);
+    }
     try_walker_orthodox_unary(ctx, op_pc, operand, dst, dst_bank, &UNARY_NEGATIVE_DESCENT)
 }
 
