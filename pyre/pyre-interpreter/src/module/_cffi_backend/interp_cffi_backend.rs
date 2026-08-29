@@ -8,7 +8,7 @@ use super::parse_c_type;
 /// it tracks the vendored `lib_pypy/cffi` rather than anything of pyre's.
 pub const VERSION: &str = "1.18.0.dev0";
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(ns, "__version__", pyre_object::w_str_new(VERSION));
 
     // `clibffi.FFI_DEFAULT_ABI`.  `FFI_CDECL` is the win32 spelling of the
@@ -136,6 +136,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             crate::make_module_builtin_function("getwinerror", super::cerrno::getwinerror),
         ),
     );
+
+    Ok(())
 }
 
 const MODULE: &str = "_cffi_backend";
