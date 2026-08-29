@@ -14186,35 +14186,3 @@ fn the_traceback_walk_receivers_pin_their_class_through_the_payload() {
         "list is acceptable as a base class, so its payload does not determine w_class",
     );
 }
-
-/// The modelled `locals()` expansion asks `trace_limit` whether it fits before
-/// it emits, because both of its arms emit the whole unroll inside ONE Python
-/// opcode step and the walk asks that question only after the step returns
-/// (`mod.rs`).  Upstream asks it after every jitcode step
-/// (`pyjitpl.py` `MetaInterp._interpret`), so the `fast2locals` it looks into
-/// is interrupted between its own steps; without this the overshoot here is
-/// the frame's `co_nlocals` and nothing bounds it.
-///
-/// The boundary is the whole content of the gate, so it is pinned on both
-/// sides rather than sampled — and the saturating arithmetic is pinned too,
-/// because a width that wraps would answer "fits" for the one input that
-/// cannot.
-#[test]
-fn locals_expansion_asks_trace_limit_rather_than_a_width() {
-    use super::specialize::locals_expansion_fits;
-
-    // One guard plus at most one store per slot, so 44 slots need 88 ops.
-    assert!(locals_expansion_fits(0, 88, 44), "exactly the budget fits");
-    assert!(!locals_expansion_fits(0, 87, 44), "one op over does not");
-    // What is already recorded counts: the same frame fits in a fresh walk and
-    // not in one that has spent its budget, which is the point of asking here
-    // rather than carrying a constant.
-    assert!(locals_expansion_fits(6000 - 88, 6000, 44));
-    assert!(!locals_expansion_fits(6000 - 87, 6000, 44));
-    // A frame with no slots emits nothing, so it fits even at the limit.
-    assert!(locals_expansion_fits(6000, 6000, 0));
-    assert!(!locals_expansion_fits(6001, 6000, 0), "already over");
-    // Neither multiplication nor addition may wrap into a "fits".
-    assert!(!locals_expansion_fits(0, usize::MAX - 1, usize::MAX));
-    assert!(!locals_expansion_fits(usize::MAX, usize::MAX - 1, 1));
-}

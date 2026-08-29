@@ -446,6 +446,7 @@ spec_folds! {
     KwonlyDefaultsInline => ("kwonly_defaults_inline",   "inline_call",   "-"),
     LoadSuperAttr        => ("load_super_attr",          "residual_call", "-"),
     SuperAttrUnwrap      => ("super_attr_unwrap",        "residual_call", "load_super_attr"),
+    LocalsTraceLimitCut  => ("builtin_locals_trace_limit_cut", "specialize", "builtin_locals"),
 }
 
 const SPEC_FOLD_COUNT: usize = SPEC_FOLD_ROWS.len();
@@ -704,6 +705,38 @@ pub(crate) fn spec_gate<T, E>(
         }
     }
     outcome
+}
+
+/// The `locals()` expansion's trace-limit cut.  Returns whether to cut.
+///
+/// [`spec_gate`] reads a fold's `Ok(Some(_))` as fired, and this decision has
+/// no such value to be read off -- it ends the TRACE rather than returning a
+/// specialization -- so the row is driven from the decision point instead of
+/// wrapping a call.  It is asked only once the recorded length has already
+/// crossed `trace_limit`, so `consulted` counts the crossings that happened
+/// inside an expansion and `fired` counts the ones that cut.
+///
+/// Suppressing `builtin_locals_trace_limit_cut` restores the pre-cut
+/// behaviour: the unroll runs to its end and the overshoot is left to the
+/// opcode-level check in `mod.rs`.  That is what makes the "without the cut"
+/// half of `locals_expansion_trace_too_long`'s table reproducible from one
+/// binary, and it is the same reason the three orthodox sub-walk rows carry a
+/// row at all.
+#[inline]
+pub(crate) fn spec_gate_locals_trace_limit_cut() -> bool {
+    if !spec_instrumented() {
+        return true;
+    }
+    let idx = SpecFold::LocalsTraceLimitCut.index();
+    if spec_suppressed_mask().get(idx) {
+        SPEC_SUPPRESSED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    if fbw_spec_census_enabled() {
+        SPEC_CONSULTED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SPEC_FIRED[idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
 }
 
 /// The STORE_ATTR gate.  One call, two firing outcomes: `Direct` folded the
