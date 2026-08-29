@@ -396,6 +396,7 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     );
     majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
     majit_gc::set_active_gc_shrink_array(Some(gc_shrink_array_via_active_runtime));
+    majit_gc::set_active_gc_varsize_layout(Some(gc_varsize_layout_via_active_runtime));
     majit_gc::set_active_gc_is_nursery_object(Some(gc_is_nursery_object_via_active_runtime));
     majit_gc::set_active_gc_id_or_identityhash(Some(id_or_identityhash_via_active_runtime));
     majit_gc::set_active_write_barrier(Some(gc_write_barrier_via_active_runtime));
@@ -1963,6 +1964,18 @@ fn gc_shrink_array_via_active_runtime(addr: usize, smaller_length: usize) -> boo
         return majit_gc::gc_sync::gc_op(|gc| gc.shrink_array(addr, smaller_length));
     }
     false
+}
+
+fn gc_varsize_layout_via_active_runtime(addr: usize) -> Option<majit_gc::GcVarSizeLayout> {
+    let obj = GcRef(addr);
+    if let Some(r) = gc_box::with_reentrant_ref(|gc| gc.varsize_layout(obj)) {
+        return r;
+    }
+    if majit_gc::gc_sync::is_initialized() {
+        majit_gc::gc_sync::gc_query_reentrant(|g| g.varsize_layout(obj))
+    } else {
+        None
+    }
 }
 
 fn gc_is_nursery_object_via_active_runtime(addr: usize) -> bool {

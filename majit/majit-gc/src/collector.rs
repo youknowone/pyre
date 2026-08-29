@@ -8374,6 +8374,22 @@ impl GcAllocator for MiniMarkGC {
         MiniMarkGC::shrink_array(self, addr, smaller_length)
     }
 
+    fn varsize_layout(&self, obj: GcRef) -> Option<crate::GcVarSizeLayout> {
+        if obj.is_null() || !self.is_managed_heap_object(obj.0) {
+            return None;
+        }
+        let type_id = unsafe { (*header_of(obj.0)).type_id() };
+        if type_id as usize >= self.types.len() {
+            return None;
+        }
+        let info = self.types.get(type_id);
+        (info.item_size != 0).then_some(crate::GcVarSizeLayout {
+            base_size: info.size,
+            item_size: info.item_size,
+            items_have_gc_ptrs: info.items_have_gc_ptrs,
+        })
+    }
+
     fn debug_validate_oldgen_freeblocks(&self, site: &str) {
         self.oldgen.debug_validate_freeblocks(site);
     }
@@ -14936,6 +14952,25 @@ cache size\t: 8192 kB\n";
 
         assert_eq!(gc.old_objects_pointing_to_young.len(), before + 1);
         assert!(gc.old_objects_pointing_to_young.contains(&array.0));
+    }
+
+    /// The four-argument arraymove residual recovers its array token from the
+    /// same TYPE_INFO row the collector uses to walk the variable part.
+    #[test]
+    fn varsize_layout_reports_registered_array_shape() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(24, 16, 8, true, vec![]));
+        let array = gc.alloc_varsize_typed(tid, 24, 16, 3);
+
+        let dynamic: &dyn crate::GcAllocator = &gc;
+        assert_eq!(
+            dynamic.varsize_layout(array),
+            Some(crate::GcVarSizeLayout {
+                base_size: 24,
+                item_size: 16,
+                items_have_gc_ptrs: true,
+            })
+        );
     }
 
     /// An array with no card marked has nothing the move could invalidate.

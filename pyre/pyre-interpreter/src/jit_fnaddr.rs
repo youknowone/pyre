@@ -2452,6 +2452,16 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         "pyre_object::jit_ll_shrink_array",
         pyre_object::lowlevel_string::jit_ll_shrink_array,
     );
+    // `rgc.ll_arraymove` / `list.ll_arraymove` keeps PyPy's four-argument
+    // residual ABI. The target recovers the registered array token from the
+    // GC TYPE_INFO row, runs the before-move barrier for reference items, and
+    // performs overlap-safe raw memmove.
+    cpa4(
+        &mut entries,
+        "pyre_object::object_array::jit_ll_arraymove",
+        "pyre_object::jit_ll_arraymove",
+        pyre_object::object_array::jit_ll_arraymove,
+    );
     // `dont_look_inside` residual append targets for the StringBuilder value:
     // `guess_call_kind` residualizes a call whose leaf is `ll_append_res0` /
     // `ll_append_res_slice` once its native fnaddr is bound. Unlike shrink, these
