@@ -9120,6 +9120,12 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // (BoxInt exec, generic residual below) requires every box bound.
     ensure_residual_call_args_bound(&allboxes, op.pc)?;
 
+    // `w_bool_from(truth)` inside a descended body: guard the truth and take
+    // the singleton, as `space.newbool` traces.
+    if try_walker_fold_newbool_call(ctx, op.pc, &allboxes, &i_args, dst, dst_bank)?.is_some() {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+
     // BoxInt fold (#62): `box_int_fn(raw)` allocates a fresh `PyLong`.  The
     // opaque CanRaise residual the generic leg would record blocks the
     // optimizer (no DCE of an unused/round-tripped box).  Emit the
@@ -9327,6 +9333,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     // operand layout whose class compares `is_w` by value.
                     try_walker_fold_is_op(ctx, op.pc, op_tag, &r_args, dst, dst_bank)?
                 } else {
+                    // Descend the helper whole ahead of the hand folds, so
+                    // their `consulted` counts read whether the descent
+                    // took the site.
+                    if let Some(outcome) = spec_gate(SpecFold::CompareOpDescent, || {
+                        try_walker_orthodox_compare_op(
+                            ctx, op.pc, op_tag, tag_opref, &r_args, dst, dst_bank,
+                        )
+                    })? {
+                        return Ok((outcome, op.next_pc));
+                    }
                     // int compare first; then long (two-bigint operands keep
                     // bigint comparison); float (incl. mixed int/float) last.
                     match spec_gate(SpecFold::CompareOpInt, || {

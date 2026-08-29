@@ -1,4 +1,4 @@
-# pyre-check: spec-folds=binary_op_int,truth_bool,compare_op_int
+# pyre-check: spec-folds=binary_op_int,truth_bool,compare_op_descent
 # The three folds that carry most of the corpus's fold traffic, and nothing
 # declared any of them, so switching one off was a silent change. This fixture
 # fires them 398/69/65 times, the widest margin of any fixture firing all three.

@@ -7488,7 +7488,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
 /// into the operand-stack slot the guard's own resume image describes, and
 /// swapping the prebuilt singleton in for a recorded call result leaves it
 /// storing the same value.
-fn walker_newbool_guarded<Sym: WalkSym>(
+pub(crate) fn walker_newbool_guarded<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     truth: OpRef,
@@ -7515,6 +7515,62 @@ fn walker_newbool_guarded<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
     );
     Ok(Some(const_bool))
+}
+
+/// A `w_bool_from(truth)` residual met inside a descended body, folded the
+/// way `space.newbool` traces: a guard on the truth and the prebuilt
+/// singleton as a constant, instead of the elidable call the codewriter
+/// classifies it as (`call.rs BOOL_FROM_TARGETS`), which a variable truth
+/// would keep as one call per comparison.  The callee is recognised by its
+/// published address (`runtime_fnaddr_by_path`).  A constant truth needs no
+/// guard.  Declines when the truth has no concrete value or the descr shape
+/// is not the one-int-argument, ref-result one.
+pub(crate) fn try_walker_fold_newbool_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    allboxes: &[OpRef],
+    i_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    if !ctx.fbw_mode.inline_subwalk || dst_bank != 'r' || i_args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(&funcbox) = allboxes.first() else {
+        return Ok(None);
+    };
+    if !funcbox.is_constant() {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcbox) else {
+        return Ok(None);
+    };
+    if crate::runtime_fnaddr_patch::runtime_fnaddr_by_path("pyre_object::boolobject::w_bool_from")
+        != Some(addr)
+    {
+        return Ok(None);
+    }
+    let truth = i_args[0];
+    let Some(majit_ir::Value::Int(value)) = ctx.trace_ctx.box_value(truth) else {
+        return Ok(None);
+    };
+    let observed = value != 0;
+    let result = if truth.is_constant() {
+        let result_obj = pyre_object::w_bool_from(observed);
+        let const_bool = ctx.trace_ctx.const_ref(result_obj as i64);
+        ctx.trace_ctx.set_opref_concrete(
+            const_bool,
+            majit_ir::Value::Ref(majit_ir::GcRef(result_obj as usize)),
+        );
+        const_bool
+    } else {
+        let Some(guarded) = walker_newbool_guarded(ctx, op_pc, truth, observed, dst_bank)? else {
+            return Ok(None);
+        };
+        guarded
+    };
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    Ok(Some(()))
 }
 
 /// Does `tp` name a layout whose class overrides `is_w` with a value
@@ -9432,6 +9488,13 @@ const BINARY_OP_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "BINARY-OP-SUBWALK",
 };
 
+const COMPARE_OP_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::opcode_ops::compare_value_from_tag",
+    commit_label: "compare_op_commit",
+    call_site_label: "compare_op_call_site",
+    decline_tag: "COMPARE-OP-SUBWALK",
+};
+
 /// Descend an operator's body whole instead of re-emitting an arm of it by
 /// hand.
 ///
@@ -9711,6 +9774,61 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         dst,
         dst_bank,
         &BINARY_OP_DESCENT,
+    )
+}
+
+/// `COMPARE_OP` on two exact builtin machine ints (`int`, `bool`): descend
+/// `compare_value_from_tag` → `compare` → `compare_slot` → `int_lt` and its
+/// siblings instead of re-emitting the arm by hand
+/// (`try_walker_specialize_compare_op_int`).  See
+/// [`try_walker_orthodox_binary_op`] for the operand policy; the body's
+/// override probe is promoted away for such a pair
+/// (`descroperation.rs compare`), and the `bool`-vs-`int` subtype ordering
+/// it keeps is decided on the promoted classes.
+///
+/// Tags 0..=5 are the six rich comparisons.  `in` / `not in` (6, 7) take
+/// `contains`, `is` / `is_not` (8, 9) have their own fold, and
+/// CHECK_EXC_MATCH (10) its own; none of them is this body's comparison.
+pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    op_tag: i64,
+    tag: OpRef,
+    r_args: &[OpRef],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    if !ctx.is_authoritative_executor
+        || r_args.len() != 2
+        || dst_bank != 'r'
+        || !(0..=5).contains(&op_tag)
+    {
+        return Ok(None);
+    }
+    let mut operands = [(OpRef::NONE, std::ptr::null_mut()); 2];
+    for (slot, &operand) in operands.iter_mut().zip(r_args) {
+        let Some(obj) = walker_concrete_ref_object(ctx, operand) else {
+            return Ok(None);
+        };
+        // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker
+        // shadow.
+        let admitted = unsafe {
+            pyre_object::is_exact_builtin_instance(obj)
+                && (pyre_object::is_int(obj) || pyre_object::is_bool(obj))
+        };
+        if !admitted {
+            return Ok(None);
+        }
+        *slot = (operand, obj);
+    }
+    try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[(tag, op_tag)],
+        &operands,
+        dst,
+        dst_bank,
+        &COMPARE_OP_DESCENT,
     )
 }
 
