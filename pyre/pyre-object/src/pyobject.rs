@@ -892,11 +892,13 @@ pub fn compute_subclass_ranges_from(alias_chains: &[&[SubclassRangeAlias]]) {
 /// differs. A later GC writeback is byte-identical.
 static SUBCLASS_RANGES_INIT: OnceLock<()> = OnceLock::new();
 
-// `dont_look_inside`: one-time host initialization (`OnceLock` +
-// global type-table walk) stays opaque to the JIT — production
-// entry points have run the full init before any trace executes,
-// so the residual call is a no-op there.
-#[majit_macros::dont_look_inside]
+// `not_in_trace`: one-time host initialization (`OnceLock` + global
+// type-table walk).  It still runs while tracing and blackholing, and
+// production entry points have run the full init before any trace
+// executes, so compiled code omits the call: as a residual it was one
+// effectful call — and a heap-cache flush — on every traced
+// `is_exception` probe.
+#[majit_macros::not_in_trace]
 pub extern "C" fn ensure_object_subclass_ranges_initialized() {
     SUBCLASS_RANGES_INIT.get_or_init(|| {
         let aliases = all_subclass_range_aliases();
