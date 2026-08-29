@@ -931,6 +931,15 @@ impl<'a> Transformer<'a> {
         for block_idx in 0..rewritten.blocks.len() {
             self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
+        // A rewrite can itself define a condition as a constant (notably the
+        // false result paired with `can_enter_jit`'s `loop_header`).  Follow
+        // that constant exit after rewriting, matching the block-following
+        // half of upstream jtransform, then discard the disconnected arm and
+        // the now-dead condition definition.
+        if crate::model::fold_constant_exitswitch(&mut rewritten) > 0 {
+            crate::model::clear_unreachable_blocks(&mut rewritten);
+            crate::model::prune_dead_phis(&mut rewritten);
+        }
 
         GraphTransformResult {
             graph: rewritten,
@@ -3761,7 +3770,8 @@ impl<'a> Transformer<'a> {
         // pyre keys on the direct_call callee identity since the front-end
         // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
         if let Some(key) = jit_marker_key_from_target(target, &self.config.jitdriver_receiver_roots)
-            && let Some(ops) = self.try_handle_jit_marker(key, args, graph)
+            && let Some(ops) =
+                self.try_handle_jit_marker(key, args, op.result.as_ref(), graph)
         {
             return RewriteResult::Replace(ops);
         }
@@ -5824,6 +5834,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         key: JitMarkerKey,
         args: &[crate::flowspace::model::Variable],
+        result: Option<&crate::flowspace::model::Variable>,
         graph: &crate::model::FunctionGraph,
     ) -> Option<Vec<SpaceOperation>> {
         let jitdriver_index = self.portal_jd_index?;
@@ -5833,7 +5844,13 @@ impl<'a> Transformer<'a> {
             && let Some(jd) = cc.jitdriver_sd_from_jitdriver(jitdriver_index)
             && !jd.active
         {
-            return Some(Vec::new());
+            return Some(match (key, result) {
+                (JitMarkerKey::CanEnterJit, Some(result)) => vec![SpaceOperation {
+                    result: Some(result.clone()),
+                    kind: OpKind::ConstInt(0),
+                }],
+                _ => Vec::new(),
+            });
         }
         match key {
             JitMarkerKey::LoopHeader | JitMarkerKey::CanEnterJit => {
@@ -5857,8 +5874,20 @@ impl<'a> Transformer<'a> {
                     );
                 }
                 // jtransform.py:1723 `handle_jit_marker__can_enter_jit =
-                // handle_jit_marker__loop_header`.
-                Some(self.handle_jit_marker__loop_header(jitdriver_index))
+                // handle_jit_marker__loop_header`.  `rewrite_can_enter_jits`
+                // runs after `make_jitcodes`, so the portal jitcode observes
+                // only this loop header and a false result for pyre's
+                // interpreter-only boolean carrier.
+                let mut ops = self.handle_jit_marker__loop_header(jitdriver_index);
+                if key == JitMarkerKey::CanEnterJit
+                    && let Some(result) = result
+                {
+                    ops.push(SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                }
+                Some(ops)
             }
             JitMarkerKey::JitMergePoint => {
                 let (num_greens, autoreds, green_kinds, red_kinds, driver_name) = {
@@ -11537,6 +11566,7 @@ mod tests {
             .try_handle_jit_marker(
                 merge_key,
                 &[receiver, next_instr, profiled, pycode, frame, ec],
+                None,
                 &graph,
             )
             .expect("recognized portal marker must lower");
@@ -11556,15 +11586,19 @@ mod tests {
         let enter_key =
             jit_marker_key_from_target(&enter_target, &default_jitdriver_receiver_roots())
                 .expect("source can_enter_jit method must be recognized");
+        let enter_result = graph.alloc_value_var();
         let enter_ops = transformer
-            .try_handle_jit_marker(enter_key, &[], &graph)
+            .try_handle_jit_marker(enter_key, &[], Some(&enter_result), &graph)
             .expect("recognized can_enter_jit marker must lower");
         assert!(matches!(
             enter_ops.as_slice(),
             [SpaceOperation {
                 kind: OpKind::LoopHeader { jitdriver_index },
                 ..
-            }] if *jitdriver_index == resolved_driver
+            }, SpaceOperation {
+                result: Some(result),
+                kind: OpKind::ConstInt(0),
+            }] if *jitdriver_index == resolved_driver && result == &enter_result
         ));
         assert!(
             !enter_ops
@@ -11578,18 +11612,81 @@ mod tests {
     fn try_handle_jit_marker_can_enter_jit_aliases_to_loop_header() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_portal_jd(Some(2));
+        let mut graph = crate::model::FunctionGraph::new("fixture");
+        let result = graph.alloc_value_var();
         let ops = transformer
             .try_handle_jit_marker(
                 JitMarkerKey::CanEnterJit,
                 &[],
-                &crate::model::FunctionGraph::new("fixture"),
+                Some(&result),
+                &graph,
             )
             .expect("can_enter_jit should dispatch when portal_jd is set");
-        assert_eq!(ops.len(), 1);
+        assert_eq!(ops.len(), 2);
         match &ops[0].kind {
             OpKind::LoopHeader { jitdriver_index } => assert_eq!(*jitdriver_index, 2),
             other => panic!("expected LoopHeader, got {other:?}"),
         }
+        assert!(matches!(
+            &ops[1],
+            SpaceOperation {
+                result: Some(defined),
+                kind: OpKind::ConstInt(0),
+            } if defined == &result
+        ));
+    }
+
+    #[test]
+    fn can_enter_jit_result_folds_to_false_path_after_loop_header() {
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("can_enter_jit_false_path");
+        let entry = graph.startblock;
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        let receiver = graph.alloc_value_var();
+        let entered = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "can_enter_jit",
+                        Some("PyPyJitDriver".into()),
+                    ),
+                    args: vec![receiver],
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .expect("boolean marker call defines its branch condition");
+        graph.set_branch(entry, entered, if_true, vec![], if_false, vec![]);
+        let true_value = graph
+            .push_op_var(if_true, OpKind::ConstInt(1), true)
+            .unwrap();
+        graph.set_return(if_true, Some(true_value));
+        let false_value = graph
+            .push_op_var(if_false, OpKind::ConstInt(0), true)
+            .unwrap();
+        graph.set_return(if_false, Some(false_value));
+
+        let result = Transformer::new(&config)
+            .with_portal_jd(Some(0))
+            .transform(&graph);
+        let entry = &result.graph.blocks[entry.0];
+        assert!(entry
+            .operations
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::LoopHeader { jitdriver_index: 0 })));
+        assert!(!result
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(op.kind, OpKind::Call { .. })));
+        assert!(entry.exitswitch.is_none());
+        assert_eq!(entry.exits.len(), 1);
+        assert_eq!(entry.exits[0].target, if_false);
+        assert!(result.graph.blocks[if_true.0].operations.is_empty());
+        assert!(!result.graph.blocks[if_false.0].operations.is_empty());
     }
 
     #[test]
@@ -11617,6 +11714,7 @@ mod tests {
         let _ = transformer.try_handle_jit_marker(
             JitMarkerKey::CanEnterJit,
             &[],
+            None,
             &crate::model::FunctionGraph::new("fixture"),
         );
     }
@@ -11649,6 +11747,7 @@ mod tests {
                 .try_handle_jit_marker(
                     JitMarkerKey::LoopHeader,
                     &[],
+                    None,
                     &crate::model::FunctionGraph::new("fixture"),
                 )
                 .expect("inactive driver still dispatches (then drops)");
@@ -11666,6 +11765,7 @@ mod tests {
             .try_handle_jit_marker(
                 JitMarkerKey::LoopHeader,
                 &[],
+                None,
                 &crate::model::FunctionGraph::new("fixture"),
             )
             .expect("active driver dispatches");
@@ -11723,6 +11823,7 @@ mod tests {
                 .try_handle_jit_marker(
                     JitMarkerKey::LoopHeader,
                     &[],
+                    None,
                     &crate::model::FunctionGraph::new("fixture")
                 )
                 .is_none()
@@ -11828,7 +11929,7 @@ mod tests {
         FunctionGraph::set_concretetype_of_inline(&r1_var, ConcreteType::Signed);
         let args_vars = vec![receiver_var, g1_var.clone(), g2_var.clone(), r1_var.clone()];
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args_vars, &graph)
+            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args_vars, None, &graph)
             .expect("portal_jd + cc + 2-greens + 1-red satisfies dispatch preconditions");
 
         assert_eq!(ops.len(), 7, "promote_greens(2 greens)*2 + merge*3 = 7");
@@ -11937,6 +12038,7 @@ mod tests {
             .try_handle_jit_marker(
                 JitMarkerKey::JitMergePoint,
                 &[receiver, pc, program, vm, base],
+                None,
                 &graph,
             )
             .expect("portal_jd + cc + 2 greens + 2 reds satisfies dispatch preconditions");
@@ -12000,6 +12102,7 @@ mod tests {
             .try_handle_jit_marker(
                 JitMarkerKey::JitMergePoint,
                 &[receiver, next_instr, profiled, pycode, frame, ec],
+                None,
                 &graph,
             )
             .expect("declared greens-first marker should lower");
@@ -12059,6 +12162,7 @@ mod tests {
         let _ = transformer.try_handle_jit_marker(
             JitMarkerKey::JitMergePoint,
             &[receiver, frame, ec, next_instr, profiled, pycode],
+            None,
             &graph,
         );
     }
@@ -12106,7 +12210,12 @@ mod tests {
             kind: OpKind::ConstInt(7),
         });
         let args_vars = vec![receiver_var, g1_var, red_var];
-        let _ = transformer.try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args_vars, &graph);
+        let _ = transformer.try_handle_jit_marker(
+            JitMarkerKey::JitMergePoint,
+            &args_vars,
+            None,
+            &graph,
+        );
     }
 
     /// Synthetic Rust-wrapper elision must accept a single-arg `Ok(_)`

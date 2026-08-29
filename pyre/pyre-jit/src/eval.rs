@@ -1645,6 +1645,41 @@ pub(crate) enum LoopResult {
     ExitFrameWithException(pyre_interpreter::PyError),
 }
 
+fn set_pending_loop_exit(ec: *const PyExecutionContext, loop_result: LoopResult) {
+    let pending = match loop_result {
+        LoopResult::Done(result) => {
+            pyre_interpreter::executioncontext::PendingLoopExit::Done(result)
+        }
+        LoopResult::ContinueRunningNormally => {
+            pyre_interpreter::executioncontext::PendingLoopExit::ContinueRunningNormally
+        }
+        LoopResult::ExitFrameWithException(err) => {
+            pyre_interpreter::executioncontext::PendingLoopExit::ExitFrameWithException(err)
+        }
+    };
+    // The EC carrier is included in the interpreter root walk because its
+    // PyResult/PyError payload can hold moving GC references.  This store and
+    // the caller's take are also adjacent with no collection point in between:
+    // the marker returns only its boolean before the read.
+    unsafe { (&mut *(ec as *mut PyExecutionContext)).set_pending_loop_exit(pending) };
+}
+
+fn take_pending_loop_exit(ec: *const PyExecutionContext) -> LoopResult {
+    match unsafe { (&mut *(ec as *mut PyExecutionContext)).take_pending_loop_exit() }
+        .expect("true can_enter_jit result must carry a pending loop exit")
+    {
+        pyre_interpreter::executioncontext::PendingLoopExit::Done(result) => {
+            LoopResult::Done(result)
+        }
+        pyre_interpreter::executioncontext::PendingLoopExit::ContinueRunningNormally => {
+            LoopResult::ContinueRunningNormally
+        }
+        pyre_interpreter::executioncontext::PendingLoopExit::ExitFrameWithException(err) => {
+            LoopResult::ExitFrameWithException(err)
+        }
+    }
+}
+
 /// Action from handle_jit_outcome for eval_loop_jit dispatch.
 enum JitAction {
     Return(PyResult),
@@ -6156,10 +6191,10 @@ impl PyPyJitDriver {
     }
 
     /// interp_jit.py:114-117 — can_enter_jit at back-edge.
-    /// The untranslated body is intentionally a runtime no-op.  The translator
-    /// lowers it to `jit_marker('can_enter_jit', ...)`, which jtransform aliases
-    /// to the JitCode `loop_header` operation.  The live runtime warmstate call
-    /// remains alongside it until generic `warmspot.apply_jit` is wired.
+    /// The translator lowers the call to the JitCode `loop_header` operation
+    /// and defines its result as false.  The untranslated interpreter body is
+    /// the `rewrite_can_enter_jits` side: it drives warmstate outside the portal
+    /// jitcode and reports a compiled-loop exit through the execution context.
     ///
     /// The argument order mirrors `jit_merge_point` so both markers carry one
     /// shape, but this marker's operands are discarded: it lowers to
@@ -6173,8 +6208,41 @@ impl PyPyJitDriver {
         pycode: pyre_object::PyObjectRef,
         frame: &mut PyFrame,
         ec: *const PyExecutionContext,
-    ) {
-        let _ = (frame, ec, next_instr, pycode, is_being_profiled);
+    ) -> bool {
+        let env = PyreEnv;
+        let (driver, info) = driver_pair();
+        let loop_pycode = pycode as *const ();
+        let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
+        let green_key = driver.resolve_cell_key(green_key_hash, || {
+            pyre_jit_trace::driver::make_green_key_typed(
+                loop_pycode,
+                next_instr,
+                is_being_profiled,
+            )
+        });
+        if portal_metatrace_enabled()
+            && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                >= portal_metatrace_skip()
+            && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            drive_portal_metatrace(frame as *mut PyFrame, green_key_hash, next_instr);
+        }
+        // The Stage-0 drive records IR and executes residuals concretely, so it
+        // is a collection point; reload the same shadow-stack root before the
+        // compile path reads the frame.
+        let f: *mut PyFrame = FrameView::top_frame();
+        let Some(loop_result) = maybe_compile_and_run(
+            unsafe { &mut *f },
+            green_key,
+            next_instr,
+            driver,
+            info,
+            &env,
+        ) else {
+            return false;
+        };
+        set_pending_loop_exit(ec, loop_result);
+        true
     }
 }
 
@@ -10265,66 +10333,17 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 let marker_ec = pyre_interpreter::call::getexecutioncontext();
                 let marker_pycode = unsafe { &*f }.pycode as pyre_object::PyObjectRef;
                 let marker_profiled = unsafe { &*f }.get_is_being_profiled();
-                pypyjitdriver.can_enter_jit(
+                if pypyjitdriver.can_enter_jit(
                     loop_header_pc,
                     marker_profiled,
                     marker_pycode,
                     unsafe { &mut *f },
                     marker_ec,
-                );
-                // can_enter_jit is a lowered no-op / merge point; re-seed
-                // conservatively before the next frame reads.
-                let f: *mut PyFrame = FrameView::top_frame();
-                // Compute these after the merge point: the portal split requires every
-                // live-across value to be a declared green or red. Upstream bakes the
-                // driver into the enter function and reaches the space through `self.space`.
-                let env = PyreEnv;
-                let (driver, info) = driver_pair();
-                let loop_pycode = unsafe { &*f }.pycode;
-                let loop_profiled = unsafe { &*f }.get_is_being_profiled();
-                let green_key_hash = make_green_key(loop_pycode, loop_header_pc, loop_profiled);
-                // The same resolve the function-entry door takes, for the same
-                // reason: `maybe_compile_and_run` and everything it reads
-                // (`has_runnable_compiled_loop`, `runnable_procedure_token`,
-                // `maybe_compile_decision`) answer for whichever cell HEADS a
-                // chained bucket, so a bare hash decides about one cell while
-                // `force_start_tracing_for_key` — which walks the chain — acts
-                // on another.  A loop-header key gets a chained bucket from the
-                // hash-form installers (`disable_noninlinable_function`,
-                // `prepare_trace_segmenting`) and from the inlined-callee
-                // merge point in `jitcode_dispatch`, which mints its callee's
-                // loop header as a raw `make_green_key`.
-                let green_key = driver.resolve_cell_key(green_key_hash, || {
-                    pyre_jit_trace::driver::make_green_key_typed(
-                        loop_pycode,
-                        loop_header_pc,
-                        loop_profiled,
-                    )
-                });
-                if portal_metatrace_enabled()
-                    && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        >= portal_metatrace_skip()
-                    && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
-                {
-                    drive_portal_metatrace(f, green_key_hash, loop_header_pc);
-                }
-                // The Stage-0 drive records IR and executes residuals
-                // concretely, so it is a collection point; re-seed before the
-                // compile path reads the frame. A plain reload of the same
-                // shadow-stack slot, so the knob-off path reads the value it
-                // already held.
-                let f: *mut PyFrame = FrameView::top_frame();
-                if let Some(loop_result) = maybe_compile_and_run(
-                    unsafe { &mut *f },
-                    green_key,
-                    loop_header_pc,
-                    driver,
-                    info,
-                    &env,
                 ) {
                     // maybe_compile_and_run compiles and may allocate → re-seed
                     // before handle_exception reads the frame.
                     let f: *mut PyFrame = FrameView::top_frame();
+                    let loop_result = take_pending_loop_exit(marker_ec);
                     // warmspot.py handle_jitexception: an
                     // `ExitFrameWithExceptionRef` from a direct compiled-code
                     // exit is re-raised into the interpreter loop.  Offer it to
