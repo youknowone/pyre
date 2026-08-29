@@ -42,15 +42,27 @@ fn is_ascii_identifier_char(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
+/// Whether the text after a numeric token is one of the keywords that may
+/// legally follow it, which is what decides the warning.
+///
+/// [3.14-spec] `pytokenizer._lookahead` compares the keyword's letters and
+/// stops there, and its `o` arm reads a single character, so PyPy warns for
+/// `1andromeda` and `1orx` as well.  3.14.2 `lookahead` additionally requires
+/// the name to end, and warns only where the arm reads a single character in
+/// both — the `i` one, which is why `1ifx`, `1inx` and `1isx` still warn.
+/// Measured on 3.14.2 for all eight keywords, glued and separated.
 fn numeric_keyword_suffix(rest: &[u8]) -> bool {
-    rest.starts_with(b"and")
-        || rest.starts_with(b"else")
-        || rest.starts_with(b"for")
-        || rest.starts_with(b"if")
-        || rest.starts_with(b"in")
-        || rest.starts_with(b"is")
-        || rest.starts_with(b"or")
-        || rest.starts_with(b"not")
+    let ends_the_name = |keyword: &[u8]| {
+        !rest
+            .get(keyword.len())
+            .is_some_and(|&byte| byte >= 0x80 || is_ascii_identifier_char(byte))
+    };
+    [b"if".as_slice(), b"in", b"is"]
+        .iter()
+        .any(|keyword| rest.starts_with(keyword))
+        || [b"and".as_slice(), b"else", b"for", b"or", b"not"]
+            .iter()
+            .any(|keyword| rest.starts_with(keyword) && ends_the_name(keyword))
 }
 
 fn consume_decimal_digits(bytes: &[u8], mut index: usize) -> usize {
@@ -477,6 +489,125 @@ fn warn_codegen_syntax(
     })
 }
 
+/// Whether the letters before a quote open an interpolated literal, whose
+/// replacement fields `pytokenizer` tokenizes as ordinary source.
+fn is_interpolated_prefix(run: &[u8]) -> bool {
+    run.len() <= 2
+        && run
+            .iter()
+            .all(|byte| matches!(byte.to_ascii_lowercase(), b'f' | b't' | b'r'))
+        && run
+            .iter()
+            .any(|byte| matches!(byte.to_ascii_lowercase(), b'f' | b't'))
+}
+
+/// The `}` closing a replacement field opened at `start`, or `limit`.
+fn replacement_field_end(bytes: &[u8], start: usize, limit: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < limit {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                index = skip_quoted_string(bytes, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' => {
+                if depth == 0 {
+                    return index;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    limit
+}
+
+/// Where a replacement field's expression ends: its `!` conversion or its `:`
+/// format spec, whichever comes first outside brackets and strings.
+fn replacement_expression_end(bytes: &[u8], start: usize, limit: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < limit {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                index = skip_quoted_string(bytes, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            // `!=` is an operator, not a conversion.
+            b'!' if depth == 0 && bytes.get(index + 1) != Some(&b'=') => return index,
+            b':' if depth == 0 => return index,
+            _ => {}
+        }
+        index += 1;
+    }
+    limit
+}
+
+/// Scan one replacement field: its expression, then the replacement fields
+/// its format spec carries.  The spec's own text is literal and is not a
+/// token stream, so nothing between those fields is scanned.
+fn scan_replacement_field(
+    source: &str,
+    filename: &str,
+    start: usize,
+    end: usize,
+) -> Result<(), PyError> {
+    let bytes = source.as_bytes();
+    let expression_end = replacement_expression_end(bytes, start, end);
+    scan_tokenizer_warnings(source, filename, start, expression_end)?;
+    let mut index = expression_end;
+    while index < end {
+        if bytes[index] == b'{' {
+            let inner_end = replacement_field_end(bytes, index + 1, end);
+            scan_replacement_field(source, filename, index + 1, inner_end)?;
+            index = inner_end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Skip an interpolated literal, scanning each replacement field on the way.
+/// Returns the index just past the closing quote.
+fn scan_interpolated_string(
+    source: &str,
+    filename: &str,
+    quote_index: usize,
+) -> Result<usize, PyError> {
+    let bytes = source.as_bytes();
+    let quote = bytes[quote_index];
+    let triple =
+        bytes.get(quote_index + 1) == Some(&quote) && bytes.get(quote_index + 2) == Some(&quote);
+    let mut index = quote_index + if triple { 3 } else { 1 };
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if triple && bytes[index..].starts_with(&[quote, quote, quote]) {
+            return Ok(index + 3);
+        } else if !triple && bytes[index] == quote {
+            return Ok(index + 1);
+        } else if bytes[index] == b'{' && bytes.get(index + 1) == Some(&b'{') {
+            index += 2;
+        } else if bytes[index] == b'}' && bytes.get(index + 1) == Some(&b'}') {
+            index += 2;
+        } else if bytes[index] == b'{' {
+            let field_end = replacement_field_end(bytes, index + 1, bytes.len());
+            scan_replacement_field(source, filename, index + 1, field_end)?;
+            index = field_end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(index)
+}
+
 /// Emit tokenizer-level numeric-literal warnings before parsing.
 ///
 /// PyPy's `pytokenizer.generate_tokens` warns when a valid numeric token runs
@@ -485,12 +616,24 @@ fn warn_codegen_syntax(
 /// scan before entering Ruff's parser, whose recovered tree otherwise loses
 /// the token boundary that owns the warning.
 pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &str) -> Result<(), PyError> {
+    scan_tokenizer_warnings(source, filename, 0, source.len())
+}
+
+/// [`emit_tokenizer_syntax_warnings`] over one byte range.  A replacement
+/// field re-enters here: an interpolated literal's expressions are tokenized
+/// like any other source, while its literal text never is.
+fn scan_tokenizer_warnings(
+    source: &str,
+    filename: &str,
+    start: usize,
+    end: usize,
+) -> Result<(), PyError> {
     let bytes = source.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
+    let mut index = start;
+    while index < end {
         match bytes[index] {
             b'#' => {
-                while index < bytes.len() && bytes[index] != b'\n' {
+                while index < end && bytes[index] != b'\n' {
                     index += 1;
                 }
             }
@@ -498,19 +641,26 @@ pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &str) -> Result<()
                 index = skip_quoted_string(bytes, index);
             }
             byte if byte >= 0x80 || byte == b'_' || byte.is_ascii_alphabetic() => {
+                let name_start = index;
                 index += 1;
-                while index < bytes.len()
+                while index < end
                     && (bytes[index] >= 0x80 || is_ascii_identifier_char(bytes[index]))
                 {
                     index += 1;
                 }
+                if index < end
+                    && matches!(bytes[index], b'\'' | b'"')
+                    && is_interpolated_prefix(&bytes[name_start..index])
+                {
+                    index = scan_interpolated_string(source, filename, index)?;
+                }
             }
             b'.' | b'0'..=b'9' => {
-                let Some((kind, end)) = number_literal_end(bytes, index) else {
+                let Some((kind, token_end)) = number_literal_end(bytes, index) else {
                     index += 1;
                     continue;
                 };
-                if end > index && numeric_keyword_suffix(&bytes[end..]) {
+                if token_end > index && numeric_keyword_suffix(&bytes[token_end..]) {
                     let (lineno, column) = line_offset_at(source, index);
                     warn_codegen_syntax(
                         source,
@@ -520,7 +670,7 @@ pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &str) -> Result<()
                         &format!("invalid {kind} literal"),
                     )?;
                 }
-                index = end.max(index + 1);
+                index = token_end.max(index + 1);
             }
             _ => index += 1,
         }
