@@ -417,6 +417,12 @@ fn w_tuple_new_array_backed_impl(
         if let Some(s) = block_root {
             items_block = crate::gc_roots::shadow_stack_get(s) as *mut ItemsBlock;
         }
+        // The shell is a livevar across that same call for the same reason, so
+        // re-read it out of its slot too rather than keeping the word held
+        // across the barrier.
+        let raw = raw_slot
+            .map(crate::gc_roots::shadow_stack_get)
+            .unwrap_or(std::ptr::null_mut()) as *mut u8;
         // The header went in before the root was published; only the items
         // block is still outstanding. Nothing below can collect, so the
         // remembered tuple keeps the block from here on.

@@ -52,13 +52,45 @@ pub fn w_method_new(
     let _ = crate::gc_roots::pin_root(w_function);
     let _ = crate::gc_roots::pin_root(w_self);
     let _ = crate::gc_roots::pin_root(w_class);
+    // `PyObject` is not `Copy`, and the nursery arm writes the shell twice (a
+    // null-member image, then the real one), so keep the two fields and build
+    // the header at each write.
+    let header_type = &METHOD_TYPE as *const PyType;
+    let header_class = get_instantiate(&METHOD_TYPE);
     let header = PyObject {
-        ob_type: &METHOD_TYPE as *const PyType,
-        w_class: get_instantiate(&METHOD_TYPE),
+        ob_type: header_type,
+        w_class: header_class,
     };
     let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE);
     let w_module = PY_NULL;
     if !raw.is_null() {
+        // The allocator hands back uninitialized payload, and
+        // `register_pyre_class` registered this layout's `ptr_offsets`, so from
+        // the moment the shell is reachable a collection reads all four member
+        // slots off it. Publish a null-member image first, the same shape
+        // tupleobject writes with a null items block before it pins its shell.
+        unsafe {
+            std::ptr::write(
+                raw as *mut Method,
+                Method {
+                    ob: PyObject {
+                        ob_type: header_type,
+                        w_class: header_class,
+                    },
+                    w_function: PY_NULL,
+                    w_self: PY_NULL,
+                    w_class: PY_NULL,
+                    w_module,
+                },
+            );
+        }
+        // The shell is a livevar across the barrier below just as the members
+        // are: that call is a `gc_op`, which leaves RUNNING before taking
+        // `gc_mutex` (`gc_sync.rs`) and roots only its own copy, so a foreign
+        // collector can move the shell there. Pin it into the same block the
+        // members occupy and take every address back out of the shadow stack
+        // afterwards.
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         // Remember the shell before publishing nursery members: running the
         // barrier after the stores would leave a movable `w_self` (notably a
         // list) named by a slot no collection traces until it does. This is
@@ -66,7 +98,7 @@ pub fn w_method_new(
         // items block. A nursery shell answers the barrier in its `is_in_nursery`
         // arm, so the call stands for the spill case alone.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        for slot in save_point..save_point + 3 {
+        for slot in save_point..save_point + 4 {
             let root = crate::gc_roots::shadow_stack_get(slot);
             let current =
                 crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
@@ -75,6 +107,7 @@ pub fn w_method_new(
         let w_function = crate::gc_roots::shadow_stack_get(save_point);
         let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
         let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
+        let raw = crate::gc_roots::shadow_stack_get(save_point + 3) as *mut u8;
         unsafe {
             std::ptr::write(
                 raw as *mut Method,

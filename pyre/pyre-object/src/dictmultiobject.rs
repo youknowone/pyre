@@ -5753,8 +5753,14 @@ fn w_dict_view_iterator_new_direction(
         crate::lltype::malloc_typed(value) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_BaseDictMultiIterObject, value) };
+        // The shell is a livevar across the barrier: that call is a `gc_op`,
+        // which leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`) and
+        // roots only its own copy, so a foreign collector can move it there.
+        // Publish it first and return the address the slot carries afterwards.
+        let shell_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         crate::gc_hook::try_gc_write_barrier(raw);
-        raw as PyObjectRef
+        crate::gc_roots::shadow_stack_get(shell_slot)
     }
 }
 
@@ -5928,8 +5934,14 @@ pub fn w_dict_view_new(w_dict: PyObjectRef, kind: DictViewKind) -> PyObjectRef {
         crate::lltype::malloc_typed(value) as PyObjectRef
     } else {
         unsafe { std::ptr::write(raw as *mut W_DictViewObject, value) };
+        // The shell is a livevar across the barrier: that call is a `gc_op`,
+        // which leaves RUNNING before taking `gc_mutex` (`gc_sync.rs`) and
+        // roots only its own copy, so a foreign collector can move it there.
+        // Publish it first and return the address the slot carries afterwards.
+        let shell_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         crate::gc_hook::try_gc_write_barrier(raw);
-        raw as PyObjectRef
+        crate::gc_roots::shadow_stack_get(shell_slot)
     }
 }
 
