@@ -5989,11 +5989,12 @@ unsafe fn jitcode_constants_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    // Every collection, minor included.  `jitcode.py JitCode` is an ordinary
-    // GC object upstream and `constants_r` an ordinary traced field of it, so
-    // the collector keeps and forwards its entries whatever generation they
-    // are in.  pyre owns the array in `Arc` memory, out of the object graph,
-    // so this walker IS that tracing and owes the same guarantee.
+    // `jitcode.py JitCode` is an ordinary GC object upstream and `constants_r`
+    // an ordinary traced field of it. Major marking therefore walks every
+    // live pool. A minor collection reaches only JitCodes recorded by the
+    // write barrier in `old_objects_pointing_to_young`; pyre's off-GC analog
+    // is `MetaInterpStaticData.jitcodes_with_young_constants`, consumed by the
+    // state-side walker below.
     //
     // This used to skip minor collections when tagged ints were disabled, on
     // the claim that the entries were then "stable old-generation int/float
@@ -6001,10 +6002,11 @@ unsafe fn jitcode_constants_root_walker_area(
     // consequence was the fault it was meant to make impossible: upstream
     // builds every jitcode at translation time, while pyre builds one per
     // CodeObject at RUN time, so a trace's `Operand::ConstRef` reaches the pool
-    // straight off the heap.  Measured with `PYRE_PROBE14=1` on
+    // straight off the heap. Measured with `PYRE_PROBE14=1` on
     // `_pending/exec_foreign_globals_gc_root.py`, one slot holds a NURSERY
-    // object on every walk; skipped by the minor pass, it was neither kept
-    // alive nor forwarded, and the next major seeded a corpse
+    // object on the first post-publication walk; skipped by the old blanket
+    // minor bypass, it was neither kept alive nor forwarded, and the next
+    // major seeded a corpse
     // (`GC BUG: invalid type_id ... site=jitcode_constants`).
     unsafe { pyre_jit_trace::state::walk_jitcode_constants_refs_area(data, visitor) };
 }

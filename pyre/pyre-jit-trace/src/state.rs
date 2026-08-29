@@ -84,6 +84,20 @@ struct MetaInterpStaticData {
     /// warmspot.py:282: self.metainterp_sd.jitcodes = jitcodes.
     /// Box<JitCode> for address stability across vec growth.
     jitcodes: Vec<Box<JitCode>>,
+    /// `incminimark.py old_objects_pointing_to_young` for the off-GC
+    /// `JitCode.constants_r` arrays above. RPython's `JitCode` is a GC
+    /// object, so publishing its freshly-filled `constants_r` field takes the
+    /// normal write barrier and puts that one object on the remembered set.
+    /// Pyre's body lives in an `Arc`, outside the managed heap; record the
+    /// corresponding jitcode index at the same publication boundary. The next
+    /// minor walk consumes the entries after forwarding their nursery
+    /// referents, while a major walk still visits every jitcode.
+    ///
+    /// `RefCell` supplies the same interior mutability as the collector-owned
+    /// AddressStack upstream: a stop-the-world root walk reaches this
+    /// thread-local state through a shared opaque area pointer. Publication
+    /// and collection cannot overlap on the owning mutator.
+    jitcodes_with_young_constants: RefCell<Vec<usize>>,
     /// pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)` —
     /// frozen snapshot of the assembler's `all_liveness` buffer. In RPython
     /// this is set once at `finish_setup` time; in pyre the assembler is
@@ -169,6 +183,7 @@ impl MetaInterpStaticData {
     fn new() -> Self {
         Self {
             jitcodes: Vec::new(),
+            jitcodes_with_young_constants: RefCell::new(Vec::new()),
             liveness_info: std::sync::Arc::<[u8]>::from(Vec::<u8>::new().into_boxed_slice()),
             finish_setup_done: false,
             insns_len: 0,
@@ -329,6 +344,29 @@ impl MetaInterpStaticData {
         payload.jitcode.set_index(idx as usize);
     }
 
+    /// Write-barrier half of [`Self::jitcodes_with_young_constants`].
+    ///
+    /// The pool is immutable after publication except for GC forwarding, so
+    /// one pending entry is sufficient until the next minor collection. The
+    /// linear duplicate check matches incminimark's flag-gated remembered-set
+    /// insertion and stays over the small population of newly-published
+    /// jitcodes, not the thousands of frozen placeholder slots.
+    fn remember_jitcode_constants_write(&self, index: usize) {
+        let Some(jitcode) = self.jitcodes.get(index) else {
+            return;
+        };
+        let Some(body) = jitcode.payload.jitcode.try_body() else {
+            return;
+        };
+        if body.constants_r.is_empty() {
+            return;
+        }
+        let mut pending = self.jitcodes_with_young_constants.borrow_mut();
+        if !pending.contains(&index) {
+            pending.push(index);
+        }
+    }
+
     /// warmspot.py:281-282:
     ///
     /// ```python
@@ -360,11 +398,13 @@ impl MetaInterpStaticData {
                     let index = self.jitcodes[pos].index;
                     Self::stamp_payload_index(index, &payload);
                     self.jitcodes[pos].payload = payload;
+                    self.remember_jitcode_constants_write(pos);
                 }
                 _ => {
                     let index = self.jitcodes.len() as i32;
                     Self::stamp_payload_index(index, &payload);
                     self.jitcodes.push(Box::new(JitCode { index, payload }));
+                    self.remember_jitcode_constants_write(index as usize);
                 }
             }
         }
@@ -416,6 +456,7 @@ impl MetaInterpStaticData {
                     let index = self.jitcodes[pos].index;
                     Self::stamp_payload_index(index, &payload);
                     self.jitcodes[pos].payload = payload;
+                    self.remember_jitcode_constants_write(pos);
                 }
                 Some(payload) => {
                     // Re-spliced build of an already-populated entry:
@@ -424,6 +465,7 @@ impl MetaInterpStaticData {
                     Self::stamp_payload_index(index, &payload);
                     self.jitcodes.push(Box::new(JitCode { index, payload }));
                     let pos = self.jitcodes.len() - 1;
+                    self.remember_jitcode_constants_write(pos);
                     return &*self.jitcodes[pos] as *const JitCode;
                 }
                 None => {}
@@ -444,6 +486,7 @@ impl MetaInterpStaticData {
         let jitcode = Box::new(JitCode { index, payload });
         let ptr = &*jitcode as *const JitCode;
         self.jitcodes.push(jitcode);
+        self.remember_jitcode_constants_write(index as usize);
         ptr
     }
 
@@ -839,6 +882,7 @@ pub fn install_build_time_jitcode_at(index: usize, payload: std::sync::Arc<crate
         } else {
             sd.jitcodes.push(slot);
         }
+        sd.remember_jitcode_constants_write(index);
     });
 }
 
@@ -898,6 +942,7 @@ pub fn install_codeless_jitcode(payload: std::sync::Arc<crate::PyJitCode>) -> i3
         let index = sd.jitcodes.len() as i32;
         MetaInterpStaticData::stamp_payload_index(index, &payload);
         sd.jitcodes.push(Box::new(JitCode { index, payload }));
+        sd.remember_jitcode_constants_write(index as usize);
         index
     })
 }
@@ -1384,7 +1429,7 @@ pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> 
 }
 
 /// `framework.py` `root_walker.walk_roots` hook for the boxed `Ref`
-/// constants embedded in every live jitcode's `constants_r` pool.
+/// constants embedded in live jitcodes' `constants_r` pools.
 ///
 /// RPython keeps these alive implicitly: a `JitCode` is a GC object and
 /// its `constants_ptr` array is traced through the object graph, so a
@@ -1408,8 +1453,9 @@ pub fn jitcode_source_has_exception_handler(jitcode_index: i32) -> Option<bool> 
 /// (`jit_make_function_from_globals(globals, code)`), and a frame running
 /// under `exec(code, {...})` carries an ordinary collectable one.  So this
 /// walk writes the visitor's answer back into the slot instead of marking a
-/// copy of it, and `jitcode_constants_root_walker_area` runs it for minor
-/// collections too.
+/// copy of it. Major collections walk every pool; minor collections consume
+/// only [`MetaInterpStaticData::jitcodes_with_young_constants`], the off-GC
+/// counterpart of incminimark's `old_objects_pointing_to_young`.
 pub fn walk_jitcode_constants_refs(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_constants_refs_in(&state.borrow(), visitor);
@@ -1453,11 +1499,10 @@ pub static PROBE14_RELOCATED: std::sync::atomic::AtomicUsize =
 /// Companion witnesses for the OTHER half of this area, the `code_ptr ->
 /// wrapper` roots, and for the invariant a relocation count cannot test.
 ///
-/// The constants half skips minor collections outright, so a movable object in
-/// the pool is never offered for relocation there — it simply dies.  A
-/// relocation counter therefore cannot refute "no movable object is in this
-/// pool"; membership of the nursery at walk time can, and it is the property
-/// both halves' documented invariants actually assert.
+/// A relocation counter alone cannot refute that the remembered-set boundary
+/// missed a movable object: a missed pool is never offered to the visitor.
+/// Membership of the nursery in every pool that is offered can, so the probe
+/// records that independently.
 pub static PROBE14_CODE_SLOTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1465,6 +1510,77 @@ pub static PROBE14_NURSERY: std::sync::atomic::AtomicUsize = std::sync::atomic::
 fn probe14_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PYRE_PROBE14").as_deref() == Ok("1"))
+}
+
+fn walk_jitcode_constant_pool(
+    sd: &MetaInterpStaticData,
+    jitcode_index: usize,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    probe: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(jc) = sd.jitcodes.get(jitcode_index) else {
+        return;
+    };
+    let pool_len = jc.payload.jitcode.constants_r.len();
+    // The pool cell, not a copy of it. Upstream reaches a run-time write into
+    // a prebuilt structure through the write barrier —
+    // `_remember_young_pointer_inlined` puts the written-to object on
+    // `old_objects_pointing_to_young`, and the remembered set is scanned at
+    // the next minor, so the entry is kept and forwarded.
+    //
+    // The store goes through `ConstSlotR::set`, whose receiver is `&self`.
+    // By the time the walk runs the body is published behind an `Arc` and
+    // there is no `&mut` route to it, so a `*mut` cast out of
+    // `Vec::as_ptr()` would be a write through shared-reference provenance —
+    // undefined, and free to be compiled as if the slot still held the
+    // pre-write value, which is the stale GC reference this walker exists to
+    // prevent. Interior mutability makes the store well-defined instead of
+    // relying on it happening to survive optimisation.
+    //
+    // `METAINTERP_SD` is thread-local while `Arc<RuntimeJitCode>` is not, so
+    // two threads' areas can present the same slot; the second visit reads an
+    // address that is no longer a nursery start and is a no-op. That is also
+    // why the slot is an `AtomicI64` and not a `Cell`.
+    //
+    // The pool also carries words that are not gcrefs at all — patched
+    // host-static addresses and pre-patch STR sentinels. `drag_out_root` and
+    // `seed_major_root` reject them before any deref, which is what makes
+    // handing them the whole pool safe; a fast path that pre-filtered the
+    // slots would have to reproduce those gates.
+    let pool = jc.payload.jitcode.constants_r.as_slice();
+    for pool_slot in 0..pool_len {
+        let cell = &pool[pool_slot];
+        let mut gcref = majit_ir::GcRef(cell.get() as usize);
+        let before = gcref.0;
+        if probe {
+            probe14_note_nursery("CONSTANT", before, jc.payload.jitcode.name(), jitcode_index);
+        }
+        visitor(&mut gcref);
+        if gcref.0 != before {
+            cell.set(gcref.0 as i64);
+        }
+        if probe {
+            PROBE14_SLOTS.fetch_add(1, Relaxed);
+            if gcref.0 != before {
+                let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
+                if n <= 20 {
+                    eprintln!(
+                        "[probe14] RELOCATION APPLIED #{n}: constants_r slot \
+                         0x{before:x} -> 0x{:x} (walk {}, cum_slot {}, \
+                         jitcode {}/{}, pool_slot {}/{})",
+                        gcref.0,
+                        PROBE14_WALKS.load(Relaxed),
+                        PROBE14_SLOTS.load(Relaxed),
+                        jitcode_index,
+                        sd.jitcodes.len(),
+                        pool_slot,
+                        pool_len,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn walk_jitcode_constants_refs_in(
@@ -1476,79 +1592,25 @@ fn walk_jitcode_constants_refs_in(
     if probe {
         PROBE14_WALKS.fetch_add(1, Relaxed);
     }
-    for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
-        let pool_len = jc.payload.jitcode.constants_r.len();
-        // The pool cell, not a copy of it.  Upstream reaches a run-time write
-        // into a prebuilt structure through the write barrier —
-        // `_remember_young_pointer_inlined` puts the written-to object on
-        // `old_objects_pointing_to_young`, and the remembered set is scanned at
-        // every minor, so the entry is kept and forwarded.  `constants_r` is a
-        // bare Rust `Vec` with no GC header to carry
-        // GCFLAG_TRACK_YOUNG_PTRS, so this walker IS pyre's remembered set for
-        // it, and owes both halves: drag the object out, and store back where
-        // it went.
-        //
-        // The store goes through `ConstSlotR::set`, whose receiver is `&self`.
-        // By the time the walk runs the body is published behind an `Arc` and
-        // there is no `&mut` route to it, so a `*mut` cast out of
-        // `Vec::as_ptr()` would be a write through shared-reference provenance
-        // — undefined, and free to be compiled as if the slot still held the
-        // pre-write value, which is the stale GC reference this walker exists
-        // to prevent. Interior mutability makes the store well-defined instead
-        // of relying on it happening to survive optimisation.
-        //
-        // `METAINTERP_SD` is thread-local while `Arc<RuntimeJitCode>` is not,
-        // so two threads' areas can present the same slot; the second visit
-        // reads an address that is no longer a nursery start and is a no-op.
-        // That is also why the slot is an `AtomicI64` and not a `Cell`.
-        //
-        // The pool also carries words that are not gcrefs at all — patched
-        // host-static addresses and pre-patch STR sentinels.  `drag_out_root`
-        // and `seed_major_root` reject them before any deref, which is what
-        // makes handing them the whole pool safe; a fast path that pre-filtered
-        // the slots would have to reproduce those gates.
-        let pool = jc.payload.jitcode.constants_r.as_slice();
-        for pool_slot in 0..pool_len {
-            let cell = &pool[pool_slot];
-            let mut gcref = majit_ir::GcRef(cell.get() as usize);
-            let before = gcref.0;
-            if probe {
-                probe14_note_nursery("CONSTANT", before, jc.payload.jitcode.name(), jitcode_index);
-            }
-            visitor(&mut gcref);
-            if gcref.0 != before {
-                cell.set(gcref.0 as i64);
-            }
-            if probe {
-                PROBE14_SLOTS.fetch_add(1, Relaxed);
-                if gcref.0 != before {
-                    let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
-                    if n <= 20 {
-                        // `jitcode` is the position in the walked `sd.jitcodes`
-                        // and `pool_slot` the position inside that jitcode's own
-                        // `constants_r`, so each report names the pool it came
-                        // from.  `cum_slot` is the running slot-visit ordinal
-                        // across every walk and every jitcode -- it is NOT a
-                        // within-pool index, and earlier runs are keyed on it.
-                        //
-                        // This locates the pool.  It does NOT name the WRITER:
-                        // nothing here distinguishes a pool built by
-                        // `add_const_r` from one built by `emit_const_r_bits`.
-                        eprintln!(
-                            "[probe14] RELOCATION APPLIED #{n}: constants_r slot \
-                             0x{before:x} -> 0x{:x} (walk {}, cum_slot {}, \
-                             jitcode {}/{}, pool_slot {}/{})",
-                            gcref.0,
-                            PROBE14_WALKS.load(Relaxed),
-                            PROBE14_SLOTS.load(Relaxed),
-                            jitcode_index,
-                            sd.jitcodes.len(),
-                            pool_slot,
-                            pool_len,
-                        );
-                    }
-                }
-            }
+    let is_minor = majit_gc::shadow_stack::extra_root_walk_kind()
+        == majit_gc::shadow_stack::ExtraRootWalkKind::Minor;
+    if is_minor {
+        // `incminimark.py _minor_collection` consumes
+        // `old_objects_pointing_to_young`: every nursery referent exposed by
+        // these pools is promoted by the visitor below, and no later mutator
+        // store can create another young edge because a published JitCode body
+        // is immutable. A later body publication re-adds its slot through
+        // `remember_jitcode_constants_write`.
+        let pending = std::mem::take(&mut *sd.jitcodes_with_young_constants.borrow_mut());
+        for jitcode_index in pending {
+            walk_jitcode_constant_pool(sd, jitcode_index, visitor, probe);
+        }
+    } else {
+        // `incminimark.py collect_nonstack_roots` / `visit_all_objects`:
+        // major marking follows every live JitCode field, irrespective of its
+        // remembered-set state.
+        for jitcode_index in 0..sd.jitcodes.len() {
+            walk_jitcode_constant_pool(sd, jitcode_index, visitor, probe);
         }
     }
     // ARMING WITNESS.  The relocation report above prints only when a slot
@@ -15445,7 +15507,7 @@ mod indirectcalltargets_tests {
     //! (and unrelated tests that use the thread-local) do not alias.
     use super::{
         MetaInterpStaticData, MetainterpSdGuard, pyjitcode_for_jitcode_index,
-        raw_code_for_jitcode_index,
+        raw_code_for_jitcode_index, walk_jitcode_constants_refs_in,
     };
     use majit_metainterp::jitcode::{JitCode, JitCodeBuilder};
     use pyre_interpreter::bytecode::CodeObject;
@@ -15525,6 +15587,51 @@ mod indirectcalltargets_tests {
         pyjit.jitcode = Arc::new(runtime_jc);
         pyjit.metadata.is_drained = true;
         Arc::new(pyjit)
+    }
+
+    fn pyjit_with_ref_constant(value: usize) -> Arc<crate::PyJitCode> {
+        let runtime_jc = majit_metainterp::jitcode::JitCode::new("ref_constant_test");
+        runtime_jc.set_body(majit_translate::jitcode::JitCodeBody {
+            code: vec![majit_metainterp::jitcode::insns::BC_LIVE, 0, 0],
+            constants_r: vec![(value as i64).into()],
+            startpoints: Some([0_usize].into_iter().collect()),
+            ..Default::default()
+        });
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+        pyjit.jitcode = Arc::new(runtime_jc);
+        Arc::new(pyjit)
+    }
+
+    /// `incminimark.py old_objects_pointing_to_young`: publishing a JitCode
+    /// remembers its off-GC constant pool for exactly the next minor. A major
+    /// still follows the complete `MetaInterpStaticData.jitcodes` graph.
+    #[test]
+    fn jitcode_constants_minor_walk_consumes_publication_remembered_set() {
+        use majit_gc::shadow_stack::{ExtraRootWalkKind, set_extra_root_walk_kind};
+
+        let mut sd = MetaInterpStaticData::new();
+        sd.jitcodes.push(Box::new(super::JitCode {
+            index: 0,
+            payload: pyjit_with_ref_constant(0x1000),
+        }));
+        sd.remember_jitcode_constants_write(0);
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Minor);
+        let mut minor_seen = 0;
+        walk_jitcode_constants_refs_in(&sd, &mut |slot| {
+            minor_seen += 1;
+            slot.0 = 0x2000;
+        });
+        assert_eq!(minor_seen, 1);
+        assert_eq!(sd.jitcodes[0].payload.jitcode.constants_r[0].get(), 0x2000);
+
+        walk_jitcode_constants_refs_in(&sd, &mut |_| minor_seen += 1);
+        assert_eq!(minor_seen, 1, "clean pool is absent from the next minor");
+
+        set_extra_root_walk_kind(ExtraRootWalkKind::Major);
+        let mut major_seen = 0;
+        walk_jitcode_constants_refs_in(&sd, &mut |_| major_seen += 1);
+        assert_eq!(major_seen, 1, "major walks every live JitCode pool");
     }
 
     #[should_panic(expected = "make_jitcodes returned an unpopulated JitCode skeleton")]
