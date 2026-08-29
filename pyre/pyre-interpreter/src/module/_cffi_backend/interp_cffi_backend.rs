@@ -73,6 +73,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         ("from_buffer", super::func::from_buffer),
         ("gcp", super::func::gcp),
         ("_offset_in_bytes", super::func::offset_in_bytes),
+        ("callback", super::func::callback),
     ] {
         crate::module_ns_store(
             ns,

@@ -54,7 +54,8 @@ pub unsafe fn pointer_convert_from_object(
         other = ctypeobj::ctype_at(other.ctptr)
             .ok_or_else(|| PyError::system_error("array without a pointer type"))?;
     }
-    if other.kind != ctypeobj::KIND_POINTER {
+    // `W_CTypeFunc` and `W_CTypePointer` are both `W_CTypePtrBase` upstream.
+    if !matches!(other.kind, ctypeobj::KIND_POINTER | ctypeobj::KIND_FUNC) {
         return Err(ct.convert_error("compatible pointer", w_ob));
     }
     if !std::ptr::eq(ct as *const W_CType, other as *const W_CType) {

@@ -11,6 +11,7 @@ crate::pyre_module_init!(interp_cffi_backend);
 
 pub mod allocator;
 pub mod cbuffer;
+pub mod ccallback;
 pub mod cdataobj;
 pub mod cdlopen;
 pub mod cerrno;

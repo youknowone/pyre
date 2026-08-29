@@ -432,7 +432,8 @@ pub fn root_forever(obj: PyObjectRef) {
 /// `cdata` must be readable for `ct.size` bytes.
 pub unsafe fn convert_to_object(ct: &W_CType, cdata: *const u8) -> Result<PyObjectRef, PyError> {
     match ct.kind {
-        KIND_POINTER => Ok(super::ctypeptr::pointer_convert_to_object(ct, cdata)),
+        // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
+        KIND_POINTER | KIND_FUNC => Ok(super::ctypeptr::pointer_convert_to_object(ct, cdata)),
         KIND_ARRAY => Ok(super::ctypeptr::array_convert_to_object(ct, cdata)),
         KIND_STRUCT | KIND_UNION => super::ctypestruct::convert_to_object(ct, cdata),
         _ if ct.is_primitive() => unsafe { super::ctypeprim::convert_to_object(ct, cdata) },
@@ -471,7 +472,10 @@ pub unsafe fn convert_from_object(
     w_ob: PyObjectRef,
 ) -> Result<(), PyError> {
     match ct.kind {
-        KIND_POINTER => unsafe { super::ctypeptr::pointer_convert_from_object(ct, cdata, w_ob) },
+        // `W_CTypeFunc(W_CTypePtrBase)` inherits the same conversion.
+        KIND_POINTER | KIND_FUNC => unsafe {
+            super::ctypeptr::pointer_convert_from_object(ct, cdata, w_ob)
+        },
         KIND_ARRAY => unsafe { super::ctypeptr::array_convert_from_object(ct, cdata, w_ob) },
         KIND_STRUCT | KIND_UNION => unsafe {
             super::ctypestruct::convert_from_object(ct, cdata, w_ob)

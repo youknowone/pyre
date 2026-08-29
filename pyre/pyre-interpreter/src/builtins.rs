@@ -14540,7 +14540,7 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
 
-fn exec_or_eval(
+pub(crate) fn exec_or_eval(
     source: PyObjectRef,
     globals_arg: PyObjectRef,
     locals_arg: PyObjectRef,

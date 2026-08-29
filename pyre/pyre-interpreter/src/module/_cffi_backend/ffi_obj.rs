@@ -587,6 +587,102 @@ fn ffi_cast(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     ctypeobj::cast(w_ctype, roots.get(source_slot))
 }
 
+/// `W_FFIObject.descr_callback`.
+fn ffi_callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let a = bind_method(
+        args,
+        "callback",
+        &["cdecl", "python_callable", "error", "onerror"],
+        1,
+    )?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.base();
+    for &value in &a {
+        let _ = roots.pin_root(value);
+    }
+    let w_ctype = ffi_type(
+        roots.get(base),
+        roots.get(base + 1),
+        ACCEPT_STRING | ACCEPT_CTYPE | CONSIDER_FN_AS_FNPTR,
+    )?;
+    let ctype_slot = base + a.len();
+    let _ = roots.pin_root(w_ctype);
+    let error_slot = ctype_slot + 1;
+    let _ = roots.pin_root(if roots.get(base + 3).is_null() {
+        pyre_object::w_none()
+    } else {
+        roots.get(base + 3)
+    });
+    let onerror_slot = error_slot + 1;
+    let _ = roots.pin_root(if roots.get(base + 4).is_null() {
+        pyre_object::w_none()
+    } else {
+        roots.get(base + 4)
+    });
+    // Read the callable back out of its slot rather than holding it in a local:
+    // `pin_root` publishes through a safepoint, so a value carried across one
+    // may have moved.
+    let w_python_callable = roots.get(base + 2);
+    if !w_python_callable.is_null() && unsafe { !pyre_object::is_none(w_python_callable) } {
+        return super::ccallback::make_callback(
+            roots.get(ctype_slot),
+            w_python_callable,
+            roots.get(error_slot),
+            roots.get(onerror_slot),
+        );
+    }
+
+    // `space.appexec`: keep the decorator as an app-level function with the
+    // ctype and the two policy values in its globals.
+    let w_module = crate::importing::get_sys_module("_cffi_backend")
+        .ok_or_else(|| PyError::system_error("_cffi_backend is not loaded"))?;
+    let module_slot = onerror_slot + 1;
+    let _ = roots.pin_root(w_module);
+    let globals_slot = module_slot + 1;
+    let _ = roots.pin_root(pyre_object::dictmultiobject::w_dict_new());
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            roots.get(globals_slot),
+            "_cffi_backend",
+            roots.get(module_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            roots.get(globals_slot),
+            "ctype",
+            roots.get(ctype_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            roots.get(globals_slot),
+            "error",
+            roots.get(error_slot),
+        );
+        pyre_object::dictmultiobject::w_dict_setitem_str(
+            roots.get(globals_slot),
+            "onerror",
+            roots.get(onerror_slot),
+        );
+    }
+    // `appexec` compiles through `gateway.py ApplevelClass`, whose whole
+    // constants graph carries `hidden_applevel=True`; compiling here rather
+    // than calling the `eval` builtin keeps the decorator working when the
+    // application has rebound that name.
+    const DECORATOR: &str =
+        "lambda python_callable: _cffi_backend.callback(ctype, python_callable, error, onerror)";
+    let code = crate::compile::compile_eval(DECORATOR)
+        .map_err(|_| PyError::system_error("could not compile the callback decorator"))?;
+    let code_slot = globals_slot + 1;
+    let _ = roots.pin_root(crate::pycode::box_code_object_with_hidden_applevel(
+        code, true,
+    ));
+    crate::builtins::exec_or_eval(
+        roots.get(code_slot),
+        roots.get(globals_slot),
+        pyre_object::PY_NULL,
+        true,
+        pyre_object::PY_NULL,
+    )
+}
+
 fn ffi_from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let a = bind_method(
         args,
@@ -1094,6 +1190,7 @@ fn init_ffi_type(ns: PyObjectRef) {
         ("addressof", ffi_addressof as crate::gateway::BuiltinCodeFn),
         ("alignof", ffi_alignof),
         ("cast", ffi_cast),
+        ("callback", ffi_callback),
         ("dlclose", ffi_dlclose),
         ("dlopen", ffi_dlopen),
         ("from_buffer", ffi_from_buffer),

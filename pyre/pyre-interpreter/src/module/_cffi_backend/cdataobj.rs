@@ -33,6 +33,8 @@ pub const FLAVOR_FROM_BUFFER: i64 = 6;
 pub const FLAVOR_GCP: i64 = 7;
 /// `W_CDataNewNonStd` — memory returned by an application allocator.
 pub const FLAVOR_NEW_NONSTD: i64 = 8;
+/// `W_CDataCallback` — a libffi closure calling an application-level object.
+pub const FLAVOR_CALLBACK: i64 = 9;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
 #[crate::pyre_class("_cffi_backend._CDataBase")]
@@ -44,8 +46,9 @@ pub struct W_CData {
     pub ptr: *mut u8,
     /// Which RPython subclass this is; one of the `FLAVOR_*`.
     pub flavor: i64,
-    /// `W_CDataNewOwning.allocated_length` for an owning cdata, and
-    /// `W_CDataSliced.length` for a slice.  -1 when neither applies.
+    /// `W_CDataNewOwning.allocated_length` for an owning cdata,
+    /// `W_CDataSliced.length` for a slice, and the raw callback side-block
+    /// address for `W_CDataCallback`.  -1 when none applies.
     pub length: i64,
     /// `W_CDataNewStd.datasize`, which becomes -1 once the memory is freed.
     /// A `W_CDataFromBuffer` keeps no size here and uses the slot for whether
@@ -53,10 +56,10 @@ pub struct W_CData {
     pub datasize: i64,
     /// Whatever the cdata must keep alive: `W_CDataPtrToStructOrUnion`'s
     /// `structobj`, `W_CDataFromBuffer`'s `w_keepalive`, `W_CDataGCP`'s
-    /// `w_original_cdata`.
+    /// `w_original_cdata`, or `W_CDataCallback.w_callable`.
     pub w_keepalive: PyObjectRef,
-    /// `W_CDataGCP.w_destructor`, and the object a `W_CDataFromBuffer` took
-    /// its export from — the one whose export it decrefs on release.
+    /// `W_CDataGCP.w_destructor`, the object a `W_CDataFromBuffer` took its
+    /// export from, or `W_CDataCallback.w_onerror`.
     pub w_destructor: PyObjectRef,
     /// The translated `special_memory_pressure` field installed for classes
     /// passed as the object argument to `rgc.add_memory_pressure`.
@@ -151,6 +154,16 @@ impl W_CData {
                     Ok(format!("buffer from '{}' object", type_name))
                 }
             }
+            // `W_ExternPython._repr_extra`.
+            FLAVOR_CALLBACK => {
+                let roots = pyre_object::gc_roots::push_roots();
+                let callable_slot = roots.base();
+                let _ = roots.pin_root(self.w_keepalive);
+                let w_repr = crate::builtins::builtin_repr(&[roots.get(callable_slot)])?;
+                Ok(format!("calling {}", unsafe {
+                    pyre_object::w_str_get_value(w_repr)
+                }))
+            }
             _ => unsafe { ct.extra_repr(self.ptr) },
         }
     }
@@ -226,6 +239,34 @@ pub fn new_cdata_handle(w_ctype: PyObjectRef, w_keepalive: PyObjectRef) -> PyObj
     W_CData::from_obj(obj)
         .expect("new_cdata_full returns a cdata")
         .ptr = obj.cast::<u8>();
+    obj
+}
+
+/// `W_CDataCallback.__init__`'s cdata half.  The callback flavor reuses
+/// `w_keepalive` for `w_callable`, `w_destructor` for `w_onerror`, and
+/// `length` for the raw side-block address.
+pub fn new_cdata_callback(
+    ptr: *mut u8,
+    w_ctype: PyObjectRef,
+    w_callable: PyObjectRef,
+    w_onerror: PyObjectRef,
+    raw_side_block: i64,
+) -> PyObjectRef {
+    let roots = pyre_object::gc_roots::push_roots();
+    let onerror_slot = roots.base();
+    let _ = roots.pin_root(w_onerror);
+    let obj = new_cdata_full(
+        ptr,
+        w_ctype,
+        FLAVOR_CALLBACK,
+        raw_side_block,
+        -1,
+        w_callable,
+    );
+    W_CData::from_obj(obj)
+        .expect("new_cdata_full returns a cdata")
+        .w_destructor = roots.get(onerror_slot);
+    pyre_object::gc_hook::try_gc_write_barrier_managed(obj.cast::<u8>());
     obj
 }
 
@@ -438,13 +479,18 @@ pub fn raw_alloc(size: i64, zero: bool) -> Result<*mut u8, PyError> {
 }
 
 /// `lltype.free(self._ptr, flavor='raw')` in the light finalizers of
-/// `W_CDataMem` and `W_CDataNewStd`.
+/// `W_CDataMem` and `W_CDataNewStd`, and `Closure.__del__` for a callback.
 ///
 /// # Safety
 /// `obj` must be a GC-dead `W_CData`.
 pub unsafe fn w_cdata_dealloc(obj: PyObjectRef) {
     let cdata = unsafe { &mut *(obj as *mut W_CData) };
-    if matches!(cdata.flavor, FLAVOR_MEM | FLAVOR_NEW_STD) && cdata.datasize >= 0 {
+    if cdata.flavor == FLAVOR_CALLBACK {
+        // Clear the slot before releasing it: the release is a `Box::from_raw`,
+        // so a second sweep of the same object must find nothing left to free.
+        let side_block = std::mem::replace(&mut cdata.length, 0);
+        unsafe { super::ccallback::free_callback_side_block(side_block, cdata.ptr) };
+    } else if matches!(cdata.flavor, FLAVOR_MEM | FLAVOR_NEW_STD) && cdata.datasize >= 0 {
         unsafe { libc::free(cdata.ptr.cast::<libc::c_void>()) };
     }
     cdata.ptr = std::ptr::null_mut();

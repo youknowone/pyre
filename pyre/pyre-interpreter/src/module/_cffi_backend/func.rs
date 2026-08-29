@@ -52,6 +52,32 @@ pub fn cast(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     ctypeobj::cast(args[0], args[1])
 }
 
+/// `func.py callback`.
+pub fn callback(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() > 4 {
+        return Err(PyError::type_error(format!(
+            "callback() takes at most 4 arguments ({} given)",
+            positional.len()
+        )));
+    }
+    crate::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["ctype", "callable", "error", "onerror"],
+        "callback",
+    )?;
+    let bind = |slot, name, position| {
+        crate::builtins::bind_pos_or_kw(positional, kwargs, slot, name, "callback", position)
+    };
+    let w_ctype = bind(0, "ctype", 1)?
+        .ok_or_else(|| PyError::type_error("callback() missing required argument 'ctype'"))?;
+    let w_callable = bind(1, "callable", 2)?
+        .ok_or_else(|| PyError::type_error("callback() missing required argument 'callable'"))?;
+    let w_error = bind(2, "error", 3)?.unwrap_or_else(pyre_object::w_none);
+    let w_onerror = bind(3, "onerror", 4)?.unwrap_or_else(pyre_object::w_none);
+    super::ccallback::make_callback(w_ctype, w_callable, w_error, w_onerror)
+}
+
 /// `func.py typeof`.
 pub fn typeof_(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     Ok(cdataobj::cdata_arg(args[0])?.ctype)
