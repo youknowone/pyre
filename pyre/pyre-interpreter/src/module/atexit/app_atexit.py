@@ -1,10 +1,9 @@
-import sys as _sys
-
-
 # CPython 3.14 permits distinct atexit module objects while keeping one
 # interpreter-owned callback stack.  PyPy's app-level list is the same storage
 # shape; anchor it on pyre's interpreter-owned sys module so re-imported module
-# instances share it.
+# instances share it.  `_sys` is seeded by the module initializer rather than
+# imported here: the name can be blocked in `sys.modules`, and this body runs
+# during finalization for a program that never imported `atexit`.
 try:
     atexit_callbacks = _sys._pyre_atexit_callbacks
 except AttributeError:

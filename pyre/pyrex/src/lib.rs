@@ -203,7 +203,10 @@ fn parse_args(
                 print!("{}", usage(binary_name));
                 std::process::exit(0);
             }
-            Short('i') => flags.inspect = true,
+            Short('i') => {
+                flags.inspect = true;
+                flags.interactive = true;
+            }
             // app_main.py `cmdline_options['E']` / `X_option`.
             Short('E') => flags.ignore_environment = true,
             // app_main.py `isolated_option`: -I implies -E, -s and -P.
@@ -495,11 +498,14 @@ fn sys_path_cwd() -> std::path::PathBuf {
     }
 }
 
-/// `interactive or sys.stdin.isatty()` — a stdin run drives the prompt when fd
-/// 0 is a terminal or `-i` was given, and executes stdin as a script
-/// otherwise.
-fn stdin_is_interactive(inspect: bool) -> bool {
-    if inspect {
+/// `stdin_is_interactive` — a stdin run drives the prompt when fd 0 is a
+/// terminal or `-i` was given, and executes stdin as a script otherwise.
+///
+/// The argument is `config->interactive`, which only `-i` sets.  PYTHONINSPECT
+/// does not reach it, so a run that owes the flag to the environment still
+/// needs the terminal.
+fn stdin_is_interactive(interactive: bool) -> bool {
+    if interactive {
         return true;
     }
     #[cfg(feature = "sandbox")]
@@ -512,6 +518,41 @@ fn stdin_is_interactive(inspect: bool) -> bool {
     #[cfg(not(feature = "sandbox"))]
     {
         std::io::IsTerminal::is_terminal(&std::io::stdin())
+    }
+}
+
+/// `pymain_repl`'s three tests for the prompt that opens over a program that
+/// has just finished.
+///
+/// PYTHONINSPECT is read here rather than taken from the option block, because
+/// upstream checks it "at the end, to give programs the opportunity to set it
+/// from Python" -- and `os.environ` writes reach `putenv`, so a program that
+/// sets the name during its own run is asking for this prompt.  `-i` is the
+/// only spelling that opens one over a stdin that is not a terminal.
+///
+/// `run_code` is `config_run_code`: the prompt that follows `-c`, `-m` or a
+/// script.  Stdin read as a program is not one of them, and neither the option
+/// nor the variable gives it a prompt afterwards.
+fn prompt_requested(run_code: bool) -> bool {
+    if !run_code {
+        return false;
+    }
+    // The startup guard already refused every prompt this build can be asked
+    // for, and it could still say why.  Reaching one from here would be past
+    // that refusal, so the answer is no.
+    #[cfg(feature = "sandbox")]
+    {
+        return false;
+    }
+    #[cfg(not(feature = "sandbox"))]
+    {
+        if importing::interactive_flag() {
+            return true;
+        }
+        let inspect = importing::inspect_flag()
+            || (!importing::ignore_environment_flag()
+                && std::env::var_os("PYTHONINSPECT").is_some_and(|value| !value.is_empty()));
+        inspect && stdin_is_interactive(false)
     }
 }
 
@@ -754,7 +795,7 @@ fn real_main(binary_name: &str) {
     // overrides have already been folded in.
     importing::apply_pth_config(&mut flags);
     let LaunchFlags {
-        inspect,
+        interactive,
         quiet,
         no_site,
         ..
@@ -771,7 +812,7 @@ fn real_main(binary_name: &str) {
     // builds; a piped stdin program reads through the seam and is fine.
     #[cfg(feature = "sandbox")]
     if !is_interact
-        && (inspect || (matches!(mode, RunMode::Stdin { .. }) && stdin_is_interactive(false)))
+        && (flags.inspect || (matches!(mode, RunMode::Stdin { .. }) && stdin_is_interactive(false)))
     {
         eprintln!("{binary_name}: interactive mode is unavailable in the sandbox");
         std::process::exit(2);
@@ -835,9 +876,9 @@ fn real_main(binary_name: &str) {
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let cmd = dedent_command(&cmd);
-            run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site);
-            if inspect {
-                repl::run_repl(true, no_site);
+            let session = run_source(cmd.as_ref(), Mode::Exec, "<string>", no_site, true);
+            if session.is_some() {
+                repl::run_repl(true, no_site, session);
             }
         }
         RunMode::Module(module) => {
@@ -848,9 +889,9 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from(&module)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            run_module(&module, no_site);
-            if inspect {
-                repl::run_repl(true, no_site);
+            let session = run_module(&module, no_site, true);
+            if session.is_some() {
+                repl::run_repl(true, no_site, session);
             }
         }
         RunMode::Script(path) => {
@@ -861,9 +902,9 @@ fn real_main(binary_name: &str) {
             argv.extend(args);
             importing::set_sys_argv(&argv);
             let compile_path = script_compile_path(&path);
-            run_script_path(&path, &compile_path, no_site, binary_name);
-            if inspect {
-                repl::run_repl(true, no_site);
+            let session = run_script_path(&compile_path, no_site, binary_name, true);
+            if session.is_some() {
+                repl::run_repl(true, no_site, session);
             }
         }
         RunMode::Stdin { argv0 } => {
@@ -877,10 +918,10 @@ fn real_main(binary_name: &str) {
             let mut argv = vec![std::ffi::OsString::from(argv0)];
             argv.extend(args);
             importing::set_sys_argv(&argv);
-            if stdin_is_interactive(inspect) {
+            if stdin_is_interactive(interactive) {
                 // A tty (or `-i`) prints the banner unless `-q` and drops into
                 // the prompt.
-                repl::run_repl(quiet, no_site);
+                repl::run_repl(quiet, no_site, None);
             } else {
                 // Otherwise stdin is read to EOF and executed as a single
                 // `exec` unit named `<stdin>`.
@@ -891,7 +932,7 @@ fn real_main(binary_name: &str) {
                         std::process::exit(1);
                     }
                 };
-                run_source(&source, Mode::Exec, "<stdin>", no_site);
+                run_source(&source, Mode::Exec, "<stdin>", no_site, false);
             }
         }
         RunMode::Interact {
@@ -1326,7 +1367,7 @@ fn init_warnoptions(
             importing::importhook("warnings", w_main_globals, pyre_object::PY_NULL, 0, ec_ptr)?;
             return Ok(());
         };
-        let Some(w_sys) = importing::get_sys_module("sys") else {
+        let Some(w_sys) = importing::get_interpreter_sys_module() else {
             return Ok(());
         };
         // `from warnings import _processoptions` raises `ImportError` when the
@@ -1382,6 +1423,19 @@ fn init_faulthandler(
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
 ) {
     if !importing::faulthandler_flag() {
+        return;
+    }
+    // `_PyFaulthandler_Init` runs once per process, from `pyinit_core`, ahead
+    // of the program `run_command_line` goes on to dispatch, so whatever that
+    // program does to the handlers is what a following `-i` inherits.  pyre
+    // installs from `import site` instead, which each entry point reaches --
+    // one of them per process -- so this holds the installer idempotent at the
+    // point that depends on it: a second install would undo a
+    // `faulthandler.disable()` the program had just made.
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    let mut first = false;
+    INSTALLED.call_once(|| first = true);
+    if !first {
         return;
     }
     let attempt = (|| -> Result<(), pyre_interpreter::PyError> {
@@ -1752,6 +1806,28 @@ fn clear_shutdown_modules(
     collect_and_run_finalizers(ec_ptr);
 }
 
+/// The module dict of one of the two names finalization reaches for, or
+/// `None` when the runtime never minted it.
+///
+/// The reads are from the interpreter's own registry, not from `sys.modules`:
+/// `finalize_modules_delete_special` clears `interp->sysdict` and
+/// `interp->builtins`, and a program can park any value under either name in
+/// the mapping. `w_module_get_w_dict` is a raw field read whose contract is
+/// "points to a valid `Module`", so a value that is not one yields a wild
+/// pointer its caller then stores through -- `sys.modules['sys'] = 42`
+/// segfaulted at exit. `clear_shutdown_modules` already tests the same way
+/// before the same cast.
+fn interpreter_module_dict(
+    module: Option<pyre_object::PyObjectRef>,
+) -> Option<pyre_object::PyObjectRef> {
+    let module = module?;
+    if module.is_null() || !unsafe { pyre_object::is_module(module) } {
+        return None;
+    }
+    let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    (!dict.is_null()).then_some(dict)
+}
+
 /// `pylifecycle.c finalize_modules_delete_special`, the step `finalize_modules`
 /// takes before it releases any module namespace.
 ///
@@ -1787,19 +1863,16 @@ fn finalize_delete_special() {
         ("stdout", "__stdout__"),
         ("stderr", "__stderr__"),
     ];
-    if let Some(builtins) = pyre_interpreter::importing::get_sys_module("builtins") {
-        let dict = unsafe { pyre_object::w_module_get_w_dict(builtins) };
-        if !dict.is_null() {
-            unsafe { pyre_object::w_dict_setitem_str(dict, "_", pyre_object::w_none()) };
-        }
+    if let Some(dict) =
+        interpreter_module_dict(pyre_interpreter::importing::get_interpreter_builtins_module())
+    {
+        unsafe { pyre_object::w_dict_setitem_str(dict, "_", pyre_object::w_none()) };
     }
-    let Some(sys) = pyre_interpreter::importing::get_sys_module("sys") else {
+    let Some(dict) =
+        interpreter_module_dict(pyre_interpreter::importing::get_interpreter_sys_module())
+    else {
         return;
     };
-    let dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
-    if dict.is_null() {
-        return;
-    }
     for name in SYS_CLEARED {
         // `_PySys_ClearAttrString` binds `None` rather than deleting the name,
         // so a late reader finds a value that is not there instead of a name
@@ -1918,6 +1991,28 @@ fn finalize_system_exit(
 
 /// Die by SIGINT for an uncaught KeyboardInterrupt after shutdown has run
 /// (`app_main.py:1133-1153`).
+/// Whether a top-level `KeyboardInterrupt` has been reported and not answered
+/// by an explicit exit status yet.
+///
+/// `_PyErr_PrintEx` records one, and `Py_RunMain` consults it after the prompt
+/// and after `Py_FinalizeEx`, so an interrupt raised by the program under `-i`
+/// still ends the process by SIGINT once the prompt is done -- and so does one
+/// raised at the prompt itself.  An explicit `exit(n)` answers it, `exit(0)`
+/// included, because `SystemExit` leaves through `Py_Exit` without passing the
+/// check.
+static UNHANDLED_KEYBOARD_INTERRUPT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn note_unhandled_keyboard_interrupt(error: &pyre_interpreter::PyError) {
+    if is_keyboard_interrupt(error) {
+        UNHANDLED_KEYBOARD_INTERRUPT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn had_unhandled_keyboard_interrupt() -> bool {
+    UNHANDLED_KEYBOARD_INTERRUPT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn terminate_by_sigint() -> ! {
     // A Win32 process has no SIGINT to die of: restoring `SIG_DFL` and calling
     // `raise(SIGINT)` runs the CRT's default action, which returns and ends the
@@ -1962,7 +2057,7 @@ fn is_keyboard_interrupt(error: &pyre_interpreter::PyError) -> bool {
 
 /// Run a library module as `__main__` via `runpy._run_module_as_main`,
 /// the `-m` entry point. `vm.run_module` analog.
-fn run_module(module: &str, no_site: bool) {
+fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession> {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
 
@@ -1988,15 +2083,14 @@ fn run_module(module: &str, no_site: bool) {
         Ok(())
     })();
 
+    let inspect = prompt_requested(run_code);
     if let Err(e) = result {
         // `_run_module_as_main` ends the same run as a script does, so its
-        // failure takes the same exit: `app_main.py` reports every top-level
-        // exception through `display_exception`, which is what reaches a
-        // `sys.excepthook` the module installed.
-        handle_main_error(e, canonical, ec_ptr);
+        // failure takes the same exit, and `-i` opens the prompt over it the
+        // same way -- `SystemExit` included.
+        report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
     }
-    finalize_runtime(canonical, ec_ptr);
-    maybe_print_jit_stats();
+    finish_or_inspect(inspect, execution_context, canonical, main_module)
 }
 
 /// `os.path.abspath` for the run filename, or `None` for the `-c "<string>"`
@@ -2218,8 +2312,89 @@ fn finish_main(canonical: pyre_object::PyObjectRef, ec_ptr: *const PyExecutionCo
     maybe_print_jit_stats();
 }
 
+/// End a startup failure the way `Py_RunMain` does.
+///
+/// `pymain_run_python` reports the failure and returns a status; `Py_FinalizeEx`
+/// then runs regardless, so the `atexit` callbacks, module teardown and stream
+/// flush a live interpreter owes are delivered before the status is.  Every
+/// caller here is past `import_site`, so `site` and any `sitecustomize` have
+/// already had their chance to register one.
+fn end_after_startup_failure(
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+    status: i32,
+) -> ! {
+    finish_main(canonical, ec_ptr);
+    std::process::exit(status);
+}
+
+/// The interpreter a program leaves running for `-i` to continue in.
+///
+/// `pymain_run_python` runs the program, then the prompt, and reaches
+/// `Py_FinalizeEx` only after both, so the two share one interpreter and one
+/// `__main__`.  That sharing is the whole of `-i`: the names the program bound
+/// are the ones the prompt inspects.  A program that failed is inspected the
+/// same way -- an uncaught exception, a source that would not compile, even a
+/// `SystemExit` -- because the point of asking for the prompt is to look at
+/// what went wrong.
+pub(crate) struct MainSession {
+    pub(crate) execution_context: Rc<PyExecutionContext>,
+    pub(crate) canonical: pyre_object::PyObjectRef,
+    pub(crate) main_module: pyre_object::PyObjectRef,
+}
+
+/// Finalize here, or hand the live interpreter to the prompt to finalize once
+/// it is done with it.
+fn finish_or_inspect(
+    inspect: bool,
+    execution_context: Rc<PyExecutionContext>,
+    canonical: pyre_object::PyObjectRef,
+    main_module: pyre_object::PyObjectRef,
+) -> Option<MainSession> {
+    if !inspect {
+        finish_main(canonical, Rc::as_ptr(&execution_context));
+        return None;
+    }
+    Some(MainSession {
+        execution_context,
+        canonical,
+        main_module,
+    })
+}
+
+/// Report a top-level failure the prompt is about to open over.
+///
+/// `handle_main_error` is the arm that ends the process, and it finalizes on
+/// the way out; this one only prints, because the interpreter that failed is
+/// the one the prompt continues in.  `SystemExit` takes this path too: `-i`
+/// turns the request to exit into a report, which is why the run ends with the
+/// prompt's status rather than the program's.
+fn report_main_error_for_inspect(mut e: pyre_interpreter::PyError) {
+    note_unhandled_keyboard_interrupt(&e);
+    if !pyre_interpreter::error::print_exception_via_excepthook(&mut e) {
+        pyre_interpreter::eprint_exception(&e, true);
+    }
+}
+
+/// Report a top-level failure, and end the process unless `-i` asked for the
+/// prompt to open over it.
+///
+/// `handle_main_error` finalizes on its way out, so it is the arm that must not
+/// be taken while the prompt still has the interpreter ahead of it.
+fn report_or_end_on_main_error(
+    e: pyre_interpreter::PyError,
+    inspect: bool,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) {
+    if !inspect {
+        handle_main_error(e, canonical, ec_ptr);
+    }
+    report_main_error_for_inspect(e);
+}
+
 fn eval_source_in_main(
-    source: &str,
+    read_source: impl FnOnce() -> String,
     mode: Mode,
     filename: &str,
     main_file: Option<&str>,
@@ -2227,42 +2402,11 @@ fn eval_source_in_main(
     canonical: pyre_object::PyObjectRef,
     main_module: pyre_object::PyObjectRef,
     no_site: bool,
-) {
-    let code = match compile_source_with_filename(source, mode, filename) {
-        Ok(code) => code,
-        Err(e) => {
-            // Render the `File "…", line N` + source + caret + `SyntaxError:`
-            // banner for the malformed source, matching an interactive run.
-            // A main file that will not compile is reported by the same
-            // `PyErr_Print` every other top-level failure is, so the hook sees
-            // it too and the stdlib renderer is what offers the keyword the
-            // author meant.
-            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source, mode);
-            if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
-                pyre_interpreter::eprint_syntax_error(&err);
-            }
-            std::process::exit(1);
-        }
-    };
-
+    run_code: bool,
+) -> Option<MainSession> {
     let ec_ptr = Rc::as_ptr(&execution_context);
-    let mut frame = match PyFrame::new_with_context_and_globals(code, execution_context, canonical)
-    {
-        Ok(frame) => frame,
-        Err(e) => {
-            pyre_interpreter::eprint_exception(&e, true);
-            std::process::exit(1);
-        }
-    };
-    // The frame is a GC object, and the only root that reaches one is the
-    // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
-    // joins when `eval_with_jit` below installs it.  Everything between here
-    // and that call runs Python (`site`) and can therefore drive a collection
-    // that would reclaim the frame and hand its storage to the next frame
-    // allocation.  RPython keeps a local holding a GC object alive through the
-    // translated shadow stack; publish it explicitly for the same span.
-    let _main_frame_root = pyre_object::gc_roots::push_roots();
-    let _ = pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
+    // The frame below takes the context by value; the prompt needs it too.
+    let session_context = Rc::clone(&execution_context);
 
     // Seed the module-identity attributes every `__main__` namespace carries
     // (pythonrun.c seeds these; `runpy` does the `-m` case). Without them a
@@ -2312,22 +2456,75 @@ fn eval_source_in_main(
     seed_main_loader(canonical, script_file, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
 
-    // `run_command_line` reaches its stdin branch with `site`, the warnings
-    // bootstrap and the signal handlers already installed, and prints the
-    // banner there rather than on the way in: what it labels is the import
-    // trace `-v` produced for all of that, so it follows the trace instead of
-    // heading it.  `<stdin>` names that branch -- a tty takes the prompt, and
-    // the prompt prints its own.  On stderr, where the trace goes; a piped
-    // program's stdout is its own.
-    if filename == "<stdin>" && importing::verbose_flag() != 0 {
+    // `main.c pymain_header`, which runs once startup is complete -- after
+    // `site` and the warnings bootstrap, so it follows the import trace `-v`
+    // produced for all of that rather than heading it, which is what makes the
+    // banner label that trace.  Its three tests are the three here: `-q`
+    // suppresses outright, a program that is not a tty needs `verbose` to get a
+    // banner at all, and `site_import` decides the second line.  `<stdin>`
+    // names the branch -- a tty takes the prompt, which prints its own.
+    if filename == "<stdin>" && !importing::quiet_flag() && importing::verbose_flag() != 0 {
+        // `fprintf(stderr, ...)`, the process descriptor rather than the
+        // `sys.stderr` a `sitecustomize` may have replaced by now.
         eprintln!("{}", repl::BANNER);
-        // `print_banner(not no_site)` -- the second line names the four
-        // builtins `site` installs, so `-S` leaves it nothing to offer and the
-        // notice is dropped with them.
+        // The `site_import` half: the second line names the four builtins
+        // `site` installs, so `-S` leaves it nothing to offer.
         if !no_site {
             eprintln!("{}", repl::BANNER_COPYRIGHT);
         }
     }
+
+    // Read and compiled only once startup is complete, which is the order
+    // `pymain_run_python` runs in: `site` is imported by interpreter
+    // initialisation, ahead of every path that reaches user source.  A program
+    // that will not open, or will not compile, still gets it -- the report
+    // below goes through `sys.excepthook`, which `site` is entitled to have
+    // replaced, and the failure still finalizes on its way out.
+    let source = read_source();
+    let source = source.as_str();
+    let code = match compile_source_with_filename(source, mode, filename) {
+        Ok(code) => code,
+        Err(e) => {
+            // Render the `File "…", line N` + source + caret + `SyntaxError:`
+            // banner for the malformed source, matching an interactive run.
+            // A main file that will not compile is reported by the same
+            // `PyErr_Print` every other top-level failure is, so the hook sees
+            // it too and the stdlib renderer is what offers the keyword the
+            // author meant.
+            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source, mode);
+            if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
+                pyre_interpreter::eprint_syntax_error(&err);
+            }
+            // The source never ran, but the interpreter it would have run in is
+            // up, and that is what `-i` asked to be left at.
+            if prompt_requested(run_code) {
+                return finish_or_inspect(true, session_context, canonical, main_module);
+            }
+            end_after_startup_failure(canonical, ec_ptr, 1);
+        }
+    };
+
+    let mut frame = match PyFrame::new_with_context_and_globals(code, execution_context, canonical)
+    {
+        Ok(frame) => frame,
+        Err(e) => {
+            pyre_interpreter::eprint_exception(&e, true);
+            if prompt_requested(run_code) {
+                return finish_or_inspect(true, session_context, canonical, main_module);
+            }
+            end_after_startup_failure(canonical, ec_ptr, 1);
+        }
+    };
+    // The frame is a GC object, and the only root that reaches one is the
+    // `CURRENT_FRAME` / `f_backref` chain the frame walker follows — which it
+    // joins when `eval_with_jit` below installs it.  What runs between here
+    // and that call is Python -- the `linecache` registration below -- and can
+    // therefore drive a collection that would reclaim the frame and hand its
+    // storage to the next frame allocation.  RPython keeps a local holding a GC
+    // object alive through the translated shadow stack; publish it explicitly
+    // for the same span.
+    let _main_frame_root = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(&*frame as *const PyFrame as pyre_object::PyObjectRef);
 
     // `<string>` names no file, so `linecache._interactive_cache` is the only
     // place a traceback frame or `inspect.getsource` can reach the command's
@@ -2345,18 +2542,31 @@ fn eval_source_in_main(
         );
     }
 
-    match eval_with_jit(&mut frame, None) {
+    let failure = match eval_with_jit(&mut frame, None) {
         Ok(result) => {
             if !result.is_null() && !unsafe { pyre_object::is_none(result) } {
                 println!("{}", PyDisplay(result));
             }
+            None
         }
-        Err(e) => handle_main_error(e, canonical, ec_ptr),
+        Err(e) => Some(e),
+    };
+    // Asked once the program is done, because the program is one of the things
+    // that answers it -- `os.environ["PYTHONINSPECT"] = "1"` is a request for
+    // the prompt below.
+    let inspect = prompt_requested(run_code);
+    if let Some(e) = failure {
+        report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
     }
-    finish_main(canonical, ec_ptr);
+    finish_or_inspect(inspect, session_context, canonical, main_module)
 }
 
-fn read_script_source(path: &str, binary_name: &str) -> String {
+fn read_script_source(
+    path: &str,
+    binary_name: &str,
+    canonical: pyre_object::PyObjectRef,
+    ec_ptr: *const PyExecutionContext,
+) -> String {
     // The script is read through the import machinery's source provider, so
     // under sandbox the controller VFS mediates it over the same channel
     // module imports use.  The bytes then go through the tokenizer's BOM /
@@ -2370,17 +2580,26 @@ fn read_script_source(path: &str, binary_name: &str) -> String {
             Ok(source) => source,
             Err(error) => {
                 pyre_interpreter::eprint_exception(&error, false);
-                std::process::exit(1);
+                end_after_startup_failure(canonical, ec_ptr, 1);
             }
         },
+        // `pymain_run_file` reports an unopenable script with
+        // `EXIT_STATUS_ERROR`, which is 2 -- the status a shell reads as "the
+        // program was never run", distinct from the 1 a program that ran and
+        // failed exits with.
         Err(e) => {
             eprintln!("{binary_name}: cannot open '{path}': {e}");
-            std::process::exit(1);
+            end_after_startup_failure(canonical, ec_ptr, 2);
         }
     }
 }
 
-fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str) {
+fn run_script_path(
+    filename: &str,
+    no_site: bool,
+    binary_name: &str,
+    run_code: bool,
+) -> Option<MainSession> {
     let execution_context = setup_exec_context();
     let ec_ptr = Rc::as_ptr(&execution_context);
     let (canonical, main_module) = prepare_main_module(&execution_context);
@@ -2408,17 +2627,28 @@ fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str)
             // the package's own loader when it runs `__main__` below.
             seed_main_loader(canonical, None, ec_ptr);
             import_site(no_site, canonical, ec_ptr);
-            if let Err(e) = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false) {
-                handle_main_error(e, canonical, ec_ptr);
+            let outcome = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false);
+            // Asked after the entry point has run, the way the source-file and
+            // `-m` paths ask it: `pymain_run_python` reads `PYTHONINSPECT` at
+            // the end "to give programs the opportunity to set it from Python",
+            // and a directory or zipapp `__main__` is such a program.
+            let inspect = prompt_requested(run_code);
+            if let Err(e) = outcome {
+                report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
             }
-            finish_main(canonical, ec_ptr);
+            finish_or_inspect(inspect, execution_context, canonical, main_module)
         }
         Ok(false) => {
-            let source = read_script_source(path, binary_name);
             let main_file = absolute_script_path(filename);
             let filename = main_file.as_deref().unwrap_or(filename);
             eval_source_in_main(
-                &source,
+                // The resolved path rather than the argv spelling: the read is
+                // deferred until `site` has been imported, so a `sitecustomize`
+                // that changes the working directory would otherwise resolve a
+                // relative argv against the new one -- opening a different
+                // same-named file than the one `__file__` names, or none.  The
+                // file a run opens and the file it reports are the same file.
+                || read_script_source(filename, binary_name, canonical, ec_ptr),
                 Mode::Exec,
                 filename,
                 main_file.as_deref(),
@@ -2426,13 +2656,24 @@ fn run_script_path(path: &str, filename: &str, no_site: bool, binary_name: &str)
                 canonical,
                 main_module,
                 no_site,
-            );
+                run_code,
+            )
         }
-        Err(e) => handle_main_error(e, canonical, ec_ptr),
+        Err(e) => {
+            let inspect = prompt_requested(run_code);
+            report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
+            finish_or_inspect(inspect, execution_context, canonical, main_module)
+        }
     }
 }
 
-fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
+fn run_source(
+    source: &str,
+    mode: Mode,
+    filename: &str,
+    no_site: bool,
+    run_code: bool,
+) -> Option<MainSession> {
     // `config_run_filename_abspath` absolutizes the run filename before the
     // module is compiled, so `co_filename` — and with it every `File "…"` line
     // a traceback prints — carries the absolute path, not the literal argv
@@ -2457,7 +2698,7 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
     }
 
     eval_source_in_main(
-        source,
+        || source.to_string(),
         mode,
         filename,
         main_file.as_deref(),
@@ -2465,7 +2706,8 @@ fn run_source(source: &str, mode: Mode, filename: &str, no_site: bool) {
         canonical,
         main_module,
         no_site,
-    );
+        run_code,
+    )
 }
 
 #[cfg(test)]

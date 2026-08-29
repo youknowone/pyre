@@ -75,7 +75,7 @@ fn pwd_uid_converter(w_uid: pyre_object::PyObjectRef) -> Result<libc::uid_t, cra
 ///
 /// Backed by `rustpython_host_env::pwd` (a thin `nix` wrapper).
 #[cfg(unix)]
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
         crate::_structseq::new_instance(
@@ -257,4 +257,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    Ok(())
 }

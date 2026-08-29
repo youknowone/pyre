@@ -1513,7 +1513,7 @@ fn create_environ() -> pyre_object::PyObjectRef {
 ///
 /// Provides the minimal surface that os.py module init needs to succeed.
 /// Real posix calls are not implemented — they raise or return defaults.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(ns, "environ", create_environ());
     crate::module_ns_store(
         ns,
@@ -8952,8 +8952,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 // call libc::symlink directly so we don't need an at-cwd dance.
                 let ret = unsafe { libc::symlink(c_src.as_ptr(), c_dst.as_ptr()) };
                 if ret < 0 {
-                    return Err(io_err_with_filename(
+                    // `os_symlink_impl` reports through `path_error2`, so the
+                    // failure carries the name it was asked to link to as well
+                    // as the one it could not create.
+                    return Err(fs_err_with_filename2(
                         std::io::Error::last_os_error(),
+                        0,
+                        src.w_path(),
                         dst.w_path(),
                     ));
                 }
@@ -12723,6 +12728,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     }
 
     crate::module_ns_store(ns, "error", crate::typedef::w_object());
+    Ok(())
 }
 
 #[cfg(test)]

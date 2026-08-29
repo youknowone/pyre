@@ -919,7 +919,7 @@ pub(crate) fn stack_effects(
 }
 
 /// Is the instruction an unconditional jump (no fallthrough)?
-fn is_unconditional_jump(instr: &pyre_interpreter::bytecode::Instruction) -> bool {
+pub(crate) fn is_unconditional_jump(instr: &pyre_interpreter::bytecode::Instruction) -> bool {
     use pyre_interpreter::bytecode::Instruction;
     matches!(
         instr,

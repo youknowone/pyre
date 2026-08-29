@@ -18,6 +18,10 @@ use std::sync::{LazyLock, Mutex};
 #[derive(Clone, Default)]
 pub struct LaunchFlags {
     pub inspect: bool,
+    /// `-i` alone.  PYTHONINSPECT folds into `inspect` and stops there, and the
+    /// difference is what decides whether a prompt opens over a stdin that is
+    /// not a terminal: `stdin_is_interactive` is `isatty(0) || interactive`.
+    pub interactive: bool,
     pub quiet: bool,
     pub no_site: bool,
     pub no_user_site: bool,
@@ -339,6 +343,9 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         flags.faulthandler || flags.dev_mode,
         "PYTHONFAULTHANDLER",
     );
+    // `interactive` is deliberately not folded: `-i` is the only spelling that
+    // sets it, and `pymain_repl` is where the variable is read again anyway,
+    // late enough that a program can still set it from Python.
     flags.inspect = fold_presence_flag(&flags, flags.inspect, "PYTHONINSPECT");
     // app_main.py:773-774 — the variable enables it on any non-empty value,
     // `0` included, the same way `-X warn_default_encoding` does.

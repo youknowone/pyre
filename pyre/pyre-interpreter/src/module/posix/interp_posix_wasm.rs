@@ -921,7 +921,7 @@ fn refuse_write(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef,
     ))
 }
 
-pub fn register_module(ns: PyObjectRef) {
+pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // `os._create_environ_mapping` binds this dict itself rather than copying
     // it, so `os.environ._data` is this object and `os.environ` is a live view
     // of it.  The guest is started with no environment — the runner hands the
@@ -1127,6 +1127,7 @@ pub fn register_module(ns: PyObjectRef) {
     for (name, value) in constants {
         crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
     }
+    Ok(())
 }
 
 /// `posix.urandom(n)` — the same entry point the syscall arm publishes, over

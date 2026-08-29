@@ -1351,10 +1351,7 @@ unsafe fn box_code_constant_inheriting_unit(
 /// `importing.py update_code_filenames`. That is the difference from
 /// the code constructor and `replace`, whose filename changes only the object
 /// being built and leaves nested constants on the name they compiled under.
-pub(crate) unsafe fn set_compilation_unit_filename_bytes(
-    w_code: PyObjectRef,
-    bytes: Option<Vec<u8>>,
-) {
+pub unsafe fn set_compilation_unit_filename_bytes(w_code: PyObjectRef, bytes: Option<Vec<u8>>) {
     let old_filename = unsafe { code_filename_bytes(w_code) };
     if let Some(bytes) = bytes.as_ref() {
         let pycode = unsafe { &*(w_code as *const PyCode) };
@@ -2748,7 +2745,7 @@ unsafe fn read_code_filename(
 
 /// Split the authoritative filesystem bytes from the compiler dependency's
 /// UTF-8-only `source_path` spelling (`objspace.py newfilename`).
-pub(crate) fn split_code_filename_bytes(
+pub fn split_code_filename_bytes(
     bytes: Vec<u8>,
     fallback: Option<&str>,
 ) -> (String, Option<Vec<u8>>) {

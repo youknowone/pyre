@@ -1001,7 +1001,7 @@ crate::py_module! {
             "_abc",
             &["SimpleWeakSet"],
             &[],
-        );
+        )?;
         let simple_weak_set = crate::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         root_forever(simple_weak_set);

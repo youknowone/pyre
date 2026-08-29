@@ -251,7 +251,7 @@ fn c_locale_conv() -> LocaleConvData {
 /// This mirrors the `except ImportError` fallback in the stdlib's
 /// `locale` module, but routed through pyre's builtin-module registry
 /// so a single import succeeds.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // Locale category constants sourced from libc so the values match
     // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
     // Windows has a C runtime too, and its numbering is a third one again
@@ -776,4 +776,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             ),
         );
     }
+    Ok(())
 }

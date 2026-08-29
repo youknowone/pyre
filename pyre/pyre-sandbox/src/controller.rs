@@ -189,10 +189,10 @@ impl PyPySandboxedProc {
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        // Close any inherited fds beyond stdio before exec, so a fd leaked from
-        // the trusted controller cannot cross into the untrusted child (the
-        // analog of subprocess `close_fds=True`). Runs post-fork/pre-exec and is
-        // async-signal-safe (only raw close(2)/close_range(2)).
+        // Keep any inherited fd beyond stdio from crossing into the untrusted
+        // child, so a fd leaked from the trusted controller cannot (the analog
+        // of subprocess `close_fds=True`). Runs post-fork/pre-exec and is
+        // async-signal-safe (only raw fcntl(2)/close_range(2)).
         // SAFETY: the hook calls only async-signal-safe syscalls and allocates
         // nothing.
         unsafe {
@@ -298,20 +298,34 @@ impl PyPySandboxedProc {
     }
 }
 
-/// Post-fork/pre-exec hook: close every fd >= 3 so only stdio (0/1/2) crosses
-/// into the untrusted child. Async-signal-safe — only raw close syscalls, no
-/// allocation. A fd already closed is ignored.
+/// Post-fork/pre-exec hook: mark every fd >= 3 close-on-exec, so only stdio
+/// (0/1/2) crosses into the untrusted child. Async-signal-safe — only raw
+/// fcntl/close_range syscalls, no allocation. A fd that is not open is ignored.
+///
+/// Marking rather than closing, because one of those fds is not ours to close:
+/// `std::process::Command` keeps a `CLOEXEC` pipe for the child to report a
+/// failed `execvp` on, and the parent reads a spawn as successful precisely
+/// when that pipe reaches EOF. Closing it here turns every exec failure into a
+/// silent success — `pyre interact /etc/hosts` handed the controller a child
+/// that never existed instead of the one-line error it owes. `_posixsubprocess`
+/// keeps the same fd open for the same reason, excluding `errpipe_write` from
+/// the range it closes; Rust does not name its own, so the flag does the work
+/// the exclusion would.
+///
+/// The child is untrusted only from `execve` onwards, and that is exactly when
+/// the flag takes effect, so nothing crosses that did not before.
 fn close_inherited_fds() -> io::Result<()> {
-    // Bounded brute-force close(2) loop; closing an unopened fd is a harmless
-    // error. SAFETY: only raw sysconf/close syscalls, no allocation.
-    unsafe fn close_from_brute_force() {
-        // SAFETY: sysconf(_SC_OPEN_MAX) and close(2) over a bounded fd range;
-        // closing an unopened fd is a harmless error.
+    // Bounded brute-force fcntl(2) loop; a fd that is not open answers EBADF,
+    // which is as harmless here as a failed close was.
+    // SAFETY: only raw sysconf/fcntl syscalls, no allocation.
+    unsafe fn cloexec_from_brute_force() {
+        // SAFETY: sysconf(_SC_OPEN_MAX) and fcntl(F_SETFD) over a bounded fd
+        // range; an unopened fd is a harmless error.
         unsafe {
             let max = libc::sysconf(libc::_SC_OPEN_MAX);
             let max = if max < 0 { 1024 } else { max as i32 };
             for fd in 3..max {
-                libc::close(fd);
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
         }
     }
@@ -322,20 +336,21 @@ fn close_inherited_fds() -> io::Result<()> {
             libc::SYS_close_range,
             3 as libc::c_long,
             libc::c_uint::MAX as libc::c_long,
-            0 as libc::c_long,
+            libc::CLOSE_RANGE_CLOEXEC as libc::c_long,
         );
-        // Pre-5.9 kernels lack close_range and return ENOSYS; never leave an
-        // inherited fd open — fall back to the brute-force loop, as
+        // Pre-5.9 kernels lack close_range and answer ENOSYS; pre-5.11 ones
+        // have it but not this flag and answer EINVAL. Never leave an inherited
+        // fd open across the exec — fall back to the brute-force loop, as
         // _posixsubprocess reverts to brute force whenever the primary
         // mechanism is unavailable.
         if r != 0 {
-            close_from_brute_force();
+            cloexec_from_brute_force();
         }
     }
     #[cfg(not(target_os = "linux"))]
-    // SAFETY: bounded close(2) loop.
+    // SAFETY: bounded fcntl(2) loop.
     unsafe {
-        close_from_brute_force();
+        cloexec_from_brute_force();
     }
     Ok(())
 }

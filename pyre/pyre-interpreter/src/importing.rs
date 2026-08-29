@@ -523,7 +523,7 @@ thread_local! {
 
 #[derive(Clone, Copy)]
 pub(crate) struct BuiltinModuleDef {
-    init: fn(PyObjectRef),
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
     startup: Option<fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>>,
     /// The module follows ordinary `sys.modules` ownership and may be
     /// collected after a fresh import is removed from that cache. Most of
@@ -558,7 +558,10 @@ struct ImportRootArea {
 /// Register a builtin module initializer.
 ///
 /// PyPy equivalent: Module.install() → space.builtin_modules[name] = mod
-pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
+pub fn register_builtin_module(
+    name: &'static str,
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
+) {
     BUILTIN_MODULES.lock().unwrap().insert(
         name,
         BuiltinModuleDef {
@@ -571,7 +574,10 @@ pub fn register_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
 
 /// Register a builtin module whose holder has no native/JIT owner beyond the
 /// ordinary Python object graph.
-pub fn register_collectible_builtin_module(name: &'static str, init: fn(PyObjectRef)) {
+pub fn register_collectible_builtin_module(
+    name: &'static str,
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
+) {
     BUILTIN_MODULES.lock().unwrap().insert(
         name,
         BuiltinModuleDef {
@@ -587,7 +593,7 @@ pub fn register_collectible_builtin_module(name: &'static str, init: fn(PyObject
 /// `getbuiltinmodule()` and allowing startup imports without a module cycle.
 pub fn register_builtin_module_with_startup(
     name: &'static str,
-    init: fn(PyObjectRef),
+    init: fn(PyObjectRef) -> Result<(), crate::PyError>,
     startup: fn(PyObjectRef, *const PyExecutionContext) -> Result<(), crate::PyError>,
 ) {
     BUILTIN_MODULES.lock().unwrap().insert(
@@ -784,9 +790,12 @@ pub fn install_builtin_modules() {
         pyre_install_module!(pwd);
         #[cfg(unix)]
         pyre_install_module!(grp);
-        #[cfg(unix)]
+        // `host_env` as well as `unix`: both are wholly gated on that pair, so
+        // without it `sys.builtin_module_names` would advertise a module whose
+        // every call raises.
+        #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(resource);
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "host_env"))]
         pyre_install_module!(fcntl);
         #[cfg(unix)]
         pyre_install_module!(syslog);
@@ -869,7 +878,7 @@ fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     Ok(arg)
 }
 
-fn init_string_module(ns: PyObjectRef) {
+fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "formatter_parser",
@@ -971,6 +980,7 @@ fn init_string_module(ns: PyObjectRef) {
             ]))
         }),
     );
+    Ok(())
 }
 
 /// `_sysconfig` — `config_vars()`, the build variables that come from the
@@ -990,7 +1000,7 @@ fn init_string_module(ns: PyObjectRef) {
 /// suffix is built from: `EXT_SUFFIX == "." + SOABI + shared-library
 /// extension`. `_sysconfigdata` publishes the same keys for `_init_posix` but
 /// spells `SOABI` shorter — see [`soabi_tag`].
-fn init_sysconfig_stub(ns: PyObjectRef) {
+fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "config_vars",
@@ -1021,6 +1031,7 @@ fn init_sysconfig_stub(ns: PyObjectRef) {
             Ok(roots.get(vars_slot))
         }),
     );
+    Ok(())
 }
 
 /// The whole middle component of the extension suffix — PEP 3149's "ABI
@@ -1184,7 +1195,7 @@ fn quote_for_cflags(path: &str) -> String {
 /// `sysconfig._get_sysconfigdata` reaches this module by name only after
 /// `_PYTHON_SYSCONFIGDATA_NAME` and `_PYTHON_SYSCONFIGDATA_PATH` have had their
 /// turn, so a cross-compilation snapshot still overrides it.
-fn init_sysconfigdata(ns: PyObjectRef) {
+fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // These take the root slot rather than the dict itself: a word passed by
     // value goes stale the moment the key or the value allocates.
     fn store_str(vars_slot: usize, key: &str, value: &str) {
@@ -1466,12 +1477,13 @@ fn init_sysconfigdata(ns: PyObjectRef) {
         "build_time_vars",
         pyre_object::gc_roots::shadow_stack_get(vars_slot),
     );
+    Ok(())
 }
 
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
 /// tracing primitives are neutral no-ops that let `tracemalloc` import and
 /// report an inactive tracer.
-fn init_tracemalloc(ns: PyObjectRef) {
+fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "start",
@@ -1527,6 +1539,7 @@ fn init_tracemalloc(ns: PyObjectRef) {
         "_get_object_traceback",
         crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
     );
+    Ok(())
 }
 
 /// `_scproxy` — the macOS SystemConfiguration proxy probe that
@@ -1534,7 +1547,7 @@ fn init_tracemalloc(ns: PyObjectRef) {
 /// import.  Report "no system proxy configured" so the import succeeds and
 /// proxy resolution yields an empty mapping.
 #[cfg(target_os = "macos")]
-fn init_scproxy(ns: PyObjectRef) {
+fn init_scproxy(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "_get_proxies",
@@ -1559,6 +1572,7 @@ fn init_scproxy(ns: PyObjectRef) {
             Ok(roots.get(d_slot))
         }),
     );
+    Ok(())
 }
 
 /// Try to load a builtin module by name.
@@ -1570,12 +1584,20 @@ fn init_scproxy(ns: PyObjectRef) {
 /// `W_ModuleDictObject` for every module via
 /// `allocate_and_init_instance(module=True)`. Pyre mirrors that here:
 /// the initializer writes directly into a rooted, non-moving module dict.
-pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
+///
+/// `Ok(None)` is "no builtin by that name"; an `Err` is an initializer that
+/// ran and raised.  A module whose namespace comes from a bundled app-level
+/// source fails the way any module body can -- the source's own imports
+/// resolve through the running `sys.modules`, which the program owns -- and
+/// that belongs to the import which asked for the module, not to the process.
+pub(crate) fn load_builtin_module(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
     // The registry key outlives the module, which is what lets the sweep below
     // hand the name to `BuiltinCode.module` without copying it.
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock().unwrap();
-        let (static_name, def) = table.get_key_value(name)?;
+        let Some((static_name, def)) = table.get_key_value(name) else {
+            return Ok(None);
+        };
         (*static_name, *def)
     };
     let w_dict = pyre_object::dictmultiobject::w_module_dict_new();
@@ -1591,7 +1613,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
         pyre_object::gc_roots::shadow_stack_get(save_point + 1),
     );
     // Run module-specific initializer (PyPy: interpleveldefs)
-    (module_def.init)(w_dict);
+    (module_def.init)(w_dict)?;
     // MixedModule parity: interp-level builtin functions carry the module
     // name as `__module__`, so `pickle` can save them by reference
     // (`save_global`) without guessing via `whichmodule`. Snapshot owned
@@ -1660,7 +1682,7 @@ pub(crate) fn load_builtin_module(name: &str) -> Option<PyObjectRef> {
     if name == "builtins" {
         crate::module_ns_store(w_dict, "__builtins__", module);
     }
-    Some(module)
+    Ok(Some(module))
 }
 
 /// Build a builtin module for `_imp.create_builtin`, then run its `startup`
@@ -1685,7 +1707,7 @@ pub(crate) fn create_builtin_module(
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
-    let Some(module) = load_builtin_module(name) else {
+    let Some(module) = load_builtin_module(name)? else {
         return Ok(None);
     };
     let _ = pyre_object::gc_roots::pin_root(module);
@@ -2940,7 +2962,7 @@ pub fn add_sys_path(dir: &Path) {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     let entry = crate::gateway::fsdecode_os_str_wtf8(dir.as_os_str());
-    if get_sys_module("sys").is_none() {
+    if get_interpreter_sys_module().is_none() {
         {
             let mut path = SYS_PATH.lock().unwrap();
             let pb = dir.to_path_buf();
@@ -2956,7 +2978,7 @@ pub fn add_sys_path(dir: &Path) {
     let _roots = push_roots();
     let slot = shadow_stack_len();
     let _ = pin_root(pyre_object::w_str_from_wtf8(entry.clone()));
-    let Some(sys_mod) = get_sys_module("sys") else {
+    let Some(sys_mod) = get_interpreter_sys_module() else {
         return;
     };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
@@ -2997,7 +3019,7 @@ pub fn add_sys_path_0() {
     };
     // No `sys` yet (an embedder that never imports `site`): stage at the front
     // of the seed instead, which `create_sys_path_list` flushes in order.
-    if get_sys_module("sys").is_none() {
+    if get_interpreter_sys_module().is_none() {
         SYS_PATH.lock().unwrap().insert(0, PathBuf::from(entry));
         return;
     }
@@ -3006,7 +3028,7 @@ pub fn add_sys_path_0() {
     let _roots = push_roots();
     let slot = shadow_stack_len();
     let _ = pin_root(crate::gateway::fsdecode_os_str(&entry));
-    let Some(sys_mod) = get_sys_module("sys") else {
+    let Some(sys_mod) = get_interpreter_sys_module() else {
         return;
     };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
@@ -3034,13 +3056,34 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     // Once installed, the Python-visible dict is the sole semantic module
     // cache.  PyPy's `check_sys_modules` reads `space.sys.get('modules')` and
     // a deleted key is genuinely absent; the process-owned registry below is
-    // only the bootstrap owner/root used before that dict exists.
+    // only the bootstrap owner/root used before that dict exists, and the
+    // `None` sentinel is something only a running program writes, so the
+    // registry has none to drop.
     let dict = sys_modules_dict();
     if !dict.is_null() {
-        return unsafe { pyre_object::w_dict_getitem_str(dict, name) }
-            .filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) });
+        return sys_modules_dict_entry(dict, name).filter(|m| !unsafe { pyre_object::is_none(*m) });
     }
     sys_modules_registry_get(name)
+}
+
+/// `PyImport_GetModule` — whatever `sys.modules` holds under `name`, sentinel
+/// included.
+///
+/// A reader that is not importing owes the program the refusal the binding
+/// itself states: `sys.displayhook` hands the entry to `setattr`, and a name
+/// bound to `None` is refused there rather than treated as absent.
+pub(crate) fn sys_modules_entry(name: &str) -> Option<PyObjectRef> {
+    let dict = sys_modules_dict();
+    if dict.is_null() {
+        return sys_modules_registry_get(name);
+    }
+    sys_modules_dict_entry(dict, name)
+}
+
+/// The `sys.modules` dict read both readers above share: a missing key and a
+/// null are the same absence.
+fn sys_modules_dict_entry(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+    unsafe { pyre_object::w_dict_getitem_str(dict, name) }.filter(|m| !m.is_null())
 }
 
 /// Look `name` up in `SYS_MODULES`, the process-owned name→module registry.
@@ -3127,6 +3170,20 @@ pub fn get_builtin_module(name: &str) -> Option<PyObjectRef> {
 /// `sys` entry is the corresponding owner.
 pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
     sys_modules_registry_get("sys")
+}
+
+/// Return the interpreter-owned `builtins` module, bypassing the
+/// Python-visible `sys.modules` mapping.
+///
+/// The other half of [`get_interpreter_sys_module`]: `PyInterpreterState`
+/// carries `builtins` beside `sysdict`, and `finalize_modules_delete_special`
+/// reads both from there rather than through a mapping the program owns.
+/// The module this returns is the registry's, not
+/// `ExecutionContext::get_builtin()`'s -- the two are the split described at
+/// `create_builtin_module`, and finalization wants the one whose dict
+/// `sys.modules` published.
+pub fn get_interpreter_builtins_module() -> Option<PyObjectRef> {
+    sys_modules_registry_get("builtins")
 }
 
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
@@ -3413,6 +3470,7 @@ thread_local! {
 static SYS_NO_SITE: AtomicBool = AtomicBool::new(false);
 static SYS_QUIET: AtomicBool = AtomicBool::new(false);
 static SYS_INSPECT: AtomicBool = AtomicBool::new(false);
+static SYS_INTERACTIVE: AtomicBool = AtomicBool::new(false);
 static SYS_NO_USER_SITE: AtomicBool = AtomicBool::new(false);
 static SYS_IGNORE_ENVIRONMENT: AtomicBool = AtomicBool::new(false);
 static SYS_ISOLATED: AtomicBool = AtomicBool::new(false);
@@ -3460,6 +3518,7 @@ pub fn no_site_flag() -> bool {
 pub fn set_runtime_flags(flags: &crate::launch_env::LaunchFlags) {
     SYS_QUIET.store(flags.quiet, Ordering::Relaxed);
     SYS_INSPECT.store(flags.inspect, Ordering::Relaxed);
+    SYS_INTERACTIVE.store(flags.interactive, Ordering::Relaxed);
     SYS_NO_USER_SITE.store(flags.no_user_site, Ordering::Relaxed);
     SYS_IGNORE_ENVIRONMENT.store(flags.ignore_environment, Ordering::Relaxed);
     SYS_ISOLATED.store(flags.isolated, Ordering::Relaxed);
@@ -3558,11 +3617,18 @@ pub fn quiet_flag() -> bool {
     SYS_QUIET.load(Ordering::Relaxed)
 }
 
-/// `-i`, which `make_flags` reports as both `inspect` and `interactive`, folded
-/// with `PYTHONINSPECT`. The variable sets only `inspect`, so a run that owes
-/// the flag to the environment still reports `interactive` as false.
+/// `-i` folded with PYTHONINSPECT, reported as `sys.flags.inspect`.
 pub fn inspect_flag() -> bool {
     SYS_INSPECT.load(Ordering::Relaxed)
+}
+
+/// `-i` alone, reported as `sys.flags.interactive`.
+///
+/// The variable sets only `inspect`, so a run that owes the flag to the
+/// environment reports `interactive` as false -- and needs a terminal on stdin
+/// before `stdin_is_interactive` will open a prompt for it.
+pub fn interactive_flag() -> bool {
+    SYS_INTERACTIVE.load(Ordering::Relaxed)
 }
 
 pub fn no_user_site_flag() -> bool {
@@ -3871,7 +3937,7 @@ fn python_sys_path_dirs() -> Result<Option<Vec<PathBuf>>, crate::PyError> {
     // Python list is authoritative even when empty: a missing / non-list / empty
     // `sys.path` searches nothing, so `del sys.path` and `sys.path.clear()` break
     // imports exactly as they do under CPython, rather than resurrecting the seed.
-    let Some(sys_mod) = get_sys_module("sys") else {
+    let Some(sys_mod) = get_interpreter_sys_module() else {
         return Ok(None);
     };
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys_mod) };
@@ -4130,8 +4196,8 @@ pub fn appleveldef_install(
     filename: &str,
     modname: &str,
     names: &[&str],
-) {
-    appleveldef_install_seeded(ns, source, filename, modname, names, &[]);
+) -> Result<(), crate::PyError> {
+    appleveldef_install_seeded(ns, source, filename, modname, names, &[])
 }
 
 /// [`appleveldef_install`] with `seed` bound into the app namespace before the
@@ -4150,7 +4216,7 @@ pub fn appleveldef_install_seeded(
     modname: &str,
     names: &[&str],
     seed: &[(&str, PyObjectRef)],
-) {
+) -> Result<(), crate::PyError> {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: compile failed — {e}"));
     let ctx = crate::call::getexecutioncontext();
@@ -4187,15 +4253,19 @@ pub fn appleveldef_install_seeded(
     let w_code = crate::pycode::w_code_new_with_hidden_applevel(code_ptr as *const (), true);
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
-    if let Err(e) = frame.run_with_jit() {
-        panic!("appleveldef `{filename}`: exec — {e:?}");
-    }
+    // The source is a module body, so what it raises is the program's to see:
+    // a `from _operator import eq` in it resolves through the running
+    // `sys.modules`, which the program can have blocked.  Only the failures
+    // that no program can cause -- a bundled file that does not compile, a
+    // name the file never binds -- stay panics.
+    frame.run_with_jit()?;
     for &name in names {
         match unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) } {
             Some(val) => ns.store(name, val),
             None => panic!("appleveldef `{filename}`: name `{name}` not bound by source"),
         }
     }
+    Ok(())
 }
 
 // ── load_source_module ───────────────────────────────────────────────
@@ -4660,7 +4730,7 @@ fn load_part(
         let m = if modulename == "builtins" && !execution_context.is_null() {
             unsafe { (*execution_context).get_builtin() }
         } else {
-            load_builtin_module(modulename).ok_or_else(|| {
+            load_builtin_module(modulename)?.ok_or_else(|| {
                 crate::PyError::new(
                     crate::PyErrorKind::ImportError,
                     format!("builtin module '{modulename}' failed to initialize"),
@@ -4788,7 +4858,7 @@ fn load_part(
             let m = if partname == "builtins" && !execution_context.is_null() {
                 unsafe { (*execution_context).get_builtin() }
             } else {
-                load_builtin_module(partname).ok_or_else(|| {
+                load_builtin_module(partname)?.ok_or_else(|| {
                     crate::PyError::new(
                         crate::PyErrorKind::ImportError,
                         format!("builtin module '{modulename}' failed to initialize"),
@@ -6032,7 +6102,7 @@ pub(crate) fn module_shadow_info(
     // by user code — only a real set participates, and its membership test
     // (which hashes `__name__`) propagates.
     let mut shadowing_stdlib = false;
-    if let Some(sys_mod) = get_sys_module("sys") {
+    if let Some(sys_mod) = get_interpreter_sys_module() {
         let _scope = pyre_object::gc_roots::push_roots();
         let name_slot = pyre_object::gc_roots::shadow_stack_len();
         let w_name = pyre_object::gc_roots::pin_root(w_name);

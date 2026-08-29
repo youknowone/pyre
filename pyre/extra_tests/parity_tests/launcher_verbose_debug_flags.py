@@ -1,7 +1,12 @@
 # pyre-check: pypy-diverges: pypy3 counts `-d` the way it counts `-v`, so it
 # answers 2 for `-dd` where 3.14 saturates `sys.flags.debug` at 1, and its
 # `parse_env` folds on `if v:`, so a `=0` from either variable enables the flag
-# there and leaves it alone here.
+# there and leaves it alone here.  Its verbose banner diverges twice more:
+# `app_main.py run_command_line` reaches `print_banner` under a bare
+# `if verbose:`, with no `quiet` test, so `-q -v` still prints both lines
+# there; and `print_banner` writes through `sys.stderr`, so a `sitecustomize`
+# that rebinds the attribute captures the banner `fprintf(stderr, ...)` sends
+# to the descriptor.
 #
 # CPython-suite gap: `test_site` and `test_cmd_line` reach `-v` only by running
 # a subprocess with it, and both modules are outside the gated set, so a
@@ -24,6 +29,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 
 REPORT = "import sys; print('%d %d' % (sys.flags.verbose, sys.flags.debug))"
 
@@ -197,6 +203,51 @@ assert any(
     line.startswith(("Python ", "pyre ")) for line in site_err.splitlines()
 ), site_err[:400]
 assert COPYRIGHT_LINE not in site_err.splitlines(), site_err[:400]
+# `pymain_header` tests `quiet` before it tests anything else, so `-q` drops the
+# whole banner in every mode that would otherwise print one -- this arm included,
+# where `-q` otherwise has nothing to suppress.  pypy3 has no such test on its
+# stdin branch and prints both lines anyway.
+quiet_banner_err, quiet_banner_out = stdin_run(["-q", "-v"])
+assert quiet_banner_out == "done\n", quiet_banner_out
+assert not any(
+    line.startswith(("Python ", "pyre ")) for line in quiet_banner_err.splitlines()
+), quiet_banner_err[:400]
+assert COPYRIGHT_LINE not in quiet_banner_err.splitlines(), quiet_banner_err[:400]
+
+
+def banner_destination():
+    """`(reached fd 2, reached a replaced sys.stderr)` for the verbose banner."""
+    with tempfile.TemporaryDirectory() as root:
+        captured = os.path.join(root, "captured")
+        with open(os.path.join(root, "sitecustomize.py"), "w") as handle:
+            handle.write(
+                "import sys\n"
+                "sys.stderr = open(%r, 'w', buffering=1)\n" % captured
+            )
+        out = subprocess.run(
+            [sys.executable, "-v"],
+            input="print('done')\n",
+            capture_output=True,
+            text=True,
+            env=child_env({"PYTHONPATH": root}),
+        )
+        assert out.returncode == 0, (out.returncode, out.stderr[-400:])
+        with open(captured, encoding="utf-8", errors="replace") as handle:
+            replaced = handle.read()
+
+    def has_banner(text):
+        return any(
+            line.startswith(("Python ", "pyre ")) for line in text.splitlines()
+        )
+
+    return has_banner(out.stderr), has_banner(replaced)
+
+
+# `fprintf(stderr, ...)`: the banner goes to the process descriptor, so a
+# `sitecustomize` that rebinds `sys.stderr` during `import site` -- which runs
+# before the banner -- does not redirect it.  pypy3 writes it through the live
+# `sys.stderr` and so follows the rebind.
+assert banner_destination() == (True, False), banner_destination()
 # Without `-v` there is no banner, and a pipe still is not a prompt.
 plain_err, plain_out = stdin_run([])
 assert plain_out == "done\n", plain_out

@@ -18,7 +18,7 @@ use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use sre_engine::engine::{Request, SearchIter, State};
 use sre_engine::string::{StrDrive, StringCursor};
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // Must equal `re/_constants.py:MAGIC` (the bundled stdlib) — `_compiler.py`
     // asserts `_sre.MAGIC == MAGIC` at import time.
     module_ns_store(ns, "MAGIC", w_int_new(20230612)); // SRE magic number
@@ -129,6 +129,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // other builtin typedefs in `typedef.rs` (W_SRE_Pattern.typedef /
     // W_SRE_Match.typedef, interp_sre.py/:869); instances carry
     // `pyre_object::interp_sre` typed payloads.
+    Ok(())
 }
 
 /// `args[1]` as the typed pattern receiver for getsets registered on
@@ -1602,6 +1603,17 @@ enum TemplateItem {
 /// literal `str`/`bytes` runs interleaved with integer group references — into
 /// the [`TemplateItem`] stream `expand_into` consumes.
 fn template_items_from_list(w_result: PyObjectRef) -> Result<Vec<TemplateItem>, crate::PyError> {
+    // `parse_template` is reached by name through `re._parser`, so what comes
+    // back is whatever the program left there. `w_list_len` reads the list
+    // header without checking, which a tuple answers with a wild length.
+    // `_sre.template`'s own argument check is where this is refused upstream,
+    // and its wording is what a program that reaches here sees.
+    if !unsafe { pyre_object::is_list(w_result) } {
+        return Err(crate::PyError::type_error(format!(
+            "template() argument 2 must be list, not {}",
+            crate::baseobjspace::object_functionstr_type_name(w_result)
+        )));
+    }
     let n = unsafe { pyre_object::w_list_len(w_result) };
     let mut items: Vec<TemplateItem> = Vec::with_capacity(n);
     for i in 0..n {

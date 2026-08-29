@@ -6,7 +6,7 @@ incremental updates, and GC ownership remain on the Python hash object rather
 than in a TLS cache or global side table.
 """
 
-import operator as _operator
+from operator import index as _index
 
 from _hashlib import _blake2_new as _new_state
 
@@ -100,13 +100,13 @@ def _make_blake_type(class_name, _salt_size, _person_size, _key_size,
             # PyPy sets every integer parameter into the native parameter
             # block after range checking. operator.index matches the clinic
             # integer converters while accepting integer subclasses.
-            digest_size = _operator.index(digest_size)
-            fanout = _operator.index(fanout)
-            depth = _operator.index(depth)
-            leaf_size = _operator.index(leaf_size)
-            node_offset = _operator.index(node_offset)
-            node_depth = _operator.index(node_depth)
-            inner_size = _operator.index(inner_size)
+            digest_size = _index(digest_size)
+            fanout = _index(fanout)
+            depth = _index(depth)
+            leaf_size = _index(leaf_size)
+            node_offset = _index(node_offset)
+            node_depth = _index(node_depth)
+            inner_size = _index(inner_size)
             if not 1 <= digest_size <= cls.MAX_DIGEST_SIZE:
                 raise ValueError(
                     "digest_size must be between 1 and %d bytes" %

@@ -358,9 +358,14 @@ impl W_TextIOWrapper {
         crate::baseobjspace::is_true(closed)
     }
 
+    /// `textio.c CHECK_CLOSED`.
+    ///
+    /// The sentence ends in a period here and in `iobase.c`, and does not in
+    /// `fileio.c` or `stringio.c`; which spelling a program sees says which
+    /// layer refused it.
     fn check_closed(&self) -> Result<(), crate::PyError> {
         if self.buffer_closed()? {
-            Err(crate::PyError::value_error("I/O operation on closed file"))
+            Err(crate::PyError::value_error("I/O operation on closed file."))
         } else {
             Ok(())
         }
@@ -988,6 +993,14 @@ impl W_TextIOWrapper {
     ///
     /// `None` for every other stream, including one this did not build: it
     /// states no codec here, and the caller has to go through `write`.
+    ///
+    /// A closed stream is one of them.  `write` starts at `CHECK_CLOSED` and
+    /// the descriptor path has no such step, so short-circuiting a stream the
+    /// program has closed would keep writing where `print` owes a
+    /// `ValueError` -- the whole stack is closed by then, so there is nothing
+    /// left for the fast path to write to either.  Declining costs nothing
+    /// when the check itself raises: `write` runs the same check and reports
+    /// what it raised.
     pub fn stdio_native_print_errors(stream: PyObjectRef) -> Option<&'static str> {
         if stream.is_null()
             || !std::ptr::eq(
@@ -998,6 +1011,9 @@ impl W_TextIOWrapper {
             return None;
         }
         let payload = unsafe { &*(stream as *const Self) };
+        if payload.check_closed().is_err() {
+            return None;
+        }
         let (Some(encoding), Some(errors)) = (
             unsafe { pyre_object::w_str_get_value_opt(payload.w_encoding) },
             unsafe { pyre_object::w_str_get_value_opt(payload.w_errors) },

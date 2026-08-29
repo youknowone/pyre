@@ -2004,7 +2004,7 @@ impl Drop for MmapHandleGuard {
     }
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     #[cfg(any(unix, windows))]
     {
         // `interp_mmap.py:42 error = OSError` alias.
@@ -2045,6 +2045,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         // Register the type itself.
         crate::module_ns_store(ns, "mmap", mmap_type());
     }
+    Ok(())
 }
 
 /// `rmmap.py` — the mapping flags and advice values a POSIX `mmap(2)`

@@ -1080,7 +1080,7 @@ pub unsafe extern "C" fn PyErr_PrintEx(set_sys_last_vars: c_int) {
         crate::PyError::write_report_line(b"sys.excepthook is missing\n");
         let _ = crate::builtins::sys_excepthook(&[reload(1), reload(0), reload(2)]);
     };
-    let Some(sys_module) = crate::importing::get_sys_module("sys") else {
+    let Some(sys_module) = crate::importing::get_interpreter_sys_module() else {
         without_hook();
         return;
     };

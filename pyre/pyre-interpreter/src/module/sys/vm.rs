@@ -1356,7 +1356,7 @@ pub fn exc_info_direct() -> PyObjectRef {
     }
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     module_ns_store(ns, "maxsize", w_int_new(i64::MAX));
     module_ns_store(ns, "maxunicode", w_int_new(0x10FFFF));
     #[cfg(all(
@@ -1720,7 +1720,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
                 w_int_new(i64::from(crate::importing::debug_flag() != 0)),
                 // `-i` sets both.
                 w_int_new(i64::from(crate::importing::inspect_flag())),
-                w_int_new(i64::from(crate::importing::inspect_flag())),
+                w_int_new(i64::from(crate::importing::interactive_flag())),
                 w_int_new(crate::importing::optimize_level()),
                 w_int_new(i64::from(crate::importing::dont_write_bytecode_flag())),
                 w_int_new(i64::from(crate::importing::no_user_site_flag())),
@@ -2047,10 +2047,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             |args| {
                 let s = args[0];
                 if !unsafe { pyre_object::is_exact_type(s, &pyre_object::STR_TYPE) } {
-                    return Err(crate::PyError::type_error(format!(
-                        "can't intern {}",
-                        crate::type_methods::arg_type_name(s)
-                    )));
+                    // The clinic converter takes a `unicode`, so anything that
+                    // is not a `str` at all is refused by the argument and
+                    // never reaches `sys_intern_impl`; only a `str` subclass
+                    // does, and that is the refusal the body itself states.
+                    let name = crate::type_methods::arg_type_name(s);
+                    let message = if unsafe { is_str(s) } {
+                        format!("can't intern {name}")
+                    } else {
+                        format!("intern() argument must be str, not {name}")
+                    };
+                    return Err(crate::PyError::type_error(message));
                 }
                 Ok(unsafe { pyre_object::unicodeobject::intern_exact_str(s) })
             },
@@ -3266,6 +3273,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     // `space.fromcache(AuditHolder)` — see [`audit_holder`] for why the holder
     // is built here rather than on the first `addaudithook`.
     audit_holder();
+    Ok(())
 }
 
 /// `pypy/module/sys/vm.py AuditHolder`, which upstream reaches through
@@ -3764,7 +3772,7 @@ fn stdio_encoding_and_errors() -> (String, String) {
 
 fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (String, String) {
     let defaults = stdio_encoding_and_errors();
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return (defaults.0, default_errors.to_string());
     };
     let Ok(stream) = crate::baseobjspace::getattr_str(sys, stream_name) else {
@@ -3793,7 +3801,7 @@ fn live_stdio_encoding_errors(stream_name: &str, default_errors: &str) -> (Strin
 /// The `__std*__` aliases name the streams this built even after user code
 /// rebinds `sys.stdout`; a rebound one is not this function's to reconfigure.
 pub fn init_stream_codecs() -> Result<(), crate::PyError> {
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Ok(());
     };
     for name in ["__stdout__", "__stderr__", "__stdin__"] {
@@ -3818,6 +3826,53 @@ fn version_ex_triple() -> Option<(u32, u32, u32)> {
         info.dwMinorVersion,
         info.dwBuildNumber,
     ))
+}
+
+/// `textio.c CHECK_CLOSED`, the sentence a `TextIOWrapper` method states.
+const CLOSED_TEXT_LAYER: &str = "I/O operation on closed file.";
+
+/// `fileio.c self_check_closed`, where a query delegated down the stack ends.
+const CLOSED_RAW_LAYER: &str = "I/O operation on closed file";
+
+/// The `CHECK_CLOSED` an instance override owes.
+///
+/// The type methods these stand in for all start at one, and these reach the
+/// descriptor without going through the buffer at all, so a stream the program
+/// has closed would keep answering.  `message` is the spelling of the layer
+/// the override skipped: a `TextIOWrapper` method ends the sentence with a
+/// period, and a query that would have been delegated down to the raw
+/// descriptor does not.
+///
+/// The stream is named through the `__std*__` alias rather than `sys.stdout`
+/// and its neighbours, because it is the stream `make_std_stream` built that
+/// carries the override, and that is the one the alias keeps naming after user
+/// code rebinds the plain name.  A missing or unreadable alias leaves the
+/// override answering as it did before, which is what the seam does whenever
+/// `sys` cannot state something -- it runs before `sys` exists and after it is
+/// torn down.
+fn stdio_check_closed(alias: &str, message: &'static str) -> Result<(), crate::PyError> {
+    let closed = crate::importing::get_interpreter_sys_module()
+        .and_then(|sys| crate::baseobjspace::getattr_str(sys, alias).ok())
+        .and_then(|stream| crate::baseobjspace::getattr_str(stream, "closed").ok())
+        .is_some_and(|closed| crate::baseobjspace::is_true(closed).unwrap_or(false));
+    if closed {
+        return Err(crate::PyError::value_error(message));
+    }
+    Ok(())
+}
+
+/// The body every `flush` override shares once its own stream has answered
+/// `CHECK_CLOSED`.
+fn flush_std_descriptors() -> crate::PyResult {
+    // The sandbox path writes unbuffered ll_os_write requests, so there
+    // is nothing to flush (and the real fds are the marshalling pipe).
+    #[cfg(not(feature = "sandbox"))]
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+    }
+    Ok(w_none())
 }
 
 fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
@@ -3971,6 +4026,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // `backslashreplace` → escaped) instead of panicking in `w_str_get_value`.
     let write_fn = if to_stderr {
         crate::make_builtin_function("write", |args| {
+            stdio_check_closed("__stderr__", CLOSED_TEXT_LAYER)?;
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, _) = live_stdio_encoding_errors("stderr", "backslashreplace");
                 let bytes = encode_stdio_text(s_obj, "stderr", &encoding, "backslashreplace")?;
@@ -4000,6 +4056,7 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         })
     } else {
         crate::make_builtin_function("write", |args| {
+            stdio_check_closed("__stdout__", CLOSED_TEXT_LAYER)?;
             if let Some(s_obj) = pick_str(args) {
                 let (encoding, errors) = live_stdio_encoding_errors("stdout", "strict");
                 let bytes = encode_stdio_text(s_obj, "stdout", &encoding, &errors)?;
@@ -4028,21 +4085,25 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
         })
     };
     crate::baseobjspace::setdictvalue_native(stream, "write", write_fn);
-    crate::baseobjspace::setdictvalue_native(
-        stream,
-        "flush",
-        crate::make_builtin_function("flush", |_| {
-            // The sandbox path writes unbuffered ll_os_write requests, so there
-            // is nothing to flush (and the real fds are the marshalling pipe).
-            #[cfg(not(feature = "sandbox"))]
-            {
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                let _ = std::io::stderr().flush();
-            }
-            Ok(w_none())
+    // `flush` stands in for `TextIOWrapper.flush`, which starts at
+    // `CHECK_CLOSED`, so the descriptor picks the stream to ask -- a bare `fn`
+    // pointer carries no captures, the way `fileno` below selects one per
+    // descriptor rather than closing over `fd`.
+    let flush_fn = match fd {
+        0 => crate::make_builtin_function("flush", |_| {
+            stdio_check_closed("__stdin__", CLOSED_TEXT_LAYER)?;
+            flush_std_descriptors()
         }),
-    );
+        2 => crate::make_builtin_function("flush", |_| {
+            stdio_check_closed("__stderr__", CLOSED_TEXT_LAYER)?;
+            flush_std_descriptors()
+        }),
+        _ => crate::make_builtin_function("flush", |_| {
+            stdio_check_closed("__stdout__", CLOSED_TEXT_LAYER)?;
+            flush_std_descriptors()
+        }),
+    };
+    crate::baseobjspace::setdictvalue_native(stream, "flush", flush_fn);
     // PyPy's W_TextIOWrapper.isatty_w delegates to its live buffer, which in
     // turn delegates to the raw descriptor.  Do not install an instance
     // override here: after forkpty changes fd 0 into the slave terminal, the
@@ -4050,21 +4111,46 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
     // `BuiltinCodeFn` is a bare `fn` pointer (no captures), so select a
     // constant-returning function per descriptor rather than closing over `fd`.
     let fileno_fn = match fd {
-        0 => crate::make_builtin_function("fileno", |_| Ok(w_int_new(0))),
-        2 => crate::make_builtin_function("fileno", |_| Ok(w_int_new(2))),
-        _ => crate::make_builtin_function("fileno", |_| Ok(w_int_new(1))),
+        0 => crate::make_builtin_function("fileno", |_| {
+            stdio_check_closed("__stdin__", CLOSED_RAW_LAYER)?;
+            Ok(w_int_new(0))
+        }),
+        2 => crate::make_builtin_function("fileno", |_| {
+            stdio_check_closed("__stderr__", CLOSED_RAW_LAYER)?;
+            Ok(w_int_new(2))
+        }),
+        _ => crate::make_builtin_function("fileno", |_| {
+            stdio_check_closed("__stdout__", CLOSED_RAW_LAYER)?;
+            Ok(w_int_new(1))
+        }),
     };
     crate::baseobjspace::setdictvalue_native(stream, "fileno", fileno_fn);
-    let (writable_fn, readable_fn) = if writable {
-        (
-            crate::make_builtin_function("writable", |_| Ok(w_bool_from(true))),
-            crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
-        )
-    } else {
-        (
+    // A buffered layer delegates the query that names its own direction down to
+    // the raw descriptor, which refuses once the stream is closed, and answers
+    // the opposite one with a constant `False` that closing does not turn into
+    // an error.  Only the matching query takes the check.
+    let (writable_fn, readable_fn) = match fd {
+        0 => (
             crate::make_builtin_function("writable", |_| Ok(w_bool_from(false))),
-            crate::make_builtin_function("readable", |_| Ok(w_bool_from(true))),
-        )
+            crate::make_builtin_function("readable", |_| {
+                stdio_check_closed("__stdin__", CLOSED_RAW_LAYER)?;
+                Ok(w_bool_from(true))
+            }),
+        ),
+        2 => (
+            crate::make_builtin_function("writable", |_| {
+                stdio_check_closed("__stderr__", CLOSED_RAW_LAYER)?;
+                Ok(w_bool_from(true))
+            }),
+            crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
+        ),
+        _ => (
+            crate::make_builtin_function("writable", |_| {
+                stdio_check_closed("__stdout__", CLOSED_RAW_LAYER)?;
+                Ok(w_bool_from(true))
+            }),
+            crate::make_builtin_function("readable", |_| Ok(w_bool_from(false))),
+        ),
     };
     crate::baseobjspace::setdictvalue_native(stream, "writable", writable_fn);
     crate::baseobjspace::setdictvalue_native(stream, "readable", readable_fn);

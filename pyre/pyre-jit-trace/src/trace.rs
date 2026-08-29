@@ -1092,6 +1092,111 @@ fn try_commit_midbody_abort_inner(
     }
 }
 
+/// Whether a backward jump is reachable from `start_pc` — the loop a
+/// reconstructed frame resumed there can still reach.
+///
+/// `drive_bridge_carrier_walk` keeps its sub-walk only on a clean
+/// `SubReturn`; every other outcome falls through to the journal-rollback tail,
+/// which hands the guard back to a resume from `rd_numb`.  By then the sub-walk
+/// has concrete-executed the callee's residual calls — a `STORE_ATTR` runs
+/// through a residual helper, outside the store journal's reach — so the
+/// replayed region reads fields it has already written.  A callee that reaches
+/// its own loop header while a compiled token exists for it surfaces
+/// `SubLoopCalleeCallAssembler`, one such outcome, and that is only decidable
+/// after the prologue has run.  Walk the code instead and decline before
+/// driving anything: the effect odometer has not moved at that point, so the
+/// rollback the decline falls into is sound.
+///
+/// The walk starts where the drain resumes the frame, not at the top of the
+/// code, because a frame resumed past its loops cannot re-enter them.  Reading
+/// the whole code object instead declined `inline_subwalk_user_iterator`'s
+/// `step`, resumed at py 37 with only the `return` tail ahead of it and its one
+/// header behind at py 20, and that decline cost 402 -> 5988 guard failures and
+/// a `loops_aborted` of 1.
+///
+/// Successors are the codewriter's: fall-through unless the opcode is an
+/// unconditional jump, the branch operand's target, and the handler any
+/// covering exception-table entry names.  The test remains a superset of the
+/// outcome it stands for — a header whose token is not compiled would have
+/// walked through — so it still costs bridges rather than answers, and a seed
+/// that lands outside the code declines rather than admits.
+///
+/// Deciding early rather than repairing the tail is what the tail itself
+/// reports.  On `chunked_read_keeps_its_buffered_tail.py` without this arm,
+/// `PYRE_FBW_DEBUG_ABORT` reads:
+///
+/// ```text
+/// [fbw-effect] pc=1886 helper=StoreAttr extraeffect=RandomEffects writes_live=true
+/// [fbw-effect-bump] site=residual count=1
+/// [fbw-effect] pc=1960 helper=StoreAttr extraeffect=CannotRaise writes_live=true
+/// [fbw-effect-bump] site=residual count=2
+/// [s2-adopt-decline] no latched multi-frame image; single-frame adopt follows
+/// [p2-drain-abort] effects=2 adopted=false
+/// ```
+///
+/// The odometer does see both stores; they bump it as `residual`, not as
+/// `store_journal`, which is the same thing as saying no journal carries them.
+/// So the tail's two exits are the adopt — which declined for want of a latched
+/// multi-frame image — and the rollback, which restores only what a journal
+/// holds and then replays the region over stores that already stand.  Repairing
+/// that means making the adopt succeed for this shape, not making the rollback
+/// reach further; until it does, not entering is the only sound road.
+fn backward_jump_reachable_from(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
+    use pyre_interpreter::Instruction as I;
+    let n = code.instructions.len();
+    // An entry the projection cannot place inside this code object leaves the
+    // walk with nothing to explore, and an empty walk answers "no loop" -- the
+    // admitting answer. Refuse instead: not knowing where the frame resumes is
+    // not evidence that it resumes outside every loop.
+    if start_pc >= n {
+        return true;
+    }
+    // On a raise the unwinder transfers to the covering handler, which is a
+    // control-flow successor the branch operand does not carry.
+    let handlers: Vec<(usize, usize, usize)> =
+        pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+            .map(|e| {
+                (
+                    e.start as usize / 2,
+                    e.end as usize / 2,
+                    e.target as usize / 2,
+                )
+            })
+            .collect();
+    let mut seen = vec![false; n];
+    let mut work = vec![start_pc];
+    while let Some(pc) = work.pop() {
+        if pc >= n || seen[pc] {
+            continue;
+        }
+        seen[pc] = true;
+        let Some((instr, op_arg)) = pyre_interpreter::decode_instruction_at(code, pc) else {
+            // An opcode this build cannot decode says nothing about where it
+            // goes, so keep walking past it rather than pruning the successor.
+            work.push(pc + 1);
+            continue;
+        };
+        if matches!(
+            instr,
+            I::JumpBackward { .. } | I::JumpBackwardNoInterrupt { .. }
+        ) {
+            return true;
+        }
+        if !crate::liveness::is_unconditional_jump(&instr) {
+            work.push(pc + 1);
+        }
+        if let Some(target) = crate::liveness::target_pc(code, &instr, pc, op_arg) {
+            work.push(target);
+        }
+        for (start, end, target) in &handlers {
+            if pc >= *start && pc < *end {
+                work.push(*target);
+            }
+        }
+    }
+    false
+}
+
 fn start_pc_is_loop_header(code: &pyre_interpreter::CodeObject, start_pc: usize) -> bool {
     use pyre_interpreter::Instruction as I;
     let mut arg_state = pyre_interpreter::OpArgState::default();
@@ -1823,6 +1928,21 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             carrier.recipes.len()
         );
     }
+    // Deeper than the middle-frame drive can compile.  Decided here, before
+    // anything in the callee runs: past this point the sub-walk
+    // concrete-executes the reconstructed frames, and the abort tail's rollback
+    // covers the journals alone -- a residual call's heap writes move the
+    // odometer and push no journal entry, so they stand while the blackhole
+    // replays the region that made them.  `carrier_py_frame_depth` reads only
+    // the carrier, so nothing the sub-walk produces is needed to answer it.
+    //
+    // Transient, unlike `NoRecipes` below: the depth is this carrier's, and the
+    // same guard can fail again carrying a shallower one.
+    if carrier_py_frame_depth(carrier) > crate::jitcode_dispatch::fbw_max_multiframe_depth() {
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        crate::jitcode_dispatch::census_record("P2Drain::OverMultiframeDepth");
+        return p2_drain_abort();
+    }
     let Some(recipe) = carrier.recipes.last() else {
         crate::jitcode_dispatch::census_record("P2Drain::NoRecipes");
         // Churn guard: making this class transient retried the same
@@ -1866,6 +1986,61 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeEntry");
         return p2_drain_abort();
     };
+    let raw_callee_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
+    if raw_callee_code.is_null() {
+        discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+        crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
+        return p2_drain_abort();
+    }
+    // Before anything runs in the callee: a frame that can reach a loop header
+    // from where the drain resumes it can stop the sub-walk at an outcome this
+    // drain does not keep, and the rollback that follows does not reach what
+    // the sub-walk has already executed by then.
+    // See `backward_jump_reachable_from`.
+    //
+    // Every recipe is tested, not the deepest alone.  A middle frame is driven
+    // by the same `drive_bridge_frame_subwalk`, so it surfaces the same outcome
+    // from its own header -- and it is driven only after the deepest callee has
+    // executed, which is exactly the position this arm exists to avoid.  For a
+    // self-recursive carrier every recipe shares one code object, so the
+    // whole-code test this replaces covered the middles by accident; reading
+    // each recipe's own resume point is what keeps that cover once the test
+    // stops reading the whole code.
+    for carried in carrier.recipes.iter() {
+        let raw_code = carried.code_ptr as *const pyre_interpreter::CodeObject;
+        let seed = (!raw_code.is_null())
+            .then(|| crate::state::pyjitcode_for_code(carried.code_ptr))
+            .flatten()
+            .and_then(|carried_pjc| {
+                let carried_entry = select_recipe_entry(
+                    carried.jitcode_index,
+                    carried_pjc.jitcode.index() as i32,
+                    carried.jitcode_pc,
+                )?;
+                Some(crate::py_coord::containing_py_pc_for_jitcode_pc(
+                    &carried_pjc.metadata,
+                    carried_entry,
+                ) as usize)
+            });
+        // A recipe the drain cannot project has no resume point to test, and
+        // admitting it would drive a frame this arm never read.
+        let Some(seed) = seed else {
+            fbw_bridge_decline(ctx);
+            discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+            crate::jitcode_dispatch::census_record("P2Drain::RecipeNotProjectable");
+            return p2_drain_abort();
+        };
+        if backward_jump_reachable_from(unsafe { &*raw_code }, seed) {
+            // Kept permanently declined, as the whole-code test was: the churn
+            // the `NoRecipes` arm measures is what a retryable decline of this
+            // class costs, and narrowing which carriers reach here does not
+            // change what happens to the ones that do.
+            fbw_bridge_decline(ctx);
+            discard_bridge_carrier_walk(ctx, sym, entry_depth, pre_pos, &pre_virtualref_boxes);
+            crate::jitcode_dispatch::census_record("P2Drain::LoopBearingCallee");
+            return p2_drain_abort();
+        }
+    }
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
     // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
@@ -1939,37 +2114,34 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // caller's residual-call return register (make_result_of_lastop) and
         // rebinding `result` to that caller's own return.  Any non-portable
         // middle shape yields `None` and drops to the journal-rollback abort
-        // epilogue below, so a carrier we cannot compile deopts cleanly.
+        // epilogue below, which restores what it journaled and no more; the
+        // declines that can be taken before the callee runs belong above this
+        // point, not here.
         let n = carrier.recipes.len();
-        let want_compile = n >= 1
-            && carrier_py_frame_depth(carrier)
-                <= crate::jitcode_dispatch::fbw_max_multiframe_depth();
         let mut middles_ok = true;
-        if want_compile {
-            for i in (0..n.saturating_sub(1)).rev() {
-                // recipes[i]'s paused parents are the shallower frames
-                // recipes[..i] (the root sits above them all).
-                match drive_middle_frame_and_thread(
-                    ctx,
-                    &session,
-                    sym,
-                    root_pc,
-                    root_ec,
-                    root_ec_box,
-                    root_frame_box,
-                    &carrier.recipes[i],
-                    &carrier.recipes[..i],
-                    result,
-                ) {
-                    Some(mid_result) => result = mid_result,
-                    None => {
-                        middles_ok = false;
-                        break;
-                    }
+        for i in (0..n.saturating_sub(1)).rev() {
+            // recipes[i]'s paused parents are the shallower frames
+            // recipes[..i] (the root sits above them all).
+            match drive_middle_frame_and_thread(
+                ctx,
+                &session,
+                sym,
+                root_pc,
+                root_ec,
+                root_ec_box,
+                root_frame_box,
+                &carrier.recipes[i],
+                &carrier.recipes[..i],
+                result,
+            ) {
+                Some(mid_result) => result = mid_result,
+                None => {
+                    middles_ok = false;
+                    break;
                 }
             }
         }
-        if want_compile && middles_ok {
+        if middles_ok {
             if inject_root_call_result(sym, root_pc, result) {
                 crate::jitcode_dispatch::census_record("P2Drain::CompileRoot");
                 let root_py_pc = crate::py_coord::resume_py_pc_for_jitcode_word(

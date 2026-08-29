@@ -117,7 +117,7 @@ fn _normal_dist_inv_cdf(p: f64, mu: f64, sigma: f64) -> Result<f64, crate::PyErr
     normal_dist_inv_cdf_impl(p, mu, sigma)
 }
 
-pub fn init(ns: PyObjectRef) {
+pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "_normal_dist_inv_cdf",
@@ -131,4 +131,5 @@ pub fn init(ns: PyObjectRef) {
             ),
         ),
     );
+    Ok(())
 }

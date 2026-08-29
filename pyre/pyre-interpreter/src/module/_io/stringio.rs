@@ -488,13 +488,18 @@ impl W_StringIO {
     }
 
     #[getter]
-    fn line_buffering(&self) -> bool {
-        false
+    fn line_buffering(&self) -> Result<bool, crate::PyError> {
+        // `_io_StringIO_line_buffering_get_impl` opens at `CHECK_CLOSED`, so
+        // the constant is only the answer while the stream is open.
+        self.check_closed()?;
+        Ok(false)
     }
 
     #[getter]
     fn newlines(&self) -> Result<PyObjectRef, crate::PyError> {
-        // interp_stringio.py:477-480.
+        // interp_stringio.py:477-480, with the `CHECK_CLOSED` that
+        // `_io_StringIO_newlines_get_impl` states ahead of the decoder test.
+        self.check_closed()?;
         if self.w_decoder.is_null() {
             Ok(w_none())
         } else {

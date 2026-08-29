@@ -35,10 +35,10 @@ static HANDLES: std::sync::Mutex<[usize; 3]> = std::sync::Mutex::new([0; 3]);
 /// retain the execution namespace as their `__globals__`, which keeps
 /// `slotnames` reachable from `get_slotvalues` even though only three names
 /// are surfaced.
-fn handle(which: usize) -> PyObjectRef {
+fn handle(which: usize) -> PyResult {
     let cached = HANDLES.lock().unwrap()[which];
     if cached != 0 {
-        return cached as PyObjectRef;
+        return Ok(cached as PyObjectRef);
     }
 
     // Do not hold HANDLES while executing Python: applevel installation can
@@ -55,7 +55,19 @@ fn handle(which: usize) -> PyObjectRef {
     let save_point = pyre_object::gc_roots::shadow_stack_len();
     let w_app_globals = pyre_object::dictmultiobject::w_module_dict_new();
     let _ = pyre_object::gc_roots::pin_root(w_app_globals);
-    crate::importing::appleveldef_install(
+    // The source reads `sys.modules['copyreg']`, so it needs the same `sys`
+    // the program sees -- but binding the name through an import would read
+    // whatever the program left in `sys.modules['sys']`, and a `None` there
+    // is the sentinel that makes an import raise.  The interpreter's own
+    // module carries the same `modules` dict, so seeding it keeps what the
+    // source reads while taking the name out of the program's reach.
+    let Some(w_sys) = crate::importing::get_interpreter_sys_module() else {
+        panic!("reduce_protocol: no sys module to read `sys.modules` through");
+    };
+    // Running the source is running Python -- a fresh frame, the program's
+    // recursion limit, the program's `builtins` -- so a failure belongs to the
+    // `__reduce__` that forced the install.
+    crate::importing::appleveldef_install_seeded(
         pyre_object::gc_roots::shadow_stack_get(save_point),
         include_str!("reduce_protocol_app.py"),
         "reduce_protocol_app.py",
@@ -65,7 +77,8 @@ fn handle(which: usize) -> PyObjectRef {
         // only as their `__globals__['__name__']`.
         "__builtin__",
         &["reduce_1", "reduce_2", "get_slotvalues"],
-    );
+        &[("sys", w_sys)],
+    )?;
     let w_app_globals = pyre_object::gc_roots::shadow_stack_get(save_point);
     let get = |name: &str| {
         unsafe { pyre_object::w_dict_getitem_str(w_app_globals, name) }
@@ -80,7 +93,7 @@ fn handle(which: usize) -> PyObjectRef {
     if handles[which] == 0 {
         *handles = initialized;
     }
-    handles[which] as PyObjectRef
+    Ok(handles[which] as PyObjectRef)
 }
 
 /// RPython's GC transform treats the app-level interphook cache as a normal
@@ -104,7 +117,7 @@ fn typename(w_obj: PyObjectRef) -> String {
 
 /// objectobject.py `get_slotvalues(obj)` — app-level handle.
 pub fn get_slotvalues(w_obj: PyObjectRef) -> PyResult {
-    crate::call::call_function_impl_result(handle(GET_SLOTVALUES), &[w_obj])
+    crate::call::call_function_impl_result(handle(GET_SLOTVALUES)?, &[w_obj])
 }
 
 /// objectobject.py `object_getstate_default(space, w_obj, required)`.
@@ -295,7 +308,7 @@ fn reduce_1(w_obj: PyObjectRef, proto: i64) -> PyResult {
     let proto_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_proto);
     crate::call::call_function_impl_result(
-        handle(REDUCE_1),
+        handle(REDUCE_1)?,
         &[
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             pyre_object::gc_roots::shadow_stack_get(proto_slot),
@@ -321,7 +334,7 @@ fn reduce_2(
     let proto_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_proto);
     crate::call::call_function_impl_result(
-        handle(REDUCE_2),
+        handle(REDUCE_2)?,
         &[
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
             pyre_object::gc_roots::shadow_stack_get(proto_slot),

@@ -39,39 +39,49 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
             Ok(())
         }
     }
+    /// The item converters take `PyNumber_Index` before the width check, so a
+    /// value that is not an integer at all is refused by the protocol, which
+    /// names the type it could not convert, rather than by the unwrap behind
+    /// it, which states PyPy's own sentence.
+    fn item_int_w(w: PyObjectRef) -> Result<i64, PyError> {
+        if unsafe { pyre_object::is_int(w) || pyre_object::pyobject::is_long(w) } {
+            return int_w(w);
+        }
+        int_w(crate::baseobjspace::space_index(w)?)
+    }
     let n = match typecode {
         b'b' => {
-            let v = int_w(w)?;
+            let v = item_int_w(w)?;
             signed_range(v, i8::MIN as i64, i8::MAX as i64, "signed char")?;
             out[..1].copy_from_slice(&(v as i8).to_ne_bytes());
             1
         }
         b'B' => {
-            let v = int_w(w)?;
+            let v = item_int_w(w)?;
             signed_range(v, 0, u8::MAX as i64, "unsigned byte integer")?;
             out[..1].copy_from_slice(&(v as u8).to_ne_bytes());
             1
         }
         b'h' => {
-            let v = int_w(w)?;
+            let v = item_int_w(w)?;
             signed_range(v, i16::MIN as i64, i16::MAX as i64, "signed short")?;
             out[..2].copy_from_slice(&(v as i16).to_ne_bytes());
             2
         }
         b'H' => {
-            let v = int_w(w)?;
+            let v = item_int_w(w)?;
             signed_range(v, 0, u16::MAX as i64, "unsigned short")?;
             out[..2].copy_from_slice(&(v as u16).to_ne_bytes());
             2
         }
         b'i' => {
-            let v = int_w(w)?;
+            let v = item_int_w(w)?;
             signed_range(v, i32::MIN as i64, i32::MAX as i64, "signed int")?;
             out[..4].copy_from_slice(&(v as i32).to_ne_bytes());
             4
         }
         b'I' => {
-            let v = int_w(w)?;
+            let v = item_int_w(w)?;
             signed_range(v, 0, u32::MAX as i64, "unsigned int")?;
             out[..4].copy_from_slice(&(v as u32).to_ne_bytes());
             4
@@ -79,7 +89,7 @@ fn pack_into(typecode: u8, w: PyObjectRef, out: &mut Bytes) -> Result<usize, PyE
         b'l' | b'q' => {
             // C long / long long on 64-bit — full i64 range; `int_w` itself
             // raises OverflowError outside it.
-            let v = int_w(w)?;
+            let v = item_int_w(w)?;
             out[..8].copy_from_slice(&v.to_ne_bytes());
             8
         }
@@ -431,10 +441,18 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
     let isz = unsafe { arr::w_array_itemsize(obj) };
     let tc = unsafe { arr::w_array_typecode(obj) };
     if unsafe { pyre_object::sliceobject::is_slice(key) } {
-        // Slice assignment accepts only an array of the same typecode.
-        if !unsafe { arr::is_array(w_value) } || unsafe { arr::w_array_typecode(w_value) } != tc {
+        // `array_ass_subscr` names the operand it was handed; an array of
+        // another kind passed that test and is refused by `PyErr_BadArgument`
+        // behind it.
+        if !unsafe { arr::is_array(w_value) } {
+            return Err(PyError::type_error(format!(
+                "can only assign array (not \"{}\") to array slice",
+                unsafe { pyre_object::type_name_of(w_value) }
+            )));
+        }
+        if unsafe { arr::w_array_typecode(w_value) } != tc {
             return Err(PyError::type_error(
-                "can only assign array (not \"other\") to array slice",
+                "bad argument type for built-in operation",
             ));
         }
         let (start, stop, step) = crate::sliceobject::indices3(
@@ -802,6 +820,11 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.fromlist")?;
+    // `array_array_fromlist` opens at `PyList_Check`, so a tuple or any other
+    // iterable is refused rather than consumed.
+    if !unsafe { pyre_object::is_list(args[1]) } {
+        return Err(PyError::type_error("arg must be list"));
+    }
     array_extend_iterable(args[0], args[1], true)?;
     Ok(pyre_object::w_none())
 }
@@ -815,7 +838,10 @@ fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
 fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.frombytes")?;
     if !unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
-        return Err(PyError::type_error("a bytes-like object is required"));
+        return Err(PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            crate::type_methods::arg_type_name(args[1])
+        )));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[1]) }.to_vec();
     array_frombytes(args[0], &bytes)?;
@@ -1085,9 +1111,10 @@ fn array_add_method(args: &[PyObjectRef]) -> PyResult {
     let a = args[0];
     let b = args[1];
     if !unsafe { arr::is_array(b) } {
-        return Err(PyError::type_error(
-            "can only append array (not \"other\") to array",
-        ));
+        return Err(PyError::type_error(format!(
+            "can only append array (not \"{}\") to array",
+            unsafe { pyre_object::type_name_of(b) }
+        )));
     }
     let tc = unsafe { arr::w_array_typecode(a) };
     if unsafe { arr::w_array_typecode(b) } != tc {
@@ -1106,11 +1133,17 @@ fn array_iadd_method(args: &[PyObjectRef]) -> PyResult {
     let a = args[0];
     array_check_resize(a)?;
     let b = args[1];
-    if !unsafe { arr::is_array(b) }
-        || unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) }
-    {
+    // `array_inplace_concat` refuses a non-array itself and hands the
+    // same-kind test to `array_do_extend`, which states the other sentence.
+    if !unsafe { arr::is_array(b) } {
+        return Err(PyError::type_error(format!(
+            "can only extend array with array (not \"{}\")",
+            unsafe { pyre_object::type_name_of(b) }
+        )));
+    }
+    if unsafe { arr::w_array_typecode(b) } != unsafe { arr::w_array_typecode(a) } {
         return Err(PyError::type_error(
-            "can only extend array with array of same kind",
+            "can only extend with array of same kind",
         ));
     }
     let src = unsafe { arr::w_array_bytes(b) }.to_vec();
@@ -1136,9 +1169,23 @@ fn array_repeat_bytes(obj: PyObjectRef, count: i64) -> PyResult {
     Ok(arr::w_array_from_bytes(tc, isz, out))
 }
 
+/// `sequence_repeat`'s count.  `array` carries `sq_repeat` and no
+/// `nb_multiply`, so the binary operator reaches the repeat with whatever it
+/// was handed: an operand with no `__index__` at all is refused as a repeat,
+/// naming its own type, rather than by the conversion behind that check.
+fn array_repeat_count(w_count: PyObjectRef) -> Result<i64, PyError> {
+    if unsafe { crate::baseobjspace::lookup(w_count, "__index__") }.is_none() {
+        return Err(PyError::type_error(format!(
+            "can't multiply sequence by non-int of type '{}'",
+            crate::type_methods::arg_type_name(w_count)
+        )));
+    }
+    crate::builtins::getindex_w(w_count)
+}
+
 fn array_mul_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__mul__")?;
-    let count = crate::builtins::getindex_w(args[1])?;
+    let count = array_repeat_count(args[1])?;
     array_repeat_bytes(args[0], count)
 }
 
@@ -1146,7 +1193,7 @@ fn array_imul_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__imul__")?;
     let obj = args[0];
     array_check_resize(obj)?;
-    let count = crate::builtins::getindex_w(args[1])?.max(0) as usize;
+    let count = array_repeat_count(args[1])?.max(0) as usize;
     let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
     if count == 0 {
         unsafe { arr::w_array_vec_mut(obj) }.clear();
@@ -1294,18 +1341,23 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     }
     let w_cls = args[0];
     if !unsafe { pyre_object::is_type(w_cls) } {
-        return Err(PyError::type_error(
-            "_array_reconstructor() argument 1 must be type, not other",
-        ));
+        return Err(PyError::type_error(format!(
+            "_array_reconstructor() argument 1 must be type, not {}",
+            crate::type_methods::clinic_arg_type_name(w_cls)
+        )));
     }
     let array_type = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
     if !crate::baseobjspace::issubclass(w_cls, array_type)? {
-        return Err(PyError::type_error(
-            "_array_reconstructor() argument 1 must be a subclass of array.array",
-        ));
+        return Err(PyError::type_error(format!(
+            "{} is not a subtype of array.array",
+            unsafe { pyre_object::w_type_get_name(w_cls) }
+        )));
     }
     if !unsafe { pyre_object::is_str(args[1]) } {
-        return Err(PyError::type_error("typecode must be a unicode character"));
+        return Err(PyError::type_error(format!(
+            "_array_reconstructor() argument 2 must be a unicode character, not {}",
+            crate::type_methods::clinic_arg_type_name(args[1])
+        )));
     }
     let typecode_bytes = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(args[1]) }.as_bytes();
     if typecode_bytes.len() != 1 || arr::typecode_itemsize(typecode_bytes[0]).is_none() {
@@ -1314,21 +1366,20 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
     let typecode = typecode_bytes[0];
     let itemsize = arr::typecode_itemsize(typecode).unwrap() as usize;
     // mformat_code: int in [MACHINE_FORMAT_CODE_MIN, MACHINE_FORMAT_CODE_MAX].
-    if !unsafe { pyre_object::is_int(args[2]) } {
-        return Err(PyError::type_error(
-            "an integer is required (got type other)",
-        ));
-    }
-    let mformat = unsafe { pyre_object::w_int_get_value(args[2]) };
+    // The `int` converter takes `PyNumber_Index`, which names the type it
+    // could not convert.
+    let w_mformat = crate::baseobjspace::space_index(args[2])?;
+    let mformat = crate::baseobjspace::int_w(w_mformat)?;
     if !(0..=21).contains(&mformat) {
         return Err(PyError::value_error(
             "third argument must be a valid machine format code.",
         ));
     }
     if !unsafe { pyre_object::bytesobject::is_bytes_like(args[3]) } {
-        return Err(PyError::type_error(
-            "fourth argument should be bytes, not other",
-        ));
+        return Err(PyError::type_error(format!(
+            "fourth argument should be bytes, not {}",
+            unsafe { pyre_object::type_name_of(args[3]) }
+        )));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[3]) }.to_vec();
     if mformat == array_machine_format_code(typecode, itemsize) {
@@ -1604,7 +1655,7 @@ pub fn init_array_type(ns: PyObjectRef) {
 }
 
 /// `array` module init — `moduledef.py interpleveldefs`.
-pub fn init_array_module(ns: pyre_object::PyObjectRef) {
+pub fn init_array_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     let type_obj = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
     module_ns_store(ns, "array", type_obj);
     module_ns_store(ns, "ArrayType", type_obj);
@@ -1614,6 +1665,7 @@ pub fn init_array_module(ns: pyre_object::PyObjectRef) {
         "_array_reconstructor",
         crate::make_builtin_function("_array_reconstructor", array_reconstructor),
     );
+    Ok(())
 }
 
 /// PyPy `pypy/module/array/moduledef.py:Module.startup`: array is a

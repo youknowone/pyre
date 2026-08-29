@@ -652,7 +652,7 @@ pub fn install_signal_handling(ec: &mut ExecutionContext) {
 /// from `libc::*` so they match the host's POSIX numbering (the previous
 /// macOS-flavoured hard-coded list disagreed with Linux for
 /// SIGUSR1/SIGUSR2/SIGCHLD).
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // interp_signal.py `signal(signum, handler) -> previous`.
     crate::module_ns_store(
         ns,
@@ -1570,4 +1570,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
         crate::module_ns_store(ns, "CTRL_C_EVENT", pyre_object::w_int_new(0));
         crate::module_ns_store(ns, "CTRL_BREAK_EVENT", pyre_object::w_int_new(1));
     }
+    Ok(())
 }

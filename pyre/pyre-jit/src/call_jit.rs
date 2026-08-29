@@ -3527,6 +3527,27 @@ fn bridge_resolution_from_bool(compiled_continue: bool) -> BridgeResolution {
     }
 }
 
+/// `MAJIT_BRIDGE_BAIL=<stage>` (diagnostic): resume in the blackhole from a
+/// chosen point inside the guard-failure entry, so a wrong answer that appears
+/// only with bridges on can be attributed to one prefix of what the attempt
+/// does.  `MAJIT_NO_BRIDGE` and `MAJIT_MAX_BRIDGES` name WHICH bridge; this
+/// names which STEP of it.  1 = before `decode_and_restore_guard_failure`, so
+/// nothing the attempt owns has run; 2 = after it, so the resume data has been
+/// decoded, its pending fields replayed and the virtualizable synchronised;
+/// 3 = after the frame's `last_instr` is repointed, so only the walk is
+/// missing.  Stage 1 is the control -- it has to reproduce `MAJIT_NO_BRIDGE=1`
+/// exactly, and a stage that does not is measuring the build rather than the
+/// step.
+fn bridge_bail_stage() -> u32 {
+    static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| {
+        std::env::var("MAJIT_BRIDGE_BAIL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// compile.py (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
@@ -3652,6 +3673,9 @@ pub fn trace_and_compile_from_bridge(
     if !majit_metainterp::bridge_fuel_take() {
         return BridgeResolution::ResumeBlackhole;
     }
+    if bridge_bail_stage() == 1 {
+        return BridgeResolution::ResumeBlackhole;
+    }
 
     let info = {
         let (_, info) = crate::eval::driver_pair();
@@ -3682,6 +3706,9 @@ pub fn trace_and_compile_from_bridge(
             exit_layout,
         )
     });
+    if bridge_bail_stage() == 2 {
+        return BridgeResolution::ResumeBlackhole;
+    }
     let Some((_, resume_pc, num_resume_frames, resume_coords)) = decoded_resume else {
         return BridgeResolution::ResumeBlackhole;
     };
@@ -3728,6 +3755,9 @@ pub fn trace_and_compile_from_bridge(
         );
     }
 
+    if bridge_bail_stage() == 3 {
+        return BridgeResolution::ResumeBlackhole;
+    }
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();

@@ -305,7 +305,7 @@ fn select_failure(e: std::io::Error) -> Result<(), crate::PyError> {
 /// Windows over WinSock's `select`, which accepts sockets only — and the
 /// `select.poll()` polling object, which POSIX alone has.  epoll / kqueue
 /// object types are not implemented yet.
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "select",
@@ -621,4 +621,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             pyre_object::w_int_new(libc::PIPE_BUF as i64),
         );
     }
+    Ok(())
 }

@@ -2,7 +2,7 @@
 //!
 //! Verbatim move of the inline block previously in importing.rs.
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     // PyPy exports W_Chain.typedef itself. Its __new__ and classmethod
     // from_iterable both preserve lazy traversal of the outer iterable.
     crate::module_ns_store(
@@ -180,4 +180,5 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             .expect("itertools.batched TypeDef initialized")
             .as_ptr(),
     );
+    Ok(())
 }

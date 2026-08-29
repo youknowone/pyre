@@ -1,4 +1,5 @@
-import sys
+# `sys` is seeded by the installer rather than imported, so a program that
+# blocked the name for its own downstream code does not take this file with it.
 
 def reduce_1(obj, proto):
     import copyreg

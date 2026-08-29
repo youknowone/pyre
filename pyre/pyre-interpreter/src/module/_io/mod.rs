@@ -211,7 +211,7 @@ fn iobase_flush(args: &[PyObjectRef]) -> crate::PyResult {
         .copied()
         .ok_or_else(|| crate::PyError::type_error("flush() requires self"))?;
     if iobase_internal_closed(self_obj) {
-        return Err(crate::PyError::value_error("I/O operation on closed file"));
+        return Err(crate::PyError::value_error("I/O operation on closed file."));
     }
     Ok(w_none())
 }
@@ -224,6 +224,11 @@ fn iobase_closed_get(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_bool_from(iobase_internal_closed(self_obj)))
 }
 
+/// `iobase.c iobase_check_closed`, reached as `_IOBase._checkClosed`.
+///
+/// The sentence ends in a period at this layer and in `textio.c`, and does not
+/// in `fileio.c` or `stringio.c`; `flush` and `isatty` below carry the same
+/// spelling this one does.
 fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
     // CPython 3.14 `IOBase._checkClosed` no longer exposes PyPy's optional
     // `message` argument: Argument Clinic rejects every argument after self.
@@ -237,7 +242,7 @@ fn iobase_check_closed(args: &[PyObjectRef]) -> crate::PyResult {
         .copied()
         .ok_or_else(|| crate::PyError::type_error("_checkClosed() requires self"))?;
     if io_closed(self_obj) {
-        Err(crate::PyError::value_error("I/O operation on closed file"))
+        Err(crate::PyError::value_error("I/O operation on closed file."))
     } else {
         Ok(w_none())
     }
@@ -626,7 +631,7 @@ fn iobase_isatty(args: &[PyObjectRef]) -> crate::PyResult {
         .copied()
         .ok_or_else(|| crate::PyError::type_error("isatty() requires self"))?;
     if io_closed(self_obj) {
-        return Err(crate::PyError::value_error("I/O operation on closed file"));
+        return Err(crate::PyError::value_error("I/O operation on closed file."));
     }
     Ok(w_bool_from(false))
 }
@@ -1609,6 +1614,6 @@ crate::py_module! {
             "_io",
             &["IncrementalNewlineDecoder"],
             &[("_TextIOBase", text_base)],
-        );
+        )?;
     }
 }

@@ -1999,7 +1999,7 @@ impl PyError {
                 w_object,
             ],
         );
-        if let Some(sys_mod) = crate::importing::get_sys_module("sys")
+        if let Some(sys_mod) = crate::importing::get_interpreter_sys_module()
             && let Ok(w_hook) = crate::baseobjspace::getattr_str(sys_mod, "unraisablehook")
             && !w_hook.is_null()
             && !unsafe { pyre_object::is_none(w_hook) }
@@ -2067,7 +2067,7 @@ impl PyError {
     /// stream's codec and error handler. False for a stream that is missing,
     /// `None` or refuses the write, leaving the caller its own descriptor sink.
     fn write_to_sys_stderr(buf: &[u8]) -> bool {
-        let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
+        let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
             return false;
         };
         let stderr = match crate::baseobjspace::getattr_str(sys_mod, "stderr") {
@@ -3954,7 +3954,7 @@ pub(crate) fn emit_report_to_host_stderr(buf: &[u8]) {
 /// to the seam, because treating the two alike leaks the write past a
 /// configured sink.
 pub(crate) fn emit_report_to_sys_stderr(buf: &[u8]) {
-    let stream = crate::importing::get_sys_module("sys")
+    let stream = crate::importing::get_interpreter_sys_module()
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
     let Some(stream) = stream else {
         emit_report_to_host_stderr(buf);
@@ -4038,7 +4038,7 @@ fn report_through_default_excepthook(failure: &mut PyError) {
 /// original both go through the default hook, which is `display_exception`'s
 /// `originalexcepthook`, so this answers `true` and the caller prints nothing.
 pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return false;
     };
     let _roots = pyre_object::gc_roots::push_roots();

@@ -438,12 +438,52 @@ fn derive_config(d: PyObjectRef) -> Result<DialectConfig, PyError> {
 
 // ── registry (`app_csv.py`) ──
 
-/// The module-global `_dialects` mapping, fetched through `sys.modules`
-/// (GC-rooted there) rather than a thread-local raw pointer.
+/// `_csvstate.dialects` — the mapping `register_dialect` fills and
+/// `get_dialect_from_registry` reads.
+///
+/// Upstream reaches it as module state, off the defining class, and PyPy as a
+/// module global of `app_csv.py`; neither asks `sys.modules` where the module
+/// is.  Naming the module instead resolves through the running `sys.modules`,
+/// which a program is entitled to block -- and then `csv.list_dialects()`
+/// fails on a module it never asked for.
+///
+/// The reference is the atomic word itself, not a field inside an allocation
+/// some other atomic names.  A re-import replaces the mapping while another
+/// thread is inside `list_dialects`, and a plain field written and read across
+/// threads is a data race however the enclosing allocation is reached -- the
+/// sibling `_ast` slot escapes that only because it is published once and never
+/// replaced, which a per-import registry cannot be.  Same shape as
+/// `faulthandler`'s owner slot.
+static CSV_DIALECTS: std::sync::atomic::AtomicPtr<pyre_object::PyObject> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Forward the registry.  The module namespace holds the same mapping, but
+/// only for as long as the module itself is reachable, and a program that
+/// takes `_csv` out of `sys.modules` leaves this slot its only owner.
+///
+/// Runs from the collector inside the stop-the-world window, so no publish can
+/// interleave between this load and the store that forwards it.
+pub(crate) fn walk_csv_state_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let mut dialects = CSV_DIALECTS.load(std::sync::atomic::Ordering::Acquire);
+    if dialects.is_null() {
+        return;
+    }
+    visitor(&mut dialects);
+    CSV_DIALECTS.store(dialects, std::sync::atomic::Ordering::Release);
+}
+
+/// Publish the mapping `init` just built.  A re-import mints a fresh one, the
+/// way a fresh module state would.
+fn publish_csv_dialects(dialects: PyObjectRef) {
+    CSV_DIALECTS.store(dialects, std::sync::atomic::Ordering::Release);
+}
+
 fn csv_dialects() -> Result<PyObjectRef, PyError> {
-    let m = crate::importing::get_sys_module("_csv")
-        .ok_or_else(|| PyError::runtime_error("_csv module not initialized"))?;
-    crate::baseobjspace::getattr_str(m, "_dialects")
+    let dialects = CSV_DIALECTS.load(std::sync::atomic::Ordering::Acquire);
+    if dialects.is_null() {
+        return Err(PyError::runtime_error("_csv module not initialized"));
+    }
+    Ok(dialects)
 }
 
 fn lookup_registered_dialect(name: PyObjectRef) -> Result<PyObjectRef, PyError> {
@@ -1292,8 +1332,12 @@ crate::py_module! {
         "field_size_limit" / * = field_size_limit_fn,
     },
     extra_init: |ns| {
-        // `app_csv._dialects = {}` — the registry mapping, kept in the module
-        // namespace so it is reachable for GC.
-        crate::module_ns_store(ns, "_dialects", pyre_object::w_dict_new());
+        // `app_csv._dialects = {}` — the registry mapping.  It is stored in
+        // the module namespace under the name PyPy gives it and published to
+        // the state the accelerator reads, which is what keeps it reachable
+        // once the module is not.
+        let dialects = pyre_object::w_dict_new();
+        crate::module_ns_store(ns, "_dialects", dialects);
+        publish_csv_dialects(dialects);
     },
 }

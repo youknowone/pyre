@@ -231,8 +231,8 @@ pub mod test_hooks {
 // literal — `interpleveldefs = { 'name': 'interp_x.func', ... }` — and
 // PyPy's MixedModule machinery walks the dict at import time.  Pyre
 // mirrors that with the `py_module!` macro below: each call expands to
-// a `pub fn init(ns: PyObjectRef)` that stores every entry via
-// `module_ns_store`.  The previous one-line `moduledef.rs` shim
+// a `pub fn init(ns: PyObjectRef) -> Result<(), PyError>` that stores
+// every entry via `module_ns_store`.  The previous one-line `moduledef.rs` shim
 // (which did nothing but `super::interp_x::register_module(ns)`) has
 // been retired across every builtin module.
 //
@@ -310,7 +310,9 @@ macro_rules! py_module {
         $(,)?
     ) => {
         #[allow(dead_code)]
-        pub fn init(ns: ::pyre_object::PyObjectRef) {
+        pub fn init(
+            ns: ::pyre_object::PyObjectRef,
+        ) -> ::std::result::Result<(), $crate::PyError> {
             let _name = $name;
             $($(
                 $crate::module_ns_store(ns, $key, $value);
@@ -356,7 +358,7 @@ macro_rules! py_module {
                     $appfile,
                     $name,
                     &[ $( $appname ),* ],
-                );
+                )?;
             )*)?
             // inline_app: PyPy `applevel(r'''…''')` (gateway.py) —
             // embed a Python snippet inline; the runtime executes it the
@@ -371,7 +373,7 @@ macro_rules! py_module {
                     "<inline>",
                     $name,
                     &[ $( $inline_name ),* ],
-                );
+                )?;
             )*)?
             // inline_functions: `#[pyre_function]` typed defs whose name +
             // arity are derived from the signature.  Replaces the
@@ -419,6 +421,7 @@ macro_rules! py_module {
                     $body
                 }
             )?
+            ::std::result::Result::Ok(())
         }
     };
 }
@@ -1423,7 +1426,7 @@ pub fn stdio_line_endings_bytes<'a>(
 /// stream at all — leaves them on the mode `allocate_stdio` builds with.
 pub fn stdio_newline(stream_name: &str) -> Option<&'static str> {
     let platform_default = if cfg!(windows) { Some("\r\n") } else { None };
-    let stated = crate::importing::get_sys_module("sys")
+    let stated = crate::importing::get_interpreter_sys_module()
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, stream_name).ok())
         .and_then(crate::module::_io::W_TextIOWrapper::stdio_write_newline);
     stated.unwrap_or(platform_default)

@@ -4123,7 +4123,7 @@ enum DefaultPrintTarget {
 /// and a `b'Â¢'` on the native path. A missing `sys.stdout` attribute
 /// raises `RuntimeError("lost sys.stdout")` as builtin_print does.
 fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> {
-    let Some(sys_mod) = crate::importing::get_sys_module("sys") else {
+    let Some(sys_mod) = crate::importing::get_interpreter_sys_module() else {
         // No `sys` yet (very early bootstrap) — native path.
         return Ok(DefaultPrintTarget::Native("strict"));
     };
@@ -4181,7 +4181,7 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         .first()
         .copied()
         .unwrap_or_else(|| pyre_object::w_str_new(""));
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Err(crate::PyError::runtime_error("lost sys.stdin"));
     };
 
@@ -4476,12 +4476,23 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     Ok(w_none())
 }
 
-/// Bind `builtins._` best-effort; a missing `builtins` module (early
-/// bootstrap) is ignored.
-fn set_builtins_underscore(value: PyObjectRef) {
-    if let Some(b) = crate::importing::get_sys_module("builtins") {
-        let _ = crate::baseobjspace::setattr_str(b, "_", value);
-    }
+/// The `builtins` entry `sys.modules` holds, which `sys_displayhook_impl`
+/// reads before anything else and refuses to do without.
+///
+/// The entry is read afresh at each use rather than carried: the repr and the
+/// two writes between the first binding and the last each run Python, and a
+/// module reachable only through a Rust local is moved out from under it at
+/// the safepoint that follows.
+fn displayhook_builtins() -> Result<PyObjectRef, crate::PyError> {
+    crate::importing::sys_modules_entry("builtins")
+        .ok_or_else(|| crate::PyError::runtime_error("lost builtins module"))
+}
+
+/// Bind `builtins._`.  A name bound to something that is not a module is
+/// refused by the binding itself, so nothing here tests for it.
+fn set_builtins_underscore(value: PyObjectRef) -> Result<(), crate::PyError> {
+    crate::baseobjspace::setattr_str(displayhook_builtins()?, "_", value)?;
+    Ok(())
 }
 
 /// One `print_item_to(x, sys_stdout())` / `print_newline_to(sys_stdout())`
@@ -4526,12 +4537,15 @@ fn displayhook_write(part: PyObjectRef) -> Result<bool, crate::PyError> {
 /// prints nothing and leaves `_` unchanged (`sys_displayhook` in sysmodule.c).
 pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let value = args.first().copied().unwrap_or_else(w_none);
+    // The module is read ahead of the `None` test, so a value that is never
+    // rendered still reports a lost `builtins`.
+    displayhook_builtins()?;
     if unsafe { pyre_object::is_none(value) } {
         return Ok(w_none());
     }
     // `_` is cleared before rendering so a failing repr does not leave a
     // stale binding, then set to the value once the write succeeds.
-    set_builtins_underscore(w_none());
+    set_builtins_underscore(w_none())?;
     let repr = pyre_object::w_str_from_wtf8(unsafe { crate::display::py_repr_wtf8(value)? });
     // `pypy/module/sys/app.py:252-253` —
     //     print_item_to(repr(obj), sys_stdout())
@@ -4545,7 +4559,7 @@ pub(crate) fn sys_displayhook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     if !displayhook_write(w_str_new("\n"))? {
         return Ok(w_none());
     }
-    set_builtins_underscore(value);
+    set_builtins_underscore(value)?;
     Ok(w_none())
 }
 
@@ -4557,7 +4571,7 @@ pub(crate) fn sys_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     // Route through the live `sys.stderr`, not directly through the host
     // seam: tests and applications are allowed to replace `sys.stderr` and
     // `sys.__excepthook__` must honor that replacement.
-    let stderr = crate::importing::get_sys_module("sys")
+    let stderr = crate::importing::get_interpreter_sys_module()
         .and_then(|sys| crate::baseobjspace::getattr_str(sys, "stderr").ok());
     // Both renderers below run Python -- the stdlib one imports `traceback`,
     // the built-in one calls `__str__` on the chain -- so each of the three
@@ -14146,6 +14160,27 @@ fn source_as_str(
     filename: &rustpython_wtf8::Wtf8,
     flags: &mut i64,
 ) -> Result<String, crate::PyError> {
+    let text = source_text(source, funcname, what, filename, flags)?;
+    // A null ends the C string the tokenizer would read, so the source is
+    // refused whole rather than at the character.  The error carries no
+    // position for the same reason: nothing was tokenized to have one, and a
+    // reported line would invite a fix to that line instead of to the string.
+    if *flags & PYCF_ACCEPT_NULL_BYTES == 0 && text.contains('\0') {
+        return Err(crate::PyError::new(
+            crate::PyErrorKind::SyntaxError,
+            "source code string cannot contain null bytes",
+        ));
+    }
+    Ok(text)
+}
+
+fn source_text(
+    source: PyObjectRef,
+    funcname: &str,
+    what: &str,
+    filename: &rustpython_wtf8::Wtf8,
+    flags: &mut i64,
+) -> Result<String, crate::PyError> {
     unsafe {
         if pyre_object::is_str(source) {
             // A text source is encoded strictly and coding-cookie detection is
@@ -14182,7 +14217,7 @@ fn source_as_str(
     crate::compile::decode_source_bytes(&bytes, filename, *flags & PYCF_IGNORE_COOKIE != 0)
 }
 
-fn replace_compile_syntax_error_filename(
+pub(crate) fn replace_compile_syntax_error_filename(
     mut error: crate::PyError,
     filename: &str,
     filename_bytes: Option<&[u8]>,
@@ -18947,7 +18982,13 @@ fn file_method_flush(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     if args.is_empty() {
         return Ok(w_none());
     }
-    file_check_closed(args[0])?;
+    // `fileio.c` states no `flush`, so this stands in for `_IOBase.flush` and
+    // states `iobase.c`'s sentence -- the one ending in a period -- rather than
+    // the raw layer's.  `BufferedReader.flush` hands its call here, so it is
+    // what a closed reader reports too.
+    if file_is_closed(args[0]) {
+        return Err(crate::PyError::value_error("I/O operation on closed file."));
+    }
     if file_get_fd(args[0]).is_some() {
         return Ok(w_none());
     }
@@ -20955,7 +20996,7 @@ pub(crate) fn call_forwarding_args(
 /// `app_breakpoint.py breakpoint` — forward to `sys.breakpointhook`, which
 /// must accept whatever arguments are passed.  By default that drops into pdb.
 fn builtin_breakpoint(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let Some(sys) = crate::importing::get_sys_module("sys") else {
+    let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Err(crate::PyError::runtime_error("lost sys.breakpointhook"));
     };
     let Ok(hook) = crate::baseobjspace::getattr_str(sys, "breakpointhook") else {

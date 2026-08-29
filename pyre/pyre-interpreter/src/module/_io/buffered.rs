@@ -826,11 +826,15 @@ impl W_BufferedReader {
     }
 
     fn flush(&self) -> Result<PyObjectRef, crate::PyError> {
-        // CPython 3.14 test_io.BufferedReaderTest.test_read_on_closed requires
-        // the derived raw `closed` state here. PyPy's `simple_flush_w` checks
-        // only initialization and therefore lets BufferedReader(BytesIO)
-        // flush after close; that observable result is the spec exception.
-        self.check_closed("flush of closed file")?;
+        // `_io__Buffered_simple_flush_impl` checks initialization and hands the
+        // call straight to the raw stream, so a closed reader reports the raw
+        // layer's own refusal: `_IOBase.flush` behind a `FileIO`, which states
+        // no `flush` of its own, and `CHECK_CLOSED` behind a `BytesIO`.  The
+        // reader is the only buffered class with this shape -- the writer and
+        // `BufferedRandom` carry the full `flush` and its `flush of closed
+        // file`.  PyPy's `simple_flush_w` is the same delegation, but its
+        // `BytesIO` accepts a flush after close, so it reports nothing.
+        self.check_init()?;
         super::call_method_result(self.w_raw, "flush", &[])
     }
 

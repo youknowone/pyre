@@ -280,7 +280,7 @@ fn faulthandler_get_fileno_and_file(
 ) -> Result<(i32, pyre_object::PyObjectRef), crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let resolved = if w_file.is_null() || unsafe { pyre_object::is_none(w_file) } {
-        let sys = crate::importing::get_sys_module("sys")
+        let sys = crate::importing::get_interpreter_sys_module()
             .ok_or_else(|| crate::PyError::runtime_error("sys.stderr is None"))?;
         let w_stderr = crate::baseobjspace::getattr_str(sys, "stderr")?;
         if w_stderr.is_null() || unsafe { pyre_object::is_none(w_stderr) } {
@@ -339,7 +339,7 @@ fn faulthandler_get_fileno_and_file(
     Ok((fd, pyre_object::gc_roots::shadow_stack_get(file_slot)))
 }
 
-pub fn register_module(ns: pyre_object::PyObjectRef) {
+pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
     crate::module_ns_store(
         ns,
         "enable",
@@ -767,6 +767,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
             0,
         ),
     );
+    Ok(())
 }
 
 #[cfg(all(unix, feature = "host_env"))]

@@ -75,6 +75,38 @@ pub fn compile_source_with_filename(
     compile_source_with_opts(source, mode, filename, default_compile_opts())
 }
 
+/// Compile a file named by its filesystem bytes, returning the wrapped code
+/// object rather than the bare `CodeObject`.
+///
+/// `Py_CompileStringObject` names a unit with an object, so a path byte with no
+/// UTF-8 spelling survives into `co_filename`.  The compiler dependency's
+/// `source_path` is `str`-only, so the undecodable spelling is restored on the
+/// wrapped code and on a `SyntaxError` afterwards, the way `builtin_compile`
+/// and `parse_source_module` restore it (`objspace.py newfilename`).  Doing it
+/// here rather than at each caller keeps `__file__` and `co_filename` on one
+/// spelling; a caller that recovered only one of them would leave warnings
+/// naming a different file than the module reports.
+pub fn compile_source_named_by_bytes(
+    source: &str,
+    mode: Mode,
+    filename_bytes: Vec<u8>,
+) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    let (source_path, filename_bytes) =
+        crate::pycode::split_code_filename_bytes(filename_bytes, None);
+    let code = compile_source_with_filename(source, mode, &source_path).map_err(|error| {
+        crate::builtins::replace_compile_syntax_error_filename(
+            crate::compile_err_to_syntax_error(error, source, mode),
+            &source_path,
+            filename_bytes.as_deref(),
+        )
+    })?;
+    // The bytes land on the wrapper the compile produced, before anything can
+    // allocate, exactly as `builtin_compile` lands them.
+    let w_code = crate::w_code_new(Box::into_raw(Box::new(code)) as *const ());
+    unsafe { crate::pycode::set_compilation_unit_filename_bytes(w_code, filename_bytes) };
+    Ok(w_code)
+}
+
 /// Compile Python source with an explicit `CompileOpts`, carrying the
 /// `__future__` feature flags and the `optimize` level that `compile()`
 /// resolves from its `flags` / `optimize` arguments (pycompiler.py
