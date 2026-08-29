@@ -3771,7 +3771,8 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    // `module/mod.rs` gates `_cffi_backend` on the same two conditions.
+    #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
     if let Some(lib) =
         pyre_interpreter::module::_cffi_backend::lib_obj::W_LibObject::from_obj(concrete_obj)
         && spec_gate(SpecFold::LoadAttrCffiLib, || {
