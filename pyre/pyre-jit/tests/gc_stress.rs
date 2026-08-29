@@ -713,15 +713,21 @@ assert result == 300, result
 ///
 /// `blobs` (bytes reachable only through a list), `ba` (a live bytearray grown
 /// after the collections), and `pieces` (bytearray fragments held only through a
-/// list) must all survive the 100 collections; each round allocates fresh dead
-/// bytes/bytearray garbage. The returned checksum is reachable only if every
-/// live buffer survived intact.
+/// list) must all survive the 100 collections. `slot_ba.x` additionally lives
+/// only in the `BaseUserClassMapdict`-shaped `w_slots` list traced by
+/// `bytearray_object_custom_trace`; its ordinary `z` attribute must remain in
+/// the separate instance dict. Each round allocates fresh dead bytes/bytearray
+/// garbage. The returned checksum is reachable only if every live edge and
+/// buffer survived intact.
 #[test]
 fn bytes_bytearray_buffers_survive_full_collection() {
     const PROGRAM: &str = r#"
 import gc
 
 def run():
+    class SlotBA(bytearray):
+        __slots__ = ("x", "__dict__")
+
     blobs = []
     i = 0
     while i < 12:
@@ -729,6 +735,9 @@ def run():
         i = i + 1
 
     ba = bytearray(b"seed")
+    slot_ba = SlotBA(b"slot-owner")
+    slot_ba.x = bytearray(b"slot-value")
+    slot_ba.z = 17
     pieces = []
     i = 0
     while i < 8:
@@ -743,6 +752,8 @@ def run():
         n = n + 1
 
     ba.extend(b"-grown")
+    assert slot_ba.__dict__ == {"z": 17}
+    assert slot_ba.x == bytearray(b"slot-value")
 
     total = 0
     i = 0

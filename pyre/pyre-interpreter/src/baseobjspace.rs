@@ -5128,10 +5128,10 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
 /// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
-/// Native `str` and `list` subclasses carry their PyPy-shaped indexed storage
-/// on the payload object itself. Other fixed Rust payloads still fall back to
-/// an exposed instance `__dict__` when their type has one. `None`/`false`
-/// means the receiver has no writable storage.
+/// Native subclasses with an object-resident `w_slots` field carry their
+/// PyPy-shaped indexed storage on the payload object itself. Other fixed Rust
+/// payloads still fall back to an exposed instance `__dict__` when their type
+/// has one. `None`/`false` means the receiver has no writable storage.
 pub(crate) fn native_slot_get(
     obj: PyObjectRef,
     name: &str,
@@ -5148,6 +5148,11 @@ pub(crate) fn native_slot_get(
     }
     if unsafe { pyre_object::is_str(obj) } {
         return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_get(obj, index as usize) });
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        return Ok(unsafe {
+            pyre_object::bytearrayobject::w_bytearray_slot_get(obj, index as usize)
+        });
     }
     if unsafe { pyre_object::is_float(obj) } {
         return Ok(unsafe { pyre_object::floatobject::w_float_slot_get(obj, index as usize) });
@@ -5190,6 +5195,10 @@ pub(crate) fn native_slot_set(
     }
     if unsafe { pyre_object::is_str(obj) } {
         unsafe { pyre_object::unicodeobject::w_str_slot_set(obj, index as usize, value) };
+        return Ok(true);
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        unsafe { pyre_object::bytearrayobject::w_bytearray_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
     if unsafe { pyre_object::is_float(obj) } {
@@ -5235,6 +5244,11 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     }
     if unsafe { pyre_object::is_str(obj) } {
         return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_del(obj, index as usize) });
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        return Ok(unsafe {
+            pyre_object::bytearrayobject::w_bytearray_slot_del(obj, index as usize)
+        });
     }
     if unsafe { pyre_object::is_float(obj) } {
         return Ok(unsafe { pyre_object::floatobject::w_float_slot_del(obj, index as usize) });

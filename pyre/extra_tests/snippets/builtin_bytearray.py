@@ -1007,6 +1007,22 @@ assert a.y == b.y
 assert a == b
 
 
+class SlottedBytearray(bytearray):
+    __slots__ = ("x", "y", "__dict__")
+
+
+a = SlottedBytearray(b"abc")
+a.x = 1
+a.y = 2
+a.z = 3
+assert a.__dict__ == {"z": 3}
+reduced = a.__reduce__()
+assert reduced[2] == ({"z": 3}, {"x": 1, "y": 2})
+del a.x
+assert not hasattr(a, "x")
+assert a.__dict__ == {"z": 3}
+
+
 class B(bytearray):
     pass
 

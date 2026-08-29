@@ -750,6 +750,7 @@ unsafe fn bytearray_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     }
     f(&mut ba.w_dict as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut ba.w_weakreflifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut ba.w_slots as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// `interp_array.py W_ArrayBase.__del__`: free the raw element buffer when
