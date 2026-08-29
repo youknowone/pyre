@@ -540,7 +540,12 @@ pub struct Terminator {
     /// [`BasicBlock::term`] so a parse error on a single terminator does
     /// not poison the whole function.
     pub kind: Value,
-    pub span: Span,
+    /// Optional for the same reason `kind` is projected rather than typed:
+    /// a terminator missing its span costs the caller a fallback, and
+    /// should not cost the body its parse. Charon writes one on every
+    /// terminator, so this is `Some` for an artefact it produced.
+    #[serde(default)]
+    pub span: Option<Span>,
 }
 
 #[derive(Debug, Deserialize)]

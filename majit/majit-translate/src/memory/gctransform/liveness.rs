@@ -846,7 +846,11 @@ pub fn scan(
             let mut locals: Vec<String> = still.iter().map(|l| gc_locals[l].clone()).collect();
             locals.sort();
             movable.sort();
-            let at = &body.body[b].terminator.span.data;
+            let at = body.body[b]
+                .terminator
+                .span
+                .as_ref()
+                .map_or(&fd.item_meta.span.data, |s| &s.data);
             stats.stale_pin_reads.push(StalePinRead {
                 func_name: fd.item_meta.name_path(),
                 file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
@@ -889,7 +893,12 @@ pub fn scan(
             // One span answers every column below, and it is the
             // terminator's own: the call being reported *is* the terminator,
             // so the block's last statement names a line that runs after it.
-            let at = &bb.terminator.span.data;
+            // A terminator with no span at all falls back to the function's.
+            let at = bb
+                .terminator
+                .span
+                .as_ref()
+                .map_or(&fd.item_meta.span.data, |s| &s.data);
             if !unbracketed.contains(&b) {
                 stats.withheld_under_a_bracket += 1;
                 // Withholding the call is right -- a bracket does dominate it
@@ -989,7 +998,12 @@ pub fn scan(
             // One span answers both columns, and it is the terminator's
             // own: the call being reported *is* the terminator, so the
             // block's last statement names a line that runs after it.
-            let at = &bb.terminator.span.data;
+            // A terminator with no span at all falls back to the function's.
+            let at = bb
+                .terminator
+                .span
+                .as_ref()
+                .map_or(&fd.item_meta.span.data, |s| &s.data);
             findings.push(Finding {
                 func: id,
                 func_name: fd.item_meta.name_path(),
