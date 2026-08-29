@@ -641,6 +641,12 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         let outcome = if carrier_raise_escapes {
             Ok((DispatchOutcome::Terminate, walk_position))
         } else {
+            // This walk's Ref bank is a local, not the anchored
+            // `sym.registers_r`, so publish it for the length of the walk or a
+            // fold's freshly minted `ConstPtr` sits in a bank no root area
+            // reaches.
+            let _bank_guard =
+                crate::trace::InlineRegisterBankGuard::enter(&raw mut *wc.registers_r);
             walk(jitcode_code, walk_position, &mut wc)
         };
         if matches!(
@@ -1451,7 +1457,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     as u32;
             sub_wc.vstack_valid = true;
         }
+        // As above: the callee bank is a local of this frame.
+        let bank_guard = crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
         let outcome = walk(callee_code, entry, &mut sub_wc);
+        drop(bank_guard);
         // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:
         // self.run_blackhole_interp_to_cancel_tracing(stb)` (:2930-2931), which

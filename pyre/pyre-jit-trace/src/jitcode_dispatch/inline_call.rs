@@ -6765,6 +6765,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // nested-residual decline, mirroring the native `CALL_ASSEMBLER`
             // fold's `SELFREC_CA_FOLD_ACTIVE` exemption.
             let _bridge_rec_selfrec_guard = bridge_rec_root_selfrec.then(SelfRecCaFoldGuard::enter);
+            // Root this sub-walk's own Ref bank: a callee fold mints its
+            // `ConstPtr` into `sub_wc.registers_r`, which is not the anchored
+            // `sym.registers_r`.
+            let _callee_bank_guard =
+                crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
             walk(body.code, 0, &mut sub_wc)
         };
         if let Some(jd_no) = subwalk_jd_no {
@@ -9959,7 +9964,13 @@ pub(crate) fn run_sub_jitcode_walk<Sym: WalkSym>(
                 seed_callee_vstack_mirror(&mut sub_wc, &frame);
             }
         }
-        let (outcome, end_pc) = match walk(sub_body.code, 0, &mut sub_wc) {
+        // As above: the callee bank is not `sym.registers_r`, so publish it for
+        // the length of the sub-walk.
+        let callee_bank_guard =
+            crate::trace::InlineRegisterBankGuard::enter(&raw mut *sub_wc.registers_r);
+        let walk_result = walk(sub_body.code, 0, &mut sub_wc);
+        drop(callee_bank_guard);
+        let (outcome, end_pc) = match walk_result {
             Ok(pair) => pair,
             Err(error) => {
                 // The error carries a pc in THIS sub-jitcode, and the enclosing

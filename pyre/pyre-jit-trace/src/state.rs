@@ -3067,6 +3067,17 @@ pub struct PyreSym {
     /// back to NONE, and so the full-body-walk argbox seed can recover the
     /// kept conditional-expression / short-circuit value (#124).
     pub(crate) bridge_stack_oprefs: Option<Vec<OpRef>>,
+    /// Reference register banks of the inline sub-walks open under this trace,
+    /// as addresses.  `inline_call.rs` builds the callee `WalkContext` over a
+    /// local `Vec<OpRef>` and calls `walk` directly, without entering
+    /// `trace_bytecode`, so a `ConstPtr` a callee fold parks there sits in a
+    /// bank that is not `registers_r` and that
+    /// `walk_active_sym_register_area` would otherwise not reach.  Pushed and
+    /// popped by `trace::InlineRegisterBankGuard` around each sub-walk, so the
+    /// list holds only banks whose owning frame is live.  Each entry is the
+    /// bank's `(address, length)`: `WalkContext` holds the bank as a slice, so
+    /// one word does not describe it.
+    pub(crate) inline_register_banks: Vec<(usize, usize)>,
     /// Kept-stack branch-guard resume coordinate for the full-body walk: the
     /// guard's OWN jitcode byte offset (`frame0.jitcode_pc`, the mid-opcode
     /// `goto_if_not`), resolved the same way the blackhole resolves its
@@ -6748,6 +6759,7 @@ impl PyreSym {
             nlocals: 0,
             bridge_local_oprefs: None,
             bridge_stack_oprefs: None,
+            inline_register_banks: Vec::new(),
             bridge_walk_entry_pc: None,
             bridge_walk_entry_jitcode_index: -1,
             bridge_registers_r: None,
