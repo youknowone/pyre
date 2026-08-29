@@ -968,6 +968,21 @@ pub trait GcAllocator: Send {
     /// Address of the published nursery_top slot that JIT code reads.
     fn nursery_top_addr(&self) -> usize;
 
+    /// Address of the head of a singly-linked recycle list an inline
+    /// allocation may take a cell from before it bumps, or 0 when this
+    /// allocator keeps none.
+    ///
+    /// A cell on the list is threaded through its second word — the same word
+    /// a two-word headerless allocation publishes as its link — so taking the
+    /// head is a load of the head, a load of that cell's link, and a store
+    /// back. The default keeps inline allocation a pure bump, which is what an
+    /// allocator that recycles nothing wants; one that DOES recycle has to
+    /// report the list here, because a bump-only fast path goes dead as soon
+    /// as the current chunk fills and the allocator starts living off the list.
+    fn nursery_recycle_list_addr(&self) -> usize {
+        0
+    }
+
     /// Maximum size for nursery allocation (larger objects go to old gen directly).
     fn max_nursery_object_size(&self) -> usize;
 

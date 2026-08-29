@@ -6938,14 +6938,16 @@ impl<'a> Assembler386<'a> {
     /// interpreter's own nursery, whose payload is the call's two arguments:
     /// the value at offset 0 and the successor link at offset 8.
     ///
-    /// The fast path only advances `nursery_free` and stores those two words,
-    /// so it cannot collect and emits no gcmap. The slow path is the ordinary
-    /// residual call wrapper, which may collect inside the callee; the callee
-    /// is free to treat the second argument as a keep-root, since that is the
-    /// object the new node links to. This is sound because the op is still a
-    /// call: the optimizer's residual-call emission fences pending setfields
-    /// before the allocation, so a collector that walks the interpreter's own
-    /// structures finds roots that are current.
+    /// The fast path takes the head of the allocator's recycle list when it
+    /// reports one and has one, otherwise advances `nursery_free`, and stores
+    /// those two words. Neither can collect, so it emits no gcmap. The slow
+    /// path is the ordinary residual call wrapper, which may collect inside
+    /// the callee; the callee is free to treat the second argument as a
+    /// keep-root, since that is the object the new node links to. This is
+    /// sound because the op is still a call: the optimizer's residual-call
+    /// emission fences pending setfields before the allocation, so a collector
+    /// that walks the interpreter's own structures finds roots that are
+    /// current.
     fn genop_nursery_alloc_inline_x86(&mut self, op: &Op, arglocs: &[Loc]) {
         // Two-word headerless node: value@0, link@8.
         const NURSERY_ALLOC_NODE_SIZE: i32 = 16;
@@ -7004,12 +7006,34 @@ impl<'a> Assembler386<'a> {
 
         let slow_path = self.mc.new_dynamic_label();
         let done = self.mc.new_dynamic_label();
+        let bump = self.mc.new_dynamic_label();
+        let init = self.mc.new_dynamic_label();
+
+        // Take from the recycle list first, exactly as the callee's own
+        // allocation order does. A bump-only fast path would agree with the
+        // callee only while the current chunk has room: once it fills, an
+        // allocator that recycles serves every request from the list, the bump
+        // pointer stays at the limit, and the fast path never fires again.
+        let recycle_addr = crate::runner::dynasm_nursery_recycle_list_addr();
+        if recycle_addr != 0 {
+            let rl = recycle_addr as i64;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(scratch), QWORD rl
+                ; mov Rq(base_reg), [Rq(scratch)]                   // cell = *recycle_head
+                ; test Rq(base_reg), Rq(base_reg)
+                ; jz =>bump                                         // empty -> bump instead
+                ; mov Rq(new_free_reg), [Rq(base_reg) + 8]          // cell's link word
+                ; mov [Rq(scratch)], Rq(new_free_reg)               // *recycle_head = link
+                ; jmp =>init
+            );
+        }
 
         // CallR regalloc has already spilled/moved caller-save registers via
         // before_call(). Use only those freed registers plus R11, and load
         // value/next before staging nursery slot addresses so their original
         // argloc source registers stay intact for the slow residual call.
         dynasm!(self.mc ; .arch x64
+            ; =>bump
             ; mov Rq(scratch), QWORD nf
             ; mov Rq(base_reg), [Rq(scratch)]                       // base = *nursery_free
             ; lea Rq(new_free_reg), [Rq(base_reg) + NURSERY_ALLOC_NODE_SIZE]
@@ -7018,6 +7042,7 @@ impl<'a> Assembler386<'a> {
             ; ja =>slow_path
             ; mov Rq(scratch), QWORD nf
             ; mov [Rq(scratch)], Rq(new_free_reg)                   // *nursery_free = base + 16
+            ; =>init
             ; mov [Rq(base_reg)], Rq(value_reg)                     // value @ base+0
             ; mov [Rq(base_reg) + 8], Rq(next_reg)                  // next @ base+8
             ; mov rax, Rq(base_reg)                                 // result = base
