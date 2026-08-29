@@ -1,15 +1,23 @@
 //! The collector the matcher runs on.
 //!
-//! **RPython has no "without a GC" configuration**, so neither should this
-//! crate. `target.py --opt=jit` is a translated binary and every translated
-//! binary carries a collector: `lltype.malloc(JITFRAME, depth)` — which is what
-//! `llmodel.py malloc_jitframe` reduces to — is a GC allocation, and the
-//! matcher's own `Regex` nodes are GC objects too. Running majit's side of the
-//! comparison with no collector at all made the JIT take a fallback path that
-//! no shipped configuration takes: `runner::alloc_jitframe` has nothing to
-//! allocate a JITFRAME under, so every compiled entry gets one from the process
-//! allocator and frees it on the way out, which on the `and`/`or` row is once
-//! per input character.
+//! **A JIT-enabled RPython build cannot be translated without a GC**, so
+//! neither should this crate run without one. `--gc=none` and `--gc=ref` are
+//! real translation options (`translationoption.py:65-82`), but they select a
+//! `gctransformer` of `"none"`/`"ref"`, and `gc.py:653-662 get_ll_description`
+//! resolves `GcLLDescr_<gctransformer>` against a module defining only
+//! `GcLLDescr_boehm` (`gc.py:151`) and `GcLLDescr_framework` (`gc.py:313`);
+//! anything else raises `NotImplementedError("GC transformer %r not supported
+//! by the JIT backend")`. Both descrs that do exist inherit `malloc_jitframe`
+//! from the base `GcLLDescription` (`gc.py:132-135`), where it is
+//! `jitframe.JITFRAME.allocate` and so `lltype.malloc(JITFRAME,
+//! frame_info.jfi_frame_depth)` (`jitframe.py:50`) — a GC allocation, with no
+//! arm anywhere that puts a JITFRAME somewhere else. The matcher's own `Regex`
+//! nodes are GC objects too. Running majit's side of the comparison with no
+//! collector at all made the JIT take a fallback path that no translatable
+//! configuration takes: `runner::alloc_jitframe` has nothing to allocate a
+//! JITFRAME under, so every compiled entry gets one from the process allocator
+//! and frees it on the way out, which on the `and`/`or` row is once per input
+//! character.
 //!
 //! The sequence below is `pyre-jit`'s `init_gc_subsystem` with everything
 //! pyre-specific removed — the same four steps

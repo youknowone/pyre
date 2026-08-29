@@ -417,12 +417,20 @@ between them was this frame.
 
 Both numbers above are conditional on one, and this crate had none — no
 `majit/examples/` crate did. That is not a difference from RPython that was
-open to it: **RPython has no configuration without a GC.** `target.py --opt=jit`
-is a translated binary, every translated binary carries a collector, and
-`lltype.malloc(JITFRAME, depth)` — which is all `malloc_jitframe` is — is a GC
-allocation. Running majit's side without one put it on a path no shipped
-configuration takes. `src/gc.rs` installs MiniMark in `main`, which is
-`pyre-jit`'s `init_gc_subsystem` with the pyre-specific parts removed.
+open to it: **a JIT-enabled RPython build cannot be translated without a GC.**
+`--gc=none` and `--gc=ref` are real translation options
+(`translationoption.py:65-82`), but they select a `gctransformer` of
+`"none"`/`"ref"`, and `gc.py:653-662 get_ll_description` looks up
+`GcLLDescr_<gctransformer>` in a module that defines only `GcLLDescr_boehm`
+(`gc.py:151`) and `GcLLDescr_framework` (`gc.py:313`) — anything else raises
+`NotImplementedError("GC transformer %r not supported by the JIT backend")`.
+Both surviving descrs inherit `malloc_jitframe` from the base class
+(`gc.py:132-135`), where it is `lltype.malloc(JITFRAME,
+frame_info.jfi_frame_depth)` (`jitframe.py:50`) — a GC allocation, and there is
+no arm that puts a JITFRAME anywhere else. Running majit's side without a
+collector put it on a path no translatable configuration takes. `src/gc.rs`
+installs MiniMark in `main`, which is `pyre-jit`'s `init_gc_subsystem` with the
+pyre-specific parts removed.
 
 Installing it was not enough on its own, and the census is what said so: the
 row did not move. The frame was coming from `alloc_nursery_no_collect_typed`,
