@@ -22293,7 +22293,13 @@ pub(crate) fn buffer_as_bytes_like(
     #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
     if let Some((address, length)) = crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
     {
-        let data = unsafe { std::slice::from_raw_parts(address, length) };
+        // A buffer over a NULL cdata is empty, and no slice may be built from
+        // a null address even at length zero.
+        let data = if address.is_null() {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(address, length) }
+        };
         return Ok(Some(pyre_object::bytesobject::w_bytes_from_bytes(data)));
     }
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
