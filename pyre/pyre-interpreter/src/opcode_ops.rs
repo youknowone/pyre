@@ -218,6 +218,9 @@ pub fn compare_value(
     compare(a, b, cmp_op)
 }
 
+/// `inline(never)` for the same reason as [`binary_value_from_tag`]: the
+/// codewriter must mint the graph a trace descends.
+#[inline(never)]
 pub fn compare_value_from_tag(
     a: PyObjectRef,
     b: PyObjectRef,
