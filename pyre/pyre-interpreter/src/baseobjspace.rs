@@ -10003,6 +10003,40 @@ pub(crate) unsafe fn lookup_in_type_wtf8_uncached(
     lookup_where_pair_wtf8_uncached(w_type, name).map(|(_src, value)| value)
 }
 
+/// Residual-call twin of [`lookup_in_type_wtf8_uncached`] for traced code:
+/// the name arrives as an interned, immortal str object (`box_str_constant`)
+/// because the residual call ABI cannot pass a `&Wtf8`, and the result is a
+/// raw pointer with null for `None`.  The same shape as
+/// [`_pure_lookup_where_with_method_cache`] next to the cached arm, without
+/// the elidable marker: this arm serves types without a version tag.
+///
+/// # Safety
+/// `w_type` may be null or a non-type; `w_name` must be a live str object.
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn _lookup_in_type_uncached(
+    w_type: *mut PyObject,
+    w_name: *mut PyObject,
+) -> *mut PyObject {
+    let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
+    lookup_in_type_wtf8_uncached(w_type, name).unwrap_or(std::ptr::null_mut())
+}
+
+/// The uncached arms of [`lookup_in_type_where_wtf8`].  The ordinary
+/// interpreter passes its borrowed name straight through; traced code boxes
+/// the name so the residual call carries thin pointers only, which keeps the
+/// un-lowerable `&Wtf8` callee out of every gateway body that reaches a type
+/// lookup (`descent_decline` scans a body for such callees regardless of
+/// which arm executes).
+#[inline]
+unsafe fn lookup_in_type_uncached_split(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    if !majit_metainterp::jit::we_are_jitted() {
+        return lookup_in_type_wtf8_uncached(w_type, name);
+    }
+    let w_name = pyre_object::unicodeobject::box_str_constant(name);
+    let v = _lookup_in_type_uncached(w_type, w_name);
+    if v.is_null() { None } else { Some(v) }
+}
+
 unsafe fn lookup_where_pair_wtf8(
     w_type: PyObjectRef,
     name: &Wtf8,
@@ -10555,7 +10589,7 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     name: &Wtf8,
 ) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
-        return lookup_in_type_wtf8_uncached(w_type, name);
+        return lookup_in_type_uncached_split(w_type, name);
     }
     // typeobject.py:505 — `promote(self)`.
     let _ = majit_metainterp::jit::promote(w_type);
@@ -10563,7 +10597,7 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     let version_tag = w_type_version_tag(w_type);
     if version_tag == 0 {
         // typeobject.py:507-509 — no version tag: uncacheable.
-        return lookup_in_type_wtf8_uncached(w_type, name);
+        return lookup_in_type_uncached_split(w_type, name);
     }
     if !majit_metainterp::jit::we_are_jitted() {
         let v = _cached_lookup_where_name(w_type, name, version_tag).1;
