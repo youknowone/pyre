@@ -7000,34 +7000,17 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // UNARY_POSITIVE.  Descend `pos` whole rather than re-emit its identity
     // arm by hand; the body's own `guard_class` and promoted `w_class` select
-    // the arm.  Sits ahead of the `unary_positive_int` fold so that fold's
-    // `consulted` count reads whether the descent took the site.
+    // the arm.  The `unary_positive_int` fold that stood behind this descent
+    // measured `consulted=0` on every fixture once the descent was in.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
-        && spec_gate(SpecFold::UnaryPositiveDescent, || {
+        && let Some(outcome) = spec_gate(SpecFold::UnaryPositiveDescent, || {
             try_walker_orthodox_unary_positive(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
-        .is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-
-    // #61: UNARY_POSITIVE `+int` identity fold.  Kept behind the descent so a
-    // build whose `pos` jitcode is missing or unlowered still forwards
-    // an exact-int operand.  A bool (`+True` is int `1`) / non-int operand
-    // declines to the generic leg so its `__pos__` still runs.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
-        && spec_gate(SpecFold::UnaryPositiveInt, || {
-            try_walker_specialize_unary_positive_int(ctx, op.pc, r_args[0], dst, dst_bank)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return Ok((outcome, op.next_pc));
     }
 
     // UNARY_NEGATIVE.  Descend `neg` whole rather than re-emit its integer arm
@@ -7039,12 +7022,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && r_args.len() == 1
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && spec_gate(SpecFold::UnaryNegativeDescent, || {
+        && let Some(outcome) = spec_gate(SpecFold::UnaryNegativeDescent, || {
             try_walker_orthodox_unary_negative(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
-        .is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return Ok((outcome, op.next_pc));
     }
 
     // UNARY_INVERT.  Descend `invert` whole rather than re-emit its integer arm
@@ -7057,12 +7039,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         && dst_bank == 'r'
         && r_args.len() == 1
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
-        && spec_gate(SpecFold::UnaryInvertDescent, || {
+        && let Some(outcome) = spec_gate(SpecFold::UnaryInvertDescent, || {
             try_walker_orthodox_unary_invert(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
-        .is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        return Ok((outcome, op.next_pc));
     }
 
     // #62: specialize STORE_SUBSCR `list[int] = value` (int / float storage,
@@ -9201,6 +9182,16 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                             )
                         })?
                     } else {
+                        // Descend the helper whole ahead of the hand folds, so
+                        // their `consulted` counts read whether the descent
+                        // took the site.
+                        if let Some(outcome) = spec_gate(SpecFold::BinaryOpDescent, || {
+                            try_walker_orthodox_binary_op(
+                                ctx, op.pc, op_tag, tag_opref, &r_args, dst, dst_bank,
+                            )
+                        })? {
+                            return Ok((outcome, op.next_pc));
+                        }
                         // int specialization first; float (incl. mixed int/float)
                         // as a fallback so two-int operands keep int arithmetic.
                         if let Some(outcome) = spec_gate(SpecFold::BinaryOpInt, || {

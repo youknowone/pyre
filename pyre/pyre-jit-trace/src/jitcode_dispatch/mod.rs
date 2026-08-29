@@ -12815,9 +12815,9 @@ fn handle<Sym: WalkSym>(
                 OpCode::NewWithVtable,
                 majit_metainterp::counters::RECORDED_OPS,
             );
-            let resbox = ctx
-                .trace_ctx
-                .record_op_with_descr(OpCode::NewWithVtable, &[], descr);
+            let resbox =
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::NewWithVtable, &[], descr);
             ctx.trace_ctx.heap_cache_mut().new_object(resbox);
             if let Some(class) = known_class {
                 ctx.trace_ctx
