@@ -3761,9 +3761,13 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                         }
                         // `guard_frame_globals=false`: the receiver pin above
                         // (not a frame-globals-identity guard) proves the dict.
-                        emit_namespace_cell_fold(
+                        if !emit_namespace_cell_fold(
                             ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false,
-                        )?;
+                        )? {
+                            // Nothing was written to `dst`, so the residual
+                            // still owes the load.
+                            return Ok(None);
+                        }
                         return Ok(Some(()));
                     }
                 }
@@ -3806,7 +3810,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
                 ctx.trace_ctx.heap_cache_mut().replace_box(obj, expected);
             }
-            emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false)?;
+            if !emit_namespace_cell_fold(ctx, op_pc, dst, dst_bank, w_dict, slot, stored, false)? {
+                return Ok(None);
+            }
             Ok(Some(()))
         })?
         .is_some()
