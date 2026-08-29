@@ -4439,8 +4439,13 @@ impl<'a> Assembler386<'a> {
                 // where the gcmap can name them.  Must precede the argument
                 // setup, which clobbers the ABI argument registers.
                 self.push_all_regs_to_jitframe(&[], true);
+                // arg3 is the descr's tid: a varsize object allocated as
+                // type 0 is traced with the layout of whatever registered
+                // first, so its items are never walked.
+                let type_id = op.with_array_descr(|ad| ad.type_id()).unwrap_or(0) as i64;
                 self.emit_abi_int_arg_from_imm(0, base_size);
                 self.emit_abi_int_arg_from_imm(1, itemsize);
+                self.emit_abi_int_arg_from_imm(3, type_id);
                 match arglocs.first() {
                     Some(Loc::Reg(len_r)) => {
                         self.emit_abi_int_arg_from_reg(2, len_r.value as u8);

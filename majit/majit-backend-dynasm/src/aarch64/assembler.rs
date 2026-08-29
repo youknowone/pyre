@@ -3300,6 +3300,7 @@ impl<'a> AssemblerARM64<'a> {
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
             OpCode::CallMallocNurseryVarsize => {
                 let base_size = op.with_array_descr(|ad| ad.base_size()).unwrap_or(16) as i64;
+                let type_id = op.with_array_descr(|ad| ad.type_id()).unwrap_or(0) as i64;
                 let itemsize = match arglocs.get(1) {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
@@ -3314,7 +3315,10 @@ impl<'a> AssemblerARM64<'a> {
                 // x0/x1/x2.
                 self.push_all_regs_to_jitframe(&[], true);
                 // _build_malloc_slowpath(kind='var') parity:
-                // x0 = base_size, x1 = item_size, x2 = length
+                // x0 = base_size, x1 = item_size, x2 = length, x3 = type_id.
+                // The tid comes from the descr: a varsize object allocated as
+                // type 0 is traced with the layout of whatever registered
+                // first, so its items are never walked.
                 self.emit_mov_imm64(0, base_size);
                 self.emit_mov_imm64(1, itemsize);
                 match arglocs.first() {
@@ -3339,11 +3343,15 @@ impl<'a> AssemblerARM64<'a> {
                 } else {
                     dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
                 }
+                self.emit_mov_imm64(3, type_id);
+                // x3 now carries an argument, so the helper address goes to
+                // x4, which `emit_malloc_slowpath_helper_call` saves after
+                // reading it.
                 self.emit_mov_imm64(
-                    3,
+                    4,
                     crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64,
                 );
-                self.emit_malloc_slowpath_helper_call(3);
+                self.emit_malloc_slowpath_helper_call(4);
                 self.reload_frame_if_necessary();
                 // pop_gcmap
                 dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);

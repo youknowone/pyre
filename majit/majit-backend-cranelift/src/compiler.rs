@@ -4197,9 +4197,14 @@ extern "C" fn gc_alloc_typed_nursery_shim(type_id: u64, size: u64) -> u64 {
     })
 }
 
-extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64) -> u64 {
+extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64, type_id: u64) -> u64 {
     with_cranelift_gc_required(|gc| {
-        gc.alloc_varsize(base_size as usize, item_size as usize, length as usize)
+        gc.alloc_varsize_typed(
+            type_id as u32,
+            base_size as usize,
+            item_size as usize,
+            length as usize,
+        )
             .0 as u64
     })
 }
@@ -13420,6 +13425,9 @@ impl CraneliftBackend {
                         .expect("CallMallocNurseryVarsize descr must be an ArrayDescr");
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
+                    // The descr's tid, not 0: a varsize object typed 0 is
+                    // traced with the layout of whatever registered first.
+                    let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
                     // rewrite.py:858: args = [ConstInt(kind), ConstInt(itemsize), v_length]
                     let length = resolve_opref_or_imm(
                         &mut builder,
@@ -13439,7 +13447,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         per_call_gcmap,
                         gc_alloc_varsize_shim as *const () as usize,
-                        &[base_size, item_size, length],
+                        &[base_size, item_size, length, type_id],
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
@@ -15322,16 +15330,18 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     let __descr_arc = op.getdescr();
-                    let (base_size, item_size) =
+                    let (base_size, item_size, type_id) =
                         if let Some(ad) = __descr_arc.as_ref().and_then(|d| d.as_array_descr()) {
                             (
                                 builder.ins().iconst(cl_types::I64, ad.base_size() as i64),
                                 builder.ins().iconst(cl_types::I64, ad.item_size() as i64),
+                                builder.ins().iconst(cl_types::I64, ad.type_id() as i64),
                             )
                         } else {
                             (
                                 builder.ins().iconst(cl_types::I64, 16),
                                 builder.ins().iconst(cl_types::I64, 8),
+                                builder.ins().iconst(cl_types::I64, 0),
                             )
                         };
                     let result = emit_collecting_gc_call(
@@ -15346,7 +15356,7 @@ impl CraneliftBackend {
                         ref_root_base_ofs,
                         per_call_gcmap,
                         gc_alloc_varsize_shim as *const () as usize,
-                        &[base_size, item_size, length],
+                        &[base_size, item_size, length, type_id],
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");

@@ -1060,11 +1060,17 @@ pub extern "C" fn dynasm_nursery_slowpath_varsize(
     base_size: u64,
     item_size: u64,
     length: u64,
+    type_id: u64,
 ) -> u64 {
     let gc_hdr = majit_gc::header::GcHeader::SIZE;
     let result = with_dynasm_active_gc_mut(|gc| {
-        gc.alloc_varsize(base_size as usize, item_size as usize, length as usize)
-            .0 as u64
+        gc.alloc_varsize_typed(
+            type_id as u32,
+            base_size as usize,
+            item_size as usize,
+            length as usize,
+        )
+        .0 as u64
     });
     result.unwrap_or_else(|| {
         let Some(total) = (item_size as usize)
@@ -4083,7 +4089,7 @@ mod tests {
 
     #[test]
     fn varsize_slowpaths_return_null_on_size_overflow() {
-        assert_eq!(dynasm_nursery_slowpath_varsize(0, 2, u64::MAX), 0);
+        assert_eq!(dynasm_nursery_slowpath_varsize(0, 2, u64::MAX, 0), 0);
         assert_eq!(
             dynasm_alloc_oldgen_varsize_typed_and_set_len(1, 0, 2, 0, usize::MAX),
             0
