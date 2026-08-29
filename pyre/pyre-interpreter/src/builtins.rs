@@ -19849,6 +19849,15 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // `posix` resolves one, so `open` and `os.open` answer for the
                 // same file after a `chdir`.
                 let seam_path = wasm_fd::seam_path(path_bytes);
+                // The seam reports a directory read as a missing file; opening
+                // one for reading is `EISDIR`, which is what `os.open` plus
+                // `os.read` already answer for the same name.
+                if crate::importing::source_is_dir(&seam_path) {
+                    return Err(crate::PyError::os_error_syscall(
+                        wasm_errno::EISDIR,
+                        resolved_path.w_path(),
+                    ));
+                }
                 match crate::importing::read_source_bytes(&seam_path) {
                     Ok(bytes) => bytes,
                     Err(e) => {
