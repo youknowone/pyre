@@ -1,21 +1,22 @@
 # pyre-check: platforms=linux
+# pyre-check: pypy-diverges: pypy3 prints `SAMENAME False` -- the startup file's
+#   `co_filename` is not the `__file__` it bound (measured on the ubuntu runner).
 #
-# APFS and NTFS reject a filename byte with no UTF-8 spelling, so the file this
-# pins cannot be created on darwin or win32 at all; ext4 takes every byte but
-# `/` and NUL.
+# APFS and NTFS reject a filename byte with no UTF-8 spelling, so this file
+# cannot be created on darwin or win32 at all; ext4 takes every byte but `/`
+# and NUL.
 #
 # CPython-suite gap: `test_cmd_line.test_run_startup` runs a startup file under
-# an ASCII name and never varies it, and the undecodable-path handling
-# `test_os` covers never reaches PYTHONSTARTUP.  That module also sits at
-# IMPORTERROR in the baseline, so none of it runs either way.
+# an ASCII name and never varies it, and the undecodable-path handling `test_os`
+# covers never reaches PYTHONSTARTUP.  That module also sits at IMPORTERROR in
+# the baseline, so none of it runs either way.
 #
 # parity-tests reason: `PYTHONSTARTUP` is read with `var_os`, which makes it the
 # one launcher path an undecodable filename reaches -- `parse_args` refuses a
 # non-Unicode argv outright.  A lossy conversion is invisible until the script
-# opens its own `__file__`, and it splits `__file__` from `co_filename`, so a
-# warning raised in the startup file names a different path than the file that
-# ran.  The properties are asserted rather than the escaped spelling, so the
-# row does not also pin how each runtime renders a lone surrogate.
+# opens its own `__file__`, and it splits `__file__` from `co_filename`.  The
+# properties are asserted rather than the escaped spelling, so the row does not
+# also pin how each runtime renders a lone surrogate.
 import os
 import subprocess
 import sys
@@ -49,4 +50,4 @@ with tempfile.TemporaryDirectory() as tmp:
     assert "BYTES True" in out, (out, err)
     assert code == 0, (code, err)
 
-print("startup file keeps its undecodable path bytes")
+print("OK")
