@@ -340,10 +340,14 @@ pub(crate) fn unop_wrapper_residual_path(segments: &[String]) -> Option<Vec<Stri
 }
 
 /// Zero-checked interpreter seams for the two projections of
-/// `rbigint.divmod`. Each returns a direct RBigInt handle at source level, so
-/// the target swap is ABI-identical to the other pointer residual mappings.
+/// `rbigint.divmod`, and the `rbigint.add`/`sub`/`mul` seams the machine-int
+/// overflow arms call. Each returns a direct RBigInt handle at source level,
+/// so the target swap is ABI-identical to the other pointer residual mappings.
 pub(crate) fn divmod_projection_residual_path(segments: &[String]) -> Option<Vec<String>> {
     let residual = match segments.last().map(String::as_str) {
+        Some("bigint_add") => "jit_bigint_add",
+        Some("bigint_sub") => "jit_bigint_sub",
+        Some("bigint_mul") => "jit_bigint_mul",
         Some("bigint_floordiv_nonzero") => "jit_bigint_div_floor",
         Some("bigint_modulo_nonzero") => "jit_bigint_mod_floor",
         // Machine-int-divisor quotient leg (`_int_floordiv`): the divisor is
@@ -673,6 +677,9 @@ mod tests {
     #[test]
     fn maps_zero_checked_divmod_projections() {
         for (source, residual) in [
+            ("bigint_add", "jit_bigint_add"),
+            ("bigint_sub", "jit_bigint_sub"),
+            ("bigint_mul", "jit_bigint_mul"),
             ("bigint_floordiv_nonzero", "jit_bigint_div_floor"),
             ("bigint_modulo_nonzero", "jit_bigint_mod_floor"),
             ("bigint_int_floordiv_nonzero", "jit_bigint_int_div_floor"),

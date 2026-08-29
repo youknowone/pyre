@@ -72,18 +72,26 @@ fn bigint_mod_inverse(base: &BigInt, modulus: &BigInt) -> Result<BigInt, PyError
         .map_err(|_| PyError::value_error("pow() 3rd argument cannot be 0"))
 }
 
-#[majit_macros::elidable]
-fn bigint_add(a: BigInt, b: BigInt) -> BigInt {
+/// Host spelling of `rbigint.add`, retargeted by the MIR front to
+/// `jit_bigint_add` the way [`bigint_floordiv_nonzero`] is to
+/// `jit_bigint_div_floor`: the operands are handles and the result is a
+/// direct RBigInt handle, so the swap is ABI-identical.  A by-value
+/// `elidable` wrapper here was an unrepresentable residual, and the traced
+/// overflow arm of `int_add` / `int_sub` / `int_mul` aborted on it.
+#[majit_macros::jit_elidable]
+fn bigint_add(a: &BigInt, b: &BigInt) -> BigInt {
     a + b
 }
 
-#[majit_macros::elidable]
-fn bigint_sub(a: BigInt, b: BigInt) -> BigInt {
+/// `rbigint.sub`; see [`bigint_add`].
+#[majit_macros::jit_elidable]
+fn bigint_sub(a: &BigInt, b: &BigInt) -> BigInt {
     a - b
 }
 
-#[majit_macros::elidable]
-fn bigint_mul(a: BigInt, b: BigInt) -> BigInt {
+/// `rbigint.mul`; see [`bigint_add`].
+#[majit_macros::jit_elidable]
+fn bigint_mul(a: &BigInt, b: &BigInt) -> BigInt {
     a * b
 }
 
@@ -828,7 +836,7 @@ unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_add(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_add(BigInt::from(va), BigInt::from(vb)))),
+        None => Ok(w_long_new(bigint_add(&BigInt::from(va), &BigInt::from(vb)))),
     }
 }
 
@@ -837,7 +845,7 @@ unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_sub(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_sub(BigInt::from(va), BigInt::from(vb)))),
+        None => Ok(w_long_new(bigint_sub(&BigInt::from(va), &BigInt::from(vb)))),
     }
 }
 
@@ -846,7 +854,7 @@ unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let vb = int_value(b);
     match va.checked_mul(vb) {
         Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_mul(BigInt::from(va), BigInt::from(vb)))),
+        None => Ok(w_long_new(bigint_mul(&BigInt::from(va), &BigInt::from(vb)))),
     }
 }
 
