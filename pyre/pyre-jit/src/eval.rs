@@ -6214,11 +6214,7 @@ impl PyPyJitDriver {
         let loop_pycode = pycode as *const ();
         let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
         let green_key = driver.resolve_cell_key(green_key_hash, || {
-            pyre_jit_trace::driver::make_green_key_typed(
-                loop_pycode,
-                next_instr,
-                is_being_profiled,
-            )
+            pyre_jit_trace::driver::make_green_key_typed(loop_pycode, next_instr, is_being_profiled)
         });
         if portal_metatrace_enabled()
             && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

@@ -3770,8 +3770,7 @@ impl<'a> Transformer<'a> {
         // pyre keys on the direct_call callee identity since the front-end
         // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
         if let Some(key) = jit_marker_key_from_target(target, &self.config.jitdriver_receiver_roots)
-            && let Some(ops) =
-                self.try_handle_jit_marker(key, args, op.result.as_ref(), graph)
+            && let Some(ops) = self.try_handle_jit_marker(key, args, op.result.as_ref(), graph)
         {
             return RewriteResult::Replace(ops);
         }
@@ -11615,12 +11614,7 @@ mod tests {
         let mut graph = crate::model::FunctionGraph::new("fixture");
         let result = graph.alloc_value_var();
         let ops = transformer
-            .try_handle_jit_marker(
-                JitMarkerKey::CanEnterJit,
-                &[],
-                Some(&result),
-                &graph,
-            )
+            .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[], Some(&result), &graph)
             .expect("can_enter_jit should dispatch when portal_jd is set");
         assert_eq!(ops.len(), 2);
         match &ops[0].kind {
@@ -11648,10 +11642,7 @@ mod tests {
             .push_op_var(
                 entry,
                 OpKind::Call {
-                    target: CallTarget::method(
-                        "can_enter_jit",
-                        Some("PyPyJitDriver".into()),
-                    ),
+                    target: CallTarget::method("can_enter_jit", Some("PyPyJitDriver".into())),
                     args: vec![receiver],
                     result_ty: ValueType::Bool,
                 },
@@ -11672,16 +11663,20 @@ mod tests {
             .with_portal_jd(Some(0))
             .transform(&graph);
         let entry = &result.graph.blocks[entry.0];
-        assert!(entry
-            .operations
-            .iter()
-            .any(|op| matches!(op.kind, OpKind::LoopHeader { jitdriver_index: 0 })));
-        assert!(!result
-            .graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| matches!(op.kind, OpKind::Call { .. })));
+        assert!(
+            entry
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::LoopHeader { jitdriver_index: 0 }))
+        );
+        assert!(
+            !result
+                .graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::Call { .. }))
+        );
         assert!(entry.exitswitch.is_none());
         assert_eq!(entry.exits.len(), 1);
         assert_eq!(entry.exits[0].target, if_false);

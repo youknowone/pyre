@@ -602,11 +602,12 @@ impl ExecutionContext {
         visitor(unsafe { &mut *(&mut self.py_repr as *mut PyObjectRef as *mut majit_ir::GcRef) });
         if let Some(pending) = self.pending_loop_exit.as_mut() {
             match pending {
-                PendingLoopExit::Done(Ok(value)) => visitor(unsafe {
-                    &mut *(value as *mut PyObjectRef as *mut majit_ir::GcRef)
-                }),
-                PendingLoopExit::Done(Err(err))
-                | PendingLoopExit::ExitFrameWithException(err) => err.walk_gc_refs(visitor),
+                PendingLoopExit::Done(Ok(value)) => {
+                    visitor(unsafe { &mut *(value as *mut PyObjectRef as *mut majit_ir::GcRef) })
+                }
+                PendingLoopExit::Done(Err(err)) | PendingLoopExit::ExitFrameWithException(err) => {
+                    err.walk_gc_refs(visitor)
+                }
                 PendingLoopExit::ContinueRunningNormally => {}
             }
         }
