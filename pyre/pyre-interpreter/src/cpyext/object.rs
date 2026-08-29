@@ -1267,19 +1267,52 @@ pub unsafe extern "C" fn PyObject_Type(object: *mut CPyObject) -> *mut CPyObject
 
 // ── the constants an extension asks for by identifier ───────────────────
 
-/// The object `Py_CONSTANT_<n>` names, `n` being an index this array covers.
+/// The identifiers `Py_GetConstant` takes, under the header's own names.
+///
+/// An identifier is an index rather than a flag -- a caller asks for exactly
+/// one -- so these stay numbers.  Declaring each once mints the count
+/// [`CONSTANT_MIRRORS`] is sized by and the table
+/// `every_constant_identifier_is_the_number_the_header_gives_it` walks, so an
+/// identifier added here is compared against the header without anyone
+/// remembering to list it.
+macro_rules! constant_identifiers {
+    ($($name:ident = $value:expr,)*) => {
+        $(const $name: usize = $value;)*
+
+        /// One past the last identifier the header declares.
+        const CONSTANT_COUNT: usize = [$($value,)*].len();
+
+        #[cfg(test)]
+        const ALL_CONSTANT_IDENTIFIERS: &[(&str, usize)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+constant_identifiers! {
+    PY_CONSTANT_NONE = 0,
+    PY_CONSTANT_FALSE = 1,
+    PY_CONSTANT_TRUE = 2,
+    PY_CONSTANT_ELLIPSIS = 3,
+    PY_CONSTANT_NOT_IMPLEMENTED = 4,
+    PY_CONSTANT_ZERO = 5,
+    PY_CONSTANT_ONE = 6,
+    PY_CONSTANT_EMPTY_STR = 7,
+    PY_CONSTANT_EMPTY_BYTES = 8,
+    PY_CONSTANT_EMPTY_TUPLE = 9,
+}
+
+/// The object an identifier names.
 fn constant_object(identifier: usize) -> PyObjectRef {
     match identifier {
-        0 => pyre_object::w_none(),
-        1 => pyre_object::boolobject::w_bool_from(false),
-        2 => pyre_object::boolobject::w_bool_from(true),
-        3 => pyre_object::w_ellipsis(),
-        4 => pyre_object::w_not_implemented(),
-        5 => pyre_object::w_int_new(0),
-        6 => pyre_object::w_int_new(1),
-        7 => pyre_object::w_str_new(""),
-        8 => pyre_object::bytesobject::w_bytes_from_bytes(b""),
-        9 => pyre_object::tupleobject::w_tuple_new(Vec::new()),
+        PY_CONSTANT_NONE => pyre_object::w_none(),
+        PY_CONSTANT_FALSE => pyre_object::boolobject::w_bool_from(false),
+        PY_CONSTANT_TRUE => pyre_object::boolobject::w_bool_from(true),
+        PY_CONSTANT_ELLIPSIS => pyre_object::w_ellipsis(),
+        PY_CONSTANT_NOT_IMPLEMENTED => pyre_object::w_not_implemented(),
+        PY_CONSTANT_ZERO => pyre_object::w_int_new(0),
+        PY_CONSTANT_ONE => pyre_object::w_int_new(1),
+        PY_CONSTANT_EMPTY_STR => pyre_object::w_str_new(""),
+        PY_CONSTANT_EMPTY_BYTES => pyre_object::bytesobject::w_bytes_from_bytes(b""),
+        PY_CONSTANT_EMPTY_TUPLE => pyre_object::tupleobject::w_tuple_new(Vec::new()),
         _ => unreachable!("the caller indexed CONSTANT_MIRRORS first"),
     }
 }
@@ -1291,8 +1324,8 @@ fn constant_object(identifier: usize) -> PyObjectRef {
 /// the same identifier have to answer the same pointer — which for `0` and
 /// `1` and the empty containers they would not, each `w_int_new` being its own
 /// object.
-static CONSTANT_MIRRORS: [std::sync::OnceLock<usize>; 10] =
-    [const { std::sync::OnceLock::new() }; 10];
+static CONSTANT_MIRRORS: [std::sync::OnceLock<usize>; CONSTANT_COUNT] =
+    [const { std::sync::OnceLock::new() }; CONSTANT_COUNT];
 
 fn constant_mirror(identifier: std::ffi::c_uint) -> Option<*mut CPyObject> {
     let index = identifier as usize;
@@ -1801,4 +1834,54 @@ pub unsafe extern "C" fn PyObject_CallOneArg(
     };
     let argument_vector = [arg];
     result(unsafe { call_vector(callable, argument_vector.as_ptr(), 1, std::ptr::null_mut()) })
+}
+
+#[cfg(test)]
+mod tests {
+    /// `Py_GetConstant` takes the number an extension compiled against
+    /// `include/pyre3.14t/object.h` wrote, so the identifiers are one table in
+    /// two places.  This walks the header and rejects any identifier whose
+    /// number the Rust side spells differently, or does not spell at all.
+    #[test]
+    fn every_constant_identifier_is_the_number_the_header_gives_it() {
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        let mut header: Vec<(&str, usize)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define Py_CONSTANT_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(value) = body.trim().parse::<usize>() else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        assert_eq!(
+            header.len(),
+            super::ALL_CONSTANT_IDENTIFIERS.len(),
+            "object.h declares {} identifiers and this file declares {}",
+            header.len(),
+            super::ALL_CONSTANT_IDENTIFIERS.len()
+        );
+
+        for (name, theirs) in &header {
+            let found = super::ALL_CONSTANT_IDENTIFIERS
+                .iter()
+                .find(|(known, _)| known.strip_prefix("PY_CONSTANT_") == Some(name));
+            let Some((_, ours)) = found else {
+                panic!(
+                    "object.h defines Py_CONSTANT_{name} = {theirs}, \
+                     and this file has no PY_CONSTANT_{name}"
+                );
+            };
+            assert_eq!(
+                ours, theirs,
+                "Py_CONSTANT_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
+    }
 }

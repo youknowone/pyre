@@ -3038,28 +3038,45 @@ fn method_descr_call(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 
 // ── `tp_members` ────────────────────────────────────────────────────────
 
-/// `structmember.h` type codes.
-pub const T_SHORT: c_int = 0;
-pub const T_INT: c_int = 1;
-pub const T_LONG: c_int = 2;
-pub const T_FLOAT: c_int = 3;
-pub const T_DOUBLE: c_int = 4;
-pub const T_STRING: c_int = 5;
-/// The string is the storage itself rather than a pointer to it.
-pub const T_STRING_INPLACE: c_int = 13;
-pub const T_OBJECT: c_int = 6;
-pub const T_CHAR: c_int = 7;
-pub const T_BYTE: c_int = 8;
-pub const T_UBYTE: c_int = 9;
-pub const T_USHORT: c_int = 10;
-pub const T_UINT: c_int = 11;
-pub const T_ULONG: c_int = 12;
-pub const T_BOOL: c_int = 14;
-pub const T_OBJECT_EX: c_int = 16;
-pub const T_LONGLONG: c_int = 17;
-pub const T_ULONGLONG: c_int = 18;
-pub const T_PYSSIZET: c_int = 19;
-pub const T_NONE: c_int = 20;
+/// The `structmember.h` type codes.
+///
+/// A code is not a flag -- a member names exactly one -- and C writes the
+/// field, so these stay numbers rather than becoming an `enum` a stray value
+/// could not inhabit.  Declaring each once mints the table
+/// `every_member_type_code_is_the_number_the_header_gives_it` walks, so a code
+/// added here is compared without anyone remembering to list it.
+macro_rules! member_type_codes {
+    ($($(#[$doc:meta])* $name:ident = $value:expr,)*) => {
+        $($(#[$doc])* pub const $name: c_int = $value;)*
+
+        #[cfg(test)]
+        const ALL_MEMBER_TYPE_CODES: &[(&str, c_int)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+member_type_codes! {
+    T_SHORT = 0,
+    T_INT = 1,
+    T_LONG = 2,
+    T_FLOAT = 3,
+    T_DOUBLE = 4,
+    T_STRING = 5,
+    /// The string is the storage itself rather than a pointer to it.
+    T_STRING_INPLACE = 13,
+    T_OBJECT = 6,
+    T_CHAR = 7,
+    T_BYTE = 8,
+    T_UBYTE = 9,
+    T_USHORT = 10,
+    T_UINT = 11,
+    T_ULONG = 12,
+    T_BOOL = 14,
+    T_OBJECT_EX = 16,
+    T_LONGLONG = 17,
+    T_ULONGLONG = 18,
+    T_PYSSIZET = 19,
+    T_NONE = 20,
+}
 bitflags::bitflags! {
     /// The `object.h` flags a `PyMemberDef` row carries.
     ///
@@ -6116,8 +6133,23 @@ pub struct CPySlot {
     pub sl_value: u64,
 }
 
-/// `PySlot.sl_flags`: an entry the reader may skip rather than refuse.
-pub(super) const SLOT_OPTIONAL: u16 = 0x01;
+bitflags::bitflags! {
+    /// The `object.h` flags a `PySlot` entry carries in `sl_flags`.
+    ///
+    /// `OPTIONAL` is the one the readers act on -- an entry they may skip
+    /// rather than refuse.  The names are the header's, prefix and all; the
+    /// test at the foot of this file compares the two, walking `Flags::FLAGS`.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) struct SlotFlags: u16 {
+        const PYSLOT_OPTIONAL = 0x01;
+        const PYSLOT_STATIC = 0x02;
+        const PYSLOT_INTPTR = 0x04;
+    }
+}
+
+const _: () = assert!(size_of::<SlotFlags>() == size_of::<u16>());
+const _: () = assert!(align_of::<SlotFlags>() == align_of::<u16>());
 
 /// The identifiers `PyType_FromSlots` reads for itself; every other one is
 /// left to the `Py_tp_slots` array, which is the `PyType_Spec` vocabulary.
@@ -6169,7 +6201,8 @@ pub unsafe extern "C" fn PyType_FromSlots(slots: *mut CPySlot) -> *mut CPyObject
             from_slots_id::TP_ITEMSIZE => spec.itemsize = value as isize as c_int,
             from_slots_id::TP_SLOTS => spec.slots = value as *mut CPyTypeSlot,
             unknown => {
-                if slot.sl_flags & SLOT_OPTIONAL == 0 {
+                if !SlotFlags::from_bits_retain(slot.sl_flags).contains(SlotFlags::PYSLOT_OPTIONAL)
+                {
                     super::pyerrors::set_pending_error(crate::PyError::new(
                         crate::PyErrorKind::SystemError,
                         format!("PyType_FromSlots(): unrecognised slot {unknown}"),
@@ -7174,6 +7207,130 @@ mod tests {
             assert_eq!(
                 ours, *theirs,
                 "Py_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
+    }
+
+    /// A `PySlot`'s `sl_flags` is one thing two places spell: an extension
+    /// compiled against `include/pyre3.14t/object.h` builds it, and the two
+    /// slot-array readers test it.  This walks the header and rejects any flag
+    /// whose bit the Rust side spells differently.
+    #[test]
+    fn every_slot_flag_is_the_bit_the_header_gives_it() {
+        use bitflags::Flags as _;
+
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/object.h");
+
+        let mut header: Vec<(&str, u16)> = Vec::new();
+        for line in HEADER.lines() {
+            let Some(rest) = line.strip_prefix("#define PySlot_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let body = body.trim();
+            let Some(digits) = body.strip_prefix("0x") else {
+                continue;
+            };
+            let Ok(value) = u16::from_str_radix(digits, 16) else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        assert_eq!(
+            header.len(),
+            super::SlotFlags::FLAGS.len(),
+            "object.h declares {} PySlot_ flags and this file declares {}",
+            header.len(),
+            super::SlotFlags::FLAGS.len()
+        );
+
+        for flag in super::SlotFlags::FLAGS {
+            let name = flag
+                .name()
+                .strip_prefix("PYSLOT_")
+                .expect("every flag is declared under the header's own name");
+            let ours = flag.value().bits();
+            let (_, theirs) = header
+                .iter()
+                .find(|(known, _)| known.eq_ignore_ascii_case(name))
+                .unwrap_or_else(|| panic!("object.h declares no PySlot_{name}"));
+            assert_eq!(
+                ours, *theirs,
+                "PySlot_{name} is {theirs} in object.h and {ours} here"
+            );
+        }
+    }
+
+    /// A member's `type` is the other half of the same ABI: `object.h` numbers
+    /// the codes as `Py_T_*`, `structmember.h` gives each the bare spelling an
+    /// extension still writes, and this file switches on the number that
+    /// arrives.  This resolves the header pair and rejects any code the Rust
+    /// side numbers differently, or does not spell at all.
+    #[test]
+    fn every_member_type_code_is_the_number_the_header_gives_it() {
+        const OBJECT_H: &str = include_str!("../../../../include/pyre3.14t/object.h");
+        const STRUCTMEMBER_H: &str = include_str!("../../../../include/pyre3.14t/structmember.h");
+
+        // `Py_T_SHORT 0` and the two the interpreter keeps to itself,
+        // `_Py_T_OBJECT` and `_Py_T_NONE`.
+        let mut numbered: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in OBJECT_H.lines() {
+            let rest = line
+                .strip_prefix("#define Py_T_")
+                .or_else(|| line.strip_prefix("#define _Py_T_"));
+            let Some(rest) = rest else { continue };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(value) = body.trim().parse::<std::ffi::c_int>() else {
+                continue;
+            };
+            numbered.push((name, value));
+        }
+
+        // Each bare spelling names one of those, so the number an extension
+        // compiles reaches this file through two headers.
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        for line in STRUCTMEMBER_H.lines() {
+            let Some(rest) = line.strip_prefix("#define T_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let body = body.trim();
+            let alias = body
+                .strip_prefix("Py_T_")
+                .or_else(|| body.strip_prefix("_Py_T_"))
+                .unwrap_or_else(|| panic!("T_{name} is defined as {body}, not a Py_T_ code"));
+            let (_, value) = numbered
+                .iter()
+                .find(|(known, _)| *known == alias)
+                .unwrap_or_else(|| panic!("T_{name} names Py_T_{alias}, which object.h lacks"));
+            header.push((name, *value));
+        }
+
+        assert_eq!(
+            header.len(),
+            super::ALL_MEMBER_TYPE_CODES.len(),
+            "the headers declare {} type codes and this file declares {}",
+            header.len(),
+            super::ALL_MEMBER_TYPE_CODES.len()
+        );
+
+        for (name, theirs) in &header {
+            let found = super::ALL_MEMBER_TYPE_CODES
+                .iter()
+                .find(|(known, _)| known.strip_prefix("T_") == Some(name));
+            let Some((_, ours)) = found else {
+                panic!("structmember.h defines T_{name} = {theirs}, and this file has no T_{name}");
+            };
+            assert_eq!(
+                ours, theirs,
+                "T_{name} is {theirs} in the headers and {ours} here"
             );
         }
     }

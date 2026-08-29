@@ -15077,16 +15077,16 @@ fn init_builtin_code_type(ns: PyObjectRef) {
     let flags_getter = make_builtin_function_with_arity(
         "co_flags",
         |args| {
-            let mut flags = 0i64;
+            let mut flags = crate::CodeFlags::empty();
             if let Some(s) = code_sig(args) {
                 if s.has_vararg() {
-                    flags |= 0x04; // CO_VARARGS
+                    flags |= crate::CodeFlags::VARARGS;
                 }
                 if s.has_kwarg() {
-                    flags |= 0x08; // CO_VARKEYWORDS
+                    flags |= crate::CodeFlags::VARKEYWORDS;
                 }
             }
-            Ok(pyre_object::w_int_new(flags))
+            Ok(pyre_object::w_int_new(flags.bits() as i64))
         },
         2,
     );

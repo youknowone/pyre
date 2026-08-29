@@ -9,14 +9,28 @@ use std::ffi::{CStr, c_char, c_int, c_long, c_void};
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
-/// `Py_mod_create`.
-const PY_MOD_CREATE: c_int = 1;
-/// `Py_mod_exec`.
-const PY_MOD_EXEC: c_int = 2;
-/// `Py_mod_multiple_interpreters`.
-const PY_MOD_MULTIPLE_INTERPRETERS: c_int = 3;
-/// `Py_mod_gil`.
-const PY_MOD_GIL: c_int = 4;
+/// The `moduleobject.h` slot identifiers a `PyModuleDef_Slot` array carries.
+///
+/// A slot names one identifier rather than a set of bits, so these stay
+/// numbers.  Declaring each once mints the table
+/// `every_module_slot_is_the_number_the_header_gives_it` walks, so a slot
+/// added here is compared against the header without anyone remembering to
+/// list it.
+macro_rules! module_slots {
+    ($($name:ident = $value:expr,)*) => {
+        $(const $name: c_int = $value;)*
+
+        #[cfg(test)]
+        const ALL_MODULE_SLOTS: &[(&str, c_int)] = &[$((stringify!($name), $value),)*];
+    };
+}
+
+module_slots! {
+    PY_MOD_CREATE = 1,
+    PY_MOD_EXEC = 2,
+    PY_MOD_MULTIPLE_INTERPRETERS = 3,
+    PY_MOD_GIL = 4,
+}
 
 /// The two versions a module may declare: the full API version an extension
 /// built against `Python.h` carries, and the stable-ABI one a limited-API
@@ -579,7 +593,9 @@ pub(super) fn create_module_from_export_slots(
                 value,
             }),
             unknown => {
-                if slot.sl_flags & super::typeobject::SLOT_OPTIONAL == 0 {
+                if !super::typeobject::SlotFlags::from_bits_retain(slot.sl_flags)
+                    .contains(super::typeobject::SlotFlags::PYSLOT_OPTIONAL)
+                {
                     return refuse(format!(
                         "module {name}: PyModExport_* returned an unrecognised slot {unknown}"
                     ));
@@ -1309,4 +1325,90 @@ pub(super) fn ensure_linked() {
     std::hint::black_box(PyModule_FromDefAndSpec2 as *const ());
     std::hint::black_box(PyModule_Check as *const ());
     std::hint::black_box(PyModule_CheckExact as *const ());
+}
+
+#[cfg(test)]
+mod tests {
+    /// A `PyModuleDef_Slot.slot` is the number an extension compiled against
+    /// `include/pyre3.14t/moduleobject.h` wrote, so the identifiers are one
+    /// table in two places.  This walks the header and rejects any identifier
+    /// whose number the Rust side spells differently, or does not spell at
+    /// all; `_Py_mod_LAST_SLOT` is what the reader refuses past, so it is held
+    /// to the highest of them.
+    #[test]
+    fn every_module_slot_is_the_number_the_header_gives_it() {
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/moduleobject.h");
+
+        let mut header: Vec<(&str, std::ffi::c_int)> = Vec::new();
+        let mut last_slot = None;
+        for line in HEADER.lines() {
+            if let Some(body) = line.strip_prefix("#define _Py_mod_LAST_SLOT ") {
+                last_slot = body.trim().parse::<std::ffi::c_int>().ok();
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("#define Py_mod_") else {
+                continue;
+            };
+            let Some((name, body)) = rest.split_once(' ') else {
+                continue;
+            };
+            let Ok(value) = body.trim().parse::<std::ffi::c_int>() else {
+                continue;
+            };
+            header.push((name, value));
+        }
+
+        assert_eq!(
+            header.len(),
+            super::ALL_MODULE_SLOTS.len(),
+            "moduleobject.h declares {} module slots and this file declares {}",
+            header.len(),
+            super::ALL_MODULE_SLOTS.len()
+        );
+
+        for (name, theirs) in &header {
+            let upper = format!("PY_MOD_{}", name.to_ascii_uppercase());
+            let found = super::ALL_MODULE_SLOTS
+                .iter()
+                .find(|(known, _)| *known == upper);
+            let Some((_, ours)) = found else {
+                panic!(
+                    "moduleobject.h defines Py_mod_{name} = {theirs}, and this file has no {upper}"
+                );
+            };
+            assert_eq!(
+                ours, theirs,
+                "Py_mod_{name} is {theirs} in moduleobject.h and {ours} here"
+            );
+        }
+
+        let highest = header.iter().map(|(_, value)| *value).max().unwrap();
+        assert_eq!(
+            last_slot,
+            Some(highest),
+            "moduleobject.h's highest slot is {highest} and its _Py_mod_LAST_SLOT is {last_slot:?}"
+        );
+    }
+
+    /// The two versions `PyModule_Create2` accepts are `patchlevel.h`'s, which
+    /// is what an extension's own `PyModule_Create` passes.
+    #[test]
+    fn both_module_versions_are_the_numbers_the_header_gives_them() {
+        const HEADER: &str = include_str!("../../../../include/pyre3.14t/patchlevel.h");
+
+        for (name, ours) in [
+            ("PYTHON_API_VERSION", super::PYTHON_API_VERSION),
+            ("PYTHON_ABI_VERSION", super::PYTHON_ABI_VERSION),
+        ] {
+            let theirs = HEADER
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("#define {name} ")))
+                .and_then(|body| body.trim().parse::<std::ffi::c_int>().ok())
+                .unwrap_or_else(|| panic!("patchlevel.h declares no {name}"));
+            assert_eq!(
+                ours, theirs,
+                "{name} is {theirs} in patchlevel.h and {ours} here"
+            );
+        }
+    }
 }

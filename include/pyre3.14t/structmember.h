@@ -17,7 +17,7 @@ extern "C" {
 #define T_FLOAT Py_T_FLOAT
 #define T_DOUBLE Py_T_DOUBLE
 #define T_STRING Py_T_STRING
-#define T_OBJECT 6
+#define T_OBJECT _Py_T_OBJECT
 #define T_OBJECT_EX Py_T_OBJECT_EX
 #define T_CHAR Py_T_CHAR
 #define T_BYTE Py_T_BYTE
@@ -25,11 +25,12 @@ extern "C" {
 #define T_USHORT Py_T_USHORT
 #define T_UINT Py_T_UINT
 #define T_ULONG Py_T_ULONG
+#define T_STRING_INPLACE Py_T_STRING_INPLACE
 #define T_BOOL Py_T_BOOL
 #define T_LONGLONG Py_T_LONGLONG
 #define T_ULONGLONG Py_T_ULONGLONG
 #define T_PYSSIZET Py_T_PYSSIZET
-#define T_NONE 20
+#define T_NONE _Py_T_NONE
 #define READONLY Py_READONLY
 
 struct PyGetSetDef {
