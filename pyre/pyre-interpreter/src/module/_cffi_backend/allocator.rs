@@ -162,12 +162,25 @@ fn init_allocator_type(ns: PyObjectRef) {
 
 /// `W_Allocator.descr_call`.
 fn allocator_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    // `interp2app(W_Allocator.descr_call)` — `self`, a required `arg`, and an
+    // `init` that `WrappedDefault(None)` supplies.  Binding here is what makes
+    // `alloc()` a TypeError rather than an out-of-bounds read.
+    let bound = super::func::bind_entry_point(
+        args,
+        "__FFIAllocator.__call__",
+        &["self", "arg", "init"],
+        2,
+    )?;
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.base();
     for value in [
-        args[0],
-        args[1],
-        args.get(2).copied().unwrap_or_else(pyre_object::w_none),
+        bound[0],
+        bound[1],
+        if bound[2].is_null() {
+            pyre_object::w_none()
+        } else {
+            bound[2]
+        },
     ] {
         let _ = roots.pin_root(value);
     }

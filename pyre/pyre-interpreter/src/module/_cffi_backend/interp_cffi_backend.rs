@@ -23,44 +23,55 @@ pub fn register_module(ns: pyre_object::PyObjectRef) {
     register_rtld_constants(ns);
 
     // `moduledef.py interpleveldefs` — the fixed-arity entry points first.
-    for (name, f, arity) in [
+    // `interp2app` reads each parameter's name off the interp-level function
+    // and drops the `w_` prefix, so every one of these binds by keyword too.
+    for (name, f, argnames) in [
         (
             "new_primitive_type",
             super::func::new_primitive_type as crate::gateway::BuiltinCodeFn,
-            1u16,
+            &["name"] as &[&'static str],
         ),
-        ("new_pointer_type", super::func::new_pointer_type, 1),
-        ("new_array_type", super::func::new_array_type, 2),
-        ("new_void_type", super::func::new_void_type, 0),
-        ("cast", super::func::cast, 2),
-        ("typeof", super::func::typeof_, 1),
-        ("sizeof", super::func::sizeof, 1),
-        ("alignof", super::func::alignof, 1),
-        ("getcname", super::func::getcname, 2),
-        ("unpack", super::func::unpack, 2),
-        ("release", super::func::release, 1),
-        ("newp_handle", super::handle::newp_handle, 2),
-        ("from_handle", super::handle::from_handle, 1),
-        ("get_errno", super::cerrno::get_errno, 0),
-        ("set_errno", super::cerrno::set_errno, 1),
-        ("_get_types", super::func::get_types, 0),
-        ("_get_common_types", get_common_types, 1),
-        ("new_struct_type", super::func::new_struct_type, 1),
-        ("new_union_type", super::func::new_union_type, 1),
-        ("new_enum_type", super::func::new_enum_type, 4),
+        ("new_pointer_type", super::func::new_pointer_type, &["ctype"]),
+        ("new_array_type", super::func::new_array_type, &["ctptr", "length"]),
+        ("new_void_type", super::func::new_void_type, &[]),
+        ("cast", super::func::cast, &["ctype", "ob"]),
+        ("typeof", super::func::typeof_, &["cdata"]),
+        ("sizeof", super::func::sizeof, &["obj"]),
+        ("alignof", super::func::alignof, &["ctype"]),
+        ("getcname", super::func::getcname, &["ctype", "replace_with"]),
+        ("unpack", super::func::unpack, &["cdata", "length"]),
+        ("release", super::func::release, &["cdata"]),
+        ("newp_handle", super::handle::newp_handle, &["ctype", "x"]),
+        ("from_handle", super::handle::from_handle, &["cdata"]),
+        ("get_errno", super::cerrno::get_errno, &[]),
+        ("set_errno", super::cerrno::set_errno, &["errno"]),
+        ("_get_types", super::func::get_types, &[]),
+        ("_get_common_types", get_common_types, &["dict"]),
+        ("new_struct_type", super::func::new_struct_type, &["name"]),
+        ("new_union_type", super::func::new_union_type, &["name"]),
+        (
+            "new_enum_type",
+            super::func::new_enum_type,
+            &["name", "enumerators", "enumvalues", "basectype"],
+        ),
     ] {
         crate::module_ns_store(
             ns,
             name,
             crate::gateway::with_module(
                 MODULE,
-                crate::make_module_builtin_function_with_arity(name, f, arity),
+                crate::gateway::make_module_builtin_function_with_arity_and_sig(
+                    name,
+                    f,
+                    argnames.len() as u16,
+                    crate::gateway::Signature::new(argnames.to_vec(), None, None, 0, 0),
+                ),
             ),
         );
     }
     // `newp(ctype, init=None)`, `string(cdata, maxlen=-1)`,
-    // `typeoffsetof(ctype, field_or_index, following=0)` and
-    // `rawaddressof(ctype, cdata, offset=0)` all carry a default.
+    // `typeoffsetof(ctype, field_or_index, following=0)` carry a default, and
+    // the rest of this group binds its own arguments for the same reason.
     for (name, f) in [
         ("newp", super::func::newp as crate::gateway::BuiltinCodeFn),
         ("string", super::func::string),
@@ -202,10 +213,16 @@ fn get_common_types(
     let mut index = 0;
     while let Some((key, value)) = parse_c_type::enum_common_types(index) {
         let w_value = pyre_object::w_str_new(value);
-        // SAFETY: cffi's Python half only ever passes a real dict here
-        // (`cffi/commontypes.py:_get_common_types(_CACHE)`).
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str(roots.get(slot), key, w_value);
+        // `space.setitem_str` takes the dict fast path only for a real dict and
+        // otherwise dispatches `__setitem__`, so a mapping of any other kind
+        // reaches its own method instead of the raw accessor.
+        if unsafe { pyre_object::pyobject::is_dict(roots.get(slot)) } {
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(roots.get(slot), key, w_value);
+            }
+        } else {
+            let w_key = pyre_object::w_str_new(key);
+            crate::baseobjspace::setitem(roots.get(slot), w_key, w_value)?;
         }
         index += 1;
     }

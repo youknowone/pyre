@@ -46,7 +46,7 @@ fn offset_in_bytes_type() -> PyObjectRef {
 /// declare a fixed arity at registration.  `argnames` is the whole parameter
 /// list and `required` how many of them have no default; a parameter that was
 /// not supplied comes back as `PY_NULL`, which [`optional`] reads as absent.
-fn bind_entry_point(
+pub(super) fn bind_entry_point(
     args: &[PyObjectRef],
     name: &'static str,
     argnames: &[&'static str],
@@ -306,7 +306,7 @@ pub fn from_buffer(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let ct = ctypeobj::ctype_arg(w_ctype)?;
     if !ct.is_ptr_or_array() {
         return Err(PyError::type_error(format!(
-            "expected a poiunter or array ctype, got '{}'",
+            "expected a pointer or array ctype, got '{}'",
             ct.name()
         )));
     }
