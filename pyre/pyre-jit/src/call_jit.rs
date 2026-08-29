@@ -2566,6 +2566,31 @@ fn leave_compiled_frame_chain(frame_ptr: *mut PyFrame, got_exception: bool) {
     }
 }
 
+/// The escape-propagation arm of `ExecutionContext.leave`, for the portal
+/// activation whose chain restore is emitted by the compiled trace.
+///
+/// `portal_traced_activation_result` must not call
+/// [`leave_compiled_frame_chain`]: `record_ec_leave_frame_chain` owns the
+/// `topframeref` restore after CALL_ASSEMBLER returns.  It still owes this
+/// independent half of the same upstream `finally`, however.  A frame that
+/// escaped (or raised) forces and marks its caller so a later `f_back` walk
+/// cannot reach a caller virtual reference that was finished unforced.
+pub(crate) fn propagate_portal_frame_escape(frame: *mut PyFrame, got_exception: bool) {
+    if frame.is_null() {
+        return;
+    }
+    unsafe {
+        if (*frame).escaped() || got_exception {
+            // `ExecutionContext.leave`: `f_back = frame.f_backref()`; the
+            // call forces a still-virtual caller before marking it escaped.
+            let f_back = (*frame).get_f_back();
+            if !f_back.is_null() {
+                (*f_back).mark_as_escaped();
+            }
+        }
+    }
+}
+
 /// resume.py blackhole_from_resumedata parity:
 /// Decode rd_numb via ResumeDataDirectReader, build blackhole chain,
 /// run _run_forever.

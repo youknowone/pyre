@@ -8175,16 +8175,17 @@ impl<M: Clone> MetaInterp<M> {
     /// compile.py: has_compiled_targets — check if a green key has
     /// compiled target tokens that a bridge can jump to.
     pub fn has_compiled_targets(&self, green_key: u64) -> bool {
-        // Consistent with has_compiled_loop: direct key only, no alias, and
-        // the warmstate token must still be live. warmstate.py:483-500 removes
-        // invalidated/dead cells before retracing; pyre's compiled_loops
-        // side-table must not make such a dead token look jumpable.
-        if !self.has_compiled_loop(green_key) {
-            return false;
-        }
-        self.compiled_loops
-            .get(&green_key)
-            .is_some_and(|c| !c.front_target_tokens.is_empty())
+        // `pyjitpl.py has_compiled_targets(token)` is exactly
+        // `bool(token) and bool(token.target_tokens)`: both halves belong to
+        // the SAME token returned by `warmstate.py get_procedure_token`.
+        // In particular, `compile_tmp_callback` may replace a cell's old loop
+        // token with a live callback token whose target list is empty while
+        // pyre's optimizer-only `compiled_loops` side table still retains the
+        // old loop state.  Reading that side table here makes the gate admit a
+        // target that `compile_trace` cannot obtain from the current token,
+        // so a function-entry trace repeatedly aborts as `ABORT_BAD_LOOP`.
+        self.entry_procedure_token(green_key)
+            .is_some_and(|token| token.has_target_tokens())
     }
 
     /// pyjitpl.py: compile_trace — try to compile the current
@@ -26023,6 +26024,59 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&fresh, &stale),
             "and it is a new token, not the invalidated one"
+        );
+    }
+
+    /// `compile_tmp_callback` replaces the cell's procedure token, but it
+    /// does not erase pyre's optimizer-side metadata for the displaced loop.
+    /// `pyjitpl.py has_compiled_targets(token)` asks only about the current
+    /// cell token, so the stale side table must not make the callback token
+    /// look like a jump target.
+    #[test]
+    fn a_tmp_callback_token_does_not_inherit_displaced_loop_targets() {
+        let mut meta = MetaInterp::<()>::new(10);
+        meta.finish_setup_descrs_for_jitdrivers();
+        let green_key = 4242;
+
+        let old_token = std::sync::Arc::new(JitCellToken::new(1));
+        old_token.set_compiled(Box::new(()));
+        meta.compiled_loops.insert(
+            green_key,
+            CompiledEntry {
+                token: std::sync::Arc::downgrade(&old_token),
+                meta: std::sync::Arc::new(()),
+                front_target_tokens: vec![crate::history::TargetToken::new_loop(1)],
+                front_entry_index: Some(0),
+                front_target_source_positions: None,
+                root_trace_id: 1,
+                traces: indexmap::IndexMap::new(),
+                previous_tokens: Vec::new(),
+                loop_header_pc: Some(0),
+                next_global_opref: 0,
+            },
+        );
+
+        let callback_token = std::sync::Arc::new(JitCellToken::new(2));
+        callback_token.set_compiled(Box::new(()));
+        meta.warm_state_mut()
+            .memory_manager
+            .keep_loop_alive(&callback_token);
+        meta.warm_state_mut()
+            .attach_tmp_callback_to_interp(green_key, callback_token);
+
+        assert!(meta.has_compiled_loop(green_key));
+        assert!(
+            matches!(
+                meta.function_entry_step(green_key, green_key, (0, 0)),
+                crate::warmstate::FunctionEntryStep::NotHot
+            ),
+            "warmstate.py checks JC_TEMPORARY before the procedure token, so retained loop \
+             metadata must not make the callback runnable at function entry"
+        );
+        assert!(
+            !meta.has_compiled_targets(green_key),
+            "the current callback token has no target_tokens; the displaced \
+             loop's side-table targets belong to a different object"
         );
     }
 

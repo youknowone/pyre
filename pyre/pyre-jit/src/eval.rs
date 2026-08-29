@@ -9027,6 +9027,15 @@ fn portal_activation_bracketed(
             (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)
         },
     };
+    // The compiled trace owns only the raw `topframeref` restore.  Preserve
+    // `ExecutionContext.leave`'s separate escape-propagation arm even when the
+    // profile hook above raised: upstream puts both in the same `finally`.
+    if matches!(leave_owner, PortalLeaveOwner::CompiledTrace) {
+        crate::call_jit::propagate_portal_frame_escape(
+            frame_root.frame() as *mut PyFrame,
+            outer_result.is_err(),
+        );
+    }
     let live = leave_result?;
     outer_result.map(|_| live)
 }
@@ -14600,6 +14609,11 @@ mod tests {
     /// absent (the supported test-stub representation).
     #[test]
     fn pycode_green_keys_preserve_wrapper_identity() {
+        // `w_code_new` is a GC allocation.  Tests run in parallel, so another
+        // worker may already have installed the process-global object hooks;
+        // enter this worker through the same per-thread runtime/GIL bootstrap
+        // as production before allocating.
+        init_gc_subsystem();
         let w_code = pyre_interpreter::pycode::w_code_new(std::ptr::null());
         assert!(!w_code.is_null());
 
