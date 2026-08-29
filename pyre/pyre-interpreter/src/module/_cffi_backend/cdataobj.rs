@@ -631,8 +631,16 @@ fn cdata_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     let extra = cdata.repr_extra()?;
+    // A struct this cdata does not own is written "struct foo &", so that it
+    // does not read like the owning "<cdata 'struct foo' 0x...>".
+    let owning = matches!(cdata.flavor, FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD);
+    let extra1 = if !owning && ct.is_struct_or_union() {
+        " &"
+    } else {
+        ""
+    };
     Ok(pyre_object::w_str_new(&format!(
-        "<cdata '{}' {extra}>",
+        "<cdata '{}{extra1}' {extra}>",
         ct.name()
     )))
 }
@@ -736,10 +744,12 @@ fn cdata_exit(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
 /// `W_CData.enter_exit` and the overrides of it.
 pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
     let cdata = cdata_arg(w_cdata)?;
-    // `W_CDataPtrToStructOrUnion.enter_exit` releases the struct it co-owns.
+    // `W_CDataPtrToStructOrUnion.enter_exit` reaches the struct it co-owns
+    // through `_do_exit`, not through that object's own `enter_exit`: its
+    // ctype is the struct itself, which the owning check below refuses.
     if cdata.flavor == FLAVOR_PTR_TO_STRUCT {
         if exit_now && !cdata.w_keepalive.is_null() {
-            return enter_exit(cdata.w_keepalive, true);
+            return do_exit(cdata.w_keepalive);
         }
         return Ok(());
     }
@@ -750,28 +760,49 @@ pub fn enter_exit(w_cdata: PyObjectRef, exit_now: bool) -> Result<(), PyError> {
         }
         return Ok(());
     }
-    if matches!(cdata.flavor, FLAVOR_GCP | FLAVOR_NEW_NONSTD) {
+    // `W_CDataGCP.enter_exit`, which carries no owning check of its own.
+    if cdata.flavor == FLAVOR_GCP {
         if exit_now {
-            if cdata.flavor == FLAVOR_NEW_NONSTD && !cdata.w_destructor.is_null() {
-                add_memory_pressure(w_cdata, -cdata.sizeof()?);
-            }
             invoke_destructor(w_cdata)?;
             crate::executioncontext::may_ignore_finalizer(w_cdata);
         }
         return Ok(());
     }
+    // `W_CDataNewOwning.enter_exit`.
     let ct = cdata.ctype_ref()?;
-    if cdata.flavor != FLAVOR_NEW_STD || !ct.is_ptr_or_array() {
+    if !matches!(cdata.flavor, FLAVOR_NEW_STD | FLAVOR_NEW_NONSTD) || !ct.is_ptr_or_array() {
         return Err(PyError::value_error(
             "only 'cdata' object from ffi.new(), ffi.gc(), ffi.from_buffer() or ffi.new_allocator()() can be used with the 'with' keyword or ffi.release()",
         ));
     }
-    if exit_now && cdata.datasize >= 0 {
-        // `W_CDataNewStd._do_exit`.
-        add_memory_pressure(w_cdata, -cdata.datasize);
-        cdata.datasize = -1;
-        unsafe { libc::free(cdata.ptr.cast::<libc::c_void>()) };
-        cdata.ptr = std::ptr::null_mut();
+    if exit_now {
+        do_exit(w_cdata)?;
+    }
+    Ok(())
+}
+
+/// `W_CDataNewStd._do_exit` and `W_CDataNewNonStd._do_exit`.  Any other
+/// flavor is not a `W_CDataNewOwning`, and owns nothing to release.
+fn do_exit(w_cdata: PyObjectRef) -> Result<(), PyError> {
+    let cdata = cdata_arg(w_cdata)?;
+    match cdata.flavor {
+        FLAVOR_NEW_STD => {
+            if cdata.datasize >= 0 {
+                add_memory_pressure(w_cdata, -cdata.datasize);
+                cdata.datasize = -1;
+                crate::executioncontext::may_ignore_finalizer(w_cdata);
+                unsafe { libc::free(cdata.ptr.cast::<libc::c_void>()) };
+                cdata.ptr = std::ptr::null_mut();
+            }
+        }
+        FLAVOR_NEW_NONSTD => {
+            if !cdata.w_destructor.is_null() {
+                add_memory_pressure(w_cdata, -cdata.sizeof()?);
+            }
+            invoke_destructor(w_cdata)?;
+            crate::executioncontext::may_ignore_finalizer(w_cdata);
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1140,41 +1171,60 @@ fn do_setslice(
         return Ok(());
     }
 
-    // `<char[]>[0:N] = b"somestring"`.
-    if item.is_primitive()
-        && item_size == 1
-        && unsafe { pyre_object::bytesobject::is_bytes(w_value) }
-    {
-        let value = unsafe { pyre_object::bytesobject::w_bytes_data(w_value) };
-        if value.len() as i64 != length {
-            return Err(PyError::value_error(format!(
-                "need a string of length {length}, got {}",
-                value.len()
-            )));
+    // `<char[]>[0:N] = b"somestring"`, and the same for a bytearray.
+    if item.is_primitive() && item_size == 1 {
+        let source = unsafe {
+            if pyre_object::bytesobject::is_bytes(w_value) {
+                Some(("string", pyre_object::bytesobject::w_bytes_data(w_value)))
+            } else if pyre_object::bytearrayobject::is_bytearray(w_value) {
+                Some((
+                    "bytearray",
+                    &*pyre_object::bytearrayobject::w_bytearray_data(w_value),
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((kind, value)) = source {
+            if value.len() as i64 != length {
+                return Err(PyError::value_error(format!(
+                    "need a {kind} of length {length}, got {}",
+                    value.len()
+                )));
+            }
+            unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), target, value.len()) };
+            return Ok(());
         }
-        unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), target, value.len()) };
-        return Ok(());
     }
 
-    // `W_CData._do_setslice_iterate`.
-    let items = crate::baseobjspace::unpackiterable(w_value, -1)?;
-    if items.len() as i64 != length {
-        return Err(if (items.len() as i64) < length {
-            PyError::value_error(format!(
-                "need {length} values to unpack, got {}",
-                items.len()
-            ))
-        } else {
-            PyError::value_error(format!("got more than {length} values to unpack"))
-        });
-    }
+    // `W_CData._do_setslice_iterate`.  Each value is written as it arrives,
+    // so a sequence of the wrong length leaves the ones that came first
+    // stored before the error names the mismatch.
     let roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&items);
-    for i in 0..items.len() {
-        let element = unsafe { target.offset((i as i64 * item_size) as isize) };
-        unsafe { ctypeobj::convert_from_object(item, element, roots.get(base + i))? };
+    let iter_slot = roots.base();
+    let _ = roots.pin_root(crate::baseobjspace::iter(w_value)?);
+    let item_slot = iter_slot + 1;
+    let _ = roots.pin_root(pyre_object::PY_NULL);
+    for i in 0..length {
+        match crate::baseobjspace::next(roots.get(iter_slot)) {
+            Ok(w_item) => roots.set(item_slot, w_item),
+            Err(err) if err.matches_stop_iteration() => {
+                return Err(PyError::value_error(format!(
+                    "need {length} values to unpack, got {i}"
+                )));
+            }
+            Err(err) => return Err(err),
+        }
+        let element = unsafe { target.offset((i * item_size) as isize) };
+        unsafe { ctypeobj::convert_from_object(item, element, roots.get(item_slot))? };
     }
-    Ok(())
+    match crate::baseobjspace::next(roots.get(iter_slot)) {
+        Ok(_) => Err(PyError::value_error(format!(
+            "got more than {length} values to unpack"
+        ))),
+        Err(err) if err.matches_stop_iteration() => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 // ── arithmetic ──────────────────────────────────────────────────────────
