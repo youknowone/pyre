@@ -15,6 +15,16 @@ use std::ffi::{c_char, c_double, c_int};
 unsafe extern "C" {
     pub fn pyre_cffi_sizeof_long_double() -> usize;
     pub fn pyre_cffi_alignof_long_double() -> usize;
+    pub fn pyre_cffi_sizeof_wchar() -> usize;
+    pub fn pyre_cffi_alignof_wchar() -> usize;
+    pub fn pyre_cffi_sizeof_fast8() -> usize;
+    pub fn pyre_cffi_alignof_fast8() -> usize;
+    pub fn pyre_cffi_sizeof_fast16() -> usize;
+    pub fn pyre_cffi_alignof_fast16() -> usize;
+    pub fn pyre_cffi_sizeof_fast32() -> usize;
+    pub fn pyre_cffi_alignof_fast32() -> usize;
+    pub fn pyre_cffi_sizeof_fast64() -> usize;
+    pub fn pyre_cffi_alignof_fast64() -> usize;
     pub fn pyre_cffi_read_long_double(p: *const c_char) -> c_double;
     pub fn pyre_cffi_write_long_double(p: *mut c_char, v: c_double);
     pub fn pyre_cffi_nonnull_long_double(p: *const c_char) -> c_int;
@@ -29,6 +39,31 @@ pub fn sizeof_long_double() -> i64 {
 /// `newtype.py alignment(rffi.LONGDOUBLE)`.
 pub fn alignof_long_double() -> i64 {
     unsafe { pyre_cffi_alignof_long_double() as i64 }
+}
+
+/// The size and alignment of `wchar_t`, which is two bytes on Windows and
+/// four where it is an `int`.
+pub fn wchar_layout() -> (i64, i64) {
+    unsafe {
+        (
+            pyre_cffi_sizeof_wchar() as i64,
+            pyre_cffi_alignof_wchar() as i64,
+        )
+    }
+}
+
+/// The size and alignment of `int_fast<bits>_t`, which is a different C type
+/// on every platform.  `uint_fast<bits>_t` shares the layout.
+pub fn fast_int_layout(bits: u32) -> (i64, i64) {
+    let (size, align) = unsafe {
+        match bits {
+            8 => (pyre_cffi_sizeof_fast8(), pyre_cffi_alignof_fast8()),
+            16 => (pyre_cffi_sizeof_fast16(), pyre_cffi_alignof_fast16()),
+            32 => (pyre_cffi_sizeof_fast32(), pyre_cffi_alignof_fast32()),
+            _ => (pyre_cffi_sizeof_fast64(), pyre_cffi_alignof_fast64()),
+        }
+    };
+    (size as i64, align as i64)
 }
 
 // ── raw reads and writes ────────────────────────────────────────────────

@@ -46,7 +46,8 @@ fn primitive_types() -> &'static HashMap<&'static str, (i64, i64, i64)> {
         };
         let mut t: HashMap<&'static str, (i64, i64, i64)> = HashMap::new();
         t.insert("char", prim!(KIND_PRIM_CHAR, c_char));
-        t.insert("wchar_t", prim!(KIND_PRIM_UNICHAR, u32));
+        let (wchar_size, wchar_align) = misc::wchar_layout();
+        t.insert("wchar_t", (KIND_PRIM_UNICHAR, wchar_size, wchar_align));
         t.insert("signed char", prim!(KIND_PRIM_SIGNED, i8));
         t.insert("short", prim!(KIND_PRIM_SIGNED, c_short));
         t.insert("int", prim!(KIND_PRIM_SIGNED, c_int));
@@ -74,70 +75,46 @@ fn primitive_types() -> &'static HashMap<&'static str, (i64, i64, i64)> {
         for name in ["double _Complex", "_cffi_double_complex_t"] {
             t.insert(name, prim!(KIND_PRIM_COMPLEX, c_double, 2));
         }
-        // `eptypesize` — the fixed-width names, whose sizes are their names.
-        for (name, kind, size) in [
-            ("int8_t", KIND_PRIM_SIGNED, 1),
-            ("uint8_t", KIND_PRIM_UNSIGNED, 1),
-            ("int16_t", KIND_PRIM_SIGNED, 2),
-            ("uint16_t", KIND_PRIM_UNSIGNED, 2),
-            ("int32_t", KIND_PRIM_SIGNED, 4),
-            ("uint32_t", KIND_PRIM_UNSIGNED, 4),
-            ("int64_t", KIND_PRIM_SIGNED, 8),
-            ("uint64_t", KIND_PRIM_UNSIGNED, 8),
-            ("int_least8_t", KIND_PRIM_SIGNED, 1),
-            ("uint_least8_t", KIND_PRIM_UNSIGNED, 1),
-            ("int_least16_t", KIND_PRIM_SIGNED, 2),
-            ("uint_least16_t", KIND_PRIM_UNSIGNED, 2),
-            ("int_least32_t", KIND_PRIM_SIGNED, 4),
-            ("uint_least32_t", KIND_PRIM_UNSIGNED, 4),
-            ("int_least64_t", KIND_PRIM_SIGNED, 8),
-            ("uint_least64_t", KIND_PRIM_UNSIGNED, 8),
-            ("char16_t", KIND_PRIM_UNICHAR, 2),
-            ("char32_t", KIND_PRIM_UNICHAR, 4),
+        // `eptypesize` — the fixed-width names.  It resolves each one to a
+        // real C type of that width and takes that type's alignment, which is
+        // not the width on every target: a 32-bit x86 `int64_t` is 8 bytes
+        // aligned to 4.  Rust's integers carry the same target alignments.
+        for (name, kind, layout) in [
+            ("int8_t", KIND_PRIM_SIGNED, prim!(0, i8)),
+            ("uint8_t", KIND_PRIM_UNSIGNED, prim!(0, u8)),
+            ("int16_t", KIND_PRIM_SIGNED, prim!(0, i16)),
+            ("uint16_t", KIND_PRIM_UNSIGNED, prim!(0, u16)),
+            ("int32_t", KIND_PRIM_SIGNED, prim!(0, i32)),
+            ("uint32_t", KIND_PRIM_UNSIGNED, prim!(0, u32)),
+            ("int64_t", KIND_PRIM_SIGNED, prim!(0, i64)),
+            ("uint64_t", KIND_PRIM_UNSIGNED, prim!(0, u64)),
+            ("int_least8_t", KIND_PRIM_SIGNED, prim!(0, i8)),
+            ("uint_least8_t", KIND_PRIM_UNSIGNED, prim!(0, u8)),
+            ("int_least16_t", KIND_PRIM_SIGNED, prim!(0, i16)),
+            ("uint_least16_t", KIND_PRIM_UNSIGNED, prim!(0, u16)),
+            ("int_least32_t", KIND_PRIM_SIGNED, prim!(0, i32)),
+            ("uint_least32_t", KIND_PRIM_UNSIGNED, prim!(0, u32)),
+            ("int_least64_t", KIND_PRIM_SIGNED, prim!(0, i64)),
+            ("uint_least64_t", KIND_PRIM_UNSIGNED, prim!(0, u64)),
+            ("char16_t", KIND_PRIM_UNICHAR, prim!(0, u16)),
+            ("char32_t", KIND_PRIM_UNICHAR, prim!(0, u32)),
         ] {
-            t.insert(name, (kind, size, size));
+            t.insert(name, (kind, layout.1, layout.2));
         }
         // The `fast` names are the platform's own widths, which C picks for
-        // speed rather than size.
-        for (name, kind, ty_size) in [
-            ("int_fast8_t", KIND_PRIM_SIGNED, std::mem::size_of::<i8>()),
-            (
-                "uint_fast8_t",
-                KIND_PRIM_UNSIGNED,
-                std::mem::size_of::<u8>(),
-            ),
-            (
-                "int_fast16_t",
-                KIND_PRIM_SIGNED,
-                std::mem::size_of::<c_long>(),
-            ),
-            (
-                "uint_fast16_t",
-                KIND_PRIM_UNSIGNED,
-                std::mem::size_of::<c_long>(),
-            ),
-            (
-                "int_fast32_t",
-                KIND_PRIM_SIGNED,
-                std::mem::size_of::<c_long>(),
-            ),
-            (
-                "uint_fast32_t",
-                KIND_PRIM_UNSIGNED,
-                std::mem::size_of::<c_long>(),
-            ),
-            (
-                "int_fast64_t",
-                KIND_PRIM_SIGNED,
-                std::mem::size_of::<c_long>(),
-            ),
-            (
-                "uint_fast64_t",
-                KIND_PRIM_UNSIGNED,
-                std::mem::size_of::<c_long>(),
-            ),
+        // speed rather than size, so the C compiler is asked for them.
+        for (name, kind, bits) in [
+            ("int_fast8_t", KIND_PRIM_SIGNED, 8),
+            ("uint_fast8_t", KIND_PRIM_UNSIGNED, 8),
+            ("int_fast16_t", KIND_PRIM_SIGNED, 16),
+            ("uint_fast16_t", KIND_PRIM_UNSIGNED, 16),
+            ("int_fast32_t", KIND_PRIM_SIGNED, 32),
+            ("uint_fast32_t", KIND_PRIM_UNSIGNED, 32),
+            ("int_fast64_t", KIND_PRIM_SIGNED, 64),
+            ("uint_fast64_t", KIND_PRIM_UNSIGNED, 64),
         ] {
-            t.insert(name, (kind, ty_size as i64, ty_size as i64));
+            let (size, align) = misc::fast_int_layout(bits);
+            t.insert(name, (kind, size, align));
         }
         t.insert("intptr_t", prim!(KIND_PRIM_SIGNED, isize));
         t.insert("uintptr_t", prim!(KIND_PRIM_UNSIGNED, usize));
