@@ -73,15 +73,26 @@ pub(crate) struct OptionTryStats {
 
 /// Rewrite every recorded `Option` `Try::branch` site.  `return_option_owner`
 /// is the enclosing function's declared `Option<U>` root; `None` means the
-/// function is not Option-returning, so all sites decline.
+/// function is not Option-returning, so all sites decline. `return_niche` and
+/// `return_narrow_root` describe the enclosing return Option independently of
+/// the branched Option: a niche return builds a narrowed null instead of an
+/// enum `Option::None` aggregate.
 pub(crate) fn rewire_option_try_call_sites(
     graph: &mut FunctionGraph,
     sites: &[OptionTrySite],
     return_option_owner: Option<&str>,
+    return_niche: bool,
+    return_narrow_root: Option<&str>,
 ) -> OptionTryStats {
     let mut stats = OptionTryStats::default();
     for site in sites {
-        match rewire_one_option_try_site(graph, site, return_option_owner) {
+        match rewire_one_option_try_site(
+            graph,
+            site,
+            return_option_owner,
+            return_niche,
+            return_narrow_root,
+        ) {
             Ok(()) => stats.rewritten += 1,
             Err(decline) => {
                 stats.declined += 1;
@@ -101,6 +112,8 @@ fn rewire_one_option_try_site(
     graph: &mut FunctionGraph,
     site: &OptionTrySite,
     return_option_owner: Option<&str>,
+    return_niche: bool,
+    return_narrow_root: Option<&str>,
 ) -> Result<(), String> {
     let name = graph.name.clone();
     let Some(return_option_owner) = return_option_owner else {
@@ -268,7 +281,20 @@ fn rewire_one_option_try_site(
         collapse_pos0_read(graph, continue_link.target, pos, &name)?;
     }
 
-    let none = emit_option_variant(graph, none_bb, return_option_owner, 0, None);
+    // The break arm returns the enclosing function's `None`, whose physical
+    // shape is governed by the RETURN Option, independently of the branched
+    // Option above.  A niche `Option<PyObjectRef>` is RPython's nullable
+    // `SomeInstance(PyObject)`: emit the null pointer and restore the pointee
+    // ClassDef narrowing, exactly as the ordinary MIR aggregate fold does for
+    // `None`.  Building an `Option::None` aggregate here made the returnblock
+    // try to union that enum variant with the `PyObject` success value.
+    let none = if return_niche {
+        let null = graph.push_null_mut_ptr(none_bb);
+        let narrow_root = return_narrow_root.map(str::to_owned);
+        crate::front::option_map_or::emit_narrow(graph, none_bb, null, &narrow_root)
+    } else {
+        emit_option_variant(graph, none_bb, return_option_owner, 0, None)
+    };
     graph.set_control_flow_metadata(
         none_bb,
         None,

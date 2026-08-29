@@ -2518,10 +2518,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // the suffixed producers reaching the returnblock (ref/str/float
             // payloads); the `Int`/`Unsigned`/niche carve-out stays bare.
             let return_owner = lo.resolve_option_return_owner(&fd.signature.output);
+            let return_niche = lo.tyref_is_niche_option_ptr(&fd.signature.output);
+            let return_narrow_root = lo.option_niche_payload_class_root(&fd.signature.output);
             crate::front::option_try::rewire_option_try_call_sites(
                 &mut lo.graph,
                 &lo.option_try_sites,
                 return_owner.as_deref(),
+                return_niche,
+                return_narrow_root.as_deref(),
             )
         };
         // The `bool::then` short-circuit rewrite (`front::bool_then`) splits
@@ -30700,6 +30704,82 @@ mod tests {
         assert!(
             niche_try_switches >= 1,
             "lookup: expected a niche `?` `ne` null-test switch block"
+        );
+
+        // The `?` break arm returns the enclosing `Option<PyObjectRef>`'s
+        // `None`.  That type is a nullable PyObject pointer, not a constructed
+        // Rust `Option::None` instance.  Pin both halves of the representation:
+        // no Option None ctor survives, and a null pointer narrowed to
+        // PyObject is forwarded to the return block.
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor {
+                            name,
+                            owner_path,
+                            ..
+                        },
+                        ..
+                    } if name == "None" && owner_path.iter().any(|part| part == "Option")
+                )
+            }),
+            "lookup: niche `?` break arm must not construct Option::None"
+        );
+        let null_results: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments
+                    == &[
+                        "core".to_string(),
+                        "ptr".to_string(),
+                        "null_mut".to_string(),
+                    ] =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        let narrowed_nulls: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    args,
+                    ..
+                } if segments
+                    == &[
+                        crate::runtime_names::shims::CAST_INSTANCE.to_string(),
+                        "PyObject".to_string(),
+                    ]
+                    && args.len() == 1
+                    && null_results.contains(&args[0]) =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .any(|block| block.exits.iter().any(|link| {
+                    link.target == graph.returnblock
+                        && link.args.iter().any(
+                            |arg| matches!(arg, LinkArg::Value(v) if narrowed_nulls.contains(v)),
+                        )
+                })),
+            "lookup: niche `?` break arm must return a PyObject-narrowed null"
         );
     }
 
