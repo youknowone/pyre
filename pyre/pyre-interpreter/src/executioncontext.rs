@@ -2773,6 +2773,32 @@ impl UserDelAction {
             }
             return;
         }
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        if let Some(cdata) = crate::module::_cffi_backend::cdataobj::W_CData::from_obj(current())
+            && matches!(
+                cdata.flavor,
+                crate::module::_cffi_backend::cdataobj::FLAVOR_FROM_BUFFER
+                    | crate::module::_cffi_backend::cdataobj::FLAVOR_GCP
+                    | crate::module::_cffi_backend::cdataobj::FLAVOR_NEW_NONSTD
+            )
+        {
+            let calls_python = matches!(
+                cdata.flavor,
+                crate::module::_cffi_backend::cdataobj::FLAVOR_GCP
+                    | crate::module::_cffi_backend::cdataobj::FLAVOR_NEW_NONSTD
+            );
+            if calls_python && !self.begin_finalizer(current()) {
+                return;
+            }
+            if let Err(mut error) = crate::module::_cffi_backend::cdataobj::finalize(current()) {
+                error.write_unraisable(
+                    pyre_object::w_none(),
+                    rustpython_wtf8::Wtf8::new("Exception ignored in cffi destructor"),
+                    current(),
+                );
+            }
+            return;
+        }
         if pyre_object::generator::AsyncGenASend::from_obj(current()).is_some()
             || pyre_object::generator::AsyncGenAThrow::from_obj(current()).is_some()
         {

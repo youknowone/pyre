@@ -3589,8 +3589,7 @@ impl PyFrame {
         // once they return.
         let _root = pyre_object::gc_roots::push_roots();
         let w_globals = pyre_object::gc_roots::pin_root(w_globals);
-        let code_ptr = Box::into_raw(Box::new(code));
-        let w_code = crate::w_code_new(code_ptr as *const ());
+        let w_code = crate::box_code_object(code);
         unsafe {
             crate::w_code_set_w_globals(w_code, w_globals);
         }

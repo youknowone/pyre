@@ -525,8 +525,7 @@ fn shell_exec(
 ) -> ShellExecResult {
     match compile_repl_input(source, empty_line_given, continuing_block) {
         ShellCompileAction::Execute(code) => {
-            let code_ptr = Box::into_raw(Box::new(code));
-            let w_code = pyre_interpreter::pycode::w_code_new(code_ptr as *const ());
+            let w_code = pyre_interpreter::pycode::box_code_object(code);
             let _roots = pyre_object::gc_roots::push_roots();
             let w_code = pyre_object::gc_roots::pin_root(w_code);
             let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;

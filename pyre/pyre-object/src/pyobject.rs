@@ -478,6 +478,14 @@ pub const fn subclass_range_alias(type_id: u32, pytype: &'static PyType) -> Subc
     SubclassRangeAlias { type_id, pytype }
 }
 
+/// Where `_cffi_backend`'s tail slots start.  The three Windows
+/// payloads ahead of them exist only there, so the group begins three ids
+/// later on Windows than anywhere else.
+#[cfg(all(not(target_arch = "wasm32"), windows))]
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 194;
+#[cfg(all(not(target_arch = "wasm32"), not(windows)))]
+const CFFI_HIERARCHY_FIRST_TYPE_ID: u32 = 191;
+
 /// Canonical `rclass.OBJECT` inheritance census in GC registration order.
 ///
 /// Each entry is `(typeid, parent_typeid)`. This is the shared input for the
@@ -728,6 +736,43 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // Its append-only vtable id follows both Windows overlapped owners.
     #[cfg(windows)]
     (193, Some(0)),
+    // `_cffi_backend` is absent on wasm32 and in sandbox builds.  Its thirteen
+    // hierarchy slots sit at the tail because the interpreter's sandbox
+    // filter can only remove a contiguous trailing slice.
+    // `_cffi_backend`'s ctype, cdata, and array-iterator payloads precede the
+    // remaining payloads in the group.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 1, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 2, Some(0)),
+    // `_cffi_backend`'s struct field and library handle follow them.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 3, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 4, Some(0)),
+    // `_cffi_backend`'s allocator and MiniBuffer follow the existing owners.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 5, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 6, Some(0)),
+    // `_cffi_backend._OffsetInBytes` is the internal pointer-call carrier.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 7, Some(0)),
+    // The FFI context owner and the internal raw-function carrier follow.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 8, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 9, Some(0)),
+    // Generated libraries, global-variable carriers, and API-function wrappers
+    // close the target-gated tail.
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 10, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 11, Some(0)),
+    #[cfg(not(target_arch = "wasm32"))]
+    (CFFI_HIERARCHY_FIRST_TYPE_ID + 12, Some(0)),
 ];
 
 /// Compute subclass IDs from [`SUBCLASS_RANGE_HIERARCHY`] and write every

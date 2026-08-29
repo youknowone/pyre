@@ -813,6 +813,8 @@ pub fn install_builtin_modules() {
         pyre_install_module!(mmap);
         pyre_install_module!(_ctypes);
         #[cfg(not(target_arch = "wasm32"))]
+        pyre_install_module!(_cffi_backend);
+        #[cfg(not(target_arch = "wasm32"))]
         pyre_install_module!(_posixshmem);
         pyre_install_module!(_posixsubprocess);
         pyre_install_module!(_multiprocessing);
@@ -4240,7 +4242,6 @@ pub fn appleveldef_install_seeded(
     for &(name, value) in seed {
         unsafe { pyre_object::w_dict_setitem_str(w_app_globals, name, value) };
     }
-    let code_ptr = Box::into_raw(Box::new(code));
     // `gateway.py ApplevelClass.hidden_applevel = True`, which
     // `build_applevel_dict` passes to `space.exec_` and the compiler carries as
     // `CompileInfo`; every code object of the unit is then built with it
@@ -4250,7 +4251,7 @@ pub fn appleveldef_install_seeded(
     // Every source installed here is a native module's body — the module is
     // built in, and what it holds is an extension module on CPython — so none
     // of these frames are the running program's.
-    let w_code = crate::pycode::w_code_new_with_hidden_applevel(code_ptr as *const (), true);
+    let w_code = crate::pycode::box_code_object_with_hidden_applevel(code, true);
     let mut frame = crate::pyframe::createframe_obj(w_code as *const (), w_app_globals, ctx, None)
         .unwrap_or_else(|e| panic!("appleveldef `{filename}`: createframe — {e:?}"));
     // The source is a module body, so what it raises is the program's to see:
@@ -4322,10 +4323,7 @@ fn load_source_module(
                 message.push_str(&format!("': {e}"));
                 crate::PyError::new(crate::PyErrorKind::ImportError, message)
             })?;
-            (
-                crate::w_code_new(Box::into_raw(Box::new(code)) as *const ()),
-                cache_key.is_some(),
-            )
+            (crate::box_code_object(code), cache_key.is_some())
         }
     };
     // The whole unit was named by this path, so recurse through the eager

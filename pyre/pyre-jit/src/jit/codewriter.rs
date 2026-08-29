@@ -5937,6 +5937,10 @@ impl CodeWriter {
         {
             return;
         }
+        // The entry keeps `portal_graph` as a bare address and
+        // `grab_initial_jitcodes` dereferences it later, holding no wrapper of
+        // its own, so the graph has to outlive its wrappers.
+        pyre_interpreter::pycode::pin_code_unit(jitdriver_sd.portal_graph as *const ());
         // codewriter.py `self.callcontrol.jitdrivers_sd.append(jitdriver_sd)`.
         cc.jitdrivers_sd.push(jitdriver_sd);
     }

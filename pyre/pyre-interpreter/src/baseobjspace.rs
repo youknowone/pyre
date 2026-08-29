@@ -6230,20 +6230,22 @@ fn getattr_str_impl(obj: PyObjectRef, name: &str, call_getattr: bool, suppress: 
                 // `super`, bound `method`, `types.GenericAlias`,
                 // `types.UnionType` and the two weakref proxies each register
                 // a `__getattribute__` of their own, so the identity compare
-                // against `object`'s answers `Some` for them too.  Those
+                // against `object`'s answers `Some` for them too. Those
                 // receivers are served by the shims above — the bound-method
                 // one just above forwards to `__func__` — and running their
                 // slot through `get_and_call_function` here would re-enter
-                // it.  Restricting the dispatch to a heap-type owner
-                // admits exactly the app-level overrides, and leaves every
-                // other receiver on the descriptor protocol it already took.
-                // A `W_ObjectObject` receiver reaches this arm only through
-                // its own class, so the check is skipped for it.
-                let owned_by_heap_type = is_instance(obj)
+                // it. Restricting dispatch to a heap-type owner or an opted-in
+                // builtin owner admits the slots object space must call and
+                // leaves every other receiver on its existing descriptor
+                // protocol. A `W_ObjectObject` receiver reaches this arm only
+                // through its own class, so the check is skipped for it.
+                let owner_dispatches_getattribute = is_instance(obj)
                     || lookup_where(w_type, "__getattribute__").is_some_and(|(owner, found)| {
-                        std::ptr::eq(found, slot) && pyre_object::w_type_is_heaptype(owner)
+                        std::ptr::eq(found, slot)
+                            && (pyre_object::w_type_is_heaptype(owner)
+                                || pyre_object::w_type_dispatches_own_getattribute(owner))
                     });
-                if !owned_by_heap_type {
+                if !owner_dispatches_getattribute {
                     // descriptor.py `W_Super.getattribute`: a `super`
                     // subclass which inherits the builtin slot still runs the
                     // builtin implementation on the subclass instance.  Call

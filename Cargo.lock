@@ -2714,6 +2714,7 @@ dependencies = [
  "getrandom 0.4.3",
  "indexmap",
  "libc",
+ "libffi",
  "linkme",
  "lz4_flex",
  "majit-gc",

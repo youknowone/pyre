@@ -687,6 +687,30 @@ fn w_memoryview_new_with_flags_impl(
             // keeps its zero-copy window and derived geometry.
             return Ok(w_memoryview_new_derived(w_obj, |v| v.clone()));
         }
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        if let Some((address, length)) =
+            crate::module::_cffi_backend::cbuffer::mini_buffer_params(w_obj)
+        {
+            use pyre_object::buffer::Buffer;
+            use pyre_object::bufferview::BufferView;
+            let roots = pyre_object::gc_roots::push_roots();
+            let owner_slot = roots.base();
+            let _ = roots.pin_root(w_obj);
+            let mv = w_memoryview_alloc_header(false, true);
+            let owner = roots.get(owner_slot);
+            let view = BufferView::Simple {
+                backing: Buffer::External {
+                    w_obj: owner,
+                    address: address as usize,
+                    size: length,
+                    readonly: false,
+                },
+                w_obj: owner,
+                length: length as i64,
+            };
+            w_memoryview_set_view(mv, bufferview_alloc(view));
+            return Ok(mv);
+        }
         #[cfg(all(any(unix, windows), not(feature = "sandbox")))]
         if let Some(view) = crate::module::mmap::interp_mmap::mmap_buffer_view(w_obj) {
             let (address, length, readonly) = view?;
@@ -14472,8 +14496,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     .map_err(|error| {
         replace_compile_syntax_error_filename(error, &filename, filename_bytes.as_deref())
     })?;
-    let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-    let result = crate::w_code_new(code_ptr);
+    let result = crate::box_code_object(code);
     unsafe { crate::pycode::set_compilation_unit_filename_bytes(result, filename_bytes) };
     Ok(result)
 }
@@ -14553,7 +14576,7 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
 
-fn exec_or_eval(
+pub(crate) fn exec_or_eval(
     source: PyObjectRef,
     globals_arg: PyObjectRef,
     locals_arg: PyObjectRef,
@@ -14588,8 +14611,7 @@ fn exec_or_eval(
             crate::syntax_warnings::emit_escape_warnings(&source, "<string>")?;
             let code = crate::compile::compile_source(&source, mode)
                 .map_err(|e| compile_err_to_syntax_error(e, &source, mode))?;
-            let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-            (crate::w_code_new(code_ptr), false)
+            (crate::box_code_object(code), false)
         }
     };
     let raw_code = unsafe {
@@ -17819,6 +17841,12 @@ impl Drop for WritableBuffer {
 /// `array.array`'s element bytes, and a contiguous memoryview's window.
 pub(crate) unsafe fn acquire_readbuf<'a>(obj: PyObjectRef) -> Result<&'a [u8], crate::PyError> {
     unsafe {
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        if let Some((address, length)) =
+            crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+        {
+            return Ok(std::slice::from_raw_parts(address, length));
+        }
         if pyre_object::bytesobject::is_bytes_like(obj) {
             return Ok(pyre_object::bytesobject::bytes_like_data(obj));
         }
@@ -17865,6 +17893,12 @@ pub(crate) unsafe fn fileio_writebuf(
     }
 
     unsafe {
+        #[cfg(all(not(feature = "sandbox"), not(target_arch = "wasm32")))]
+        if let Some((address, length)) =
+            crate::module::_cffi_backend::cbuffer::mini_buffer_params(obj)
+        {
+            return Ok((std::slice::from_raw_parts_mut(address, length), obj, false));
+        }
         if pyre_object::bytearrayobject::is_bytearray(obj) {
             return Ok((
                 pyre_object::bytearrayobject::w_bytearray_data_mut(obj),

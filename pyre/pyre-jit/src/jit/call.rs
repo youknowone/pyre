@@ -496,6 +496,11 @@ impl CallControl {
         // registration's skeleton stands (no recompile-on-refine).
         let needs_rebuild = !self.jitcodes.contains_key(&key);
         if needs_rebuild {
+            // The payload keeps this raw body address and trace-side readers
+            // dereference it holding no wrapper, so the graph it belongs to
+            // must outlive its wrappers
+            // (`pyre_interpreter::pycode::retire_code_unit`).
+            pyre_interpreter::pycode::pin_code_unit(code_ptr as *const ());
             // call.py:168-171 — create JitCode skeleton, insert, append
             // to unfinished_graphs. The body fill (jtransform / regalloc
             // / flatten / assemble) is deferred to

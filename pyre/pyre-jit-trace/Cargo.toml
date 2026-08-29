@@ -17,6 +17,9 @@ dynasm = ["dep:majit-backend-dynasm", "majit-metainterp/dynasm"]
 # the only build that legitimately drops it is a Charon extraction pass of
 # `pyre-jit` — which is exactly where the host copy was dead weight.
 prepass = ["dep:pyre-interpreter", "dep:majit-translate", "dep:mimalloc", "dep:syn", "dep:walkdir"]
+# Keep JIT-side module references in lockstep with the interpreter's sandbox
+# build, which drops the modules that reach the OS directly.
+sandbox = ["pyre-interpreter/sandbox"]
 test-support = []
 
 [dependencies]
