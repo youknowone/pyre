@@ -10457,6 +10457,11 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             "new_with_vtable/d>r",
             majit_translate::insns::BC_NEW_WITH_VTABLE,
         ),
+        // The header read `jtransform.rs rewrite_op_getfield` replaces,
+        // in the ref bank (`OpKind::GuardClass`: one ref register in, the
+        // class out) — emitted once a descended helper reads `ob_type`
+        // through a graph the codewriter looks inside.
+        ("guard_class/r>r", majit_translate::insns::BC_GUARD_CLASS_R),
     ] {
         insns.insert(key.to_string(), byte);
     }
