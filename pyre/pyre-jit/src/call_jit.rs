@@ -5478,6 +5478,19 @@ fn bh_null_arg_diag() -> bool {
 /// uninstalled mid-loop carrying a stale flag one entry longer than the plain
 /// interpreter would, which costs that frame the profiled green key until its
 /// next interpreted call clears it, and reports nothing either way.
+///
+/// Reading the top frame is only correct while no walker-inlined callee can be
+/// executing under a profiler, because an inlined callee has no frame on
+/// `topframeref` / `f_backref` — a builtin residual firing inside one would
+/// report the inliner's frame. Two independent guards close that: at record
+/// time `inline_call.rs` declines on `ec_hook_installed()`, so a trace recorded
+/// under a hook inlines nothing; at execute time `is_being_profiled` is a
+/// portal green, so a profiled frame cannot enter a trace compiled under the
+/// unprofiled key, and a frame that predates the hook keeps the flag false and
+/// is declined by the test below — which is what `call_valuestack` does
+/// upstream, gating on the same per-frame flag.
+/// `c_call_reports_the_callee_frame_not_the_inliners` pins both arms against
+/// cpython and pypy3. Relaxing the inline decline breaks the first guard.
 fn residual_call_c_profile_frame(
     ec: *const pyre_interpreter::PyExecutionContext,
     callable: PyObjectRef,
