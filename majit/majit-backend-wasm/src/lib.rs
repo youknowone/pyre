@@ -4157,12 +4157,15 @@ impl majit_backend::Backend for WasmBackend {
                 .rev()
                 .find(|op| op.opcode == majit_ir::OpCode::Jump)
                 .is_some_and(|jump| {
-                    jump.getarglist().iter().enumerate().any(|(j, arg)| match arg {
-                        majit_ir::operand::Operand::InputArg(ia) => {
-                            input_pos.get(&ia.index).is_some_and(|&k| k != j)
-                        }
-                        _ => false,
-                    })
+                    jump.getarglist()
+                        .iter()
+                        .enumerate()
+                        .any(|(j, arg)| match arg {
+                            majit_ir::operand::Operand::InputArg(ia) => {
+                                input_pos.get(&ia.index).is_some_and(|&k| k != j)
+                            }
+                            _ => false,
+                        })
                 });
             // Loop state carried on the HEAP (a permutation array flipped via
             // setarrayitem, an object field bumped via setfield, a residual
