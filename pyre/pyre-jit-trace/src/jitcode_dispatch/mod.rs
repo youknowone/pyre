@@ -6624,6 +6624,14 @@ struct InflightForiter {
     body_completed: bool,
 }
 
+/// Which `(seq, index)` pair a [`BridgeIterJournalEntry::Cursor`] restores.
+#[derive(Clone, Copy)]
+enum BridgeIterKind {
+    List,
+    ListReverse,
+    Tuple,
+}
+
 /// Concrete iterator state to restore when a bridge walk is abandoned.
 #[derive(Clone, Copy)]
 enum BridgeIterJournalEntry {
@@ -6632,7 +6640,10 @@ enum BridgeIterJournalEntry {
         pre_current: i64,
         pre_remaining: i64,
     },
-    Tuple {
+    /// The three iterators whose payload is a source reference plus a cursor,
+    /// and whose successful advance moves only the cursor.
+    Cursor {
+        kind: BridgeIterKind,
         iter: pyre_object::PyObjectRef,
         pre_seq: pyre_object::PyObjectRef,
         pre_index: i64,
@@ -7479,7 +7490,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             BridgeIterJournalEntry::Range { iter, .. } => {
                 visitor(unsafe { &mut *(iter as *mut pyre_object::PyObjectRef).cast() });
             }
-            BridgeIterJournalEntry::Tuple { iter, pre_seq, .. } => {
+            BridgeIterJournalEntry::Cursor { iter, pre_seq, .. } => {
                 visitor(unsafe { &mut *(iter as *mut pyre_object::PyObjectRef).cast() });
                 visitor(unsafe { &mut *(pre_seq as *mut pyre_object::PyObjectRef).cast() });
             }

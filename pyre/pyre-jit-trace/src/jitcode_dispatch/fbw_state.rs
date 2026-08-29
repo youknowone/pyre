@@ -834,13 +834,68 @@ pub(crate) fn fbw_bridge_tuple_iter_journal_push(
     pre_seq: pyre_object::PyObjectRef,
     pre_index: i64,
 ) {
+    fbw_bridge_cursor_journal_push(BridgeIterKind::Tuple, iter, pre_seq, pre_index);
+}
+
+fn fbw_bridge_cursor_journal_push(
+    kind: BridgeIterKind,
+    iter: pyre_object::PyObjectRef,
+    pre_seq: pyre_object::PyObjectRef,
+    pre_index: i64,
+) {
     FBW_BRIDGE_ITER_JOURNAL.with(|j| {
-        j.borrow_mut().push(BridgeIterJournalEntry::Tuple {
+        j.borrow_mut().push(BridgeIterJournalEntry::Cursor {
+            kind,
             iter,
             pre_seq,
             pre_index,
         })
     });
+}
+
+/// Snapshot `iter`'s cursor before a bridge/retrace walk advances it eagerly,
+/// so [`fbw_bridge_iter_journal_rollback`] can put it back on a walk that does
+/// not commit.  The range and zip FOR_ITER specializations journal their own
+/// advance; this is the same snapshot for every advance that reaches the
+/// generic `for_iter_next` residual instead.
+///
+/// Journals the three kinds whose successful advance moves only a cursor.  For
+/// every other kind — a generator, a user `__next__`, an itertools iterator, a
+/// sequence iterator reading through `__getitem__` — the advance is
+/// irreversible and nothing is recorded, so a walk that does not commit still
+/// loses the item it consumed.  A machine-word `range` is absent because it
+/// never reaches this residual: `try_walker_specialize_for_iter_next` folds it
+/// and journals the fold's own advance.
+pub(crate) fn fbw_bridge_iter_journal_capture(iter: pyre_object::PyObjectRef) {
+    if iter.is_null() {
+        return;
+    }
+    unsafe {
+        let kind = if pyre_object::is_list_iter(iter) {
+            BridgeIterKind::List
+        } else if pyre_object::is_list_reverse_iter(iter) {
+            BridgeIterKind::ListReverse
+        } else if pyre_object::is_tuple_iter(iter) {
+            BridgeIterKind::Tuple
+        } else {
+            return;
+        };
+        let (pre_seq, pre_index) = match kind {
+            BridgeIterKind::List => (
+                pyre_object::w_list_iter_seq(iter),
+                pyre_object::w_list_iter_index(iter),
+            ),
+            BridgeIterKind::ListReverse => (
+                pyre_object::w_list_reverse_iter_seq(iter),
+                pyre_object::w_list_reverse_iter_index(iter),
+            ),
+            BridgeIterKind::Tuple => (
+                pyre_object::w_tuple_iter_seq(iter),
+                pyre_object::w_tuple_iter_index(iter),
+            ),
+        };
+        fbw_bridge_cursor_journal_push(kind, iter, pre_seq, pre_index);
+    }
 }
 
 /// Non-commit epilogue for a bridge/retrace recording walk: restore each
@@ -863,13 +918,31 @@ pub(crate) fn fbw_bridge_iter_journal_rollback() {
                         pre_remaining,
                     );
                 },
-                BridgeIterJournalEntry::Tuple {
+                BridgeIterJournalEntry::Cursor {
+                    kind,
                     iter,
                     pre_seq,
                     pre_index,
                 } => unsafe {
-                    pyre_object::w_tuple_iter_set_seq(iter, pre_seq);
-                    pyre_object::w_tuple_iter_set_index(iter, pre_index);
+                    let (set_seq, set_index): (
+                        unsafe fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
+                        unsafe fn(pyre_object::PyObjectRef, i64),
+                    ) = match kind {
+                        BridgeIterKind::List => (
+                            pyre_object::w_list_iter_set_seq,
+                            pyre_object::w_list_iter_set_index,
+                        ),
+                        BridgeIterKind::ListReverse => (
+                            pyre_object::w_list_reverse_iter_set_seq,
+                            pyre_object::w_list_reverse_iter_set_index,
+                        ),
+                        BridgeIterKind::Tuple => (
+                            pyre_object::w_tuple_iter_set_seq,
+                            pyre_object::w_tuple_iter_set_index,
+                        ),
+                    };
+                    set_seq(iter, pre_seq);
+                    set_index(iter, pre_index);
                 },
             }
         }
