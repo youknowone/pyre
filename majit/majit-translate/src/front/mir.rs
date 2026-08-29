@@ -3574,8 +3574,7 @@ impl<'a> Lowering<'a> {
             // param is never touched, and a fieldless enum — already
             // resolved to `Int` above regardless of its own zero-sized
             // layout — never reaches this arm.
-            let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_zero_sized(&local.ty, llbc)
-            {
+            let ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_zero_sized(&local.ty, llbc) {
                 ValueType::Void
             } else {
                 ty

@@ -17,7 +17,7 @@
 //! ```
 use majit_charon_reader::{
     Llbc,
-    ullbc::{Rvalue, StmtKind, TypeDecl, TypeDeclKind, TyRef},
+    ullbc::{Rvalue, StmtKind, TyRef, TypeDecl, TypeDeclKind},
 };
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -76,9 +76,7 @@ fn main() {
 
     for td in llbc.file.translated.type_decls.iter().flatten() {
         total += 1;
-        let is_zero_sized = td
-            .layout_for_target("")
-            .is_some_and(|l| l.size == Some(0));
+        let is_zero_sized = td.layout_for_target("").is_some_and(|l| l.size == Some(0));
         if !is_zero_sized {
             continue;
         }
@@ -153,7 +151,10 @@ fn main() {
     }
     println!("--- cross-reference: actually constructed ---");
     println!("construction sites (Assign+Aggregate): {construction_sites}");
-    println!("distinct newly-Void types constructed: {}", reached_types.len());
+    println!(
+        "distinct newly-Void types constructed: {}",
+        reached_types.len()
+    );
     for n in &reached_types {
         println!("{n}");
     }

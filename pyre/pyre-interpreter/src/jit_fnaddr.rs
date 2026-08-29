@@ -3145,6 +3145,23 @@ pub fn jit_trace_fnaddrs() -> Vec<(&'static str, i64)> {
         code_varnames_len,
     );
 
+    let code_instructions_len: fn(&crate::CodeObject) -> usize =
+        crate::pyopcode::code_instructions_len;
+    pa1(
+        &mut entries,
+        "pyre_interpreter::pyopcode::code_instructions_len",
+        "pyre_interpreter::code_instructions_len",
+        code_instructions_len,
+    );
+
+    let code_unit_at: fn(&crate::CodeObject, usize) -> u16 = crate::pyopcode::code_unit_at;
+    pa2(
+        &mut entries,
+        "pyre_interpreter::pyopcode::code_unit_at",
+        "pyre_interpreter::code_unit_at",
+        code_unit_at,
+    );
+
     // Paired-local index decode helpers for the LoadFastLoadFast /
     // StoreFastLoadFast / StoreFastStoreFast /
     // LoadFastBorrowLoadFastBorrow arms — same alias-pair rationale as

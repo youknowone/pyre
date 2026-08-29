@@ -14,7 +14,8 @@ use pyre_interpreter::PyExecutionContext;
 use pyre_interpreter::executioncontext::ActionFlagOps;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{
-    PyError, PyResult, StepResult, decode_instruction_forward, execute_opcode_step,
+    PyError, PyResult, StepResult, decode_instruction_forward_packed,
+    decode_instruction_forward_pc, execute_opcode_step,
 };
 use pyre_interpreter::{locals_w, locals_w_mut};
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -7036,8 +7037,7 @@ fn jd1_experiment_enabled() -> bool {
 
 fn portal_metatrace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE").as_deref() == Ok("1"))
+    *ENABLED.get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE").as_deref() == Ok("1"))
 }
 
 /// Where the Stage-0 probe enters the portal jitcode.
@@ -7051,8 +7051,7 @@ fn portal_metatrace_enabled() -> bool {
 /// keeps `eval_loop_jit`'s single `frame` argument.
 fn portal_metatrace_entry_at_start() -> bool {
     static AT_START: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AT_START
-        .get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE_ENTRY").as_deref() == Ok("start"))
+    *AT_START.get_or_init(|| std::env::var("PYRE_PORTAL_METATRACE_ENTRY").as_deref() == Ok("start"))
 }
 
 static PORTAL_METATRACE_FIRED: std::sync::atomic::AtomicBool =
@@ -7073,8 +7072,7 @@ fn portal_metatrace_skip() -> u64 {
     })
 }
 
-static PORTAL_METATRACE_SEEN: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static PORTAL_METATRACE_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct PortalMetatraceSym {
     header_pc: usize,
@@ -7355,11 +7353,12 @@ fn drive_portal_metatrace(f: *mut PyFrame, green_key: u64, loop_header_pc: usize
                 let mut standalone = majit_metainterp::StandaloneFrameStack::new();
                 standalone.frames.push(frame);
                 let before = ctx.num_recorded_ops();
-                let mut machine = majit_metainterp::JitCodeMachine::<PortalMetatraceSym, _>::with_framestack(
-                    &mut standalone.frames,
-                    &[],
-                    &[],
-                );
+                let mut machine =
+                    majit_metainterp::JitCodeMachine::<PortalMetatraceSym, _>::with_framestack(
+                        &mut standalone.frames,
+                        &[],
+                        &[],
+                    );
                 machine.set_outer_program_pc(entry_pc);
                 let action = machine.run_to_end(ctx, &mut sym, &runtime);
                 drop(machine);
@@ -9867,13 +9866,6 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     }
 }
 
-/// pyre-local debug instrumentation (no PyPy counterpart).
-/// `@not_in_trace` so that compiled code does not include this call.
-#[majit_macros::not_in_trace]
-fn trace_jit_bytecode(_pc: usize, _instruction_name: &str) {
-    // Debug logging disabled — per-bytecode eprintln causes O(n) slowdown.
-}
-
 /// Loop-header PC set for `code`, from the `CallControl` that owns the
 /// per-graph codewriter caches (call.py `self.jitcodes = {}`).
 ///
@@ -10071,8 +10063,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // `ref_guard_value` the marker emits promotes the operand the dispatch
         // actually consumes.
         let code = unsafe {
-            &*pyre_interpreter::w_code_get_ptr(marker_pycode)
-                .cast::<pyre_interpreter::CodeObject>()
+            &*pyre_interpreter::w_code_get_ptr(marker_pycode).cast::<pyre_interpreter::CodeObject>()
         };
 
         // Bounds net for a frame resumed past its last instruction. Upstream
@@ -10080,17 +10071,23 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
         // and it sits *after* the marker here because any pre-marker read of
         // the code object is precisely the second, unpromoted read this
         // ordering exists to remove.
-        if pc >= code.instructions.len() {
+        if pc >= pyre_interpreter::code_instructions_len(code) {
             return LoopResult::Done(Ok(w_none()));
         }
 
-        let (opcode_pc, instruction, op_arg) = match decode_instruction_forward(code, pc) {
-            Ok(decoded) => decoded,
-            Err(err) => return LoopResult::Done(Err(err.into())),
-        };
+        let opcode_pc = decode_instruction_forward_pc(code, pc);
+        let packed_instruction = decode_instruction_forward_packed(code, pc);
+        if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
+            return LoopResult::Done(Err(pyre_interpreter::pycode::BytecodeCorruption.into()));
+        }
+        let opcode = (packed_instruction & 0xff) as u8;
+        // SAFETY: the packed opcode came from a live `CodeUnit`, whose opcode
+        // field is a valid repr(u8) `Instruction` discriminant.
+        let instruction =
+            unsafe { std::mem::transmute::<u8, pyre_interpreter::Instruction>(opcode) };
+        let op_arg = pyre_interpreter::OpArg::new((packed_instruction >> 8) as u32);
 
         // ── handle_bytecode (RPython interp_jit.py:90) ──
-        trace_jit_bytecode(pc, "");
         unsafe { &mut *f }.last_instr = pc as isize;
         unsafe { &mut *f }.set_last_instr_from_next_instr(opcode_pc + 1);
         // pyopcode.py dispatch_bytecode parity: fire
@@ -10307,8 +10304,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
                 if portal_metatrace_enabled()
                     && PORTAL_METATRACE_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         >= portal_metatrace_skip()
-                    && !PORTAL_METATRACE_FIRED
-                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
                 {
                     drive_portal_metatrace(f, green_key_hash, loop_header_pc);
                 }
