@@ -2448,6 +2448,24 @@ fn flush_instruction_cache(ptr: *const u8, len: usize) {
     let _ = (ptr, len);
 }
 
+/// `LLtypeMixin.read_int_at_mem` for the raw-memory backends.
+#[inline]
+fn bh_read_int_at_mem(base: i64, offset: i64, size: usize, signed: bool) -> i64 {
+    let addr = (base as usize).wrapping_add(offset as usize);
+    unsafe {
+        match (size, signed) {
+            (1, true) => (addr as *const i8).read_unaligned() as i64,
+            (1, false) => (addr as *const u8).read_unaligned() as i64,
+            (2, true) => (addr as *const i16).read_unaligned() as i64,
+            (2, false) => (addr as *const u16).read_unaligned() as i64,
+            (4, true) => (addr as *const i32).read_unaligned() as i64,
+            (4, false) => (addr as *const u32).read_unaligned() as i64,
+            (8, _) => (addr as *const i64).read_unaligned(),
+            other => panic!("read_int_at_mem: unsupported (size, signed) = {other:?}"),
+        }
+    }
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
@@ -3379,44 +3397,50 @@ pub trait Backend: Send {
     /// model.py:250 bh_setarrayitem_raw_i(array, index, newvalue, arraydescr)
     fn bh_setarrayitem_raw_i(
         &self,
-        _array: i64,
-        _index: i64,
-        _newvalue: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array: i64,
+        index: i64,
+        newvalue: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
+        // `LLtypeMixin.bh_setarrayitem_raw_i` is the GC implementation
+        // verbatim: raw changes ownership, not the addressed layout.
+        self.bh_setarrayitem_gc_i(array, index, newvalue, arraydescr)
     }
     /// model.py:252 bh_setarrayitem_raw_f(array, index, newvalue, arraydescr)
     fn bh_setarrayitem_raw_f(
         &self,
-        _array: i64,
-        _index: i64,
-        _newvalue: f64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array: i64,
+        index: i64,
+        newvalue: f64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) {
+        self.bh_setarrayitem_gc_f(array, index, newvalue, arraydescr)
     }
 
     /// model.py bh_arraylen_gc(array, arraydescr).
     ///
-    /// Upstream shape is `read_int_at_mem(array, lendescr.offset, WORD, 1)`
-    /// (`llmodel.py:585-588`). Production backends override this for
-    /// pyre's length-prefixed GC arrays; the trait default remains a
-    /// compatibility stub for incomplete/test CPUs.
+    /// `LLtypeMixin.bh_arraylen_gc` reads the descriptor's length field.
     fn bh_arraylen_gc(
         &self,
-        _array_ptr: i64,
-        _arraydescr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        let offset = arraydescr
+            .array_len_offset()
+            .expect("bh_arraylen_gc requires ArrayDescr.lendescr");
+        unsafe {
+            ((array_ptr as usize).wrapping_add(offset) as *const usize).read_unaligned() as i64
+        }
     }
 
     // ── model.py:230-236 allocation ──
     /// model.py / llmodel.py bh_new(sizedescr)
     fn bh_new(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        0
+        panic!("Backend::bh_new requires an LLtypeMixin allocation implementation")
     }
     /// model.py / llmodel.py bh_new_with_vtable(sizedescr)
     fn bh_new_with_vtable(&self, _sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        0
+        panic!("Backend::bh_new_with_vtable requires an LLtypeMixin allocation implementation")
     }
 
     /// llsupport/gc.py GcLLDescr_framework
@@ -3432,7 +3456,7 @@ pub trait Backend: Send {
     }
     /// model.py bh_new_array(length, arraydescr)
     fn bh_new_array(&self, _length: i64, _arraydescr: &majit_translate::jitcode::BhDescr) -> i64 {
-        0
+        panic!("Backend::bh_new_array requires an LLtypeMixin allocation implementation")
     }
     /// model.py:234 bh_new_array_clear(length, arraydescr)
     fn bh_new_array_clear(
@@ -3440,21 +3464,62 @@ pub trait Backend: Send {
         _length: i64,
         _arraydescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        panic!("Backend::bh_new_array_clear requires an LLtypeMixin allocation implementation")
     }
     /// model.py: bh_strlen(string_ptr)
-    fn bh_strlen(&self, _string_ptr: i64) -> i64 {
-        0
+    fn bh_strlen(&self, string_ptr: i64) -> i64 {
+        assert_ne!(string_ptr, 0, "bh_strlen: null string");
+        unsafe {
+            ((string_ptr as usize).wrapping_add(std::mem::size_of::<usize>()) as *const usize)
+                .read_unaligned() as i64
+        }
     }
     /// model.py: bh_strgetitem(string_ptr, index)
-    fn bh_strgetitem(&self, _string_ptr: i64, _index: i64) -> i64 {
-        0
+    fn bh_strgetitem(&self, string_ptr: i64, index: i64) -> i64 {
+        assert!(index >= 0 && index < self.bh_strlen(string_ptr));
+        let chars = 2 * std::mem::size_of::<usize>();
+        unsafe {
+            ((string_ptr as usize).wrapping_add(chars + index as usize) as *const u8)
+                .read_unaligned() as i64
+        }
     }
     /// model.py: bh_strsetitem(string_ptr, index, value)
-    fn bh_strsetitem(&self, _string_ptr: i64, _index: i64, _value: i64) {}
+    fn bh_strsetitem(&self, string_ptr: i64, index: i64, value: i64) {
+        assert!(index >= 0 && index < self.bh_strlen(string_ptr));
+        let chars = 2 * std::mem::size_of::<usize>();
+        unsafe {
+            ((string_ptr as usize).wrapping_add(chars + index as usize) as *mut u8)
+                .write_unaligned(value as u8)
+        }
+    }
     /// model.py: bh_newstr(length)
-    fn bh_newstr(&self, _length: i64) -> i64 {
-        0
+    fn bh_newstr(&self, length: i64) -> i64 {
+        assert!(length >= 0, "bh_newstr: negative length");
+        let word = std::mem::size_of::<usize>();
+        let tid = majit_gc::lowlevel_str_type_id();
+        assert_ne!(tid, 0, "bh_newstr: low-level STR type is unpublished");
+        use majit_gc::GcAllocator;
+        let result = majit_gc::gc_sync::gc_op(|gc| {
+            gc.alloc_varsize_typed(tid, 2 * word + 1, 1, length as usize)
+        });
+        assert!(!result.is_null(), "bh_newstr: allocation failed");
+        unsafe {
+            ((result.0 + word) as *mut usize).write_unaligned(length as usize);
+        }
+        result.0 as i64
+    }
+
+    /// `LLtypeMixin.bh_strhash` computes the RPython content hash.
+    fn bh_strhash(&self, string_ptr: i64) -> i64 {
+        let length = self.bh_strlen(string_ptr) as usize;
+        if length == 0 {
+            return -1;
+        }
+        let mut x = self.bh_strgetitem(string_ptr, 0) << 7;
+        for index in 0..length {
+            x = 1_000_003i64.wrapping_mul(x) ^ self.bh_strgetitem(string_ptr, index as i64);
+        }
+        x ^ length as i64
     }
     /// model.py bh_call_i(func, args_i, args_r, args_f, calldescr).
     /// `llmodel.py:816 call_stub_i`: ABI-correct dispatch via the shared
@@ -3572,207 +3637,325 @@ pub trait Backend: Send {
     // ── model.py: additional bh_* helpers ──
 
     /// model.py: bh_unicodelen(string_ptr)
-    fn bh_unicodelen(&self, _string_ptr: i64) -> i64 {
-        0
+    fn bh_unicodelen(&self, string_ptr: i64) -> i64 {
+        self.bh_strlen(string_ptr)
     }
     /// model.py: bh_unicodegetitem(string_ptr, index)
-    fn bh_unicodegetitem(&self, _string_ptr: i64, _index: i64) -> i64 {
-        0
+    fn bh_unicodegetitem(&self, string_ptr: i64, index: i64) -> i64 {
+        assert!(index >= 0 && index < self.bh_unicodelen(string_ptr));
+        let chars = 2 * std::mem::size_of::<usize>();
+        let offset = chars + index as usize * std::mem::size_of::<u32>();
+        unsafe {
+            ((string_ptr as usize).wrapping_add(offset) as *const u32).read_unaligned() as i64
+        }
     }
     /// model.py: bh_unicodesetitem(string_ptr, index, value)
-    fn bh_unicodesetitem(&self, _string_ptr: i64, _index: i64, _value: i64) {}
+    fn bh_unicodesetitem(&self, string_ptr: i64, index: i64, value: i64) {
+        assert!(index >= 0 && index < self.bh_unicodelen(string_ptr));
+        let chars = 2 * std::mem::size_of::<usize>();
+        let offset = chars + index as usize * std::mem::size_of::<u32>();
+        unsafe {
+            ((string_ptr as usize).wrapping_add(offset) as *mut u32).write_unaligned(value as u32)
+        }
+    }
     /// model.py: bh_newunicode(length)
-    fn bh_newunicode(&self, _length: i64) -> i64 {
-        0
+    fn bh_newunicode(&self, length: i64) -> i64 {
+        assert!(length >= 0, "bh_newunicode: negative length");
+        let word = std::mem::size_of::<usize>();
+        let tid = majit_gc::lowlevel_unicode_type_id();
+        assert_ne!(
+            tid, 0,
+            "bh_newunicode: low-level UNICODE type is unpublished"
+        );
+        use majit_gc::GcAllocator;
+        let result = majit_gc::gc_sync::gc_op(|gc| {
+            gc.alloc_varsize_typed(tid, 2 * word, 4, length as usize)
+        });
+        assert!(!result.is_null(), "bh_newunicode: allocation failed");
+        unsafe {
+            ((result.0 + word) as *mut usize).write_unaligned(length as usize);
+        }
+        result.0 as i64
+    }
+
+    /// `LLtypeMixin.bh_unicodehash` computes the RPython content hash.
+    fn bh_unicodehash(&self, string_ptr: i64) -> i64 {
+        let length = self.bh_unicodelen(string_ptr) as usize;
+        if length == 0 {
+            return -1;
+        }
+        let mut x = self.bh_unicodegetitem(string_ptr, 0) << 7;
+        for index in 0..length {
+            x = 1_000_003i64.wrapping_mul(x) ^ self.bh_unicodegetitem(string_ptr, index as i64);
+        }
+        x ^ length as i64
     }
     /// model.py: bh_copystrcontent(src, dst, srcstart, dststart, length)
-    fn bh_copystrcontent(
-        &self,
-        _src: i64,
-        _dst: i64,
-        _srcstart: i64,
-        _dststart: i64,
-        _length: i64,
-    ) {
+    fn bh_copystrcontent(&self, src: i64, dst: i64, srcstart: i64, dststart: i64, length: i64) {
+        assert!(length >= 0);
+        assert!(srcstart >= 0 && srcstart + length <= self.bh_strlen(src));
+        assert!(dststart >= 0 && dststart + length <= self.bh_strlen(dst));
+        let chars = 2 * std::mem::size_of::<usize>();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (src as usize + chars + srcstart as usize) as *const u8,
+                (dst as usize + chars + dststart as usize) as *mut u8,
+                length as usize,
+            )
+        }
     }
     /// model.py: bh_copyunicodecontent(src, dst, srcstart, dststart, length)
-    fn bh_copyunicodecontent(
-        &self,
-        _src: i64,
-        _dst: i64,
-        _srcstart: i64,
-        _dststart: i64,
-        _length: i64,
-    ) {
+    fn bh_copyunicodecontent(&self, src: i64, dst: i64, srcstart: i64, dststart: i64, length: i64) {
+        assert!(length >= 0);
+        assert!(srcstart >= 0 && srcstart + length <= self.bh_unicodelen(src));
+        assert!(dststart >= 0 && dststart + length <= self.bh_unicodelen(dst));
+        let chars = 2 * std::mem::size_of::<usize>();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (src as usize + chars + srcstart as usize * 4) as *const u8,
+                (dst as usize + chars + dststart as usize * 4) as *mut u8,
+                length as usize * 4,
+            )
+        }
     }
     /// llmodel.py bh_raw_load_i(addr, offset, descr).
     fn bh_raw_load_i(
         &self,
-        _addr: i64,
-        _offset: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        addr: i64,
+        offset: i64,
+        descr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        let (base, size, sign) = descr.unpack_arraydescr_size();
+        assert_eq!(base, 0, "bh_raw_load_i requires a lengthless raw array");
+        bh_read_int_at_mem(addr, offset, size, sign)
     }
     /// llmodel.py bh_raw_store_i(addr, offset, newvalue, descr).
     fn bh_raw_store_i(
         &self,
-        _addr: i64,
-        _offset: i64,
-        _newvalue: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        addr: i64,
+        offset: i64,
+        newvalue: i64,
+        descr: &majit_translate::jitcode::BhDescr,
     ) {
+        let (base, size, _) = descr.unpack_arraydescr_size();
+        assert_eq!(base, 0, "bh_raw_store_i requires a lengthless raw array");
+        unsafe { crate::llmodel::write_int_at_mem(addr as usize, offset as usize, size, newvalue) }
     }
     // ── model.py: interior field access ──
     /// model.py: bh_getinteriorfield_gc_i(array, index, descr)
     fn bh_getinteriorfield_gc_i(
         &self,
-        _array: i64,
-        _index: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        descr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_getinteriorfield_gc_i: expected InteriorField, got {descr:?}");
+        };
+        let (base, itemsize, _) = array.unpack_arraydescr_size();
+        let (field_offset, field_size, signed) = field.unpack_fielddescr_size();
+        let offset = base as i64 + index * itemsize as i64 + field_offset as i64;
+        bh_read_int_at_mem(array_ptr, offset, field_size, signed)
     }
     /// model.py: bh_getinteriorfield_gc_r(array, index, descr)
     fn bh_getinteriorfield_gc_r(
         &self,
-        _array: i64,
-        _index: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        descr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
-        GcRef::NULL
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_getinteriorfield_gc_r: expected InteriorField, got {descr:?}");
+        };
+        let (base, itemsize, _) = array.unpack_arraydescr_size();
+        let offset = base as i64 + index * itemsize as i64 + field.as_offset() as i64;
+        let addr = (array_ptr as usize).wrapping_add(offset as usize);
+        GcRef(unsafe { (addr as *const usize).read_unaligned() })
     }
     /// model.py: bh_getinteriorfield_gc_f(array, index, descr)
     fn bh_getinteriorfield_gc_f(
         &self,
-        _array: i64,
-        _index: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        descr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        0.0
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_getinteriorfield_gc_f: expected InteriorField, got {descr:?}");
+        };
+        let (base, itemsize, _) = array.unpack_arraydescr_size();
+        let offset = base as i64 + index * itemsize as i64 + field.as_offset() as i64;
+        let addr = (array_ptr as usize).wrapping_add(offset as usize);
+        unsafe { (addr as *const f64).read_unaligned() }
     }
     /// model.py: bh_setinteriorfield_gc_i(array, index, newvalue, descr)
     fn bh_setinteriorfield_gc_i(
         &self,
-        _array: i64,
-        _index: i64,
-        _newvalue: i64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        newvalue: i64,
+        descr: &majit_translate::jitcode::BhDescr,
     ) {
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_setinteriorfield_gc_i: expected InteriorField, got {descr:?}");
+        };
+        let (base, itemsize, _) = array.unpack_arraydescr_size();
+        let (field_offset, field_size, _) = field.unpack_fielddescr_size();
+        let offset = base as i64 + index * itemsize as i64 + field_offset as i64;
+        unsafe {
+            crate::llmodel::write_int_at_mem(
+                array_ptr as usize,
+                offset as usize,
+                field_size,
+                newvalue,
+            )
+        }
     }
     /// model.py: bh_setinteriorfield_gc_r(array, index, newvalue, descr)
     fn bh_setinteriorfield_gc_r(
         &self,
-        _array: i64,
-        _index: i64,
-        _newvalue: GcRef,
-        _descr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        newvalue: GcRef,
+        descr: &majit_translate::jitcode::BhDescr,
     ) {
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_setinteriorfield_gc_r: expected InteriorField, got {descr:?}");
+        };
+        let (base, itemsize, _) = array.unpack_arraydescr_size();
+        let offset = base as i64 + index * itemsize as i64 + field.as_offset() as i64;
+        unsafe {
+            crate::llmodel::write_ref_at_mem(array_ptr as usize, offset as usize, newvalue.0)
+        };
+        majit_gc::gc_write_barrier(GcRef(array_ptr as usize));
     }
     /// model.py: bh_setinteriorfield_gc_f(array, index, newvalue, descr)
     fn bh_setinteriorfield_gc_f(
         &self,
-        _array: i64,
-        _index: i64,
-        _newvalue: f64,
-        _descr: &majit_translate::jitcode::BhDescr,
+        array_ptr: i64,
+        index: i64,
+        newvalue: f64,
+        descr: &majit_translate::jitcode::BhDescr,
     ) {
+        let majit_translate::jitcode::BhDescr::InteriorField { array, field } = descr else {
+            panic!("bh_setinteriorfield_gc_f: expected InteriorField, got {descr:?}");
+        };
+        let (base, itemsize, _) = array.unpack_arraydescr_size();
+        let offset = base as i64 + index * itemsize as i64 + field.as_offset() as i64;
+        unsafe { crate::llmodel::write_float_at_mem(array_ptr as usize, offset as usize, newvalue) }
     }
     fn bh_gc_load_indexed_i(
         &self,
-        _addr: i64,
-        _index: i64,
-        _scale: i64,
-        _base_ofs: i64,
-        _bytes: i64,
+        addr: i64,
+        index: i64,
+        scale: i64,
+        base_ofs: i64,
+        bytes: i64,
     ) -> i64 {
-        0
+        let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
+        bh_read_int_at_mem(addr, offset, bytes.unsigned_abs() as usize, bytes < 0)
     }
     fn bh_gc_load_indexed_f(
         &self,
-        _addr: i64,
-        _index: i64,
-        _scale: i64,
-        _base_ofs: i64,
-        _bytes: i64,
+        addr: i64,
+        index: i64,
+        scale: i64,
+        base_ofs: i64,
+        bytes: i64,
     ) -> f64 {
-        0.0
+        assert_eq!(bytes as usize, std::mem::size_of::<f64>());
+        let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
+        let at = (addr as usize).wrapping_add(offset as usize);
+        unsafe { (at as *const f64).read_unaligned() }
     }
     /// blackhole.py bhimpl_gc_store_indexed_i
     fn bh_gc_store_indexed_i(
         &self,
-        _addr: i64,
-        _index: i64,
-        _value: i64,
-        _scale: i64,
-        _base_ofs: i64,
-        _bytes: i64,
+        addr: i64,
+        index: i64,
+        value: i64,
+        scale: i64,
+        base_ofs: i64,
+        bytes: i64,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
+        assert!(bytes > 0);
+        let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
+        unsafe {
+            crate::llmodel::write_int_at_mem(addr as usize, offset as usize, bytes as usize, value)
+        }
     }
     /// blackhole.py bhimpl_gc_store_indexed_f
     fn bh_gc_store_indexed_f(
         &self,
-        _addr: i64,
-        _index: i64,
-        _value: f64,
-        _scale: i64,
-        _base_ofs: i64,
-        _bytes: i64,
+        addr: i64,
+        index: i64,
+        value: f64,
+        scale: i64,
+        base_ofs: i64,
+        bytes: i64,
+        _descr: &majit_translate::jitcode::BhDescr,
     ) {
+        assert_eq!(bytes as usize, std::mem::size_of::<f64>());
+        let offset = base_ofs.wrapping_add(scale.wrapping_mul(index));
+        unsafe { crate::llmodel::write_float_at_mem(addr as usize, offset as usize, value) }
     }
     /// llmodel.py bh_raw_load_f(addr, offset, descr).
     fn bh_raw_load_f(
         &self,
-        _addr: i64,
-        _offset: i64,
+        addr: i64,
+        offset: i64,
         _descr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        0.0
+        let at = (addr as usize).wrapping_add(offset as usize);
+        unsafe { (at as *const f64).read_unaligned() }
     }
     /// llmodel.py bh_raw_store_f(addr, offset, newvalue, descr).
     fn bh_raw_store_f(
         &self,
-        _addr: i64,
-        _offset: i64,
-        _newvalue: f64,
+        addr: i64,
+        offset: i64,
+        newvalue: f64,
         _descr: &majit_translate::jitcode::BhDescr,
     ) {
+        unsafe { crate::llmodel::write_float_at_mem(addr as usize, offset as usize, newvalue) }
     }
     // ── model.py: raw field access ──
     fn bh_getfield_raw_i(
         &self,
-        _struct_ptr: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> i64 {
-        0
+        self.bh_getfield_gc_i(struct_ptr, fielddescr)
     }
     fn bh_getfield_raw_r(
         &self,
-        _struct_ptr: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> GcRef {
-        GcRef::NULL
+        self.bh_getfield_gc_r(struct_ptr, fielddescr)
     }
     fn bh_getfield_raw_f(
         &self,
-        _struct_ptr: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) -> f64 {
-        0.0
+        self.bh_getfield_gc_f(struct_ptr, fielddescr)
     }
     fn bh_setfield_raw_i(
         &self,
-        _struct_ptr: i64,
-        _newvalue: i64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        newvalue: i64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
+        self.bh_setfield_gc_i(struct_ptr, newvalue, fielddescr)
     }
     fn bh_setfield_raw_f(
         &self,
-        _struct_ptr: i64,
-        _newvalue: f64,
-        _fielddescr: &majit_translate::jitcode::BhDescr,
+        struct_ptr: i64,
+        newvalue: f64,
+        fielddescr: &majit_translate::jitcode::BhDescr,
     ) {
+        self.bh_setfield_gc_f(struct_ptr, newvalue, fielddescr)
     }
 
     /// model.py: bh_classof(obj_ptr)

@@ -18135,6 +18135,18 @@ impl majit_backend::Backend for CraneliftBackend {
         self.bh_new_array(length, arraydescr)
     }
 
+    /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
+    fn bh_newstr(&self, length: i64) -> i64 {
+        let length = u64::try_from(length).expect("bh_newstr length must be non-negative");
+        gc_malloc_str_helper(majit_gc::lowlevel_str_type_id() as u64, length) as i64
+    }
+
+    /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
+    fn bh_newunicode(&self, length: i64) -> i64 {
+        let length = u64::try_from(length).expect("bh_newunicode length must be non-negative");
+        gc_malloc_unicode_helper(majit_gc::lowlevel_unicode_type_id() as u64, length) as i64
+    }
+
     /// llmodel.py bh_call_i: ABI-correct dispatch.
     ///
     /// Routes through `majit_backend::call_stub::bh_call_i_dispatch`, whose

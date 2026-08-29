@@ -195,14 +195,37 @@ pub enum DispatchError {
 ///   self.descrs = builder.descrs
 ///   self.op_catch_exception = builder.op_catch_exception
 ///   self.op_rvmprof_code = builder.op_rvmprof_code
+#[derive(Clone, Copy)]
+struct BlackholeCpuRef(*const (dyn majit_backend::Backend + 'static));
+
+impl BlackholeCpuRef {
+    /// Erase the borrow lifetime without manufacturing a long-lived Rust
+    /// reference.  The builder is leased only while its owning MetaInterp CPU
+    /// is alive; every dereference is tied to the interpreter borrow below.
+    fn new(cpu: &dyn majit_backend::Backend) -> Self {
+        let ptr = cpu as *const dyn majit_backend::Backend;
+        // SAFETY: raw trait-object pointers carry a lifetime bound only at the
+        // type level. `BlackholeInterpBuilder::set_cpu` documents and enforces
+        // the owner relationship at each production lease.
+        Self(unsafe {
+            std::mem::transmute::<
+                *const dyn majit_backend::Backend,
+                *const (dyn majit_backend::Backend + 'static),
+            >(ptr)
+        })
+    }
+
+    fn get(&self) -> &dyn majit_backend::Backend {
+        // SAFETY: callers can obtain this only through a live builder/interp
+        // whose active lease is nested inside the CPU owner's lifetime.
+        unsafe { &*self.0 }
+    }
+}
+
 pub struct BlackholeInterpreter {
-    /// RPython `blackhole.py:286` `self.cpu = builder.cpu`.
-    /// Reference to the backend trait for `bh_*` concrete execution.
-    /// Raw pointer because the interpreter is pool-managed and
-    /// the Backend outlives all interpreter instances.
-    /// RPython `blackhole.py:286/56` `self.cpu = builder.cpu`.
+    /// RPython `BlackholeInterpreter.__init__`: `self.cpu = builder.cpu`.
     /// Backend trait for `bh_*` concrete execution. None until set.
-    pub cpu: Option<&'static dyn majit_backend::Backend>,
+    cpu: Option<BlackholeCpuRef>,
     /// RPython `blackhole.py:288` `self.descrs = builder.descrs`.
     /// Descriptor table from the assembler. In RPython, `descrs` is a list
     /// of `AbstractDescr` objects carrying field offsets, array item sizes,
@@ -239,6 +262,10 @@ pub struct BlackholeInterpreter {
     pub position: usize,
     /// Caller frame in the blackhole frame chain.
     pub nextblackholeinterp: Option<Box<BlackholeInterpreter>>,
+    /// Free-list link owned by `BlackholeInterpBuilder.blackholeinterps`.
+    /// This is distinct from `nextblackholeinterp`, exactly as upstream's
+    /// `back` pool link is distinct from the live caller-frame chain.
+    back: Option<Box<BlackholeInterpreter>>,
     /// Return type of this frame.
     pub return_type: BhReturnType,
     /// True when run() hit jitcode::BC_ABORT (unsupported bytecode). Callers
@@ -472,6 +499,7 @@ impl Default for BlackholeInterpreter {
             jitcode: EMPTY_JITCODE.with(std::sync::Arc::clone),
             position: 0,
             nextblackholeinterp: None,
+            back: None,
             return_type: BhReturnType::Void,
             aborted: false,
             abort_permanent_bail: false,
@@ -624,6 +652,7 @@ impl BlackholeInterpreter {
         self.tmpreg_f = 0;
         self.exception_last_value = 0;
         self.nextblackholeinterp = None;
+        self.back = None;
         self.return_type = BhReturnType::Void;
         self.aborted = false;
         self.abort_permanent_bail = false;
@@ -1474,7 +1503,13 @@ impl BlackholeInterpreter {
         // (a nested call from this handler) would read it at its first
         // `GUARD_NO_EXCEPTION` and re-deliver the already-handled exception.
         // Drain the backend cells here so the handler runs with a pristine cell.
-        self.cpu().clear_stored_exception();
+        // Synthetic dispatcher tests can exercise a pure catch path without
+        // any CPU operation.  A real builder always carries `codewriter.cpu`;
+        // when present, keep the Rust residual-exception side channel in sync
+        // with the exception slot that the upstream frame just consumed.
+        if let Some(cpu) = self.cpu {
+            cpu.get().clear_stored_exception();
+        }
         true
     }
 
@@ -1976,8 +2011,11 @@ impl BlackholeInterpreter {
 // through these handlers + bhimpl methods.
 
 impl BlackholeInterpreter {
-    fn cpu(&self) -> &'static dyn majit_backend::Backend {
-        self.cpu.expect("blackhole cpu reference unset")
+    fn cpu(&self) -> &dyn majit_backend::Backend {
+        self.cpu
+            .as_ref()
+            .expect("blackhole cpu reference unset")
+            .get()
     }
 
     // ── bhimpl_residual_call_* (blackhole.py:1224-1255) ──
@@ -2304,12 +2342,13 @@ impl BlackholeInterpreter {
 ///    + `dispatch_loop`). Phase D incrementally wires this up as
 ///      `bhimpl_*` methods are ported from RPython.
 pub struct BlackholeInterpBuilder {
-    pool: Vec<BlackholeInterpreter>,
+    /// `BlackholeInterpBuilder.blackholeinterps`: intrusive free-list head.
+    blackholeinterps: Option<Box<BlackholeInterpreter>>,
     /// RPython `blackhole.py` `self.cpu = codewriter.cpu`.
     /// Stored as raw pointer; the Backend outlives the builder.
     /// RPython `blackhole.py:286/56` `self.cpu = builder.cpu`.
     /// Backend trait for `bh_*` concrete execution. None until set.
-    pub cpu: Option<&'static dyn majit_backend::Backend>,
+    cpu: Option<BlackholeCpuRef>,
     /// RPython `blackhole.py:68` `self._insns`: opcode byte → "opname/argcodes".
     /// Populated by `setup_insns`; empty until called.
     pub _insns: Vec<String>,
@@ -2369,7 +2408,7 @@ fn sync_raise_position(bh: &mut BlackholeInterpreter, err: &DispatchError) {
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
         Self {
-            pool: Vec::new(),
+            blackholeinterps: None,
             cpu: None,
             _insns: Vec::new(),
             op_live: u8::MAX,
@@ -2380,6 +2419,13 @@ impl BlackholeInterpBuilder {
             dispatch_table: std::sync::Arc::new(Vec::new()),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
         }
+    }
+
+    /// Bind the exact CPU owned by the MetaInterp that produced the trace.
+    /// The caller must keep that CPU alive and at a stable address for the
+    /// builder's active lease; pooled interpreters are refreshed on acquire.
+    pub fn set_cpu(&mut self, cpu: &dyn majit_backend::Backend) {
+        self.cpu = Some(BlackholeCpuRef::new(cpu));
     }
 
     /// TODO narrowed for parity:
@@ -2683,7 +2729,12 @@ impl BlackholeInterpBuilder {
     /// `__init__`, which stores `self.cpu = builder.cpu`. We propagate
     /// the `cpu` field from the builder to each acquired interpreter.
     pub fn acquire_interp(&mut self) -> BlackholeInterpreter {
-        let mut bh = self.pool.pop().unwrap_or_default();
+        let mut bh = if let Some(mut head) = self.blackholeinterps.take() {
+            self.blackholeinterps = head.back.take();
+            *head
+        } else {
+            BlackholeInterpreter::default()
+        };
         // RPython blackhole.py:284-289:
         //   self.cpu = builder.cpu
         //   self.dispatch_loop = builder.dispatch_loop
@@ -2711,7 +2762,7 @@ impl BlackholeInterpBuilder {
     pub fn release_interp(&mut self, mut interp: BlackholeInterpreter) {
         // blackhole.py:254
         interp.cleanup_registers();
-        // Pool management (RPython uses linked-list via .back; Rust uses Vec)
+        // Live-chain and free-list links have separate upstream owners.
         interp.nextblackholeinterp = None;
         interp.aborted = false;
         interp.abort_permanent_bail = false;
@@ -2737,7 +2788,8 @@ impl BlackholeInterpBuilder {
         // `scalar_slot`/`array_elem_slot` range checks are `debug_assert!`, so
         // a release build reads whatever slot the arithmetic lands on.
         interp.state_field_layout = StateFieldLayout::default();
-        self.pool.push(interp);
+        interp.back = self.blackholeinterps.take();
+        self.blackholeinterps = Some(Box::new(interp));
     }
 
     /// Release an entire blackhole chain (including all nextblackholeinterps).
@@ -7615,7 +7667,7 @@ fn handler_getfield_gc_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
@@ -7627,7 +7679,7 @@ fn handler_getfield_gc_i_intbase(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
@@ -7639,7 +7691,7 @@ fn handler_getfield_gc_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
     bh.registers_r[code[pos] as usize] = result.0 as i64;
     Ok(pos + 1)
@@ -7651,7 +7703,7 @@ fn handler_getfield_gc_r_intbase(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
     bh.registers_r[code[pos] as usize] = result.0 as i64;
     Ok(pos + 1)
@@ -7663,7 +7715,7 @@ fn handler_getfield_gc_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
     bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
     Ok(pos + 1)
@@ -7675,7 +7727,7 @@ fn handler_getfield_gc_f_intbase(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
     bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
     Ok(pos + 1)
@@ -7690,7 +7742,7 @@ fn handler_setfield_gc_i(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7706,7 +7758,7 @@ fn handler_setfield_gc_i_c(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = code[position + 1] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7718,7 +7770,7 @@ fn handler_setfield_gc_i_intbase(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7730,7 +7782,7 @@ fn handler_setfield_gc_r(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7742,7 +7794,7 @@ fn handler_setfield_gc_r_intbase(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7754,7 +7806,7 @@ fn handler_setfield_gc_f(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7767,7 +7819,7 @@ fn handler_arraylen_gc(
 ) -> Result<usize, DispatchError> {
     let array_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_arraylen_gc(array_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
@@ -7784,7 +7836,7 @@ fn handler_getarrayitem_gc_i(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
     Ok(pos + 1)
 }
@@ -7796,7 +7848,7 @@ fn handler_getarrayitem_gc_i_intbase(
     let array = bh.registers_i[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
     Ok(pos + 1)
 }
@@ -7808,7 +7860,7 @@ fn handler_getarrayitem_gc_r(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_getarrayitem_gc_r(array, index, descr).0 as i64;
     Ok(pos + 1)
 }
@@ -7825,7 +7877,7 @@ fn handler_setarrayitem_gc_i(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_i(array, index, value, descr);
     Ok(pos)
 }
@@ -7838,7 +7890,7 @@ fn handler_setarrayitem_gc_r(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_r[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7856,7 +7908,7 @@ fn handler_setarrayitem_gc_r_c(
     let index = code[position + 1] as i8 as i64;
     let value = bh.registers_r[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7876,7 +7928,7 @@ fn handler_setarrayitem_gc_i_c(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = code[position + 2] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_i(array, index, value, descr);
     Ok(pos)
 }
@@ -7889,7 +7941,7 @@ fn handler_getfield_raw_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize]; // raw ptr is int
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getfield_raw_i(struct_ptr, descr);
     Ok(pos + 1)
 }
@@ -7900,7 +7952,7 @@ fn handler_getfield_raw_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[pos] as usize] = cpu.bh_getfield_raw_f(struct_ptr, descr).to_bits() as i64;
     Ok(pos + 1)
 }
@@ -7914,7 +7966,7 @@ fn handler_setfield_raw_i(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_raw_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7926,7 +7978,7 @@ fn handler_setfield_raw_f(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_raw_f(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7942,7 +7994,7 @@ fn handler_new(
 ) -> Result<usize, DispatchError> {
     // @arguments("cpu", "d", returns="r")
     let (descr, pos) = read_descr(bh, code, position);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new(descr);
     Ok(pos + 1)
 }
@@ -7952,7 +8004,7 @@ fn handler_new_with_vtable(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let (descr, pos) = read_descr(bh, code, position);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_with_vtable(descr);
     Ok(pos + 1)
 }
@@ -7964,7 +8016,7 @@ fn handler_new_array(
     // @arguments("cpu", "i", "d", returns="r")
     let length = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_array(length, descr);
     Ok(pos + 1)
 }
@@ -7975,7 +8027,7 @@ fn handler_new_array_clear(
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
     Ok(pos + 1)
 }
@@ -7989,7 +8041,7 @@ fn handler_new_array_clear_c(
 ) -> Result<usize, DispatchError> {
     let length = code[position] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
     Ok(pos + 1)
 }
@@ -8001,7 +8053,7 @@ fn handler_strlen(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 1] as usize] = cpu.bh_strlen(s);
     Ok(position + 2)
 }
@@ -8012,7 +8064,7 @@ fn handler_strgetitem(
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 2] as usize] = cpu.bh_strgetitem(s, index);
     Ok(position + 3)
 }
@@ -8024,7 +8076,7 @@ fn handler_strsetitem(
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_strsetitem(s, index, value);
     Ok(position + 3)
 }
@@ -8034,7 +8086,7 @@ fn handler_newstr(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[position + 1] as usize] = cpu.bh_newstr(length);
     Ok(position + 2)
 }
@@ -8044,7 +8096,7 @@ fn handler_unicodelen(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 1] as usize] = cpu.bh_unicodelen(s);
     Ok(position + 2)
 }
@@ -8055,7 +8107,7 @@ fn handler_unicodegetitem(
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 2] as usize] = cpu.bh_unicodegetitem(s, index);
     Ok(position + 3)
 }
@@ -8067,7 +8119,7 @@ fn handler_unicodesetitem(
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_unicodesetitem(s, index, value);
     Ok(position + 3)
 }
@@ -8077,7 +8129,7 @@ fn handler_newunicode(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[position + 1] as usize] = cpu.bh_newunicode(length);
     Ok(position + 2)
 }
@@ -8120,7 +8172,7 @@ fn handler_getinteriorfield_gc_i(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getinteriorfield_gc_i(array, index, descr);
     Ok(pos + 1)
 }
@@ -8133,7 +8185,7 @@ fn handler_setinteriorfield_gc_i(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setinteriorfield_gc_i(array, index, value, descr);
     Ok(pos)
 }
@@ -8502,67 +8554,6 @@ fn handler_residual_call_r_v(
 // `blackhole.py:107`).  All `*_u16_ext` width adapters have been
 // retired; canonical `handler_*` decoders own every dispatch slot.
 
-/// Per-thread Backend instance backing every `bh.cpu` call.
-///
-/// TODO: RPython `blackhole.py:55-56,286` reads
-/// `self.cpu = builder.cpu`, where `builder.cpu` is the metainterp-shared
-/// AbstractCPU subclass (`LLOpHelpers` in tests, real native cpu in
-/// production).  The cpu's `bh_getfield_gc_*` etc. methods are stateless
-/// thin wrappers around `lltype.cast_*` / pointer arithmetic in RPython.
-///
-/// pyre's `MetaInterp::backend` is per-instance (not `'static`) and
-/// owns trace-compilation state (descr registries, etc.) that would be
-/// inappropriate to share with the blackhole `bh.cpu` field.  We leak ONE
-/// `BackendImpl` instance per thread instead, so `bh.cpu` is a *different*
-/// object from the one the metainterp that recorded the trace holds.
-///
-/// ## The invariant that makes the split observationally inert
-///
-/// Every `Backend` method this field reaches must be a pure function of
-/// its arguments — `&self` may not be read.  The full reachable surface is
-/// `bh_getfield_gc_{i,r,f}`, `bh_setfield_gc_{i,r,f}`,
-/// `bh_getarrayitem_gc_{i,r,f}`, `bh_arraylen_gc`, `bh_new`,
-/// `bh_new_with_vtable`, `bh_new_array{,_clear}`, `bh_call_{i,r,f,v}`, and
-/// `clear_stored_exception`.  On dynasm each is descr-supplied offsets fed
-/// to `read_int_at_mem` / `write_int_at_mem` (`runner.rs`) or a
-/// free function (`jit_exc_clear`, `call_stub::bh_call_*_dispatch`); none
-/// touches `&self`.  A method added to that list that *does* read backend
-/// state would make the blackhole observe a fresh, empty `BackendImpl`
-/// where the metainterp observes the populated one, and nothing here would
-/// catch it.
-///
-/// Convergence path: align with RPython's `builder.cpu` invariant by
-/// passing the metainterp-owned `BackendImpl` to `BlackholeInterpBuilder`
-/// at construction (likely as `Arc<dyn Backend>` since
-/// `BH_BUILDER3` outlives any single MetaInterp invocation).  Open
-/// architectural item; not in scope here because the change cascades
-/// through the Backend trait's `Send + Sync` bound and every callsite
-/// that holds `&'static dyn Backend` today.
-// Exactly the condition under which `BackendImpl` resolves: cranelift or
-// dynasm off wasm32, and unconditionally on wasm32, where it is
-// `WasmBackend`. A narrower gate here leaves `bh.cpu` unset on wasm and
-// every vable handler trips `expect("cpu not set")`.
-#[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
-pub fn production_cpu() -> &'static dyn majit_backend::Backend {
-    // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
-    // instance per thread.  Mirrors `BH_BUILDER3` (`call_jit.rs`)
-    // which is itself a `thread_local!` — production blackhole resume
-    // already runs on the same thread that owns the trace's metainterp.
-    thread_local! {
-        static CPU: std::cell::Cell<Option<&'static dyn majit_backend::Backend>> =
-            const { std::cell::Cell::new(None) };
-    }
-    CPU.with(|cell| {
-        if let Some(cpu) = cell.get() {
-            return cpu;
-        }
-        let backend: Box<dyn majit_backend::Backend> = Box::new(crate::pyjitpl::BackendImpl::new());
-        let leaked: &'static dyn majit_backend::Backend = Box::leak(backend);
-        cell.set(Some(leaked));
-        leaked
-    })
-}
-
 /// Build a strict `BlackholeInterpBuilder` for pyre's blackhole resume path.
 ///
 /// TODO: pyre's `JitCodeBuilder` emits other
@@ -8594,17 +8585,6 @@ pub fn production_cpu() -> &'static dyn majit_backend::Backend {
 /// that this minimal install side-steps.
 pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     let mut builder = BlackholeInterpBuilder::new();
-    // Wire the blackhole cpu BEFORE the vable canonical routing.
-    // RPython `blackhole.py:286 self.cpu = builder.cpu` parity — the
-    // production builder must carry a non-None cpu so canonical handlers
-    // like `handler_getfield_vable_r` don't trip
-    // `bh.cpu.expect("cpu not set")` once their setup_insns entries land.
-    // The leaked instance services only stateless GC reads;
-    // the residual_call (`bh_call_*`) prereq audit is pending.
-    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
-    {
-        builder.cpu = Some(production_cpu());
-    }
     let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
     insns.insert(
         "inline_call_nested_ext/P".to_string(),
@@ -9807,7 +9787,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("uint_mul_high/ii>i", handler_uint_mul_high);
     builder.wire_handler("int_between/iii>i", handler_int_between);
 
-    // String hashing (stubs)
+    // String hashing
     builder.wire_handler("strhash/r>i", handler_strhash);
     builder.wire_handler("unicodehash/r>i", handler_unicodehash);
 
@@ -9972,7 +9952,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getarrayitem_vable_f/ridd>f", handler_getarrayitem_vable_f);
     builder.wire_handler("setarrayitem_vable_f/rifdd", handler_setarrayitem_vable_f);
 
-    // Inline call (stub — needs frame-chain)
+    // Inline call
     builder.wire_handler("inline_call_irf_i/dIRF>i", handler_inline_call_irf_i);
     builder.wire_handler("inline_call_irf_r/dIRF>r", handler_inline_call_irf_r);
     builder.wire_handler("inline_call_irf_f/dIRF>f", handler_inline_call_irf_f);
@@ -10016,7 +9996,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         handler_record_known_result_ref_ext,
     );
 
-    // Recursive call (stub — needs portal runner)
+    // Recursive call
     // RPython `rpython/jit/metainterp/blackhole.py:1101-1132`:
     //   @arguments("self", "i", "I", "R", "F", "I", "R", "F", returns="X")
     // canonical keys `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`. `recursive_call`
@@ -10109,7 +10089,8 @@ fn handler_strhash(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = 0;
+    let string = bh.registers_r[code[p] as usize];
+    bh.registers_i[code[p + 1] as usize] = bh.cpu().bh_strhash(string);
     Ok(p + 2)
 }
 fn handler_unicodehash(
@@ -10117,7 +10098,8 @@ fn handler_unicodehash(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = 0;
+    let string = bh.registers_r[code[p] as usize];
+    bh.registers_i[code[p + 1] as usize] = bh.cpu().bh_unicodehash(string);
     Ok(p + 2)
 }
 bhhandler_f_i!(
@@ -10153,7 +10135,7 @@ fn handler_guard_class(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let typeptr = cpu.bh_classof(bh.registers_r[code[p] as usize]);
     bh.registers_i[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
@@ -10266,9 +10248,8 @@ fn handler_copystrcontent(
     let srcstart = bh.registers_i[code[p + 2] as usize];
     let dststart = bh.registers_i[code[p + 3] as usize];
     let length = bh.registers_i[code[p + 4] as usize];
-    if let Some(cpu) = bh.cpu {
-        cpu.bh_copystrcontent(src, dst, srcstart, dststart, length);
-    }
+    bh.cpu()
+        .bh_copystrcontent(src, dst, srcstart, dststart, length);
     Ok(p + 5)
 }
 /// RPython `blackhole.py` `bhimpl_copyunicodecontent`.
@@ -10282,9 +10263,8 @@ fn handler_copyunicodecontent(
     let srcstart = bh.registers_i[code[p + 2] as usize];
     let dststart = bh.registers_i[code[p + 3] as usize];
     let length = bh.registers_i[code[p + 4] as usize];
-    if let Some(cpu) = bh.cpu {
-        cpu.bh_copyunicodecontent(src, dst, srcstart, dststart, length);
-    }
+    bh.cpu()
+        .bh_copyunicodecontent(src, dst, srcstart, dststart, length);
     Ok(p + 5)
 }
 fn handler_raise(
@@ -10311,6 +10291,10 @@ fn handler_reraise(
 ) -> Result<usize, DispatchError> {
     // `reraise/` decodes no operands, so `p` is already the end of the
     // instruction.
+    assert!(
+        bh.exception_last_value != 0,
+        "BlackholeInterpreter.bhimpl_reraise requires an active exception"
+    );
     Err(DispatchError::RaiseException {
         exc: bh.exception_last_value,
         resume_position: p,
@@ -10408,20 +10392,23 @@ fn handler_goto_if_exception_mismatch(
     }
 }
 fn handler_debug_fatalerror(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    _p: usize,
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
 ) -> Result<usize, DispatchError> {
-    panic!("bhimpl_debug_fatalerror");
+    let string = bh.registers_r[code[p] as usize];
+    let length = bh.cpu().bh_strlen(string);
+    let bytes: Vec<u8> = (0..length)
+        .map(|index| bh.cpu().bh_strgetitem(string, index) as u8)
+        .collect();
+    panic!("{}", String::from_utf8_lossy(&bytes));
 }
 /// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
 /// (the tagging arithmetic lives at the erase site, never here); the
 /// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `debug_assert!` mirrors `ll_assert` — removed from the optimized
-/// build, and the cast op only enters a trace once tagging is live, so
-/// this is inert until enablement.
+/// `ll_assert` remains a translated runtime assertion.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    debug_assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
+    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
@@ -10429,7 +10416,7 @@ fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
 /// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
 /// before it is reinterpreted as a `GCREF`.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    debug_assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
+    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 
@@ -10469,7 +10456,7 @@ fn handler_getfield_vable_i(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
 }
@@ -10484,7 +10471,7 @@ fn handler_getfield_vable_i_intbase(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
 }
@@ -10499,7 +10486,7 @@ fn handler_getfield_vable_r(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
     Ok(p + 1)
 }
@@ -10514,7 +10501,7 @@ fn handler_getfield_vable_f(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
     Ok(p + 1)
 }
@@ -10531,7 +10518,7 @@ fn handler_setfield_vable_i(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
 }
@@ -10547,7 +10534,7 @@ fn handler_setfield_vable_i_intbase(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
 }
@@ -10563,7 +10550,7 @@ fn handler_setfield_vable_r(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
     Ok(p)
 }
@@ -10579,7 +10566,7 @@ fn handler_setfield_vable_r_intbase(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
     Ok(p)
 }
@@ -10595,7 +10582,7 @@ fn handler_setfield_vable_f(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
     Ok(p)
 }
@@ -10786,13 +10773,10 @@ fn handler_getarrayitem_raw_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[p] as usize] as usize; // raw ptr
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let array = bh.registers_i[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let item_size = descr.as_offset();
-    let offset = index * item_size.max(1);
-    let value = unsafe { *((array + offset) as *const i64) };
-    bh.registers_i[code[p] as usize] = value;
+    bh.registers_i[code[p] as usize] = bh.cpu().bh_getarrayitem_raw_i(array, index, descr);
     Ok(p + 1)
 }
 /// RPython `blackhole.py` `bhimpl_setarrayitem_raw_i`.
@@ -10801,13 +10785,11 @@ fn handler_setarrayitem_raw_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[p] as usize] as usize;
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let array = bh.registers_i[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
-    let item_size = descr.as_offset();
-    let offset = index * item_size.max(1);
-    unsafe { *((array + offset) as *mut i64) = value };
+    bh.cpu().bh_setarrayitem_raw_i(array, index, value, descr);
     Ok(p)
 }
 
@@ -10824,9 +10806,10 @@ fn handler_conditional_call_ir_v(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if condition != 0 {
-        bh.cpu
-            .expect("cpu")
+        BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
+        bh.cpu()
             .bh_call_v(func, Some(&ai), Some(&ar), None, &calldescr);
+        check_residual_call_exception_after(bh, p)?;
     }
     Ok(p)
 }
@@ -10842,10 +10825,11 @@ fn handler_conditional_call_value_ir_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
+        BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
-            .cpu
-            .expect("cpu")
+            .cpu()
             .bh_call_i(func, Some(&ai), Some(&ar), None, &calldescr);
+        check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_i[code[p] as usize] = value;
     Ok(p + 1)
@@ -10862,11 +10846,12 @@ fn handler_conditional_call_value_ir_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
+        BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
-            .cpu
-            .expect("cpu")
+            .cpu()
             .bh_call_r(func, Some(&ai), Some(&ar), None, &calldescr)
             .0 as i64;
+        check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_r[code[p] as usize] = value;
     Ok(p + 1)
@@ -10882,7 +10867,7 @@ fn handler_getlistitem_gc_i(
     let index = bh.registers_i[code[p + 1] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(items, index, array_descr);
     Ok(p + 1)
@@ -10896,7 +10881,7 @@ fn handler_getlistitem_gc_r(
     let index = bh.registers_i[code[p + 1] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     bh.registers_r[code[p] as usize] = cpu.bh_getarrayitem_gc_r(items, index, array_descr).0 as i64;
     Ok(p + 1)
@@ -10911,7 +10896,7 @@ fn handler_setlistitem_gc_i(
     let value = bh.registers_i[code[p + 2] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     cpu.bh_setarrayitem_gc_i(items, index, value, array_descr);
     Ok(p)
@@ -10926,7 +10911,7 @@ fn handler_setlistitem_gc_r(
     let value = bh.registers_r[code[p + 2] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     cpu.bh_setarrayitem_gc_r(items, index, majit_ir::GcRef(value as usize), array_descr);
     Ok(p)
@@ -10970,7 +10955,7 @@ fn handler_check_neg_index(
     let mut index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     if index < 0 {
-        let cpu = bh.cpu.expect("cpu not set");
+        let cpu = bh.cpu();
         index += cpu.bh_arraylen_gc(array, descr);
     }
     bh.registers_i[code[p] as usize] = index;
@@ -10985,7 +10970,7 @@ fn handler_check_resizable_neg_index(
     let mut index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     if index < 0 {
-        let cpu = bh.cpu.expect("cpu not set");
+        let cpu = bh.cpu();
         index += cpu.bh_getfield_gc_i(lst, descr);
     }
     bh.registers_i[code[p] as usize] = index;
@@ -11002,7 +10987,7 @@ fn handler_getarrayitem_gc_f(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] =
         cpu.bh_getarrayitem_gc_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
@@ -11017,7 +11002,7 @@ fn handler_setarrayitem_gc_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_f(array, index, value, descr);
     Ok(p)
 }
@@ -11030,7 +11015,7 @@ fn handler_getarrayitem_raw_f(
     let array = bh.registers_i[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] =
         cpu.bh_getarrayitem_raw_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
@@ -11045,7 +11030,7 @@ fn handler_setarrayitem_raw_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_raw_f(array, index, value, descr);
     Ok(p)
 }
@@ -11057,7 +11042,7 @@ fn handler_getfield_raw_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[p] as usize];
     let (descr, p) = read_descr(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_raw_r(struct_ptr, descr).0 as i64;
     Ok(p + 1)
 }
@@ -11072,7 +11057,7 @@ fn handler_getinteriorfield_gc_f(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] =
         cpu.bh_getinteriorfield_gc_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
@@ -11085,7 +11070,7 @@ fn handler_getinteriorfield_gc_r(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getinteriorfield_gc_r(array, index, descr).0 as i64;
     Ok(p + 1)
 }
@@ -11098,7 +11083,7 @@ fn handler_setinteriorfield_gc_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setinteriorfield_gc_f(array, index, value, descr);
     Ok(p)
 }
@@ -11111,7 +11096,7 @@ fn handler_setinteriorfield_gc_r(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setinteriorfield_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(p)
 }
@@ -11126,7 +11111,7 @@ fn handler_gc_load_indexed_i(
     let scale = bh.registers_i[code[p + 2] as usize];
     let base_ofs = bh.registers_i[code[p + 3] as usize];
     let bytes = bh.registers_i[code[p + 4] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p + 5] as usize] =
         cpu.bh_gc_load_indexed_i(addr, index, scale, base_ofs, bytes);
     Ok(p + 6)
@@ -11141,7 +11126,7 @@ fn handler_gc_load_indexed_f(
     let scale = bh.registers_i[code[p + 2] as usize];
     let base_ofs = bh.registers_i[code[p + 3] as usize];
     let bytes = bh.registers_i[code[p + 4] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p + 5] as usize] = cpu
         .bh_gc_load_indexed_f(addr, index, scale, base_ofs, bytes)
         .to_bits() as i64;
@@ -11160,9 +11145,9 @@ fn handler_gc_store_indexed_i(
     let scale = bh.registers_i[code[p + 3] as usize];
     let base_ofs = bh.registers_i[code[p + 4] as usize];
     let bytes = bh.registers_i[code[p + 5] as usize];
-    let (_, p) = read_descr(bh, code, p + 6);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_gc_store_indexed_i(addr, index, value, scale, base_ofs, bytes);
+    let (descr, p) = read_descr(bh, code, p + 6);
+    let cpu = bh.cpu();
+    cpu.bh_gc_store_indexed_i(addr, index, value, scale, base_ofs, bytes, descr);
     Ok(p)
 }
 // blackhole.py bhimpl_gc_store_indexed_f
@@ -11178,9 +11163,9 @@ fn handler_gc_store_indexed_f(
     let scale = bh.registers_i[code[p + 3] as usize];
     let base_ofs = bh.registers_i[code[p + 4] as usize];
     let bytes = bh.registers_i[code[p + 5] as usize];
-    let (_, p) = read_descr(bh, code, p + 6);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_gc_store_indexed_f(addr, index, value, scale, base_ofs, bytes);
+    let (descr, p) = read_descr(bh, code, p + 6);
+    let cpu = bh.cpu();
+    cpu.bh_gc_store_indexed_f(addr, index, value, scale, base_ofs, bytes, descr);
     Ok(p)
 }
 // blackhole.py bhimpl_raw_store_i/f
@@ -11195,7 +11180,7 @@ fn handler_raw_store_i(
     let value = bh.registers_i[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
     // blackhole.py:1505-1506: cpu.bh_raw_store_i(addr, offset, newvalue, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_raw_store_i(addr, offset, value, descr);
     Ok(p)
 }
@@ -11210,7 +11195,7 @@ fn handler_raw_store_f(
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
     // blackhole.py:1510-1511: cpu.bh_raw_store_f(addr, offset, newvalue, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_raw_store_f(addr, offset, value, descr);
     Ok(p)
 }
@@ -11223,7 +11208,7 @@ fn handler_raw_load_i(
     let offset = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     // blackhole.py:1500-1501: cpu.bh_raw_load_i(addr, offset, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_raw_load_i(addr, offset, descr);
     Ok(p + 1)
 }
@@ -11236,7 +11221,7 @@ fn handler_raw_load_f(
     let offset = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     // blackhole.py:1503-1504: cpu.bh_raw_load_f(addr, offset, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_raw_load_f(addr, offset, descr).to_bits() as i64;
     Ok(p + 1)
 }
@@ -11253,7 +11238,7 @@ fn handler_newlist(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     // blackhole.py:1163: result = cpu.bh_new(structdescr)
     let result = cpu.bh_new(structdescr);
     // blackhole.py:1164: cpu.bh_setfield_gc_i(result, length, lengthdescr)
@@ -11280,7 +11265,7 @@ fn handler_newlist_clear(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_new(structdescr);
     cpu.bh_setfield_gc_i(result, length, lengthdescr);
     // blackhole.py:1178: items = cpu.bh_new_array_clear(length, arraydescr)
@@ -11300,7 +11285,7 @@ fn handler_newlist_hint(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_new(structdescr);
     // blackhole.py:1186: cpu.bh_setfield_gc_i(result, 0, lengthdescr)
     cpu.bh_setfield_gc_i(result, 0, lengthdescr);
@@ -11365,7 +11350,7 @@ fn handler_getlistitem_gc_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     bh.registers_f[code[p] as usize] = cpu
         .bh_getarrayitem_gc_f(items, index, array_descr)
@@ -11383,7 +11368,7 @@ fn handler_setlistitem_gc_f(
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (items_descr, p) = read_descr(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     cpu.bh_setarrayitem_gc_f(items, index, value, array_descr);
     Ok(p)
@@ -12226,7 +12211,7 @@ fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
     }
 }
 
-// recursive_call — stub (needs portal runner)
+// recursive_call
 /// RPython `blackhole.py` `get_portal_runner(jdindex)`:
 /// Returns (fnptr, calldescr) from jitdrivers_sd[jdindex].
 /// pyre: uses portal_runner_ptr directly (single jitdriver).

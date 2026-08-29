@@ -905,6 +905,14 @@ impl TraceCtx {
         });
     }
 
+    /// Borrow the exact MetaInterp CPU installed by [`Self::set_cpu`].
+    pub fn blackhole_cpu(&self) -> Option<&dyn majit_backend::Backend> {
+        self.cpu.map(|cpu| {
+            // SAFETY: identical owner contract to `field_sanity_load`.
+            unsafe { &*cpu }
+        })
+    }
+
     /// pyjitpl.py `executor.execute(cpu, mi, opnum, fielddescr, box)`
     /// line-by-line dispatch for the GETFIELD_GC_{I,R,F} subset.
     ///

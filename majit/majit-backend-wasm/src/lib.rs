@@ -3387,6 +3387,43 @@ impl majit_backend::Backend for WasmBackend {
         self.bh_new_array(length, arraydescr)
     }
 
+    /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
+    fn bh_newstr(&self, length: i64) -> i64 {
+        let length = usize::try_from(length).expect("bh_newstr length must be non-negative");
+        let base_size = 2 * std::mem::size_of::<usize>() + 1;
+        let ptr = wasm_bh_alloc(
+            majit_gc::lowlevel_str_type_id(),
+            base_size
+                .checked_add(length)
+                .expect("bh_newstr allocation size overflow"),
+        );
+        if ptr != 0 {
+            unsafe {
+                *((ptr as *mut u8).add(std::mem::size_of::<usize>()) as *mut usize) = length;
+            }
+        }
+        ptr
+    }
+
+    /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
+    fn bh_newunicode(&self, length: i64) -> i64 {
+        let length = usize::try_from(length).expect("bh_newunicode length must be non-negative");
+        let base_size = 2 * std::mem::size_of::<usize>();
+        let ptr = wasm_bh_alloc(
+            majit_gc::lowlevel_unicode_type_id(),
+            length
+                .checked_mul(std::mem::size_of::<u32>())
+                .and_then(|items| base_size.checked_add(items))
+                .expect("bh_newunicode allocation size overflow"),
+        );
+        if ptr != 0 {
+            unsafe {
+                *((ptr as *mut u8).add(std::mem::size_of::<usize>()) as *mut usize) = length;
+            }
+        }
+        ptr
+    }
+
     /// llmodel.py bh_arraylen_gc: read the length prefix at
     /// `lendescr.offset`. Word-width (`*const usize`), matching the store
     /// `bh_new_array` makes at the same offset — a fixed 8-byte read would fold

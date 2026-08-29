@@ -2745,6 +2745,7 @@ pub fn blackhole_resume_via_rd_numb(
     // release_bh_rd to drop and re-acquire the borrow.
     let bh = BH_BUILDER_RD.with(|cell| unsafe {
         let builder = &mut *cell.get();
+        builder.set_cpu(driver.meta_interp().blackhole_cpu());
         sync_bh_builder_control_opcodes(builder);
         resume::blackhole_from_resumedata(
             builder,

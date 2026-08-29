@@ -3475,6 +3475,18 @@ impl Backend for DynasmBackend {
         self.bh_new_array(length, arraydescr)
     }
 
+    /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
+    fn bh_newstr(&self, length: i64) -> i64 {
+        let length = u64::try_from(length).expect("bh_newstr length must be non-negative");
+        dynasm_malloc_str(majit_gc::lowlevel_str_type_id() as u64, length) as i64
+    }
+
+    /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
+    fn bh_newunicode(&self, length: i64) -> i64 {
+        let length = u64::try_from(length).expect("bh_newunicode length must be non-negative");
+        dynasm_malloc_unicode(majit_gc::lowlevel_unicode_type_id() as u64, length) as i64
+    }
+
     /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves a vtable pointer through the installed gc_ll_descr.

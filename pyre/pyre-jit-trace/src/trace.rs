@@ -2968,6 +2968,8 @@ fn try_adopt_single_frame_blackhole(
     drop(captured_stack);
     let terminal = majit_metainterp::drive_single_frame_blackhole(
         &mut latched.miframe,
+        ctx.blackhole_cpu()
+            .expect("blackhole adoption requires the tracing MetaInterp CPU"),
         majit_metainterp::blackhole::StateFieldLayout::default(),
         virtualizable_info,
         // RPython threads the current MIFrame's own red virtualizable through
@@ -3586,14 +3588,10 @@ fn try_adopt_multi_frame_blackhole(
     // full-coverage dispatch table, not the inline-call-only builder.
     let (mut mf_builder, _unwired) =
         crate::jitcode_runtime::build_default_bh_builder_with_unwired_report();
-    // The workspace entry turns this crate's defaults off, so a `pyre-jit`
-    // that names no backend no longer forwards one and the call has to be
-    // gated. The predicate is `production_cpu`'s own: present on wasm32
-    // regardless of feature, since `BackendImpl` is `WasmBackend` there.
-    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
-    {
-        mf_builder.cpu = Some(majit_metainterp::blackhole::production_cpu());
-    }
+    mf_builder.set_cpu(
+        ctx.blackhole_cpu()
+            .expect("multi-frame blackhole requires the tracing MetaInterp CPU"),
+    );
     let majit_metainterp::MultiFrameBlackholeResult {
         outcome,
         terminal: mf_terminal,

@@ -183,6 +183,7 @@ fn seed_deopt_vinfo_ptr(
 )]
 pub fn drive_single_frame_blackhole(
     miframe: &mut crate::pyjitpl::MIFrame,
+    cpu: &dyn majit_backend::Backend,
     state_field_layout: crate::blackhole::StateFieldLayout,
     virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
     mut virtualizable_ptr: i64,
@@ -229,6 +230,7 @@ pub fn drive_single_frame_blackhole(
     }
 
     let mut builder = BackEdgeBhBuilder::lease();
+    builder.set_cpu(cpu);
     builder.setup_cached_control_opcodes(
         metainterp_sd.op_live,
         metainterp_sd.op_catch_exception,
@@ -2805,6 +2807,7 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let mut bh_builder = BackEdgeBhBuilder::lease();
+        bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
         let staticdata = &self.meta.staticdata;
         let outcome = drive_multi_frame_blackhole(
             &mut bh_builder,
@@ -6410,6 +6413,7 @@ impl<S: JitState> JitDriver<S> {
                 // the values match the metainterp's actual byte
                 // assignments.
                 let mut bh_builder = BackEdgeBhBuilder::lease();
+                bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,
