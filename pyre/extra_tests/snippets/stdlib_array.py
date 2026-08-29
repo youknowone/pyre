@@ -227,6 +227,82 @@ with assert_raises(BufferError):
 assert conversion_order == ["index"]
 exported_view.release()
 
+# PyPy's descr_remove delegates through its live-length index_count_array
+# search and then descr_pop.  Equality can mutate the receiver at both sides
+# of that boundary, so the receiver and needle must remain rooted and live.
+remove_growing = array("i", [1, 2])
+remove_calls = []
+
+
+class GrowingRemoveNeedle:
+    def __eq__(self, other):
+        remove_calls.append(other)
+        if other == 1:
+            remove_growing.append(3)
+            gc.collect()
+            return False
+        return other == 3
+
+
+remove_growing.remove(GrowingRemoveNeedle())
+assert remove_calls == [1, 2, 3]
+assert remove_growing == array("i", [1, 2])
+
+remove_cleared_false = array("i", [1, 2])
+
+
+class ClearingFalseNeedle:
+    def __eq__(self, other):
+        del remove_cleared_false[:]
+        return False
+
+
+with assert_raises(ValueError) as error:
+    remove_cleared_false.remove(ClearingFalseNeedle())
+assert str(error.exception) == "array.remove(x): x not in array"
+assert remove_cleared_false == array("i")
+
+remove_cleared_true = array("i", [1, 2])
+
+
+class ClearingTrueNeedle:
+    def __eq__(self, other):
+        del remove_cleared_true[:]
+        return True
+
+
+# CPython 3.14 array_del_slice treats the now-empty matched range as a
+# successful no-op; PyPy's descr_pop raises here, so the 3.14 result wins.
+assert remove_cleared_true.remove(ClearingTrueNeedle()) is None
+assert remove_cleared_true == array("i")
+
+remove_exported = array("i", [1])
+remove_view = memoryview(remove_exported)
+remove_export_events = []
+
+
+class ExportedRemoveNeedle:
+    def __eq__(self, other):
+        remove_export_events.append(other)
+        return True
+
+
+with assert_raises(BufferError):
+    remove_exported.remove(ExportedRemoveNeedle())
+assert remove_export_events == [1]
+assert remove_exported == array("i", [1])
+remove_view.release()
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i", [1]).remove(x=1)
+assert str(error.exception) == "array.remove() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").remove()
+assert str(error.exception) == "array.remove() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").remove(1, 2)
+assert str(error.exception) == "array.remove() takes exactly one argument (2 given)"
+
 # slice assignment step overflow behaviour test
 T = "I"
 a = array(T, range(10))

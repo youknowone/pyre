@@ -717,12 +717,34 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.remove")?;
-    let obj = args[0];
-    array_check_resize(obj)?;
-    let idx = array_find(obj, args[1])?;
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "remove")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.remove() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let idx = array_find(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    )?;
     match idx {
         Some(i) => {
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            // [3.14-spec] CPython `array_array_remove_impl` hands the matched
+            // index to `array_del_slice`; if `__eq__` already shrank the array
+            // past it, deletion is an empty successful slice.  PyPy's
+            // `W_ArrayBase.descr_remove` instead calls `descr_pop`, whose
+            // bounds check raises.  Preserve the 3.14 observable no-op.
+            if i >= unsafe { arr::w_array_len(obj) } {
+                return Ok(pyre_object::w_none());
+            }
+            // PyPy reaches its resize through `descr_pop` only after the
+            // comparison search.  CPython likewise runs comparisons before
+            // `array_del_slice` rejects an exported receiver.
+            array_check_resize(obj)?;
             let isz = unsafe { arr::w_array_itemsize(obj) };
             let vec = unsafe { arr::w_array_vec_mut(obj) };
             vec.drain(i * isz..i * isz + isz);
@@ -734,12 +756,23 @@ fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
 
 /// First index whose element equals `w_value`, via `==`.
 fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, PyError> {
-    let len = unsafe { arr::w_array_len(obj) };
-    for i in 0..len {
+    // PyPy `index_count_array`: the receiver and needle stay red/live, and
+    // `arr.len` is checked at every loop boundary because equality is user
+    // code that may resize and collect either object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_value]);
+    let mut i = 0;
+    loop {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        if i >= unsafe { arr::w_array_len(obj) } {
+            break;
+        }
         let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
+        let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if crate::baseobjspace::eq_w(w_item, w_value)? {
             return Ok(Some(i));
         }
+        i += 1;
     }
     Ok(None)
 }
@@ -1631,7 +1664,14 @@ pub fn init_array_type(ns: PyObjectRef) {
             crate::make_builtin_function("insert", array_insert_method),
         )
     };
-    m(ns, "remove", array_remove_method, 2);
+    // `remove` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "remove",
+            crate::make_builtin_function("remove", array_remove_method),
+        )
+    };
     // `index` accepts optional start/stop.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
