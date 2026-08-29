@@ -5381,7 +5381,7 @@ impl<'a> Transformer<'a> {
         let (jd_index, num_green_args) = self
             .callcontrol
             .as_ref()
-            .and_then(|cc| cc.jitdriver_sd_from_portal_graph(&path))
+            .and_then(|cc| cc.jitdriver_sd_from_portal_runner_ptr(&path))
             .map(|sd| (sd.index, sd.greens.len()))
             .unwrap_or((0, 0));
 
@@ -11750,6 +11750,19 @@ mod tests {
                 ops.is_empty(),
                 "inactive driver must drop markers, got {ops:?}"
             );
+
+            let mut graph = crate::model::FunctionGraph::new("fixture");
+            let result = graph.alloc_value_var();
+            let ops = transformer
+                .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[], Some(&result), &graph)
+                .expect("inactive can_enter_jit still defines its bound result");
+            assert!(matches!(
+                ops.as_slice(),
+                [SpaceOperation {
+                    result: Some(defined),
+                    kind: OpKind::ConstInt(0),
+                }] if defined == &result
+            ));
         }
 
         cc.set_jitdriver_active(0, true);

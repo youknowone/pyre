@@ -6340,9 +6340,8 @@ impl<'a> Lowering<'a> {
                     // projection from a payload-free enum reads no bytes.
                     // Give the projected value the `Void` kind rather than
                     // materialising it in a value bank.  `getkind(lltype.Void)`
-                    // is `'void'`, and both `NON_VOID_ARGS`
-                    // (`call.py:220-221`) and `add_in_correct_list`
-                    // (`jtransform.py:449`) drop a void argument, so the value
+                    // is `'void'`, and both `call.py NON_VOID_ARGS` and
+                    // `jtransform.py add_in_correct_list` drop a void argument, so the value
                     // takes neither a calldescr `arg_classes` slot nor an
                     // argument-bank entry.  That is what the callee's machine
                     // ABI expects: a zero-sized parameter occupies no argument
@@ -16627,19 +16626,12 @@ impl<'a> Lowering<'a> {
         let Some(td) = self.llbc.type_by_id(def_id) else {
             return false;
         };
-        let TypeDeclKind::Enum(variants) = &td.kind else {
-            return false;
-        };
-        variants.iter().all(|variant| {
-            variant
-                .fields
-                .iter()
-                .all(|f| tyref_is_zero_sized(&f.ty, self.llbc))
-        }) && td
-            .layout_for_target("")
-            .and_then(|l| l.discriminant_offset())
-            .unwrap_or(0)
-            == 0
+        let target = std::env::var("TARGET").unwrap_or_default();
+        type_decl_is_fieldless_enum(td, self.llbc)
+            && td
+                .layout_for_target(&target)
+                .and_then(|l| l.discriminant_offset())
+                == Some(0)
     }
 
     /// The resolved JSON body of a [`TyRef`], following the dedup
@@ -20254,9 +20246,10 @@ fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
         TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
     };
+    let target = std::env::var("TARGET").unwrap_or_default();
     def_id
         .and_then(|def_id| llbc.type_by_id(def_id))
-        .and_then(|td| td.layout_for_target(""))
+        .and_then(|td| td.layout_for_target(&target))
         .is_some_and(|layout| layout.size == Some(0))
 }
 

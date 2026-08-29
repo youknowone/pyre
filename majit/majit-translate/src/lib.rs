@@ -2135,6 +2135,7 @@ fn analyze_pipeline_from_module_paths(
         .iter()
         .map(|driver| pipeline::CompiledJitDriver {
             portal: driver.portal_graph.clone(),
+            portal_runner: driver.portal_runner.clone(),
             main_jitcode_index: driver
                 .mainjitcode
                 .as_ref()
@@ -2244,6 +2245,11 @@ fn register_configured_jitdrivers(
                 .last_mut()
                 .expect("non-empty portal path asserted above") = portal_name;
             let portal_path = crate::parse::CallPath::from_segments(portal_segments);
+            assert!(
+                !call_control.function_graphs().contains_key(&portal_path),
+                "derived split portal path `{}` collides with an existing graph",
+                portal_path.canonical_key(),
+            );
 
             let (marker_block, marker_index) =
                 crate::codewriter::support::find_jit_merge_point(&portal, driver_roots)
@@ -2256,8 +2262,10 @@ fn register_configured_jitdrivers(
                 spec.reds.len(),
                 driver_roots,
             );
-            // `warmspot.py split_graph_and_record_jitdriver` also sets
-            // `_dont_inline_`; the rich model has no carrier for that flag.
+            // `warmspot.py WarmRunnerDesc.split_graph_and_record_jitdriver`:
+            // keep the copied portal as a backend-inlining boundary and let
+            // JIT policy inspect its loop.
+            portal.func.dont_inline = true;
             portal.hints.push("unroll_safe".into());
             let split_start = portal.startblock;
             call_control.register_function_graph(portal_path.clone(), portal);
@@ -2290,6 +2298,7 @@ fn register_configured_jitdrivers(
             spec.red_types.clone(),
             spec.portal.clone(),
         );
+        call_control.set_jitdriver_portal_runner(index, spec.portal_runner.clone());
     }
 }
 
@@ -2609,6 +2618,7 @@ mod portal_driver_tests {
     fn driver(portal: CallPath) -> pipeline::JitDriverSpec {
         pipeline::JitDriverSpec {
             portal,
+            portal_runner: None,
             greens: Vec::new(),
             reds: Vec::new(),
             green_kinds: Vec::new(),
@@ -2641,6 +2651,41 @@ mod portal_driver_tests {
         register_configured_jitdrivers(
             &mut call_control,
             &[driver(first), driver(second)],
+            &GraphTransformConfig::default().jitdriver_receiver_roots,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "derived split portal path `fixture::eval_loop_jit_portal` collides")]
+    fn rejects_split_portal_path_collision() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let derived = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let mut graph = FunctionGraph::new("eval_loop_jit");
+        let receiver = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(graph.startblock).inputargs = vec![receiver.clone()];
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                    args: vec![receiver],
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+        call_control.register_function_graph(derived, return_graph("unrelated_existing_graph"));
+        let mut spec = driver(portal);
+        spec.split_portal = true;
+
+        register_configured_jitdrivers(
+            &mut call_control,
+            &[spec],
             &GraphTransformConfig::default().jitdriver_receiver_roots,
         );
     }
@@ -2714,6 +2759,7 @@ mod portal_driver_tests {
             transform: GraphTransformConfig::default(),
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
+                portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),
@@ -2736,15 +2782,22 @@ mod portal_driver_tests {
         );
         let split_portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
         assert_eq!(call_control.jitdrivers_sd()[0].portal_graph, split_portal);
+        assert_eq!(
+            call_control.jitdrivers_sd()[0].portal_runner,
+            Some(CallPath::from_segments(["fixture", "portal_runner"]))
+        );
         let split_graph = call_control
             .function_graphs()
             .get(&split_portal)
             .expect("split portal graph must be registered under its derived path");
         assert_eq!(split_graph.name, "eval_loop_jit_portal");
+        assert!(split_graph.func.dont_inline);
+        assert!(split_graph.hints.iter().any(|hint| hint == "unroll_safe"));
         assert_eq!(
             split_graph.source_identity.as_deref(),
             Some("pyre_jit::eval::eval_loop_jit#portal")
         );
+        let split_reds = split_graph.block(split_graph.startblock).inputargs[3..5].to_vec();
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
@@ -2767,6 +2820,7 @@ mod portal_driver_tests {
             })
             .expect("portal emits a jit_merge_point");
         assert_eq!(merge.len(), 2);
+        assert_eq!(merge, &split_reds);
         assert!(
             merge
                 .iter()

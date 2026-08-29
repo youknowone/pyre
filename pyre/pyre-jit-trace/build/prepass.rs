@@ -1029,6 +1029,10 @@ fn real_main() {
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {
                     portal: majit_translate::CallPath::from_segments(["eval", "eval_loop_jit"]),
+                    portal_runner: Some(majit_translate::CallPath::from_segments([
+                        "call_jit",
+                        "ll_portal_runner_shim",
+                    ])),
                     greens: pypyjit_driver_layout::PYPYJIT_GREEN_VARS
                         .iter()
                         .map(|(name, _)| (*name).to_string())
@@ -1060,6 +1064,7 @@ fn real_main() {
                         "baseobjspace",
                         "_unpackiterable_unknown_length",
                     ]),
+                    portal_runner: None,
                     greens: vec!["greenkey".to_string()],
                     reds: vec![],
                     green_kinds: vec![majit_ir::Type::Ref],

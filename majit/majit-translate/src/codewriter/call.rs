@@ -551,6 +551,10 @@ pub struct JitDriverStaticData {
     pub red_types: Vec<String>,
     /// Portal graph path.
     pub portal_graph: CallPath,
+    /// `warmspot.py jd.portal_runner_ptr`: the synthetic helper that owns
+    /// recursive portal entry.  It is deliberately distinct from both the
+    /// split portal graph and the graph containing the original merge point.
+    pub portal_runner: Option<CallPath>,
     /// `warmspot.py split_graph_and_record_jitdriver`: graph containing the
     /// marker before the split portal copy was made.
     pub jit_merge_point_in: CallPath,
@@ -3275,6 +3279,7 @@ impl CallControl {
     /// with no green/red layout. Used by tests that need a portal without a
     /// full driver registration; production seeds via `setup_jitdriver`.
     pub fn mark_portal(&mut self, path: CallPath) {
+        let index = self.jitdrivers_sd.len();
         self.setup_jitdriver(
             path.clone(),
             Vec::new(),
@@ -3284,8 +3289,12 @@ impl CallControl {
             false,
             Vec::new(),
             Vec::new(),
-            path,
+            path.clone(),
         );
+        // Test-only shorthand: production warmspot attaches a distinct
+        // synthetic runner after splitting, but callers of `mark_portal`
+        // explicitly provide the target they want classified recursive.
+        self.set_jitdriver_portal_runner(index, Some(path));
     }
 
     /// `codewriter.py CodeWriter.setup_vrefinfo(self, vrefinfo)`.
@@ -3365,6 +3374,7 @@ impl CallControl {
             virtualizables,
             red_types,
             portal_graph,
+            portal_runner: None,
             jit_merge_point_in,
             mainjitcode: None,
             index_of_virtualizable: -1,
@@ -3381,6 +3391,15 @@ impl CallControl {
         if let Some(jd) = self.jitdrivers_sd.get_mut(index) {
             jd.active = active;
         }
+    }
+
+    /// Attach `warmspot.py jd.portal_runner_ptr` after driver creation.
+    ///
+    /// Warmspot creates this helper after the portal graph has been split;
+    /// keeping the assignment separate mirrors that construction order and
+    /// prevents graph identity from standing in for runner identity.
+    pub fn set_jitdriver_portal_runner(&mut self, index: usize, runner: Option<CallPath>) {
+        self.jitdrivers_sd[index].portal_runner = runner;
     }
 
     /// warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
@@ -3629,14 +3648,18 @@ impl CallControl {
 
     /// call.py `jitdriver_sd_from_portal_runner_ptr(funcptr)`.
     ///
-    /// Pyre has no separate `portal_runner_ptr` (the runner is the
-    /// portal graph itself), so we reuse the path lookup.  Future
-    /// phases that need the distinction can split the field.
     pub fn jitdriver_sd_from_portal_runner_ptr(
         &self,
         path: &CallPath,
     ) -> Option<&JitDriverStaticData> {
-        self.jitdriver_sd_from_portal_graph(path)
+        self.jitdrivers_sd
+            .iter()
+            .find(|sd| sd.portal_runner.as_ref() == Some(path))
+    }
+
+    /// `call.py jitdriver_sd_from_portal_runner_ptr(funcptr) is not None`.
+    fn is_portal_recursive_call(&self, path: &CallPath) -> bool {
+        self.jitdriver_sd_from_portal_runner_ptr(path).is_some()
     }
 
     /// call.py `jitdriver_sd_from_jitdriver(jitdriver)`.
@@ -4026,10 +4049,7 @@ impl CallControl {
                             };
                             // `call.py:119-120`
                             // jitdriver_sd_from_portal_runner_ptr → recursive.
-                            if self.jitdrivers_sd.iter().any(|jd| {
-                                jd.portal_graph == callee_path
-                                    || jd.jit_merge_point_in == callee_path
-                            }) {
+                            if self.is_portal_recursive_call(&callee_path) {
                                 // Not a refusal — the portal is already a
                                 // candidate and re-walking it would loop —
                                 // but recorded so the BFS's skip rows add up
@@ -4578,11 +4598,7 @@ impl CallControl {
             let path = self.target_to_path(target);
             if let Some(ref p) = path {
                 // call.py jitdriver_sd_from_portal_runner_ptr(funcptr)
-                if self
-                    .jitdrivers_sd
-                    .iter()
-                    .any(|jd| &jd.portal_graph == p || &jd.jit_merge_point_in == p)
-                {
+                if self.is_portal_recursive_call(p) {
                     return CallKind::Recursive;
                 }
                 // call.py:129-134 _gctransformer_hint_close_stack_ → 'residual'
@@ -9800,6 +9816,42 @@ mod tests {
             cc.guess_call_kind(&direct_call_op(target)),
             CallKind::Recursive
         );
+    }
+
+    #[test]
+    fn only_portal_runner_identity_is_recursive() {
+        let mut cc = CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let original = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let runner = CallPath::from_segments(["call_jit", "ll_portal_runner_shim"]);
+        cc.setup_jitdriver(
+            portal.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            original.clone(),
+        );
+        cc.set_jitdriver_portal_runner(0, Some(runner.clone()));
+
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                runner.segments.clone()
+            ))),
+            CallKind::Recursive
+        );
+        for non_runner in [portal, original] {
+            assert_ne!(
+                cc.guess_call_kind(&direct_call_op(CallTarget::function_path(
+                    non_runner.segments
+                ))),
+                CallKind::Recursive,
+                "portal graph identities must not stand in for portal_runner_ptr"
+            );
+        }
     }
 
     #[test]

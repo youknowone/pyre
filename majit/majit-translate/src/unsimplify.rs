@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
+use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::Variable;
 use crate::model::{BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation};
 
@@ -349,12 +350,22 @@ pub(crate) fn split_block(
     index: usize,
     forcelink: Option<&[Variable]>,
 ) -> BlockId {
+    let operation_len = graph.block(block).operations.len();
     assert!(
-        index <= graph.block(block).operations.len(),
+        index <= operation_len,
         "split_block: index out of range (got {}, len={})",
         index,
-        graph.block(block).operations.len(),
+        operation_len,
     );
+    if matches!(
+        graph.block(block).exitswitch,
+        Some(ExitSwitch::LastException)
+    ) {
+        assert!(
+            index < operation_len,
+            "split_block: cannot split a LastException block after its raising operation"
+        );
+    }
 
     // `unsimplify.py split_block`: `varmap.keys()` is consumed in first-
     // insertion order, so keep that order independently of HashMap iteration.
@@ -484,28 +495,45 @@ pub(crate) fn split_block(
             .and_then(jit_merge_point_receiver)
             .map(Variable::id);
         let mut rematerialized_ids = Vec::new();
-        let mut rematerialized_ops = Vec::new();
         for var in &missing {
-            if marker_receiver_id != Some(var.id()) {
-                continue;
-            }
-            let Some(producer) = rematerializable_marker_receiver_producer(graph, var) else {
+            let rematerialized_kind = if FunctionGraph::concretetype_of(var) == ConcreteType::Void {
+                // `unsimplify.py split_block`: recreate every omitted Void
+                // value as `same_as(Constant(None, lltype.Void))`.  The rich
+                // model represents the constant-producing operation directly;
+                // later lowering treats `ConstNone` as lltype.Void.
+                Some(OpKind::ConstNone)
+            } else if marker_receiver_id == Some(var.id()) {
+                // Pre-rtyping structural adaptation for the driver singleton:
+                // its source graph may still expose a ref/unknown receiver
+                // where upstream has already rtyped it to Void.
+                rematerializable_marker_receiver_producer(graph, var).map(|producer| producer.kind)
+            } else {
+                None
+            };
+            let Some(kind) = rematerialized_kind else {
                 continue;
             };
             let result = varmap
                 .get(*var)
                 .cloned()
                 .expect("split_block: missing Variable has no fresh mapping");
-            // The moved operations already use this fresh varmap result, so
-            // making it the copied producer's result performs the substitution.
+            // Upstream inserts `same_as` immediately before the first operation
+            // that consumes the fresh variable (or at the end when only an
+            // outgoing link/exitswitch needs it).
+            let insert_at = moved_operations
+                .iter()
+                .position(|op| crate::inline::op_variable_refs(&op.kind).contains(&result))
+                .unwrap_or(moved_operations.len());
             rematerialized_ids.push(var.id());
-            rematerialized_ops.push(SpaceOperation {
-                result: Some(result),
-                kind: producer.kind,
-            });
+            moved_operations.insert(
+                insert_at,
+                SpaceOperation {
+                    result: Some(result),
+                    kind,
+                },
+            );
         }
         missing.retain(|var| !rematerialized_ids.contains(&var.id()));
-        moved_operations.splice(0..0, rematerialized_ops);
         if !missing.is_empty() {
             let uses = use_sites(
                 &moved_source,
@@ -680,6 +708,18 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "cannot split a LastException block")]
+    fn split_at_end_of_last_exception_block_is_rejected() {
+        let a = Variable::named("a");
+        let result = Variable::named("result");
+        let mut graph = graph_with_ops(vec![a.clone()], vec![unary(&a, &result)], result);
+        let old = graph.startblock;
+        graph.block_mut(old).exitswitch = Some(ExitSwitch::LastException);
+
+        split_block(&mut graph, old, 1, None);
+    }
+
+    #[test]
     fn split_with_forcelink_uses_explicit_order() {
         let a = Variable::named("a");
         let b = Variable::named("b");
@@ -706,6 +746,47 @@ mod tests {
             vec![LinkArg::Value(b), LinkArg::Value(a)]
         );
         assert_eq!(graph.block(new).inputargs.len(), 2);
+    }
+
+    #[test]
+    fn split_with_forcelink_rematerializes_every_omitted_void() {
+        let kept = Variable::named("kept");
+        let omitted_void = Variable::named("omitted_void");
+        FunctionGraph::set_concretetype_of_inline(&omitted_void, ConcreteType::Void);
+        let result = Variable::named("result");
+        let mut graph = graph_with_ops(
+            vec![kept.clone(), omitted_void.clone()],
+            vec![SpaceOperation {
+                result: Some(result.clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::function_path(["consume_void"]),
+                    args: vec![omitted_void],
+                    result_ty: ValueType::Void,
+                },
+            }],
+            result,
+        );
+        let old = graph.startblock;
+
+        let new = split_block(&mut graph, old, 0, Some(&[kept]));
+
+        assert_eq!(graph.block(new).inputargs.len(), 1);
+        assert!(matches!(
+            graph.block(new).operations[0].kind,
+            OpKind::ConstNone
+        ));
+        let recreated = graph.block(new).operations[0]
+            .result
+            .as_ref()
+            .expect("ConstNone must recreate the omitted Void variable");
+        assert_eq!(
+            FunctionGraph::concretetype_of(recreated),
+            ConcreteType::Void
+        );
+        let OpKind::Call { args, .. } = &graph.block(new).operations[1].kind else {
+            panic!("original consumer must remain a Call")
+        };
+        assert_eq!(args, &[recreated.clone()]);
     }
 
     fn assert_split_rematerializes_marker_receiver(producer_kind: OpKind) {

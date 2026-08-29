@@ -25,6 +25,13 @@ pub struct JitDriverSpec {
     /// Resolution is deliberately exact: leaf-name fallback makes portal
     /// selection depend on unrelated functions and aliases in the input set.
     pub portal: CallPath,
+    /// Exact identity of the synthetic portal runner function.
+    ///
+    /// RPython: `JitDriverStaticData.portal_runner_ptr`.  This is distinct
+    /// from both `portal_graph` and `_jit_merge_point_in`: only direct calls
+    /// to the runner classify as recursive in `CallControl.guess_call_kind`.
+    #[serde(default)]
+    pub portal_runner: Option<CallPath>,
     pub greens: Vec<String>,
     pub reds: Vec<String>,
     /// Optional operand-kind declarations parallel to `greens`.
@@ -118,6 +125,10 @@ pub struct PipelineResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledJitDriver {
     pub portal: CallPath,
+    /// RPython: `jitdriver_sd.portal_runner_ptr`, preserved as source-level
+    /// identity alongside the run-time `portal_runner_adr`.
+    #[serde(default)]
+    pub portal_runner: Option<CallPath>,
     pub main_jitcode_index: usize,
     /// RPython: `jitdriver.greens` — the green names, in declaration order.
     #[serde(default)]
@@ -266,6 +277,7 @@ mod tests {
             }],
             jit_drivers: vec![CompiledJitDriver {
                 portal: CallPath::from_segments(["eval", "mainloop"]),
+                portal_runner: None,
                 main_jitcode_index: 0,
                 greens: Vec::new(),
                 reds: Vec::new(),
@@ -303,6 +315,7 @@ mod tests {
             transform: GraphTransformConfig::default(),
             jit_drivers: vec![JitDriverSpec {
                 portal: CallPath::from_segments(["engine", "mainloop"]),
+                portal_runner: None,
                 greens: Vec::new(),
                 reds: Vec::new(),
                 green_kinds: Vec::new(),
