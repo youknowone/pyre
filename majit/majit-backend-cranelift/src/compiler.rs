@@ -252,7 +252,7 @@ fn attached_descr_ptrs_with_fallbacks(
 fn match_metainterp_finish_descr(
     jf_descr_raw: i64,
     attachments: &'static CpuDescrAttachments,
-) -> Option<&DescrRef> {
+) -> Option<&'static DescrRef> {
     let ptr = jf_descr_raw as usize;
     fn check(
         slot: &'static Option<majit_ir::DescrRef>,
