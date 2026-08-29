@@ -1,4 +1,5 @@
 import gc
+import sys
 from array import _array_reconstructor, array
 from io import BytesIO
 from pickle import dumps, loads
@@ -926,3 +927,72 @@ partial = array("i")
 with assert_raises(ValueError):
     partial.fromfile(BytesIO(b"\x01\x00\x00\x00X"), 2)
 assert partial == array("i")
+
+# PyPy's @unwrap_spec(n=int) completes before descr_fromfile reads itemsize;
+# the count and read callbacks may both mutate the rooted receiver.
+fromfile_target = array("i", [1])
+
+
+class GrowingFromfileCount:
+    def __index__(self):
+        fromfile_target.append(2)
+        gc.collect()
+        return 1
+
+
+class ReenteringReader:
+    def read(self, size):
+        assert size == array("i").itemsize
+        fromfile_target.append(3)
+        gc.collect()
+        return array("i", [4]).tobytes()
+
+
+fromfile_target.fromfile(ReenteringReader(), GrowingFromfileCount())
+assert fromfile_target == array("i", [1, 2, 3, 4])
+
+for count in (1 << 200, -(1 << 200)):
+    with assert_raises(OverflowError) as error:
+        array("i").fromfile(BytesIO(), count)
+    assert str(error.exception) == "Python int too large to convert to C ssize_t"
+
+
+class MustNotRead:
+    def __init__(self):
+        self.called = False
+
+    def read(self, size):
+        self.called = True
+        return b""
+
+
+for typecode in ("h", "q"):
+    product_overflow = array(typecode)
+    unread = MustNotRead()
+    with assert_raises(MemoryError) as error:
+        product_overflow.fromfile(
+            unread, sys.maxsize // product_overflow.itemsize + 1
+        )
+    assert str(error.exception) == ""
+    assert not unread.called
+
+# As in PyPy, frombytes processes an aligned result before the EOF check.  The
+# 3.14 boundary treats both short and over-long reads as unequal and reports
+# its byte-oriented EOFError sentence after retaining every complete item.
+short_read = array("i")
+with assert_raises(EOFError) as error:
+    short_read.fromfile(BytesIO(array("i", [5]).tobytes()), 2)
+assert str(error.exception) == "read() didn't return enough bytes"
+assert short_read == array("i", [5])
+
+
+class OverReader:
+    def read(self, size):
+        return array("i", [6, 7]).tobytes()
+
+
+over_read = array("i")
+with assert_raises(EOFError) as error:
+    over_read.fromfile(OverReader(), 1)
+assert str(error.exception) == "read() didn't return enough bytes"
+assert over_read == array("i", [6, 7])

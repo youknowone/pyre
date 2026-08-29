@@ -782,12 +782,13 @@ fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_none())
 }
 
-/// The index gateway for `array.insert` / `array.pop`.
+/// The ssize gateway for `array.insert` / `array.pop` / `array.fromfile`.
 ///
 /// PyPy's `W_ArrayBase.descr_insert` and `descr_pop` use `@unwrap_spec(...=int)`
-/// before entering the method body.  CPython 3.14 exposes the narrower
-/// `__index__` protocol and its Py_ssize_t overflow wording, so keep PyPy's
-/// gateway-before-body ordering while applying the 3.14 observable contract.
+/// and `descr_fromfile` uses `@unwrap_spec(n=int)` before entering the method
+/// body.  CPython 3.14 exposes the narrower `__index__` protocol and its
+/// Py_ssize_t overflow wording, so keep PyPy's gateway-before-body ordering
+/// while applying the 3.14 observable contract.
 fn array_ssize_index_w(w_index: PyObjectRef) -> Result<i64, PyError> {
     let w_index = crate::baseobjspace::space_index(w_index)?;
     crate::baseobjspace::int_w(w_index).map_err(|error| {
@@ -1255,32 +1256,40 @@ fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
 
 fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 3, "array.fromfile")?;
-    let obj = args[0];
-    let count = crate::builtins::getindex_w(args[2])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(args);
+    roots.normalize(base, args.len());
+    // PyPy `W_ArrayBase.descr_fromfile` runs its `@unwrap_spec(n=int)` gateway
+    // before reading `self.itemsize`.  The callback may resize and collect the
+    // receiver or file, so every input is reloaded from the published slots.
+    let count = array_ssize_index_w(roots.get(base + 2))?;
     if count < 0 {
         return Err(PyError::value_error("negative count"));
     }
-    let size = unsafe { arr::w_array_itemsize(obj) }
-        .checked_mul(count as usize)
+    let obj = roots.get(base);
+    let size = (unsafe { arr::w_array_itemsize(obj) } as i64)
+        .checked_mul(count)
         .ok_or_else(|| PyError::memory_error(""))?;
-    let w_bytes = call_method(args[1], "read", &[pyre_object::w_int_new(size as i64)])?;
+    // `ovfcheck(self.itemsize * n)` is a signed Py_ssize_t operation in PyPy;
+    // do not let a product in usize's upper half wrap when it is boxed below.
+    let size_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_int_new(size));
+    let w_bytes = call_method(roots.get(base + 1), "read", &[roots.get(size_slot)])?;
     if !unsafe { pyre_object::is_bytes(w_bytes) } {
         return Err(PyError::type_error("read() didn't return bytes"));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec();
-    // CPython 3.14 calls `frombytes` before reporting a short read.  A
-    // non-item-aligned result therefore raises ValueError without appending;
-    // PyPy's source has the same call order despite its EOF-focused comment.
-    array_frombytes(obj, &bytes)?;
-    if bytes.len() < size {
-        let mut error = PyError::value_error("not enough items in file");
-        if let Some(cls) = crate::builtins::lookup_exc_class("EOFError") {
-            let exc_args = [cls, pyre_object::w_str_new("not enough items in file")];
-            if let Ok(exc) = crate::builtins::exc_exception_new(&exc_args) {
-                error.exc_object = exc;
-            }
-        }
-        return Err(error);
+    // PyPy `descr_fromfile` calls `_frombytes` before reporting its short-read
+    // EOF, so an aligned prefix is appended and a non-aligned result fails in
+    // `_frombytes` first.  [3.14-spec] `array_array_fromfile_impl` makes any
+    // length unequal to the request an EOF (including an over-read) and uses
+    // the byte-oriented sentence below.
+    array_frombytes(roots.get(base), &bytes)?;
+    if bytes.len() != size as usize {
+        return Err(PyError::new(
+            PyErrorKind::EOFError,
+            "read() didn't return enough bytes",
+        ));
     }
     Ok(pyre_object::w_none())
 }
