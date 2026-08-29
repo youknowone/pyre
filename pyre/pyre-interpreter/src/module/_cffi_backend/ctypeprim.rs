@@ -601,17 +601,11 @@ fn convert_to_char_n_t(ct: &W_CType, w_ob: PyObjectRef) -> Result<u32, PyError> 
     Err(ct.convert_error("unicode string of length 1", w_ob))
 }
 
-/// `space.unpackcomplex`.
+/// `space.unpackcomplex`, which is [`crate::builtins::complex_coerce`] here:
+/// it asks for `__complex__` before falling back on the real-number
+/// protocol, and that is how a cdata of a complex ctype answers.
 fn unpack_complex(w_ob: PyObjectRef) -> Result<(f64, f64), PyError> {
-    if unsafe { pyre_object::pyobject::is_complex(w_ob) } {
-        return Ok(unsafe {
-            (
-                pyre_object::complexobject::w_complex_get_real(w_ob),
-                pyre_object::complexobject::w_complex_get_imag(w_ob),
-            )
-        });
-    }
-    Ok((crate::baseobjspace::float_w(w_ob)?, 0.0))
+    crate::builtins::complex_coerce(w_ob)
 }
 
 /// `W_CTypePrimitive._overflow`.
