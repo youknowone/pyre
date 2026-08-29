@@ -4097,6 +4097,42 @@ mod tests {
     }
 
     #[test]
+    fn test_ptr_eq_ref_against_int_modelled_pointer_folds() {
+        // `py_type_check` compares a heap object's `ob_type` against a
+        // `&'static PyType`.  The field read is a `Value::Ref`; the static's
+        // address is a pointer to non-moving memory, which pyre models as
+        // `Value::Int` holding the same word.  Once the receiver itself is a
+        // constant both args are constant and the pure pass folds the compare,
+        // so the fold has to read the word out of either shape -- the
+        // `(Ref, Ref)`-only spelling reached `execute_nonspec_const` with no
+        // matching row and panicked as an unregistered opcode.
+        let (result, ctx) = run_one(
+            vec![same_r(), same_r(), bin_r(OpCode::PtrEq, 0, 1)],
+            2,
+            &[
+                (OpRef::ref_op(0), Value::Ref(GcRef(4330386864))),
+                (OpRef::ref_op(1), Value::Int(4330386864)),
+            ],
+        );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 1);
+    }
+
+    #[test]
+    fn test_ptr_ne_ref_against_distinct_int_modelled_pointer_folds() {
+        let (result, ctx) = run_one(
+            vec![same_r(), same_r(), bin_r(OpCode::PtrNe, 0, 1)],
+            2,
+            &[
+                (OpRef::ref_op(0), Value::Ref(GcRef(4330386864))),
+                (OpRef::ref_op(1), Value::Int(4330408704)),
+            ],
+        );
+        assert_remove(&result);
+        assert_int_const(&ctx, OpRef::int_op(2), 1);
+    }
+
+    #[test]
     fn test_ptr_eq_distinct_constants_not_folded_in_rewrite() {
         // PtrEq(const 100, const 200): two distinct non-null ConstPtr.
         // rewrite.py _optimize_oois_ooisnot has no value-compare
