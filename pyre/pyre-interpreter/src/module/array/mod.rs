@@ -1427,17 +1427,26 @@ fn array_copy_method(args: &[PyObjectRef]) -> PyResult {
 /// `display::py_repr` so an array nested in a list / error / tuple formats
 /// the same way.
 pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyError> {
-    let tc = unsafe { arr::w_array_typecode(obj) } as char;
-    let len = unsafe { arr::w_array_len(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    // PyPy `W_ArrayBase.descr_repr` obtains
+    // `space.type(self).getname(space)`.  This is deliberately the live
+    // subclass name (including a later `__name__` assignment), not the fixed
+    // builtin owner's name.
+    let class_name = crate::baseobjspace::object_functionstr_type_name(current_obj());
+    let tc = unsafe { arr::w_array_typecode(current_obj()) } as char;
+    let len = unsafe { arr::w_array_len(current_obj()) };
     if len == 0 {
         return Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
-            "array('{tc}')"
+            "{class_name}('{tc}')"
         )));
     }
     let mut out = rustpython_wtf8::Wtf8Buf::new();
-    out.push_str(&format!("array('{tc}', "));
+    out.push_str(&format!("{class_name}('{tc}', "));
     if matches!(tc, 'u' | 'w') {
-        let s = array_tounicode_method(&[obj])?;
+        let s = array_tounicode_method(&[current_obj()])?;
         out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(s)? });
         out.push_str(")");
         return Ok(out);
@@ -1447,7 +1456,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
         if i != 0 {
             out.push_str(", ");
         }
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
+        let w_item = unsafe { arr::w_array_unpack_item(current_obj(), i) };
         out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(w_item)? });
     }
     out.push_str("])");
@@ -1998,7 +2007,6 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "__delitem__", array_delitem, 2);
     m(ns, "__contains__", array_contains_method, 2);
     m(ns, "__repr__", array_repr_method, 1);
-    m(ns, "__str__", array_repr_method, 1);
     m(ns, "__eq__", array_eq_method, 2);
     m(ns, "__ne__", array_ne_method, 2);
     m(ns, "__lt__", array_lt_method, 2);

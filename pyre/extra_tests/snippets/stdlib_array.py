@@ -1074,3 +1074,53 @@ assert str(error.exception) == "cannot resize an array that is exporting buffers
 exported_unicode_view.release()
 exported_unicode.fromunicode("x")
 assert exported_unicode.tounicode() == "x"
+
+# PyPy `descr_repr` uses the concrete class's current name.  There is no
+# separate `__str__` entry in either upstream; object stringification falls
+# back to the same repr slot.
+assert "__str__" not in array.__dict__
+
+
+class NamedArray(array):
+    pass
+
+
+empty_named = NamedArray("i")
+items_named = NamedArray("i", [1, 2])
+unicode_named = NamedArray("u", "x")
+assert repr(empty_named) == "NamedArray('i')"
+assert repr(items_named) == "NamedArray('i', [1, 2])"
+assert repr(unicode_named) == "NamedArray('u', 'x')"
+assert str(items_named) == "NamedArray('i', [1, 2])"
+assert repr([items_named]) == "[NamedArray('i', [1, 2])]"
+
+NamedArray.__name__ = "RenamedArray"
+assert repr(empty_named) == "RenamedArray('i')"
+assert repr(items_named) == "RenamedArray('i', [1, 2])"
+
+
+class OverrideReprArray(array):
+    def __repr__(self):
+        return "OVERRIDDEN ARRAY REPR"
+
+    def __str__(self):
+        return "OVERRIDDEN ARRAY STR"
+
+
+overridden_repr = OverrideReprArray("i", [1])
+assert repr(overridden_repr) == "OVERRIDDEN ARRAY REPR"
+assert repr([overridden_repr]) == "[OVERRIDDEN ARRAY REPR]"
+assert str(overridden_repr) == "OVERRIDDEN ARRAY STR"
+# Calling the base descriptor directly still formats the storage with the
+# concrete class name, rather than redispatching the override.
+assert array.__repr__(overridden_repr) == "OverrideReprArray('i', [1])"
+
+
+class OnlyReprArray(array):
+    def __repr__(self):
+        return "ONLY ARRAY REPR"
+
+
+only_repr = OnlyReprArray("i", [1])
+assert repr(only_repr) == "ONLY ARRAY REPR"
+assert str(only_repr) == "ONLY ARRAY REPR"

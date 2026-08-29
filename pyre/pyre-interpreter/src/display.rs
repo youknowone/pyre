@@ -591,6 +591,7 @@ pub(crate) unsafe fn builtin_subclass_dunder_obj(
             || pyre_object::is_tuple(obj)
             || pyre_object::is_dict(obj)
             || pyre_object::is_set_or_frozenset(obj)
+            || std::ptr::eq(tp, &pyre_object::interp_array::ARRAY_TYPE as *const PyType)
             || std::ptr::eq(
                 tp,
                 &pyre_object::bytearrayobject::BYTEARRAY_TYPE as *const PyType,
