@@ -14217,7 +14217,7 @@ fn source_text(
     crate::compile::decode_source_bytes(&bytes, filename, *flags & PYCF_IGNORE_COOKIE != 0)
 }
 
-fn replace_compile_syntax_error_filename(
+pub(crate) fn replace_compile_syntax_error_filename(
     mut error: crate::PyError,
     filename: &str,
     filename_bytes: Option<&[u8]>,

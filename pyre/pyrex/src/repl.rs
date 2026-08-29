@@ -299,9 +299,7 @@ fn report_or_exit_before_prompt(
 }
 
 /// Run `source` in the prompt's `__main__` namespace.
-fn exec_in_main(runtime: &ReplRuntime, code: pyre_interpreter::CodeObject) -> Result<(), PyError> {
-    let code_ptr = Box::into_raw(Box::new(code));
-    let w_code = pyre_interpreter::pycode::w_code_new(code_ptr as *const ());
+fn exec_in_main(runtime: &ReplRuntime, w_code: pyre_object::PyObjectRef) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let _ = pyre_object::gc_roots::pin_root(w_code);
     let code_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -338,12 +336,18 @@ fn run_startup_file(
         return;
     }
     let path = std::path::PathBuf::from(path);
-    let display = path.to_string_lossy().into_owned();
+    // `PYTHONSTARTUP` is read with `var_os`, so it is the one launcher path a
+    // filename with no UTF-8 spelling reaches -- `parse_args` refuses a
+    // non-Unicode argv outright.  Every name this file is reported under is
+    // derived from its filesystem bytes, so the script can open its own
+    // `__file__` and its tracebacks name the file that ran.
+    let filename_bytes = pyre_interpreter::gateway::fsencode_os_str(path.as_os_str());
+    let display = pyre_interpreter::gateway::fsdecode_filename_wtf8(&filename_bytes);
     let bytes = match importing::read_source_bytes(&path) {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("Could not open PYTHONSTARTUP");
-            let w_filename = pyre_object::w_str_new(&display);
+            let w_filename = pyre_interpreter::gateway::fsdecode_filename_bytes(&filename_bytes);
             report_or_exit_before_prompt(
                 PyError::os_error_syscall(e.raw_os_error().unwrap_or(0), w_filename),
                 canonical,
@@ -352,11 +356,7 @@ fn run_startup_file(
             return;
         }
     };
-    let source = match pyre_interpreter::decode_source_bytes(
-        &bytes,
-        rustpython_wtf8::Wtf8::new(display.as_str()),
-        false,
-    ) {
+    let source = match pyre_interpreter::decode_source_bytes(&bytes, &display, false) {
         Ok(source) => source,
         Err(error) => {
             report_or_exit_before_prompt(error, canonical, runtime.ctx_ptr);
@@ -374,7 +374,7 @@ fn run_startup_file(
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
             "__file__",
-            pyre_object::w_str_new(&display),
+            pyre_interpreter::gateway::fsdecode_filename_bytes(&filename_bytes),
         );
         let _ = pyre_interpreter::baseobjspace::setattr_str(
             main_module,
@@ -383,14 +383,8 @@ fn run_startup_file(
         );
     }
     let outcome =
-        match pyre_interpreter::compile_source_with_filename(&source, Mode::Exec, &display) {
-            Ok(code) => exec_in_main(runtime, code),
-            Err(e) => Err(pyre_interpreter::compile_err_to_syntax_error(
-                e,
-                &source,
-                Mode::Exec,
-            )),
-        };
+        pyre_interpreter::compile_source_named_by_bytes(&source, Mode::Exec, filename_bytes)
+            .and_then(|w_code| exec_in_main(runtime, w_code));
     if bind_file_name {
         let _ = pyre_interpreter::baseobjspace::delattr_str(main_module, "__file__");
         let _ = pyre_interpreter::baseobjspace::delattr_str(main_module, "__cached__");
