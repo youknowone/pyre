@@ -7331,6 +7331,7 @@ pub(crate) mod wasm_errno {
     pub const EEXIST: i32 = 17;
     pub const ENOENT: i32 = 2;
     pub const ENOTSUP: i32 = 45;
+    pub const EAFNOSUPPORT: i32 = 47;
     pub const EISDIR: i32 = 21;
     pub const ENOTDIR: i32 = 20;
     pub const EINTR: i32 = 4;
