@@ -1127,7 +1127,8 @@ impl<'a> Transformer<'a> {
     ///
     /// The two frame constructors call the hint (`pyre-interpreter`
     /// `pyframe.rs` `PyFrame::new` and `createframe_obj`, mirroring
-    /// `pyframe.py:99`), but neither is the caller this arm answers for:
+    /// `pyframe.py PyFrame.__init__`), but neither is the caller this arm
+    /// answers for:
     /// both hint a frame they hold by value, so the reachable path there
     /// is the structural sibling below,
     /// `FieldDescriptor::base_is_local_aggregate`, which recovers the

@@ -976,16 +976,12 @@ fn real_main() {
     // graph rewrite can recognize `next_instr`, `valuestackdepth`, and
     // `locals_cells_stack_w[*]` as virtualizable accesses before legacy
     // TracePattern classification runs.
-    // `_virtualizable_` is a class declaration upstream
-    // (`classdesc.get_param('_virtualizable_')`), consulted by `rlib/jit.py`'s
-    // `hint` entry before it mints `access_directly`. pyre's frame is a Rust
-    // struct that carries no such parameter, so the same table that fills
-    // `vable_fields` below declares it, and the front end reads it back
-    // through `virtualizable_decl`.
-    majit_translate::virtualizable_decl::register_virtualizable_roots([
-        virtualizable_spec::PYFRAME_VABLE_OWNER_ROOT.to_string(),
-    ]);
-
+    //
+    // `owner_root` below is also the `_virtualizable_` declaration upstream
+    // reads off the class (`classdesc.get_param('_virtualizable_')`, consulted
+    // by `rlib/jit.py`'s `hint` entry before it mints `access_directly`). The
+    // pipeline derives the front end's root set from these descriptors, so
+    // this table is the single place the frame is declared virtualizable.
     let analyze_config = majit_translate::AnalyzeConfig {
         pipeline: majit_translate::PipelineConfig {
             transform: majit_translate::GraphTransformConfig {

@@ -524,24 +524,33 @@ impl<'a> MirGraphLookup<'a> {
 /// the `(receiver root, method leaf)` pair, and an ambiguous pair is treated
 /// as unresolved.
 ///
-/// Measured on the interpreter's own graph, of the five hint sites only
-/// `eval::dispatch` seeds — the one whose hinted value is a `&mut PyFrame`,
-/// so `class_roots` reads `PyFrame` off the parameter's `Ref` leaf. The two
-/// frame constructors hint a `PyFrame` held BY VALUE, and the front end
-/// re-mints that aggregate's `Variable` between the transparent constructor
-/// and its uses without an op this pass follows, so its root is unrecorded
-/// and the minter's class test fails closed.
+/// The pass is inert in the production translation, and not for any reason
+/// inside it. A census over the build script's two pipeline invocations
+/// (489 and 4147 lowered functions) found **zero `OpKind::Hint` ops of any
+/// kind**, and neither frame constructor present in the set at all: the five
+/// hint sites are spelled in `pyre-interpreter` / `pyre-jit`, but nothing
+/// carrying one reaches the function set this pass runs over. So the seeds
+/// are empty before any of the machinery below gets a say, and every claim
+/// about which site seeds has to be re-measured once a hint does arrive —
+/// do not read a green gate here as agreement.
 ///
-/// Even the site that seeds flags nothing, and the first under-approximation
-/// is why. The seed reaches `handle_jitexception`'s argument and that callee
-/// resolves, but `handle_jitexception` is also reached from callers holding
-/// no hinted frame. Nearly every callee a hinted frame reaches is reached
-/// that way too, so the flag lands on no graph until pyre can specialize a
-/// second one. That leans the safe way — `policy::look_inside_graph` aborts
-/// on a flag it cannot honour, and the suppression the flag would buy
-/// (dropping a `jit_force_virtualizable`) has no injector on this path yet —
-/// but it means the gate is quiet by absence, not by agreement, and a census
-/// is the only way to tell which.
+/// The two under-approximations that will bite first when one does:
+///
+/// * `class_roots` answers with the ctor's own name for a struct literal,
+///   because that is the spelling everything else uses — `adt_node_class_root`
+///   ends on `name.rsplit("::")`, and the declared set holds the bare leaf.
+///   `front::mir` fills the same op's `result_ty` with `owner_path::leaf`, so
+///   reading that instead would answer with a spelling no comparison matches.
+///   A root reachable only through `result_ty` is still unrecorded, and a hint
+///   on an unrecorded or undeclared root seeds nothing — the erasing branch.
+///
+/// * One graph per function, where upstream keys a second on
+///   `(AccessDirect, key)`. A callee reached by both a hinted and an unhinted
+///   caller cannot be flagged, since the one graph has to answer for both;
+///   `reaching` counts the two and only flags a parameter no unflagged caller
+///   supplies. That leans the safe way — `policy::look_inside_graph` aborts on
+///   a flag it cannot honour — but it means a flag's absence is not evidence
+///   the flag was not wanted.
 pub(crate) fn propagate_access_directly(
     functions: &mut [SemanticFunction],
     dont_look_inside: &std::collections::HashSet<String>,
@@ -620,12 +629,23 @@ pub(crate) fn propagate_access_directly(
         }
         edges.push(func_edges);
     }
-    // Close the hint seeds over the aliases once: they never change.
+    // Close the hint seeds and the killed set over the aliases once: neither
+    // depends on which parameters are flagged, so neither changes between
+    // rounds.
+    //
+    // The killed set is closed IN PLACE because the fixpoint below subtracts
+    // it a second time, and both subtractions have to name the same set.  A
+    // killed value that reaches a merge arrives there under a freshly minted
+    // `inputarg`, and that same id is an alias target of whatever the other
+    // arm passed — so the raw set, which holds only the hint's own result,
+    // does not name it.  `binaryop.py pairtype(SomeInstance, SomeInstance)
+    // .union` deletes any flag key the other side lacks, so a merge one arm
+    // re-bound away carries no flag; closing the killed set is how that
+    // intersection is reproduced here.
     for (i, seeds) in hint_seeds.iter_mut().enumerate() {
         close_ids_over_aliases(&aliases[i], seeds);
-        let mut dead = killed[i].clone();
-        close_ids_over_aliases(&aliases[i], &mut dead);
-        seeds.retain(|id| !dead.contains(id));
+        close_ids_over_aliases(&aliases[i], &mut killed[i]);
+        seeds.retain(|id| !killed[i].contains(id));
     }
 
     // Per function, the parameter positions that arrive carrying the flag.
@@ -777,24 +797,29 @@ fn class_roots(func: &SemanticFunction) -> std::collections::HashMap<u64, String
                     .map(str::to_string),
                 OpKind::Call {
                     target, result_ty, ..
-                } => leaf_root(result_ty).map(str::to_string).or_else(|| {
-                    match target {
-                        // A struct literal names the type it builds; the
-                        // front end spells one as a transparent ctor.
-                        CallTarget::SyntheticTransparentCtor {
-                            name, is_struct, ..
-                        } if *is_struct => Some(name.clone()),
-                        // `__cast_pointer/<Root>` and
-                        // `__cast_instance_intrinsic/<Root>` carry the target
-                        // class in the path.
-                        CallTarget::FunctionPath { segments }
-                            if is_representation_cast(segments) =>
-                        {
-                            segments.get(1).cloned()
-                        }
-                        _ => None,
+                } => match target {
+                    // A struct literal names the type it builds; the front
+                    // end spells one as a transparent ctor.  This is read
+                    // BEFORE `result_ty` because the two spell the class
+                    // differently: the ctor carries the bare leaf, while
+                    // `front::mir` fills the same op's `result_ty` with
+                    // `owner_path::leaf`.  Every other producer of a root —
+                    // `adt_node_class_root`, which is where `OpKind::Input`'s
+                    // `class_root` comes from — collapses to the bare leaf, and
+                    // so does the declared virtualizable set, so reading
+                    // `result_ty` first would answer with a spelling nothing
+                    // else uses and no comparison could match.
+                    CallTarget::SyntheticTransparentCtor {
+                        name, is_struct, ..
+                    } if *is_struct => Some(name.clone()),
+                    // `__cast_pointer/<Root>` and
+                    // `__cast_instance_intrinsic/<Root>` carry the target
+                    // class in the path.
+                    CallTarget::FunctionPath { segments } if is_representation_cast(segments) => {
+                        segments.get(1).cloned()
                     }
-                }),
+                    _ => leaf_root(result_ty).map(str::to_string),
+                },
                 _ => None,
             };
             if let Some(root) = root {
@@ -896,8 +921,9 @@ fn resolve_callee(
 /// Whether a call is one of `front::mir`'s representation-cast markers.
 ///
 /// `jtransform.rs rewrite_op_cast_pointer` rewrites both to `same_as`
-/// (jtransform.py:254-257), so the result is the operand under a different
-/// static type — the one variable an RPython flow graph would have had.
+/// (`jtransform.py Transformer.rewrite_op_cast_pointer`), so the result is
+/// the operand under a different static type — the one variable an RPython
+/// flow graph would have had.
 fn is_representation_cast(segments: &[String]) -> bool {
     matches!(
         segments.first().map(String::as_str),
@@ -1426,6 +1452,133 @@ mod tests {
         assert!(
             !fns[2].graph.access_directly,
             "the flag must not survive the access_directly=False re-bind"
+        );
+    }
+
+    /// `front::mir` fills a transparent ctor's `result_ty` with
+    /// `owner_path::leaf`, while both the declared virtualizable set and
+    /// `OpKind::Input`'s `class_root` (via `adt_node_class_root`, which ends
+    /// on `name.rsplit("::")`) carry the bare leaf.  A hint on a value a
+    /// struct literal produced — which is what BOTH frame constructors hint —
+    /// therefore only seeds if the ctor's own name is what the class test
+    /// reads.  Every other test here types its value through
+    /// `declare_frame_param`, which spells the bare leaf, so this is the only
+    /// one that can see the difference.
+    #[test]
+    fn a_hint_on_a_struct_literal_seeds_through_the_ctor_name() {
+        use crate::flowspace::model::Variable;
+        use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
+
+        let mut ctor = free_fn("createframe_obj");
+        let start = ctor.graph.startblock;
+        let frame = Variable::named("frame");
+        ctor.graph.block_mut(start).operations.push(SpaceOperation {
+            result: Some(frame.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_struct_ctor(
+                    vec!["pyre_interpreter".to_string(), "pyframe".to_string()],
+                    "PyFrame",
+                ),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some("pyre_interpreter::pyframe::PyFrame".to_string())),
+            },
+        });
+        let hinted = Variable::named("hinted");
+        ctor.graph.block_mut(start).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Hint {
+                value: frame,
+                kind: crate::hints::HintKind::FreshVirtualizable,
+            },
+        });
+        ctor.graph.block_mut(start).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["init_cells".to_string()],
+                },
+                args: vec![hinted],
+                result_ty: ValueType::Void,
+            },
+        });
+
+        let mut fns = vec![ctor, free_fn("init_cells")];
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
+        assert!(
+            fns[1].graph.access_directly,
+            "the ctor's own name is the spelling the declared set holds"
+        );
+    }
+
+    /// A merge whose arms disagree is unflagged, because
+    /// `binaryop.py pairtype(SomeInstance, SomeInstance).union` keeps only the
+    /// flags BOTH sides carry — it deletes any key the other annotation lacks.
+    /// So a block reached both by a value the `False` spelling killed and by
+    /// one that still carries the flag must not be flagged.
+    ///
+    /// The sibling above cannot see this: there the killed value is consumed
+    /// in its own block, where the hint's own result id is what the seed set
+    /// is filtered against.  Here the merge gives the killed value a fresh
+    /// `inputarg` id, and that id is also an alias target of the flagged
+    /// parameter — so it only stays out of the seed set if the killed set is
+    /// closed over the aliases the same way the seeds are.
+    #[test]
+    fn a_merge_of_a_killed_and_a_flagged_value_is_not_flagged() {
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            BlockId, CallTarget, ExitCase, Link, OpKind, SpaceOperation, ValueType,
+        };
+
+        let mut mid = caller_hinting_arg0("app_profile_call", None, &[]);
+        let start = mid.graph.startblock;
+        let param = mid.graph.block(BlockId(0)).inputargs[0].clone();
+        let normal = Variable::named("normal_w_object");
+        mid.graph.block_mut(start).operations.push(SpaceOperation {
+            result: Some(normal.clone()),
+            kind: OpKind::Hint {
+                value: param.clone(),
+                kind: crate::hints::HintKind::NoAccessDirectly,
+            },
+        });
+
+        // The merge block's inputarg is a DIFFERENT Variable, as the front end
+        // mints it, and both arms feed it.
+        let merged = Variable::named("merged");
+        let body = mid.graph.create_block();
+        mid.graph.block_mut(body).inputargs = vec![merged.clone()];
+        mid.graph.block_mut(body).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["call_function".to_string()],
+                },
+                args: vec![merged],
+                result_ty: ValueType::Void,
+            },
+        });
+        let still_flagged =
+            Link::from_variables(&mid.graph, vec![param], body, Some(ExitCase::Bool(true)));
+        let re_bound =
+            Link::from_variables(&mid.graph, vec![normal], body, Some(ExitCase::Bool(false)));
+        mid.graph.block_mut(start).exits = vec![still_flagged, re_bound];
+
+        let mut fns = vec![
+            caller_hinting_arg0(
+                "dispatch",
+                Some(crate::hints::HintKind::AccessDirectly),
+                &[("app_profile_call", 1)],
+            ),
+            mid,
+            free_fn("call_function"),
+        ];
+        propagate_access_directly(&mut fns, &Default::default(), &vable_roots());
+        assert!(
+            fns[1].graph.access_directly,
+            "app_profile_call itself is still reached with the flag"
+        );
+        assert!(
+            !fns[2].graph.access_directly,
+            "a merge one arm re-bound away is not flagged, as `union` intersects"
         );
     }
 

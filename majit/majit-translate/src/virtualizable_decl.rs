@@ -12,6 +12,16 @@
 //! (`rvirtualizable.rs` records why). This module is where the front end
 //! reads it back, so the minter's class test can run before there is a
 //! `ClassDesc` to ask.
+//!
+//! Upstream the declaration is per-CLASS Bookkeeper state, so it is neither
+//! thread- nor invocation-scoped: `get_param` asks the class every time.
+//! Scoping it to an invocation is a pyre deviation forced by having no
+//! `ClassDesc` at this point, and the way it is kept honest is that the
+//! pipeline re-seeds this registry from its own `AnalyzeConfig` on every run
+//! (`lib.rs analyze_pipeline_from_module_paths`), deriving the roots from the
+//! `owner_root` the same config already puts on every
+//! `VirtualizableFieldDescriptor`. One declaration channel, refreshed per
+//! invocation — the shape `local_crates` has.
 
 use std::cell::RefCell;
 
@@ -32,6 +42,11 @@ thread_local! {
 /// Replace this thread's `_virtualizable_` root set. A later invocation on
 /// the same thread overwrites, matching the per-invocation semantics of
 /// `local_crates::register_local_crate_roots`.
+///
+/// The production caller is the pipeline itself, which derives the set from
+/// the `AnalyzeConfig` it was handed. Public for a consumer that builds a
+/// program without going through `analyze_pipeline_from_module_paths`; such a
+/// consumer owns the ordering, since the read happens during the build.
 pub fn register_virtualizable_roots(roots: impl IntoIterator<Item = String>) {
     REGISTERED.with(|registered| *registered.borrow_mut() = roots.into_iter().collect());
 }

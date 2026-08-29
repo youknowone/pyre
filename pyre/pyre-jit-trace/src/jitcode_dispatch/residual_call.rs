@@ -6083,6 +6083,54 @@ fn try_walker_force_quasi_immut_mapdict_write<Sym: WalkSym>(
     Some(())
 }
 
+/// The `RuntimeHelperKind` a residual's fold ladder may recognise, which is
+/// its own except while a profile function is installed.
+///
+/// A profiled frame owes `c_call` / `c_return` around every builtin call its
+/// bytecode makes — `baseobjspace.py call_valuestack`, `pyopcode.py`
+/// CALL_FUNCTION_KW / CALL_FUNCTION_EX and `callmethod.py CALL_METHOD_KW` hand
+/// `call_args_and_c_profile` the executing frame.  Upstream's compiled loop
+/// carries that reporting because its tracer traced THROUGH `call_args`, and
+/// its own `test_cprofile_builtin` unpacks exactly ONE loop out of a profiled
+/// `lst.append` / `lst.pop` pair: the answer there is to record the reporting,
+/// never to decline the trace.
+///
+/// The residual helpers take that same diversion
+/// (`call_jit.rs residual_call_c_profile_frame`), so the reporting rides in the
+/// trace as a `CALL_MAY_FORCE` to a helper that runs it — for exactly the three
+/// call helpers, which are the whole population that owes an event.  Every
+/// other kind reaching a residual dispatcher erases an operator dispatch, which
+/// reports nothing on cpython, pypy3 or pyre alike.
+///
+/// What the walker owes in return is to leave those three ALONE.  A fold, a
+/// descent into the builtin's own jitcode, or a `CALL_ASSEMBLER` replaces the
+/// residual with something that reaches no call door, and none of them can
+/// report: measured 2026-08-26, admitting a profiled trace while the folds
+/// stayed live stopped `len`'s `c_call` at the entry threshold, 1041, however
+/// long the tail.  Answering `None` is how they are left alone — no fold arm
+/// tests for it, so each declines exactly as it does for a shape it cannot
+/// handle, and the uniform decline path is the generic residual.
+///
+/// The two doors into a PYTHON callee owe `call` / `return` from `pyframe.py
+/// execute_frame` rather than `c_call`, and are closed for a trace function and
+/// a profiler alike by [`super::ec_hook_installed`].
+fn walker_foldable_runtime_helper<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    ei: &majit_ir::EffectInfo,
+) -> majit_ir::RuntimeHelperKind {
+    let owes_c_call_events = matches!(
+        ei.runtime_helper,
+        majit_ir::RuntimeHelperKind::CallFn
+            | majit_ir::RuntimeHelperKind::CallKw
+            | majit_ir::RuntimeHelperKind::CallFunctionEx
+    );
+    if owes_c_call_events && ctx.session.borrow().is_being_profiled {
+        majit_ir::RuntimeHelperKind::None
+    } else {
+        ei.runtime_helper
+    }
+}
+
 /// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
 /// R-list args, and `descr`, runs `_build_allboxes` to produce the
 /// callee's ABI-ordered arglist, classifies the call by `EffectInfo`
@@ -6272,47 +6320,10 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // sees the later replacement.
     replace_movable_load_global_namespace_with_frame_globals(ctx, ei.runtime_helper, &mut r_args);
 
-    // A profiled frame owes `c_call` / `c_return` around every builtin call
-    // its bytecode makes -- `baseobjspace.py call_valuestack`, `pyopcode.py`
-    // CALL_FUNCTION_KW / CALL_FUNCTION_EX and `callmethod.py CALL_METHOD_KW`
-    // hand `call_args_and_c_profile` the executing frame.  Upstream's compiled
-    // loop carries that reporting because its tracer traced THROUGH
-    // `call_args`; this walker decides the call instead, folding or
-    // residualising it, and either way the arm that reports never runs.
-    //
-    // So decline the walk rather than compile a loop that runs its tail
-    // silently.  The three call helpers are the whole population that owes an
-    // event -- every other `RuntimeHelperKind` reaching this dispatcher erases an
-    // operator dispatch, which reports nothing on cpython, pypy3 or pyre
-    // alike.
-    //
-    // A `CallFn` naming a PYTHON callee owes no `c_call` either, and
-    // `call_valuestack` draws that line at `is_builtin_code(w_func)`.  The
-    // walker could be told: operand 0 of the plain `CallFn` shape carries the
-    // callable, and a `GuardValue` pins the recording-time answer.  Measured
-    // 2026-08-26, that is NOT enough and the narrowing was reverted --
-    // `profile_hook_armed_before_a_hot_loop` fails on all three backends.
-    // Admitting the trace for the Python callee also admits every FOLDED
-    // builtin in the same loop body, and a fold never reaches this dispatcher
-    // at all, so `len`'s `c_call` / `c_return` stop firing.  The decline on
-    // the Python call was what protected them.  Reporting has to be RECORDED
-    // into the trace before any of this can narrow; declining is the safe
-    // answer until then.
-    //
-    // This converges rather than retracing forever: `abort_count` reaches
-    // `MAX_TRACE_ABORT_COUNT` on the profiled green key and the cell latches
-    // `JC_DONT_TRACE_HERE`.  Being a green is also what keeps that ban off the
-    // unprofiled cell -- see `DispatchError::ProfiledResidualCall`.
-    if ctx.session.borrow().is_being_profiled
-        && matches!(
-            ei.runtime_helper,
-            majit_ir::RuntimeHelperKind::CallFn
-                | majit_ir::RuntimeHelperKind::CallKw
-                | majit_ir::RuntimeHelperKind::CallFunctionEx
-        )
-    {
-        return Err(DispatchError::ProfiledResidualCall { pc: op.pc });
-    }
+    // The identity the fold ladder below is allowed to recognise, which under
+    // a profile function is not this call's own — see
+    // [`walker_foldable_runtime_helper`].
+    let foldable_runtime_helper = walker_foldable_runtime_helper(ctx, ei);
     // Residual-call entry mirrors `execute_varargs`: even when the walker
     // folds the call or leaves it recorded symbolically, stale handled
     // exceptions from earlier opcodes are not visible to the following
@@ -6328,7 +6339,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_list_pop(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -6344,7 +6355,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // generic residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinLen, || {
             try_walker_specialize_builtin_len(ctx, code, op, &r_args, dst)
         })?
@@ -6369,7 +6380,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // which loses the brake rather than applying a wrong one.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && walker_active_py_code(ctx)
             .is_none_or(|active| !pyre_interpreter::code_returns_only_constants(active))
         && try_walker_force_quasi_immut_class_body(ctx, code, op, 1, &r_args)
@@ -6385,9 +6396,16 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // BuiltinCode.func is an indirect PBC target exactly like RPython's
     // gateway wrappers.  Enter its generated JitCode before considering the
     // user-function-only full-body walk below.
-    if let Some(inlined) =
-        try_walker_inline_builtin_call(ctx, op, code, 1, &r_args, ei.runtime_helper, dst_bank, dst)?
-    {
+    if let Some(inlined) = try_walker_inline_builtin_call(
+        ctx,
+        op,
+        code,
+        1,
+        &r_args,
+        foldable_runtime_helper,
+        dst_bank,
+        dst,
+    )? {
         return Ok(inlined);
     }
 
@@ -6404,7 +6422,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         funcptr,
         &r_args,
         call_descr,
-        ei.runtime_helper,
+        foldable_runtime_helper,
         dst_bank,
         dst,
     )? {
@@ -6413,7 +6431,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
         if let Some(inlined) = try_walker_inline_exception_string_override(
             ctx, op, code, funcptr, &r_args, call_descr, dst,
@@ -6445,7 +6463,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         funcptr,
         &r_args,
         call_descr,
-        ei.runtime_helper,
+        foldable_runtime_helper,
         dst_bank,
         dst,
     )? {
@@ -6617,7 +6635,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // (e.g. the `(i % 7)` in `(i % 7) and (i + 3)`) folds to a pure
         // `int_is_true`, eliding the may-force call whose force/exc guards
         // mis-resume the kept short-circuit stack.
-        if ei.runtime_helper == majit_ir::RuntimeHelperKind::Truth {
+        if foldable_runtime_helper == majit_ir::RuntimeHelperKind::Truth {
             if let Some(truth) = spec_gate(SpecFold::TruthInt, || {
                 try_walker_specialize_truth_int(ctx, op.pc, r_args[0])
             })? {
@@ -6643,7 +6661,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
         && spec_gate(SpecFold::UnaryPositiveDescent, || {
             try_walker_orthodox_unary_positive(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
@@ -6659,7 +6677,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryPositive
         && spec_gate(SpecFold::UnaryPositiveInt, || {
             try_walker_specialize_unary_positive_int(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
@@ -6677,7 +6695,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
         && spec_gate(SpecFold::UnaryNegativeDescent, || {
             try_walker_orthodox_unary_negative(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
@@ -6695,7 +6713,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryInvert
         && spec_gate(SpecFold::UnaryInvertDescent, || {
             try_walker_orthodox_unary_invert(ctx, op.pc, r_args[0], dst, dst_bank)
         })?
@@ -6712,7 +6730,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // whose commit/rollback epilogues run on FBW walk ends.
     if ctx.is_authoritative_executor
         && dst_bank == 'v'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::StoreSubscr
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::StoreSubscr
     {
         if spec_gate(SpecFold::StoreSubscr, || {
             try_walker_specialize_store_subscr(ctx, op.pc, &r_args)
@@ -6745,7 +6763,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
 
     // Range GET_ITER: virtualize exact machine-word `range` into the same
     // `W_IntRangeIterator` shape PyPy's inlined `descr_iter` would trace.
-    if ctx.is_authoritative_executor && ei.runtime_helper == majit_ir::RuntimeHelperKind::GetIter {
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::GetIter
+    {
         if let Some(iter_op) = spec_gate(SpecFold::GetIter, || {
             try_walker_specialize_get_iter(ctx, op.pc, &r_args, dst, dst_bank)
         })? {
@@ -6766,7 +6786,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // including NULL for exhaustion, so the codewriter's trailing
     // GuardNonnull remains the only loop-exit guard.
     if ctx.is_authoritative_executor
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::ForIterNext
     {
         if let Some(item_op) = spec_gate(SpecFold::ForIterNext, || {
             try_walker_specialize_for_iter_next(ctx, op.pc, &r_args, dst, dst_bank)
@@ -6789,7 +6809,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // reproduce constant-for-constant (SAFE — never declined).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::MakeFunction
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::MakeFunction
         && spec_gate(SpecFold::MakeFunction, || {
             try_walker_specialize_make_function(ctx, op.pc, &r_args, dst, dst_bank)
         })?
@@ -6805,7 +6825,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // opaque residual for any other shape (SAFE — never declined).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::NewtupleFromArray
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewtupleFromArray
         && spec_gate(SpecFold::Newtuple, || {
             try_walker_specialize_newtuple(ctx, op.pc, &r_args, dst, dst_bank)
         })?
@@ -6822,7 +6842,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // declined).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::NewtupleFromArray
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewtupleFromArray
         && spec_gate(SpecFold::NewtupleObject, || {
             try_walker_specialize_newtuple_object(ctx, op.pc, &r_args, dst, dst_bank)
         })?
@@ -6842,7 +6862,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // declined.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::NewlistFromArray
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewlistFromArray
         && spec_gate(SpecFold::Newlist, || {
             try_walker_specialize_newlist(ctx, op.pc, &r_args, dst, dst_bank)
         })?
@@ -6888,7 +6908,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_orthodox_list_append(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -6905,7 +6925,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && !ctx.fbw_mode.inline_subwalk
         && dst_bank == 'v'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::ListAppendValue
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::ListAppendValue
     {
         // Fold to native array stores when the receiver has spare capacity, or
         // fall through to the generic `jit_list_append` residual below.  The
@@ -6930,7 +6950,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // iterator state and read the resolved entry value live.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinDictGet, || {
             try_walker_specialize_builtin_dict_get(ctx, code, op, &r_args, dst)
         })?
@@ -6944,7 +6964,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Non-matching shapes fall through to the generic residual.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinTypeGetattr, || {
             try_walker_specialize_builtin_type_getattr(ctx, code, op, &r_args, dst)
         })?
@@ -6959,7 +6979,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // which answers the receiver the instance-shape read declines.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinGetattr, || {
             try_walker_specialize_builtin_getattr(ctx, code, op, &r_args, dst)
         })?
@@ -6973,7 +6993,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Non-canonical callables and arguments fall through to the residual.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
         if let Some(outcome) = spec_gate(SpecFold::BuiltinRange, || {
             try_walker_specialize_builtin_range(ctx, code, op, funcptr, &r_args, call_descr, dst)
@@ -6985,7 +7005,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Virtualize PyPy's exact `zip(tuple0, tuple1, strict=True)` shape.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallKw
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallKw
         && spec_gate(SpecFold::BuiltinZip, || {
             try_walker_specialize_builtin_zip(ctx, code, op, &r_args, dst)
         })?
@@ -7005,7 +7025,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // falls through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinLocals, || {
             try_walker_specialize_builtin_locals(ctx, code, op, &r_args, dst)
         })?
@@ -7024,7 +7044,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::SysGetframe, || {
             try_walker_specialize_sys_getframe(ctx, code, op, &r_args, dst)
         })?
@@ -7041,7 +7061,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // non-finite sqrt) falls through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathSqrt, || {
             try_walker_specialize_math_sqrt(ctx, code, op, &r_args, dst)
         })?
@@ -7051,7 +7071,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathLogTrig, || {
             try_walker_specialize_math_log_trig(ctx, code, op, &r_args, dst)
         })?
@@ -7061,7 +7081,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathFrexp, || {
             try_walker_specialize_math_frexp(ctx, code, op, &r_args, dst)
         })?
@@ -7071,7 +7091,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathLdexp, || {
             try_walker_specialize_math_ldexp(ctx, code, op, &r_args, dst)
         })?
@@ -7081,7 +7101,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathIsqrt, || {
             try_walker_specialize_math_isqrt(ctx, code, op, &r_args, dst)
         })?
@@ -7091,7 +7111,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathFabs, || {
             try_walker_specialize_math_fabs(ctx, code, op, &r_args, dst)
         })?
@@ -7101,7 +7121,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathFloat1, || {
             try_walker_specialize_math_float1(ctx, code, op, &r_args, dst)
         })?
@@ -7111,7 +7131,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathFloat2, || {
             try_walker_specialize_math_float2(ctx, code, op, &r_args, dst)
         })?
@@ -7121,7 +7141,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathIsclose, || {
             try_walker_specialize_math_isclose(ctx, code, op, &r_args, dst, dst_bank)
         })?
@@ -7131,7 +7151,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinFold1, || {
             try_walker_specialize_builtin_fold1(ctx, code, op, &r_args, dst)
         })?
@@ -7141,7 +7161,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinFold2, || {
             try_walker_specialize_builtin_fold2(ctx, code, op, &r_args, dst)
         })?
@@ -7151,7 +7171,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathFloor, || {
             try_walker_specialize_math_round_to_int(
                 ctx,
@@ -7168,7 +7188,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathCeil, || {
             try_walker_specialize_math_round_to_int(
                 ctx,
@@ -7185,7 +7205,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::MathTrunc, || {
             try_walker_specialize_math_round_to_int(
                 ctx,
@@ -7202,7 +7222,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::IntCall, || {
             try_walker_specialize_int_call(ctx, code, op, &r_args, dst)
         })?
@@ -7213,7 +7233,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // Ahead of the re-route below, which is what a decline here falls back to.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BareSuperVirtual, || {
             try_walker_specialize_bare_super_virtual(ctx, code, op, &r_args, dst)
         })?
@@ -7223,7 +7243,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BareSuperCall, || {
             try_walker_specialize_bare_super_call(ctx, code, op, &r_args, dst)
         })?
@@ -7233,7 +7253,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::TwoArgSuperCall, || {
             try_walker_specialize_two_arg_super_call(ctx, code, op, &r_args, dst)
         })?
@@ -7243,7 +7263,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::FloatCall, || {
             try_walker_specialize_float_call(ctx, code, op, &r_args, dst)
         })?
@@ -7253,7 +7273,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::StrCall, || {
             try_walker_specialize_str_call(ctx, code, op, &r_args, dst)
         })?
@@ -7270,7 +7290,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BuiltinDivmod, || {
             try_walker_specialize_builtin_divmod(ctx, code, op, &r_args, dst)
         })?
@@ -7294,14 +7314,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // through to the generic residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && try_walker_trace_exception_new(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
         && r_args.is_empty()
         && ctx.fbw_mode.current_exception_seed.is_some()
     {
@@ -7323,7 +7343,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
         && try_walker_trace_raise_builtin(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -7333,7 +7353,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // canonical builtin exception class.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::RaiseVarargs
         && try_walker_trace_raise_bare_class(ctx, code, op, &r_args, dst)?.is_some()
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
@@ -7397,7 +7417,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // rather than merely survivable by them.
     let set_add_subst = if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
         spec_gate(SpecFold::SetAddMethod, || {
             try_walker_specialize_set_add_method(ctx, code, op, &r_args)
@@ -7939,6 +7959,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         })?;
 
     let ei = call_descr.get_extra_info();
+    // The identity the fold ladder below is allowed to recognise, which under
+    // a profile function is not this call's own — see
+    // [`walker_foldable_runtime_helper`].
+    let foldable_runtime_helper = walker_foldable_runtime_helper(ctx, ei);
     // pyjitpl.py OS_NOT_IN_TRACE guard — see helper docstring
     // for the convergence rationale.
     if let Some(outcome) =
@@ -7961,7 +7985,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         code,
         1 + i_width,
         &r_args,
-        ei.runtime_helper,
+        foldable_runtime_helper,
         dst_bank,
         dst,
     )? {
@@ -7976,7 +8000,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         funcptr,
         &r_args,
         call_descr,
-        ei.runtime_helper,
+        foldable_runtime_helper,
         dst_bank,
         dst,
     )? {
@@ -7984,7 +8008,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     }
 
     // A class is not a `Function`, so the user-call route above declined it.
-    if ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
         if let Some(inlined) =
             try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
         {
@@ -8001,7 +8025,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // have produced — the indexed entry is loop-invariant — and suppress the
     // residual.  Falls through to the generic record when either operand is
     // not concrete (the residual stays correct in that case).
-    if ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadConst {
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadConst {
         if let (Some(&idx_opref), Some(&code_opref)) = (i_args.first(), r_args.first()) {
             if let (
                 Some(majit_ir::Value::Int(consti)),
@@ -8051,7 +8075,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // `bh_load_global_fn` does and reaches production parity for
     // global-function-call loops when combined with the user-call inlining
     // path. Handler-bearing reachability also includes the builtins fallback.
-    if ctx.is_authoritative_executor && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadGlobal
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadGlobal
     {
         if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1))
@@ -8081,7 +8106,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
             ctx.trace_ctx.reads_module_global = true;
         }
     }
-    if ctx.is_authoritative_executor && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadGlobal
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadGlobal
     {
         if let (Some(&namei_opref), Some(&ns_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1))
@@ -8120,7 +8146,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // above.  The residual is `bh_load_name_fn(frame, w_name, namei)`, so
     // r_args = [frame, w_name].  `try_walker_load_name_cell_fold` gates module
     // scope at runtime and routes non-module frames back to this residual.
-    if ctx.is_authoritative_executor && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadName {
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadName
+    {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
             if let (
                 Some(majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr))),
@@ -8174,7 +8202,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // 1.32us per iteration; at the fixture's own 3000 iterations the difference
     // sits under this box's noise floor.
     if ctx.is_authoritative_executor
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadName
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadName
         && !walk_body_has_exception_handler(ctx, code)
     {
         if let (Some(&frame_opref), Some(&name_opref)) = (r_args.first(), r_args.get(1)) {
@@ -8202,7 +8230,9 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // guard proves the attribute is present on this shape), so it is attempted
     // even in handler-bearing bodies; every unfoldable shape falls through to
     // the residual (which keeps its exception guard).
-    if ctx.is_authoritative_executor && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadAttr {
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadAttr
+    {
         if let (Some(&obj_opref), Some(&code_opref), Some(&namei_opref)) =
             (r_args.first(), r_args.get(1), i_args.first())
         {
@@ -8327,7 +8357,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // STORE_ATTR property setter: the plain-slot store fold above declines a
     // `property` data descriptor; inline its Python setter instead of the
     // opaque `setattr` residual.  `store_attr_fn` r_args = [obj, value, code].
-    if ctx.is_authoritative_executor && ei.runtime_helper == majit_ir::RuntimeHelperKind::StoreAttr
+    if ctx.is_authoritative_executor
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::StoreAttr
     {
         if let (Some(&obj_opref), Some(&value_opref), Some(&code_opref), Some(&namei_opref)) =
             (r_args.first(), r_args.get(1), r_args.get(2), i_args.first())
@@ -8358,7 +8389,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadAttr
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadAttr
         && next_op_is_load_method_self_for_attr(code, op, ctx, dst)
     {
         if let (Some(&obj_opref), Some(&code_opref), Some(&namei_opref)) =
@@ -8436,7 +8467,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // residual (SAFE).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadSuperAttr
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadSuperAttr
     {
         if let (
             Some(&global_super_opref),
@@ -8500,7 +8531,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // which costs a real allocation the fold alone would not pay.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::SuperAttrUnwrap
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::SuperAttrUnwrap
     {
         if let (Some(&raw_opref), Some(&which_opref)) = (r_args.first(), i_args.first()) {
             if let Some(majit_ir::Value::Int(which)) = ctx.trace_ctx.box_value(which_opref) {
@@ -8515,7 +8546,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
     if ctx.is_authoritative_executor
-        && ei.runtime_helper == majit_ir::RuntimeHelperKind::LoadMethodSelf
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::LoadMethodSelf
     {
         if let (Some(&namei_opref), Some(&obj_opref), Some(&attr_opref), Some(&code_opref)) =
             (i_args.first(), r_args.first(), r_args.get(1), r_args.get(2))
@@ -8570,7 +8601,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // (`getfield_gc_pure`) forwards through the setfield and the box DCEs
     // when it never escapes.  The concrete shadow carries the authentic
     // boxed pointer so downstream specializations still see a concrete int.
-    if ei.runtime_helper == majit_ir::RuntimeHelperKind::BoxInt && dst_bank == 'r' {
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BoxInt && dst_bank == 'r' {
         if let Some(&raw_arg) = i_args.first() {
             if let Some(boxed_ptr) = walker_execute_may_force_boxed(ctx, &allboxes, call_descr) {
                 let intval =
@@ -8593,12 +8624,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // paths.  Falls through to the generic record for
     // non-int operands / deferred operators.
     if matches!(
-        ei.runtime_helper,
+        foldable_runtime_helper,
         majit_ir::RuntimeHelperKind::BinaryOp | majit_ir::RuntimeHelperKind::CompareOp
     ) {
         if let Some(&tag_opref) = i_args.first() {
             if let Some(majit_ir::Value::Int(op_tag)) = ctx.trace_ctx.box_value(tag_opref) {
-                let specialized = if ei.runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp {
+                let specialized = if foldable_runtime_helper
+                    == majit_ir::RuntimeHelperKind::BinaryOp
+                {
                     let is_subscr = matches!(
                         pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag),
                         Some(pyre_interpreter::bytecode::BinaryOperator::Subscr)
@@ -8779,14 +8812,14 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 if specialized.is_some() {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
-                if ei.runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp {
+                if foldable_runtime_helper == majit_ir::RuntimeHelperKind::BinaryOp {
                     if let Some(inlined) = try_walker_inline_user_binop(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
                         return Ok(inlined);
                     }
                 }
-                if ei.runtime_helper == majit_ir::RuntimeHelperKind::CompareOp {
+                if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CompareOp {
                     if let Some(inlined) = try_walker_inline_user_compareop(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
@@ -8802,13 +8835,13 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // path's value0/value1 fold).  A non-foldable shape falls through to the
     // opaque residual below — correct, no decline.
     if matches!(
-        ei.runtime_helper,
+        foldable_runtime_helper,
         majit_ir::RuntimeHelperKind::UnpackSequence | majit_ir::RuntimeHelperKind::UnpackItem
     ) && spec_gate(SpecFold::Unpack, || {
         try_walker_specialize_unpack(
             ctx,
             op.pc,
-            ei.runtime_helper,
+            foldable_runtime_helper,
             &i_args,
             &r_args,
             &allboxes,
