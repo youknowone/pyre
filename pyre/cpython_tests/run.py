@@ -686,13 +686,20 @@ DOTTED_IDENTITY_MODULES = {
     "test.test_threading",
 }
 
-# These suites create many child interpreters or threads of their own.  Running
-# them inside the module-level worker pool can exhaust process/thread resources
-# and turn an otherwise 20-second pass into a five-minute timeout.
+# These suites create child interpreters or threads of their own.  Running them
+# inside the module-level worker pool can exhaust process/thread resources and
+# turn an otherwise passing module into a timeout or an ENOMEM child launch.
 SERIAL_MODULES = {
     "test.test_regrtest",
     "test.test_thread",
     "test.test_threading",
+    # `TestExecutablePrependedZip.test_execute_zip{2,64}` each launches the
+    # pyre executable embedded behind a shell prefix.  On the Linux CI runner,
+    # that extra interpreter was the fourth one beside `--jobs 3` and both
+    # launches failed with ENOMEM.  The tests pass when their parent is the
+    # only module worker, which is the same isolation this set gives the
+    # subprocess-heavy suites above.
+    "test.test_zipfile",
 }
 
 # Modules whose resource-gated tests are ruinous when test.support.use_resources
