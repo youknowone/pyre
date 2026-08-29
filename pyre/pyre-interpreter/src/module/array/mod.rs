@@ -473,7 +473,34 @@ fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError
 fn index_in_range(obj: PyObjectRef, w_index: PyObjectRef, what: &str) -> Result<usize, PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(&[obj, w_index]);
-    let mut i = crate::builtins::getindex_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let w_index = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if unsafe {
+        !pyre_object::pyobject::is_int_or_long(w_index)
+            && crate::baseobjspace::lookup(w_index, "__index__").is_none()
+    } {
+        // PyPy `ObjSpace.decode_index4` enters `getindex_w` only after the
+        // slice branch.  [3.14-spec] `arraymodule.c::array_subscr` and
+        // `array_ass_subscr` give the array-specific sentence to an operand
+        // with no index slot; an existing slot's own failure still escapes.
+        return Err(PyError::type_error("array indices must be integers"));
+    }
+    let w_indexed = crate::baseobjspace::space_index(w_index)?;
+    let mut i = match int_w(w_indexed) {
+        Ok(i) => i,
+        Err(error) if error.kind == PyErrorKind::OverflowError => {
+            // PyPy `ObjSpace.getindex_w` names the original operand when the
+            // converted integer does not fit.  [3.14-spec]
+            // `PyNumber_AsSsize_t(item, PyExc_IndexError)` changes only the
+            // exception class selected by the array subscription boundary.
+            return Err(PyError::new(
+                PyErrorKind::IndexError,
+                format!("cannot fit '{}' into an index-sized integer", unsafe {
+                    crate::baseobjspace::object_functionstr_type_name(w_index)
+                }),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let len = unsafe { arr::w_array_len(pyre_object::gc_roots::shadow_stack_get(base)) };
     if i < 0 {
         i += len as i64;

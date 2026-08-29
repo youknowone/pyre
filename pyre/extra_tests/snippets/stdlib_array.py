@@ -748,6 +748,41 @@ for operation in ("get", "delete"):
     assert str(error.exception) == expected
     assert indexed == array("i")
 
+# PyPy decode_index4 keeps the original operand for overflow reporting.
+# Python 3.14's array boundary selects IndexError and has its own no-index-slot
+# TypeError, while an existing __index__ slot still runs normally.
+class HugeSubscriptionIndex:
+    def __index__(self):
+        return 1 << 200
+
+
+for key, source_type in ((1 << 200, "int"), (HugeSubscriptionIndex(), "HugeSubscriptionIndex")):
+    for operation in ("get", "set", "delete"):
+        indexed = array("i", [1, 2])
+        with assert_raises(IndexError) as error:
+            if operation == "get":
+                indexed[key]
+            elif operation == "set":
+                indexed[key] = 9
+            else:
+                del indexed[key]
+        assert str(error.exception) == (
+            f"cannot fit '{source_type}' into an index-sized integer"
+        )
+        assert indexed == array("i", [1, 2])
+
+for operation in ("get", "set", "delete"):
+    indexed = array("i", [1, 2])
+    with assert_raises(TypeError) as error:
+        if operation == "get":
+            indexed[None]
+        elif operation == "set":
+            indexed[None] = 9
+        else:
+            del indexed[None]
+    assert str(error.exception) == "array indices must be integers"
+    assert indexed == array("i", [1, 2])
+
 # W_SliceObject.unpack likewise runs every bound conversion before
 # adjust_indices reads self.len.  A newly appended last item is therefore the
 # item selected by a -1 lower bound.
