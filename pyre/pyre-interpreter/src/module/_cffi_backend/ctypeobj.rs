@@ -178,9 +178,11 @@ impl W_CType {
         self.kind == KIND_PRIM_CHAR || self.kind == KIND_PRIM_UNICHAR
     }
 
-    /// `isinstance(ct, W_CTypePtrOrArray)`.
+    /// `isinstance(ct, W_CTypePtrOrArray)`.  A function ctype answers yes:
+    /// `W_CTypeFunc` is a `W_CTypePtrBase`, which is a `W_CTypePtrOrArray`.
+    /// The predicate that excludes it is `F_NONFUNC_POINTER_OR_ARRAY`.
     pub fn is_ptr_or_array(&self) -> bool {
-        self.kind == KIND_POINTER || self.kind == KIND_ARRAY
+        self.kind == KIND_POINTER || self.kind == KIND_ARRAY || self.kind == KIND_FUNC
     }
 
     /// `isinstance(ct, W_CTypeStructOrUnion)`.
@@ -211,15 +213,18 @@ impl W_CType {
         self.check_complete(false)
     }
 
-    /// `W_CTypePtrOrArray.is_unichar_ptr_or_array`.
+    /// `W_CTypePtrOrArray.is_unichar_ptr_or_array`, which `W_CTypeFunc`
+    /// overrides to false.
     pub fn is_unichar_ptr_or_array(&self) -> bool {
-        self.is_ptr_or_array()
+        self.has(F_NONFUNC_POINTER_OR_ARRAY)
             && ctype_at(self.ctitem).is_some_and(|it| it.kind == KIND_PRIM_UNICHAR)
     }
 
-    /// `W_CTypePtrOrArray.is_char_or_unichar_ptr_or_array`.
+    /// `W_CTypePtrOrArray.is_char_or_unichar_ptr_or_array`, which
+    /// `W_CTypeFunc` overrides to false.
     pub fn is_char_or_unichar_ptr_or_array(&self) -> bool {
-        self.is_ptr_or_array() && ctype_at(self.ctitem).is_some_and(|it| it.is_char_or_unichar())
+        self.has(F_NONFUNC_POINTER_OR_ARRAY)
+            && ctype_at(self.ctitem).is_some_and(|it| it.is_char_or_unichar())
     }
 
     /// `W_CType._within_bounds`.
@@ -492,7 +497,7 @@ pub unsafe fn convert_from_object(
 pub fn cast(w_ctype: PyObjectRef, w_ob: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let ct = ctype_arg(w_ctype)?;
     match ct.kind {
-        KIND_POINTER | KIND_ARRAY => super::ctypeptr::cast(w_ctype, w_ob),
+        _ if ct.is_ptr_or_array() => super::ctypeptr::cast(w_ctype, w_ob),
         _ if ct.is_primitive() => super::ctypeprim::cast(w_ctype, w_ob),
         _ => Err(PyError::type_error(format!(
             "cannot cast to '{}'",

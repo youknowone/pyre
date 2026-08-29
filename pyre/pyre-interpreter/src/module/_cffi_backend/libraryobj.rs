@@ -132,7 +132,7 @@ fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     lib.check_closed()?;
     let w_ctype = args[1];
     let ct = ctypeobj::ctype_arg(w_ctype)?;
-    if !ct.is_ptr_or_array() && ct.kind != ctypeobj::KIND_FUNC {
+    if !ct.is_ptr_or_array() {
         return Err(PyError::type_error(format!(
             "function or pointer or array cdata expected, got '{}'",
             ct.name()
