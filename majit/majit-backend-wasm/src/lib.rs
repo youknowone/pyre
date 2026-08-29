@@ -175,32 +175,6 @@ pub const BRIDGE_DIAG_LABELS: &[&str] = &[
     "inline_deferred",
     "inline_trip_fired",
     "inline_decl_defer_invalidation_guard",
-    // 57-68: why `general_int_call_assembler_target` returned `None`, i.e.
-    // which of its guards left `allow_ca` false and so made
-    // `wasm_unsupported_trace_reason` decline a CALL_ASSEMBLER-bearing trace.
-    // `compile_loop` reports that decline as one `cl_decl_unsupported`, which
-    // is a `loops_aborted` bump and nothing more; the reason string cannot
-    // leave the guest, so the split has to be a counter like every other
-    // question this table answers.
-    //
-    // `ca_none_frame_bytes` is the one that separates a target still carrying
-    // `register_pending_call_assembler_target`'s all-zero geometry from a real
-    // disagreement: an entry whose input types match and whose frame bytes are
-    // zero IS that placeholder, and reaching the non-self arm with one means
-    // the trace baked a CALL_ASSEMBLER against a pending token that is not the
-    // token this compile runs under.
-    "ca_none_opcode",
-    "ca_none_descr",
-    "ca_none_types",
-    "ca_none_token",
-    "ca_none_unregistered",
-    "ca_none_self_bad",
-    "ca_none_materialize",
-    "ca_none_input_types",
-    "ca_none_declined",
-    "ca_none_frame_bytes",
-    "ca_none_gcmap",
-    "ca_none_not_compiled",
 ];
 
 #[repr(u8)]
@@ -642,10 +616,9 @@ fn guard_fail_args_advanced(
 
 use failguard::{
     CallAssemblerTarget, ChainedTraceMeta, CompiledWasmLoop, LabelTarget, WasmFailDescr,
-    WasmFrameData, ca_dispatch_exists, ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot,
+    WasmFrameData, ca_dispatch_publish, ca_dispatch_redirect, ca_dispatch_slot,
     call_assembler_target, fail_descr_base, global_fail_descr, label_target,
     publish_call_assembler_target, publish_label_target, register_fail_descrs,
-    register_pending_call_assembler_target,
 };
 use majit_backend::{AsmInfo, BackendError, DeadFrame, JitCellToken};
 use majit_gc::GcAllocator;
@@ -2775,14 +2748,16 @@ impl WasmBackend {
             &inputs.ops,
             inputs.bridge_entry_arity,
         );
-        ca_dispatch_publish(
-            token.number,
-            old_handle,
-            compiled as *const CompiledWasmLoop as usize as u32,
-        );
         if let Some(mut target) = call_assembler_target(token.number) {
             target.func_handle = old_handle;
             target.compiled_ptr = compiled as *const CompiledWasmLoop as usize as u64;
+            ca_dispatch_publish(
+                token.number,
+                old_handle,
+                target.compiled_ptr as u32,
+                target.callee_frame_bytes,
+                target.callee_gcmap_ptr,
+            );
             publish_call_assembler_target(token.number, target);
         }
         Ok(())
@@ -2929,27 +2904,10 @@ fn resolve_cross_loop_jump_target(
 }
 
 /// Resolve every distinct compiled target used by CALL_ASSEMBLER ops in this
-/// trace.  Codegen resolves the matching frozen geometry at each op by token,
-/// so sibling specializations may safely have different frame sizes and gcmap
-/// pointers.
-/// Geometry/census of the loop being compiled.  This is only used to turn its
-/// own registered pending target into a CA target: no `CompiledWasmLoop` exists
-/// yet for that token, so the normal live-target census cannot be read.
-struct PendingSelfCa<'a> {
-    token_number: u64,
-    input_types: &'a [majit_ir::Type],
-    frame: codegen::FrameGeometry,
-}
-
-/// Resolve every distinct compiled target used by CALL_ASSEMBLER ops in this
-/// trace.  `pending_self` is present only from `compile_loop`, after its frame
-/// has been frozen.  It admits the currently-compiling token through the
-/// stable pending dispatch entry; all other tokens still require a live,
-/// installed `CompiledWasmLoop`.
-fn general_int_call_assembler_target(
-    ops: &[Op],
-    pending_self: Option<PendingSelfCa<'_>>,
-) -> Option<Vec<(u64, CallAssemblerTarget)>> {
+/// trace.  PyPy's `compile_tmp_callback` always supplies a real compiled token
+/// while the final loop is pending, so every target here must likewise be an
+/// installed `CompiledWasmLoop`; there is no bodyless self-placeholder case.
+fn general_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
     let mut resolved = Vec::new();
     let mut saw_ca = false;
     for op in ops.iter().filter(|op| op.opcode.is_call_assembler()) {
@@ -2958,15 +2916,12 @@ fn general_int_call_assembler_target(
             op.opcode,
             majit_ir::OpCode::CallAssemblerI | majit_ir::OpCode::CallAssemblerR
         ) {
-            diag_bump(57);
             return None;
         }
         let Some(descr_ref) = op.getdescr() else {
-            diag_bump(58);
             return None;
         };
         let Some(descr) = descr_ref.as_call_descr() else {
-            diag_bump(58);
             return None;
         };
         let arg_types = descr.arg_types();
@@ -2978,108 +2933,72 @@ fn general_int_call_assembler_target(
                 majit_ir::Type::Int | majit_ir::Type::Ref
             )
         {
-            diag_bump(59);
             return None;
         }
         let Some(target_token) = descr.call_target_token() else {
-            diag_bump(60);
             return None;
         };
         let Some(mut registered) = call_assembler_target(target_token) else {
-            diag_bump(61);
             return None;
         };
-        let target = if let Some(self_) = pending_self.as_ref().filter(|self_| {
-            target_token == self_.token_number
-                // A self target must be precisely the placeholder installed
-                // by `register_pending_target`, never an old compiled loop.
-                && registered.func_handle == 0
-                && registered.compiled_ptr == 0
-                && ca_dispatch_exists(target_token)
-        }) {
-            // Keep the ordinary input validation, then use the current loop's
-            // frozen geometry.
-            if registered.input_types.as_slice() != arg_types || self_.frame.ca_frame_bytes == 0 {
-                diag_bump(62);
+        // A straight-line function trace may have deferred host module
+        // compilation. CALL_ASSEMBLER is its first real consumer, so
+        // materialize it before publishing the stable dispatch entry.
+        if registered.func_handle == 0 && registered.compiled_ptr != 0 {
+            let loop_ = unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() }?;
+            let Ok(handle) = loop_.materialize_func_handle() else {
                 return None;
-            }
-            let callee_gcmap_ptr =
-                Box::leak(build_callee_gcmap(self_.input_types, self_.frame)).as_ptr() as i64;
-            if callee_gcmap_ptr == 0 {
-                diag_bump(62);
-                return None;
-            }
-            CallAssemblerTarget {
-                token_number: target_token,
-                func_handle: 0,
-                input_types: self_.input_types.to_vec(),
-                callee_frame_bytes: self_.frame.ca_frame_bytes,
-                callee_gcmap_ptr,
-                compiled_ptr: 0,
-            }
-        } else {
-            // A straight-line function trace may have deferred host module
-            // compilation. CALL_ASSEMBLER is its first real consumer, so
-            // materialize it before baking the stable dispatch entry.
-            if registered.func_handle == 0 && registered.compiled_ptr != 0 {
-                let loop_ =
-                    unsafe { (registered.compiled_ptr as *const CompiledWasmLoop).as_ref() }?;
-                let Ok(handle) = loop_.materialize_func_handle() else {
-                    diag_bump(63);
-                    return None;
-                };
-                if handle == 0 {
-                    diag_bump(63);
-                    return None;
-                }
-                registered.func_handle = handle;
-                ca_dispatch_publish(target_token, handle, registered.compiled_ptr as u32);
-                publish_call_assembler_target(target_token, registered.clone());
-            }
-            if registered.input_types.as_slice() != arg_types {
-                diag_bump(64);
-                return None;
-            }
-            if registered.callee_frame_bytes == 0 {
-                diag_bump(66);
-                return None;
-            }
-            if registered.callee_gcmap_ptr == 0 {
-                diag_bump(67);
-                return None;
-            }
-            if registered.compiled_ptr == 0 {
-                diag_bump(68);
-                return None;
-            }
-            // A successfully compiled loop is retained by its token while it
-            // is registered. It can subsequently become terminally declined,
-            // so read the live state before baking every CA entry.
-            let live = unsafe {
-                (registered.compiled_ptr as *const CompiledWasmLoop)
-                    .as_ref()
-                    .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
             };
-            if !live {
-                diag_bump(65);
+            if handle == 0 {
                 return None;
             }
-            registered
+            registered.func_handle = handle;
+            ca_dispatch_publish(
+                target_token,
+                handle,
+                registered.compiled_ptr as u32,
+                registered.callee_frame_bytes,
+                registered.callee_gcmap_ptr,
+            );
+            publish_call_assembler_target(target_token, registered.clone());
+        }
+        if registered.input_types.as_slice() != arg_types {
+            return None;
+        }
+        if registered.callee_frame_bytes == 0 {
+            return None;
+        }
+        if registered.callee_gcmap_ptr == 0 {
+            return None;
+        }
+        if registered.compiled_ptr == 0 {
+            return None;
+        }
+        // A successfully compiled loop is retained by its token while it is
+        // registered. It can subsequently become terminally declined, so read
+        // the live state before baking every CA entry.
+        let live = unsafe {
+            (registered.compiled_ptr as *const CompiledWasmLoop)
+                .as_ref()
+                .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
         };
+        if !live {
+            return None;
+        }
         // The same target may occur in several operations; each operation was
         // validated above, while the codegen map needs one geometry per token.
         if !resolved
             .iter()
             .any(|(known_token, _)| *known_token == target_token)
         {
-            resolved.push((target_token, target));
+            resolved.push((target_token, registered));
         }
     }
     (saw_ca && !resolved.is_empty()).then_some(resolved)
 }
 
 fn bridge_int_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTarget)>> {
-    general_int_call_assembler_target(ops, None)
+    general_int_call_assembler_target(ops)
 }
 
 fn ca_codegen_targets(
@@ -3087,13 +3006,11 @@ fn ca_codegen_targets(
 ) -> std::collections::HashMap<u64, codegen::CaTarget> {
     targets
         .iter()
-        .map(|(token, target)| {
+        .map(|(token, _target)| {
             (
                 *token,
                 codegen::CaTarget {
                     dispatch_entry: ca_dispatch_slot(*token),
-                    callee_frame_bytes: target.callee_frame_bytes,
-                    callee_gcmap_ptr: target.callee_gcmap_ptr,
                 },
             )
         })
@@ -3350,16 +3267,6 @@ impl majit_backend::Backend for WasmBackend {
         "wasm"
     }
 
-    fn supports_tmp_callback_call_assembler(&self) -> bool {
-        // `general_int_call_assembler_target` admits CALL_ASSEMBLER only
-        // against a published compiled target without trampoline calls; a
-        // tmp-callback body reaches the portal runner through a host
-        // trampoline, so its target is never admissible. Resolution keeps
-        // the pending token; the self-recursive bootstrap publishes it and
-        // redirects on the real compile.
-        false
-    }
-
     fn bridge_decline_is_terminal(&self) -> bool {
         // Every `compile_bridge` `Unsupported` return is a deterministic
         // structural decline — a function of the (ops, source-loop) shape that
@@ -3369,20 +3276,6 @@ impl majit_backend::Backend for WasmBackend {
         // codegen frame-slot / unhandled-opcode declines. So re-firing the guard
         // only rebuilds the same unsupported bridge; record it terminal.
         true
-    }
-
-    /// `compile_tmp_callback` parity: install a resolvable-but-not-enterable
-    /// placeholder before tracing.  Stage 1 still declines its zero geometry;
-    /// the stable dispatch slot is what lets the completed module later update
-    /// already-emitted callers without patching wasm bytes.
-    fn register_pending_target(
-        &mut self,
-        token_number: u64,
-        input_types: Vec<majit_ir::Type>,
-        _num_inputs: usize,
-        _index_of_virtualizable: i32,
-    ) {
-        register_pending_call_assembler_target(token_number, input_types);
     }
 
     // ── Blackhole allocation (llmodel.py:775-790) ──
@@ -3567,19 +3460,23 @@ impl majit_backend::Backend for WasmBackend {
                 label_ref_slots,
             ),
         };
-        let input_types: Vec<majit_ir::Type> = inputargs.iter().map(|ia| ia.tp).collect();
-        // A general CALL_ASSEMBLER can enter already-compiled loops through
-        // the shared table. Codegen keeps each callee's geometry keyed by its
-        // operation's target token. The pending self token is admitted with
-        // the current frame.
-        let ca_targets = general_int_call_assembler_target(
-            ops,
-            Some(PendingSelfCa {
-                token_number: token.number,
-                input_types: &input_types,
-                frame,
-            }),
-        );
+        // `x86/assembler.py::assemble_loop` installs the generated frame
+        // depth on the token's `CompiledLoopToken.frame_info`.  CALL_ASSEMBLER
+        // redirect later propagates the replacement depth through that exact
+        // object (`CompiledLoopToken.update_frame_info`).
+        if let Some(clt) = token.compiled_loop_token() {
+            let baseofs = (majit_gc::header::GcHeader::SIZE
+                + majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+            let depth = frame.ca_frame_bytes as usize / std::mem::size_of::<isize>();
+            clt.frame_info
+                .lock()
+                .update_frame_depth(baseofs, depth as i64);
+        }
+        // A general CALL_ASSEMBLER enters the real compiled token selected by
+        // the descr.  While this loop is pending, PyPy puts a separately
+        // compiled tmp callback in that cell; the bodyless pending-token
+        // shortcut previously used by wasm is intentionally absent.
+        let ca_targets = general_int_call_assembler_target(ops);
         let allow_ca = ca_deopt_helper_slot() != 0 && ca_targets.is_some();
 
         // Decline traces the wasm backend cannot compile correctly, so the
@@ -3841,6 +3738,8 @@ impl majit_backend::Backend for WasmBackend {
             token.number,
             compiled.eager_func_handle(),
             compiled as *const CompiledWasmLoop as usize as u32,
+            compiled.frame.ca_frame_bytes,
+            callee_gcmap_ptr,
         );
         publish_call_assembler_target(
             token.number,
@@ -5210,12 +5109,9 @@ impl majit_backend::Backend for WasmBackend {
                 new.number
             )));
         };
-        if old_target.input_types != new_target.input_types
-            || old_target.callee_frame_bytes != new_target.callee_frame_bytes
-            || old_target.callee_gcmap_ptr != new_target.callee_gcmap_ptr
-        {
+        if old_target.input_types != new_target.input_types {
             return Err(BackendError::Unsupported(format!(
-                "call-assembler redirect from token {} to {} changed baked geometry",
+                "call-assembler redirect from token {} to {} changed input types",
                 old.number, new.number
             )));
         }
@@ -5234,7 +5130,13 @@ impl majit_backend::Backend for WasmBackend {
                 )));
             }
             new_target.func_handle = handle;
-            ca_dispatch_publish(new.number, handle, new_target.compiled_ptr as u32);
+            ca_dispatch_publish(
+                new.number,
+                handle,
+                new_target.compiled_ptr as u32,
+                new_target.callee_frame_bytes,
+                new_target.callee_gcmap_ptr,
+            );
             publish_call_assembler_target(new.number, new_target.clone());
         }
         let movable_callee = new_target.callee_frame_bytes != 0
@@ -5252,12 +5154,27 @@ impl majit_backend::Backend for WasmBackend {
             )));
         }
 
+        // `x86/assembler.py::redirect_call_assembler` first calls
+        // `newlooptoken.compiled_loop_token.update_frame_info(old, baseofs)`.
+        // In particular, a real loop may need a deeper frame than the temporary
+        // callback it replaces; rejecting that growth is not PyPy semantics.
+        if let (Some(new_clt), Some(old_clt)) =
+            (new.compiled_loop_token(), old.compiled_loop_token())
+        {
+            let baseofs = (majit_gc::header::GcHeader::SIZE
+                + majit_backend::jitframe::FIRST_ITEM_OFFSET) as i64;
+            let old_weak = std::sync::Arc::downgrade(&old_clt);
+            new_clt.update_frame_info(&old_clt, old_weak, baseofs);
+        }
+
         // Existing callers retain `old`'s stable entry.  Make both the
         // runtime dispatch values and the metadata lookup resolve to `new`.
         ca_dispatch_redirect(
             old.number,
             new_target.func_handle,
             new_target.compiled_ptr as u32,
+            new_target.callee_frame_bytes,
+            new_target.callee_gcmap_ptr,
         );
         transfer_call_assembler_target_activity(&old_target, &new_target);
         new_target.token_number = old.number;
@@ -5279,6 +5196,9 @@ mod tests {
     use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;
     use majit_gc::trace::TypeInfo;
+    use majit_ir::forwarding::bound_operand_from_opref as rb;
+
+    static WASM_COMPILE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn cross_loop_terminal_jump_uses_target_descr_identity() {
@@ -5297,6 +5217,7 @@ mod tests {
 
     #[test]
     fn straightline_trace_defers_host_module_until_execution() {
+        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
         let mut backend = WasmBackend::new();
         let token = JitCellToken::new(1);
         let finish = Op::new(majit_ir::OpCode::Finish, &[]);
@@ -5321,6 +5242,76 @@ mod tests {
         token.invalidate();
         assert_eq!(compiled.eager_func_handle(), 0);
         assert!(compiled.pending_wasm_bytes.borrow().is_some());
+    }
+
+    #[test]
+    fn redirect_call_assembler_grows_tmp_callback_frame_info() {
+        let _compile_guard = WASM_COMPILE_TEST_LOCK.lock().unwrap();
+        fn compile_with_depth(backend: &mut WasmBackend, token: &JitCellToken, value_count: u32) {
+            let inputargs = vec![InputArg::new_int(0)];
+            let mut previous = majit_ir::OpRef::input_arg_int(0);
+            let mut ops = Vec::new();
+            let mut values = Vec::new();
+            for position in 1..=value_count {
+                let op = Op::new(
+                    majit_ir::OpCode::IntAdd,
+                    &[rb(previous), rb(majit_ir::OpRef::const_int(1))],
+                );
+                op.pos.set(majit_ir::OpRef::int_op(position));
+                previous = op.pos.get();
+                values.push(previous);
+                ops.push(std::rc::Rc::new(op));
+            }
+            if value_count > 1 {
+                let guard = Op::new(
+                    majit_ir::OpCode::GuardTrue,
+                    &[rb(majit_ir::OpRef::const_int(1))],
+                );
+                guard.pos.set(majit_ir::OpRef::void_op(value_count + 1));
+                guard.setfailargs(values.iter().copied().map(rb).collect::<Vec<_>>().into());
+                guard.set_fail_arg_types(vec![majit_ir::Type::Int; values.len()]);
+                ops.push(std::rc::Rc::new(guard));
+            }
+            let finish = Op::new(majit_ir::OpCode::Finish, &[rb(previous)]);
+            finish.pos.set(majit_ir::OpRef::void_op(value_count + 2));
+            finish.set_fail_arg_types(vec![majit_ir::Type::Int]);
+            ops.push(std::rc::Rc::new(finish));
+            backend
+                .compile_loop(&inputargs, &ops, token)
+                .expect("compile wasm redirect target");
+        }
+
+        let mut backend = WasmBackend::new();
+        let tmp = JitCellToken::new(9_900_001);
+        let real = JitCellToken::new(9_900_002);
+        compile_with_depth(&mut backend, &tmp, 1);
+        compile_with_depth(&mut backend, &real, 96);
+
+        let tmp_clt = tmp.compiled_loop_token().expect("tmp callback CLT");
+        let real_clt = real.compiled_loop_token().expect("real loop CLT");
+        let tmp_depth = tmp_clt.frame_info.lock().jfi_frame_depth;
+        let real_depth = real_clt.frame_info.lock().jfi_frame_depth;
+        assert!(tmp_depth < real_depth);
+
+        backend
+            .redirect_call_assembler(&tmp, &real)
+            .expect("redirect tmp callback to deeper real loop");
+        assert_eq!(tmp_clt.frame_info.lock().jfi_frame_depth, real_depth);
+
+        let redirected = call_assembler_target(tmp.number).expect("redirected target metadata");
+        let installed = call_assembler_target(real.number).expect("real target metadata");
+        assert_eq!(redirected.callee_frame_bytes, installed.callee_frame_bytes);
+        assert_eq!(redirected.callee_gcmap_ptr, installed.callee_gcmap_ptr);
+
+        let table = failguard::WASM_CA_DISPATCH.lock();
+        let entry = table
+            .as_ref()
+            .and_then(|table| table.get(&tmp.number))
+            .expect("redirected dispatch entry");
+        let targets = entry.targets.lock().unwrap();
+        let target = targets.last().expect("published runtime target");
+        assert_eq!(target.callee_frame_bytes, installed.callee_frame_bytes);
+        assert_eq!(target.callee_gcmap_ptr, installed.callee_gcmap_ptr);
     }
 
     /// llsupport/gc.py GcLLDescr_framework

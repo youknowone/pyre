@@ -378,15 +378,41 @@ pub static CALL_ASSEMBLER_TARGETS: parking_lot::Mutex<
 // never bake a table slot because redirects and the pending->real transition
 // replace it after the caller module was compiled.
 #[repr(C)]
-pub struct WasmCaDispatchEntry {
+pub struct WasmCaRuntimeTarget {
     /// `__indirect_function_table` slot. Zero means pending/unavailable.
-    pub func_handle: AtomicU32,
+    pub func_handle: u32,
     /// `CompiledWasmLoop` address for the deopt helper, in wasm32 memory.
-    pub compiled_ptr: AtomicU32,
+    pub compiled_ptr: u32,
+    /// Current callee JitFrame item-region size.  This is redirectable state:
+    /// `CompiledLoopToken.update_frame_info` permits the replacement loop to
+    /// need a deeper frame than the temporary callback.
+    pub callee_frame_bytes: u32,
+    /// Current callee GC map.  It must change together with frame depth when
+    /// `redirect_call_assembler` installs the real loop.
+    pub callee_gcmap_ptr: i64,
 }
 
-pub const WASM_CA_DISPATCH_FUNC_HANDLE_OFS: u64 = 0;
-pub const WASM_CA_DISPATCH_COMPILED_PTR_OFS: u64 = 4;
+/// Stable cell baked by callers.  A redirect publishes one pointer to an
+/// immutable target snapshot, so generated code cannot combine the new loop's
+/// function with the temporary callback's frame geometry under concurrent
+/// execution.  Old snapshots stay owned by the entry for as long as any caller
+/// can still hold the pointer it loaded.
+#[repr(C)]
+pub struct WasmCaDispatchEntry {
+    pub target_ptr: AtomicU32,
+    pub targets: std::sync::Mutex<Vec<Box<WasmCaRuntimeTarget>>>,
+}
+
+pub const WASM_CA_DISPATCH_TARGET_PTR_OFS: u64 =
+    std::mem::offset_of!(WasmCaDispatchEntry, target_ptr) as u64;
+pub const WASM_CA_TARGET_FUNC_HANDLE_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, func_handle) as u64;
+pub const WASM_CA_TARGET_COMPILED_PTR_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, compiled_ptr) as u64;
+pub const WASM_CA_TARGET_FRAME_BYTES_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, callee_frame_bytes) as u64;
+pub const WASM_CA_TARGET_GCMAP_PTR_OFS: u64 =
+    std::mem::offset_of!(WasmCaRuntimeTarget, callee_gcmap_ptr) as u64;
 
 /// `make_and_attach_done_descrs` gives every cpu one `DoneWithThisFrame*` per
 /// result kind plus one `ExitFrameWithExceptionDescrRef`, and
@@ -507,37 +533,55 @@ pub fn ca_dispatch_slot(number: u64) -> u32 {
         .entry(number)
         .or_insert_with(|| {
             Box::new(WasmCaDispatchEntry {
-                func_handle: AtomicU32::new(0),
-                compiled_ptr: AtomicU32::new(0),
+                target_ptr: AtomicU32::new(0),
+                targets: std::sync::Mutex::new(Vec::new()),
             })
         });
     (&**entry as *const WasmCaDispatchEntry as usize) as u32
 }
 
-pub fn ca_dispatch_exists(number: u64) -> bool {
-    WASM_CA_DISPATCH
-        .lock()
-        .as_ref()
-        .is_some_and(|table| table.contains_key(&number))
-}
-
 /// Publish an installed loop after its module has acquired a shared-table
-/// slot. Release stores pair with the runtime loads in emitted trace modules;
-/// wasm execution cannot begin until this compile call returns.
-pub fn ca_dispatch_publish(number: u64, func_handle: u32, compiled_ptr: u32) {
+/// slot.  All runtime fields live in one immutable snapshot, and the release
+/// store publishes its address only after the snapshot is fully initialized.
+pub fn ca_dispatch_publish(
+    number: u64,
+    func_handle: u32,
+    compiled_ptr: u32,
+    callee_frame_bytes: u32,
+    callee_gcmap_ptr: i64,
+) {
     let _ = ca_dispatch_slot(number);
     let table = WASM_CA_DISPATCH.lock();
     let entry = table
         .as_ref()
         .and_then(|table| table.get(&number))
         .expect("CALL_ASSEMBLER dispatch entry disappeared while publishing");
-    entry.compiled_ptr.store(compiled_ptr, Ordering::Release);
-    entry.func_handle.store(func_handle, Ordering::Release);
+    let target = Box::new(WasmCaRuntimeTarget {
+        func_handle,
+        compiled_ptr,
+        callee_frame_bytes,
+        callee_gcmap_ptr,
+    });
+    let target_ptr = (&*target as *const WasmCaRuntimeTarget as usize) as u32;
+    entry.targets.lock().unwrap().push(target);
+    entry.target_ptr.store(target_ptr, Ordering::Release);
 }
 
 /// Redirect existing callers of `old_number` to the installed target.
-pub fn ca_dispatch_redirect(old_number: u64, func_handle: u32, compiled_ptr: u32) {
-    ca_dispatch_publish(old_number, func_handle, compiled_ptr);
+pub fn ca_dispatch_redirect(
+    old_number: u64,
+    func_handle: u32,
+    compiled_ptr: u32,
+    callee_frame_bytes: u32,
+    callee_gcmap_ptr: i64,
+) {
+    ca_dispatch_publish(
+        old_number,
+        func_handle,
+        compiled_ptr,
+        callee_frame_bytes,
+        callee_gcmap_ptr,
+    );
 }
 
 /// Remove every dispatch entry that still resolves to `compiled_ptr`.  This
@@ -545,7 +589,14 @@ pub fn ca_dispatch_redirect(old_number: u64, func_handle: u32, compiled_ptr: u32
 /// an old token whose entry has already been redirected elsewhere.
 pub fn ca_dispatch_remove_compiled_ptr(compiled_ptr: u32) {
     if let Some(table) = WASM_CA_DISPATCH.lock().as_mut() {
-        table.retain(|_, entry| entry.compiled_ptr.load(Ordering::Acquire) != compiled_ptr);
+        table.retain(|_, entry| {
+            entry
+                .targets
+                .lock()
+                .unwrap()
+                .last()
+                .is_none_or(|target| target.compiled_ptr != compiled_ptr)
+        });
     }
 }
 
@@ -567,26 +618,6 @@ pub fn publish_call_assembler_target(number: u64, target: CallAssemblerTarget) {
         .lock()
         .get_or_insert_with(Default::default)
         .insert(number, target);
-}
-
-/// Register the frontend's compile_tmp_callback placeholder.  The geometry is
-/// deliberately zero: Stage-1 admission continues to require a fully live
-/// target, while the stable dispatch entry lets a later self-recursive compile
-/// use this token without baking a transient table slot.
-pub fn register_pending_call_assembler_target(number: u64, input_types: Vec<Type>) {
-    ca_dispatch_remove(number);
-    let _ = ca_dispatch_slot(number);
-    publish_call_assembler_target(
-        number,
-        CallAssemblerTarget {
-            token_number: number,
-            func_handle: 0,
-            input_types,
-            callee_frame_bytes: 0,
-            callee_gcmap_ptr: 0,
-            compiled_ptr: 0,
-        },
-    );
 }
 
 /// Remove metadata and the dispatch entry for an invalidated token.

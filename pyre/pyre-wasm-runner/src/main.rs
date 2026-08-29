@@ -806,18 +806,6 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
                 "inline_deferred",
                 "inline_trip_fired",
                 "inline_decl_defer_invalidation_guard",
-                "ca_none_opcode",
-                "ca_none_descr",
-                "ca_none_types",
-                "ca_none_token",
-                "ca_none_unregistered",
-                "ca_none_self_bad",
-                "ca_none_materialize",
-                "ca_none_input_types",
-                "ca_none_declined",
-                "ca_none_frame_bytes",
-                "ca_none_gcmap",
-                "ca_none_not_compiled",
             ];
             let mut parts = Vec::new();
             for (i, lbl) in labels.iter().enumerate() {
