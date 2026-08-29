@@ -217,6 +217,26 @@ pub unsafe fn w_array_bytes(obj: PyObjectRef) -> &'static [u8] {
     }
 }
 
+/// Address exposed by PyPy `W_ArrayBase._buffer_as_unsigned` and the public
+/// `buffer_info()` method.  Rust's empty `Vec::as_ptr()` is a non-null dangling
+/// sentinel; an allocation-free array instead exposes the null raw buffer used
+/// by both PyPy and CPython.
+///
+/// # Safety
+/// `obj` must point to a valid `W_Array`; the returned address is invalidated
+/// by any operation that reallocates its storage.
+pub unsafe fn w_array_buffer_address(obj: PyObjectRef) -> usize {
+    unsafe {
+        let a = &*(obj as *const W_Array);
+        let data = &*a.data;
+        if data.capacity() == 0 {
+            0
+        } else {
+            data.as_ptr() as usize
+        }
+    }
+}
+
 /// Borrow the backing byte `Vec` mutably (for length-changing mutators).
 ///
 /// # Safety
@@ -363,6 +383,15 @@ mod tests {
         }
         assert_eq!(typecode_itemsize(b'x'), None);
         assert_eq!(typecode_itemsize(b'c'), None);
+    }
+
+    #[test]
+    fn fresh_array_exposes_a_null_buffer_address() {
+        let array = w_array_new(b'i', 4);
+        assert_eq!(unsafe { w_array_buffer_address(array) }, 0);
+        unsafe { w_array_vec_mut(array) }.extend_from_slice(&1i32.to_ne_bytes());
+        assert_ne!(unsafe { w_array_buffer_address(array) }, 0);
+        unsafe { w_array_dealloc(array) };
     }
 
     #[test]

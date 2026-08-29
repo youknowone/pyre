@@ -1389,10 +1389,17 @@ fn array_contains_method(args: &[PyObjectRef]) -> PyResult {
 fn array_buffer_info_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.buffer_info")?;
     let obj = args[0];
-    let addr = unsafe { arr::w_array_bytes(obj) }.as_ptr() as i64;
+    let addr = unsafe { arr::w_array_buffer_address(obj) } as u64;
     let len = unsafe { arr::w_array_len(obj) } as i64;
+    // PyPy boxes `_buffer_as_unsigned` as an unsigned integer; keep a pointer
+    // whose top bit is set non-negative rather than narrowing it through i64.
+    let w_addr = if addr <= i64::MAX as u64 {
+        pyre_object::w_int_new(addr as i64)
+    } else {
+        pyre_object::longobject::w_long_new(BigInt::from(addr))
+    };
     Ok(pyre_object::w_tuple_new(vec![
-        pyre_object::w_int_new(addr),
+        w_addr,
         pyre_object::w_int_new(len),
     ]))
 }

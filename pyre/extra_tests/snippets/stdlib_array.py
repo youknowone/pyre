@@ -1124,3 +1124,14 @@ class OnlyReprArray(array):
 only_repr = OnlyReprArray("i", [1])
 assert repr(only_repr) == "ONLY ARRAY REPR"
 assert str(only_repr) == "ONLY ARRAY REPR"
+
+# A fresh array owns no raw allocation.  Rust's empty-Vec dangling sentinel
+# must not leak through PyPy's public `_buffer_as_unsigned` equivalent.
+fresh_buffer_info = array("i")
+assert fresh_buffer_info.buffer_info() == (0, 0)
+fresh_buffer_info.frombytes(b"")
+assert fresh_buffer_info.buffer_info() == (0, 0)
+fresh_buffer_info.append(1)
+buffer_address, buffer_length = fresh_buffer_info.buffer_info()
+assert buffer_address > 0
+assert buffer_length == 1
