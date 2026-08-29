@@ -1484,8 +1484,18 @@ class CodeLocationTest(unittest.TestCase):
         rc, out, err = assert_python_ok('-OO', '-c', code)
 
     def test_co_branches(self):
-        _testcapi = import_helper.import_module("_testcapi")
-        code_offset_to_line = _testcapi.code_offset_to_line
+        try:
+            from _testcapi import code_offset_to_line
+        except ImportError:
+            # `_testcapi.code_offset_to_line` is a CPython-only test helper;
+            # PyPy does not expose it.  Keep the public `co_branches()` test
+            # active by translating its instruction offsets through the
+            # public code-object line table instead.
+            def code_offset_to_line(code, offset):
+                for start, end, line in code.co_lines():
+                    if start <= offset < end:
+                        return line
+                raise AssertionError(f"no source line for offset {offset}")
 
         def get_line_branches(func):
             code = func.__code__
