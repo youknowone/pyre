@@ -610,8 +610,62 @@ fn check_arity_range(
 }
 
 fn array_append_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.append")?;
-    array_append(args[0], args[1])?;
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "append")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.append() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let old_len = unsafe { arr::w_array_len(obj) };
+    let itemsize = unsafe { arr::w_array_itemsize(obj) };
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+
+    // PyPy `W_Array.descr_append` converts `w_x` before calling `setlen`.
+    // [3.14-spec] CPython 3.14.6 `ins1` additionally calls the descriptor's
+    // setitem once at index -1 to validate, resizes from the pre-conversion
+    // length, then converts again for the real slot.  The two conversions and
+    // the resize between them are observable through `__index__`/`__float__`.
+    let mut validated: Bytes = [0; 8];
+    pack_into(
+        typecode,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        &mut validated,
+    )?;
+
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    array_check_resize(obj)?;
+    let new_len = old_len
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(itemsize))
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    if new_len > vec.len() {
+        vec.try_reserve(new_len - vec.len())
+            .map_err(|_| PyError::memory_error(""))?;
+    }
+    vec.resize(new_len, 0);
+
+    let mut packed: Bytes = [0; 8];
+    let packed_len = pack_into(
+        typecode,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        &mut packed,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    if old_len < unsafe { arr::w_array_len(obj) } {
+        // CPython 3.14.6 writes through the pointer captured after resize even
+        // if the second conversion resized the array again.  Keep the same
+        // visible slot update when it remains live, without reproducing that
+        // out-of-bounds raw write when user code cleared the receiver.
+        let start = old_len * itemsize;
+        let vec = unsafe { arr::w_array_vec_mut(obj) };
+        vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
+    }
     Ok(pyre_object::w_none())
 }
 
@@ -1760,7 +1814,14 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "__rmul__", array_mul_method, 2);
     m(ns, "__imul__", array_imul_method, 2);
     m(ns, "__reduce_ex__", array_reduce_ex_method, 2);
-    m(ns, "append", array_append_method, 2);
+    // `append` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "append",
+            crate::make_builtin_function("append", array_append_method),
+        )
+    };
     m(ns, "extend", array_extend_method, 2);
     // `insert` uses the PyArg_UnpackTuple arity wording and the fixed
     // `array.insert` keyword owner, both supplied by its gateway body.

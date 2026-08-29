@@ -40,6 +40,82 @@ def test_float_with_integer_input():
 
 test_float_with_integer_input()
 
+# PyPy's W_Array.descr_append converts before setlen.  CPython 3.14's ins1
+# preserves that ordering but validates once before resize and converts again
+# for the actual slot, so both callbacks and their intervening mutations are
+# observable.
+append_target = array("i", [1])
+
+
+class GrowingAppendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        gc.collect()
+        append_target.append(2)
+        return 3
+
+
+growing_append_item = GrowingAppendItem()
+append_target.append(growing_append_item)
+assert growing_append_item.calls == 2
+assert append_target == array("i", [1, 3, 2])
+
+append_target = array("i", [1])
+
+
+class ClearingAppendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        del append_target[:]
+        return 3
+
+
+clearing_append_item = ClearingAppendItem()
+append_target.append(clearing_append_item)
+assert clearing_append_item.calls == 2
+assert append_target == array("i")
+
+append_target = array("i", [1])
+append_view = memoryview(append_target)
+
+
+class ExportedAppendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        return 3
+
+
+exported_append_item = ExportedAppendItem()
+with assert_raises(BufferError):
+    append_target.append(exported_append_item)
+assert exported_append_item.calls == 1
+assert append_target == array("i", [1])
+append_view.release()
+
+
+class AppendArraySubclass(array):
+    pass
+
+
+with assert_raises(TypeError) as error:
+    AppendArraySubclass("i").append(v=1)
+assert str(error.exception) == "array.append() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").append()
+assert str(error.exception) == "array.append() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").append(1, 2)
+assert str(error.exception) == "array.append() takes exactly one argument (2 given)"
+
 # PyPy's W_ArrayBase.descr_index supplies the optional bounds to
 # index_count_array.  CPython 3.14 keeps the same observable positional search
 # but makes the public bounds positional-only.
