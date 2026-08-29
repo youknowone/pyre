@@ -5594,8 +5594,6 @@ impl<'a> Lowering<'a> {
                     self.range_iter_new_sites
                         .push(crate::front::range_iter::RangeNewSite {
                             result_var: res.clone(),
-                            start: arg_vars[0].clone(),
-                            end: arg_vars[1].clone(),
                         });
                     self.slice_index_range_sites.push(
                         crate::front::slice_index::SliceIndexRangeSite {
@@ -33843,6 +33841,67 @@ mod tests {
                     if op == "or")
             ),
             "slice hash must contain PyPy's unsigned shift/or rotate expansion"
+        );
+    }
+
+    /// `w_method_new` pins three roots with `for slot in save_point..save_point
+    /// + 3`.  RPython represents that loop through `builtin_range` and
+    /// `RangeIteratorRepr`; the Rust `core::ops::range::Range<usize>` shell
+    /// must therefore be consumed by `front::range_iter`, not enter the
+    /// annotator as one shared foreign ClassDef whose `start` field can merge
+    /// with unrelated Range instantiations.  Loads the real object LLBC, so
+    /// ignored by default.
+    #[test]
+    #[ignore]
+    fn method_root_scan_uses_rpython_range_iterator() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real object LLBC");
+        let graph = super::lower_function(&llbc, "pyre_object::function::w_method_new")
+            .expect("lower w_method_new");
+        let operations: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+
+        let range_shells: Vec<_> = operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        result_ty: ValueType::Ref(Some(owner)),
+                        ..
+                    } if owner.ends_with("ops::range::Range")
+                )
+            })
+            .collect();
+        assert!(
+            range_shells.is_empty(),
+            "the Rust Range shell must be consumed before annotation: {range_shells:#?}"
+        );
+        assert!(
+            operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &[crate::runtime_names::shims::RANGE.to_string()]
+            )),
+            "w_method_new must route its root scan through RPython builtin_range"
+        );
+        assert!(
+            operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments == &["__iter_next".to_string()]
+            )),
+            "w_method_new must lower the range loop through the native next op"
         );
     }
 }
