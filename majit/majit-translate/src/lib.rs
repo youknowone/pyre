@@ -1425,6 +1425,29 @@ fn analyze_pipeline_from_module_paths(
         call_control.register_function_graph(path.clone(), graph.as_ref().clone());
     }
     prof.mark("  register_function_graph (free fns)");
+    // RPython `CallControl.graphs_from` obtains the graph from the concrete
+    // function pointer, distinguishing same-named methods from distinct trait
+    // impls. The string-keyed Rust registry needs that identity explicitly:
+    // `impl From<bool> for Dynamic` and `impl From<FnPtr> for Dynamic` both
+    // otherwise collapse onto `[types, dynamic, Dynamic, from]`. Charon's
+    // trait-impl id is already carried on the SemanticFunction; register the
+    // exact path that `front::mir::blanket_into_devirt` emits.
+    for func in &program.functions {
+        let (Some(owner), Some(impl_id)) = (&func.self_ty_root, func.trait_impl_id) else {
+            continue;
+        };
+        let path = crate::parse::CallPath::for_trait_impl_method(owner, impl_id, &func.name);
+        let graph = match &func.return_type {
+            Some(return_type) => func.graph.clone().with_return_type(return_type),
+            None => func.graph.clone(),
+        };
+        if func.hints.is_empty() {
+            call_control.register_function_graph(path, graph);
+        } else {
+            call_control.register_function_graph_with_hints(path, graph, func.hints.clone());
+        }
+    }
+    prof.mark("  register concrete trait-impl identities");
     // Re-register free functions with their RPython-equivalent hints
     // (`elidable`, `loop_invariant`, `unroll_safe`, `jit_look_inside`)
     // so `JitPolicy::look_inside_graph` sees the same metadata RPython
@@ -1905,10 +1928,16 @@ fn analyze_pipeline_from_module_paths(
         // AND the hints (elidable/loopinvariant/cannot_collect/oopspec).
         let paths = if let Some(ref owner) = func.self_ty_root {
             // impl method: ["owner", "method"]
-            vec![crate::parse::CallPath::from_segments([
+            let mut paths = vec![crate::parse::CallPath::from_segments([
                 owner.as_str(),
                 func.name.as_str(),
-            ])]
+            ])];
+            if let Some(impl_id) = func.trait_impl_id {
+                paths.push(crate::parse::CallPath::for_trait_impl_method(
+                    owner, impl_id, &func.name,
+                ));
+            }
+            paths
         } else {
             // Same alias-spelling set as the graph-registration loop
             // above so every spelling the call-site might canonicalise

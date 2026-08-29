@@ -1074,10 +1074,15 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         // like a free function to the canonical registration loop and
         // the impl-key return-type / hint registrations get dropped.
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
+        let trait_impl_id = trait_impl_id_for_fundecl(fd);
         let graph = if let Some(owner) = &self_ty_root {
+            let source_identity = match trait_impl_id {
+                Some(impl_id) => format!("{module_path}::{owner}::<Impl#{impl_id}>::{name}"),
+                None => format!("{module_path}::{owner}::{name}"),
+            };
             graph
                 .with_owner_root(owner.clone())
-                .with_source_identity(format!("{module_path}::{owner}::{name}"))
+                .with_source_identity(source_identity)
         } else {
             graph.with_source_identity(fn_path.clone())
         };
@@ -1132,6 +1137,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
             graph,
             return_type,
             self_ty_root,
+            trait_impl_id,
             module_path,
             hints: Vec::new(),
             trait_root,
@@ -13609,12 +13615,13 @@ impl<'a> Lowering<'a> {
     ///   whole conversion is a `T -> T` identity —
     ///   [`IntoDevirt::Identity`].
     /// - Otherwise the impl's `methods` table binds the single `From`
-    ///   method to the concrete `from` FunDecl, whose path is the
-    ///   devirtualized call target — [`IntoDevirt::Target`].  `from`
-    ///   is an associated function (no `self` receiver), so the
-    ///   caller must keep the `FunctionPath` shape (a
-    ///   `CallTarget::Method` hint would bind the *argument* as a
-    ///   receiver).
+    ///   method to the concrete `from` FunDecl. Its owner, trait-impl id,
+    ///   and method form the devirtualized call target —
+    ///   [`IntoDevirt::Target`]. The id is load-bearing: several
+    ///   `impl From<_> for Dynamic` bodies share the same owner/method pair.
+    ///   `from` is an associated function (no `self` receiver), so the caller
+    ///   must keep the `FunctionPath` shape (a `CallTarget::Method` hint would
+    ///   bind the *argument* as a receiver).
     ///
     /// Returns `None` (caller keeps the blanket-into path) when the
     /// obligation is unresolved (`kind` is a clause/builtin rather
@@ -13675,13 +13682,9 @@ impl<'a> Lowering<'a> {
                 m.get("skip_binder")?.get("id")?.as_u64()
             })?;
             let fd = self.llbc.fn_by_id(fn_id)?;
-            let segments: Vec<String> = fd
-                .item_meta
-                .name_path()
-                .split("::")
-                .map(|s| s.to_string())
-                .collect();
-            return Some(IntoDevirt::Target(segments));
+            let (owner, method) = impl_method_owner_for_fundecl(self.llbc, fd)?;
+            let path = crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method);
+            return Some(IntoDevirt::Target(path.segments));
         }
         None
     }
@@ -19580,6 +19583,22 @@ fn trait_impl_trait_path_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<String
         return None;
     }
     Some(trait_path)
+}
+
+/// Return the concrete Charon trait-impl id carried by an impl-owned
+/// function's penultimate name segment. Inherent impls and free functions do
+/// not carry this identity.
+fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u64> {
+    let last_idx = fd
+        .item_meta
+        .name
+        .iter()
+        .rposition(|segment| matches!(segment, NameSeg::Ident { .. }))?;
+    let impl_payload = match fd.item_meta.name.get(last_idx.checked_sub(1)?)? {
+        NameSeg::Other(value) => value.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    impl_payload.as_object()?.get("Trait")?.as_u64()
 }
 
 /// Detect a trait-default body — a function whose penultimate NameSeg
@@ -30153,6 +30172,7 @@ mod tests {
             graph,
             return_type: None,
             self_ty_root: None,
+            trait_impl_id: None,
             module_path: String::new(),
             hints: Vec::new(),
             trait_root: None,

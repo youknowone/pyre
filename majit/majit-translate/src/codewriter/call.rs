@@ -4158,6 +4158,7 @@ impl CallControl {
                             graph,
                             return_type: None,
                             self_ty_root: None,
+                            trait_impl_id: None,
                             hints,
                             module_path: String::new(),
                             trait_root: None,
