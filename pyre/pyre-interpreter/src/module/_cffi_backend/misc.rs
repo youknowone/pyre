@@ -268,28 +268,35 @@ pub fn as_long_long(w_ob: PyObjectRef) -> Result<i64, PyError> {
 /// as `OverflowError`; otherwise the value is masked and a float rounded
 /// down, which is what an explicit `ffi.cast()` asks for.
 pub fn as_unsigned_long_long(w_ob: PyObjectRef, strict: bool) -> Result<u64, PyError> {
-    if let Some(value) = exact_int_w(w_ob) {
-        match value {
-            Ok(value) => {
-                if strict && value < 0 {
-                    return Err(PyError::overflow_error(NEG_MSG));
-                }
-                return Ok(value as u64);
+    match exact_int_w(w_ob) {
+        Some(Ok(value)) => {
+            if strict && value < 0 {
+                return Err(PyError::overflow_error(NEG_MSG));
             }
-            Err(err) => {
-                // A bigint wider than a word: `strict` reports it, and the
-                // masking path below reads it back through `space.int`.
-                if strict {
-                    return Err(err);
-                }
+            return Ok(value as u64);
+        }
+        // A bigint wider than a word reaches the path below either way, which
+        // reads it back through `space.int`.
+        Some(Err(_)) => {}
+        None => {
+            if strict && is_a_float(w_ob) {
+                return Err(PyError::type_error("integer expected, got float"));
             }
         }
-    } else if strict && is_a_float(w_ob) {
-        return Err(PyError::type_error("integer expected, got float"));
     }
     let w_int = crate::baseobjspace::space_int(w_ob)?;
     if strict {
-        return crate::baseobjspace::uint_w(w_int).map_err(|_| PyError::overflow_error(OVF_MSG));
+        // `toulonglong` signals a negative value as `ValueError` and a value
+        // too wide for the word as `OverflowError`; both surface here as an
+        // `OverflowError`, under their own messages.
+        return crate::baseobjspace::uint_w(w_int).map_err(|err| {
+            let message = if err.kind == crate::error::PyErrorKind::ValueError {
+                NEG_MSG
+            } else {
+                OVF_MSG
+            };
+            PyError::overflow_error(message)
+        });
     }
     Ok(bigint_mask_u64(w_int))
 }
