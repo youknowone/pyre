@@ -7345,6 +7345,7 @@ pub(crate) mod wasm_errno {
     pub const EEXIST: i32 = 17;
     pub const ENOENT: i32 = 2;
     pub const ENOTSUP: i32 = 45;
+    pub const EAFNOSUPPORT: i32 = 47;
     pub const EISDIR: i32 = 21;
     pub const ENOTDIR: i32 = 20;
     pub const EINTR: i32 = 4;
@@ -19889,6 +19890,15 @@ fn open_raw_file(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 // `posix` resolves one, so `open` and `os.open` answer for the
                 // same file after a `chdir`.
                 let seam_path = wasm_fd::seam_path(path_bytes);
+                // The seam reports a directory read as a missing file; opening
+                // one for reading is `EISDIR`, which is what `os.open` plus
+                // `os.read` already answer for the same name.
+                if crate::importing::source_is_dir(&seam_path) {
+                    return Err(crate::PyError::os_error_syscall(
+                        wasm_errno::EISDIR,
+                        resolved_path.w_path(),
+                    ));
+                }
                 match crate::importing::read_source_bytes(&seam_path) {
                     Ok(bytes) => bytes,
                     Err(e) => {

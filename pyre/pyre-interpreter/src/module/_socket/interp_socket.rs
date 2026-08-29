@@ -12,6 +12,11 @@
 /// API.
 #[cfg(any(unix, windows))]
 use super::rsocket_rffi as rffi;
+/// The same names again where there is no host layer to reach them through:
+/// the four address converters are arithmetic over the spelling, so they are
+/// written out rather than called, and the entry points below cannot tell.
+#[cfg(not(any(unix, windows)))]
+use super::interp_socket_wasm as rffi;
 
 /// _socket module — PyPy: pypy/module/_socket/.
 ///
@@ -1030,200 +1035,173 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     );
 
     // ── inet_aton / inet_ntoa ──
-    #[cfg(any(unix, windows))]
-    {
-        crate::module_ns_store(
-            ns,
+    crate::module_ns_store(
+        ns,
+        "inet_aton",
+        crate::make_builtin_function_with_arity(
             "inet_aton",
-            crate::make_builtin_function_with_arity(
-                "inet_aton",
-                |args| {
-                    if args.is_empty() {
-                        return Err(crate::PyError::type_error("inet_aton() missing argument"));
-                    }
-                    let s = unsafe {
-                        if !pyre_object::is_str(args[0]) {
-                            return Err(crate::PyError::type_error(
-                                "inet_aton: arg must be a string",
-                            ));
-                        }
-                        crate::baseobjspace::str_utf8_w(args[0])?.to_string()
-                    };
-                    let c = std::ffi::CString::new(s.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null in argument"))?;
-                    let Some(bytes) = rffi::inet_aton(&c) else {
-                        return Err(crate::PyError::os_error(
-                            "illegal IP address string passed to inet_aton",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("inet_aton() missing argument"));
+                }
+                let s = unsafe {
+                    if !pyre_object::is_str(args[0]) {
+                        return Err(crate::PyError::type_error(
+                            "inet_aton: arg must be a string",
                         ));
-                    };
-                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
-                },
-                1,
-            ),
-        );
-        crate::module_ns_store(
-            ns,
+                    }
+                    crate::baseobjspace::str_utf8_w(args[0])?.to_string()
+                };
+                let c = std::ffi::CString::new(s.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null in argument"))?;
+                let Some(bytes) = rffi::inet_aton(&c) else {
+                    return Err(crate::PyError::os_error(
+                        "illegal IP address string passed to inet_aton",
+                    ));
+                };
+                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+            },
+            1,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "inet_ntoa",
+        crate::make_builtin_function_with_arity(
             "inet_ntoa",
-            crate::make_builtin_function_with_arity(
-                "inet_ntoa",
-                |args| {
-                    if args.is_empty() {
-                        return Err(crate::PyError::type_error("inet_ntoa() missing argument"));
-                    }
-                    let data = unsafe {
-                        if !pyre_object::bytesobject::is_bytes_like(args[0]) {
-                            return Err(crate::PyError::type_error(
-                                "inet_ntoa: argument must be bytes-like",
-                            ));
-                        }
-                        pyre_object::bytesobject::bytes_like_data(args[0])
-                    };
-                    if data.len() != 4 {
-                        return Err(crate::PyError::os_error(
-                            "packed IP wrong length for inet_ntoa",
+            |args| {
+                if args.is_empty() {
+                    return Err(crate::PyError::type_error("inet_ntoa() missing argument"));
+                }
+                let data = unsafe {
+                    if !pyre_object::bytesobject::is_bytes_like(args[0]) {
+                        return Err(crate::PyError::type_error(
+                            "inet_ntoa: argument must be bytes-like",
                         ));
                     }
-                    let Some(text) = rffi::inet_ntoa([data[0], data[1], data[2], data[3]]) else {
-                        return Err(crate::PyError::os_error("inet_ntoa failed"));
-                    };
-                    Ok(pyre_object::w_str_new(&text))
-                },
-                1,
-            ),
-        );
+                    pyre_object::bytesobject::bytes_like_data(args[0])
+                };
+                if data.len() != 4 {
+                    return Err(crate::PyError::os_error(
+                        "packed IP wrong length for inet_ntoa",
+                    ));
+                }
+                let Some(text) = rffi::inet_ntoa([data[0], data[1], data[2], data[3]]) else {
+                    return Err(crate::PyError::os_error("inet_ntoa failed"));
+                };
+                Ok(pyre_object::w_str_new(&text))
+            },
+            1,
+        ),
+    );
 
-        // inet_pton(af, ip) → bytes
-        crate::module_ns_store(
-            ns,
+    // inet_pton(af, ip) → bytes
+    crate::module_ns_store(
+        ns,
+        "inet_pton",
+        crate::make_builtin_function_with_arity(
             "inet_pton",
-            crate::make_builtin_function_with_arity(
-                "inet_pton",
-                |args| {
-                    if args.len() < 2 {
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "inet_pton() requires 2 arguments",
+                    ));
+                }
+                let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let ip = unsafe {
+                    if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error(
-                            "inet_pton() requires 2 arguments",
+                            "inet_pton: address must be a string",
                         ));
                     }
-                    let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                    let ip = unsafe {
-                        if !pyre_object::is_str(args[1]) {
-                            return Err(crate::PyError::type_error(
-                                "inet_pton: address must be a string",
-                            ));
-                        }
-                        crate::baseobjspace::str_utf8_w(args[1])?.to_string()
-                    };
-                    let c_ip = std::ffi::CString::new(ip.as_bytes())
-                        .map_err(|_| crate::PyError::value_error("embedded null"))?;
-                    let mut buf = [0u8; 16];
-                    let r = unsafe {
-                        rffi::inet_pton(af, c_ip.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void)
-                    };
-                    // `inet_pton` separates the two failures: a negative
-                    // return is a family it has no parser for and leaves
-                    // `EAFNOSUPPORT` behind, a zero is an address string it
-                    // parsed and rejected.
-                    if r < 0 {
-                        return Err(crate::PyError::os_error_syscall(
-                            rffi::last_error_code(),
-                            pyre_object::PY_NULL,
-                        ));
-                    }
-                    if r != 1 {
-                        return Err(crate::PyError::os_error(
-                            "illegal IP address string passed to inet_pton",
-                        ));
-                    }
-                    let n = match af {
-                        x if x == rffi::AF_INET => 4,
-                        x if x == rffi::AF_INET6 => 16,
-                        _ => {
-                            return Err(crate::PyError::value_error("unknown address family"));
-                        }
-                    };
-                    Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf[..n]))
-                },
-                2,
-            ),
-        );
+                    crate::baseobjspace::str_utf8_w(args[1])?.to_string()
+                };
+                let c_ip = std::ffi::CString::new(ip.as_bytes())
+                    .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+                match rffi::pton(af, &c_ip) {
+                    Ok(packed) => Ok(pyre_object::bytesobject::w_bytes_from_bytes(&packed)),
+                    Err(rffi::PtonError::Family(code)) => Err(crate::PyError::os_error_syscall(
+                        code,
+                        pyre_object::PY_NULL,
+                    )),
+                    Err(rffi::PtonError::Address) => Err(crate::PyError::os_error(
+                        "illegal IP address string passed to inet_pton",
+                    )),
+                }
+            },
+            2,
+        ),
+    );
 
-        // inet_ntop(af, packed) → str
-        crate::module_ns_store(
-            ns,
+    // inet_ntop(af, packed) → str
+    crate::module_ns_store(
+        ns,
+        "inet_ntop",
+        crate::make_builtin_function_with_arity(
             "inet_ntop",
-            crate::make_builtin_function_with_arity(
-                "inet_ntop",
-                |args| {
-                    if args.len() < 2 {
+            |args| {
+                if args.len() < 2 {
+                    return Err(crate::PyError::type_error(
+                        "inet_ntop() requires 2 arguments",
+                    ));
+                }
+                let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
+                let data = unsafe {
+                    if !pyre_object::bytesobject::is_bytes_like(args[1]) {
                         return Err(crate::PyError::type_error(
-                            "inet_ntop() requires 2 arguments",
+                            "inet_ntop: argument must be bytes-like",
                         ));
                     }
-                    let af = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
-                    let data = unsafe {
-                        if !pyre_object::bytesobject::is_bytes_like(args[1]) {
-                            return Err(crate::PyError::type_error(
-                                "inet_ntop: argument must be bytes-like",
-                            ));
-                        }
-                        pyre_object::bytesobject::bytes_like_data(args[1])
-                    };
-                    let expected = match af {
-                        x if x == rffi::AF_INET => 4,
-                        x if x == rffi::AF_INET6 => 16,
-                        _ => {
-                            return Err(crate::PyError::value_error("unknown address family"));
-                        }
-                    };
-                    if data.len() != expected {
-                        return Err(crate::PyError::value_error(
-                            "invalid length of packed IP address string",
-                        ));
+                    pyre_object::bytesobject::bytes_like_data(args[1])
+                };
+                let expected = match af {
+                    x if x == rffi::AF_INET => 4,
+                    x if x == rffi::AF_INET6 => 16,
+                    _ => {
+                        return Err(crate::PyError::value_error(format!(
+                            "unknown address family {af}"
+                        )));
                     }
-                    let mut buf = [0u8; 64];
-                    let r = unsafe {
-                        rffi::inet_ntop(
-                            af,
-                            data.as_ptr() as *const libc::c_void,
-                            buf.as_mut_ptr() as *mut libc::c_char,
-                            buf.len() as rffi::SockLen,
-                        )
-                    };
-                    if r.is_null() {
-                        return Err(crate::PyError::os_error("inet_ntop failed"));
-                    }
-                    let s = unsafe { std::ffi::CStr::from_ptr(r) };
-                    Ok(pyre_object::w_str_new(&s.to_string_lossy()))
-                },
-                2,
-            ),
-        );
+                };
+                if data.len() != expected {
+                    return Err(crate::PyError::value_error(
+                        "invalid length of packed IP address string",
+                    ));
+                }
+                let Some(text) = rffi::ntop(af, data) else {
+                    return Err(crate::PyError::os_error("inet_ntop failed"));
+                };
+                Ok(pyre_object::w_str_new(&text))
+            },
+            2,
+        ),
+    );
 
-        // gethostname() → str
-        crate::module_ns_store(
-            ns,
+    // gethostname() → str, over the name the host layer reports.  Where there
+    // is none, `interp_socket_wasm` registers the one its `uname` answers.
+    #[cfg(any(unix, windows))]
+    crate::module_ns_store(
+        ns,
+        "gethostname",
+        crate::make_builtin_function_with_arity(
             "gethostname",
-            crate::make_builtin_function_with_arity(
-                "gethostname",
-                |_| {
-                    let name = rffi::hostname().map_err(|e| {
-                        crate::PyError::os_error_with_errno(
-                            e.raw_os_error().unwrap_or(0),
-                            "gethostname",
-                        )
-                    })?;
-                    // `interp_func.py:24` is
-                    // `space.fsdecode(space.newbytes(res))` -- the hostname is
-                    // opaque kernel bytes (`sethostname(2)` takes a plain
-                    // `const char*`), so a byte with no UTF-8 spelling has to
-                    // survive as its surrogate escape.
-                    Ok(crate::gateway::fsdecode_os_str(&name))
-                },
-                0,
-            ),
-        );
-    }
-
+            |_| {
+                let name = rffi::hostname().map_err(|e| {
+                    crate::PyError::os_error_with_errno(
+                        e.raw_os_error().unwrap_or(0),
+                        "gethostname",
+                    )
+                })?;
+                // `interp_func.py:24` is
+                // `space.fsdecode(space.newbytes(res))` -- the hostname is
+                // opaque kernel bytes (`sethostname(2)` takes a plain
+                // `const char*`), so a byte with no UTF-8 spelling has to
+                // survive as its surrogate escape.
+                Ok(crate::gateway::fsdecode_os_str(&name))
+            },
+            0,
+        ),
+    );
     // `sethostname` alone stays POSIX-only: WinSock has no counterpart and
     // `moduledef.py` does not export it where rsocket cannot provide it.
     #[cfg(all(unix, feature = "host_env"))]

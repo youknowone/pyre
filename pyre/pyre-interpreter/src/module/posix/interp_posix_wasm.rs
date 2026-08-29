@@ -107,18 +107,65 @@ fn cwd_bytes() -> Vec<u8> {
 /// An empty name stays empty so that the seam reports `ENOENT` for it, which is
 /// what `open("")` owes its caller rather than the working directory's contents.
 fn resolve_against_cwd(path: &[u8]) -> Vec<u8> {
-    if path.is_empty() || path.starts_with(b"/") {
+    if path.is_empty() {
         return path.to_vec();
+    }
+    if path.starts_with(b"/") {
+        return normalized(path);
     }
     let mut resolved = cwd_bytes();
     if resolved.is_empty() {
-        return path.to_vec();
+        return normalized(path);
     }
     if !resolved.ends_with(b"/") {
         resolved.push(b'/');
     }
     resolved.extend_from_slice(path);
-    resolved
+    normalized(&resolved)
+}
+
+/// `path` with its `.` and `..` components resolved and its repeated slashes
+/// collapsed, the way `posixpath.normpath` resolves them.
+///
+/// The seam is asked for a name, not walked component by component, and the
+/// embedded filesystem answers an exact key: `lib-python/3/..` names a
+/// directory that is there, and asking for it under that spelling finds
+/// nothing.  Resolving is lexical, so a `..` above a symbolic link lands where
+/// the spelling says rather than where a walk would -- which is what
+/// `normpath` documents about itself, and the only rule available to a seam
+/// that cannot walk.
+fn normalized(path: &[u8]) -> Vec<u8> {
+    let rooted = path.starts_with(b"/");
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in path.split(|b| *b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => match parts.last() {
+                // A `..` above the root is the root, and one that has no
+                // component to cancel is kept only where it can still mean
+                // something -- which is nowhere below an absolute path.
+                Some(&last) if last != b".." => {
+                    parts.pop();
+                }
+                _ if rooted => {}
+                _ => parts.push(part),
+            },
+            other => parts.push(other),
+        }
+    }
+    let mut out = if rooted { vec![b'/'] } else { Vec::new() };
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            out.push(b'/');
+        }
+        out.extend_from_slice(part);
+    }
+    // Everything cancelled: an absolute path is left as the root, a relative
+    // one as the directory it started in.
+    if out.is_empty() {
+        out.push(b'.');
+    }
+    out
 }
 
 /// `posix.chdir(path)` — the directory later relative paths resolve against.
@@ -126,6 +173,11 @@ fn resolve_against_cwd(path: &[u8]) -> Vec<u8> {
 /// `fchdir` is what a descriptor argument would need, and the seam has no
 /// directory descriptor to offer it, so a name is the only spelling accepted.
 fn chdir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `path_arg` reads `dir_fd` because most of its callers take one; `chdir`
+    // is spelled `chdir(path)` and `fchdir` is the call that would take the
+    // other, so the keyword is not a name this entry point knows.
+    let (_, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &["path"], "chdir")?;
     let resolved = path_arg(args, "chdir")?;
     let target = resolve_against_cwd(&resolved.as_bytes);
     let path: std::path::PathBuf = crate::gateway::os_string_from_fs_bytes(&target).into();
@@ -861,13 +913,28 @@ fn environ_snapshot() -> PyObjectRef {
 /// bytes to begin with, so both spellings arrive here and both are kept as
 /// bytes: a name that came from the embedder is a name the guest can set again,
 /// whatever it spells.
+///
+/// The converter's own two refusals are the ones owed here: a TypeError for
+/// something that is neither spelling, and a ValueError for a name carrying an
+/// embedded NUL, which is the one `test_os` asks for by name.
 fn env_bytes_arg(
     w_arg: PyObjectRef,
     name: &'static str,
 ) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
-    crate::gateway::fsencode_path_w(w_arg).map_err(|_| {
-        crate::PyError::type_error(format!("{name}() argument must be str or bytes"))
-    })
+    crate::gateway::fsencode_path_or_fd_w(w_arg, name, false)
+}
+
+/// The names `setenv` and `unsetenv` refuse outright: an empty one names no
+/// variable, and one carrying `=` could not be spelled back out of the
+/// environment it went into.  Both report `EINVAL`.
+fn check_env_name(name: &[u8]) -> Result<(), crate::PyError> {
+    if name.is_empty() || name.contains(&b'=') {
+        return Err(crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::EINVAL,
+            pyre_object::w_none(),
+        ));
+    }
+    Ok(())
 }
 
 /// `posix.putenv(name, value)` — add or replace one variable.
@@ -882,12 +949,14 @@ fn putenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let name = env_bytes_arg(pos[0], "putenv")?;
     // `putenv` is defined over `name=value`, so a name carrying the separator
-    // could not be spelled back out of the environment it went into.
+    // could not be spelled back out of the environment it went into.  That one
+    // is a ValueError; an empty name is the syscall's own `EINVAL`.
     if name.as_bytes.contains(&b'=') {
         return Err(crate::PyError::value_error(
             "illegal environment variable name",
         ));
     }
+    check_env_name(&name.as_bytes)?;
     let value = env_bytes_arg(pos[1], "putenv")?;
     ENVIRONMENT
         .lock()
@@ -904,10 +973,181 @@ fn unsetenv(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             .ok_or_else(|| crate::PyError::type_error("unsetenv expected 1 argument, got 0"))?,
         "unsetenv",
     )?;
+    // `unsetenv` has no separate report for a name it cannot spell: both the
+    // empty one and one carrying `=` come back as `EINVAL`.
+    check_env_name(&name.as_bytes)?;
     // A name nothing set is a name already unset, which is what the syscall
     // reports and what `os.environ.__delitem__` relies on so that it can raise
     // the KeyError itself, against the caller's own spelling of the key.
     ENVIRONMENT.lock().unwrap().remove(&name.as_bytes);
+    Ok(pyre_object::w_none())
+}
+
+/// `os.uname_result` structseq — the five fields `uname` fills.
+fn uname_seq_type() -> PyObjectRef {
+    static UNAME_SEQ_TYPE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *UNAME_SEQ_TYPE.get_or_init(|| {
+        crate::_structseq::make_struct_seq(
+            "os.uname_result",
+            &["sysname", "nodename", "release", "version", "machine"],
+        ) as usize
+    }) as PyObjectRef
+}
+
+/// `posix.uname()` — the record wasi's own `uname` fills in, which names the
+/// guest rather than whatever machine the embedder happens to be.
+///
+/// `platform.uname` reads all five, and `platform._node` takes `nodename`
+/// through `socket.gethostname`, which wasi writes over this same call.
+fn uname(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let fields = ["wasi", "(none)", "0.0.0", "0.0.0", "wasm32"];
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut seq = Vec::with_capacity(fields.len());
+    for field in fields {
+        seq.push(pyre_object::gc_roots::pin_root(pyre_object::w_str_new(field)));
+    }
+    Ok(crate::_structseq::new_instance(uname_seq_type(), seq))
+}
+
+/// The first path argument of an entry point that takes more after it, with
+/// everything after it accepted and dropped: nothing here reads a mode, a time
+/// pair or a length, because nothing here writes.
+///
+/// `path_kw` is what that argument is called, which is not the same word for
+/// all of them -- the one-path calls name it `path` and the two-path calls
+/// name it `src` -- and every one of them can be spelled as a keyword.
+fn write_path_arg(
+    args: &[PyObjectRef],
+    name: &'static str,
+    path_kw: &'static str,
+) -> Result<crate::gateway::FsEncodedPath, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let Some(w_path) = pos
+        .first()
+        .copied()
+        .or_else(|| crate::builtins::kwarg_get(kwargs, path_kw))
+    else {
+        return Err(crate::PyError::type_error(format!(
+            "{name}() missing required argument '{path_kw}' (pos 1)"
+        )));
+    };
+    crate::gateway::fsencode_path_or_fd_w(w_path, name, false)
+}
+
+/// The entry points a read-only mount publishes and refuses, named by the
+/// first path they were given.
+///
+/// wasi carries all of these, so a program that asks whether they exist is
+/// answered the way it would be on any wasi host; what it cannot do is write
+/// through them, and `EROFS` is what a read-only mount reports for that.
+fn refuse_write_path(
+    args: &[PyObjectRef],
+    name: &'static str,
+    path_kw: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let resolved = write_path_arg(args, name, path_kw)?;
+    Err(crate::PyError::os_error_syscall(
+        crate::builtins::wasm_errno::EROFS,
+        resolved.w_path(),
+    ))
+}
+
+/// Two of the four `access` mode bits, which the constant table publishes
+/// under the same names.
+const X_OK: i64 = 1;
+const W_OK: i64 = 2;
+
+/// `posix.access(path, mode, ...)` — whether the name is there and the access
+/// asked for is one this mount grants.
+///
+/// The mount is read-only, so `W_OK` is false for everything; `X_OK` is true
+/// for a directory, which is the permission that makes one traversable, and
+/// false for a file, since nothing here can be executed.
+fn access(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(
+        kwargs,
+        &["path", "mode", "dir_fd", "effective_ids", "follow_symlinks"],
+        "access",
+    )?;
+    let Some(w_path) = crate::builtins::bind_pos_or_kw(pos, kwargs, 0, "path", "access", 2)? else {
+        return Err(crate::PyError::type_error(
+            "access() missing required argument 'path' (pos 1)",
+        ));
+    };
+    let Some(w_mode) = crate::builtins::bind_pos_or_kw(pos, kwargs, 1, "mode", "access", 2)? else {
+        return Err(crate::PyError::type_error(
+            "access() missing required argument 'mode' (pos 2)",
+        ));
+    };
+    let mode = unsafe { pyre_object::w_int_get_value(w_mode) };
+    let resolved = crate::gateway::fsencode_path_or_fd_w(w_path, "access", false)?;
+    let path = seam_path(&resolved.as_bytes);
+    let is_dir = crate::importing::source_is_dir(&path);
+    let exists = is_dir || crate::importing::source_file_size(&path).is_ok();
+    let granted = exists && (mode & W_OK) == 0 && ((mode & X_OK) == 0 || is_dir);
+    Ok(pyre_object::w_bool_from(granted))
+}
+
+/// `posix.write(fd, data)` — the two descriptors this guest has a sink for.
+///
+/// 1 and 2 are the embedder's output and error buffers, which is where
+/// `sys.stdout` and `sys.stderr` already write; anything else names either a
+/// read-only descriptor from the table or nothing at all.
+fn write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    crate::builtins::kwarg_reject_unknown(kwargs, &[], "write")?;
+    if pos.len() != 2 {
+        return Err(crate::PyError::type_error(format!(
+            "write expected 2 arguments, got {}",
+            pos.len()
+        )));
+    }
+    let fd = unsafe { pyre_object::w_int_get_value(pos[0]) };
+    let data = unsafe {
+        if !pyre_object::bytesobject::is_bytes_like(pos[1]) {
+            return Err(crate::PyError::type_error(
+                "a bytes-like object is required, not 'str'",
+            ));
+        }
+        pyre_object::bytesobject::bytes_like_data(pos[1])
+    };
+    let delivered = match fd {
+        1 => crate::print_hook_emit_bytes(data),
+        2 => crate::stderr_hook_emit(data),
+        // Every other number is one nothing can be written through: a
+        // descriptor the table knows was opened for reading, and one it does
+        // not know is no descriptor at all.
+        _ => {
+            return Err(crate::PyError::os_error_syscall(
+                crate::builtins::wasm_errno::EBADF,
+                pyre_object::w_none(),
+            ));
+        }
+    };
+    if !delivered {
+        return Err(crate::PyError::os_error_syscall(
+            crate::builtins::wasm_errno::EBADF,
+            pyre_object::w_none(),
+        ));
+    }
+    Ok(pyre_object::w_int_new(data.len() as i64))
+}
+
+/// `posix.fsync(fd)` / `posix.fdatasync(fd)` — nothing to flush, but the
+/// descriptor is still checked: a read-only file has no dirty pages, and a
+/// number naming no descriptor is `EBADF` here as everywhere.
+fn sync_fd(args: &[PyObjectRef], name: &'static str) -> Result<PyObjectRef, crate::PyError> {
+    let Some(w_fd) = args.first().copied() else {
+        return Err(crate::PyError::type_error(format!(
+            "{name} expected 1 argument, got 0"
+        )));
+    };
+    let fd = unsafe { pyre_object::w_int_get_value(w_fd) } as i32;
+    if fd == 1 || fd == 2 {
+        return Ok(pyre_object::w_none());
+    }
+    with_raw_fd(fd, |_| Ok(()))?;
     Ok(pyre_object::w_none())
 }
 
@@ -1101,6 +1341,98 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         "rmdir",
         crate::make_builtin_function("rmdir", |args| refuse_write(args, "rmdir")),
     );
+    // The rest of wasi's writing surface, published so that a program can ask
+    // for it and refused because the mount is read-only.  `mkdir` and `chmod`
+    // take a mode after the path, `utime` a pair of times, `truncate` a
+    // length: none is read, since none of them gets as far as writing.
+    crate::module_ns_store(
+        ns,
+        "mkdir",
+        crate::make_builtin_function("mkdir", |args| refuse_write_path(args, "mkdir", "path")),
+    );
+    crate::module_ns_store(
+        ns,
+        "chmod",
+        crate::make_builtin_function("chmod", |args| refuse_write_path(args, "chmod", "path")),
+    );
+    crate::module_ns_store(
+        ns,
+        "utime",
+        crate::make_builtin_function("utime", |args| refuse_write_path(args, "utime", "path")),
+    );
+    crate::module_ns_store(
+        ns,
+        "truncate",
+        crate::make_builtin_function("truncate", |args| refuse_write_path(args, "truncate", "path")),
+    );
+    // The two-path calls, named by their source the way `rename` reports it.
+    crate::module_ns_store(
+        ns,
+        "rename",
+        crate::make_builtin_function("rename", |args| refuse_write_path(args, "rename", "src")),
+    );
+    crate::module_ns_store(
+        ns,
+        "replace",
+        crate::make_builtin_function("replace", |args| refuse_write_path(args, "replace", "src")),
+    );
+    crate::module_ns_store(
+        ns,
+        "link",
+        crate::make_builtin_function("link", |args| refuse_write_path(args, "link", "src")),
+    );
+    crate::module_ns_store(
+        ns,
+        "symlink",
+        crate::make_builtin_function("symlink", |args| refuse_write_path(args, "symlink", "src")),
+    );
+    crate::module_ns_store(
+        ns,
+        "ftruncate",
+        crate::make_builtin_function_with_arity(
+            "ftruncate",
+            |args| {
+                sync_fd(args, "ftruncate")?;
+                Err(crate::PyError::os_error_syscall(
+                    crate::builtins::wasm_errno::EROFS,
+                    pyre_object::w_none(),
+                ))
+            },
+            2,
+        ),
+    );
+    crate::module_ns_store(
+        ns,
+        "fsync",
+        crate::make_builtin_function_with_arity("fsync", |args| sync_fd(args, "fsync"), 1),
+    );
+    crate::module_ns_store(
+        ns,
+        "fdatasync",
+        crate::make_builtin_function_with_arity("fdatasync", |args| sync_fd(args, "fdatasync"), 1),
+    );
+    crate::module_ns_store(ns, "access", crate::make_builtin_function("access", access));
+    crate::module_ns_store(
+        ns,
+        "write",
+        crate::make_builtin_function("write", write),
+    );
+    crate::module_ns_store(
+        ns,
+        "uname",
+        crate::make_builtin_function_with_arity("uname", uname, 0),
+    );
+    // `_io` asks this of every descriptor it wraps; no terminal is reachable,
+    // and a descriptor that is not one has no encoding of its own.
+    crate::module_ns_store(
+        ns,
+        "device_encoding",
+        crate::make_builtin_function_with_arity(
+            "device_encoding",
+            |_args| Ok(pyre_object::w_none()),
+            1,
+        ),
+    );
     // ── the constants those entry points are called with ──
     let constants: &[(&str, i64)] = &[
         ("O_RDONLY", oflag::RDONLY),
@@ -1117,8 +1449,8 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
         ("O_DIRECTORY", oflag::DIRECTORY),
         ("O_CLOEXEC", oflag::CLOEXEC),
         ("F_OK", 0),
-        ("X_OK", 1),
-        ("W_OK", 2),
+        ("X_OK", X_OK),
+        ("W_OK", W_OK),
         ("R_OK", 4),
         ("SEEK_SET", 0),
         ("SEEK_CUR", 1),
