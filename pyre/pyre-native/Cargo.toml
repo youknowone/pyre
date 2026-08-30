@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Native library backends for pyre, kept outside the LLBC extraction"
 
+[features]
+default = ["host_env"]
+host_env = ["dep:rustpython-host_env"]
+sandbox = ["host_env"]
+wasm_vfs = ["dep:lz4_flex"]
+
 [dependencies]
 parking_lot = { workspace = true }
 md-5 = { workspace = true }
@@ -19,6 +25,14 @@ flate2 = { workspace = true, features = ["zlib-rs"] }
 zlib-rs = { workspace = true }
 bzip2 = { workspace = true }
 xz-core = { workspace = true }
+base64 = { workspace = true }
+crc32fast = { workspace = true }
+rustpython-wtf8 = { workspace = true }
+rustpython-host_env = { workspace = true, optional = true }
+libc = { workspace = true }
+lz4_flex = { version = "0.13", default-features = false, features = [
+    "safe-decode",
+], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { workspace = true }
@@ -29,3 +43,6 @@ pem-rfc7468 = { workspace = true }
 der = { workspace = true }
 pkcs8 = { workspace = true }
 rustls-native-certs = { workspace = true }
+
+[build-dependencies]
+cc = "1.2"

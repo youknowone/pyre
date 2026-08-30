@@ -331,7 +331,7 @@ fn encode_mapping(
         | Mapping::JisX0213_2004_2 => {
             let config_2000 =
                 matches!(mapping, Mapping::JisX0213_2000_1 | Mapping::JisX0213_2000_2);
-            let (code, consumed) = encode_jisx0213_code(input, final_input, config_2000)?;
+            let (code, consumed) = encode_jisx0213_code(input, final_input, config_2000, false)?;
             let plane2 = matches!(mapping, Mapping::JisX0213_2000_2 | Mapping::JisX0213_2004_2);
             if plane2 == (code & 0x8000 != 0) {
                 return Ok((code & 0x7fff, consumed));

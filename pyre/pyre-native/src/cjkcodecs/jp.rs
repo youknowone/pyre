@@ -374,6 +374,7 @@ pub(super) fn encode_jisx0213_code(
     input: &[u32],
     final_input: bool,
     config_2000: bool,
+    allow_jisx0212_common: bool,
 ) -> Result<(u16, usize), EncodeOne> {
     let c = input[0];
     if c <= 0xffff {
@@ -408,11 +409,11 @@ pub(super) fn encode_jisx0213_code(
             return Ok((code, 1));
         }
         if let Some(code) = try_map_encode(&JISXCOMMON_ENCMAP, &JISXCOMMON_ENCMAP_DATA, c) {
-            // PyPy `_codecs_jp.c::jisx0213_encoder` and
-            // `_codecs_iso2022.c::jisx0213_encoder` both abandon the shared
-            // table's high-bit JIS X 0212 entries here.  They are not JIS X
-            // 0213 plane 2 codes.
-            if code & 0x8000 == 0 {
+            // PyPy `_codecs_jp.c`'s `euc_jis_2004_encoder` accepts JIS X 0212
+            // entries from `jisxcommon`, while `shift_jis_2004_encoder` and
+            // `_codecs_iso2022.c`'s `jisx0213_encoder` reject them.  The high
+            // bit is a codeset-2 marker only on the EUC path.
+            if allow_jisx0212_common || code & 0x8000 == 0 {
                 return Ok((code, 1));
             }
         }
@@ -438,7 +439,7 @@ pub(super) fn encode_euc_jis_2004(
     if c < 0x80 {
         return bytes1(c as u8);
     }
-    let (code, consumed) = match encode_jisx0213_code(input, final_input, config_2000) {
+    let (code, consumed) = match encode_jisx0213_code(input, final_input, config_2000, true) {
         Ok(value) => value,
         Err(EncodeOne::Illegal(_)) if (0xff61..=0xff9f).contains(&c) => {
             return bytes2(0x8e, (c - 0xfec0) as u8, 1);
@@ -549,7 +550,7 @@ pub(super) fn encode_shift_jis_2004(
     if let Some(code) = jisx0201_encode(c) {
         return bytes1(code);
     }
-    let (code, consumed) = match encode_jisx0213_code(input, final_input, config_2000) {
+    let (code, consumed) = match encode_jisx0213_code(input, final_input, config_2000, false) {
         Ok((code, consumed)) if code & 0x8000 == 0 || c > 0xffff => (code, consumed),
         Ok((code, consumed)) => {
             if (config_2000 && c == 0x9b1d)

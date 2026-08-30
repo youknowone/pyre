@@ -57,7 +57,7 @@ members = [
 # pyre internal crates
 pyre-object = { version = "0.0.2", path = "pyre/pyre-object" }
 pyre-macros = { version = "0.0.2", path = "pyre/pyre-macros" }
-pyre-native = { version = "0.0.2", path = "pyre/pyre-native" }
+pyre-native = { version = "0.0.2", path = "pyre/pyre-native", default-features = false }
 pyre-interpreter = { version = "0.0.2", path = "pyre/pyre-interpreter" }
 pyre-sandbox = { version = "0.0.2", path = "pyre/pyre-sandbox" }
 pyre-module = { version = "0.0.2", path = "pyre/pyre-module" }

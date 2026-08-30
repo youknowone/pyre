@@ -2967,11 +2967,8 @@ dependencies = [
 name = "pyre-interpreter"
 version = "0.0.2"
 dependencies = [
- "base64",
  "bitflags 2.13.0",
  "cc",
- "crc32fast",
- "flate2",
  "getrandom 0.4.3",
  "indexmap",
  "libc",
@@ -3087,11 +3084,16 @@ dependencies = [
 name = "pyre-native"
 version = "0.0.2"
 dependencies = [
+ "base64",
  "blake2b_simd",
  "blake2s_simd",
  "bzip2",
+ "cc",
+ "crc32fast",
  "der",
  "flate2",
+ "libc",
+ "lz4_flex",
  "md-5",
  "parking_lot",
  "pem-rfc7468",
@@ -3100,6 +3102,8 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "rustls-webpki",
+ "rustpython-host_env",
+ "rustpython-wtf8",
  "scrypt 0.11.0",
  "sha1",
  "sha2 0.10.9",

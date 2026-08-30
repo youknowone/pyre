@@ -41,40 +41,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let target = std::env::var("TARGET").unwrap_or_default();
 
-    // cffi's declaration parser is the format a compiled cffi extension module
-    // embeds its type information in, so both interpreters compile the same C
-    // translation unit rather than re-spell the grammar
-    // (`pypy/module/_cffi_backend/parse_c_type.py`'s ECI).  `commontypes.c` is
-    // `#include`d by `parse_c_type.c` and is not a unit of its own.
-    // `longdouble.c` joins it because `long double`'s width and representation
-    // are the C compiler's to know, exactly as `misc.py` reaches for C to
-    // answer `pypy__is_nonnull_longdouble`.
-    if std::env::var_os("CARGO_FEATURE_SANDBOX").is_none() && !target.starts_with("wasm32-") {
-        let cffi_root = Path::new("src/module/_cffi_backend");
-        let cffi_sources = [
-            "src/module/_cffi_backend/src/parse_c_type.c",
-            "src/module/_cffi_backend/src/longdouble.c",
-        ];
-        for source in cffi_sources {
-            println!("cargo:rerun-if-changed={source}");
-        }
-        for header in [
-            "src/precommondefs.h",
-            "src/parse_c_type.h",
-            "src/commontypes.c",
-        ] {
-            println!(
-                "cargo:rerun-if-changed={}",
-                cffi_root.join(header).display()
-            );
-        }
-        cc::Build::new()
-            .files(cffi_sources)
-            .include(cffi_root)
-            .warnings(false)
-            .compile("pyre_cffi_parse_c_type");
-    }
-
     // `ctypefunc` names `ffi_type_longdouble`, which libffi defines only where
     // its configure saw `sizeof(long double) != sizeof(double)`.  A build with
     // that off -- Apple's system libffi on aarch64, for one -- neither defines

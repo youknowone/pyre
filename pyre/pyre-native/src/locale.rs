@@ -15,7 +15,7 @@
 /// drops it, which would collapse the "stop" and "repeat the last group"
 /// conventions onto the same vector.
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-pub(super) fn charp2str(ptr: *const libc::c_char) -> Vec<u8> {
+pub fn charp2str(ptr: *const libc::c_char) -> Vec<u8> {
     let mut out = Vec::new();
     if !ptr.is_null() {
         let mut cur = ptr;
@@ -38,7 +38,7 @@ pub(super) fn charp2str(ptr: *const libc::c_char) -> Vec<u8> {
 /// `:180-182`) and reads the host locale even there; pyre compiles the call out
 /// instead, because the sandbox build replaces `_locale`'s host entry points
 /// with raising stubs and `format()` must not acquire a raising path.
-pub(crate) fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
         let conv = unsafe { libc::localeconv() };

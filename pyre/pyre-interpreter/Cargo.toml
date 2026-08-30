@@ -8,7 +8,7 @@ description = "Python bytecode interpreter for pyre"
 
 [features]
 default = ["host_env"]
-host_env = ["dep:rustpython-host_env"]
+host_env = ["dep:rustpython-host_env", "pyre-native/host_env"]
 # Expose the crate-internal `test_hooks` module (thread-local dict hash-hook
 # installer) to downstream test builds. Enabled by `pyre-jit`'s
 # dev-dependency so its `#[test]`s — which drive interpreter frames through
@@ -19,7 +19,7 @@ test-hooks = []
 # RPython-style sandbox: route every OS call through host_seam's marshalling
 # trampoline instead of the real syscall. Implies host_env (same call surface,
 # swapped bodies); the real-vs-trampoline choice lives only inside host_seam.
-sandbox = ["host_env", "dep:pyre-sandbox"]
+sandbox = ["host_env", "dep:pyre-sandbox", "pyre-native/sandbox"]
 # Load C extension modules built against pyre's own ABI. The build-time switch
 # is upstream's: `has_so_extension` reads `config.objspace.usemodules.cpyext`
 # (imp/importing.py:60) and gates `create_dynamic` (imp/interp_imp.py:49-51).
@@ -41,7 +41,7 @@ dynasm = ["majit-metainterp/dynasm"]
 # and serve it from an in-memory VFS — the browser/web wasm target has no
 # filesystem. Off by default; the native and wasmtime-runner targets read the
 # real filesystem instead.
-wasm_vfs = ["dep:lz4_flex", "host_env"]
+wasm_vfs = ["pyre-native/wasm_vfs", "host_env"]
 
 [dependencies]
 pyre-object = { workspace = true }
@@ -80,19 +80,9 @@ pyre-sandbox = { workspace = true, optional = true }
 libc = { workspace = true }
 siphasher = { workspace = true }
 getrandom = { workspace = true }
-base64 = { workspace = true }
-crc32fast = { workspace = true }
-flate2 = { workspace = true, features = ["zlib-rs"] }
 indexmap = { workspace = true }
 paste = { workspace = true }
 parking_lot = { workspace = true }
-# Decompresses the embedded stdlib VFS blob at runtime (wasm_vfs). Decode-only,
-# no_std-compatible safe path; the encode side is unused here.
-lz4_flex = { version = "0.13", default-features = false, features = [
-    "safe-encode",
-    "safe-decode",
-], optional = true }
-
 # `_cffi_backend` owns the `ffi_cif` for a function type and reuses it across
 # every call to that function (`pypy/module/_cffi_backend/ctypefunc.py`'s
 # `cif_descr`), which the host_env ctypes door cannot express -- it builds a

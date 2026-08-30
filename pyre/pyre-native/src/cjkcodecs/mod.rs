@@ -14,7 +14,7 @@ mod mappings_tw;
 mod tw;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Codec {
+pub enum Codec {
     EucKr,
     Cp949,
     Johab,
@@ -42,7 +42,7 @@ pub(super) enum Codec {
 }
 
 impl Codec {
-    pub(super) fn from_name(name: &str) -> Option<Self> {
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "euc_kr" => Some(Self::EucKr),
             "cp949" => Some(Self::Cp949),
@@ -86,7 +86,7 @@ fn is_iso2022(codec: Codec) -> bool {
     )
 }
 
-pub(super) fn initial_state(codec: Codec, decoder: bool) -> [u8; 8] {
+pub fn initial_state(codec: Codec, decoder: bool) -> [u8; 8] {
     let mut state = [0; 8];
     if is_iso2022(codec) {
         if decoder {
@@ -98,7 +98,7 @@ pub(super) fn initial_state(codec: Codec, decoder: bool) -> [u8; 8] {
     state
 }
 
-pub(super) enum DecodeOne {
+pub enum DecodeOne {
     Char(u32, usize),
     Pair(u32, u32, usize),
     Skip(usize),
@@ -106,13 +106,13 @@ pub(super) enum DecodeOne {
     Illegal(usize),
 }
 
-pub(super) enum EncodeOne {
+pub enum EncodeOne {
     Bytes([u8; 8], usize, usize),
     Incomplete,
     Illegal(usize),
 }
 
-pub(super) fn decode_one(codec: Codec, input: &[u8], state: &mut [u8; 8]) -> DecodeOne {
+pub fn decode_one(codec: Codec, input: &[u8], state: &mut [u8; 8]) -> DecodeOne {
     debug_assert!(!input.is_empty());
     if is_iso2022(codec) {
         return iso2022::decode_one(codec, input, state);
@@ -145,7 +145,7 @@ pub(super) fn decode_one(codec: Codec, input: &[u8], state: &mut [u8; 8]) -> Dec
     }
 }
 
-pub(super) fn encode_one(
+pub fn encode_one(
     codec: Codec,
     input: &[u32],
     final_input: bool,
@@ -183,7 +183,7 @@ pub(super) fn encode_one(
     }
 }
 
-pub(super) fn encode_reset(codec: Codec, state: &mut [u8; 8]) -> Option<([u8; 8], usize)> {
+pub fn encode_reset(codec: Codec, state: &mut [u8; 8]) -> Option<([u8; 8], usize)> {
     match codec {
         Codec::Hz => cn::reset_hz(state),
         Codec::Iso2022Kr

@@ -393,7 +393,7 @@ impl VfsProvider {
     /// synthetic `Dir` entry for every ancestor directory (so `is_dir` answers
     /// for `re/`, `collections/`, and the mount itself).
     fn from_blob(blob: &[u8], mount: &Path) -> Self {
-        let raw = lz4_flex::block::decompress_size_prepended(blob)
+        let raw = pyre_native::vfs::decompress_size_prepended(blob)
             .expect("wasm_vfs: corrupt embedded stdlib blob");
         let mut map: HashMap<PathBuf, VfsEntry> = HashMap::new();
         map.insert(mount.to_path_buf(), VfsEntry::Dir);
@@ -722,19 +722,12 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_immutables_map);
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_cn);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_jp);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_iso2022);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_hk);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_kr);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_tw);
-    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_multibytecodec);
     // moduledef.py: `applevel_name = os.name` installs the one posix module
     // under `os.name` — `"posix"` on a POSIX host, `"nt"` on Windows, where a

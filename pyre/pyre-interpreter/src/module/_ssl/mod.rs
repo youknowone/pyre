@@ -4,7 +4,6 @@
 //! `ssl.py`.  This module supplies its low-level primitives while the actual
 //! TLS engine lives in `pyre-native`, outside the translated interpreter.
 
-use base64::Engine;
 use pyre_object::*;
 
 const PROTOCOL_TLS: i32 = 2;
@@ -2591,11 +2590,13 @@ mod certificate_methods {
                 return Ok(self.der);
             }
             if encoding == 1 || encoding == 0x101 {
-                let encoded = base64::engine::general_purpose::STANDARD
-                    .encode(unsafe { pyre_object::bytesobject::w_bytes_data(self.der) });
+                let encoded = pyre_native::binascii::b2a_base64(
+                    unsafe { pyre_object::bytesobject::w_bytes_data(self.der) },
+                    false,
+                );
                 let mut pem = String::with_capacity(encoded.len() + 64);
                 pem.push_str("-----BEGIN CERTIFICATE-----\n");
-                for line in encoded.as_bytes().chunks(64) {
+                for line in encoded.chunks(64) {
                     pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
                     pem.push('\n');
                 }

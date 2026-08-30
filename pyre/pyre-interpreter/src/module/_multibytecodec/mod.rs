@@ -1,7 +1,9 @@
 //! PyPy `_multibytecodec`, with its cjkcodecs engines ported to Rust.
+//!
+//! The Python/GC adapter stays here; the pure state machines and mapping
+//! tables live in `pyre_native::cjkcodecs`, outside Charon/LLBC extraction.
 
-mod cjkcodecs;
-
+use pyre_native::cjkcodecs;
 use pyre_object::*;
 use rustpython_wtf8::{CodePoint, Wtf8Buf};
 

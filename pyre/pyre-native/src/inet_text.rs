@@ -14,7 +14,7 @@
 /// `inet_aton` — the lenient parser, which reads one to four parts and gives
 /// the last one every byte the earlier ones did not claim.  A part is decimal,
 /// octal behind a `0`, or hexadecimal behind a `0x`.
-pub(super) fn aton(text: &[u8]) -> Option<[u8; 4]> {
+pub fn aton(text: &[u8]) -> Option<[u8; 4]> {
     let mut parts = Vec::new();
     for field in std::str::from_utf8(text).ok()?.split('.') {
         let (digits, radix) = match field.as_bytes() {
@@ -47,7 +47,7 @@ pub(super) fn aton(text: &[u8]) -> Option<[u8; 4]> {
 }
 
 /// `inet_ntoa` — the dotted-quad spelling of four address bytes.
-pub(super) fn ntoa(packed: [u8; 4]) -> String {
+pub fn ntoa(packed: [u8; 4]) -> String {
     format!("{}.{}.{}.{}", packed[0], packed[1], packed[2], packed[3])
 }
 
@@ -65,7 +65,7 @@ fn strict_octet(field: &[u8]) -> Option<u8> {
 }
 
 /// `inet_pton(AF_INET, ...)` — exactly four strict octets.
-pub(super) fn pton_v4(text: &[u8]) -> Option<[u8; 4]> {
+pub fn pton_v4(text: &[u8]) -> Option<[u8; 4]> {
     let mut address = [0u8; 4];
     let mut fields = text.split(|b| *b == b'.');
     for slot in &mut address {
@@ -75,7 +75,7 @@ pub(super) fn pton_v4(text: &[u8]) -> Option<[u8; 4]> {
 }
 
 /// `inet_pton(AF_INET6, ...)`.
-pub(super) fn pton_v6(text: &[u8]) -> Option<[u8; 16]> {
+pub fn pton_v6(text: &[u8]) -> Option<[u8; 16]> {
     // A trailing dotted quad occupies the last two groups, so it is taken off
     // first and the hexadecimal grammar reads what is left.  The colon before
     // it is a separator, except when the quad follows a compressed run: there
@@ -166,7 +166,7 @@ fn hex_groups(text: &[u8], limit: usize) -> Option<Vec<u16>> {
 /// The address is written out group by group and then has its longest run of
 /// zero groups replaced by `::`, which is the rewrite musl performs and the
 /// reason a run of one group is left spelled out.
-pub(super) fn ntop_v6(packed: &[u8]) -> String {
+pub fn ntop_v6(packed: &[u8]) -> String {
     let group = |i: usize| (u16::from(packed[2 * i]) << 8) | u16::from(packed[2 * i + 1]);
     // An IPv4-mapped address keeps its last four bytes in dotted-quad form.
     let text = if packed[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] {

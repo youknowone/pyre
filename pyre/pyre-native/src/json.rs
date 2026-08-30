@@ -1,13 +1,13 @@
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
-pub(super) static ESCAPE_CHARS: [&str; 0x20] = [
+pub static ESCAPE_CHARS: [&str; 0x20] = [
     "\\u0000", "\\u0001", "\\u0002", "\\u0003", "\\u0004", "\\u0005", "\\u0006", "\\u0007", "\\b",
     "\\t", "\\n", "\\u000b", "\\f", "\\r", "\\u000e", "\\u000f", "\\u0010", "\\u0011", "\\u0012",
     "\\u0013", "\\u0014", "\\u0015", "\\u0016", "\\u0017", "\\u0018", "\\u0019", "\\u001a",
     "\\u001b", "\\u001c", "\\u001d", "\\u001e", "\\u001f",
 ];
 
-pub(super) fn encode_string(value: &Wtf8, ascii_only: bool) -> Wtf8Buf {
+pub fn encode_string(value: &Wtf8, ascii_only: bool) -> Wtf8Buf {
     let mut out = Wtf8Buf::with_capacity(value.len() + 2);
     out.push_char('"');
     for cp in value.code_points() {
@@ -40,7 +40,7 @@ pub(super) fn encode_string(value: &Wtf8, ascii_only: bool) -> Wtf8Buf {
 }
 
 #[derive(Debug)]
-pub(super) struct DecodeError {
+pub struct DecodeError {
     pub msg: String,
     pub pos: usize,
 }
@@ -69,7 +69,7 @@ where
 
 /// CPython `_json.scanstring`, expressed over WTF-8 so lone surrogates retain
 /// their Python `str` identity rather than being lossily converted to UTF-8.
-pub(super) fn scan_string(
+pub fn scan_string(
     value: &Wtf8,
     char_offset: usize,
     strict: bool,

@@ -33,6 +33,10 @@ for name in ("shift_jis_2004", "shift_jisx0213"):
 for name in ("euc_jis_2004", "euc_jisx0213", "shift_jis_2004", "shift_jisx0213"):
     assert ("フルーツ\0").encode(name).endswith(b"\0")
 
+# `_codecs_jp.c::euc_jis_2004_encoder` deliberately retains JIS X 0212
+# entries from `jisxcommon`; the shift-JIS and ISO-2022 engines reject them.
+assert "\u010a".encode("euc_jis_2004") == bytes.fromhex("8faaaf")
+
 # PyPy `_codecs_iso2022.c::jisx0213_encoder` rejects JIS X 0212-only entries;
 # their high bit is not a JIS X 0213 plane-2 marker on this path.
 for name in ("iso2022_jp_2004", "iso2022_jp_3"):
