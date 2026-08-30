@@ -2382,7 +2382,7 @@ def llbc_input_paths():
     is the workspace artefact to the build and two levels above the repository
     to a caller resolving from the root. Taken as written it names a file that
     is not there, which the digest records as an unreadable input — the same
-    value however often the real artefact is rewritten, so `--no-build` would
+    value however often the real artefact is rewritten, so `--build=no` would
     approve a generated JIT front end built from an LLBC that has since moved.
     """
     override = os.environ.get("MAJIT_MIR_FRONTEND_LLBC")
@@ -2412,7 +2412,7 @@ def embedded_inputs_outside_members(member_sources, members, listed):
     workspace entirely: `majit-metainterp/src/ruleopt/mod.rs` embeds
     `rpython/jit/metainterp/ruleopt/real.rules`, which the member-directory
     filter alone drops. Left out, editing that file rebuilds the artefact
-    without moving the fingerprint, and a later `--no-build` run approves a
+    without moving the fingerprint, and a later `--build=no` run approves a
     binary built from the previous text.
 
     Scanned rather than listed by hand, so a second one cannot be added to the
@@ -2467,7 +2467,7 @@ def build_input_paths():
     `git ls-files`: a new `.rs` under a member crate compiles into the artefact
     before it is ever staged. Left out, it would contribute nothing to the
     digest, so editing it would not move the fingerprint and a later
-    `--no-build` run would accept an artefact built from code the digest never
+    `--build=no` run would accept an artefact built from code the digest never
     saw. Worse, deleting it again would return the digest to its earlier value
     while the artefact still held its code. `--others --exclude-standard` adds
     exactly the untracked-and-not-ignored files, so `target/` and the rest of
@@ -2517,7 +2517,7 @@ def build_input_paths():
 # lands in `OUT_DIR` under `target/`, which [`build_input_paths`] deliberately
 # never reads. So nothing else in the fingerprint can see the difference, and
 # without them a run under a gate stamps a digest a later unset run reproduces
-# exactly — `--no-build` then measures a differently-lowered JIT.
+# exactly — `--build=no` then measures a differently-lowered JIT.
 #
 # `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS` are cargo's own: the native builds
 # inherit whatever is set, and only the wasm module build overrides `RUSTFLAGS`
@@ -2546,7 +2546,7 @@ def build_recipe_digest():
     artefact, and none of them is a file under a member directory — this
     script is a build input by no path rule, so editing `--growable-table` out
     of `WASM_RUSTFLAGS` moved nothing in the fingerprint and a later
-    `--no-build` run approved a module built with it still in.
+    `--build=no` run approved a module built with it still in.
 
     The whole table at once rather than the row for one backend: a stamp
     naming only its own row could not be compared without also recording which
@@ -2593,7 +2593,7 @@ def build_inputs_fingerprint():
     subtrees, and a gate reading mtimes then blocks a build that is in fact
     current. Hashing the roughly one thousand inputs (about 1GB, most of it
     the LLBC) costs under a second, against the multi-minute build
-    `--no-build` exists to skip.
+    `--build=no` exists to skip.
 
     Computed after a build rather than before it: `cargo` may rewrite
     `Cargo.lock`, which is itself an input, so the state that produced the
@@ -2606,7 +2606,7 @@ def build_inputs_fingerprint():
     life. Without that call the rule above would bind the FIRST stamped
     artefact alone: a run that builds several backends stamps after each one,
     and every stamp past the first would carry a digest read before the build
-    that produced it. A later `--no-build` run then reads the tree as it
+    that produced it. A later `--build=no` run then reads the tree as it
     actually is and rejects artefacts that are in fact current.
     """
     global _BUILD_INPUTS_FINGERPRINT
@@ -2731,7 +2731,7 @@ def open_build_window():
     the `Cargo.lock` the build may have resolved. That ordering is what lets an
     edit landing mid-build be recorded against an artefact compiled before it:
     the stamp would then name a tree the binary does not contain, and a later
-    `--no-build` run would find them in agreement and measure it. Reading the
+    `--build=no` run would find them in agreement and measure it. Reading the
     tree here as well makes that window observable, which is the only way to
     tell the two orders apart.
     """
@@ -2745,7 +2745,7 @@ def invalidate_build_inputs_fingerprint():
 
     Called once per completed build, before its artefacts are stamped. The
     memoisation that survives is the one it exists for: the read-only
-    `--no-build` path, where nothing writes to the tree between reads.
+    `--build=no` path, where nothing writes to the tree between reads.
     """
     global _BUILD_INPUTS_FINGERPRINT
     _BUILD_INPUTS_FINGERPRINT = _FINGERPRINT_UNSET
@@ -2779,10 +2779,10 @@ def stamp_artefact_inputs(artefact):
     build` outside this script overwrites the executable and leaves the
     sidecar alone; restoring the tree to the state the sidecar names would
     then make the input digests agree while the executable holds different
-    code, and `--no-build` would record baselines against it.
+    code, and `--build=no` would record baselines against it.
 
     A failure here is not worth losing a finished build over, but it is worth
-    saying: the next `--no-build` run would otherwise report the artefact as
+    saying: the next `--build=no` run would otherwise report the artefact as
     unstamped with no trace of why.
     """
     fingerprint = build_inputs_fingerprint()
@@ -2793,11 +2793,11 @@ def stamp_artefact_inputs(artefact):
         # Some input changed while cargo was reading them, so the artefact
         # holds neither the tree the build started from nor the one that is
         # here now. Stamping the current tree against it would make a later
-        # `--no-build` run agree with a binary that does not contain it.
+        # `--build=no` run agree with a binary that does not contain it.
         print(
             f"  warning: the tree changed while {artefact} was building, so "
             "its inputs are not\n           the tree that is here now; it is "
-            "stamped as unusable for --no-build."
+            "stamped as unusable for --build=no."
         )
         fingerprint = STAMP_TREE_MOVED
     content = artefact_content_digest(artefact)
@@ -2837,7 +2837,7 @@ def read_artefact_stamp(stamp):
 def require_fresh_artefacts(artefacts, reason, remedy):
     """Refuse to measure an artefact that was built from different sources.
 
-    `--no-build` skips every artefact of a backend, and wasm has two: the
+    `--build=no` skips every artefact of a backend, and wasm has two: the
     native runner and the wasm module the runner loads. A module left behind by
     an earlier build produces a fully green run — and a set of recorded
     baselines — for code that is not in it, with nothing in the output saying
@@ -2889,7 +2889,7 @@ def require_fresh_llbc():
     names the wrong bytes — and a miscompiled field access returns a NUMBER
     rather than an error, which makes an unsound run indistinguishable from a
     real one. `pyre-jit-trace`'s `build.rs` refuses on exactly that, but it can
-    only refuse while a build is running. `--no-build` is the path where
+    only refuse while a build is running. `--build=no` is the path where
     nothing else asks, and it is the path a moving tree lands in: a branch that
     moves after the binaries were built leaves them measurable and the offsets
     they read stale, with nothing in the output saying so.
@@ -5077,15 +5077,15 @@ def parse_args():
         f"(default: {','.join(DEFAULT_BACKENDS)})",
     )
     parser.add_argument(
-        "--no-build",
-        action="store_true",
-        help="use existing release backend binaries instead of running cargo build",
-    )
-    parser.add_argument(
-        "--build-only",
-        action="store_true",
-        help="build and stamp each backend's release artefacts, then exit "
-        "without measuring anything",
+        "--build",
+        choices=("only", "yes", "no"),
+        nargs="?",
+        const="yes",
+        default="yes",
+        help="yes (the default) builds each backend and then measures it; no "
+        "measures the release binaries already on disk without building; only "
+        "builds and stamps them and exits without measuring, so that a caller "
+        "can time the build apart from the run",
     )
     parser.add_argument(
         "--wasm-engine",
@@ -5148,12 +5148,6 @@ def parse_args():
     )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
-    if args.build_only and args.no_build:
-        # The pair asks for a run that neither builds nor measures. Refuse
-        # rather than pick one: a CI split names them in two separate steps,
-        # and a copy-paste that lands both on one step should say so here
-        # instead of quietly doing whichever the code happens to test first.
-        parser.error("--build-only and --no-build are mutually exclusive")
     # Answered here, ahead of the backend resolution below: the check is over
     # the fixture files, and nothing about it needs a backend to exist.
     if args.check_headers:
@@ -5208,11 +5202,11 @@ def main():
             return same_file(effective_wasm_module(), WASM_MODULE_PATH)
         return not args.pyre_path
 
-    if args.no_build and any(leg_reads_local_llbc(b) for b in backends):
+    if args.build == "no" and any(leg_reads_local_llbc(b) for b in backends):
         require_fresh_llbc()
 
     for backend in backends:
-        if not args.no_build:
+        if args.build != "no":
             chk.build_backend(backend)
         pyre_bin = args.pyre_path if args.pyre_path else default_binary(backend)
         if not Path(pyre_bin).exists():
@@ -5220,9 +5214,9 @@ def main():
             if Path(alt).exists():
                 pyre_bin = alt
         if not os.access(pyre_bin, os.X_OK) and not Path(pyre_bin).exists():
-            if args.no_build:
+            if args.build == "no":
                 print(
-                    f"ERROR: --no-build requested for backend '{backend}', but "
+                    f"ERROR: --build=no requested for backend '{backend}', but "
                     f"the executable is missing: {pyre_bin}"
                 )
             else:
@@ -5235,13 +5229,13 @@ def main():
         # Asked whether or not a build ran: `PYRE_WASM_MODULE` names the module
         # the runner loads, and a build cannot supply one that is not there.
         if backend == "wasm" and not Path(wasm_module).is_file():
-            skipped = "--no-build requested" if args.no_build else "PYRE_WASM_MODULE set"
+            skipped = "--build=no requested" if args.build == "no" else "PYRE_WASM_MODULE set"
             print(
                 f"ERROR: {skipped} for backend 'wasm', but the "
                 f"wasm-host module is missing: {wasm_module}"
             )
             sys.exit(1)
-        if args.no_build:
+        if args.build == "no":
             # `--pyre-path` names a binary from outside this tree, so its age
             # says nothing about these sources. The module is a separate
             # artefact and is this tree's own unless overridden, so it is asked
@@ -5253,8 +5247,8 @@ def main():
             if artefacts:
                 require_fresh_artefacts(
                     artefacts,
-                    f"--no-build requested for backend '{backend}'",
-                    "Re-run without --no-build to rebuild it.",
+                    f"--build=no requested for backend '{backend}'",
+                    "Re-run with --build=yes to rebuild it.",
                 )
         elif backend == "wasm" and not same_file(wasm_module, WASM_MODULE_PATH):
             # The build above produced `WASM_MODULE_PATH` and stamped it, but
@@ -5268,7 +5262,7 @@ def main():
             )
         chk._set_pyre(backend, pyre_bin)
 
-    if args.build_only:
+    if args.build == "only":
         # Stop here, with every artefact built, existence-checked and stamped
         # by `build_backend`. A caller splits the run in two so that a build
         # and a measurement are timed apart -- which is otherwise impossible,

@@ -829,9 +829,9 @@ jobs:
       # one extra `build_inputs_fingerprint` (under a second; see check.py) and
       # nothing else.
       #
-      # `--build-only` rather than a bare `cargo build` because the build is
+      # `--build=only` rather than a bare `cargo build` because the build is
       # what stamps each artefact with its inputs. Built outside check.py the
-      # artefacts carry no stamp, and the `--no-build` run below drops from
+      # artefacts carry no stamp, and the `--build=no` run below drops from
       # verifying freshness to noting that it cannot -- which is the gate added
       # after this script measured binaries from two different trees and
       # printed ALL PASSED. Split this way the gate gets *more* exercise than
@@ -851,14 +851,14 @@ jobs:
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
         PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend ${{ (runner.os == 'Linux' && matrix.backend == 'dynasm') && 'dynasm,wasm' || matrix.backend }} --build-only
+      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend ${{ (runner.os == 'Linux' && matrix.backend == 'dynasm') && 'dynasm,wasm' || matrix.backend }} --build=only
     - name: Run pyre/check.py
-      # `--no-build` measures the artefacts the step above built and stamped.
+      # `--build=no` measures the artefacts the step above built and stamped.
       # Keep the `--backend` list identical to that step's.
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
         PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
-      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend ${{ (runner.os == 'Linux' && matrix.backend == 'dynasm') && 'dynasm,wasm' || matrix.backend }} --no-build
+      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py --backend ${{ (runner.os == 'Linux' && matrix.backend == 'dynasm') && 'dynasm,wasm' || matrix.backend }} --build=no
     - name: Run pyre/extra_tests/parity_tests
       # Every script must exit 0 and print "OK" as its last line under CPython
       # AND under each pyre backend, so a divergence from CPython observable
@@ -936,7 +936,7 @@ jobs:
           echo '#### ${{ matrix.backend }}'
           echo '```'
           out=$(${{ steps.cpython.outputs.python-path }} pyre/check.py \
-            --backend '${{ matrix.backend }}' --no-build --no-synthetic \
+            --backend '${{ matrix.backend }}' --build=no --no-synthetic \
             --snapshot-diff 2>&1 || true)
           echo "$out" | grep -Ei 'jit-stats diff|snapshot diff' \
             || echo '(no jit-stats output)'
