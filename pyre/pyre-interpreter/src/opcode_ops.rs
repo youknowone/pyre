@@ -69,27 +69,80 @@ pub fn binary_value(
             return Ok(result);
         }
     }
+    // `_make_binop_impl` and `_make_inplace_impl` generate two
+    // families from one dispatch; the only thing that separates them is the
+    // symbol their fallback TypeError names, so each arm shares a body and
+    // passes its own spelling — `&` for `a & b`, `&=` for `a &= b`.
+    let symbol = operator_symbol(op);
+    use crate::objspace::descroperation as desc;
     match op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => add(a, b),
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => sub(a, b),
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => mul(a, b),
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => floordiv(a, b),
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => mod_(a, b),
-        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => truediv(a, b),
+        BinaryOperator::Add | BinaryOperator::InplaceAdd => desc::add_impl(a, b, symbol),
+        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => desc::sub_impl(a, b, symbol),
+        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => desc::mul_impl(a, b, symbol),
+        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
+            desc::floordiv_impl(a, b, symbol)
+        }
+        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
+            desc::mod_impl(a, b, symbol)
+        }
+        BinaryOperator::TrueDivide | BinaryOperator::InplaceTrueDivide => {
+            desc::truediv_impl(a, b, symbol)
+        }
         BinaryOperator::Power => pow(a, b),
         // PyPy `pyopcode.py:INPLACE_POWER` calls `space.inplace_pow`
         // directly; unlike the generated `inplace_impl` family this operation
-        // has its own three-argument-aware dispatch in descroperation.py.
-        BinaryOperator::InplacePower => crate::objspace::descroperation::inplace_pow(a, b),
-        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => lshift(a, b),
-        BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => matmul(a, b),
-        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => rshift(a, b),
-        BinaryOperator::And | BinaryOperator::InplaceAnd => and_(a, b),
+        // has its own three-argument-aware dispatch in descroperation.py,
+        // and with it its own `**=` fallback.
+        BinaryOperator::InplacePower => desc::inplace_pow(a, b),
+        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => desc::lshift_impl(a, b, symbol),
+        BinaryOperator::MatrixMultiply | BinaryOperator::InplaceMatrixMultiply => {
+            desc::matmul_impl(a, b, symbol)
+        }
+        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => desc::rshift_impl(a, b, symbol),
+        BinaryOperator::And | BinaryOperator::InplaceAnd => desc::and_impl(a, b, symbol),
         // mappingproxy `__ior__` (read-only) raises TypeError, handled
         // above by `try_inplace_special`; both fall through to `or_`.
-        BinaryOperator::Or | BinaryOperator::InplaceOr => or_(a, b),
-        BinaryOperator::Xor | BinaryOperator::InplaceXor => xor(a, b),
+        BinaryOperator::Or | BinaryOperator::InplaceOr => desc::or_impl(a, b, symbol),
+        BinaryOperator::Xor | BinaryOperator::InplaceXor => desc::xor_impl(a, b, symbol),
         BinaryOperator::Subscr => getitem(a, b),
+    }
+}
+
+/// The symbol descroperation.py bakes into an operation's fallback
+/// TypeError: the operator for a binary op, the augmented assignment for an
+/// in-place one.
+///
+/// `Power`, `InplacePower` and `Subscr` are listed for the match to be
+/// exhaustive; each raises through a dispatch that spells its own message.
+fn operator_symbol(op: BinaryOperator) -> &'static str {
+    match op {
+        BinaryOperator::Add => "+",
+        BinaryOperator::Subtract => "-",
+        BinaryOperator::Multiply => "*",
+        BinaryOperator::FloorDivide => "//",
+        BinaryOperator::Remainder => "%",
+        BinaryOperator::TrueDivide => "/",
+        BinaryOperator::Power => "**",
+        BinaryOperator::Lshift => "<<",
+        BinaryOperator::MatrixMultiply => "@",
+        BinaryOperator::Rshift => ">>",
+        BinaryOperator::And => "&",
+        BinaryOperator::Or => "|",
+        BinaryOperator::Xor => "^",
+        BinaryOperator::InplaceAdd => "+=",
+        BinaryOperator::InplaceSubtract => "-=",
+        BinaryOperator::InplaceMultiply => "*=",
+        BinaryOperator::InplaceFloorDivide => "//=",
+        BinaryOperator::InplaceRemainder => "%=",
+        BinaryOperator::InplaceTrueDivide => "/=",
+        BinaryOperator::InplacePower => "**=",
+        BinaryOperator::InplaceLshift => "<<=",
+        BinaryOperator::InplaceMatrixMultiply => "@=",
+        BinaryOperator::InplaceRshift => ">>=",
+        BinaryOperator::InplaceAnd => "&=",
+        BinaryOperator::InplaceOr => "|=",
+        BinaryOperator::InplaceXor => "^=",
+        BinaryOperator::Subscr => "[]",
     }
 }
 
