@@ -1036,6 +1036,7 @@ EXPECTED_TYPES = {
     types.EllipsisType: "()",
     types.GenericAlias: "(origin, args, /)",
     types.NotImplementedType: "()",
+    types.NoneType: "()",
     types.ModuleType: "(name, doc=None)",
     types.MappingProxyType: "(mapping)",
     types.TracebackType: "(tb_next, tb_frame, tb_lasti, tb_lineno)",
@@ -1055,6 +1056,67 @@ EXPECTED_TYPES = {
 
 for owner, signature in EXPECTED_TYPES.items():
     assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
+
+
+# singleton_type_text_signatures_python314
+
+EXPECTED_SINGLETON_METHODS = {
+    types.EllipsisType: {
+        "__new__": "($type, *args, **kwargs)",
+        "__repr__": "($self, /)",
+        "__reduce__": "($self, /)",
+    },
+    types.NotImplementedType: {
+        "__new__": "($type, *args, **kwargs)",
+        "__repr__": "($self, /)",
+        "__reduce__": "($self, /)",
+        "__bool__": "($self, /)",
+    },
+    types.NoneType: {
+        "__new__": "($type, *args, **kwargs)",
+        "__bool__": "($self, /)",
+        "__repr__": "($self, /)",
+        "__hash__": "($self, /)",
+        "__eq__": "($self, value, /)",
+        "__ne__": "($self, value, /)",
+        "__lt__": "($self, value, /)",
+        "__le__": "($self, value, /)",
+        "__gt__": "($self, value, /)",
+        "__ge__": "($self, value, /)",
+    },
+}
+for owner, methods in EXPECTED_SINGLETON_METHODS.items():
+    check_descriptors(owner, methods)
+
+GENERIC_NEW_DOC = "Create and return a new object.  See help(type) for accurate signature."
+EXPECTED_SINGLETON_DOCS = {
+    types.EllipsisType: {
+        "__new__": GENERIC_NEW_DOC,
+        "__repr__": "Return repr(self).",
+        "__reduce__": None,
+    },
+    types.NotImplementedType: {
+        "__new__": GENERIC_NEW_DOC,
+        "__repr__": "Return repr(self).",
+        "__reduce__": None,
+        "__bool__": "True if self else False",
+    },
+    types.NoneType: {
+        "__new__": GENERIC_NEW_DOC,
+        "__bool__": "True if self else False",
+        "__repr__": "Return repr(self).",
+        "__hash__": "Return hash(self).",
+        "__eq__": "Return self==value.",
+        "__ne__": "Return self!=value.",
+        "__lt__": "Return self<value.",
+        "__le__": "Return self<=value.",
+        "__gt__": "Return self>value.",
+        "__ge__": "Return self>=value.",
+    },
+}
+for owner, methods in EXPECTED_SINGLETON_DOCS.items():
+    for name, doc in methods.items():
+        assert getattr(owner, name).__doc__ == doc, (owner, name)
 
 
 # module_text_signatures_python314

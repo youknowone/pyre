@@ -43,6 +43,37 @@ def _module_type_receiver_contract():
 _module_type_receiver_contract()
 
 
+def _singleton_type_receiver_contract():
+    for owner, name, message in (
+        (
+            types.EllipsisType,
+            "__repr__",
+            "descriptor '__repr__' requires a 'ellipsis' object but received a 'dict'",
+        ),
+        (
+            types.EllipsisType,
+            "__reduce__",
+            "descriptor '__reduce__' for 'ellipsis' objects doesn't apply to a 'dict' object",
+        ),
+        (
+            types.NotImplementedType,
+            "__bool__",
+            "descriptor '__bool__' requires a 'NotImplementedType' object but received a 'dict'",
+        ),
+        (
+            types.NoneType,
+            "__hash__",
+            "descriptor '__hash__' requires a 'NoneType' object but received a 'dict'",
+        ),
+    ):
+        with assert_raises(TypeError) as raised:
+            getattr(owner, name)({})
+        assert str(raised.exception) == message
+
+
+_singleton_type_receiver_contract()
+
+
 def _function_type_kwdefaults():
     def source(a, /, b, *, c):
         return a + b + c

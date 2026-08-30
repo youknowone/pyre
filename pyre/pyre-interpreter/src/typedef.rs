@@ -1701,6 +1701,7 @@ pub fn init_typeobjects() {
                 &pyre_object::pyobject::NOTIMPLEMENTED_TYPE as *const PyType,
                 "()",
             ),
+            (&pyre_object::NONE_TYPE as *const PyType, "()"),
             (&pyre_object::MODULE_TYPE as *const PyType, "(name, doc=None)"),
             (
                 &pyre_object::MAPPING_PROXY_TYPE as *const PyType,
@@ -3785,18 +3786,44 @@ fn init_module_type(ns: PyObjectRef) {
     }
 }
 
+fn set_type_callable_text_signature(ns: PyObjectRef, name: &str, text_signature: &str) {
+    let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+        .expect("TypeDef callable was just installed");
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(function);
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new(text_signature));
+    unsafe {
+        crate::function::fset_func_text_signature(
+            pyre_object::gc_roots::shadow_stack_get(function_slot),
+            pyre_object::gc_roots::shadow_stack_get(signature_slot),
+        )
+    };
+}
+
 fn singleton_receiver(
     args: &[PyObjectRef],
     owner: &str,
     name: &str,
+    method_descriptor: bool,
     predicate: unsafe fn(PyObjectRef) -> bool,
 ) -> Result<PyObjectRef, crate::PyError> {
     let self_ = args.first().copied().unwrap_or(pyre_object::PY_NULL);
     if self_.is_null() || !unsafe { predicate(self_) } {
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '{name}' requires a '{owner}' object but received a '{}'",
-            type_name_of(self_),
-        )));
+        let received = if self_.is_null() {
+            "NULL".to_string()
+        } else {
+            type_name_of(self_)
+        };
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for '{owner}' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a '{owner}' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
     }
     Ok(self_)
 }
@@ -3815,32 +3842,40 @@ fn ellipsis_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     Ok(pyre_object::special::w_ellipsis())
 }
 
+/// PyPy `pypy/interpreter/typedef.py Ellipsis.typedef`.
 fn init_ellipsis_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__doc__",
-            w_str_new("The type of the Ellipsis singleton."),
-        )
-    };
+    // Preserve the real PyPy type-dict order (`__new__`, `__repr__`,
+    // `__reduce__`, `__doc__`). [3.14-spec] The carrier docs and signatures
+    // below are the public values measured on CPython 3.14.2; storage remains
+    // PyPy `Function.w_text_signature` / `BuiltinCode.docstring`.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(ellipsis_descr_new),
+            make_new_descr_with_doc(
+                ellipsis_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
                 |args| {
-                    singleton_receiver(args, "ellipsis", "__repr__", pyre_object::is_ellipsis)?;
+                    singleton_receiver(
+                        args,
+                        "ellipsis",
+                        "__repr__",
+                        false,
+                        pyre_object::is_ellipsis,
+                    )?;
                     Ok(w_str_new("Ellipsis"))
                 },
                 1,
+                "Return repr(self).",
             ),
         )
     };
@@ -3848,16 +3883,36 @@ fn init_ellipsis_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_method_descriptor_with_arity(
                 "__reduce__",
                 |args| {
-                    singleton_receiver(args, "ellipsis", "__reduce__", pyre_object::is_ellipsis)?;
+                    singleton_receiver(
+                        args,
+                        "ellipsis",
+                        "__reduce__",
+                        true,
+                        pyre_object::is_ellipsis,
+                    )?;
                     Ok(w_str_new("Ellipsis"))
                 },
                 1,
             ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("The type of the Ellipsis singleton."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__reduce__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 /// special.py: NotImplemented.descr_new_notimplemented
@@ -3875,38 +3930,39 @@ fn notimplemented_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     Ok(pyre_object::special::w_not_implemented())
 }
 
-/// typedef.py:948-954 NotImplemented.typedef
+/// PyPy `pypy/interpreter/typedef.py NotImplemented.typedef`.
 fn init_notimplemented_type(ns: PyObjectRef) {
-    unsafe {
-        pyre_object::w_dict_setitem_str(
-            ns,
-            "__doc__",
-            pyre_object::w_str_new("The type of the NotImplemented singleton."),
-        )
-    };
+    // Preserve real PyPy's shared order (`__new__`, `__repr__`, `__reduce__`,
+    // `__bool__`, `__doc__`). [3.14-spec] Only the measured CPython 3.14.2
+    // docs/signatures and the hard boolean-context TypeError differ.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(notimplemented_descr_new),
+            make_new_descr_with_doc(
+                notimplemented_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
                 |args| {
                     singleton_receiver(
                         args,
                         "NotImplementedType",
                         "__repr__",
+                        false,
                         pyre_object::is_not_implemented,
                     )?;
                     Ok(w_str_new("NotImplemented"))
                 },
                 1,
+                "Return repr(self).",
             ),
         )
     };
@@ -3914,13 +3970,14 @@ fn init_notimplemented_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_method_descriptor_with_arity(
                 "__reduce__",
                 |args| {
                     singleton_receiver(
                         args,
                         "NotImplementedType",
                         "__reduce__",
+                        true,
                         pyre_object::is_not_implemented,
                     )?;
                     Ok(w_str_new("NotImplemented"))
@@ -3935,13 +3992,14 @@ fn init_notimplemented_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__bool__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__bool__",
                 |args| {
                     singleton_receiver(
                         args,
                         "NotImplementedType",
                         "__bool__",
+                        false,
                         pyre_object::is_not_implemented,
                     )?;
                     Err(crate::PyError::type_error(
@@ -3949,9 +4007,25 @@ fn init_notimplemented_type(ns: PyObjectRef) {
                     ))
                 },
                 1,
+                "True if self else False",
             ),
         )
     };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("The type of the NotImplemented singleton."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__reduce__", "($self, /)"),
+        ("__bool__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
+    }
 }
 
 /// noneobject.py `W_NoneObject.typedef`, plus Python 3.14's singleton rich
@@ -3971,7 +4045,7 @@ fn none_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn none_ordering(args: &[PyObjectRef], name: &str) -> Result<PyObjectRef, crate::PyError> {
-    singleton_receiver(args, "NoneType", name, pyre_object::is_none)?;
+    singleton_receiver(args, "NoneType", name, false, pyre_object::is_none)?;
     Ok(pyre_object::w_not_implemented())
 }
 
@@ -3992,52 +4066,66 @@ fn none_ge(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 }
 
 fn init_none_type(ns: PyObjectRef) {
+    // Preserve `W_NoneObject.typedef`'s shared order (`__new__`, `__bool__`,
+    // `__repr__`, then `__doc__` after the 3.14-only rich-comparison slots).
+    // [3.14-spec] The extra slots and their public docs/signatures are the
+    // values measured on CPython 3.14.2; None storage and identity stay PyPy's.
     let entries = [
         (
-            "__doc__",
-            pyre_object::w_str_new("The type of the None singleton."),
+            "__new__",
+            make_new_descr_with_doc(
+                none_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         ),
-        ("__new__", make_new_descr(none_descr_new)),
         (
             "__bool__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__bool__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__bool__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__bool__", false, pyre_object::is_none)?;
                     Ok(pyre_object::w_bool_from(false))
                 },
                 1,
+                "True if self else False",
             ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__repr__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__repr__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__repr__", false, pyre_object::is_none)?;
                     Ok(w_str_new("None"))
                 },
                 1,
+                "Return repr(self).",
             ),
         ),
         (
             "__hash__",
-            crate::make_slot_wrapper_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__hash__",
                 |args| {
-                    let self_ =
-                        singleton_receiver(args, "NoneType", "__hash__", pyre_object::is_none)?;
+                    let self_ = singleton_receiver(
+                        args,
+                        "NoneType",
+                        "__hash__",
+                        false,
+                        pyre_object::is_none,
+                    )?;
                     Ok(pyre_object::w_int_new(crate::builtins::hash_value(self_)))
                 },
                 1,
+                "Return hash(self).",
             ),
         ),
         (
             "__eq__",
-            crate::make_slot_wrapper_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__eq__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__eq__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__eq__", false, pyre_object::is_none)?;
                     if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
                         Ok(pyre_object::w_bool_from(true))
                     } else {
@@ -4045,14 +4133,15 @@ fn init_none_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "Return self==value.",
             ),
         ),
         (
             "__ne__",
-            crate::make_slot_wrapper_with_arity(
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
                 "__ne__",
                 |args| {
-                    singleton_receiver(args, "NoneType", "__ne__", pyre_object::is_none)?;
+                    singleton_receiver(args, "NoneType", "__ne__", false, pyre_object::is_none)?;
                     if args.len() >= 2 && unsafe { pyre_object::is_none(args[1]) } {
                         Ok(pyre_object::w_bool_from(false))
                     } else {
@@ -4060,25 +4149,47 @@ fn init_none_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "Return self!=value.",
             ),
         ),
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str(ns, name, value) };
     }
-    for (name, function) in [
-        ("__lt__", none_lt as DunderFn),
-        ("__le__", none_le as DunderFn),
-        ("__gt__", none_gt as DunderFn),
-        ("__ge__", none_ge as DunderFn),
+    for (name, function, doc) in [
+        ("__lt__", none_lt as DunderFn, "Return self<value."),
+        ("__le__", none_le as DunderFn, "Return self<=value."),
+        ("__gt__", none_gt as DunderFn, "Return self>value."),
+        ("__ge__", none_ge as DunderFn, "Return self>=value."),
     ] {
         unsafe {
             pyre_object::w_dict_setitem_str(
                 ns,
                 name,
-                crate::make_slot_wrapper_with_arity(name, function, 2),
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, 2, doc),
             )
         };
+    }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            w_str_new("The type of the None singleton."),
+        )
+    };
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__bool__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__hash__", "($self, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 
@@ -30247,6 +30358,7 @@ fn compress_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.compress",
         "__iter__",
+        false,
         pyre_object::interp_itertools::is_compress,
     )
 }
@@ -30256,6 +30368,7 @@ fn compress_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.compress",
         "__next__",
+        false,
         pyre_object::interp_itertools::is_compress,
     )?;
     crate::baseobjspace::next(obj)
@@ -30292,6 +30405,7 @@ fn starmap_iter_self(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.starmap",
         "__iter__",
+        false,
         pyre_object::interp_itertools::is_starmap,
     )
 }
@@ -30301,6 +30415,7 @@ fn starmap_iter_next(args: &[PyObjectRef]) -> crate::PyResult {
         args,
         "itertools.starmap",
         "__next__",
+        false,
         pyre_object::interp_itertools::is_starmap,
     )?;
     crate::baseobjspace::next(obj)
