@@ -83,6 +83,10 @@ pub(crate) struct UnwrapOrSite {
     /// `tyref_is_niche_option_ptr`).  Always an `Option` (never a `Result`)
     /// when set, so `payload_on_disc_true` is `true`.
     pub niche: bool,
+    /// `None`'s scalar tag for `Option<E>` when `E` is a densely numbered
+    /// fieldless enum.  Like the pointer niche, this representation has no
+    /// aggregate fields: `Some(e)` is `e` itself and `None` is this tag.
+    pub fieldless_none_tag: Option<i64>,
 }
 
 /// Rewrite every recorded `Option::unwrap_or` call site into the
@@ -225,7 +229,7 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
     // base pointer, so the read is the identity on it.
     let recv_in_payload = map_source(&payload_sources, &payload_inputs, &opt)
         .ok_or_else(|| format!("{name}: receiver not threaded into payload arm"))?;
-    let payload = if site.niche {
+    let payload = if site.niche || site.fieldless_none_tag.is_some() {
         recv_in_payload
     } else {
         let payload = graph.alloc_value_var();
@@ -304,6 +308,19 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
                 result_ty: ValueType::Int,
             },
         });
+    } else if let Some(none_tag) = site.fieldless_none_tag {
+        let none = graph
+            .push_op_var(a_id, OpKind::ConstInt(none_tag), true)
+            .expect("ConstInt produces a value");
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt.clone(),
+                rhs: none,
+                result_ty: ValueType::Int,
+            },
+        });
     } else {
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
@@ -379,6 +396,7 @@ mod tests {
             payload_ty: ValueType::Int,
             payload_on_disc_true: true,
             niche: false,
+            fieldless_none_tag: None,
         }
     }
 
@@ -400,6 +418,7 @@ mod tests {
             // `Result::Ok = 0`, so the payload arm is the `bool(disc)`-false arm.
             payload_on_disc_true: false,
             niche: false,
+            fieldless_none_tag: None,
         }
     }
 
@@ -715,5 +734,49 @@ mod tests {
         }
         // A still branches two ways (Some / None).
         assert_eq!(g.blocks[a.0].exits.len(), 2, "A branches to Some/None arms");
+    }
+
+    #[test]
+    fn rewrite_fieldless_enum_option_uses_none_tag_and_identity_payload() {
+        let mut g = FunctionGraph::new("test_unwrap_or_fieldless_niche");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstInt(2), true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(9), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: unwrap_or_target(),
+                    args: vec![opt, default],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let mut site = option_site(result);
+        site.fieldless_none_tag = Some(5);
+        assert_eq!(rewire_unwrap_or_call_sites(&mut g, &[site]), 1);
+        assert!(
+            g.blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .all(|op| { !matches!(op.kind, OpKind::FieldRead { .. }) })
+        );
+        assert!(
+            g.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::ConstInt(5)))
+        );
+        assert!(
+            g.blocks[a.0]
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "ne"))
+        );
     }
 }

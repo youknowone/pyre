@@ -2595,9 +2595,14 @@ impl CallControl {
                 // carries no token (synthetic / positional construction).
                 // Both spellings hash to the same `u64` for a non-colliding
                 // type, so this keeps the runtime-publish convergence.
+                // A source StructId identifies the generic declaration, not a
+                // concrete Rust instantiation. RPython's cache key is the
+                // concrete low-level STRUCT object, so instantiated owners use
+                // their full canonical spelling while monomorphic owners keep
+                // the source-attached collision-free identity token.
                 let struct_key = match owner_id {
-                    Some(sid) => LLType::Struct(sid.as_u64()),
-                    None => LLType::Struct(path_hash(&majit_ir::descr::canonical_struct_name(
+                    Some(sid) if !owner_root.contains('<') => LLType::Struct(sid.as_u64()),
+                    _ => LLType::Struct(path_hash(&majit_ir::descr::canonical_struct_name(
                         owner_root,
                     ))),
                 };

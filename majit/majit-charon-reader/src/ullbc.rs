@@ -278,6 +278,34 @@ impl TypeLayout {
             .get("offset")?
             .as_u64()
     }
+
+    /// Rust primitive spelling of a branching enum's physical tag.
+    ///
+    /// Charon records this beside the tag offset as
+    /// `discriminator.Branch.int_ty`.  Consumers must use both: reading a
+    /// 32-bit tag as an `i64` also reads the first four payload bytes and can
+    /// turn a valid variant into a switch miss.
+    pub fn discriminant_int_type(&self) -> Option<&'static str> {
+        let int_ty = self.discriminator.as_ref()?.get("Branch")?.get("int_ty")?;
+        let (signed, width) = if let Some(width) = int_ty.get("Signed") {
+            (true, width.as_str()?)
+        } else {
+            (false, int_ty.get("Unsigned")?.as_str()?)
+        };
+        match (signed, width) {
+            (true, "I8") => Some("i8"),
+            (true, "I16") => Some("i16"),
+            (true, "I32") => Some("i32"),
+            (true, "I64") => Some("i64"),
+            (true, "I128") => Some("i128"),
+            (false, "U8") => Some("u8"),
+            (false, "U16") => Some("u16"),
+            (false, "U32") => Some("u32"),
+            (false, "U64") => Some("u64"),
+            (false, "U128") => Some("u128"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -876,6 +904,26 @@ mod tests {
         assert_eq!(layout.field_offset(1, 0), Some(8));
         assert_eq!(layout.field_offset(2, 0), None);
         assert_eq!(layout.discriminant_offset(), Some(0));
+        assert_eq!(layout.discriminant_int_type(), Some("u8"));
+    }
+
+    #[test]
+    fn enum_discriminant_signedness_and_width_are_preserved() {
+        for (int_ty, expected) in [
+            (r#"{"Signed":"I16"}"#, "i16"),
+            (r#"{"Signed":"I32"}"#, "i32"),
+            (r#"{"Unsigned":"U64"}"#, "u64"),
+            (r#"{"Unsigned":"U128"}"#, "u128"),
+        ] {
+            let json = format!(
+                r#"{{
+                    "discriminator": {{"Branch": {{"offset": 4, "int_ty": {int_ty}}}}},
+                    "variant_layouts": [{{"field_offsets": []}}, {{"field_offsets": []}}]
+                }}"#
+            );
+            let layout: TypeLayout = serde_json::from_str(&json).unwrap();
+            assert_eq!(layout.discriminant_int_type(), Some(expected));
+        }
     }
 
     /// Target selection: exact-match wins; a sole entry is chosen even
