@@ -71,7 +71,8 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # Pinned to upstream main after the pyre compatibility fixes from #8390 and
 # #8506, the memoryview fixes from #8553, the runtime marshal code-byte hook
 # from #8552, the `Constants` mutable-access impls from #8557, and the compiler
-# parity fixes from #8550 were merged.  `fix_code_filenames` needs `IndexMut`
+# parity fixes from #8550 and the posixsubprocess setgroups fix from #8609 were
+# merged.  `fix_code_filenames` needs `IndexMut`
 # to edit nested code constants in place, and `loads` relies on the #8552 hook
 # to preserve invalid code bytes, so this pin must not move below either.
 #
