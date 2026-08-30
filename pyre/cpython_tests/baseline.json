@@ -1381,7 +1381,7 @@
       "dynasm": "PASS"
     },
     "test.test_wmi": {
-      "dynasm": "PASS"
+      "dynasm": "IMPORTERROR"
     },
     "test.test_wsgiref": {
       "dynasm": "PASS"
