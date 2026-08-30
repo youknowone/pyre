@@ -752,9 +752,10 @@ mod tests {
     use crate::finish_descrs::DoneWithThisFrameDescrMulti;
     use crate::jitframe::{alloc_off_gc_jitframe, free_off_gc_jitframe};
     use majit_ir::Type;
+    use std::sync::Arc;
 
     fn a_descr() -> DescrRef {
-        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 8, 0))
+        Arc::new(majit_ir::descr::SimpleSizeDescr::new(0, 8, 0))
     }
 
     /// The deadframe a compiled run returns owns the map its exit established;

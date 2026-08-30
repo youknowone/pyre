@@ -295,12 +295,35 @@ enum JitFrameHeap {
     Libc,
 }
 
+/// The JITFRAME type id resolved against the installed collector, read by
+/// every compiled entry that allocates its frame.
+///
+/// Upstream keeps this on the CPU: `malloc_jitframe` (`llmodel.py:298`) reads
+/// `self.cpu.gc_ll_descr`, a plain process-wide field, because there is one
+/// collector. This crate has two install paths, and the resolved id must have
+/// the same scope as the collector it was resolved against, or an entry can
+/// name a shape the collector it allocates from never registered:
+///
+/// - `install_gc_standalone` installs the process-wide `gc_sync` singleton,
+///   so its id lives in a process-wide static, like upstream. Any thread that
+///   reaches compiled code reads it — including one that never ran the install
+///   itself, which the thread-local below could not answer for.
+/// - `install_gc_box` installs a thread-confined collector (the `gc_box`
+///   thread-local, scaffolding for the test binaries where each thread builds
+///   its own collector and registers a different number of types ahead of
+///   JITFRAME). An id resolved against that collector is only valid on that
+///   thread, so it lives beside the box, in a thread-local of the same scope.
+///   Without `majit-gc/gc_box` the `gc_box_installed()` probe is a constant
+///   `false`, the cell is unreachable, and it retires with the box.
+///
+/// Resolving once at install rather than at every entry keeps the hot entry
+/// from querying the type table (`resolve_jitframe_type_id`).
+static STANDALONE_JITFRAME_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
 thread_local! {
-    /// The JITFRAME id resolved against this thread's active collector at
-    /// install time. Like cranelift's `JitFrameHeap`, this prevents a hot
-    /// entry from querying the type table and prevents a process-wide id
-    /// published for another test collector from naming the wrong shape.
-    static ACTIVE_JITFRAME_TYPE_ID: core::cell::Cell<Option<u32>> = const {
+    /// See [`STANDALONE_JITFRAME_TYPE_ID`]: the box-scoped twin.
+    static BOX_JITFRAME_TYPE_ID: core::cell::Cell<Option<u32>> = const {
         core::cell::Cell::new(None)
     };
 }
@@ -310,8 +333,18 @@ fn resolve_jitframe_type_id(gc: &dyn majit_gc::GcAllocator) -> Option<u32> {
     (gc.type_size(id) == Some(JitFrame::alloc_size(0))).then_some(id)
 }
 
+fn set_standalone_jitframe_type_id(id: Option<u32>) {
+    STANDALONE_JITFRAME_TYPE_ID.store(id.unwrap_or(u32::MAX), Ordering::Release);
+}
+
 fn active_jitframe_type_id() -> Option<u32> {
-    ACTIVE_JITFRAME_TYPE_ID.with(core::cell::Cell::get)
+    if majit_gc::gc_box_installed() {
+        return BOX_JITFRAME_TYPE_ID.with(core::cell::Cell::get);
+    }
+    match STANDALONE_JITFRAME_TYPE_ID.load(Ordering::Acquire) {
+        u32::MAX => None,
+        id => Some(id),
+    }
 }
 
 type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
@@ -448,7 +481,7 @@ fn install_gc_box(gc: Box<dyn majit_gc::GcAllocator>) {
     majit_gc::disarm_published_nursery();
     majit_gc::note_gc_box_installed();
     let supports_guard_gc_type = gc.supports_guard_gc_type();
-    ACTIVE_JITFRAME_TYPE_ID.with(|slot| slot.set(resolve_jitframe_type_id(gc.as_ref())));
+    BOX_JITFRAME_TYPE_ID.with(|slot| slot.set(resolve_jitframe_type_id(gc.as_ref())));
     gc_box::store(gc);
     register_active_hooks(supports_guard_gc_type);
 }
@@ -461,7 +494,7 @@ pub fn install_gc_standalone() {
     let (supports_guard_gc_type, jitframe_type_id) = majit_gc::gc_sync::gc_query(|gc| {
         (gc.supports_guard_gc_type(), resolve_jitframe_type_id(gc))
     });
-    ACTIVE_JITFRAME_TYPE_ID.with(|slot| slot.set(jitframe_type_id));
+    set_standalone_jitframe_type_id(jitframe_type_id);
     register_active_hooks(supports_guard_gc_type);
 }
 
@@ -471,7 +504,7 @@ pub fn install_gc_standalone() {
 /// freed memory.
 pub fn clear_gc_allocator() {
     gc_box::clear();
-    ACTIVE_JITFRAME_TYPE_ID.with(|slot| slot.set(None));
+    BOX_JITFRAME_TYPE_ID.with(|slot| slot.set(None));
 }
 
 /// TYPE_INFO / CLASSTYPE constants read by the dynasm assemblers for
