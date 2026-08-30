@@ -50,7 +50,12 @@ with tempfile.TemporaryDirectory() as directory:
     assert result.returncode == 0, result
     stderr = result.stderr.decode("utf-8", "replace")
     assert 'File "%s", line 1' % startup in stderr, stderr
-    assert "    x = '\nSyntaxError: source code cannot contain null bytes" in stderr
+    # `sys.stderr` ends a line with `os.linesep`, so compare the report by
+    # lines: the offending source text is the line before the SyntaxError.
+    lines = stderr.splitlines()
+    reported = "SyntaxError: source code cannot contain null bytes"
+    assert reported in lines, stderr
+    assert lines[lines.index(reported) - 1] == "    x = '", stderr
     assert "\0" not in stderr, stderr
 
 print("OK")
