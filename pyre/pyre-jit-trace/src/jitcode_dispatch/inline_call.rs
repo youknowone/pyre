@@ -7126,26 +7126,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // rewinds to the OUTER frame's entry (`trace.rs`, "legacy drop
             // kept"), re-running every effect the walk already executed —
             // `threading.Thread.start` calling `_start_joinable_thread` twice.
-            // A FOR_ITER-route admission promises a rewind to the enclosing
-            // CALL, and `VableEscapedDuringResidualCall` does not take it: its
-            // recovery lives in `trace.rs` (blackhole adopt, else the escape-pc
-            // rewind) and denies nothing.  So the next attempt rebuilds the
-            // identical framestack, admits the identical callee and reaches the
-            // identical abort, until `MAX_TRACE_ABORT_COUNT` fires
-            // `disable_noninlinable_function` on the ENCLOSING green key — the
-            // loop is gone, not merely un-inlined.  Deny the CALLEE instead, so
-            // the next attempt residualizes the call and the loop still
-            // compiles.  Recovery is untouched; only the next attempt changes.
-            //
-            // Scoped to the two FOR_ITER admissions on purpose.  This is the
-            // corpus's most common abort, and a deny wherever it appears would
-            // re-record a large part of the suite for a promise those other
-            // admissions never made.
-            if matches!(e, DispatchError::VableEscapedDuringResidualCall { .. })
-                && (foriter_deferred_admit || foriter_dirty_seeded_resume_admit)
-            {
-                return Err(fbw_decline_inline_callee(ctx, op.pc, Some(callee_code_key)));
-            }
             if matches!(
                 e,
                 DispatchError::AbortPermanentMarkerReached { .. }
