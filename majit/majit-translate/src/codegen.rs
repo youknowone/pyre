@@ -168,6 +168,7 @@ mod tests {
             functions: Vec::new(),
             jit_drivers: vec![crate::pipeline::CompiledJitDriver {
                 portal: crate::CallPath::from_segments(["engine", "mainloop"]),
+                portal_runner: None,
                 main_jitcode_index: 0,
                 greens: Vec::new(),
                 reds: Vec::new(),

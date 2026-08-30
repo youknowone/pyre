@@ -2898,17 +2898,51 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
     folded
 }
 
-/// Empty every block unreachable from `graph.startblock` in place —
+/// Non-canonical calling-convention entries emitted into one rich graph.
+///
+/// `simplify.transform_dead_op_vars_in_blocks` accepts multiple graphs and
+/// treats every graph start as a root.  Pyre's generated closure and
+/// specialization bodies can instead share one `FunctionGraph` allocation,
+/// with a secondary start represented by a no-predecessor block whose every
+/// inputarg is defined by its matching `OpKind::Input` parameter operation.
+/// A disconnected phi/branch block lacks that shape and is not a root.
+fn secondary_entry_roots(graph: &FunctionGraph) -> Vec<BlockId> {
+    let with_predecessor: HashSet<BlockId> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.exits.iter().map(|link| link.target))
+        .collect();
+    graph
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.id != graph.startblock
+                && block.id != graph.returnblock
+                && block.id != graph.exceptblock
+                && !block.inputargs.is_empty()
+                && !with_predecessor.contains(&block.id)
+                && block.inputargs.iter().all(|inputarg| {
+                    block.operations.iter().any(|op| {
+                        matches!(op.kind, OpKind::Input { .. })
+                            && op.result.as_ref() == Some(inputarg)
+                    })
+                })
+        })
+        .map(|block| block.id)
+        .collect()
+}
+
+/// Empty every block unreachable from a calling-convention entry in place —
 /// operations, exits, inputargs cleared, the `Vec` slot kept because
 /// `BlockId` doubles as the index.  Needed after
 /// [`fold_constant_exitswitch`] disconnects an arm: the registry
 /// lift (`translate_op`) and [`prune_dead_phis`] both walk blocks by
-/// index, and `prune_dead_phis` pins no-predecessor blocks as extra
-/// entry points, so a disconnected arm would otherwise keep its dead
-/// ops alive.
+/// index.  The canonical `startblock` and each generated secondary entry are
+/// roots; disconnected branch/phi arms are cleared.
 pub fn clear_unreachable_blocks(graph: &mut FunctionGraph) {
     let mut reachable = vec![false; graph.blocks.len()];
-    let mut worklist = vec![graph.startblock];
+    let mut worklist = secondary_entry_roots(graph);
+    worklist.push(graph.startblock);
     while let Some(b) = worklist.pop() {
         if std::mem::replace(&mut reachable[b.0], true) {
             continue;
@@ -4734,39 +4768,8 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // for closures / specialisations).  Each is a BFS root, so `blocks`
     // (the union of `iterblocks()` over each entry) covers every block
     // reachable from any entry.
-    let with_predecessor: HashSet<BlockId> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.exits.iter().map(|e| e.target))
-        .collect();
-    // A no-predecessor block is a legitimate calling-convention entry
-    // only when every inputarg is a genuine parameter — the result of
-    // an `OpKind::Input` op in that same block (the closure-entry shape
-    // exercised by `prune_dead_phis_skips_non_canonical_entry_blocks`).
-    // jtransform can leave *unreachable* merge blocks whose inputargs
-    // are phi targets referencing values defined in reachable blocks; a
-    // phi with no predecessor to fill it is malformed, and pinning such
-    // a block as an entry would keep its dead operands (and any value
-    // sharing their register) alive into regalloc.  Restrict the
-    // orphan-entry roots to genuine parameter blocks so dead merge
-    // blocks are excluded.
-    let is_genuine_entry = |block: &Block| -> bool {
-        block.inputargs.iter().all(|iarg| {
-            block.operations.iter().any(|op| {
-                matches!(op.kind, OpKind::Input { .. }) && op.result.as_ref() == Some(iarg)
-            })
-        })
-    };
     let start_blocks: HashSet<BlockId> = std::iter::once(start)
-        .chain(
-            graph
-                .blocks
-                .iter()
-                .filter(|b| {
-                    b.id != start && !with_predecessor.contains(&b.id) && is_genuine_entry(b)
-                })
-                .map(|b| b.id),
-        )
+        .chain(secondary_entry_roots(graph))
         .collect();
 
     // BFS reachability mirrors `flowspace/model.py iterblocks()`,
@@ -5716,6 +5719,11 @@ pub struct FuncEffects {
     /// close_stack callee must never produce a JitCode and is classified
     /// `Residual` by `guess_call_kind`.
     pub close_stack: bool,
+    /// `func._dont_inline_`, set by
+    /// `WarmRunnerDesc.split_graph_and_record_jitdriver` on the copied
+    /// portal.  The backend inliner reads this off the function object; it is
+    /// separate from JIT policy hints such as `_jit_unroll_safe_`.
+    pub dont_inline: bool,
 }
 
 impl FuncEffects {
@@ -5739,6 +5747,7 @@ impl FuncEffects {
         self.elidable |= other.elidable;
         self.loop_invariant |= other.loop_invariant;
         self.close_stack |= other.close_stack;
+        self.dont_inline |= other.dont_inline;
     }
 }
 
@@ -5826,6 +5835,112 @@ pub struct FunctionGraph {
     /// (all unset) for `FunctionGraph::new` fixtures; production
     /// registration stamps these through `CallControl::mark_*`.
     pub func: FuncEffects,
+}
+
+/// `flowspace/model.py copygraph`, for the non-shallow fresh-Variable case.
+///
+/// Block ids are positional in the rich model, so the copied graph retains
+/// the complete `blocks` order and every `BlockId` while replacing every
+/// Variable reachable from any block-owned field with a fresh identity.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable Variable identity; concretetype/name cells do not participate"
+)]
+pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
+    use crate::flowspace::model::Variable;
+    use std::collections::HashMap;
+
+    let mut varmap: HashMap<Variable, Variable> = HashMap::new();
+    let mut intern = |var: &Variable| {
+        varmap.entry(var.clone()).or_insert_with(|| var.copy());
+    };
+    for block in &graph.blocks {
+        for var in &block.inputargs {
+            intern(var);
+        }
+        for op in &block.operations {
+            for var in crate::inline::op_variable_refs(&op.kind) {
+                intern(&var);
+            }
+            if let Some(result) = &op.result {
+                intern(result);
+            }
+        }
+        for link in &block.exits {
+            for arg in link
+                .args
+                .iter()
+                .chain(link.last_exception.iter())
+                .chain(link.last_exc_value.iter())
+            {
+                if let LinkArg::Value(var) = arg {
+                    intern(var);
+                }
+            }
+        }
+        match &block.exitswitch {
+            Some(ExitSwitch::Value(var)) => intern(var),
+            Some(ExitSwitch::Fused { args, .. }) => {
+                for var in args {
+                    intern(var);
+                }
+            }
+            Some(ExitSwitch::LastException) | None => {}
+        }
+    }
+
+    let remap_var = |var: &Variable| {
+        varmap
+            .get(var)
+            .cloned()
+            .expect("copygraph: every block-owned Variable must be interned")
+    };
+    let blocks = graph
+        .blocks
+        .iter()
+        .map(|block| {
+            let operations = block
+                .operations
+                .iter()
+                .map(|op| SpaceOperation {
+                    result: op.result.as_ref().map(&remap_var),
+                    kind: crate::inline::remap_op_kind(&op.kind, &remap_var),
+                })
+                .collect();
+            let (exitswitch, exits) = remap_control_flow_metadata_var(
+                &block.exitswitch,
+                &block.exits,
+                &remap_var,
+                |block| block,
+            );
+            Block {
+                id: block.id,
+                inputargs: block.inputargs.iter().map(&remap_var).collect(),
+                operations,
+                exitswitch,
+                exits,
+                dead: block.dead,
+                // FrameState Variables are frontend build-time snapshots only;
+                // downstream graph copies retain that inert attribution verbatim.
+                framestate: block.framestate.clone(),
+            }
+        })
+        .collect();
+
+    FunctionGraph {
+        name: graph.name.clone(),
+        source_identity: graph.source_identity.clone(),
+        owner_root: graph.owner_root.clone(),
+        startblock: graph.startblock,
+        returnblock: graph.returnblock,
+        exceptblock: graph.exceptblock,
+        blocks,
+        notes: graph.notes.clone(),
+        return_type: graph.return_type.clone(),
+        hints: graph.hints.clone(),
+        access_directly: graph.access_directly,
+        func: graph.func.clone(),
+    }
 }
 
 impl FunctionGraph {
@@ -7016,6 +7131,7 @@ mod tests {
             elidable: true,
             loop_invariant: true,
             close_stack: true,
+            dont_inline: true,
             ..FuncEffects::default()
         };
 
@@ -7034,6 +7150,109 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn copygraph_preserves_structure_with_fresh_variable_identities() {
+        use std::collections::HashSet;
+
+        fn variable_ids(graph: &FunctionGraph) -> HashSet<u64> {
+            let mut ids = HashSet::new();
+            for block in &graph.blocks {
+                ids.extend(block.inputargs.iter().map(|var| var.id()));
+                for op in &block.operations {
+                    ids.extend(
+                        crate::inline::op_variable_refs(&op.kind)
+                            .iter()
+                            .map(|var| var.id()),
+                    );
+                    ids.extend(op.result.iter().map(|var| var.id()));
+                }
+                for link in &block.exits {
+                    for arg in link
+                        .args
+                        .iter()
+                        .chain(link.last_exception.iter())
+                        .chain(link.last_exc_value.iter())
+                    {
+                        if let LinkArg::Value(var) = arg {
+                            ids.insert(var.id());
+                        }
+                    }
+                }
+                match &block.exitswitch {
+                    Some(ExitSwitch::Value(var)) => {
+                        ids.insert(var.id());
+                    }
+                    Some(ExitSwitch::Fused { args, .. }) => {
+                        ids.extend(args.iter().map(|var| var.id()));
+                    }
+                    Some(ExitSwitch::LastException) | None => {}
+                }
+            }
+            ids
+        }
+
+        let mut graph = FunctionGraph::new("copy_fixture");
+        let start = graph.startblock;
+        let lhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let rhs = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.block_mut(start).inputargs = vec![lhs.clone(), rhs.clone()];
+        graph.block_mut(start).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::BinOp {
+                op: "int_add".into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: ValueType::Int,
+            },
+        });
+        let returnblock = graph.returnblock;
+        graph.block_mut(returnblock).inputargs = vec![result.copy()];
+        graph.recloseblock(
+            start,
+            vec![Link::from_variables(
+                &graph,
+                vec![result.clone()],
+                returnblock,
+                None,
+            )],
+        );
+
+        let copied = copygraph(&graph);
+
+        assert_eq!(copied.blocks.len(), graph.blocks.len());
+        assert_eq!(copied.startblock, graph.startblock);
+        assert_eq!(copied.returnblock, graph.returnblock);
+        assert_eq!(copied.exceptblock, graph.exceptblock);
+        let original_op = &graph.block(start).operations[0];
+        let copied_op = &copied.block(start).operations[0];
+        let (
+            OpKind::BinOp {
+                op: original_name,
+                result_ty: original_ty,
+                ..
+            },
+            OpKind::BinOp {
+                op: copied_name,
+                result_ty: copied_ty,
+                ..
+            },
+        ) = (&original_op.kind, &copied_op.kind)
+        else {
+            panic!("copygraph must preserve the BinOp shape")
+        };
+        assert_eq!(original_name, copied_name);
+        assert_eq!(original_ty, copied_ty);
+        assert_eq!(original_op.result.is_some(), copied_op.result.is_some());
+
+        let original_ids = variable_ids(&graph);
+        let copied_ids = variable_ids(&copied);
+        assert!(
+            original_ids.is_disjoint(&copied_ids),
+            "copygraph must not share any operative Variable identity"
+        );
+    }
 
     /// `CallTarget::SyntheticTransparentCtor::path_segments()` must
     /// return the full `(owner_path..., name)` join — `front/mir.rs`
@@ -10319,6 +10538,13 @@ mod tests {
             )
             .unwrap();
         graph.push_inputarg_var(orphan_entry, unused_param_var.clone());
+
+        clear_unreachable_blocks(&mut graph);
+        assert_eq!(
+            graph.block(orphan_entry).inputargs,
+            vec![unused_param_var.clone()],
+            "reachability cleanup must preserve a secondary calling-convention entry"
+        );
 
         prune_dead_phis(&mut graph);
 

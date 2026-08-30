@@ -190,7 +190,7 @@ Polarity below follows this file's rule, with one correction it needed: an
 | PYRE_WASM_FULL_TEARDOWN | skipping the ~0.2s wasm engine teardown at exit; setting it restores the drops for leak diagnostics | when teardown stops being the dominant fixed startup tax |
 | PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS | reading back the fastlocals a residual wrote to the frame, whether or not it forced, as a recorded `GETARRAYITEM_GC_R` off `locals_cells_stack_w` (`residual_call.rs adopt_residual_locals_writes`); setting it restores the walk that keeps the box it held before the call and so loses the write | when the walk reads a local through a channel a residual cannot leave stale; until then this is the one-binary control that keeps the defect demonstrable, and the parity fixture's two arms (a forcing call, and an inlined callee whose store forces nothing) are only separable with it |
 
-### §6a2 — Default-OFF experiments (4)
+### §6a2 — Default-OFF experiments (6)
 
 Kept as the switched-off arm of a one-binary comparison, not as latent
 defaults.  Bridge inlining reaches module replacement on its own, so
@@ -217,15 +217,18 @@ build.
 | gate | what turning it ON does | retire when |
 |---|---|---|
 | PYRE_WASM_REEMIT | re-emits a compiled loop's wasm module into its own table slot once, on the first bridge installed against it | when the replacement path no longer needs an isolated arm |
+| PYRE_GUARD_RESUME_PC | prints the coordinate every walker-emitted guard resumes at (`resume_snapshot.rs guard_resume_pc_probe_enabled`); a guard whose `py_pc` is not the opcode it was emitted under re-executes the wrong bytecode on deopt, which reads as a livelock or a corrupted local rather than as a crash | the resume coordinate is covered by an ordinary test |
+| PYRE_PORTAL_SPLIT | registers jd0 against the `warmspot.py split_graph_and_record_jitdriver` copy split immediately before `jit_merge_point`, instead of the unsplit `eval_loop_jit` graph; `=1` arms it and the prepass cache key includes the value | when the split portal path is the default and the unsplit registration arm is deleted |
 | PYRE_WASM_INLINE_NONHEADER | admits an inlined region whose closing JUMP names a resumable LABEL other than the loop header AND whose source guard is in the LOOP BODY (`lib.rs inline_nonheader_enabled`); `=1`/`true`/`on` arms it.  The preamble-sourced half of that class takes a different placement — blocks outside the header `loop`, body past its `end` — and is admitted unconditionally, so this flag now covers only the body-sourced half.  Arming it removes 49.4M of the 257.3M cross-module crossings on the 81 fixtures that reach the decline and buys 0.74x/0.67x on two of them, but costs 1.23x on `spectral_norm` | the +18 ops per non-failing iteration it levies on the owner's fall-through is paid back on the fixtures it admits, or an admission rule separates them from `spectral_norm`, which sheds 99.7% of its crossings and still loses 23% |
 | PYRE_FBW_INLINE_POISON | admits a callee the replay scan declined and refuses at the scan's poisoned pcs during the walk (`diag.rs fbw_inline_poison_enabled`) | when a refusal that follows an executed effect has a resume leg that neither repeats it nor drops it |
 | PYRE_JD1 | arms the jd1 (`unpackiterable_driver`) compiled-loop experiment — `eval.rs jd1_experiment_enabled` is `PYRE_JD1 == "1"`, so nothing else turns it on.  `PYRE_NO_JD1`, `PYRE_JD1=0` and the master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) each force it back off | the jd1 experiment concludes |
 
-### §6b — VALUE knobs (13): config, not gates
+### §6b — VALUE knobs (15): config, not gates
 
 `PYRE_FBW_MAX_SUBWALK_DEPTH`, `PYRE_FBW_MULTIFRAME_DEPTH`,
 `PYRE_FBW_NO_SPECIALIZE`, `PYRE_JD1_THRESHOLD`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT_PROBE`,
+`PYRE_PORTAL_METATRACE_ENTRY`, `PYRE_PORTAL_METATRACE_SKIP`,
 `MAJIT_DTRACE_CONST_FROM`, `MAJIT_DTRACE_CONST_TO`,
 `MAJIT_TRACE_CALL_DIAG`, `MAJIT_TRACE_OPS_DIAG`,
 `PYRE_WASM_FORCE_CA_TERMINAL_DECLINE`, `PYRE_WASM_FUEL`,
@@ -254,7 +257,14 @@ its frames on the heap. Lowering it is how the `SubWalkDepthExceeded` decline
 is exercised without building a pathological helper chain; it retires when the
 descent stops recursing on the host stack.
 
-### §6c — Default-OFF diagnostics, censuses and probes (74): keep, cost nothing
+`PYRE_PORTAL_METATRACE_ENTRY` selects where the one-shot jd0 portal probe
+starts: `merge` (the default) seeds the merge-point registers and `start`
+enters at pc 0 with the portal's declared arguments.  The numeric
+`PYRE_PORTAL_METATRACE_SKIP` value selects how many cached-loop back-edges the
+probe passes before firing; it defaults to zero.  Neither has an effect unless
+the probe in §6c is enabled.
+
+### §6c — Default-OFF diagnostics, censuses and probes (75): keep, cost nothing
 
 Deleting one of these environment reads does not change behavior when the
 variable is unset. They remain listed so diagnostics are not mistaken for dead
@@ -283,7 +293,8 @@ configuration.
 `MAJIT_MIR_FRAMESTATE_STRICT`, `PYRE_NO_JD1`, `MAJIT_NO_UNROLL`,
 `PYRE_PCMAP_AFTERRESIDUAL_AUDIT`, `PYRE_PCMAP_CONTAINING_AUDIT`,
 `PYRE_PCMAP_RECIPE_RESULTCOLOR_AUDIT`, `PYRE_PCMAP_RESIDUAL_CENSUS`,
-`MAJIT_PORTAL_RCA`, `PYRE_PROBE_BH_STARTUP`, `PYRE_PROBE_SNAPSHOT`,
+`MAJIT_PORTAL_RCA`, `PYRE_PORTAL_METATRACE`, `PYRE_PROBE_BH_STARTUP`,
+`PYRE_PROBE_SNAPSHOT`,
 `MAJIT_PROBE_SUBSCR`, `MAJIT_PROFILE_PIPELINE`, `PYRE_QMUT_MAPDICT_FORCE`,
 `PYRE_RERAISE_DIAG`, `MAJIT_SIZE_SHELL_OWNERS`, `PYRE_SNAPSHOT_DIAG`,
 `PYRE_UNJOURNALED_SITE`,
@@ -339,6 +350,12 @@ the flag itself keeps no provenance for. It is the second half of a two-step
 read: `PYRE_FBW_CENSUS` finds the walks that ended `committed=false` with
 unrecoverable effects, and this one says which residual decline put them there.
 It goes when the flag carries its own provenance.
+
+`PYRE_PORTAL_METATRACE` drives one Stage-0 `JitCodeMachine` walk over the
+build-time jd0 portal jitcode after the selected cached-loop back-edge and
+prints the `[jd0-mt]` summary.  It is unset by default and exists to inspect
+the portal split and entry seeding; it goes with that investigation once the
+ordinary warmspot path owns the same coverage.
 
 `PYRE_LOOP_CENSUS` prints one `[loop-census] <arm> <name>` line per compiled
 trace, naming it through `get_printable_location` — the JitDriver green-key

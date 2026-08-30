@@ -103,6 +103,7 @@ mod parse;
 )]
 pub mod pipeline;
 mod runtime_names;
+mod unsimplify;
 pub mod virtualizable_decl;
 // `translator/` is the RPython-orthodox port home — see
 // `translator/mod.rs` for the contract.  Currently hosts
@@ -197,6 +198,7 @@ pub struct MethodInfo {
 fn build_semantic_program_via_active_frontend(
     module_paths: &[&str],
     static_addrs: HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
     explicit_llbc_paths: Option<&[&str]>,
     prof: &mut PhaseProfiler,
 ) -> front::SemanticProgram {
@@ -244,10 +246,11 @@ fn build_semantic_program_via_active_frontend(
                 llbcs.iter().map(|l| l.crate_name().to_string()),
             );
             let mut program =
-                front::mir::build_semantic_program_from_llbcs_with_static_addrs_and_module_paths(
+                front::mir::build_semantic_program_from_llbcs_with_static_addrs_module_paths_and_jitdriver_roots(
                     &llbcs,
                     static_addrs,
                     module_paths,
+                    jitdriver_receiver_roots,
                 )
                 .unwrap_or_else(|e| panic!("Step 4.4 cutover: lower llbcs {paths:?}: {e}"));
             prof.mark("    build_semantic_program_from_llbcs");
@@ -958,6 +961,7 @@ fn analyze_pipeline_from_module_paths(
     let mut program = build_semantic_program_via_active_frontend(
         module_paths,
         static_addrs,
+        &config.pipeline.transform.jitdriver_receiver_roots,
         explicit_llbc_paths,
         &mut prof,
     );
@@ -1963,7 +1967,11 @@ fn analyze_pipeline_from_module_paths(
     // RPython: setup_jitdriver(jitdriver_sd) — register every explicit
     // portal and its green/red layout. Portal binding and graph discovery
     // are independent of any interpreter dispatch representation.
-    register_configured_jitdrivers(&mut call_control, &config.pipeline.jit_drivers);
+    register_configured_jitdrivers(
+        &mut call_control,
+        &config.pipeline.jit_drivers,
+        &config.pipeline.transform.jitdriver_receiver_roots,
+    );
     // warmspot.py WarmRunnerDesc.make_virtualizable_infos —
     // assigns each registered driver's virtualizable metadata only after the
     // complete driver set exists.
@@ -2127,6 +2135,7 @@ fn analyze_pipeline_from_module_paths(
         .iter()
         .map(|driver| pipeline::CompiledJitDriver {
             portal: driver.portal_graph.clone(),
+            portal_runner: driver.portal_runner.clone(),
             main_jitcode_index: driver
                 .mainjitcode
                 .as_ref()
@@ -2170,6 +2179,7 @@ fn analyze_pipeline_from_module_paths(
 fn register_configured_jitdrivers(
     call_control: &mut call::CallControl,
     specs: &[pipeline::JitDriverSpec],
+    driver_roots: &[String],
 ) {
     assert!(
         !specs.is_empty(),
@@ -2206,8 +2216,79 @@ fn register_configured_jitdrivers(
              must share one JitDriverStaticData",
             spec.portal.canonical_key(),
         );
+        // `spec.autoreds`: `support.py decode_hp_hint_args` requires a fixed
+        // numreds; `warmspot.py find_portals` obtains it from
+        // `support.autodetect_jit_markers_redvars` before splitting, while
+        // majit currently discovers autoreds later in
+        // `jtransform.py try_handle_jit_marker`.
+        let portal_path = if !spec.split_portal || spec.autoreds {
+            spec.portal.clone()
+        } else {
+            // Ends the `call_control` borrow the `register_function_graph`
+            // below needs mutably; also the `warmspot.py:441` copy source.
+            let original = portal_graph.clone();
+            let mut portal = crate::model::copygraph(&original);
+            let original_identity = original
+                .source_identity
+                .clone()
+                .unwrap_or_else(|| original.name.clone());
+            let portal_name = format!(
+                "{}_portal",
+                spec.portal
+                    .last_segment()
+                    .expect("non-empty portal path asserted above")
+            );
+            portal.name = portal_name.clone();
+            portal.source_identity = Some(format!("{original_identity}#portal"));
+            let mut portal_segments = spec.portal.segments.clone();
+            *portal_segments
+                .last_mut()
+                .expect("non-empty portal path asserted above") = portal_name;
+            let portal_path = crate::parse::CallPath::from_segments(portal_segments);
+            assert!(
+                !call_control.function_graphs().contains_key(&portal_path),
+                "derived split portal path `{}` collides with an existing graph",
+                portal_path.canonical_key(),
+            );
+
+            let (marker_block, marker_index) =
+                crate::codewriter::support::find_jit_merge_point(&portal, driver_roots)
+                    .expect("no jit_merge_point found in configured portal graph");
+            portal.startblock = crate::codewriter::support::split_before_jit_merge_point(
+                &mut portal,
+                marker_block,
+                marker_index,
+                spec.greens.len(),
+                spec.reds.len(),
+                driver_roots,
+            );
+            // `warmspot.py WarmRunnerDesc.split_graph_and_record_jitdriver`:
+            // keep the copied portal as a backend-inlining boundary and let
+            // JIT policy inspect its loop.
+            portal.func.dont_inline = true;
+            portal.hints.push("unroll_safe".into());
+            let split_start = portal.startblock;
+            call_control.register_function_graph(portal_path.clone(), portal);
+            let registered = call_control
+                .function_graphs()
+                .get(&portal_path)
+                .expect("registered split portal path must resolve");
+            // The marker heads the split block up to the operations
+            // `split_block` re-emits before it: upstream inserts `same_as` of
+            // a constant there and `remove_same_as` folds it into the marker's
+            // operand, so the marker lands at index 0; here the receiver's
+            // producer stays as a real operation because operands are
+            // Variables, so only the block is asserted.
+            assert_eq!(
+                crate::codewriter::support::find_jit_merge_point(registered, driver_roots)
+                    .map(|(block, _)| block),
+                Some(split_start),
+                "registered portal path aliased away from the split graph body"
+            );
+            portal_path
+        };
         call_control.setup_jitdriver(
-            spec.portal.clone(),
+            portal_path,
             spec.greens.clone(),
             spec.reds.clone(),
             spec.green_kinds.clone(),
@@ -2215,7 +2296,9 @@ fn register_configured_jitdrivers(
             spec.autoreds,
             spec.virtualizables.clone(),
             spec.red_types.clone(),
+            spec.portal.clone(),
         );
+        call_control.set_jitdriver_portal_runner(index, spec.portal_runner.clone());
     }
 }
 
@@ -2535,6 +2618,7 @@ mod portal_driver_tests {
     fn driver(portal: CallPath) -> pipeline::JitDriverSpec {
         pipeline::JitDriverSpec {
             portal,
+            portal_runner: None,
             greens: Vec::new(),
             reds: Vec::new(),
             green_kinds: Vec::new(),
@@ -2542,6 +2626,7 @@ mod portal_driver_tests {
             autoreds: false,
             virtualizables: Vec::new(),
             red_types: Vec::new(),
+            split_portal: false,
         }
     }
 
@@ -2563,7 +2648,46 @@ mod portal_driver_tests {
         call_control.register_function_graph(first.clone(), return_graph("portal"));
         call_control.register_function_graph(second.clone(), return_graph("portal"));
 
-        register_configured_jitdrivers(&mut call_control, &[driver(first), driver(second)]);
+        register_configured_jitdrivers(
+            &mut call_control,
+            &[driver(first), driver(second)],
+            &GraphTransformConfig::default().jitdriver_receiver_roots,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "derived split portal path `fixture::eval_loop_jit_portal` collides")]
+    fn rejects_split_portal_path_collision() {
+        use crate::codewriter::type_state::ConcreteType;
+
+        let mut call_control = call::CallControl::new();
+        let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
+        let derived = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        let mut graph = FunctionGraph::new("eval_loop_jit");
+        let receiver = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        graph.block_mut(graph.startblock).inputargs = vec![receiver.clone()];
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
+                    args: vec![receiver],
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        call_control.register_function_graph(portal.clone(), graph);
+        call_control.register_function_graph(derived, return_graph("unrelated_existing_graph"));
+        let mut spec = driver(portal);
+        spec.split_portal = true;
+
+        register_configured_jitdrivers(
+            &mut call_control,
+            &[spec],
+            &GraphTransformConfig::default().jitdriver_receiver_roots,
+        );
     }
 
     #[test]
@@ -2576,7 +2700,11 @@ mod portal_driver_tests {
             jit_drivers: vec![driver(portal.clone())],
             register_trait_families: Vec::new(),
         };
-        register_configured_jitdrivers(&mut call_control, &config.jit_drivers);
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
@@ -2594,15 +2722,13 @@ mod portal_driver_tests {
 
         let mut call_control = call::CallControl::new();
         let portal = CallPath::from_segments(["fixture", "eval_loop_jit"]);
-        let mut graph = FunctionGraph::new("eval_loop_jit");
-        let receiver = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let mut graph = FunctionGraph::new("pyre_jit::eval::eval_loop_jit");
         let next_instr = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let is_being_profiled = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let pycode = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let frame = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let ec = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         graph.blocks[graph.startblock.0].inputargs = vec![
-            receiver.clone(),
             next_instr.clone(),
             is_being_profiled.clone(),
             pycode.clone(),
@@ -2616,7 +2742,7 @@ mod portal_driver_tests {
                 kind: OpKind::Call {
                     target: CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into())),
                     args: vec![
-                        receiver,
+                        frame.clone(),
                         next_instr,
                         is_being_profiled,
                         pycode,
@@ -2633,6 +2759,7 @@ mod portal_driver_tests {
             transform: GraphTransformConfig::default(),
             jit_drivers: vec![pipeline::JitDriverSpec {
                 portal: portal.clone(),
+                portal_runner: Some(CallPath::from_segments(["fixture", "portal_runner"])),
                 greens: vec![
                     "next_instr".into(),
                     "is_being_profiled".into(),
@@ -2644,15 +2771,39 @@ mod portal_driver_tests {
                 autoreds: false,
                 virtualizables: vec!["frame".into()],
                 red_types: vec!["PyFrame".into(), "ExecutionContext".into()],
+                split_portal: true,
             }],
             register_trait_families: Vec::new(),
         };
-        register_configured_jitdrivers(&mut call_control, &config.jit_drivers);
+        register_configured_jitdrivers(
+            &mut call_control,
+            &config.jit_drivers,
+            &config.transform.jitdriver_receiver_roots,
+        );
+        let split_portal = CallPath::from_segments(["fixture", "eval_loop_jit_portal"]);
+        assert_eq!(call_control.jitdrivers_sd()[0].portal_graph, split_portal);
+        assert_eq!(
+            call_control.jitdrivers_sd()[0].portal_runner,
+            Some(CallPath::from_segments(["fixture", "portal_runner"]))
+        );
+        let split_graph = call_control
+            .function_graphs()
+            .get(&split_portal)
+            .expect("split portal graph must be registered under its derived path");
+        assert_eq!(split_graph.name, "eval_loop_jit_portal");
+        assert!(split_graph.func.dont_inline);
+        assert!(split_graph.hints.iter().any(|hint| hint == "unroll_safe"));
+        assert_eq!(
+            split_graph.source_identity.as_deref(),
+            Some("pyre_jit::eval::eval_loop_jit#portal")
+        );
+        let split_reds = split_graph.block(split_graph.startblock).inputargs[3..5].to_vec();
         let mut policy = policy::DefaultJitPolicy::new();
         call_control.find_all_graphs(&mut policy);
 
         let (jitcodes, _, _, _, _) =
             make_jitcodes(&config, &mut call_control, &mut PhaseProfiler::new());
+        assert_eq!(jitcodes[0].name, "eval_loop_jit_portal");
         let merge = jitcodes[0]
             .body()
             ._ssarepr
@@ -2668,7 +2819,14 @@ mod portal_driver_tests {
                 _ => None,
             })
             .expect("portal emits a jit_merge_point");
-        assert_eq!(merge, &vec![frame, ec]);
+        assert_eq!(merge.len(), 2);
+        assert_eq!(merge, &split_reds);
+        assert!(
+            merge
+                .iter()
+                .all(|var| FunctionGraph::concretetype_of(var) == ConcreteType::GcRef)
+        );
+        assert_ne!(merge[0].id(), merge[1].id());
         let jd0 = &call_control.jitdrivers_sd()[0];
         assert!(!jd0.autoreds);
         assert_eq!(jd0.numreds, Some(2));

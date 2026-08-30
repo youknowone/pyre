@@ -5536,8 +5536,8 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     let field = |index: u32, field_key: &str, offset: usize| SimpleFieldDescrSpec {
         index,
-        // descr.py:220-233 cache key is the bare fieldname; `name` is the
-        // qualified display form.
+        // `descr.py get_field_descr` keys its cache on the bare fieldname;
+        // `name` is the qualified display form.
         field_key: field_key.to_string(),
         name: format!("ExecutionContext.{field_key}"),
         offset,

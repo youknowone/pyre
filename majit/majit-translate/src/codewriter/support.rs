@@ -57,10 +57,138 @@
 //! information, different host vehicle.
 
 use crate::codewriter::call::CallControl;
-use crate::model::{OpKind, SpaceOperation};
+use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
+use crate::codewriter::type_state::ConcreteType;
+use crate::flowspace::model::Variable;
+use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 
 use majit_ir::value::Type;
+
+/// `jit/metainterp/warmspot.py find_jit_merge_points`, restricted to one graph.
+pub(crate) fn find_jit_merge_point(
+    graph: &FunctionGraph,
+    driver_roots: &[String],
+) -> Option<(BlockId, usize)> {
+    let mut found = None;
+    for block in &graph.blocks {
+        for (index, op) in block.operations.iter().enumerate() {
+            let is_merge_point = matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if jit_marker_key_from_target(target, driver_roots) == Some(JitMarkerKey::JitMergePoint)
+            );
+            if !is_merge_point {
+                continue;
+            }
+            assert!(
+                found.is_none(),
+                "found several jit_merge_points in the same graph"
+            );
+            found = Some((block.id, index));
+        }
+    }
+    found
+}
+
+/// `jit/codewriter/support.py sort_vars`.
+pub(crate) fn sort_vars(args: &[Variable]) -> Vec<Variable> {
+    // The split runs before the rtyper publishes every concretetype.  An
+    // Unknown has no upstream `getkind()` ordering yet, so assigning it the
+    // Ref key can spuriously move a later-known Int in front of it and report
+    // a bogus JitDriver declaration-order error.  Keep the declaration order
+    // until the types are authoritative; the typed codewriter pass performs
+    // the real register-bank validation afterwards.
+    if args
+        .iter()
+        .any(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Unknown)
+    {
+        return args.to_vec();
+    }
+    let mut sorted = args.to_vec();
+    sorted.sort_by_key(|var| match FunctionGraph::concretetype_of(var) {
+        ConcreteType::Signed => 1,
+        ConcreteType::GcRef => 2,
+        ConcreteType::Float => 3,
+        ConcreteType::Unknown => unreachable!("Unknown returned above"),
+        ConcreteType::Void => panic!("support.py sort_vars: Void must be filtered first"),
+    });
+    sorted
+}
+
+/// `jit/codewriter/support.py decode_hp_hint_args`.
+pub(crate) fn decode_hp_hint_args(
+    marker_args: &[Variable],
+    numgreens: usize,
+    numreds: usize,
+) -> (Vec<Variable>, Vec<Variable>) {
+    assert!(
+        marker_args.len() >= numgreens,
+        "jit_merge_point marker has fewer operands than declared greens"
+    );
+    let (greens, reds) = marker_args.split_at(numgreens);
+    assert_eq!(reds.len(), numreds);
+
+    let sort_and_check = |args: &[Variable], is_green: bool| {
+        let vars: Vec<Variable> = args
+            .iter()
+            .filter(|var| FunctionGraph::concretetype_of(var) != ConcreteType::Void)
+            .cloned()
+            .collect();
+        if is_green {
+            assert_eq!(
+                vars.len(),
+                args.len(),
+                "not supported so far: 'greens' variables contain Void"
+            );
+        }
+        let sorted = sort_vars(&vars);
+        assert_eq!(
+            vars, sorted,
+            "You have to reorder the variables named in the JitDriver (both the 'greens' and \
+             'reds' independently). They must be sorted like this: first all the integer-like, \
+             then all the pointer-like, and finally the floats.\nGot: {:?}\nExpected: {:?}",
+            vars, sorted
+        );
+        vars
+    };
+    (sort_and_check(greens, true), sort_and_check(reds, false))
+}
+
+/// `jit/codewriter/support.py split_before_jit_merge_point`.
+pub(crate) fn split_before_jit_merge_point(
+    graph: &mut FunctionGraph,
+    mut portalblock: BlockId,
+    portalopindex: usize,
+    numgreens: usize,
+    numreds: usize,
+    driver_roots: &[String],
+) -> BlockId {
+    if portalopindex > 0 {
+        portalblock = crate::unsimplify::split_block(graph, portalblock, portalopindex, None);
+    }
+    let marker = graph
+        .block(portalblock)
+        .operations
+        .first()
+        .expect("split portal block must start with jit_merge_point")
+        .clone();
+    let OpKind::Call { target, args, .. } = marker.kind else {
+        panic!("split portal block must start with jit_merge_point")
+    };
+    assert_eq!(
+        jit_marker_key_from_target(&target, driver_roots),
+        Some(JitMarkerKey::JitMergePoint),
+        "split portal block must start with jit_merge_point"
+    );
+    let marker_args = args
+        .get(1..)
+        .expect("jit_merge_point method call must carry its receiver");
+    let (greens, reds) = decode_hp_hint_args(marker_args, numgreens, numreds);
+    let mut linkargs = greens;
+    linkargs.extend(reds);
+    crate::unsimplify::split_block(graph, portalblock, 0, Some(&linkargs))
+}
 
 /// `support.py inline_calls_to`.
 ///
@@ -839,6 +967,28 @@ pub fn builtin_func_for_spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sort_vars_preserves_declaration_order_while_any_type_is_unknown() {
+        let mut graph = FunctionGraph::new("unknown_sort");
+        let unresolved = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let integer = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let reference = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let declared = vec![unresolved, integer, reference];
+        assert_eq!(sort_vars(&declared), declared);
+    }
+
+    #[test]
+    fn sort_vars_orders_fully_typed_register_banks() {
+        let mut graph = FunctionGraph::new("typed_sort");
+        let reference = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let float = graph.alloc_value_var_with_type(ConcreteType::Float);
+        let integer = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        assert_eq!(
+            sort_vars(&[reference.clone(), float.clone(), integer.clone()]),
+            vec![integer, reference, float]
+        );
+    }
 
     #[test]
     fn inline_calls_to_matches_upstream_four_entries() {
