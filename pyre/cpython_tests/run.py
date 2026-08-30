@@ -165,6 +165,18 @@ PLATFORM_GATED = {
         lambda p: p not in ("win32", "emscripten", "wasi", "ios", "tvos", "watchos", "android"),
         "os.fork() not available",
     ),
+    # `if sys.platform == "win32": raise unittest.SkipTest("fork is not
+    # available on Windows")`, in the test package's `__init__`.
+    "test.test_multiprocessing_fork": (
+        lambda p: p != "win32",
+        "fork is not available on Windows",
+    ),
+    # `if sys.platform == "win32": raise unittest.SkipTest("forkserver is
+    # not available on Windows")`, in the test package's `__init__`.
+    "test.test_multiprocessing_forkserver": (
+        lambda p: p != "win32",
+        "forkserver is not available on Windows",
+    ),
     # `if not hasattr(os, "openpty"): raise unittest.SkipTest(...)`
     "test.test_openpty": (
         lambda p: p not in ("win32", "emscripten", "wasi"),

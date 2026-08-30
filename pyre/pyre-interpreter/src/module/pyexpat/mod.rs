@@ -2143,7 +2143,7 @@ crate::py_module! {
         // it cannot come from the `exceptions:` arm, which qualifies the key
         // with the module it is declared in.  Both `error` and `ExpatError`
         // name the one class.
-        let err = crate::builtins::make_exc_type(
+        let err = crate::builtins::new_exception_class(
             EXPAT_ERROR_NAME,
             crate::builtins::exc_exception_new,
             crate::builtins::lookup_exc_class("Exception")

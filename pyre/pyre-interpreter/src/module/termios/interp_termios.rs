@@ -894,7 +894,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // it as the class to raise, which is what `except termios.error` catches.
     let w_exception = crate::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before termios init");
-    let w_error = crate::builtins::make_exc_type(
+    let w_error = crate::builtins::new_exception_class(
         "termios.error",
         crate::builtins::exc_exception_new,
         w_exception,

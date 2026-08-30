@@ -974,7 +974,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::module_ns_store(
             ns,
             "ItimerError",
-            crate::builtins::make_exc_type(
+            crate::builtins::new_exception_class(
                 "signal.ItimerError",
                 crate::builtins::exc_os_error_new,
                 w_os_error,

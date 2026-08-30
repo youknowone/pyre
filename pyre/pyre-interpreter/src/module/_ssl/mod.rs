@@ -2939,32 +2939,37 @@ crate::py_module! {
         "SSLSession" => ssl_session_methods::type_object(),
         "_SSLSocket" => ssl_socket_methods::type_object(),
         "Certificate" => certificate_methods::type_object(),
+        // `SSLError` alone is spelled `make_exc_type`: `sslmodule_init_types`
+        // builds it from a spec that names `sizeof(PySSLErrorObject)` as its
+        // own `basicsize`, which leaves it without a managed weakref.  The
+        // subclasses below come from `PyErr_NewExceptionWithDoc` and do have
+        // one.
         "SSLError" => crate::builtins::make_exc_type(
             "ssl.SSLError",
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("OSError").expect("OSError installed"),
         ),
-        "SSLZeroReturnError" => crate::builtins::make_exc_type(
+        "SSLZeroReturnError" => crate::builtins::new_exception_class(
             "ssl.SSLZeroReturnError",
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLWantReadError" => crate::builtins::make_exc_type(
+        "SSLWantReadError" => crate::builtins::new_exception_class(
             "ssl.SSLWantReadError",
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLWantWriteError" => crate::builtins::make_exc_type(
+        "SSLWantWriteError" => crate::builtins::new_exception_class(
             "ssl.SSLWantWriteError",
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLSyscallError" => crate::builtins::make_exc_type(
+        "SSLSyscallError" => crate::builtins::new_exception_class(
             "ssl.SSLSyscallError",
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),
         ),
-        "SSLEOFError" => crate::builtins::make_exc_type(
+        "SSLEOFError" => crate::builtins::new_exception_class(
             "ssl.SSLEOFError",
             crate::builtins::exc_os_error_new,
             crate::builtins::lookup_exc_class("ssl.SSLError").expect("SSLError installed"),

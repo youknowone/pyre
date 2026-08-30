@@ -4303,13 +4303,31 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
                         "escape-flush",
                     )
                 {
+                    // Frame 0's operand stack needs the same publication the
+                    // single-frame arm above gives its own, and for the same
+                    // reason: a root walk keeps its virtualizable symbolic, so
+                    // nothing the walk pushed or popped reached the live
+                    // frame's slot array and it still holds the stack from
+                    // before the walk began.  The mirror has to come from the
+                    // paused caller image rather than `capture_vstack_mirror_image`,
+                    // because `ctx` is the innermost callee on this arm and its
+                    // own vstack mirror names that frame, not frame 0.
+                    //
+                    // Leaving the stack alone resumes the blackhole on the
+                    // stale one.  The witness is a nested `for` whose walk
+                    // crossed the inner loop's exhaust: the fresh inner
+                    // iterator the outer FOR_ITER built exists only in the
+                    // walk, the resumed frame finds the previous pass's
+                    // exhausted iterator on TOS, and the inner loop ends one
+                    // iteration in — leaving every later `i` one pass ahead of
+                    // the values the body reads.
                     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| {
                         *slot.borrow_mut() = Some(LatchedMultiFrameBlackhole {
                             framestack,
                             last_exc_value,
                             raising_exception,
-                            publish_root_stack: false,
-                            mirror_stack: None,
+                            publish_root_stack: true,
+                            mirror_stack: capture_root_parent_resume_stack(ctx),
                             origin: "escape-flush",
                         });
                     });
