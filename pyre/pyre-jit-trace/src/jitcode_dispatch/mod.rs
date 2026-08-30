@@ -2149,8 +2149,15 @@ fn create_segmented_trace<Sym: WalkSym>(
     // The latch answers for the snapshot-array stack source; this leg publishes
     // from the walker mirror, whose own height check runs only in the adopter.
     // Ask it here, while a refusal is still free.
+    //
+    // The refusal has to unstage what the latch just wrote, and from BOTH slots:
+    // `latch_abort_blackhole` routes an inline sub-walk to the multi-frame one,
+    // which this predicate cannot see and this leg has no adopt for.  Left
+    // staged, that image answers `abort_blackhole_latched()` for a later abort,
+    // which then records none of its own and adopts this merge point instead of
+    // its own stop — dropping everything executed in between.
     if !latched_single_frame_mirror_publishable() {
-        drop(take_single_frame_blackhole());
+        reset_single_frame_blackhole();
         census_record("SegmentTrace::MirrorStackRefused");
         return Ok(None);
     }
