@@ -13529,9 +13529,10 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path() == "core::f64::<Impl>::is_sign_positive")
     }
 
-    /// `majit_metainterp::jit::promote(x)` = `hint(x, promote=True)`
-    /// (`rlib/jit.py`), with the `promote_string` (`:118`) and
-    /// `promote_unicode` (`:124`) siblings.  All three wrappers carry their
+    /// `majit_metainterp::jit::promote(x)` / the lower-layer
+    /// `majit_ir::jit::promote(x)` decorator carrier =
+    /// `hint(x, promote=True)` (`rlib/jit.py`), with the `promote_string`
+    /// (`:118`) and `promote_unicode` (`:124`) siblings.  All wrappers carry their
     /// flag by name (each body is a bare `hint(x)`), so the callsite is
     /// recognised by the wrapper path, not the body.  Returns the
     /// synthesised `hint_*` marker leaf for the matched wrapper so the
@@ -13550,7 +13551,7 @@ impl<'a> Lowering<'a> {
             return None;
         };
         match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
-            "majit_metainterp::jit::promote" => Some("hint_promote"),
+            "majit_metainterp::jit::promote" | "majit_ir::jit::promote" => Some("hint_promote"),
             "majit_metainterp::jit::promote_string" => Some("hint_promote_string"),
             "majit_metainterp::jit::promote_unicode" => Some("hint_promote_unicode"),
             _ => None,

@@ -839,7 +839,7 @@ impl ModuleDictStrategy {
     )]
     pub fn get_global_cache(
         &mut self,
-        storage: &ModuleDictStorage,
+        w_dict: PyObjectRef,
         key: &str,
     ) -> std::sync::Arc<parking_lot::Mutex<GlobalCache>> {
         let mut cache_registry = self.caches.lock();
@@ -863,7 +863,7 @@ impl ModuleDictStrategy {
         if let Some(cache) = cached {
             return cache;
         }
-        let cell = self.getdictvalue_no_unwrapping(storage, key);
+        let cell = self.getdictvalue_no_unwrapping(w_dict, key);
         let caches = cache_registry.as_mut().unwrap();
         // `celldict.py cache = GlobalCache(cell)`.  Lines 224-238
         // (`if not honor__builtins__ and cell is None and w_dict is
@@ -944,15 +944,32 @@ impl ModuleDictStrategy {
     ///     return self.unerase(w_dict.dstorage).get(key, None)
     /// ```
     ///
-    /// Returns the raw stored value (in PyPy this would be a
-    /// `MutableCell` or a plain `PyObjectRef`; pyre stores plain
-    /// values until the cell-indirection slice lands).
+    /// Returns the raw stored value (a `MutableCell` or a plain
+    /// `PyObjectRef`) without unwrapping a cell.
     pub fn getdictvalue_no_unwrapping(
         &self,
-        storage: &ModuleDictStorage,
+        w_dict: PyObjectRef,
         key: &str,
     ) -> Option<PyObjectRef> {
-        storage.get(key)
+        self._getdictvalue_no_unwrapping_pure(self.version, w_dict, key)
+    }
+
+    /// `celldict.py _getdictvalue_no_unwrapping_pure` — keep the module dict
+    /// object as the storage owner and unerase its `dstorage` here.  This is
+    /// the load-bearing PyPy shape: callers never pass the concrete erased
+    /// storage as a substitute for `w_dict`.
+    #[majit_macros::elidable_promote(promote_args = "0,1,2")]
+    #[expect(
+        clippy::not_unsafe_ptr_arg_deref,
+        reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the object-space boundary"
+    )]
+    pub fn _getdictvalue_no_unwrapping_pure(
+        &self,
+        _version: VersionTag,
+        w_dict: PyObjectRef,
+        key: &str,
+    ) -> Option<PyObjectRef> {
+        unsafe { crate::dictmultiobject::w_module_dict_module_storage(w_dict).get(key) }
     }
 
     /// `celldict.py setitem_str`:
@@ -968,7 +985,7 @@ impl ModuleDictStrategy {
         key: &str,
         w_value: PyObjectRef,
     ) {
-        let cell = self.getdictvalue_no_unwrapping(storage, key);
+        let cell = storage.get(key);
         self._setitem_str_cell_known(cell, storage, key, w_value);
     }
 
@@ -1042,7 +1059,7 @@ impl ModuleDictStrategy {
     ///     return unwrap_cell(self.space, cell)
     /// ```
     pub fn getitem_str(&self, storage: &ModuleDictStorage, key: &str) -> Option<PyObjectRef> {
-        let raw = self.getdictvalue_no_unwrapping(storage, key)?;
+        let raw = storage.get(key)?;
         // `unwrap_cell` is null-tolerant and an `ObjectMutableCell` may hold a
         // null `w_value`; a null unwrap means the name has no live binding, so
         // report absence rather than `Some(null)`.

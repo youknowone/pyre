@@ -8,6 +8,7 @@ pub mod field_entry;
 pub mod forwarding;
 pub mod indexmap_ext;
 pub mod intbound;
+pub mod jit;
 pub mod op_descr;
 pub mod op_info;
 pub mod op_type_index;

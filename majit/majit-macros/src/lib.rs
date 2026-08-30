@@ -2306,12 +2306,12 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
             if has_self && idx == 0 {
                 // rlib/jit.py — promote self by identity (guard_value on pointer)
                 Some(quote! {
-                    let _ = majit_metainterp::jit::promote(self as *const _ as usize);
+                    let _ = majit_ir::jit::promote(self as *const _ as usize);
                 })
             } else {
                 let named_idx = if has_self { idx - 1 } else { idx };
                 named_args.get(named_idx).map(|name| {
-                    quote! { let #name = majit_metainterp::jit::promote(#name); }
+                    quote! { let #name = majit_ir::jit::promote(#name); }
                 })
             }
         })

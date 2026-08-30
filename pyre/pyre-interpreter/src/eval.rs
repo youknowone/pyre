@@ -3173,8 +3173,7 @@ unsafe fn load_global_via_cache(
         // of `celldict.py not space.config.objspace.honor__builtins__`.
         let strategy =
             pyre_object::dictmultiobject::w_module_dict_module_strategy_mut(w_module_dict);
-        let storage = pyre_object::dictmultiobject::w_module_dict_module_storage(w_module_dict);
-        let cache = strategy.get_global_cache(storage, name);
+        let cache = strategy.get_global_cache(w_module_dict, name);
         // `celldict.py:321/353 pycode._globals_caches[nameindex] = cache.ref`.
         if !pycode.is_null() {
             crate::pycode::w_code_globals_caches_set(pycode, nameindex, &cache);
