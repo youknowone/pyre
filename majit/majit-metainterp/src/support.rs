@@ -34,7 +34,16 @@ pub(crate) fn ptr2int_mut<T>(ptr: *mut T) -> AddressAsInt {
 
 /// support.py `int_signext`.
 pub fn int_signext(value: i64, numbytes: i64) -> i64 {
-    if !(1..=8).contains(&numbytes) {
+    // `support.py int_signext` starts by shifting by `numbytes * 8 - 1`.
+    // A zero or negative width therefore raises instead of returning the
+    // unmodified value.  Widths above the machine word are different: the
+    // intermediate `r_uint` conversions discard every high bit, reducing the
+    // upstream expression to the identity on a 64-bit Signed.
+    assert!(
+        numbytes > 0,
+        "int_signext: numbytes must be positive, got {numbytes}",
+    );
+    if numbytes > 8 {
         return value;
     }
     let shift = 64 - numbytes * 8;
@@ -74,8 +83,17 @@ mod tests {
     }
 
     #[test]
-    fn int_signext_preserves_unknown_widths_like_rust_callers_expect() {
-        assert_eq!(int_signext(0x80, 0), 0x80);
+    fn int_signext_rejects_nonpositive_widths_like_rpython() {
+        for numbytes in [0, -1] {
+            assert!(
+                std::panic::catch_unwind(|| int_signext(0x80, numbytes)).is_err(),
+                "int_signext silently accepted numbytes={numbytes}",
+            );
+        }
+    }
+
+    #[test]
+    fn int_signext_preserves_widths_larger_than_the_machine_word() {
         assert_eq!(int_signext(0x80, 9), 0x80);
     }
 }

@@ -5231,8 +5231,7 @@ mod tests {
             None,
             None, // all_virtuals
             &NullAllocator,
-        )
-        .expect("runtime-only jitcode should still resume");
+        );
 
         assert_eq!(virtualizable_ptr, 0);
         assert!(std::sync::Arc::ptr_eq(&bh.jitcode, &runtime));
@@ -5332,7 +5331,6 @@ mod tests {
                 all_virtuals,
                 &NullAllocator,
             )
-            .expect("resume should produce a blackhole")
         };
 
         // resume.py:1427-1428: the ordinary path consumes the vable section, so
@@ -5479,8 +5477,7 @@ mod tests {
             identity_override,
             None, // all_virtuals
             &NullAllocator,
-        )
-        .expect("resume should produce a blackhole");
+        );
         (virtualizable_ptr, bh.registers_r[0])
     }
 
@@ -7907,7 +7904,7 @@ pub fn blackhole_from_resumedata<'a>(
     // the already-forced virtualizable alone.
     all_virtuals: Option<(Vec<i64>, Vec<i64>)>,
     allocator: &'a dyn BlackholeAllocator,
-) -> Option<(BlackholeInterpreter, i64)> {
+) -> (BlackholeInterpreter, i64) {
     // resume.py:1315-1327 The initialization is stack-critical code: it
     // must not be interrupted by StackOverflow, otherwise the
     // jit_virtual_refs are left in a dangling state.
@@ -7961,7 +7958,9 @@ pub fn blackhole_from_resumedata<'a>(
         // resume.py:1338-1340
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
         // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc).
-        let resolved = resolve_jitcode(jitcode_pos, pc)?;
+        let resolved = resolve_jitcode(jitcode_pos, pc).unwrap_or_else(|| {
+            panic!("blackhole_from_resumedata: invalid jitcode index {jitcode_pos} at pc {pc}")
+        });
         if crate::bh_debug_enabled() {
             eprintln!(
                 "[bh-frame] jitcode_pos={jitcode_pos} encoded_pc={pc} resolved_pc={}",
@@ -7996,7 +7995,8 @@ pub fn blackhole_from_resumedata<'a>(
     // place to the to-space address.
     let virtualizable_ptr = resumereader.virtualizable_ptr;
 
-    curbh.map(|b| (*b, virtualizable_ptr))
+    let curbh = curbh.expect("blackhole_from_resumedata: resume data contains no frame");
+    (*curbh, virtualizable_ptr)
 }
 
 /// resume.py force_from_resumedata

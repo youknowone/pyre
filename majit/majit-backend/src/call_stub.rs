@@ -1191,14 +1191,10 @@ impl CallArgs {
 /// each call site — a translated JIT does not run this. `majit-backend` is not
 /// one of the LLBC-extracted crates, so a release build really does drop it.
 ///
-/// The callers check this *after* their `func == 0` early return, where
-/// upstream verifies first. That guard has no upstream counterpart: it is
-/// pyre's "no callee is installed" sentinel, and it pairs with a descr that has
-/// no result type either — `jitdriver.rs` builds a `BhJitDriverSd` whose
-/// `portal_runner_ptr` is `None` and whose `mainjitcode_calldescr` falls back
-/// to `Default`, so `result_type` is `'\0'`. Verifying the return register of a
-/// call that is not made would report that pairing instead of an ABI
-/// disagreement.
+/// A NULL function pointer is rejected by every `bh_call_*` entry before this
+/// check.  `llmodel.py::bh_call_i/r/f/v` has no fake-success path for a missing
+/// callee; callers that carry `JitCode.fnaddr == None` must abort before backend
+/// dispatch.
 pub fn verify_result_type(result_type: char, accepted: &str) {
     debug_assert!(
         accepted.contains(result_type),

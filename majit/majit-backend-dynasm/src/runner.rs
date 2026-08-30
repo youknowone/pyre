@@ -3475,6 +3475,18 @@ impl Backend for DynasmBackend {
         self.bh_new_array(length, arraydescr)
     }
 
+    /// `LLtypeMixin.bh_newstr` → `gc_ll_descr.gc_malloc_str`.
+    fn bh_newstr(&self, length: i64) -> i64 {
+        let length = u64::try_from(length).expect("bh_newstr length must be non-negative");
+        dynasm_malloc_str(majit_gc::lowlevel_str_type_id() as u64, length) as i64
+    }
+
+    /// `LLtypeMixin.bh_newunicode` → `gc_ll_descr.gc_malloc_unicode`.
+    fn bh_newunicode(&self, length: i64) -> i64 {
+        let length = u64::try_from(length).expect("bh_newunicode length must be non-negative");
+        dynasm_malloc_unicode(majit_gc::lowlevel_unicode_type_id() as u64, length) as i64
+    }
+
     /// llsupport/gc.py GcLLDescr_framework
     ///   .get_typeid_from_classptr_if_gcremovetypeptr(classptr)
     /// Resolves a vtable pointer through the installed gc_ll_descr.
@@ -3495,9 +3507,8 @@ impl Backend for DynasmBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> i64 {
-        if func == 0 {
-            return 0;
-        }
+        assert_ne!(func, 0, "bh_call_i: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "iS");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
@@ -3516,9 +3527,7 @@ impl Backend for DynasmBackend {
     /// llmodel.py bh_call_r: GcRef-returning parallel of `bh_call_i`.
     /// `lltype.Ptr(lltype.GcStruct, ...)` lowers to a host pointer that
     /// matches `i64` on 64-bit, so we transmute via the shared int
-    /// dispatcher and wrap the result. Without this override
-    /// `bhimpl_residual_call_*_r` would silently no-op via the default
-    /// `bh_call_r` trait impl in `majit-backend/src/lib.rs`.
+    /// dispatcher and wrap the result.
     fn bh_call_r(
         &self,
         func: i64,
@@ -3527,9 +3536,8 @@ impl Backend for DynasmBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> majit_ir::GcRef {
-        if func == 0 {
-            return majit_ir::GcRef::NULL;
-        }
+        assert_ne!(func, 0, "bh_call_r: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "r");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
@@ -3549,9 +3557,7 @@ impl Backend for DynasmBackend {
     /// llmodel.py bh_call_f / descr.py create_call_stub
     /// (`RESULT == lltype.Float`) parity: route through the f64-typed
     /// dispatcher so an f64-returning C callee delivers via xmm0 / d0
-    /// instead of rax / x0. Without this override
-    /// `bhimpl_residual_call_*_f` would silently no-op via the default
-    /// `bh_call_f` trait impl in `majit-backend/src/lib.rs`.
+    /// instead of rax / x0.
     fn bh_call_f(
         &self,
         func: i64,
@@ -3560,9 +3566,8 @@ impl Backend for DynasmBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) -> f64 {
-        if func == 0 {
-            return 0.0;
-        }
+        assert_ne!(func, 0, "bh_call_f: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "fL");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,
@@ -3584,10 +3589,6 @@ impl Backend for DynasmBackend {
     /// is called with the right C-ABI signature. Re-routing through
     /// `bh_call_i_dispatch` (a `extern "C" fn(...) -> i64` transmute)
     /// reads garbage from rax/x0 for true void returns.
-    ///
-    /// Without this override the canonical `residual_call_*_v` walker
-    /// would silently no-op via the default trait impl
-    /// (`bh_call_v` in `majit-backend/src/lib.rs`).
     fn bh_call_v(
         &self,
         func: i64,
@@ -3596,9 +3597,8 @@ impl Backend for DynasmBackend {
         args_f: Option<&[i64]>,
         calldescr: &majit_translate::jitcode::BhCallDescr,
     ) {
-        if func == 0 {
-            return;
-        }
+        assert_ne!(func, 0, "bh_call_v: null function pointer");
+        majit_backend::call_stub::verify_result_type(calldescr.result_type, "v");
         let collected = majit_backend::call_stub::collect_call_args(
             &calldescr.arg_classes,
             args_i,

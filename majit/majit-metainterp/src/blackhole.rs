@@ -195,14 +195,37 @@ pub enum DispatchError {
 ///   self.descrs = builder.descrs
 ///   self.op_catch_exception = builder.op_catch_exception
 ///   self.op_rvmprof_code = builder.op_rvmprof_code
+#[derive(Clone, Copy)]
+struct BlackholeCpuRef(*const (dyn majit_backend::Backend + 'static));
+
+impl BlackholeCpuRef {
+    /// Erase the borrow lifetime without manufacturing a long-lived Rust
+    /// reference.  The builder is leased only while its owning MetaInterp CPU
+    /// is alive; every dereference is tied to the interpreter borrow below.
+    fn new(cpu: &dyn majit_backend::Backend) -> Self {
+        let ptr = cpu as *const dyn majit_backend::Backend;
+        // SAFETY: raw trait-object pointers carry a lifetime bound only at the
+        // type level. `BlackholeInterpBuilder::set_cpu` documents and enforces
+        // the owner relationship at each production lease.
+        Self(unsafe {
+            std::mem::transmute::<
+                *const dyn majit_backend::Backend,
+                *const (dyn majit_backend::Backend + 'static),
+            >(ptr)
+        })
+    }
+
+    fn get(&self) -> &dyn majit_backend::Backend {
+        // SAFETY: callers can obtain this only through a live builder/interp
+        // whose active lease is nested inside the CPU owner's lifetime.
+        unsafe { &*self.0 }
+    }
+}
+
 pub struct BlackholeInterpreter {
-    /// RPython `blackhole.py:286` `self.cpu = builder.cpu`.
-    /// Reference to the backend trait for `bh_*` concrete execution.
-    /// Raw pointer because the interpreter is pool-managed and
-    /// the Backend outlives all interpreter instances.
-    /// RPython `blackhole.py:286/56` `self.cpu = builder.cpu`.
+    /// RPython `BlackholeInterpreter.__init__`: `self.cpu = builder.cpu`.
     /// Backend trait for `bh_*` concrete execution. None until set.
-    pub cpu: Option<&'static dyn majit_backend::Backend>,
+    cpu: Option<BlackholeCpuRef>,
     /// RPython `blackhole.py:288` `self.descrs = builder.descrs`.
     /// Descriptor table from the assembler. In RPython, `descrs` is a list
     /// of `AbstractDescr` objects carrying field offsets, array item sizes,
@@ -239,6 +262,10 @@ pub struct BlackholeInterpreter {
     pub position: usize,
     /// Caller frame in the blackhole frame chain.
     pub nextblackholeinterp: Option<Box<BlackholeInterpreter>>,
+    /// Free-list link owned by `BlackholeInterpBuilder.blackholeinterps`.
+    /// This is distinct from `nextblackholeinterp`, exactly as upstream's
+    /// `back` pool link is distinct from the live caller-frame chain.
+    back: Option<Box<BlackholeInterpreter>>,
     /// Return type of this frame.
     pub return_type: BhReturnType,
     /// True when run() hit jitcode::BC_ABORT (unsupported bytecode). Callers
@@ -472,6 +499,7 @@ impl Default for BlackholeInterpreter {
             jitcode: EMPTY_JITCODE.with(std::sync::Arc::clone),
             position: 0,
             nextblackholeinterp: None,
+            back: None,
             return_type: BhReturnType::Void,
             aborted: false,
             abort_permanent_bail: false,
@@ -624,6 +652,7 @@ impl BlackholeInterpreter {
         self.tmpreg_f = 0;
         self.exception_last_value = 0;
         self.nextblackholeinterp = None;
+        self.back = None;
         self.return_type = BhReturnType::Void;
         self.aborted = false;
         self.abort_permanent_bail = false;
@@ -1374,22 +1403,20 @@ impl BlackholeInterpreter {
     ///
     /// Upstream inspects exactly one instruction — the resume `-live-` is
     /// skipped and whatever follows it either is the `catch_exception` or is
-    /// not.  The two scans below are pyre's, and they are not a fallback for a
+    /// not.  The backward scan below is pyre's, and it is not a fallback for a
     /// position this interpreter left wrong: every entry from
     /// [`Self::run_inner`] arrives with `self.position` naming the end of the
     /// raising instruction, which [`Self::dispatch_step`] stores out of
     /// [`DispatchError::RaiseException`] exactly as upstream's `_get_method`
     /// wrapper does, so the direct case answers all of them.
     ///
-    /// They exist for the OTHER two entries, which do not come from a
+    /// It exists for the OTHER two entries, which do not come from a
     /// dispatched instruction at all: [`Self::resume_mainloop`]'s prologue and
     /// the guard-failure chain walk both arrive with a *resume coordinate*
     /// taken from a guard descr, and pyre's descr for a post-call
     /// `GUARD_NO_EXCEPTION` names the successor block's entry `-live-` rather
     /// than the call's own trailing one (`pc_map[fallthrough_pc]`; the catch
-    /// sits between the two and no Python PC resolves onto it).  Retiring the
-    /// scans is therefore a change to what `capture_resumedata` stamps, not to
-    /// anything in this file.
+    /// sits between the two and no Python PC resolves onto it).
     pub fn handle_exception_in_frame(&mut self, exc_value: i64) -> bool {
         let code = &self.jitcode.code;
         let mut position = self.position;
@@ -1408,15 +1435,6 @@ impl BlackholeInterpreter {
         // is directly after the resume `-live-` (blackhole.py:396 parity).
         if opcode == self.op_catch_exception {
             return self.route_to_catch(position, exc_value);
-        }
-        // A guard resume coordinate can name the successor block entry before
-        // the translated raising operation.  PyPy's MIFrame position already
-        // names the operation's trailing live/catch pair; pyre recovers that
-        // generated-coordinate gap by scanning to the FIRST such pair.  Ops
-        // before the trailing live belong to that translated operation.  Once
-        // the live is crossed, only its immediately-following catch is valid.
-        if let Some(catch_pos) = self.find_catch_after_resume_live(resume_live_pos) {
-            return self.route_to_catch(catch_pos, exc_value);
         }
         // Backward case (after-residual-call guard): pyre resumes the post-call
         // `GUARD_NO_EXCEPTION` at the next opcode's `-live-`
@@ -1474,7 +1492,13 @@ impl BlackholeInterpreter {
         // (a nested call from this handler) would read it at its first
         // `GUARD_NO_EXCEPTION` and re-deliver the already-handled exception.
         // Drain the backend cells here so the handler runs with a pristine cell.
-        self.cpu().clear_stored_exception();
+        // Synthetic dispatcher tests can exercise a pure catch path without
+        // any CPU operation.  A real builder always carries `codewriter.cpu`;
+        // when present, keep the Rust residual-exception side channel in sync
+        // with the exception slot that the upstream frame just consumed.
+        if let Some(cpu) = self.cpu {
+            cpu.get().clear_stored_exception();
+        }
         true
     }
 
@@ -1569,60 +1593,6 @@ impl BlackholeInterpreter {
             }
         }
         None
-    }
-
-    fn find_catch_after_resume_live(&self, resume_live_pos: usize) -> Option<usize> {
-        let (catch_pos, skipped) = self.scan_catch_after_resume_live(resume_live_pos);
-        static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *DIAG.get_or_init(|| std::env::var_os("PYRE_CATCH_SCAN_DIAG").is_some()) {
-            eprintln!(
-                "[catch-scan] jitcode={} resume_live={resume_live_pos} \
-                 ops_before_live={skipped} found={}",
-                self.jitcode.name(),
-                catch_pos.is_some(),
-            );
-        }
-        catch_pos
-    }
-
-    /// The forward scan itself, with the number of startpoints it consumed
-    /// before the trailing `-live-`.
-    ///
-    /// That count is the open question in #1151: the loop imposes no bound on
-    /// it, so a raising operation whose own block carries no
-    /// `-live-`/`catch_exception` pair can walk into the next operation's and
-    /// route the exception to a handler that is not its own.  `PYRE_CATCH_SCAN_DIAG`
-    /// prints it for every call, found or not, so a corpus that never exceeds
-    /// one op says the producer-side invariant holds where a count of returned
-    /// catches alone would not.
-    fn scan_catch_after_resume_live(&self, resume_live_pos: usize) -> (Option<usize>, usize) {
-        let code = &self.jitcode.code;
-        let Some(startpoints) = self.jitcode.startpoints.as_ref() else {
-            return (None, 0);
-        };
-        let mut points: Vec<usize> = startpoints
-            .iter()
-            .copied()
-            .filter(|&q| q > resume_live_pos)
-            .collect();
-        points.sort_unstable();
-        let mut crossed_trailing_live = false;
-        let mut skipped = 0usize;
-        for q in points {
-            let op = code[q];
-            if op == self.op_catch_exception {
-                return (crossed_trailing_live.then_some(q), skipped);
-            }
-            if crossed_trailing_live {
-                return (None, skipped);
-            }
-            if op == self.op_live {
-                crossed_trailing_live = true;
-            } else {
-                skipped += 1;
-            }
-        }
-        (None, skipped)
     }
 
     /// blackhole.py handle_rvmprof_enter.
@@ -1976,8 +1946,11 @@ impl BlackholeInterpreter {
 // through these handlers + bhimpl methods.
 
 impl BlackholeInterpreter {
-    fn cpu(&self) -> &'static dyn majit_backend::Backend {
-        self.cpu.expect("blackhole cpu reference unset")
+    fn cpu(&self) -> &dyn majit_backend::Backend {
+        self.cpu
+            .as_ref()
+            .expect("blackhole cpu reference unset")
+            .get()
     }
 
     // ── bhimpl_residual_call_* (blackhole.py:1224-1255) ──
@@ -2304,12 +2277,13 @@ impl BlackholeInterpreter {
 ///    + `dispatch_loop`). Phase D incrementally wires this up as
 ///      `bhimpl_*` methods are ported from RPython.
 pub struct BlackholeInterpBuilder {
-    pool: Vec<BlackholeInterpreter>,
+    /// `BlackholeInterpBuilder.blackholeinterps`: intrusive free-list head.
+    blackholeinterps: Option<Box<BlackholeInterpreter>>,
     /// RPython `blackhole.py` `self.cpu = codewriter.cpu`.
     /// Stored as raw pointer; the Backend outlives the builder.
     /// RPython `blackhole.py:286/56` `self.cpu = builder.cpu`.
     /// Backend trait for `bh_*` concrete execution. None until set.
-    pub cpu: Option<&'static dyn majit_backend::Backend>,
+    cpu: Option<BlackholeCpuRef>,
     /// RPython `blackhole.py:68` `self._insns`: opcode byte → "opname/argcodes".
     /// Populated by `setup_insns`; empty until called.
     pub _insns: Vec<String>,
@@ -2369,7 +2343,7 @@ fn sync_raise_position(bh: &mut BlackholeInterpreter, err: &DispatchError) {
 impl BlackholeInterpBuilder {
     pub fn new() -> Self {
         Self {
-            pool: Vec::new(),
+            blackholeinterps: None,
             cpu: None,
             _insns: Vec::new(),
             op_live: u8::MAX,
@@ -2380,6 +2354,13 @@ impl BlackholeInterpBuilder {
             dispatch_table: std::sync::Arc::new(Vec::new()),
             jitdrivers_sd: std::sync::Arc::from([] as [BhJitDriverSd; 0]),
         }
+    }
+
+    /// Bind the exact CPU owned by the MetaInterp that produced the trace.
+    /// The caller must keep that CPU alive and at a stable address for the
+    /// builder's active lease; pooled interpreters are refreshed on acquire.
+    pub fn set_cpu(&mut self, cpu: &dyn majit_backend::Backend) {
+        self.cpu = Some(BlackholeCpuRef::new(cpu));
     }
 
     /// TODO narrowed for parity:
@@ -2683,7 +2664,12 @@ impl BlackholeInterpBuilder {
     /// `__init__`, which stores `self.cpu = builder.cpu`. We propagate
     /// the `cpu` field from the builder to each acquired interpreter.
     pub fn acquire_interp(&mut self) -> BlackholeInterpreter {
-        let mut bh = self.pool.pop().unwrap_or_default();
+        let mut bh = if let Some(mut head) = self.blackholeinterps.take() {
+            self.blackholeinterps = head.back.take();
+            *head
+        } else {
+            BlackholeInterpreter::default()
+        };
         // RPython blackhole.py:284-289:
         //   self.cpu = builder.cpu
         //   self.dispatch_loop = builder.dispatch_loop
@@ -2711,7 +2697,7 @@ impl BlackholeInterpBuilder {
     pub fn release_interp(&mut self, mut interp: BlackholeInterpreter) {
         // blackhole.py:254
         interp.cleanup_registers();
-        // Pool management (RPython uses linked-list via .back; Rust uses Vec)
+        // Live-chain and free-list links have separate upstream owners.
         interp.nextblackholeinterp = None;
         interp.aborted = false;
         interp.abort_permanent_bail = false;
@@ -2737,7 +2723,8 @@ impl BlackholeInterpBuilder {
         // `scalar_slot`/`array_elem_slot` range checks are `debug_assert!`, so
         // a release build reads whatever slot the arithmetic lands on.
         interp.state_field_layout = StateFieldLayout::default();
-        self.pool.push(interp);
+        interp.back = self.blackholeinterps.take();
+        self.blackholeinterps = Some(Box::new(interp));
     }
 
     /// Release an entire blackhole chain (including all nextblackholeinterps).
@@ -3239,12 +3226,7 @@ pub fn resume_in_blackhole(
         &null_alloc,
     );
 
-    let Some((bh, _virtualizable_ptr)) = bh else {
-        // `resume.py blackhole_from_resumedata` always yields an interpreter;
-        // reaching here means the resume data could not be decoded, which is
-        // not a frame that returned.
-        return JitException::BailToInterpreter;
-    };
+    let (bh, _virtualizable_ptr) = bh;
 
     // blackhole.py:1794
     let current_exc = BlackholeInterpreter::prepare_resume_from_failure(deadframe_exc);
@@ -3610,6 +3592,26 @@ mod tests {
         assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(0.999)), 0);
     }
 
+    #[test]
+    fn test_executor_cast_float_to_int_rejects_values_outside_signed() {
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_223_372_036_854_775_808.0,
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| { exec_unop(OpCode::CastFloatToInt, f64_bits(value)) })
+                    .is_err(),
+                "cast_float_to_int silently accepted {value:?}",
+            );
+        }
+        assert_eq!(
+            exec_unop(OpCode::CastFloatToInt, f64_bits(i64::MIN as f64)),
+            i64::MIN,
+        );
+    }
+
     // ── Overflow arithmetic ──
 
     #[test]
@@ -3862,6 +3864,18 @@ mod tests {
         assert_eq!(exec_binop(OpCode::IntLshift, -5, 2), -20);
     }
 
+    #[test]
+    fn test_executor_bad_shift_count_is_rejected() {
+        for opcode in [OpCode::IntLshift, OpCode::IntRshift, OpCode::UintRshift] {
+            for count in [-1, 64] {
+                assert!(
+                    std::panic::catch_unwind(|| exec_binop(opcode, 7, count)).is_err(),
+                    "{opcode:?} silently accepted shift count {count}",
+                );
+            }
+        }
+    }
+
     // ── IntSignext ──
 
     #[test]
@@ -3887,6 +3901,17 @@ mod tests {
             exec_binop(OpCode::IntSignext, 0x80000000_i64, 4),
             -2147483648
         );
+    }
+
+    #[test]
+    fn test_executor_int_signext_rejects_nonpositive_width() {
+        for numbytes in [0, -1] {
+            assert!(
+                std::panic::catch_unwind(|| { exec_binop(OpCode::IntSignext, 0x80, numbytes) })
+                    .is_err(),
+                "IntSignext silently accepted numbytes={numbytes}",
+            );
+        }
     }
 
     // ── ConvertFloatBytesToLonglong / ConvertLonglongBytesToFloat roundtrip ──
@@ -4431,9 +4456,8 @@ mod tests {
         /// The two `fnaddr` classifiers agree with the walker's gate.
         ///
         /// A symbolic hash carries the `SYMBOLIC_FNADDR_BASE` high-16-bit tag;
-        /// `0` is upstream's "no address" spelling (`jitcode.py:14`) and is a
-        /// no-op — not a decline — for `residual_call`, whose backend
-        /// `bh_call_*` returns `0`/null for it.
+        /// `0` is upstream's "no address" spelling
+        /// (`jitcode.py::JitCode.__init__`) and is not callable either.
         #[test]
         fn fnaddr_classifiers_match_the_walker_symbolic_gate() {
             let real = fnaddr_classifiers_match_the_walker_symbolic_gate as *const () as i64;
@@ -4464,6 +4488,34 @@ mod tests {
 
             assert!(!super::is_symbolic_fnaddr(0));
             assert!(!super::is_callable_fnaddr(0));
+        }
+
+        #[test]
+        fn residual_call_handlers_reject_every_unresolved_target() {
+            let handlers: &[super::BhOpcodeHandler] = &[
+                super::handler_residual_call_irf_i,
+                super::handler_residual_call_irf_r,
+                super::handler_residual_call_irf_f,
+                super::handler_residual_call_irf_v,
+                super::handler_residual_call_ir_i,
+                super::handler_residual_call_ir_r,
+                super::handler_residual_call_ir_v,
+                super::handler_residual_call_r_i,
+                super::handler_residual_call_r_r,
+                super::handler_residual_call_r_v,
+            ];
+            let symbolic = majit_translate::codewriter::call::SYMBOLIC_FNADDR_BASE as i64
+                | 0x1234_5678_9abc_i64;
+            for target in [0, symbolic] {
+                for handler in handlers {
+                    let mut builder = BlackholeInterpBuilder::new();
+                    let mut bh = builder.acquire_interp();
+                    bh.registers_i = vec![target];
+                    let result = handler(&mut bh, &[0], 0);
+                    assert!(matches!(result, Err(super::DispatchError::LeaveFrame)));
+                    assert!(bh.aborted);
+                }
+            }
         }
 
         #[test]
@@ -4970,15 +5022,16 @@ mod tests {
         }
 
         #[test]
-        fn test_guard_exception_resume_finds_catch_after_successor_sync() {
+        fn test_guard_exception_resume_does_not_steal_later_operation_catch() {
             let mut asm = majit_translate::codewriter::assembler::Assembler::new();
             let mut b = JitCodeBuilder::default();
             b.load_const_r_value(0, 1);
             b.load_const_i_value(0, 2);
             let resume_pc = b.current_pos();
             b.live(&mut asm, &[], &[], &[]);
-            // The normal-flow successor mirrors virtualizable state before
-            // the can-raise block's trailing live/catch pair.
+            // This operation has no adjacent catch.  A later operation does;
+            // blackhole.py handle_exception_in_frame must not route the first
+            // operation's exception to that unrelated handler.
             b.vable_setfield_int_with_base(0, 0, 0);
             b.live(&mut asm, &[], &[], &[]);
             let handler_lbl = b.new_label();
@@ -4986,7 +5039,6 @@ mod tests {
             b.load_const_i_value(2, 99);
             b.int_return(2);
             b.mark_label(handler_lbl);
-            let handler_pc = b.current_pos();
             b.load_const_i_value(2, 42);
             b.int_return(2);
             let jitcode = b.finish();
@@ -4995,31 +5047,8 @@ mod tests {
             let mut bh = builder.acquire_interp();
             bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
 
-            assert!(bh.handle_exception_in_frame(0xCAFE_F00D));
-            assert_eq!(bh.position, handler_pc);
-        }
-
-        #[test]
-        fn test_guard_exception_resume_crosses_translated_operation() {
-            let mut asm = majit_translate::codewriter::assembler::Assembler::new();
-            let mut b = JitCodeBuilder::default();
-            let resume_pc = b.current_pos();
-            b.live(&mut asm, &[], &[], &[]);
-            b.load_const_i_value(0, 1);
-            b.live(&mut asm, &[], &[], &[]);
-            let handler_lbl = b.new_label();
-            b.catch_exception(handler_lbl);
-            b.mark_label(handler_lbl);
-            let handler_pc = b.current_pos();
-            b.int_return(0);
-            let jitcode = b.finish();
-
-            let mut builder = super::build_inline_call_only_bh_builder();
-            let mut bh = builder.acquire_interp();
-            bh.setposition(std::sync::Arc::new(jitcode), resume_pc);
-
-            assert!(bh.handle_exception_in_frame(0xCAFE_F00D));
-            assert_eq!(bh.position, handler_pc);
+            assert!(!bh.handle_exception_in_frame(0xCAFE_F00D));
+            assert_eq!(bh.position, resume_pc);
         }
 
         thread_local! {
@@ -5336,18 +5365,23 @@ mod tests {
         /// continuing dispatch past it would misread the next bytes
         /// as opcodes.
         #[test]
-        fn test_handler_abort_marker_sets_aborted_and_leaves_frame() {
-            let mut builder = BlackholeInterpBuilder::new();
-            let mut bh = builder.acquire_interp();
-            assert!(!bh.aborted);
-            let result = super::handler_abort_marker(&mut bh, &[], 0);
-            match result {
-                Err(super::DispatchError::LeaveFrame) => {}
-                other => {
-                    panic!("handler_abort_marker must return Err(LeaveFrame), got {other:?}")
+        fn test_all_abort_handlers_set_aborted_and_leave_frame() {
+            let handlers: &[super::BhOpcodeHandler] = &[
+                super::handler_abort_marker,
+                super::handler_abort_result_marker_i,
+                super::handler_abort_result_marker_r,
+            ];
+            for handler in handlers {
+                let mut builder = BlackholeInterpBuilder::new();
+                let mut bh = builder.acquire_interp();
+                assert!(!bh.aborted);
+                let result = handler(&mut bh, &[0], 0);
+                match result {
+                    Err(super::DispatchError::LeaveFrame) => {}
+                    other => panic!("abort handler must return Err(LeaveFrame), got {other:?}"),
                 }
+                assert!(bh.aborted);
             }
-            assert!(bh.aborted);
         }
 
         /// Integration test: build bytecode manually with known opcode
@@ -5908,19 +5942,37 @@ fn bhimpl_int_xor(a: i64, b: i64) -> i64 {
     a ^ b
 }
 
-/// blackhole.py `bhimpl_int_rshift(a, b): return a >> b`.
+/// `blackhole.py check_shift_count` — the untranslated blackhole rejects a
+/// count outside the machine-word range instead of letting the host language
+/// mask it.  Rust's shift operators panic only in debug for some spellings,
+/// while `wrapping_shl` masks by definition, so keep the upstream check
+/// explicit and identical for all three bhimpls.
+#[inline]
+fn check_shift_count(b: i64) {
+    assert!(
+        (0..i64::BITS as i64).contains(&b),
+        "Shift count, {b}, not in valid range, 0 .. {}.",
+        i64::BITS - 1,
+    );
+}
+
+/// blackhole.py `bhimpl_int_rshift(a, b): check_shift_count(b); return a >> b`.
 fn bhimpl_int_rshift(a: i64, b: i64) -> i64 {
-    a >> (b & 63)
+    check_shift_count(b);
+    a >> (b as u32)
 }
 
-/// blackhole.py `bhimpl_int_lshift(a, b): return intmask(a << b)`.
+/// blackhole.py `bhimpl_int_lshift(a, b): check_shift_count(b); return intmask(a << b)`.
 fn bhimpl_int_lshift(a: i64, b: i64) -> i64 {
-    a.wrapping_shl((b & 63) as u32)
+    check_shift_count(b);
+    a.wrapping_shl(b as u32)
 }
 
-/// blackhole.py `bhimpl_uint_rshift(a, b): return intmask(r_uint(a) >> r_uint(b))`.
+/// blackhole.py `bhimpl_uint_rshift(a, b): check_shift_count(b); return
+/// intmask(r_uint(a) >> r_uint(b))`.
 fn bhimpl_uint_rshift(a: i64, b: i64) -> i64 {
-    ((a as u64) >> ((b as u64) & 63)) as i64
+    check_shift_count(b);
+    ((a as u64) >> (b as u32)) as i64
 }
 
 /// blackhole.py `bhimpl_int_neg(a): return intmask(-a)`.
@@ -6011,7 +6063,18 @@ fn bhimpl_convert_longlong_bytes_to_float(a: i64) -> f64 {
 }
 
 /// blackhole.py `bhimpl_cast_float_to_int(a): return int(int(a))`.
+///
+/// The outer `int()` deliberately makes the untranslated implementation fail
+/// when the truncated result is not a machine Signed value.  Rust's `as i64`
+/// instead saturates non-finite and out-of-range inputs, silently inventing a
+/// result PyPy never returns from this source-level helper.  Keep the valid
+/// domain explicit before applying the identical truncation-toward-zero cast.
 fn bhimpl_cast_float_to_int(a: f64) -> i64 {
+    const SIGNED_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
+    assert!(
+        a.is_finite() && a >= (i64::MIN as f64) && a < SIGNED_UPPER_EXCLUSIVE,
+        "bhimpl_cast_float_to_int: {a:?} is outside the Signed range",
+    );
     a as i64
 }
 
@@ -6078,15 +6141,16 @@ fn handler_abort_marker(
     Err(DispatchError::LeaveFrame)
 }
 
-/// Handler for pyre-only `abort/>i` — a no-op result marker emitted by
-/// `Assembler::encode_op`'s default branch for `OpKind::Abort { .. }`.
-/// The bytecode layout has no args and a single destination register byte.
+/// Handler for pyre-only `abort/>i`, emitted when the unsupported operation
+/// still owns an SSA result.  The trailing destination byte does not make the
+/// abort recoverable: continuing would expose the destination's stale value.
+/// Match [`handler_abort_marker`] and leave the frame immediately.
 fn handler_abort_result_marker_i(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(position + 1)
+    handler_abort_marker(bh, code, position)
 }
 
 /// Register-slot layout for state-field JIT blackhole resume.
@@ -6460,16 +6524,14 @@ fn handler_abort_permanent(
     Ok(bh.position)
 }
 
-/// Handler for pyre-only `abort/>r` — counterpart of
-/// `abort/>i` with a Ref-classified result register.  Emerges when
-/// pyre's rtyper routes an untranslatable op's result through the
-/// Abort→GcRef fallback (`rtyper.rs::infer_concrete_from_op`).
+/// Handler for pyre-only `abort/>r` — the Ref-result counterpart of
+/// [`handler_abort_result_marker_i`].
 fn handler_abort_result_marker_r(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
     position: usize,
 ) -> Result<usize, DispatchError> {
-    Ok(position + 1)
+    handler_abort_marker(bh, code, position)
 }
 bhhandler_ii_i!(handler_int_mul, bhimpl_int_mul);
 // `int_floordiv` / `int_mod` are NOT registered as bytecode handlers:
@@ -7615,7 +7677,7 @@ fn handler_getfield_gc_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
@@ -7627,7 +7689,7 @@ fn handler_getfield_gc_i_intbase(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_i(struct_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
@@ -7639,7 +7701,7 @@ fn handler_getfield_gc_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
     bh.registers_r[code[pos] as usize] = result.0 as i64;
     Ok(pos + 1)
@@ -7651,7 +7713,7 @@ fn handler_getfield_gc_r_intbase(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_r(struct_ptr, descr);
     bh.registers_r[code[pos] as usize] = result.0 as i64;
     Ok(pos + 1)
@@ -7663,7 +7725,7 @@ fn handler_getfield_gc_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
     bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
     Ok(pos + 1)
@@ -7675,7 +7737,7 @@ fn handler_getfield_gc_f_intbase(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_getfield_gc_f(struct_ptr, descr);
     bh.registers_f[code[pos] as usize] = result.to_bits() as i64;
     Ok(pos + 1)
@@ -7690,7 +7752,7 @@ fn handler_setfield_gc_i(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7706,7 +7768,7 @@ fn handler_setfield_gc_i_c(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = code[position + 1] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7718,7 +7780,7 @@ fn handler_setfield_gc_i_intbase(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7730,7 +7792,7 @@ fn handler_setfield_gc_r(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7742,7 +7804,7 @@ fn handler_setfield_gc_r_intbase(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_r[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7754,7 +7816,7 @@ fn handler_setfield_gc_f(
     let struct_ptr = bh.registers_r[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7767,7 +7829,7 @@ fn handler_arraylen_gc(
 ) -> Result<usize, DispatchError> {
     let array_ptr = bh.registers_r[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_arraylen_gc(array_ptr, descr);
     bh.registers_i[code[pos] as usize] = result;
     Ok(pos + 1)
@@ -7784,7 +7846,7 @@ fn handler_getarrayitem_gc_i(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
     Ok(pos + 1)
 }
@@ -7796,7 +7858,7 @@ fn handler_getarrayitem_gc_i_intbase(
     let array = bh.registers_i[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getarrayitem_gc_i(array, index, descr);
     Ok(pos + 1)
 }
@@ -7808,7 +7870,7 @@ fn handler_getarrayitem_gc_r(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_getarrayitem_gc_r(array, index, descr).0 as i64;
     Ok(pos + 1)
 }
@@ -7825,7 +7887,7 @@ fn handler_setarrayitem_gc_i(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_i(array, index, value, descr);
     Ok(pos)
 }
@@ -7838,7 +7900,7 @@ fn handler_setarrayitem_gc_r(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_r[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7856,7 +7918,7 @@ fn handler_setarrayitem_gc_r_c(
     let index = code[position + 1] as i8 as i64;
     let value = bh.registers_r[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(pos)
 }
@@ -7876,7 +7938,7 @@ fn handler_setarrayitem_gc_i_c(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = code[position + 2] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_i(array, index, value, descr);
     Ok(pos)
 }
@@ -7889,7 +7951,7 @@ fn handler_getfield_raw_i(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize]; // raw ptr is int
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getfield_raw_i(struct_ptr, descr);
     Ok(pos + 1)
 }
@@ -7900,7 +7962,7 @@ fn handler_getfield_raw_f(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[pos] as usize] = cpu.bh_getfield_raw_f(struct_ptr, descr).to_bits() as i64;
     Ok(pos + 1)
 }
@@ -7914,7 +7976,7 @@ fn handler_setfield_raw_i(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_raw_i(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7926,7 +7988,7 @@ fn handler_setfield_raw_f(
     let struct_ptr = bh.registers_i[code[position] as usize];
     let value = f64::from_bits(bh.registers_f[code[position + 1] as usize] as u64);
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_raw_f(struct_ptr, value, descr);
     Ok(pos)
 }
@@ -7942,7 +8004,7 @@ fn handler_new(
 ) -> Result<usize, DispatchError> {
     // @arguments("cpu", "d", returns="r")
     let (descr, pos) = read_descr(bh, code, position);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new(descr);
     Ok(pos + 1)
 }
@@ -7952,7 +8014,7 @@ fn handler_new_with_vtable(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let (descr, pos) = read_descr(bh, code, position);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_with_vtable(descr);
     Ok(pos + 1)
 }
@@ -7964,7 +8026,7 @@ fn handler_new_array(
     // @arguments("cpu", "i", "d", returns="r")
     let length = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_array(length, descr);
     Ok(pos + 1)
 }
@@ -7975,7 +8037,7 @@ fn handler_new_array_clear(
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
     Ok(pos + 1)
 }
@@ -7989,7 +8051,7 @@ fn handler_new_array_clear_c(
 ) -> Result<usize, DispatchError> {
     let length = code[position] as i8 as i64;
     let (descr, pos) = read_descr(bh, code, position + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[pos] as usize] = cpu.bh_new_array_clear(length, descr);
     Ok(pos + 1)
 }
@@ -8001,7 +8063,7 @@ fn handler_strlen(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 1] as usize] = cpu.bh_strlen(s);
     Ok(position + 2)
 }
@@ -8012,7 +8074,7 @@ fn handler_strgetitem(
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 2] as usize] = cpu.bh_strgetitem(s, index);
     Ok(position + 3)
 }
@@ -8024,7 +8086,7 @@ fn handler_strsetitem(
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_strsetitem(s, index, value);
     Ok(position + 3)
 }
@@ -8034,7 +8096,7 @@ fn handler_newstr(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[position + 1] as usize] = cpu.bh_newstr(length);
     Ok(position + 2)
 }
@@ -8044,7 +8106,7 @@ fn handler_unicodelen(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 1] as usize] = cpu.bh_unicodelen(s);
     Ok(position + 2)
 }
@@ -8055,7 +8117,7 @@ fn handler_unicodegetitem(
 ) -> Result<usize, DispatchError> {
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[position + 2] as usize] = cpu.bh_unicodegetitem(s, index);
     Ok(position + 3)
 }
@@ -8067,7 +8129,7 @@ fn handler_unicodesetitem(
     let s = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_unicodesetitem(s, index, value);
     Ok(position + 3)
 }
@@ -8077,7 +8139,7 @@ fn handler_newunicode(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let length = bh.registers_i[code[position] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[position + 1] as usize] = cpu.bh_newunicode(length);
     Ok(position + 2)
 }
@@ -8120,7 +8182,7 @@ fn handler_getinteriorfield_gc_i(
     let array = bh.registers_r[code[position] as usize];
     let index = bh.registers_i[code[position + 1] as usize];
     let (descr, pos) = read_descr(bh, code, position + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[pos] as usize] = cpu.bh_getinteriorfield_gc_i(array, index, descr);
     Ok(pos + 1)
 }
@@ -8133,7 +8195,7 @@ fn handler_setinteriorfield_gc_i(
     let index = bh.registers_i[code[position + 1] as usize];
     let value = bh.registers_i[code[position + 2] as usize];
     let (descr, pos) = read_descr(bh, code, position + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setinteriorfield_gc_i(array, index, value, descr);
     Ok(pos)
 }
@@ -8210,17 +8272,14 @@ fn check_residual_call_exception_after(
     })
 }
 
-/// Refuse to jump to a `residual_call_*` funcptr that is a
-/// `symbolic_fnaddr_for_path` hash (see `is_symbolic_fnaddr`).
+/// Refuse to jump to a `residual_call_*` funcptr that is either null or a
+/// `symbolic_fnaddr_for_path` hash (see [`is_callable_fnaddr`]).
 ///
 /// `bh_call_*` takes the funcptr straight to an indirect branch, so a hash
 /// there is a wild call. The walker's residual path already declines this exact
 /// case (`ResidualDecline::Symbolic`); the blackhole has no decline channel, so
 /// it aborts the frame, which hands the continuation back to the interpreter.
 ///
-/// `func == 0` is deliberately *not* rejected: the backends' `bh_call_*` treat
-/// it as a no-op returning `0`/null, a convention pyre relies on for host calls
-/// left unbound on purpose.
 #[inline]
 /// Refuse a register write that would land in the constant table.
 ///
@@ -8240,12 +8299,12 @@ fn debug_assert_constant_slot_untouched(index: usize, num_regs: usize, who: &str
     }
 }
 
-fn reject_symbolic_residual_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
+fn reject_unresolved_call(bh: &mut BlackholeInterpreter, func: i64) -> DispatchError {
     if crate::majit_log_enabled() {
         eprintln!(
-            "[bh] residual_call declined: funcptr {func:#x} is a symbolic path hash, not a code \
-             address; register the callee's path in the host's fnaddr bindings (jitcode {:?} pos \
-             {} last {})",
+            "[bh] residual_call declined: funcptr {func:#x} is not a callable code address; \
+             register the callee's path in the host's fnaddr bindings (jitcode {:?} pos {} last \
+             {})",
             bh.jitcode.name, bh.position, bh.last_opcode_position,
         );
     }
@@ -8284,8 +8343,8 @@ fn handler_residual_call_irf_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8307,8 +8366,8 @@ fn handler_residual_call_irf_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8330,8 +8389,8 @@ fn handler_residual_call_irf_f(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8353,8 +8412,8 @@ fn handler_residual_call_irf_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8376,8 +8435,8 @@ fn handler_residual_call_ir_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8398,8 +8457,8 @@ fn handler_residual_call_ir_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8420,8 +8479,8 @@ fn handler_residual_call_ir_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ai, p) = read_list_i(bh, code, position + 1);
     let (ar, p) = read_list_r(bh, code, p);
@@ -8441,8 +8500,8 @@ fn handler_residual_call_r_i(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -8462,8 +8521,8 @@ fn handler_residual_call_r_r(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -8483,8 +8542,8 @@ fn handler_residual_call_r_v(
     position: usize,
 ) -> Result<usize, DispatchError> {
     let func = bh.registers_i[code[position] as usize];
-    if is_symbolic_fnaddr(func) {
-        return Err(reject_symbolic_residual_call(bh, func));
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
     }
     let (ar, p) = read_list_r(bh, code, position + 1);
     let (calldescr, p) = read_descr(bh, code, p);
@@ -8501,67 +8560,6 @@ fn handler_residual_call_r_v(
 // RPython argcode contract (1-byte register operands per
 // `blackhole.py:107`).  All `*_u16_ext` width adapters have been
 // retired; canonical `handler_*` decoders own every dispatch slot.
-
-/// Per-thread Backend instance backing every `bh.cpu` call.
-///
-/// TODO: RPython `blackhole.py:55-56,286` reads
-/// `self.cpu = builder.cpu`, where `builder.cpu` is the metainterp-shared
-/// AbstractCPU subclass (`LLOpHelpers` in tests, real native cpu in
-/// production).  The cpu's `bh_getfield_gc_*` etc. methods are stateless
-/// thin wrappers around `lltype.cast_*` / pointer arithmetic in RPython.
-///
-/// pyre's `MetaInterp::backend` is per-instance (not `'static`) and
-/// owns trace-compilation state (descr registries, etc.) that would be
-/// inappropriate to share with the blackhole `bh.cpu` field.  We leak ONE
-/// `BackendImpl` instance per thread instead, so `bh.cpu` is a *different*
-/// object from the one the metainterp that recorded the trace holds.
-///
-/// ## The invariant that makes the split observationally inert
-///
-/// Every `Backend` method this field reaches must be a pure function of
-/// its arguments — `&self` may not be read.  The full reachable surface is
-/// `bh_getfield_gc_{i,r,f}`, `bh_setfield_gc_{i,r,f}`,
-/// `bh_getarrayitem_gc_{i,r,f}`, `bh_arraylen_gc`, `bh_new`,
-/// `bh_new_with_vtable`, `bh_new_array{,_clear}`, `bh_call_{i,r,f,v}`, and
-/// `clear_stored_exception`.  On dynasm each is descr-supplied offsets fed
-/// to `read_int_at_mem` / `write_int_at_mem` (`runner.rs`) or a
-/// free function (`jit_exc_clear`, `call_stub::bh_call_*_dispatch`); none
-/// touches `&self`.  A method added to that list that *does* read backend
-/// state would make the blackhole observe a fresh, empty `BackendImpl`
-/// where the metainterp observes the populated one, and nothing here would
-/// catch it.
-///
-/// Convergence path: align with RPython's `builder.cpu` invariant by
-/// passing the metainterp-owned `BackendImpl` to `BlackholeInterpBuilder`
-/// at construction (likely as `Arc<dyn Backend>` since
-/// `BH_BUILDER3` outlives any single MetaInterp invocation).  Open
-/// architectural item; not in scope here because the change cascades
-/// through the Backend trait's `Send + Sync` bound and every callsite
-/// that holds `&'static dyn Backend` today.
-// Exactly the condition under which `BackendImpl` resolves: cranelift or
-// dynasm off wasm32, and unconditionally on wasm32, where it is
-// `WasmBackend`. A narrower gate here leaves `bh.cpu` unset on wasm and
-// every vable handler trips `expect("cpu not set")`.
-#[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
-pub fn production_cpu() -> &'static dyn majit_backend::Backend {
-    // Per-thread leak: `BackendImpl` is not `Sync`, so we keep one
-    // instance per thread.  Mirrors `BH_BUILDER3` (`call_jit.rs`)
-    // which is itself a `thread_local!` — production blackhole resume
-    // already runs on the same thread that owns the trace's metainterp.
-    thread_local! {
-        static CPU: std::cell::Cell<Option<&'static dyn majit_backend::Backend>> =
-            const { std::cell::Cell::new(None) };
-    }
-    CPU.with(|cell| {
-        if let Some(cpu) = cell.get() {
-            return cpu;
-        }
-        let backend: Box<dyn majit_backend::Backend> = Box::new(crate::pyjitpl::BackendImpl::new());
-        let leaked: &'static dyn majit_backend::Backend = Box::leak(backend);
-        cell.set(Some(leaked));
-        leaked
-    })
-}
 
 /// Build a strict `BlackholeInterpBuilder` for pyre's blackhole resume path.
 ///
@@ -8594,17 +8592,6 @@ pub fn production_cpu() -> &'static dyn majit_backend::Backend {
 /// that this minimal install side-steps.
 pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
     let mut builder = BlackholeInterpBuilder::new();
-    // Wire the blackhole cpu BEFORE the vable canonical routing.
-    // RPython `blackhole.py:286 self.cpu = builder.cpu` parity — the
-    // production builder must carry a non-None cpu so canonical handlers
-    // like `handler_getfield_vable_r` don't trip
-    // `bh.cpu.expect("cpu not set")` once their setup_insns entries land.
-    // The leaked instance services only stateless GC reads;
-    // the residual_call (`bh_call_*`) prereq audit is pending.
-    #[cfg(any(target_arch = "wasm32", feature = "dynasm", feature = "cranelift"))]
-    {
-        builder.cpu = Some(production_cpu());
-    }
     let mut insns: indexmap::IndexMap<String, u8> = indexmap::IndexMap::new();
     insns.insert(
         "inline_call_nested_ext/P".to_string(),
@@ -9807,7 +9794,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("uint_mul_high/ii>i", handler_uint_mul_high);
     builder.wire_handler("int_between/iii>i", handler_int_between);
 
-    // String hashing (stubs)
+    // String hashing
     builder.wire_handler("strhash/r>i", handler_strhash);
     builder.wire_handler("unicodehash/r>i", handler_unicodehash);
 
@@ -9972,7 +9959,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("getarrayitem_vable_f/ridd>f", handler_getarrayitem_vable_f);
     builder.wire_handler("setarrayitem_vable_f/rifdd", handler_setarrayitem_vable_f);
 
-    // Inline call (stub — needs frame-chain)
+    // Inline call
     builder.wire_handler("inline_call_irf_i/dIRF>i", handler_inline_call_irf_i);
     builder.wire_handler("inline_call_irf_r/dIRF>r", handler_inline_call_irf_r);
     builder.wire_handler("inline_call_irf_f/dIRF>f", handler_inline_call_irf_f);
@@ -10016,7 +10003,7 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         handler_record_known_result_ref_ext,
     );
 
-    // Recursive call (stub — needs portal runner)
+    // Recursive call
     // RPython `rpython/jit/metainterp/blackhole.py:1101-1132`:
     //   @arguments("self", "i", "I", "R", "F", "I", "R", "F", returns="X")
     // canonical keys `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`. `recursive_call`
@@ -10109,7 +10096,8 @@ fn handler_strhash(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = 0;
+    let string = bh.registers_r[code[p] as usize];
+    bh.registers_i[code[p + 1] as usize] = bh.cpu().bh_strhash(string);
     Ok(p + 2)
 }
 fn handler_unicodehash(
@@ -10117,7 +10105,8 @@ fn handler_unicodehash(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    bh.registers_i[code[p + 1] as usize] = 0;
+    let string = bh.registers_r[code[p] as usize];
+    bh.registers_i[code[p + 1] as usize] = bh.cpu().bh_unicodehash(string);
     Ok(p + 2)
 }
 bhhandler_f_i!(
@@ -10153,7 +10142,7 @@ fn handler_guard_class(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let typeptr = cpu.bh_classof(bh.registers_r[code[p] as usize]);
     bh.registers_i[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
@@ -10266,9 +10255,8 @@ fn handler_copystrcontent(
     let srcstart = bh.registers_i[code[p + 2] as usize];
     let dststart = bh.registers_i[code[p + 3] as usize];
     let length = bh.registers_i[code[p + 4] as usize];
-    if let Some(cpu) = bh.cpu {
-        cpu.bh_copystrcontent(src, dst, srcstart, dststart, length);
-    }
+    bh.cpu()
+        .bh_copystrcontent(src, dst, srcstart, dststart, length);
     Ok(p + 5)
 }
 /// RPython `blackhole.py` `bhimpl_copyunicodecontent`.
@@ -10282,9 +10270,8 @@ fn handler_copyunicodecontent(
     let srcstart = bh.registers_i[code[p + 2] as usize];
     let dststart = bh.registers_i[code[p + 3] as usize];
     let length = bh.registers_i[code[p + 4] as usize];
-    if let Some(cpu) = bh.cpu {
-        cpu.bh_copyunicodecontent(src, dst, srcstart, dststart, length);
-    }
+    bh.cpu()
+        .bh_copyunicodecontent(src, dst, srcstart, dststart, length);
     Ok(p + 5)
 }
 fn handler_raise(
@@ -10311,6 +10298,10 @@ fn handler_reraise(
 ) -> Result<usize, DispatchError> {
     // `reraise/` decodes no operands, so `p` is already the end of the
     // instruction.
+    assert!(
+        bh.exception_last_value != 0,
+        "BlackholeInterpreter.bhimpl_reraise requires an active exception"
+    );
     Err(DispatchError::RaiseException {
         exc: bh.exception_last_value,
         resume_position: p,
@@ -10408,20 +10399,23 @@ fn handler_goto_if_exception_mismatch(
     }
 }
 fn handler_debug_fatalerror(
-    _bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    _p: usize,
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
 ) -> Result<usize, DispatchError> {
-    panic!("bhimpl_debug_fatalerror");
+    let string = bh.registers_r[code[p] as usize];
+    let length = bh.cpu().bh_strlen(string);
+    let bytes: Vec<u8> = (0..length)
+        .map(|index| bh.cpu().bh_strgetitem(string, index) as u8)
+        .collect();
+    panic!("{}", String::from_utf8_lossy(&bytes));
 }
 /// blackhole.py `bhimpl_cast_ptr_to_int(a)`. The cast is identity
 /// (the tagging arithmetic lives at the erase site, never here); the
 /// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate.
-/// `debug_assert!` mirrors `ll_assert` — removed from the optimized
-/// build, and the cast op only enters a trace once tagging is live, so
-/// this is inert until enablement.
+/// `ll_assert` remains a translated runtime assertion.
 fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
-    debug_assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
+    assert!((a & 1) == 1, "bhimpl_cast_ptr_to_int: not an odd int");
     a
 }
 
@@ -10429,7 +10423,7 @@ fn bhimpl_cast_ptr_to_int(a: i64) -> i64 {
 /// `ll_assert((i & 1) == 1)` checks the operand is a tagged immediate
 /// before it is reinterpreted as a `GCREF`.
 fn bhimpl_cast_int_to_ptr(i: i64) -> i64 {
-    debug_assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
+    assert!((i & 1) == 1, "bhimpl_cast_int_to_ptr: not an odd int");
     i
 }
 
@@ -10469,7 +10463,7 @@ fn handler_getfield_vable_i(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
 }
@@ -10484,7 +10478,7 @@ fn handler_getfield_vable_i_intbase(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_getfield_gc_i(struct_ptr, &descr);
     Ok(p + 1)
 }
@@ -10499,7 +10493,7 @@ fn handler_getfield_vable_r(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_gc_r(struct_ptr, &descr).0 as i64;
     Ok(p + 1)
 }
@@ -10514,7 +10508,7 @@ fn handler_getfield_vable_f(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_getfield_gc_f(struct_ptr, &descr).to_bits() as i64;
     Ok(p + 1)
 }
@@ -10531,7 +10525,7 @@ fn handler_setfield_vable_i(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
 }
@@ -10547,7 +10541,7 @@ fn handler_setfield_vable_i_intbase(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_i(struct_ptr, value, &descr);
     Ok(p)
 }
@@ -10563,7 +10557,7 @@ fn handler_setfield_vable_r(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
     Ok(p)
 }
@@ -10579,7 +10573,7 @@ fn handler_setfield_vable_r_intbase(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_r(struct_ptr, majit_ir::GcRef(value as usize), &descr);
     Ok(p)
 }
@@ -10595,7 +10589,7 @@ fn handler_setfield_vable_f(
         unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, struct_ptr as *mut u8) };
     }
     let (descr, p) = read_descr_vable_field(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setfield_gc_f(struct_ptr, value, &descr);
     Ok(p)
 }
@@ -10786,13 +10780,10 @@ fn handler_getarrayitem_raw_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[p] as usize] as usize; // raw ptr
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let array = bh.registers_i[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let item_size = descr.as_offset();
-    let offset = index * item_size.max(1);
-    let value = unsafe { *((array + offset) as *const i64) };
-    bh.registers_i[code[p] as usize] = value;
+    bh.registers_i[code[p] as usize] = bh.cpu().bh_getarrayitem_raw_i(array, index, descr);
     Ok(p + 1)
 }
 /// RPython `blackhole.py` `bhimpl_setarrayitem_raw_i`.
@@ -10801,13 +10792,11 @@ fn handler_setarrayitem_raw_i(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
-    let array = bh.registers_i[code[p] as usize] as usize;
-    let index = bh.registers_i[code[p + 1] as usize] as usize;
+    let array = bh.registers_i[code[p] as usize];
+    let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_i[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
-    let item_size = descr.as_offset();
-    let offset = index * item_size.max(1);
-    unsafe { *((array + offset) as *mut i64) = value };
+    bh.cpu().bh_setarrayitem_raw_i(array, index, value, descr);
     Ok(p)
 }
 
@@ -10824,9 +10813,13 @@ fn handler_conditional_call_ir_v(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if condition != 0 {
-        bh.cpu
-            .expect("cpu")
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
+        BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
+        bh.cpu()
             .bh_call_v(func, Some(&ai), Some(&ar), None, &calldescr);
+        check_residual_call_exception_after(bh, p)?;
     }
     Ok(p)
 }
@@ -10842,10 +10835,14 @@ fn handler_conditional_call_value_ir_i(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
+        BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
-            .cpu
-            .expect("cpu")
+            .cpu()
             .bh_call_i(func, Some(&ai), Some(&ar), None, &calldescr);
+        check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_i[code[p] as usize] = value;
     Ok(p + 1)
@@ -10862,11 +10859,15 @@ fn handler_conditional_call_value_ir_r(
     let (calldescr, p) = read_descr(bh, code, p);
     let calldescr = calldescr.as_calldescr().clone();
     if value == 0 {
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
+        BH_LAST_EXC_VALUE.with(|cell| cell.set(0));
         value = bh
-            .cpu
-            .expect("cpu")
+            .cpu()
             .bh_call_r(func, Some(&ai), Some(&ar), None, &calldescr)
             .0 as i64;
+        check_residual_call_exception_after(bh, p + 1)?;
     }
     bh.registers_r[code[p] as usize] = value;
     Ok(p + 1)
@@ -10882,7 +10883,7 @@ fn handler_getlistitem_gc_i(
     let index = bh.registers_i[code[p + 1] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     bh.registers_i[code[p] as usize] = cpu.bh_getarrayitem_gc_i(items, index, array_descr);
     Ok(p + 1)
@@ -10896,7 +10897,7 @@ fn handler_getlistitem_gc_r(
     let index = bh.registers_i[code[p + 1] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     bh.registers_r[code[p] as usize] = cpu.bh_getarrayitem_gc_r(items, index, array_descr).0 as i64;
     Ok(p + 1)
@@ -10911,7 +10912,7 @@ fn handler_setlistitem_gc_i(
     let value = bh.registers_i[code[p + 2] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     cpu.bh_setarrayitem_gc_i(items, index, value, array_descr);
     Ok(p)
@@ -10926,7 +10927,7 @@ fn handler_setlistitem_gc_r(
     let value = bh.registers_r[code[p + 2] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     cpu.bh_setarrayitem_gc_r(items, index, majit_ir::GcRef(value as usize), array_descr);
     Ok(p)
@@ -10970,7 +10971,7 @@ fn handler_check_neg_index(
     let mut index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     if index < 0 {
-        let cpu = bh.cpu.expect("cpu not set");
+        let cpu = bh.cpu();
         index += cpu.bh_arraylen_gc(array, descr);
     }
     bh.registers_i[code[p] as usize] = index;
@@ -10985,7 +10986,7 @@ fn handler_check_resizable_neg_index(
     let mut index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     if index < 0 {
-        let cpu = bh.cpu.expect("cpu not set");
+        let cpu = bh.cpu();
         index += cpu.bh_getfield_gc_i(lst, descr);
     }
     bh.registers_i[code[p] as usize] = index;
@@ -11002,7 +11003,7 @@ fn handler_getarrayitem_gc_f(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] =
         cpu.bh_getarrayitem_gc_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
@@ -11017,7 +11018,7 @@ fn handler_setarrayitem_gc_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_gc_f(array, index, value, descr);
     Ok(p)
 }
@@ -11030,7 +11031,7 @@ fn handler_getarrayitem_raw_f(
     let array = bh.registers_i[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] =
         cpu.bh_getarrayitem_raw_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
@@ -11045,7 +11046,7 @@ fn handler_setarrayitem_raw_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setarrayitem_raw_f(array, index, value, descr);
     Ok(p)
 }
@@ -11057,7 +11058,7 @@ fn handler_getfield_raw_r(
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_i[code[p] as usize];
     let (descr, p) = read_descr(bh, code, p + 1);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getfield_raw_r(struct_ptr, descr).0 as i64;
     Ok(p + 1)
 }
@@ -11072,7 +11073,7 @@ fn handler_getinteriorfield_gc_f(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] =
         cpu.bh_getinteriorfield_gc_f(array, index, descr).to_bits() as i64;
     Ok(p + 1)
@@ -11085,7 +11086,7 @@ fn handler_getinteriorfield_gc_r(
     let array = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_r[code[p] as usize] = cpu.bh_getinteriorfield_gc_r(array, index, descr).0 as i64;
     Ok(p + 1)
 }
@@ -11098,7 +11099,7 @@ fn handler_setinteriorfield_gc_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setinteriorfield_gc_f(array, index, value, descr);
     Ok(p)
 }
@@ -11111,7 +11112,7 @@ fn handler_setinteriorfield_gc_r(
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_setinteriorfield_gc_r(array, index, majit_ir::GcRef(value as usize), descr);
     Ok(p)
 }
@@ -11126,7 +11127,7 @@ fn handler_gc_load_indexed_i(
     let scale = bh.registers_i[code[p + 2] as usize];
     let base_ofs = bh.registers_i[code[p + 3] as usize];
     let bytes = bh.registers_i[code[p + 4] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p + 5] as usize] =
         cpu.bh_gc_load_indexed_i(addr, index, scale, base_ofs, bytes);
     Ok(p + 6)
@@ -11141,7 +11142,7 @@ fn handler_gc_load_indexed_f(
     let scale = bh.registers_i[code[p + 2] as usize];
     let base_ofs = bh.registers_i[code[p + 3] as usize];
     let bytes = bh.registers_i[code[p + 4] as usize];
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p + 5] as usize] = cpu
         .bh_gc_load_indexed_f(addr, index, scale, base_ofs, bytes)
         .to_bits() as i64;
@@ -11160,9 +11161,9 @@ fn handler_gc_store_indexed_i(
     let scale = bh.registers_i[code[p + 3] as usize];
     let base_ofs = bh.registers_i[code[p + 4] as usize];
     let bytes = bh.registers_i[code[p + 5] as usize];
-    let (_, p) = read_descr(bh, code, p + 6);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_gc_store_indexed_i(addr, index, value, scale, base_ofs, bytes);
+    let (descr, p) = read_descr(bh, code, p + 6);
+    let cpu = bh.cpu();
+    cpu.bh_gc_store_indexed_i(addr, index, value, scale, base_ofs, bytes, descr);
     Ok(p)
 }
 // blackhole.py bhimpl_gc_store_indexed_f
@@ -11178,9 +11179,9 @@ fn handler_gc_store_indexed_f(
     let scale = bh.registers_i[code[p + 3] as usize];
     let base_ofs = bh.registers_i[code[p + 4] as usize];
     let bytes = bh.registers_i[code[p + 5] as usize];
-    let (_, p) = read_descr(bh, code, p + 6);
-    let cpu = bh.cpu.expect("cpu not set");
-    cpu.bh_gc_store_indexed_f(addr, index, value, scale, base_ofs, bytes);
+    let (descr, p) = read_descr(bh, code, p + 6);
+    let cpu = bh.cpu();
+    cpu.bh_gc_store_indexed_f(addr, index, value, scale, base_ofs, bytes, descr);
     Ok(p)
 }
 // blackhole.py bhimpl_raw_store_i/f
@@ -11195,7 +11196,7 @@ fn handler_raw_store_i(
     let value = bh.registers_i[code[p + 2] as usize];
     let (descr, p) = read_descr(bh, code, p + 3);
     // blackhole.py:1505-1506: cpu.bh_raw_store_i(addr, offset, newvalue, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_raw_store_i(addr, offset, value, descr);
     Ok(p)
 }
@@ -11210,7 +11211,7 @@ fn handler_raw_store_f(
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (descr, p) = read_descr(bh, code, p + 3);
     // blackhole.py:1510-1511: cpu.bh_raw_store_f(addr, offset, newvalue, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     cpu.bh_raw_store_f(addr, offset, value, descr);
     Ok(p)
 }
@@ -11223,7 +11224,7 @@ fn handler_raw_load_i(
     let offset = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     // blackhole.py:1500-1501: cpu.bh_raw_load_i(addr, offset, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_i[code[p] as usize] = cpu.bh_raw_load_i(addr, offset, descr);
     Ok(p + 1)
 }
@@ -11236,7 +11237,7 @@ fn handler_raw_load_f(
     let offset = bh.registers_i[code[p + 1] as usize];
     let (descr, p) = read_descr(bh, code, p + 2);
     // blackhole.py:1503-1504: cpu.bh_raw_load_f(addr, offset, arraydescr)
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     bh.registers_f[code[p] as usize] = cpu.bh_raw_load_f(addr, offset, descr).to_bits() as i64;
     Ok(p + 1)
 }
@@ -11253,7 +11254,7 @@ fn handler_newlist(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     // blackhole.py:1163: result = cpu.bh_new(structdescr)
     let result = cpu.bh_new(structdescr);
     // blackhole.py:1164: cpu.bh_setfield_gc_i(result, length, lengthdescr)
@@ -11280,7 +11281,7 @@ fn handler_newlist_clear(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_new(structdescr);
     cpu.bh_setfield_gc_i(result, length, lengthdescr);
     // blackhole.py:1178: items = cpu.bh_new_array_clear(length, arraydescr)
@@ -11300,7 +11301,7 @@ fn handler_newlist_hint(
     let (lengthdescr, p) = read_descr(bh, code, p);
     let (itemsdescr, p) = read_descr(bh, code, p);
     let (arraydescr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let result = cpu.bh_new(structdescr);
     // blackhole.py:1186: cpu.bh_setfield_gc_i(result, 0, lengthdescr)
     cpu.bh_setfield_gc_i(result, 0, lengthdescr);
@@ -11365,7 +11366,7 @@ fn handler_getlistitem_gc_f(
     let index = bh.registers_i[code[p + 1] as usize];
     let (items_descr, p) = read_descr(bh, code, p + 2);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     bh.registers_f[code[p] as usize] = cpu
         .bh_getarrayitem_gc_f(items, index, array_descr)
@@ -11383,7 +11384,7 @@ fn handler_setlistitem_gc_f(
     let value = f64::from_bits(bh.registers_f[code[p + 2] as usize] as u64);
     let (items_descr, p) = read_descr(bh, code, p + 3);
     let (array_descr, p) = read_descr(bh, code, p);
-    let cpu = bh.cpu.expect("cpu not set");
+    let cpu = bh.cpu();
     let items = cpu.bh_getfield_gc_r(lst, items_descr).0 as i64;
     cpu.bh_setarrayitem_gc_f(items, index, value, array_descr);
     Ok(p)
@@ -11464,11 +11465,9 @@ pub(crate) fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
 /// Whether a jitcode's `fnaddr` can be called as a function pointer.
 ///
 /// Stricter than `!is_symbolic_fnaddr`: `0` is upstream's own "no address"
-/// spelling (`jitcode.py JitCode.__init__ fnaddr=None`) and must not be called either. The
-/// `func == 0` arm of the backends' `bh_call_*` returns `0`/null instead, which
-/// is a fine no-op convention for a `residual_call` whose funcptr the host
-/// deliberately left unbound, but for an `inline_call` it would fabricate a
-/// return value for a callee that never ran.
+/// spelling (`jitcode.py JitCode.__init__ fnaddr=None`) and must not be called
+/// either.  Both residual and inline calls decline it before reaching a
+/// backend; otherwise a callee that never ran could fabricate a return value.
 #[inline]
 pub(crate) fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
@@ -11711,6 +11710,10 @@ fn handler_call_assembler_int_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = call_int_function(target.concrete_ptr, &args);
     check_residual_call_exception_after(bh, p)?;
@@ -11734,6 +11737,10 @@ fn handler_call_assembler_ref_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     // RPython `blackhole.py bhimpl_residual_call_irf_r` →
     // `cpu.bh_call_r(...)`; pyre's ref ABI uses the same i64 carrier
@@ -11771,6 +11778,10 @@ fn handler_call_assembler_float_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     let result = call_int_function(target.concrete_ptr, &args);
     check_residual_call_exception_after(bh, p)?;
@@ -11793,6 +11804,10 @@ fn handler_call_assembler_void_ext(
         args.push(bh.read_call_arg(kind, reg as u16));
     }
     let target = bh.jitcode.call_target(fn_ptr_idx);
+    let func = target.concrete_ptr as usize as i64;
+    if !is_callable_fnaddr(func) {
+        return Err(reject_unresolved_call(bh, func));
+    }
     BH_LAST_EXC_VALUE.with(|c| c.set(0));
     call_void_function(target.concrete_ptr, &args);
     check_residual_call_exception_after(bh, p)?;
@@ -11848,6 +11863,10 @@ fn handler_cond_call_void_ext(
     let (args, p_end) = read_cond_call_args(bh, code, p, arg_count);
     if condition != 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
+        let func = target.concrete_ptr as usize as i64;
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         call_void_function(target.concrete_ptr, &args);
         check_residual_call_exception_after(bh, p_end)?;
@@ -11869,6 +11888,10 @@ fn handler_cond_call_value_int_ext(
     let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
+        let func = target.concrete_ptr as usize as i64;
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         let r = call_int_function(target.concrete_ptr, &args);
         check_residual_call_exception_after(bh, p_end + 1)?;
@@ -11894,6 +11917,10 @@ fn handler_cond_call_value_ref_ext(
     let dst = code[p_end] as usize;
     let result = if value == 0 {
         let target = bh.jitcode.call_target(fn_ptr_idx);
+        let func = target.concrete_ptr as usize as i64;
+        if !is_callable_fnaddr(func) {
+            return Err(reject_unresolved_call(bh, func));
+        }
         BH_LAST_EXC_VALUE.with(|c| c.set(0));
         // RPython `blackhole.py bhimpl_conditional_call_value_ir_r`
         // → `cpu.bh_call_r(...)` (ref ABI).  See note on
@@ -12226,7 +12253,7 @@ fn decode_return_slot_at(code: &[u8], cursor: &mut usize) -> Option<usize> {
     }
 }
 
-// recursive_call — stub (needs portal runner)
+// recursive_call
 /// RPython `blackhole.py` `get_portal_runner(jdindex)`:
 /// Returns (fnptr, calldescr) from jitdrivers_sd[jdindex].
 /// pyre: uses portal_runner_ptr directly (single jitdriver).

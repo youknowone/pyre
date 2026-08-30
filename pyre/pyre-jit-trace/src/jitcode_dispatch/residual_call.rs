@@ -2630,6 +2630,13 @@ pub(crate) fn try_fold_pure_call_via_executor<Sym: WalkSym>(
         Some(majit_ir::Value::Int(addr)) => addr,
         _ => return,
     };
+    // `jitcode.py::JitCode.__init__` uses NULL for "no address".  It is no
+    // more executable than an unpatched symbolic path hash; leave the call
+    // unfolded so the main residual-call gate can abort/decline it without
+    // jumping through address zero.
+    if func_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
+        return;
+    }
     // Cap at MAX_HOST_CALL_ARITY (`call_int_function` / `call_void_function`
     // panic on excess arity).  `allboxes.len() - 1` is the arg count
     // (funcbox doesn't pass through).
@@ -3052,7 +3059,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     clear_walk_exception(ctx);
 
     // Orthodox sub-jitcode walk safety (#171 wall-5d): a residual call whose
-    // funcbox is a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
+    // funcbox is NULL or a `symbolic_fnaddr` placeholder — a 64-bit `DefaultHasher`
     // hash of an in-body helper's `CallPath`/`CallTarget`, minted when
     // `jit_trace_fnaddrs()` has no entry for it (e.g. the zero-arg
     // `SyntheticTransparentCtor "Tuple"` unit constructor inside
@@ -3067,7 +3074,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     if ctx.fbw_mode.inline_subwalk
         && allboxes.first().is_some_and(|b| b.is_constant())
         && let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(allboxes[0])
-        && majit_translate::codewriter::call::is_symbolic_fnaddr(addr)
+        && (addr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(addr))
     {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
             pc: op_pc,
@@ -3155,7 +3162,8 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         Some(majit_ir::Value::Int(addr)) => addr,
         _ => return Ok(declined_symbolic(call_opcode)),
     };
-    // Safety gate — reject `symbolic_fnaddr_for_path`
+    // Safety gate — reject NULL (upstream's "no address" spelling in
+    // `jitcode.py::JitCode.__init__`) and `symbolic_fnaddr_for_path`
     // placeholder values that escaped runtime patching.  Pyre's
     // codewriter mints a 64-bit hash of the helper's `CallPath` when
     // the build-time `pyre_interpreter::jit_trace_fnaddrs()` snapshot
@@ -3168,7 +3176,7 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // high-16-bit tag no real funcptr can carry on any target (a bit-47
     // range test would misclassify every real funcptr on aarch64 Linux,
     // whose 48-bit VA maps code at 0xaaab…/0xffff…).
-    if majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
+    if func_ptr == 0 || majit_translate::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return Ok(declined_symbolic(call_opcode));
     }
     // A residual whose funcptr is a `PyFrame` operand-stack accessor

@@ -183,6 +183,7 @@ fn seed_deopt_vinfo_ptr(
 )]
 pub fn drive_single_frame_blackhole(
     miframe: &mut crate::pyjitpl::MIFrame,
+    cpu: &dyn majit_backend::Backend,
     state_field_layout: crate::blackhole::StateFieldLayout,
     virtualizable_info: *const crate::virtualizable::VirtualizableInfo,
     mut virtualizable_ptr: i64,
@@ -229,6 +230,7 @@ pub fn drive_single_frame_blackhole(
     }
 
     let mut builder = BackEdgeBhBuilder::lease();
+    builder.set_cpu(cpu);
     builder.setup_cached_control_opcodes(
         metainterp_sd.op_live,
         metainterp_sd.op_catch_exception,
@@ -2805,6 +2807,7 @@ impl<S: JitState> JitDriver<S> {
         }
 
         let mut bh_builder = BackEdgeBhBuilder::lease();
+        bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
         let staticdata = &self.meta.staticdata;
         let outcome = drive_multi_frame_blackhole(
             &mut bh_builder,
@@ -6410,6 +6413,7 @@ impl<S: JitState> JitDriver<S> {
                 // the values match the metainterp's actual byte
                 // assignments.
                 let mut bh_builder = BackEdgeBhBuilder::lease();
+                bh_builder.set_cpu(self.meta_interp().blackhole_cpu());
                 bh_builder.setup_cached_control_opcodes(
                     self.meta_interp().staticdata.op_live,
                     self.meta_interp().staticdata.op_catch_exception,
@@ -6459,7 +6463,8 @@ impl<S: JitState> JitDriver<S> {
                     None, // all_virtuals
                     allocator,
                 );
-                if let Some((mut bh, vable_ptr)) = bh {
+                let (mut bh, vable_ptr) = bh;
+                {
                     // Thread the state-field register layout onto every frame
                     // so the `state_field` handlers map a logical scalar/array
                     // index to the flat register slot the resume reader seeded.
@@ -6807,9 +6812,8 @@ impl<S: JitState> JitDriver<S> {
                 }
             }
 
-            // resume_in_blackhole could not build a frame (no guard storage, or
-            // `blackhole_from_resumedata` declined), or the chain raised an
-            // exception and `deliver_blackhole_exception` returned `None` (the
+            // The chain raised an exception and
+            // `deliver_blackhole_exception` returned `None` (the
             // interpreter has no exception machinery — unreachable for an
             // exception-less interpreter): fall back to crude state recovery and
             // resume the interpreter at the guard pc.
@@ -9375,6 +9379,28 @@ mod tests {
         );
         let hash = key.get_uhash();
         let mut driver = JitDriver::<TypedRestoreState>::new(1);
+        // `resume.py blackhole_from_resumedata` indexes
+        // `metainterp_sd.jitcodes[jitcode_pos]` unconditionally.  The guard
+        // snapshot below names jitcode 0, so give the fixture the same
+        // codewriter-owned registry a real translated portal always has.
+        // Returning the one restored int also lets the synthetic failing
+        // guard finish its reconstructed frame normally.
+        let mut resume_asm = majit_translate::codewriter::assembler::Assembler::new();
+        resume_asm.register_insn("live/", crate::jitcode::insns::BC_LIVE);
+        resume_asm.register_insn(
+            "catch_exception/L",
+            crate::jitcode::insns::BC_CATCH_EXCEPTION,
+        );
+        resume_asm.register_insn("rvmprof_code/ii", crate::jitcode::insns::BC_RVMPROF_CODE);
+        let mut resume_builder = crate::JitCodeBuilder::new();
+        resume_builder.live(&mut resume_asm, &[0], &[], &[]);
+        resume_builder.int_return(0);
+        let resume_jitcode = resume_builder.finish();
+        resume_jitcode.set_index(0);
+        driver.install_canonical_liveness(&resume_asm);
+        driver
+            .meta_interp_mut()
+            .install_jitcodes(vec![Arc::new(resume_jitcode)]);
         driver.meta.finish_setup_descrs_for_jitdrivers();
         let live = [Value::Int(1)];
         assert!(matches!(

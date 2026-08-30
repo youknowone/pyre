@@ -18180,6 +18180,13 @@ impl<M: Clone> MetaInterp<M> {
         &self.backend
     }
 
+    /// The same CPU object `BlackholeInterpBuilder.cpu` receives upstream.
+    /// This trait-object view avoids exposing the selected BackendImpl type
+    /// across crate boundaries while preserving object identity.
+    pub fn blackhole_cpu(&self) -> &dyn majit_backend::Backend {
+        &self.backend
+    }
+
     /// `cpu.asmmemmgr.get_stats()` used by
     /// `pypy/module/gc/referents.py:_get_stats`.
     pub fn assembler_memory_stats(&self) -> (usize, usize) {

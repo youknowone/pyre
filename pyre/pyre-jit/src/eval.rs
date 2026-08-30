@@ -7865,8 +7865,6 @@ fn drive_unpack_iterable_trace(
                 | crate::call_jit::BlackholeResult::DoneWithThisFrameFloat(_) => break,
                 // Clean bail: the frame already carries the stamped resume pc.
                 crate::call_jit::BlackholeResult::BailToInterpreter => break,
-                // Blackhole could not resume; leave the rest to `ln`.
-                crate::call_jit::BlackholeResult::Failed => break,
             }
         }
         if dbg {
@@ -11067,7 +11065,6 @@ fn blackhole_result_tag(r: &crate::call_jit::BlackholeResult) -> &'static str {
         R::DoneWithThisFrameFloat(_) => "DoneWithThisFrameFloat",
         R::ExitFrameWithExceptionRef(_) => "ExitFrameWithExceptionRef",
         R::BailToInterpreter => "BailToInterpreter",
-        R::Failed => "Failed",
     }
 }
 
@@ -11606,27 +11603,6 @@ fn execute_assembler(
                             Some(LoopResult::Done(Err(exc.clone())))
                         }
                         crate::call_jit::BlackholeResult::BailToInterpreter => None,
-                        crate::call_jit::BlackholeResult::Failed => {
-                            // RPython: blackhole resume never fails — rd_numb
-                            // is always complete (`blackhole.py:1679` raises
-                            // `ExitFrameWithExceptionRef` for uncaught
-                            // exceptions, never returns a failure code).
-                            // Pyre's `BlackholeResult::Failed` is a layered
-                            // adaptation; SSA-authoritative live_r encoder /
-                            // decoder work should eliminate the remaining
-                            // triggers. Until then
-                            // the bare `invalidate_loop` keeps the cell
-                            // retraceable; the failure surfaces in
-                            // check.py rather than being masked.
-                            if majit_metainterp::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit][BUG] blackhole failed key={} trace={} guard={} — invalidating",
-                                    green_key, trace_id, fail_index,
-                                );
-                            }
-                            driver.invalidate_loop(green_key);
-                            None
-                        }
                         _ => bh_result.to_pyresult().map(LoopResult::Done),
                     }
                 }
@@ -11992,7 +11968,6 @@ fn bound_reached(
                             return Some(LoopResult::ContinueRunningNormally);
                         }
                         crate::call_jit::BlackholeResult::BailToInterpreter => {}
-                        crate::call_jit::BlackholeResult::Failed => {}
                         _ => {
                             if let Some(r) = bh_result.to_pyresult() {
                                 return Some(LoopResult::Done(r));
@@ -12309,23 +12284,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // Fall through to eval_loop_jit
                         }
                         crate::call_jit::BlackholeResult::BailToInterpreter => {}
-                        crate::call_jit::BlackholeResult::Failed => {
-                            // RPython blackhole resume cannot fail
-                            // (`blackhole.py:1679` raises
-                            // `ExitFrameWithExceptionRef` instead).  The
-                            // `BlackholeResult::Failed` variant is a pyre
-                            // layering; reading/writing registers_r at
-                            // post-regalloc color instead of semantic slot
-                            // index would eliminate the triggers.
-                            if majit_metainterp::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit][BUG] blackhole failed key={} — invalidating",
-                                    green_key,
-                                );
-                            }
-                            let (driver, _) = driver_pair();
-                            driver.invalidate_loop(green_key);
-                        }
                         _ => {
                             if let Some(r) = bh_result.to_pyresult() {
                                 if majit_metainterp::majit_log_enabled() {

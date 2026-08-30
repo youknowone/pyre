@@ -7851,12 +7851,11 @@ fn cast_float_to_int_folds_a_const_float_without_recording() {
     );
 }
 
-/// `abort/>r` is a pyre-only no-op result marker — the walker
-/// counterpart of blackhole's `handler_abort_result_marker_r`
-/// (`blackhole.rs`).  No operand read, no register write, no
-/// IR op recorded; dispatch advances past the 1B dst slot only.
+/// A result-classified abort is still an abort.  The destination byte records
+/// the unsupported operation's SSA shape; it must not turn that operation into
+/// a no-op whose stale destination can be consumed later.
 #[test]
-fn abort_result_r_is_pure_pc_advance() {
+fn abort_result_r_stops_the_walk() {
     let opname = "abort/>r";
     let byte = *insns_opname_to_byte()
         .get(opname)
@@ -7899,13 +7898,12 @@ fn abort_result_r_is_pure_pc_advance() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
-    assert!(matches!(outcome, DispatchOutcome::Continue));
-    assert_eq!(next_pc, 2, "abort/>r operand layout = 1 byte (dst marker)");
+    let error = step(&code, 0, &mut wc).expect_err("abort/>r must abort the walk");
+    assert!(matches!(error, DispatchError::AbortMarkerReached { pc: 0 }));
     assert_eq!(
         wc.trace_ctx.num_ops(),
         ops_before,
-        "abort/>r must not record any IR op",
+        "abort/>r must abort before recording any IR op",
     );
 }
 

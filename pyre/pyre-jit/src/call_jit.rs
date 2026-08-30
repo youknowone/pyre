@@ -8,18 +8,6 @@ use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::sync::Once;
 
-/// Whether `MAJIT_NBODY_DEBUG` is set, cached at first access.
-///
-/// `std::env::var_os` acquires a global env lock on every call. Caching
-/// here matches the equivalent helpers in `majit-backend-cranelift` and
-/// `majit-backend-dynasm`. These probes were added during nbody bring-up
-/// and are not part of PyPy.
-fn pyre_nbody_debug_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_NBODY_DEBUG").is_some());
-    *ENABLED
-}
-
 /// Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
 #[allow(dead_code)]
 fn majit_probe_liveness_enabled() -> bool {
@@ -1360,8 +1348,6 @@ pub extern "C" fn bh_portal_runner_c(
 /// jitexc.py JitException hierarchy — structural parity with RPython.
 ///
 /// `_run_forever` must exit via exactly one of these variants.
-/// Call sites still return `BlackholeResult` and will be migrated
-/// once `consume_vable_info` guarantees resume data validity.
 #[allow(dead_code)] // not all variants are constructed yet
 pub enum JitException {
     /// jitexc.py ContinueRunningNormally(gi, gr, gf, ri, rr, rf):
@@ -1418,8 +1404,6 @@ pub enum BlackholeResult {
     /// stamped into the frame; the frame is resumable as-is and the compiled
     /// loop must not be invalidated.
     BailToInterpreter,
-    /// pyre-only: resume couldn't run because the resume data was invalid.
-    Failed,
 }
 
 impl From<JitException> for BlackholeResult {
@@ -2625,7 +2609,6 @@ pub fn blackhole_resume_via_rd_numb(
     // pointer with no deadframe root behind it.
     let _guard_exc_root = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
 
-    let nbody_debug = pyre_nbody_debug_enabled();
     use majit_metainterp::resume;
 
     // Thread-local BH pool (RPython BlackholeInterpBuilder). Each access
@@ -2745,6 +2728,7 @@ pub fn blackhole_resume_via_rd_numb(
     // release_bh_rd to drop and re-acquire the borrow.
     let bh = BH_BUILDER_RD.with(|cell| unsafe {
         let builder = &mut *cell.get();
+        builder.set_cpu(driver.meta_interp().blackhole_cpu());
         sync_bh_builder_control_opcodes(builder);
         resume::blackhole_from_resumedata(
             builder,
@@ -2765,12 +2749,7 @@ pub fn blackhole_resume_via_rd_numb(
         )
     });
 
-    let Some((mut bh, virtualizable_ptr)) = bh else {
-        if nbody_debug {
-            eprintln!("[nbody-debug] blackhole_resume_via_rd_numb failed: builder returned None");
-        }
-        return BlackholeResult::Failed;
-    };
+    let (mut bh, virtualizable_ptr) = bh;
 
     // resume.py: virtualizable_ptr was read by consume_vable_info
     // from the vable section. Set on the blackhole for vable bytecodes.
@@ -3108,14 +3087,13 @@ pub fn blackhole_resume_via_rd_numb(
                 release_bh_rd(bh);
                 return BlackholeResult::BailToInterpreter;
             }
-            if nbody_debug {
-                eprintln!(
-                    "[nbody-debug] blackhole_resume_via_rd_numb failed: bh.aborted position={} last_opcode_position={}",
-                    bh.position, bh.last_opcode_position
-                );
-            }
+            let position = bh.position;
+            let last_opcode_position = bh.last_opcode_position;
             release_bh_rd(bh);
-            return BlackholeResult::Failed;
+            panic!(
+                "blackhole_resume_via_rd_numb: canonical blackhole aborted at \
+                 position {position} (last opcode {last_opcode_position})"
+            );
         }
         if bh.got_exception {
             // `run()` brackets `exception_last_value` with `push_bh_regs` and
@@ -3448,12 +3426,6 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                     Some(0)
                 }
             }
-        }
-        BlackholeResult::Failed => {
-            if majit_metainterp::majit_log_enabled() {
-                eprintln!("[blackhole-resume] Failed");
-            }
-            None
         }
         BlackholeResult::BailToInterpreter => {
             if majit_metainterp::majit_log_enabled() {
