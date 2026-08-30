@@ -515,6 +515,23 @@ impl<'a> MirGraphLookup<'a> {
 ///   and unflagged callers keep the original. One graph per function cannot
 ///   split, so a parameter is flagged only when EVERY resolved call site
 ///   passes a hinted value there.
+///
+///   Porting that second graph would not make the flag mean more here, so do
+///   not read this clause as a deferred precision fix. Upstream's flag has
+///   teeth in `rvirtualizable.replace_force_virtualizable_with_call`, which
+///   DROPS an injected `jit_force_virtualizable` carrying `access_directly`
+///   instead of rewriting it to the interpreter copy's `direct_call`
+///   (`hook_access_field`'s own test of the flag is commented out upstream, so
+///   that pass is where it is read). Pyre injects nothing: the interpreter is
+///   native Rust the translator does not build, so there is one copy, and an
+///   injected op could only land in the jitcode — the copy
+///   `rewrite_op_jit_force_virtualizable` deletes from. Nor can the
+///   hand-placed `executioncontext::jit_force_virtualizable` marker be made
+///   flag-conditioned in the direction that would matter: the residual copy is
+///   compiled Rust, so nothing is removable from it at translation time. The
+///   sole reader of `FunctionGraph::access_directly` in this tree is
+///   `policy::look_inside_graph`'s abort, so flagging more graphs can only
+///   widen that abort.
 /// * **Alias closure follows links and representation casts only.** A
 ///   variable the hint produced, a parameter that arrives flagged, whatever
 ///   a `Link` binds one of those to in a successor block, and whatever a
