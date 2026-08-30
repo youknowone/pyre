@@ -330,7 +330,7 @@ fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
     let dynasm = runtime_binary(&root, "pyre-dynasm");
     let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
     let wasm_module = wasm_host_module(&root);
-    let script = root.join("pyre/bench/ca_terminal_decline.py");
+    let script = root.join("pyre/oracle/ca_terminal_decline.py");
 
     for artifact in [&dynasm, &wasm_runner, &wasm_module] {
         assert!(
