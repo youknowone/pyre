@@ -6071,6 +6071,11 @@ fn spill_guard_fail_args(
     ref_root_base_ofs: i32,
 ) {
     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+        // resume.py failargs may contain None holes.  They retain their slot
+        // index in rd_locs, but no value exists to resolve or publish.
+        if arg_ref.is_none() {
+            continue;
+        }
         let raw = if !arg_ref.is_constant()
             && arg_ref.raw() == call_result
             && !constants.contains_key(&arg_ref.raw())
@@ -7180,6 +7185,13 @@ fn emit_guard_exit(
     let mut publish = PairedSlotStores::default();
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         let offset = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
+
+        // resume.py failargs may contain None holes.  Keep the slot numbering
+        // positional, while leaving the dead slot unwritten like PyPy's
+        // recovery stub.
+        if arg_ref.is_none() {
+            continue;
+        }
 
         if let Some(accum) = accum_positions.get(&slot) {
             // _update_at_exit: reduce vector accumulator to scalar.
@@ -11506,6 +11518,9 @@ impl CraneliftBackend {
                     // implement_guard_recovery / _update_at_exit parity:
                     // Write fail_arg values to jf_frame[0..n] in fail_args order.
                     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+                        if arg_ref.is_none() {
+                            continue;
+                        }
                         let raw = resolve_failarg_opref(
                             &mut builder,
                             &constants,
@@ -23465,6 +23480,38 @@ mod tests {
         assert_eq!(descr.fail_index(), 0);
         assert_eq!(backend.get_float_value(&frame, 0), 9.25);
         assert_eq!(backend.get_ref_value(&frame, 1), GcRef(0xBEEF));
+    }
+
+    #[test]
+    fn test_guard_fail_args_leave_none_holes_unwritten() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        let guard_op = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard_op.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::NONE),
+            rb(OpRef::input_arg_int(1)),
+        ]);
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            guard_op,
+            mk_op(OpCode::Finish, &[], OpRef::NONE.raw()),
+        ];
+
+        let token = JitCellToken::new(1002);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(42)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 2), 42);
     }
 
     #[test]

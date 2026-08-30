@@ -1888,7 +1888,7 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py prepare_bridge
-    pub fn prepare_bridge(&mut self, arglocs: &[Loc]) {
+    pub fn prepare_bridge(&mut self, arglocs: &[Option<Loc>]) {
         self._prepare();
         let inputargs = self.inputargs;
         self._update_bindings(arglocs, inputargs);
@@ -1977,11 +1977,14 @@ impl<'a> RegAlloc<'a> {
     }
 
     /// x86/regalloc.py _update_bindings — bind bridge inputargs to their locations.
-    fn _update_bindings(&mut self, locs: &[Loc], inputargs: &[InputArg]) {
+    fn _update_bindings(&mut self, locs: &[Option<Loc>], inputargs: &[InputArg]) {
         let mut used: IndexMap<RegLoc, ()> = IndexMap::new();
 
         // x86/regalloc.py:295-312
         for (iarg, loc) in inputargs.iter().zip(locs.iter()) {
+            let Some(loc) = loc else {
+                continue;
+            };
             let v = iarg.opref();
             let tp = iarg.tp;
             match loc {
