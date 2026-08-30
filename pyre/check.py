@@ -5285,7 +5285,13 @@ def main():
         #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py
         chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    2,       None,    3)
         chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    1.5)
-        chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       2,       3,       2,       3)
+        # fib_loop's dynasm ceiling of 3 derives a 0.5x floor and windows reads
+        # exactly that: pypy takes 0.349s of execution there against 0.107s on
+        # ubuntu.  Run 33300212586 measured dynasm 0.5-1.6x, a 3.2x span, so
+        # twice the slowest would derive a floor that fails windows again and
+        # the ceiling is placed between the two bounds instead.  cranelift reads
+        # 1.2-1.6x and its 3 is already inside the convention.
+        chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       2,       2.1,     2,       3)
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.5,     None,    1.5)
         # fib_recursive's pypy ceilings of 6 and 8 both derive a floor capped at
         # parity, and macos dynasm reads 0.9x.  Run 33300212586 measured dynasm
