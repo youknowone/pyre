@@ -5287,6 +5287,30 @@ pub fn builtin_abs_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     abs_structural(obj)
 }
 
+/// `int.__neg__` / `float.__neg__` / `complex.__neg__` as gateway functions.
+///
+/// The body is `neg_inner`, the structural half, not `neg`: an unbound slot
+/// must not re-run the `__neg__` override probe that `neg` opens with, or a
+/// subtype override wins over the slot it was reached through and an override
+/// delegating back to it never terminates.
+pub fn builtin_neg_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "self", "__neg__")?,
+    };
+    crate::objspace::descroperation::neg_inner(obj)
+}
+
+/// `int.__pos__` / `float.__pos__` / `complex.__pos__` as gateway functions.
+/// Structural half only, for the reason [`builtin_neg_dunder`] gives.
+pub fn builtin_pos_dunder(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let obj = match args {
+        [val] => *val,
+        _ => parse_single_required(args, "self", "__pos__")?,
+    };
+    crate::objspace::descroperation::pos_inner(obj)
+}
+
 fn abs_bad_operand(obj: PyObjectRef) -> crate::PyError {
     crate::PyError::type_error(format!(
         "bad operand type for abs(): '{}'",

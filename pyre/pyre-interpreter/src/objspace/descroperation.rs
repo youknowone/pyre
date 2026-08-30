@@ -5562,7 +5562,9 @@ pub fn pos(a: PyObjectRef) -> PyResult {
 /// operation the body executes.  A caller that has already proven an exact
 /// builtin receiver cannot take it, so entering here records the arm that
 /// receiver selects and nothing else.  Every other caller reaches this through
-/// [`pos`] and is unaffected.
+/// [`pos`] and is unaffected, except the `int`/`float`/`complex` `__pos__`
+/// slots, which name this body directly because an unbound slot must not
+/// dispatch.
 ///
 /// Unlike [`invert_inner`] this keeps the `bool` operand: `+True` is a
 /// rewrapping to a plain int, not a deprecation warning.  Unlike [`neg_inner`]
@@ -5641,7 +5643,9 @@ pub fn neg(a: PyObjectRef) -> PyResult {
 /// operation the body executes.  A caller that has already proven an exact
 /// builtin receiver cannot take it, so entering here records the arm that
 /// receiver selects and nothing else.  Every other caller reaches this through
-/// [`neg`] and is unaffected.
+/// [`neg`] and is unaffected, except the `int`/`float`/`complex` `__neg__`
+/// slots, which name this body directly because an unbound slot must not
+/// dispatch.
 ///
 /// Unlike [`invert_inner`] this keeps the `bool` operand: `neg` has no separate
 /// bool slot to leave behind, and the integer arm below already answers `True`
@@ -5735,7 +5739,8 @@ pub fn invert(a: PyObjectRef) -> PyResult {
 /// reaches `lookup_exc_class`.  A caller that has already proven an exact
 /// `int` receiver takes neither, so entering here records the integer arm
 /// alone.  Every other caller reaches this through [`invert`] and is
-/// unaffected.
+/// unaffected, except `int.__invert__`, which names this body directly
+/// because an unbound slot must not dispatch.
 pub fn invert_inner(a: PyObjectRef) -> PyResult {
     unsafe {
         if is_int(a) {
