@@ -456,7 +456,7 @@ pub fn b2a_qp(buf: &[u8], quotetabs: bool, istext: bool, header: bool) -> Vec<u8
         }
         in_idx += 1;
     }
-    if buflen > 0 && in_idx < buflen && buf[in_idx - 1] == b'\r' {
+    if in_idx > 0 && in_idx < buflen && buf[in_idx - 1] == b'\r' {
         crlf = true;
     }
 

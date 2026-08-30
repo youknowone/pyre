@@ -2936,8 +2936,13 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "arg 3 (name) must be None or string",
         ));
     };
-    // PyPy `Function.descr_function__new__` calls `space.fixedview(argdefs)`
-    // before it inspects `closure`; preserve which malformed argument wins.
+    // [3.14-spec] PyPy `Function.descr_function__new__` calls
+    // `space.fixedview(argdefs)` before it inspects `closure`, but that accepts
+    // lists and then reports PyPy's `TypeError("invalid closure")` for
+    // `FunctionType(code, {}, None, [], object())`.  CPython 3.14.2 instead
+    // reports `TypeError("arg 4 (defaults) must be None or tuple")`: validate
+    // the public defaults contract at the same PyPy-shaped constructor site,
+    // before the unchanged closure processing below.
     if !w_argdefs.is_null()
         && !unsafe { pyre_object::is_none(w_argdefs) }
         && !unsafe { pyre_object::is_tuple(w_argdefs) }

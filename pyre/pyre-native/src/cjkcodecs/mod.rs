@@ -113,7 +113,9 @@ pub enum EncodeOne {
 }
 
 pub fn decode_one(codec: Codec, input: &[u8], state: &mut [u8; 8]) -> DecodeOne {
-    debug_assert!(!input.is_empty());
+    if input.is_empty() {
+        return DecodeOne::Incomplete;
+    }
     if is_iso2022(codec) {
         return iso2022::decode_one(codec, input, state);
     }
@@ -151,7 +153,9 @@ pub fn encode_one(
     final_input: bool,
     state: &mut [u8; 8],
 ) -> EncodeOne {
-    debug_assert!(!input.is_empty());
+    if input.is_empty() {
+        return EncodeOne::Incomplete;
+    }
     if is_iso2022(codec) {
         return iso2022::encode_one(codec, input, final_input, state);
     }
@@ -200,6 +204,18 @@ pub fn encode_reset(codec: Codec, state: &mut [u8; 8]) -> Option<([u8; 8], usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_input_is_incomplete() {
+        assert!(matches!(
+            decode_one(Codec::EucKr, &[], &mut [0; 8]),
+            DecodeOne::Incomplete
+        ));
+        assert!(matches!(
+            encode_one(Codec::EucKr, &[], true, &mut [0; 8]),
+            EncodeOne::Incomplete
+        ));
+    }
 
     #[test]
     fn every_one_and_two_byte_candidate_is_total() {

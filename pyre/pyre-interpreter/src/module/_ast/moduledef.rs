@@ -137,11 +137,15 @@ fn ast_method_descriptor(
     let _ = roots.pin_root(wrapper);
     let code = unsafe { crate::function::getcode(roots.get(wrapper_slot)) } as PyObjectRef;
     unsafe { crate::gateway::builtin_code_set_owner(code, &AST_METHOD_OWNER) };
-    let qualname = pyre_object::w_str_new(&format!("AST.{name}"));
+    let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(&format!("AST.{name}")));
     let text_signature_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_str_new(text_signature));
     unsafe {
-        crate::function::function_set_qualname(roots.get(wrapper_slot), qualname);
+        crate::function::function_set_qualname(
+            roots.get(wrapper_slot),
+            roots.get(qualname_slot),
+        );
         crate::function::function_set_objclass(roots.get(wrapper_slot), ast_type());
         crate::function::fset_func_text_signature(
             roots.get(wrapper_slot),

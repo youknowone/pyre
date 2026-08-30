@@ -46,7 +46,7 @@ class InitializingFlag:
 
 
 fresh.__spec__ = types.SimpleNamespace(_initializing=InitializingFlag())
-fresh.__annotate__ = lambda format: {"value": int}
+fresh.__annotate__ = lambda _format: {"value": int}
 try:
     fresh.__annotations__
 except RuntimeError as exc:

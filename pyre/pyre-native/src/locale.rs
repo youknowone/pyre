@@ -14,8 +14,13 @@
 /// result.  `rustpython_host_env::locale`'s own reader stops at `CHAR_MAX` and
 /// drops it, which would collapse the "stop" and "repeat the last group"
 /// conventions onto the same vector.
+///
+/// # Safety
+///
+/// `ptr` must be null or point to a NUL-terminated C string that remains valid
+/// for the duration of the call.
 #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-pub fn charp2str(ptr: *const libc::c_char) -> Vec<u8> {
+pub unsafe fn charp2str(ptr: *const libc::c_char) -> Vec<u8> {
     let mut out = Vec::new();
     if !ptr.is_null() {
         let mut cur = ptr;
