@@ -4330,6 +4330,11 @@ fn load_source_module(
     let (pathname_str, filename_bytes) = crate::pycode::split_code_filename_bytes(path_bytes, None);
     // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
     // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+    // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
+    // embedded NUL here with `source_as_string`'s unlocated "source code
+    // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
+    // observable while its command-line file path retains PyPy's located
+    // tokenizer boundary through `decode_file_source_bytes`.
     let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
 
     let _root = pyre_object::gc_roots::push_roots();

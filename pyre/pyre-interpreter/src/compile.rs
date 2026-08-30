@@ -219,11 +219,62 @@ pub fn decode_source_bytes(
     filename: &rustpython_wtf8::Wtf8,
     ignore_cookie: bool,
 ) -> Result<String, crate::PyError> {
-    // PyPy `PegParser.parse_source` performs this scan on the original bytes,
-    // before `_handle_encoding`.  CPython 3.14's `source_as_string` and PyPy's
-    // real parser both expose the refusal as an unlocated whole-source error;
-    // a later undecodable byte therefore cannot hide an earlier NUL either.
-    if source.contains(&0) {
+    decode_source_bytes_impl(source, filename, ignore_cookie, false)
+}
+
+/// Decode a command-line source file through the tokenizer's file boundary.
+///
+/// CPython 3.14 `tok_nextc` and PyPy `PegParser.parse_source` attach the file
+/// location to an embedded-NUL refusal.  `source_as_string` callers (including
+/// `compile()` and importlib's source loader) deliberately keep the unlocated
+/// "source code string" diagnostic exposed by [`decode_source_bytes`].
+pub fn decode_file_source_bytes(
+    source: &[u8],
+    filename: &rustpython_wtf8::Wtf8,
+    ignore_cookie: bool,
+) -> Result<String, crate::PyError> {
+    decode_source_bytes_impl(source, filename, ignore_cookie, true)
+}
+
+fn decode_source_bytes_impl(
+    source: &[u8],
+    filename: &rustpython_wtf8::Wtf8,
+    ignore_cookie: bool,
+    locate_null: bool,
+) -> Result<String, crate::PyError> {
+    // Both entry points perform this scan on the original bytes, before
+    // encoding-cookie handling, so a later undecodable byte cannot hide an
+    // earlier NUL (CPython bpo-24022/25388).
+    if let Some(null_pos) = source.iter().position(|byte| *byte == 0) {
+        if locate_null {
+            let line_start = source[..null_pos]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            let line_end = source[null_pos..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(source.len(), |relative| null_pos + relative);
+            let text = String::from_utf8_lossy(&source[line_start..line_end]);
+            let lineno = source[..null_pos]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                + 1;
+            let offset = String::from_utf8_lossy(&source[line_start..null_pos])
+                .chars()
+                .count()
+                + 1;
+            return Err(crate::PyError::syntax_error_located(
+                "source code cannot contain null bytes",
+                filename,
+                lineno as i64,
+                offset as i64,
+                lineno as i64,
+                offset as i64,
+                Some(&text),
+            ));
+        }
         return Err(crate::PyError::syntax_error(
             "source code string cannot contain null bytes",
         ));

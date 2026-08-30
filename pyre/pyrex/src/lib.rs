@@ -2644,7 +2644,7 @@ fn read_script_source(
     // module imports use.  The bytes then go through the tokenizer's BOM /
     // PEP 263 decoding in every build.
     match importing::read_source_bytes(Path::new(path)) {
-        Ok(bytes) => match pyre_interpreter::decode_source_bytes(
+        Ok(bytes) => match pyre_interpreter::decode_file_source_bytes(
             &bytes,
             rustpython_wtf8::Wtf8::new(path),
             false,
