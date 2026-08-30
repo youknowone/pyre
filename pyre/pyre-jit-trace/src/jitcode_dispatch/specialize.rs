@@ -332,87 +332,6 @@ fn walker_emit_ovf2long_box<Sym: WalkSym>(
     Ok(result)
 }
 
-/// #61: walker-native int specialization for the `UNARY_NEGATIVE` residual
-/// (oopspec [`majit_ir::RuntimeHelperKind::UnaryNegative`]).  `-x` on an exact
-/// int is `0 - x`; the object-space `neg` promotes only `-INT_MIN` to a
-/// `W_LongObject` (`intobject.py` `descr_neg` → `_make_ovf2long`).  Since
-/// majit has no overflow-checked unary negate, the fold expresses `-x` as
-/// `IntSubOvf(0, x)` behind a `GUARD_CLASS INT`, reusing the binary-sub
-/// overflow discipline in both directions: a record value other than `INT_MIN`
-/// emits `GUARD_NO_OVERFLOW` so an `INT_MIN` arrival on the reused trace deopts
-/// rather than wrapping back to `INT_MIN`, and a record value of `INT_MIN`
-/// pins the operand with `GUARD_VALUE` and takes the same `_make_ovf2long` tail
-/// the `BINARY_OP` overflow arm takes, so the `2**63` long is built from the
-/// elidable bigint helper instead of the `CallMayForce` residual.
-///
-/// Returns `Ok(Some(()))` when the fold was emitted (caller returns
-/// `Continue`); `Ok(None)` for a bool / subclass / non-int operand, when the
-/// residual result box is unavailable, or when an `INT_MIN` operand did not
-/// produce the promoted `W_LongObject` the payload read expects.
-pub(crate) fn try_walker_specialize_unary_negative_int<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    let Some((x, x_class)) = walker_unary_int_operand(ctx, operand) else {
-        return Ok(None);
-    };
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-    // `0 - INT_MIN` is the one operand `descr_neg` promotes.
-    let overflows = x == i64::MIN;
-    if overflows {
-        let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
-        if boxed_result_obj == pyre_object::PY_NULL
-            || !unsafe { pyre_object::is_long(boxed_result_obj) }
-        {
-            return Ok(None);
-        }
-    }
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let x_raw = walker_unbox_int(ctx, op_pc, operand, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, operand, x_class)?;
-    let zero_raw = ctx.trace_ctx.const_int(0);
-    let boxed = if overflows {
-        // `0 - x` overflows an i64 for exactly one operand, so "the negate
-        // promoted" and "the operand is INT_MIN" name the same set: guarding
-        // the value admits what `GUARD_OVERFLOW` would and nothing more. The
-        // value form is the one the tail can use — with `x_raw` constant the
-        // elidable bigint call folds to the `2**63` payload it returned while
-        // recording instead of running once per iteration. This is the
-        // `guard_value` spelling the version-tag promotes already use.
-        let int_min = ctx.trace_ctx.const_int(i64::MIN);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[x_raw, int_min])?;
-        walker_emit_ovf2long_box(
-            ctx,
-            op_pc,
-            pyre_object::longobject::jit_bigint_sub_int_int as *const (),
-            (zero_raw, 0),
-            (x_raw, x),
-            boxed_result_i64,
-        )?
-    } else {
-        let result_value = 0i64.wrapping_sub(x);
-        let raw_result = ctx
-            .trace_ctx
-            .record_op(OpCode::IntSubOvf, &[zero_raw, x_raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(raw_result, majit_ir::Value::Int(result_value));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
-        let boxed = walker_box_int(ctx, op_pc, raw_result, result_value)?;
-        ctx.trace_ctx
-            .set_opref_concrete(boxed, box_int_concrete(result_value, boxed_result_i64));
-        boxed
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
-}
-
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// the former int fast path's structure (`guard_class` + `getfield_gc_i` per
@@ -9681,12 +9600,15 @@ pub(crate) fn try_walker_orthodox_unary_positive<Sym: WalkSym>(
 
 /// `-x`: descend `neg`.  See [`try_walker_orthodox_unary`].
 ///
-/// `-INT_MIN` is the one operand `descr_neg` promotes, and it belongs to the
-/// [`try_walker_specialize_unary_negative_int`] fold behind this descent: the
-/// descent records the promotion's two `rbigint` calls as hoisted `CallPure*`
-/// short boxes, so the promoted long crosses the LABEL as a loop argument and
-/// `compare_op_long`'s `jit_bigint_cmp` is re-emitted in the loop body; the
-/// fold's `guard_value` on the operand makes that chain constant instead.
+/// `-INT_MIN` is the one operand `descr_neg` promotes, and the body's
+/// overflow arm (`rbigint.fromint(x).neg()`) is walked like any other: the
+/// promotion's two `rbigint` calls are recorded as hoisted `CallPure*`
+/// short boxes, the promoted long crosses the LABEL as a loop argument and
+/// `compare_op_long`'s `jit_bigint_cmp` is re-emitted in the loop body.  The
+/// retired `unary_negative_int` fold pinned that operand with `guard_value`
+/// instead (3x faster on a loop that negates `INT_MIN` every iteration);
+/// with the descent taking the site whole it measured `consulted=0` on every
+/// fixture, and the upstream trace has this same shape.
 pub(crate) fn try_walker_orthodox_unary_negative<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

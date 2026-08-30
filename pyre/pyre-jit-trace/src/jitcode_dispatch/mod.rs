@@ -8993,27 +8993,6 @@ fn walker_execute_may_force_boxed_outcome<Sym: WalkSym>(
     ))
 }
 
-/// The machine-int payload and exact class of a concrete operand, for the
-/// unary int fold and the decline that hands it the one operand it serves.
-/// `None` for a bool, a subclass instance, or anything that is not an int.
-fn walker_unary_int_operand<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    operand: OpRef,
-) -> Option<(i64, pyre_object::PyObjectRef)> {
-    let obj = walker_concrete_ref_object(ctx, operand)?;
-    // SAFETY: `obj` is a live concrete `PyObjectRef` from the walker shadow.
-    unsafe {
-        if !pyre_object::is_int(obj)
-            || pyre_object::is_bool(obj)
-            || !pyre_object::is_exact_builtin_instance(obj)
-        {
-            return None;
-        }
-        let class = walker_exact_builtin_class(obj)?;
-        Some((pyre_object::w_int_get_value(obj), class))
-    }
-}
-
 /// Resolve the concrete `PyObjectRef` carried by a Ref-bank operand's
 /// recorded concrete, or `None` when it is the vable sentinel / null.
 fn walker_concrete_ref_object<Sym: WalkSym>(

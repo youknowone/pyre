@@ -371,7 +371,6 @@ spec_folds! {
     UnaryPositiveDescent => ("unary_positive_descent",   "residual_call", "-"),
     UnaryInvertDescent   => ("unary_invert_descent",     "residual_call", "-"),
     UnaryNegativeDescent => ("unary_negative_descent",   "residual_call", "-"),
-    UnaryNegativeInt     => ("unary_negative_int",       "residual_call", "-"),
     BinaryOpDescent      => ("binary_op_descent",        "residual_call", "-"),
     CompareOpDescent     => ("compare_op_descent",       "residual_call", "-"),
     StoreSubscr          => ("store_subscr",             "residual_call", "-"),

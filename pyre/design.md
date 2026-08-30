@@ -589,10 +589,10 @@ compiled path is close to what it could be.
 
 ### 3.8 The fold layer: hand-written compensation for an opaque objspace
 
-pyre records traces through 73 `try_walker_specialize_*` functions — 71 in
+pyre records traces through 72 `try_walker_specialize_*` functions — 70 in
 `jitcode_dispatch/specialize.rs`, one each in `residual_call.rs`
-(`load_deref`) and `inline_call.rs` (`instance_next`) — 10,546 lines of body
-inside `specialize.rs`'s 18,831, described by the 84 rows of
+(`load_deref`) and `inline_call.rs` (`instance_next`) — 10,484 lines of body
+inside `specialize.rs`'s 18,765, described by the 83 rows of
 `SPEC_FOLD_ROWS` (one fold can back several rows, and row-less folds exist).
 Six of those rows are not folds at all: every label ending in `_descent` —
 `subscr_tuple_descent`, `unary_positive_descent`, `unary_invert_descent`,
@@ -601,7 +601,7 @@ an orthodox sub-walk through a `try_walker_orthodox_*` entry (11 of those
 exist; the other five are `list_append`/`list_pop` shapes and the shared
 `descent`/`unary` drivers, which carry no row), carrying a row only so it can
 be suppressed and A/B'd like the fold it replaced.  Counting them as debt
-overstates it by six; the fold count is 78.
+overstates it by six; the fold count is 77.
 Nothing in this charter named that layer before 2026-08-26, which is itself
 the finding: it is the largest single adaptation in the tree.
 
@@ -609,13 +609,13 @@ Re-derive every number here before citing it; this section has published
 two miscounts, and both survived because the recipe beside them did not run.
 Every command below is quoted as it must be typed.
 
-* Rows — `spec_folds!` opens at `diag.rs:367` and closes at `:453`:
-  `sed -n '367,453p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`
-  answers 84; `... | rg -cF '_descent"'` answers the 6 descent rows.
+* Rows — `spec_folds!` opens at `diag.rs:367` and closes at `:452`:
+  `sed -n '367,452p' pyre/pyre-jit-trace/src/jitcode_dispatch/diag.rs | rg -cF '=> ("'`
+  answers 83; `... | rg -cF '_descent"'` answers the 6 descent rows.
   `-F` is load-bearing: without it the `(` is an unclosed regex group and
   `rg` exits 2 rather than counting.
-* Definitions — `rg -c` reports one count *per file*, so it answers 71/1/1
-  rather than 73. Sum the matches instead:
+* Definitions — `rg -c` reports one count *per file*, so it answers 70/1/1
+  rather than 72. Sum the matches instead:
   `rg -o 'fn try_walker_specialize_' pyre/ majit/ -g '*.rs' | wc -l`.
   The descent entries are a separate population:
   `rg -o 'fn try_walker_orthodox_' pyre/ majit/ -g '*.rs' | wc -l` answers 11.
@@ -637,7 +637,7 @@ favour of the ported optimizer" — is not available as stated. Group by group:
 
 | group | n | nearest upstream |
 |---|---|---|
-| unbox → raw int/float/bigint arithmetic, compare, truth, cast | 22 | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
+| unbox → raw int/float/bigint arithmetic, compare, truth, cast | 21 | `OptIntBounds`, `OptRewrite.optimize_INT_IS_TRUE`, `OptPure` — cleanup only |
 | opaque builtin call → direct (mostly pure elidable) call | 14 | `OptPure.optimize_CALL_PURE_I`; recognition is `jtransform._handle_math_sqrt_call` and `@jit.elidable`, not a pass |
 | residual → `new_with_vtable` / `new_array` so it stays virtual | 11 | `OptVirtualize` removes such ops; the emitter is `MIFrame.opimpl_newlist` |
 | guarded heap field / array / mapdict read and write | 21 | `OptHeap` CSEs them; the emitter is traced `LOAD_ATTR_caching` |
@@ -647,9 +647,10 @@ favour of the ported optimizer" — is not available as stated. Group by group:
 | callee inlining (`instance_next`, `kwonly_defaults_inline`) | 2 | none as a pass; `MIFrame.opimpl_inline_call` reaches the callee by tracing into it |
 | orthodox descent rows — not folds | 6 | the descent itself; listed so the table sums to the row count |
 
-The `n` column sums to 84, the row count above it: 78 folds plus the 6
+The `n` column sums to 83, the row count above it: 77 folds plus the 6
 descent rows, re-derived on 2026-08-30 by classifying every row against its
-doc comment.  The rows the earlier 73-row split did not know are the
+doc comment (`unary_negative_int` left the unbox group the same day, when
+the `neg` descent took `-INT_MIN` too).  The rows the earlier 73-row split did not know are the
 `_descent` rows, the `math_floor`/`math_ceil`/`math_trunc` trio, the `super`
 family and the two inlining rows, which is why a new group appears rather
 than a widened one.  Re-derive it by classifying every row, not by
@@ -683,8 +684,8 @@ inlining needs the fold, the fold needs constant cells, and constant cells
 need the inlining.
 
 **What does not hold it in place.** 40 fixtures carry a `spec-folds=` header
-and they name 57 distinct rows between them (5 of those descent rows), so
-27 of the 84 rows have no fixture coupling at all
+and they name 56 distinct rows between them (5 of those descent rows), so
+27 of the 83 rows have no fixture coupling at all
 (`rg -o --no-filename --max-depth 1 'spec-folds=[^ ]+' pyre/bench/synth -g '*.py' | sed 's/spec-folds=//' | tr ',' '\n' | sort -u | wc -l`;
 `-o` must be spelled without `-h`, which is `rg`'s help flag).  Retirement
 is blocked by reach, not by headers.

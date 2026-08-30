@@ -7016,8 +7016,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // UNARY_NEGATIVE.  Descend `neg` whole rather than re-emit its integer arm
     // by hand.  The translated body owns the ordinary int arm and the exact
     // `long` operand. Bool, subclass and non-int operands still fall through
-    // to the generic residual so their override semantics are preserved, and
-    // the `INT_MIN` promotion declines to the fold below.
+    // to the generic residual so their override semantics are preserved.  The
+    // `unary_negative_int` fold that stood behind this descent measured
+    // `consulted=0` on every fixture once `-INT_MIN` was descended too.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && r_args.len() == 1
@@ -7027,25 +7028,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         })?
     {
         return Ok((outcome, op.next_pc));
-    }
-
-    // #61: UNARY_NEGATIVE `-int`.  Kept behind the descent, which declines the
-    // one operand `descr_neg` promotes: the fold pins that operand with
-    // `guard_value` and takes the `_make_ovf2long` tail, so the `2**63` long is
-    // a constant the ops reading it fold against.  It also serves an exact-int
-    // operand in a build whose `neg` jitcode is missing or unlowered.
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && r_args.len() == 1
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::UnaryNegative
-        && spec_gate(SpecFold::UnaryNegativeInt, || {
-            try_walker_specialize_unary_negative_int(
-                ctx, op.pc, r_args[0], &allboxes, call_descr, dst, dst_bank,
-            )
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // UNARY_INVERT.  Descend `invert` whole rather than re-emit its integer arm
