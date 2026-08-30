@@ -498,8 +498,11 @@ pub unsafe fn walk_active_sym_register_area(
             }
         }
         // The open sub-walks' own banks: each entry is the `(address, length)`
-        // of the Ref bank of a frame suspended below this one, published for
-        // the length of its `walk` call. A shared borrow of the list is enough
+        // of the Ref bank of a frame below this one, published for that
+        // frame's whole residency on `SubWalkDriver::frames` -- a parent
+        // suspended at a CALL keeps minted `ConstPtr`s in its bank while the
+        // child walks, so the publication outlives its own `walk` call.
+        // A shared borrow of the list is enough
         // -- every bank it names is a separate allocation, so the `&mut`
         // slices below do not alias it.
         let inline = &*std::ptr::addr_of!((*sym_ptr).inline_register_banks);
