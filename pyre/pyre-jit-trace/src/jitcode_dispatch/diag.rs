@@ -422,7 +422,6 @@ spec_folds! {
     LoadClassmethodAttr  => ("load_classmethod_attr",    "residual_call", "-"),
     LoadBoundMethodAttr  => ("load_bound_method_attr",   "residual_call", "-"),
     Subscr               => ("subscr",                   "residual_call", "-"),
-    BinaryOpInt          => ("binary_op_int",            "residual_call", "-"),
     BinaryOpLongInt      => ("binary_op_long_int",       "residual_call", "-"),
     BinaryOpLongIntShift => ("binary_op_long_int_shift", "residual_call", "-"),
     BinaryOpLongIntDiv   => ("binary_op_long_int_div",   "residual_call", "-"),
