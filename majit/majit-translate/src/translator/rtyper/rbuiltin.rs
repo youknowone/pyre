@@ -3723,18 +3723,18 @@ pub fn rtype_cast_instance_intrinsic(
 /// Restore the MIR adapter marker to RPython
 /// `rgc.ll_arraymove(array, source_start, dest_start, length)`.
 ///
-/// The currently admitted producer is `ll_delitem_nonneg`'s leftward move
-/// (`source_start = dest_start + 1`).  Its `delta < 0` slow path in
-/// `rpython/rlib/rgc.py` copies forward, exactly the general element-copy
-/// helper used here.  The helper retains upstream's one-array, four-argument
-/// call shape and its overlap semantics for this proven direction.
+/// `source_start` and `dest_start` arrive as `Signed` variables, so the
+/// direction of the move is not known here.  The minted helper carries
+/// upstream's runtime `delta` dispatch (`rpython/rlib/rgc.py`,
+/// `ll_arraymove`) and is overlap-safe either way, which is also what lets
+/// it be minted under the single name `ll_arraymove`: the rtyper caches
+/// low-level helpers on `(name, args, result)`, and both directions present
+/// the identical key.
 pub fn rtype_ll_arraymove_intrinsic(
     hop: &HighLevelOp,
     _kwds_i: &HashMap<String, usize>,
 ) -> RTypeResult {
-    use crate::translator::rtyper::rlist::{
-        FixedSizeListRepr, build_ll_arraymove_left_helper_graph,
-    };
+    use crate::translator::rtyper::rlist::{FixedSizeListRepr, build_ll_arraymove_helper_graph};
 
     let r_array = arg_repr(hop, 0)?;
     let any_array: &dyn std::any::Any = r_array.as_ref();
@@ -3757,13 +3757,8 @@ pub fn rtype_ll_arraymove_intrinsic(
     let source_start = args.remove(0);
     let dest_start = args.remove(0);
     let length = args.remove(0);
-    // Minted as `ll_arraymove_left`, not `ll_arraymove`: the graph is only
-    // upstream's `delta < 0` arm, and `lowlevel_helper_function_with_builder`
-    // caches on `(name, args, result)`.  A right-move producer would present
-    // the identical key and receive this left-only loop, which smears the
-    // first element across the overlap.
     let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-        "ll_arraymove_left".to_string(),
+        "ll_arraymove".to_string(),
         vec![
             array_lltype,
             LowLevelType::Signed,
@@ -3772,7 +3767,7 @@ pub fn rtype_ll_arraymove_intrinsic(
         ],
         LowLevelType::Void,
         move |_rtyper, _args, _result| {
-            build_ll_arraymove_left_helper_graph("ll_arraymove_left", item_lltype.clone())
+            build_ll_arraymove_helper_graph("ll_arraymove", item_lltype.clone())
         },
     )?;
     hop.exception_cannot_occur()?;
