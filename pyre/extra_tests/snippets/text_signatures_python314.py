@@ -1118,6 +1118,46 @@ assert str(inspect.signature(types.FrameType.clear)) == "(self, /)"
 assert str(inspect.signature(types.FrameType.__repr__)) == "(self, /)"
 
 
+# method_text_signatures_python314
+
+EXPECTED_METHOD_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__call__": "($self, /, *args, **kwargs)",
+    "__get__": "($self, instance, owner=None, /)",
+    "__getattribute__": "($self, name, /)",
+    "__eq__": "($self, value, /)",
+    "__ne__": "($self, value, /)",
+    "__lt__": "($self, value, /)",
+    "__le__": "($self, value, /)",
+    "__gt__": "($self, value, /)",
+    "__ge__": "($self, value, /)",
+    "__hash__": "($self, /)",
+    "__repr__": "($self, /)",
+    "__reduce__": "($self, /)",
+}
+check_descriptors(types.MethodType, EXPECTED_METHOD_METHODS)
+
+EXPECTED_METHOD_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__call__": "Call self as a function.",
+    "__get__": "Return an attribute of instance, which is of type owner.",
+    "__getattribute__": "Return getattr(self, name).",
+    "__eq__": "Return self==value.",
+    "__ne__": "Return self!=value.",
+    "__lt__": "Return self<value.",
+    "__le__": "Return self<=value.",
+    "__gt__": "Return self>value.",
+    "__ge__": "Return self>=value.",
+    "__hash__": "Return hash(self).",
+    "__repr__": "Return repr(self).",
+}
+for name, doc in EXPECTED_METHOD_DOCS.items():
+    assert getattr(types.MethodType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.MethodType.__call__)) == "(self, /, *args, **kwargs)"
+assert str(inspect.signature(types.MethodType.__get__)) == "(self, instance, owner=None, /)"
+
+
 assert str(inspect.signature(types.MethodType)) == "(function, instance, /)"
 assert str(inspect.signature(types.ModuleType)) == "(name, doc=None)"
 

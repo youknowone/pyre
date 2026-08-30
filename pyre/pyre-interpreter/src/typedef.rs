@@ -15872,34 +15872,45 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(|args| {
-                if args.len() != 3 {
-                    return Err(crate::PyError::type_error(format!(
-                        "method expected 2 arguments, got {}",
-                        args.len().saturating_sub(1),
-                    )));
-                }
-                crate::function::descr_method__new__(args[0], args[1], args[2])
-            }),
+            make_new_descr_with_doc(
+                |args| {
+                    if args.len() != 3 {
+                        return Err(crate::PyError::type_error(format!(
+                            "method expected 2 arguments, got {}",
+                            args.len().saturating_sub(1),
+                        )));
+                    }
+                    crate::function::descr_method__new__(args[0], args[1], args[2])
+                },
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__call__",
-            make_builtin_function("__call__", crate::function::descr_method_call),
+            crate::gateway::make_builtin_function_with_doc(
+                "__call__",
+                crate::function::descr_method_call,
+                "Call self as a function.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__get__",
-            make_builtin_function("__get__", |args| unsafe {
-                let method = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-                let cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                crate::function::descr_method_get(method, obj, cls)
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "__get__",
+                |args| unsafe {
+                    let method = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                    let cls = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                    crate::function::descr_method_get(method, obj, cls)
+                },
+                "Return an attribute of instance, which is of type owner.",
+            ),
         )
     };
     // typedef.py:839-840 ─
@@ -15961,10 +15972,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__getattribute__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__getattribute__",
                 |args| unsafe { crate::function::descr_method_getattribute(args[0], args[1]) },
                 2,
+                "Return getattr(self, name).",
             ),
         )
     };
@@ -15972,10 +15984,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__eq__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__eq__",
                 |args| unsafe { crate::function::descr_method_eq(args[0], args[1]) },
                 2,
+                "Return self==value.",
             ),
         )
     };
@@ -15983,10 +15996,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__ne__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__ne__",
                 |args| unsafe { crate::function::descr_method_ne(args[0], args[1]) },
                 2,
+                "Return self!=value.",
             ),
         )
     };
@@ -16010,17 +16024,17 @@ fn init_method_type(ns: PyObjectRef) {
     fn ge(args: &[PyObjectRef]) -> crate::PyResult {
         order(args, "__ge__")
     }
-    for (name, function) in [
-        ("__lt__", lt as MethodOrderFn),
-        ("__le__", le),
-        ("__gt__", gt),
-        ("__ge__", ge),
+    for (name, function, doc) in [
+        ("__lt__", lt as MethodOrderFn, "Return self<value."),
+        ("__le__", le, "Return self<=value."),
+        ("__gt__", gt, "Return self>value."),
+        ("__ge__", ge, "Return self>=value."),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, 2),
+                crate::gateway::make_builtin_function_with_arity_and_doc(name, function, 2, doc),
             )
         };
     }
@@ -16028,7 +16042,7 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__hash__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__hash__",
                 |args| unsafe {
                     Ok(pyre_object::w_int_new(crate::function::descr_method_hash(
@@ -16036,6 +16050,7 @@ fn init_method_type(ns: PyObjectRef) {
                     )?))
                 },
                 1,
+                "Return hash(self).",
             ),
         )
     };
@@ -16043,10 +16058,11 @@ fn init_method_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__repr__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__repr__",
                 |args| unsafe { crate::function::descr_method_repr(args[0]) },
                 1,
+                "Return repr(self).",
             ),
         )
     };
@@ -16061,6 +16077,30 @@ fn init_method_type(ns: PyObjectRef) {
             ),
         )
     };
+
+    // PyPy `Method.typedef` supplies the callable carriers in the order
+    // above.  CPython 3.14's method slots/method table supply their public
+    // signatures and docs; attach the signatures after the TypeDef-shaped
+    // registration so no operation is reimplemented around the port.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__call__", "($self, /, *args, **kwargs)"),
+        ("__get__", "($self, instance, owner=None, /)"),
+        ("__getattribute__", "($self, name, /)"),
+        ("__eq__", "($self, value, /)"),
+        ("__ne__", "($self, value, /)"),
+        ("__lt__", "($self, value, /)"),
+        ("__le__", "($self, value, /)"),
+        ("__gt__", "($self, value, /)"),
+        ("__ge__", "($self, value, /)"),
+        ("__hash__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__reduce__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("method TypeDef callable was just installed");
+        unsafe { crate::function::fset_func_text_signature(function, w_str_new(text_signature)) };
+    }
 }
 
 fn code_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
