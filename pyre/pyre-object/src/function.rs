@@ -87,9 +87,12 @@ pub fn w_method_new(
         // The shell is a livevar across the barrier below just as the members
         // are: that call is a `gc_op`, which leaves RUNNING before taking
         // `gc_mutex` (`gc_sync.rs`) and roots only its own copy, so a foreign
-        // collector can move the shell there. Pin it into the same block the
-        // members occupy and take every address back out of the shadow stack
-        // afterwards.
+        // collector can move the shell there. Pin it and take every address
+        // back out of the shadow stack afterwards. Read the slot index rather
+        // than counting from `save_point`: the allocation above sits between
+        // the two pushes, and a run of it that left an entry behind would
+        // otherwise hand `std::ptr::write` below another object's address.
+        let shell_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
         // Remember the shell before publishing nursery members: running the
         // barrier after the stores would leave a movable `w_self` (notably a
@@ -98,7 +101,7 @@ pub fn w_method_new(
         // items block. A nursery shell answers the barrier in its `is_in_nursery`
         // arm, so the call stands for the spill case alone.
         crate::gc_hook::try_gc_write_barrier_managed(raw);
-        for slot in save_point..save_point + 4 {
+        for slot in (save_point..save_point + 3).chain(std::iter::once(shell_slot)) {
             let root = crate::gc_roots::shadow_stack_get(slot);
             let current =
                 crate::gc_hook::try_gc_current_object_address(root as *mut u8) as PyObjectRef;
@@ -107,7 +110,7 @@ pub fn w_method_new(
         let w_function = crate::gc_roots::shadow_stack_get(save_point);
         let w_self = crate::gc_roots::shadow_stack_get(save_point + 1);
         let w_class = crate::gc_roots::shadow_stack_get(save_point + 2);
-        let raw = crate::gc_roots::shadow_stack_get(save_point + 3) as *mut u8;
+        let raw = crate::gc_roots::shadow_stack_get(shell_slot) as *mut u8;
         unsafe {
             std::ptr::write(
                 raw as *mut Method,
