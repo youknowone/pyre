@@ -4635,6 +4635,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             green_key: u64,
             exit_layout: majit_metainterp::CompiledExitLayout,
             raw_values: Vec<i64>,
+            guard_value_operand: Option<i64>,
             guard_exc: i64,
         },
     }
@@ -4665,6 +4666,17 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 .map(|jct| jct.green_key())
                 .unwrap_or(0);
             let exit_layout = mi.build_exit_layout_for_descr(green_key, descr);
+            // compile.py `AbstractResumeGuardDescr.must_compile` reads a
+            // GUARD_VALUE's actual operand directly from the deadframe before
+            // hashing `(descr, value)`.  It need not be one of the guard's
+            // fail arguments: wasm codegen parks that case in the trailing
+            // `counter_value_spill` slot specifically for this read.  Keep it
+            // while the in-guest CA frame is live, just as
+            // `jit_ca_handle_guard_failure`'s native callback does; falling
+            // back to `raw_values[index]` below turns an out-of-vector slot
+            // into zero and merges every failing value into one hot counter.
+            let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
+                .map(|slot| backend.get_value_direct(&frame, slot));
             let raw_values: Vec<i64> = descr
                 .fail_arg_types()
                 .iter()
@@ -4682,6 +4694,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                 green_key,
                 exit_layout,
                 raw_values,
+                guard_value_operand,
                 guard_exc,
             }
         }
@@ -4704,6 +4717,7 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             green_key,
             exit_layout,
             raw_values,
+            guard_value_operand,
             mut guard_exc,
         } => {
             // `grab_exc_value` cleared the only root for the pending exception
@@ -4713,7 +4727,8 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             // Inert today (wasm host allocations never collect) but keeps the
             // carrier rooted at parity with dynasm if that invariant changes.
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
-            let attempt = try_compile_ca_bridge(&descr_arc, &raw_values, None);
+            let attempt =
+                try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand);
             if attempt.terminal_declined {
                 // This target cannot reach compiled steady state: each CA
                 // invocation would blackhole.  Invalidate callers so the next
