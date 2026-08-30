@@ -3576,8 +3576,11 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
 
     let root_code = [inline, 0, 0, 1, 0, 0, ret, 0];
     let mut trace_ctx = fresh_trace_ctx();
-    let mut regs_r = distinct_const_refs(&mut trace_ctx, 1);
-    let expected = regs_r[0];
+    let expected = OpRef::input_arg_typed(0, Type::Ref);
+    let mut regs_r = vec![expected];
+    trace_ctx
+        .heap_cache_mut()
+        .class_now_known(expected, 0x1234_5678);
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut walk_ctx = WalkContext {
         callee_shadow: None,
@@ -3618,7 +3621,31 @@ fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
     assert_eq!(end_pc, root_code.len());
     drop(walk_ctx);
     assert_eq!(regs_r[0], expected);
+    assert!(
+        trace_ctx.heap_cache().is_class_known(expected),
+        "a child push must restore the parent's pre-CALL heap-cache knowledge"
+    );
     assert_eq!(fbw_finish_payload_take(), Some((expected, Type::Ref)));
+}
+
+#[test]
+fn replay_scan_treats_callee_frame_bookkeeping_as_call_owned() {
+    let get_vable = *insns_opname_to_byte()
+        .get("getarrayitem_vable_r/ridd>r")
+        .unwrap();
+    let setfield = *insns_opname_to_byte().get("setfield_gc_i/rid").unwrap();
+    let ret = *insns_opname_to_byte().get("ref_return/r").unwrap();
+    // Reading a ref slot identifies r4 as this callee's virtualizable frame;
+    // the mutable SetfieldGc that follows is frame lifecycle bookkeeping.
+    let code = [get_vable, 4, 0, 0, 0, 1, 0, 5, setfield, 4, 0, 2, 0, ret, 5];
+    let descrs = vec![
+        make_fail_descr(0),
+        make_fail_descr(1),
+        field_descr_with_index(2),
+    ];
+    let scan = fbw_callee_body_replay_scan(&code, &[], 0, &[0], 6, &[], &descrs, false);
+    assert_eq!(scan.verdict(), CalleeReplaySafety::Clean);
+    assert!(scan.poison.is_empty());
 }
 
 #[test]

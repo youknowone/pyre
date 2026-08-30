@@ -10362,8 +10362,8 @@ struct SubWalkDriverGuard {
 }
 
 impl SubWalkDriverGuard {
-    fn install<Sym: WalkSym>(driver: &mut SubWalkDriver<'_, Sym>) -> Self {
-        let pointer = driver as *mut SubWalkDriver<'_, Sym> as *mut ();
+    fn install<Sym: WalkSym>(exchange: &mut SubWalkExchange<'_, Sym>) -> Self {
+        let pointer = exchange as *mut SubWalkExchange<'_, Sym> as *mut ();
         let previous = SUBWALK_DRIVER.with(|slot| slot.replace(pointer));
         debug_assert!(previous.is_null(), "sub-walk drivers must not nest");
         Self { previous }
@@ -10460,15 +10460,9 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 seed_callee_vstack_mirror(&mut walk_ctx, &frame);
             }
         }
-        // The register bank is frame-owned now, but `TraceCtx` still resolves
-        // frontend OpRefs through the currently executing MIFrame's Ref bank.
-        // Publish this frame for exactly the duration of its walk, matching
-        // the guard that surrounded every recursive sub-walk before the
-        // explicit framestack conversion.
-        let callee_bank_guard =
-            crate::trace::InlineRegisterBankGuard::enter(&raw mut *walk_ctx.registers_r);
+        // The bank is rooted by `SubWalkDriver::push_frame` for this frame's
+        // whole residency, which outlasts this call.
         let result = walk(self.body.code, self.pc, &mut walk_ctx);
-        drop(callee_bank_guard);
         self.callee_shadow = walk_ctx.callee_shadow.take();
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
         self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
@@ -10499,8 +10493,14 @@ struct CompletedSubWalk {
     class_of_last_exc_is_const: bool,
 }
 
-struct SubWalkDriver<'a, Sym: WalkSym> {
-    frames: Vec<SubWalkFrame<'a, Sym>>,
+/// The only state nested `walk()` activations exchange with the outer driver.
+/// Keeping it separate from `SubWalkDriver.frames` matters: the active frame
+/// is already mutably borrowed while `step()` calls back into
+/// `run_sub_jitcode_walk`, so a TLS pointer to the whole driver would create a
+/// second overlapping `&mut SubWalkDriver`.  PyPy's `_interpret` likewise
+/// communicates through framestack operations, not by re-entering an already
+/// borrowed frame object.
+struct SubWalkExchange<'a, Sym: WalkSym> {
     pending: Option<SubWalkFrame<'a, Sym>>,
     completed: Option<CompletedSubWalk>,
     active_frame_id: usize,
@@ -10508,20 +10508,77 @@ struct SubWalkDriver<'a, Sym: WalkSym> {
     step_trace_position: Option<majit_metainterp::recorder::TracePosition>,
     step_effect_count: usize,
     step_unjournaled: bool,
+    /// Heap-cache state at the start of the CALL step.  The explicit driver
+    /// replays that one opcode to deliver the child's return, unlike RPython's
+    /// direct continuation, so it must rewind the speculative CALL preamble
+    /// without discarding knowledge accumulated before the CALL.
+    step_heap_cache: Option<majit_metainterp::heapcache::HeapCache>,
+}
+
+struct SubWalkDriver<'a, Sym: WalkSym> {
+    frames: Vec<SubWalkFrame<'a, Sym>>,
+    /// One entry per live frame, pushed and dropped with `frames`.
+    bank_guards: Vec<crate::trace::InlineRegisterBankGuard>,
+    exchange: SubWalkExchange<'a, Sym>,
 }
 
 impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
     fn new(root: SubWalkFrame<'a, Sym>) -> Self {
-        Self {
-            next_frame_id: root.id + 1,
-            frames: vec![root],
-            pending: None,
-            completed: None,
-            active_frame_id: 0,
-            step_trace_position: None,
-            step_effect_count: 0,
-            step_unjournaled: false,
-        }
+        let next_frame_id = root.id + 1;
+        let mut driver = Self {
+            frames: Vec::new(),
+            bank_guards: Vec::new(),
+            exchange: SubWalkExchange {
+                pending: None,
+                completed: None,
+                active_frame_id: 0,
+                next_frame_id,
+                step_trace_position: None,
+                step_effect_count: 0,
+                step_unjournaled: false,
+                step_heap_cache: None,
+            },
+        };
+        driver.push_frame(root);
+        driver
+    }
+
+    /// Push a frame and root its Ref bank for as long as it stays on
+    /// `frames`.
+    ///
+    /// The bank has to be walkable for the frame's whole residency, not only
+    /// while its own `drive` call is on the host stack: a parent suspended at
+    /// a CALL keeps the `ConstPtr`s its folds minted in `registers_r` while
+    /// the child walks and allocates.  The recursive form this driver replaced
+    /// got that by nesting one guard activation inside the next, so
+    /// `inline_register_banks` already held every live bank at once — its only
+    /// reader walks the whole list (`trace.rs walk_active_sym_register_area`).
+    ///
+    /// `InlineRegisterBankGuard::drop` pops whatever entry is on top, so the
+    /// entries have to retire in reverse order; pairing them with `frames`
+    /// is what gives that.  The address published is the `Vec`'s heap buffer,
+    /// so it survives a `frames` realloc moving the `SubWalkFrame` itself, and
+    /// the walk cannot reallocate the bank because `WalkContext` borrows it as
+    /// `&mut [OpRef]`.
+    fn push_frame(&mut self, frame: SubWalkFrame<'a, Sym>) {
+        self.frames.push(frame);
+        let bank: *mut [OpRef] = self
+            .frames
+            .last_mut()
+            .expect("the frame just pushed")
+            .registers_r
+            .as_mut_slice();
+        self.bank_guards
+            .push(crate::trace::InlineRegisterBankGuard::enter(bank));
+    }
+
+    /// Pop a frame, retiring its bank root first so the two stacks stay in
+    /// step.
+    fn pop_frame(&mut self) -> SubWalkFrame<'a, Sym> {
+        self.bank_guards
+            .pop()
+            .expect("a live sub-walk frame lost its register-bank root");
+        self.frames.pop().expect("completed sub-walk frame missing")
     }
 
     fn drive(
@@ -10533,18 +10590,18 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 .frames
                 .last_mut()
                 .expect("sub-walk driver lost its root frame");
-            self.active_frame_id = frame.id;
+            self.exchange.active_frame_id = frame.id;
             let driven = frame.drive(trace_ctx);
             match driven {
                 Err(DispatchError::SubWalkSuspended { pc }) => {
                     assert_eq!(
                         fbw_executed_effect_count(),
-                        self.step_effect_count,
+                        self.exchange.step_effect_count,
                         "sub-walk push occurred after a concrete effect"
                     );
                     assert_eq!(
                         fbw_has_unjournaled_effect(),
-                        self.step_unjournaled,
+                        self.exchange.step_unjournaled,
                         "sub-walk push occurred after an unjournaled effect"
                     );
                     // Re-entering the parent CALL after the child returns is
@@ -10552,19 +10609,25 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                     // first entry emitted so it is recorded exactly once on
                     // continuation replay.
                     trace_ctx.cut_trace_with_snapshots(
-                        self.step_trace_position
+                        self.exchange
+                            .step_trace_position
                             .expect("sub-walk driver missed the parent step boundary"),
                     );
-                    trace_ctx.heap_cache_mut().reset();
+                    *trace_ctx.heap_cache_mut() = self
+                        .exchange
+                        .step_heap_cache
+                        .take()
+                        .expect("sub-walk driver missed the parent heap-cache checkpoint");
                     frame.pc = pc;
                     let child = self
+                        .exchange
                         .pending
                         .take()
                         .expect("SubWalkSuspended without a pending callee frame");
-                    self.frames.push(child);
+                    self.push_frame(child);
                 }
                 result => {
-                    let frame = self.frames.pop().expect("completed sub-walk frame missing");
+                    let frame = self.pop_frame();
                     let class_state = frame.fbw_mode.class_of_last_exc_is_const;
                     let caller_pc = frame.caller_pc;
                     let result = result.map(|(outcome, _)| outcome);
@@ -10572,7 +10635,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                         return result.map(|outcome| (outcome, class_state));
                     };
                     parent.pc = caller_pc;
-                    self.completed = Some(CompletedSubWalk {
+                    self.exchange.completed = Some(CompletedSubWalk {
                         parent_id: parent.id,
                         caller_pc,
                         result,
@@ -10590,19 +10653,23 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
 /// preamble to cut.
 pub(crate) fn note_subwalk_driver_step<Sym: WalkSym>(
     trace_position: majit_metainterp::recorder::TracePosition,
+    heap_cache: &majit_metainterp::heapcache::HeapCache,
 ) {
     SUBWALK_DRIVER.with(|slot| {
         let pointer = slot.get();
         if pointer.is_null() {
             return;
         }
-        // SAFETY: `SubWalkDriverGuard` installs the driver created by the
-        // enclosing `run_sub_jitcode_walk::<Sym>` and clears it before that
-        // stack frame returns.  Nested walks keep the same `Sym`.
-        let driver = unsafe { &mut *(pointer as *mut SubWalkDriver<'_, Sym>) };
-        driver.step_trace_position = Some(trace_position);
-        driver.step_effect_count = fbw_executed_effect_count();
-        driver.step_unjournaled = fbw_has_unjournaled_effect();
+        // SAFETY: `SubWalkDriverGuard` installs only the driver's exchange
+        // object and clears it before the enclosing stack frame returns.
+        // `frames` is a disjoint field and remains exclusively borrowed by
+        // the driver while this callback runs. Nested walks keep the same
+        // `Sym` monomorphization.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        exchange.step_trace_position = Some(trace_position);
+        exchange.step_effect_count = fbw_executed_effect_count();
+        exchange.step_unjournaled = fbw_has_unjournaled_effect();
+        exchange.step_heap_cache = Some(heap_cache.clone());
     });
 }
 
@@ -10645,11 +10712,11 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
     if !driver_pointer.is_null() {
         // SAFETY: installed by the enclosing invocation of this same generic
         // function; see `SubWalkDriverGuard`.
-        let driver = unsafe { &mut *(driver_pointer as *mut SubWalkDriver<'a, Sym>) };
-        if driver.completed.as_ref().is_some_and(|completed| {
-            completed.parent_id == driver.active_frame_id && completed.caller_pc == pc
+        let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
+        if exchange.completed.as_ref().is_some_and(|completed| {
+            completed.parent_id == exchange.active_frame_id && completed.caller_pc == pc
         }) {
-            let completed = driver.completed.take().unwrap();
+            let completed = exchange.completed.take().unwrap();
             if completed.result.is_ok() {
                 ctx.fbw_mode.class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
             }
@@ -10736,9 +10803,9 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         0
     } else {
         // SAFETY: same scoped driver cast as the completed-result arm above.
-        let driver = unsafe { &mut *(driver_pointer as *mut SubWalkDriver<'a, Sym>) };
-        let id = driver.next_frame_id;
-        driver.next_frame_id += 1;
+        let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
+        let id = exchange.next_frame_id;
+        exchange.next_frame_id += 1;
         id
     };
     let frame = SubWalkFrame {
@@ -10789,15 +10856,15 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
         // Nested descent: publish the heap frame and yield the parent at its
         // CALL.  The outer driver pushes it without another Rust `walk()`
         // activation.
-        let driver = unsafe { &mut *(driver_pointer as *mut SubWalkDriver<'a, Sym>) };
-        assert!(driver.pending.replace(frame).is_none());
+        let exchange = unsafe { &mut *(driver_pointer as *mut SubWalkExchange<'a, Sym>) };
+        assert!(exchange.pending.replace(frame).is_none());
         return Err(DispatchError::SubWalkSuspended { pc });
     }
 
     let descent_journal_before = fbw_store_journal_len();
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let mut driver = SubWalkDriver::new(frame);
-    let _driver_guard = SubWalkDriverGuard::install(&mut driver);
+    let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
     let result = driver.drive(ctx.trace_ctx);
     match result {
         Ok((outcome, class_state)) => {

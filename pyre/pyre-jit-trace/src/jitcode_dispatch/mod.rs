@@ -3503,7 +3503,10 @@ pub fn walk<Sym: WalkSym>(
             let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
             return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
         }
-        inline_call::note_subwalk_driver_step::<Sym>(ctx.trace_ctx.get_trace_position());
+        inline_call::note_subwalk_driver_step::<Sym>(
+            ctx.trace_ctx.get_trace_position(),
+            ctx.trace_ctx.heap_cache(),
+        );
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned

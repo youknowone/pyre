@@ -1024,6 +1024,15 @@ fn real_main() {
                     })
                     .collect(),
                 call_effects: build_call_effect_overrides(),
+                // `rclass.CLASSTYPE` is embedded in the translated type-info
+                // group, not allocated as an independent GC object.  Pyre's
+                // `PyType` is likewise static raw storage: it has no
+                // `GcHeader`, so fields such as `instantiate` must not acquire
+                // a GC-managed parent descr merely because the pointer travels
+                // through the Ref bank.
+                struct_storage: vec![majit_translate::StructStorageDescriptor::raw(
+                    "pyobject::PyType",
+                )],
                 ..Default::default()
             },
             jit_drivers: vec![

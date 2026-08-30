@@ -4009,7 +4009,16 @@ pub(crate) fn fbw_callee_body_replay_scan(
                     .get(descr_index)
                     .and_then(|descr| descr.as_field_descr())
                     .is_some_and(|field| field.is_immutable());
-                if !fresh_ref_regs[target_reg as usize] || !immutable_field {
+                // PyPy's `MetaInterp._interpret` owns one MIFrame per inlined
+                // call.  Replaying the caller CALL abandons and rebuilds that
+                // callee frame, so lifecycle/bookkeeping stores on the
+                // callee's own virtualizable are no more externally visible
+                // than initialization stores on a `new_with_vtable` result.
+                // A deferred call can publish the frame, at which point that
+                // ownership proof no longer holds.
+                let callee_owned_frame = vable_reg == Some(target_reg) && !deferred_call;
+                if !callee_owned_frame && (!fresh_ref_regs[target_reg as usize] || !immutable_field)
+                {
                     replay_poison!(poison, "SetfieldGcTargetNotFreshOrMutable", d.pc, d.opname);
                 }
             } else {

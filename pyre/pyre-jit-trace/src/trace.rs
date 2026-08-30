@@ -623,6 +623,15 @@ pub fn take_fbw_bridge_declined() -> bool {
     FBW_BRIDGE_DECLINED.with(|c| c.replace(false))
 }
 
+/// Start one bridge-tracing attempt with no decline inherited from a prior
+/// attempt.  A single RPython `MetaInterp.interpret()` can cross several merge
+/// points; pyre re-enters `trace_bytecode` for those segments, so clearing the
+/// bit inside `trace_bytecode` would erase a decline recorded by an earlier
+/// segment of the *same* attempt.
+pub fn reset_fbw_bridge_declined() {
+    FBW_BRIDGE_DECLINED.with(|c| c.set(false));
+}
+
 pub(crate) fn range_foriter_demoted(key: u64) -> bool {
     RANGE_FORITER_DEMOTED.with(|s| s.borrow().contains(&key))
 }
@@ -1375,7 +1384,6 @@ pub fn trace_bytecode<Sym: WalkSym>(
     WALK_END_PROPAGATED_EXCEPTION.with(|c| *c.borrow_mut() = None);
     WALK_END_PROPAGATE_ALLOWED.with(|c| c.set(allow_propagate_out));
     WALK_END_RESTART_PC.with(|c| c.set(None));
-    FBW_BRIDGE_DECLINED.with(|c| c.set(false));
     // A prior walk's opcode-effect-window sample must not alias a same-pc
     // opcode of this walk (the escape-flush latch gate reads it).
     crate::jitcode_dispatch::escape_opcode_window_reset();

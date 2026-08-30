@@ -4050,6 +4050,10 @@ pub fn trace_and_compile_from_bridge(
     // walk's live frame IS the frame whose guard failed — so it takes the same
     // any-frame-count arming.  Only the guard-state blackhole fallback below it
     // rebuilds frames, and a kept stash never reaches that path.
+    // One upstream `MetaInterp.interpret()` owns the whole resumed bridge.
+    // `jit_merge_point_keyed` may re-enter `trace_bytecode` for later merge
+    // points, so reset the per-attempt decline latch here, not per segment.
+    pyre_jit_trace::trace::reset_fbw_bridge_declined();
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(true);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
