@@ -2670,6 +2670,30 @@ pub(crate) fn slot_holds_field(slot: &dyn FieldDescr, field: &dyn FieldDescr) ->
         fn same_owner(left: &str, right: &str) -> bool {
             let left = majit_ir::descr::strip_generic_args(left);
             let right = majit_ir::descr::strip_generic_args(right);
+            // The translated explicit sum shell is deliberately accepted
+            // under both the full standard-library spelling and Charon's
+            // crate-stripped spelling (`core::option::Option` /
+            // `option::Option`, likewise `Result`).  The translator-side
+            // StructId registry proves those aliases while building the
+            // JitCode, but that build-only registry is not serialized into
+            // the generated runtime.  Recover only these two already-gated
+            // shell identities here; a general suffix comparison would merge
+            // an unrelated `mycrate::option::Option` and violate
+            // `descr.py`'s `(STRUCT, fieldname)` identity.
+            fn explicit_sum_template(name: &str) -> Option<&'static str> {
+                let segments: Vec<&str> = name.split("::").collect();
+                match segments.as_slice() {
+                    ["option", "Option"] | ["core" | "std", "option", "Option"] => Some("Option"),
+                    ["result", "Result"] | ["core" | "std", "result", "Result"] => Some("Result"),
+                    _ => None,
+                }
+            }
+            if let (Some(left), Some(right)) = (
+                explicit_sum_template(left.as_ref()),
+                explicit_sum_template(right.as_ref()),
+            ) {
+                return left == right;
+            }
             match (
                 majit_ir::descr::struct_template_id_for_name(left.as_ref()),
                 majit_ir::descr::struct_template_id_for_name(right.as_ref()),
