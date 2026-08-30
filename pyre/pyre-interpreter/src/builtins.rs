@@ -12075,6 +12075,54 @@ pub fn builtin_super_from_frame(
     ))
 }
 
+/// Where zero-argument `super()` finds its two operands in `code`'s slots.
+///
+/// `descriptor.py _get_self_location`, minus the raising.  3.11+ localsplus
+/// lets an argument cellvar share slot zero, so upstream's two branches
+/// (`locals_cells_stack_w[0]` against `_getcell(self_cell)`) become one slot
+/// read and [`self_is_cell`](Self::self_is_cell).
+///
+/// Both answers are functions of the code object alone -- `@jit.elidable`
+/// upstream -- which is what lets the tracer bake them into a recorded body.
+pub struct BareSuperFrameLayout {
+    /// `localsplus[0]` holds the `Cell` an inner scope shares, not the
+    /// receiver itself.
+    pub self_is_cell: bool,
+    /// The `__class__` freevar's slot, or `None` when `code` closes over no
+    /// such cell — `super(): __class__ cell not found`.
+    pub class_slot: Option<usize>,
+}
+
+/// [`BareSuperFrameLayout`] for `code`, or `None` for the arity `super()`
+/// rejects outright (`super(): no arguments`).
+///
+/// Shared with the tracer's `walker_bare_super_frame_slots`, which resolves the
+/// same two slots as SSA values: a second copy of this arithmetic would let the
+/// recorded body read a different slot than the walk executed, and that is a
+/// wrong receiver rather than a declined fold.
+///
+/// Neither failure is spelled as an error here, because the two raise in the
+/// opposite order to the one they are computed in: a deleted `arg[0]` is
+/// reported ahead of a missing `__class__` cell.
+pub fn bare_super_frame_layout(code: &crate::CodeObject) -> Option<BareSuperFrameLayout> {
+    if code.arg_count == 0 {
+        return None;
+    }
+    Some(BareSuperFrameLayout {
+        self_is_cell: code
+            .varnames
+            .first()
+            .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first)),
+        class_slot: code
+            .freevars
+            .iter()
+            .position(|name| name == "__class__")
+            .map(|class_freevar| {
+                code.varnames.len() + crate::pyframe::npure_cellvars(code) + class_freevar
+            }),
+    })
+}
+
 /// The `(__class__ cell, arg[0])` pair zero-argument `super()` is built from.
 ///
 /// Every raising arm here reads frame state and runs no Python, so a caller
@@ -12087,19 +12135,12 @@ fn super_operands_from_frame(
     }
     let frame = unsafe { &*frame_ptr };
     let code = frame.code();
-    if code.arg_count == 0 {
+    let Some(layout) = bare_super_frame_layout(code) else {
         return Err(crate::PyError::runtime_error("super(): no arguments"));
-    }
+    };
 
-    // CPython 3.11+ localsplus lets an argument cellvar share slot zero;
-    // this is PyPy's `_get_self_location` / `_getcell(self_cell)` branch
-    // expressed in the unified slot layout.
     let self_slot = locals_w!(frame)[0];
-    let first_arg_is_cellvar = code
-        .varnames
-        .first()
-        .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first));
-    let w_self = if first_arg_is_cellvar
+    let w_self = if layout.self_is_cell
         && !self_slot.is_null()
         && unsafe { pyre_object::is_cell(self_slot) }
     {
@@ -12111,12 +12152,11 @@ fn super_operands_from_frame(
         return Err(crate::PyError::runtime_error("super(): arg[0] deleted"));
     }
 
-    let class_freevar = code
-        .freevars
-        .iter()
-        .position(|name| name == "__class__")
-        .ok_or_else(|| crate::PyError::runtime_error("super(): __class__ cell not found"))?;
-    let class_slot = code.varnames.len() + crate::pyframe::npure_cellvars(code) + class_freevar;
+    let Some(class_slot) = layout.class_slot else {
+        return Err(crate::PyError::runtime_error(
+            "super(): __class__ cell not found",
+        ));
+    };
     let class_cell = locals_w!(frame)
         .as_slice()
         .get(class_slot)

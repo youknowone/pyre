@@ -2906,27 +2906,6 @@ fn try_walker_specialize_frame_lineno<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Whether `localsplus[0]` itself needs a cell dereference, and the slot the
-/// `__class__` cell occupies in `code`.
-///
-/// This is `pyframe.py _get_self_location` plus
-/// `builtins.rs super_operands_from_frame`: a positional argument is required,
-/// and when its name is also a cellvar the fast-local slot holds the `Cell`
-/// shared with closures rather than the receiver directly.
-fn bare_super_frame_layout(code: &pyre_interpreter::CodeObject) -> Option<(bool, usize)> {
-    if code.arg_count == 0 {
-        return None;
-    }
-    let self_is_cell = code
-        .varnames
-        .first()
-        .is_some_and(|first| code.cellvars.iter().any(|cell| cell == first));
-    let class_freevar = code.freevars.iter().position(|name| name == "__class__")?;
-    let class_slot =
-        code.varnames.len() + pyre_interpreter::pyframe::npure_cellvars(code) + class_freevar;
-    Some((self_is_cell, class_slot))
-}
-
 /// The two operands `builtins.rs super_operands_from_frame` reads off the
 /// frame, resolved as SSA values: `localsplus[0]` and the `__class__` freevar
 /// cell.
@@ -2953,8 +2932,8 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         }
         // SAFETY: the code object outlives the walk that resolved it; read-only.
         let code = unsafe { shadow.code_ptr.as_ref()? };
-        let (self_is_cell, class_slot) = bare_super_frame_layout(code)?;
-        let class_slot = class_slot as i64;
+        let layout = pyre_interpreter::builtins::bare_super_frame_layout(code)?;
+        let class_slot = layout.class_slot? as i64;
         let slot_op = |slot: i64| -> Option<OpRef> {
             let op = shadow.opref.get(&slot).copied()?;
             // Only an entry recorded through THIS level's frame register
@@ -2962,7 +2941,7 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
             // own-frame vable read applies.
             (shadow.concrete.get(&slot)?.frame_reg == shadow.fold_frame_reg).then_some(op)
         };
-        return Some((slot_op(0)?, slot_op(class_slot)?, self_is_cell));
+        return Some((slot_op(0)?, slot_op(class_slot)?, layout.self_is_cell));
     }
     // A sub-walk that owns no shadow walks a frame the standard virtualizable
     // does not name, and a trace has exactly one of those.
@@ -2985,7 +2964,8 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
     // SAFETY: the frame is the live standard virtualizable; read-only.
     let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(&*frame) };
     let code = unsafe { code_ptr.as_ref()? };
-    let (self_is_cell, class_slot) = bare_super_frame_layout(code)?;
+    let layout = pyre_interpreter::builtins::bare_super_frame_layout(code)?;
+    let class_slot = layout.class_slot?;
     // `locals_cells_stack_w` is PyFrame's only virtualizable array
     // (`virtualizable_gen.rs arrays`), so array index 0 names it.
     let info = ctx.trace_ctx.virtualizable_info()?;
@@ -3005,7 +2985,7 @@ fn walker_bare_super_frame_slots<Sym: WalkSym>(
         .trace_ctx
         .virtualizable_entry_at(info.get_index_in_array(0, class_slot, lengths))?
         .0;
-    Some((self_op, cell_op, self_is_cell))
+    Some((self_op, cell_op, layout.self_is_cell))
 }
 
 /// Zero-argument `super()` folded to the proxy itself rather than re-routed to
