@@ -29030,6 +29030,22 @@ fn coroutine_descr_finalize(args: &[PyObjectRef]) -> crate::PyResult {
     crate::baseobjspace::generator_finalize(args[0])
 }
 
+/// CPython 3.14 `_PyGen_Finalize`, routed through PyPy's async-generator hook
+/// owner when one was captured by `AsyncGenerator.init_hooks`.
+fn async_generator_descr_finalize(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__del__")?;
+    let async_generator = args[0];
+    let has_finalizer = unsafe {
+        !pyre_object::generator::w_generator_is_exhausted(async_generator)
+            && !pyre_object::generator::w_async_generator_get_finalizer(async_generator).is_null()
+    };
+    if has_finalizer {
+        crate::baseobjspace::generator_finalize(async_generator)
+    } else {
+        crate::baseobjspace::generator_close_method(&[async_generator])
+    }
+}
+
 /// PyPy `generator.py GeneratorIterator.typedef`, augmented only by the
 /// concrete slots Python 3.14 exposes on `types.GeneratorType`.
 fn init_generator_type(ns: PyObjectRef) {
@@ -29398,48 +29414,103 @@ fn init_coroutine_type(ns: PyObjectRef) {
 
 /// PyPy `generator.py AsyncGenerator.typedef`.
 fn init_async_generator_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity) in [
-        ("__repr__", async_generator_descr_repr as DunderFn, 1),
-        (
-            "asend",
-            crate::baseobjspace::async_generator_asend_method,
-            2,
-        ),
-        (
-            "aclose",
-            crate::baseobjspace::async_generator_aclose_method,
-            1,
-        ),
-        ("__aiter__", crate::baseobjspace::iter_self_method, 1),
-        (
-            "__anext__",
-            crate::baseobjspace::async_generator_anext_method,
-            1,
-        ),
-    ] {
-        unsafe {
-            pyre_object::w_dict_setitem_str_no_proxy(
-                ns,
-                name,
-                make_builtin_function_with_arity(name, function, arity),
-            )
-        };
-    }
+    // Preserve `AsyncGenerator.typedef`'s shared order first.  Python 3.14's
+    // finalizer/size entries follow the method block; PyPy's class-getitem
+    // entry remains after the descriptor block, immediately before `__doc__`.
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__repr__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__repr__",
+                async_generator_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "asend",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "asend",
+                crate::baseobjspace::async_generator_asend_method,
+                2,
+                "asend(v) -> send 'v' in generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "athrow",
-            make_builtin_function("athrow", crate::baseobjspace::async_generator_athrow_method),
-        );
-        pyre_object::w_dict_setitem_str(
+            crate::gateway::make_method_descriptor_with_doc(
+                "athrow",
+                crate::baseobjspace::async_generator_athrow_method,
+                "athrow(value)\nathrow(type[,value[,tb]])\n\nraise exception in generator.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
-            "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
-        );
+            "aclose",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "aclose",
+                crate::baseobjspace::async_generator_aclose_method,
+                1,
+                "aclose() -> raise GeneratorExit inside generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__aiter__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__aiter__",
+                crate::baseobjspace::iter_self_method,
+                1,
+                "Return an awaitable, that resolves in asynchronous iterator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__anext__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__anext__",
+                crate::baseobjspace::async_generator_anext_method,
+                1,
+                "Return a value or raise StopAsyncIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                async_generator_descr_finalize,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__sizeof__",
+                generator_descr_sizeof,
+                1,
+                "gen.__sizeof__() -> size of gen in memory, in bytes",
+            ),
+        )
     }
     for (name, getter) in [
         ("ag_running", async_generator_get_running as DunderFn),
@@ -29487,6 +29558,45 @@ fn init_async_generator_type(ns: PyObjectRef) {
                 ),
             )
         };
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "See PEP 585",
+    ));
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new("($type, object, /)"));
+    unsafe {
+        crate::function::fset_func_text_signature(
+            roots.get(function_slot),
+            roots.get(signature_slot),
+        )
+    };
+    let classmethod_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::function::w_classmethod_new(
+        roots.get(function_slot),
+    ));
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__class_getitem__",
+            roots.get(classmethod_slot),
+        )
+    }
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("asend", "($self, object, /)"),
+        ("aclose", "($self, /)"),
+        ("__aiter__", "($self, /)"),
+        ("__anext__", "($self, /)"),
+        ("__del__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 

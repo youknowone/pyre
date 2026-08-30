@@ -19825,6 +19825,27 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         }
         let frame = &*(frame_ptr as *const crate::pyframe::PyFrame);
         let last_instr = frame.last_instr;
+        // PyPy `AsyncGenerator._finalize_`: once `init_hooks` captured the
+        // interpreter-owned finalizer, it owns finalization regardless of the
+        // suspended instruction's exception-table coverage.  The generic
+        // generator cleanup optimization below applies only when no async-gen
+        // finalizer was installed.
+        if is_async_generator(gen_obj) && !w_generator_is_exhausted(gen_obj) {
+            let finalizer = w_async_generator_get_finalizer(gen_obj);
+            if !finalizer.is_null() {
+                return match crate::call::call_function_impl_result(finalizer, &[gen_obj]) {
+                    Ok(_) => Ok(w_none()),
+                    Err(mut err) => {
+                        err.write_unraisable(
+                            w_none(),
+                            Wtf8::new("async generator finalizer"),
+                            gen_obj,
+                        );
+                        Ok(w_none())
+                    }
+                };
+            }
+        }
         // generator.py Coroutine._finalize_: warn before running the
         // GeneratorOrCoroutine finalizer. The flag is set before importing or
         // calling Python code so a failing warning hook cannot warn twice.
@@ -19844,22 +19865,6 @@ pub fn generator_finalize(gen_obj: PyObjectRef) -> PyResult {
         let code = frame.code();
         let pc_bytes = (last_instr as u32) * 2; // last_instr is a word index; table is byte offsets
         if crate::pycode::lookup_exceptiontable(&code.exceptiontable, pc_bytes).is_some() {
-            if is_async_generator(gen_obj) {
-                let finalizer = w_async_generator_get_finalizer(gen_obj);
-                if !finalizer.is_null() {
-                    return match crate::call::call_function_impl_result(finalizer, &[gen_obj]) {
-                        Ok(_) => Ok(w_none()),
-                        Err(mut err) => {
-                            err.write_unraisable(
-                                w_none(),
-                                Wtf8::new("async generator finalizer"),
-                                gen_obj,
-                            );
-                            Ok(w_none())
-                        }
-                    };
-                }
-            }
             return generator_close_impl(gen_obj, false);
         }
     }

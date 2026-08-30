@@ -1187,6 +1187,40 @@ for name, doc in EXPECTED_COROUTINE_DOCS.items():
     assert getattr(types.CoroutineType, name).__doc__ == doc, name
 
 
+# async_generator_type_text_signatures_python314
+
+EXPECTED_ASYNC_GENERATOR_METHODS = {
+    "__repr__": "($self, /)",
+    "__del__": "($self, /)",
+    "__aiter__": "($self, /)",
+    "__anext__": "($self, /)",
+    "asend": "($self, object, /)",
+    "aclose": "($self, /)",
+    "__sizeof__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+}
+check_descriptors(types.AsyncGeneratorType, EXPECTED_ASYNC_GENERATOR_METHODS)
+assert types.AsyncGeneratorType.athrow.__text_signature__ is None
+
+EXPECTED_ASYNC_GENERATOR_DOCS = {
+    "__repr__": "Return repr(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__aiter__": "Return an awaitable, that resolves in asynchronous iterator.",
+    "__anext__": "Return a value or raise StopAsyncIteration.",
+    "asend": "asend(v) -> send 'v' in generator.",
+    "athrow": (
+        "athrow(value)\nathrow(type[,value[,tb]])\n\n"
+        "raise exception in generator.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "aclose": "aclose() -> raise GeneratorExit inside generator.",
+    "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
+    "__class_getitem__": "See PEP 585",
+}
+for name, doc in EXPECTED_ASYNC_GENERATOR_DOCS.items():
+    assert getattr(types.AsyncGeneratorType, name).__doc__ == doc, name
+
+
 # module_text_signatures_python314
 
 EXPECTED_MODULE_METHODS = {

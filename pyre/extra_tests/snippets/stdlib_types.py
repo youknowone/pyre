@@ -202,16 +202,17 @@ def _coroutine_type_contract():
     instance.close()
 
     unawaited = coroutine(2)
-    frame = unawaited.cr_frame
-    with warnings.catch_warnings(record=True) as recorded:
-        warnings.simplefilter("always")
-        assert unawaited.__del__() is None
-    assert unawaited.cr_frame is frame
-    assert len(recorded) == 1
-    assert recorded[0].category is RuntimeWarning
-    assert str(recorded[0].message) == (
-        "coroutine '_coroutine_type_contract.<locals>.coroutine' was never awaited"
-    )
+    if hasattr(unawaited, "__del__"):
+        frame = unawaited.cr_frame
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            assert unawaited.__del__() is None
+        assert unawaited.cr_frame is frame
+        assert len(recorded) == 1
+        assert recorded[0].category is RuntimeWarning
+        assert str(recorded[0].message) == (
+            "coroutine '_coroutine_type_contract.<locals>.coroutine' was never awaited"
+        )
     unawaited.close()
 
     if sys.implementation.name != "pypy":
@@ -223,6 +224,70 @@ def _coroutine_type_contract():
 
 
 _coroutine_type_contract()
+
+
+def _async_generator_type_contract():
+    async def async_generator(value):
+        yield value
+
+    shared_order = [
+        "__repr__",
+        "asend",
+        "athrow",
+        "aclose",
+        "__aiter__",
+        "__anext__",
+        "ag_running",
+        "ag_frame",
+        "ag_code",
+        "ag_await",
+        "__name__",
+        "__qualname__",
+        "__class_getitem__",
+        "__doc__",
+    ]
+    if sys.implementation.name == "pyre":
+        assert [
+            name
+            for name in types.AsyncGeneratorType.__dict__
+            if name in shared_order
+        ] == shared_order
+    if hasattr(types, "ClassMethodDescriptorType"):
+        assert (
+            type(types.AsyncGeneratorType.__repr__) is types.WrapperDescriptorType
+        )
+        assert type(types.AsyncGeneratorType.asend) is types.MethodDescriptorType
+        assert (
+            type(types.AsyncGeneratorType.__dict__["__class_getitem__"])
+            is types.ClassMethodDescriptorType
+        )
+
+    instance = async_generator(1)
+    if hasattr(instance, "__sizeof__"):
+        code = instance.ag_code
+        nlocalsplus = (
+            code.co_nlocals
+            + sum(name not in code.co_varnames for name in code.co_cellvars)
+            + len(code.co_freevars)
+        )
+        expected = types.AsyncGeneratorType.__basicsize__ + (
+            nlocalsplus + code.co_stacksize
+        ) * tuple.__itemsize__
+        assert instance.__sizeof__() == expected
+    if hasattr(instance, "__del__"):
+        assert instance.ag_frame is not None
+        assert instance.__del__() is None
+        assert instance.ag_frame is None
+
+    if sys.implementation.name != "pypy":
+        with assert_raises(TypeError) as raised:
+            types.AsyncGeneratorType.asend({}, None)
+        assert str(raised.exception) == (
+            "descriptor 'asend' for 'async_generator' objects doesn't apply to a 'dict' object"
+        )
+
+
+_async_generator_type_contract()
 
 
 def _function_type_kwdefaults():
