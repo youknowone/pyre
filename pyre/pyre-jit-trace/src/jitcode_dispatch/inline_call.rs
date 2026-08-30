@@ -10460,7 +10460,15 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 seed_callee_vstack_mirror(&mut walk_ctx, &frame);
             }
         }
+        // The register bank is frame-owned now, but `TraceCtx` still resolves
+        // frontend OpRefs through the currently executing MIFrame's Ref bank.
+        // Publish this frame for exactly the duration of its walk, matching
+        // the guard that surrounded every recursive sub-walk before the
+        // explicit framestack conversion.
+        let callee_bank_guard =
+            crate::trace::InlineRegisterBankGuard::enter(&raw mut *walk_ctx.registers_r);
         let result = walk(self.body.code, self.pc, &mut walk_ctx);
+        drop(callee_bank_guard);
         self.callee_shadow = walk_ctx.callee_shadow.take();
         self.inline_callee_consts = walk_ctx.inline_callee_consts;
         self.inline_poison_pcs = walk_ctx.inline_poison_pcs.take();
