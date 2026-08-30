@@ -5495,7 +5495,12 @@ impl CallControl {
             };
             // The `__majit_wrap_` test is the population filter — every
             // non-wrapper fnaddr in the binary fails it — so it is not
-            // recorded.  The missing-graph test that follows IS a decline:
+            // recorded.  That also makes the prefix the family DECLARATION,
+            // not merely a naming convention: a genuine member spelled any
+            // other way is dropped here silently, publishes an address, binds
+            // at runtime, and is simply never seeded into the BFS nor given a
+            // jitcode.  A driver that registers wrappers by hand owes them
+            // this leaf.  The missing-graph test that follows IS a decline:
             // a generated wrapper published an address but no graph, so it
             // cannot join the PBC family and every indirect site that would
             // have dispatched to it stays residual.

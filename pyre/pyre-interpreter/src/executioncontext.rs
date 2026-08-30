@@ -107,7 +107,7 @@ pub fn force_frame_before_locals_read(frame: *mut PyFrame) {
 /// vable_and_vrefs_before_residual_call` stores the boxes back before the
 /// call — which is why `flocals_read_through_bound_proxy` passes without any
 /// force.  The `f_locals` path is also already forced one frame up, by the
-/// `descr_typecheck_fget_getdictscope` gateway, so a marker at the readers
+/// `__majit_wrap_descr_typecheck_fget_getdictscope` gateway, so a marker at the readers
 /// is redundant where it would matter and new only where it costs.
 ///
 /// So the readers carry no force.

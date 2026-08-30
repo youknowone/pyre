@@ -2717,7 +2717,16 @@ pub fn code_flags_make_generator(flags: crate::CodeFlags) -> bool {
 /// half; `jtransform.py rewrite_op_jit_force_virtualizable` deletes it from
 /// jitcode.  Publishing the wrapper descriptor seeds the same candidate
 /// graph `BuiltinCode.func` would contribute from the generated wrapper.
-pub fn descr_typecheck_fget_getdictscope(
+///
+/// The `__majit_wrap_` leaf is what makes that seeding happen, and it is not
+/// decoration: `CallControl::compute_builtin_wrapper_indirect_graphs`
+/// populates the `BuiltinCode.func` PBC family by that prefix, and the family
+/// is what enters `candidate_graphs` and gets a `get_jitcode`.  Written by
+/// hand rather than by `#[pyre_methods]`, the wrapper still has to spell it —
+/// otherwise it publishes an address, binds at runtime, joins no family, and
+/// the deletion above never runs on anything, because the codewriter never
+/// looks inside this graph at all.
+pub fn __majit_wrap_descr_typecheck_fget_getdictscope(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     let f = args.get(1).copied().unwrap_or(pyre_object::PY_NULL) as *mut PyFrame;
@@ -2737,9 +2746,9 @@ static __majit_builtin_wrapper_target_fget_getdictscope: crate::gateway::Builtin
         path: concat!(
             module_path!(),
             "::",
-            stringify!(descr_typecheck_fget_getdictscope)
+            stringify!(__majit_wrap_descr_typecheck_fget_getdictscope)
         ),
-        func: descr_typecheck_fget_getdictscope,
+        func: __majit_wrap_descr_typecheck_fget_getdictscope,
     };
 
 /// `typedef.py _make_descr_typecheck_wrapper` around `PyFrame::fget_f_code`.
@@ -3429,7 +3438,7 @@ impl PyFrame {
     /// Upstream is `return self.getdictscope()`.  Optimized frames answer
     /// with a write-through `FrameLocalsProxy` instead: `lib-python/3/test/
     /// test_frame.py` `FrameLocalsProxy.__name__`.  The residual force lives
-    /// on [`descr_typecheck_fget_getdictscope`], the GetSetProperty wrapper,
+    /// on [`__majit_wrap_descr_typecheck_fget_getdictscope`], the GetSetProperty wrapper,
     /// not here — `jtransform.py rewrite_op_jit_force_virtualizable` deletes
     /// it from jitcode; the interpreter copy still runs.
     pub fn fget_getdictscope(&mut self) -> Result<PyObjectRef, crate::PyError> {
