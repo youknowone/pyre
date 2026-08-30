@@ -6058,6 +6058,21 @@ impl ClassesPBCRepr {
             },
             _ => return Err(unported("s_result is not a SomeInstance")),
         };
+        // The flowspace adapter wraps SyntheticTransparentCtor constants so
+        // Rust aggregate construction keeps the canonical ClassDef but cannot
+        // be mistaken for a semantic class call.  RPython class construction
+        // allocates first (`rtype_new_instance`, rpbc.py:1020-1021) and only
+        // then optionally dispatches `__init__` (rpbc.py:1060-1067).  A Rust
+        // `T { fields }` expresses only the first step; the following setattr
+        // chain expresses its field initializers.  Preserve that boundary even
+        // when method seeding placed a Python-level `__init__` on the class.
+        let transparent_ctor = matches!(
+            hop.args_v.borrow().first(),
+            Some(Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(host),
+                ..
+            })) if host.transparent_class_target().is_some()
+        );
         // upstream `s_init = classdef.classdesc.s_read_attribute('__init__')`.
         let classdesc = classdef.borrow().classdesc.clone();
         let s_init = ClassDesc::s_read_attribute(&classdesc, "__init__")
@@ -6083,9 +6098,6 @@ impl ClassesPBCRepr {
         // class-default initialisation loop (rclass.py:752-769) like
         // any other; a field without a class-level default keeps the
         // malloc zero-init.
-        if !init_is_impossible {
-            return Err(unported("class has __init__ (rpbc.py:1060-1067)"));
-        }
         if classdef.borrow().minid.is_none() {
             // Number this mid-session-minted classdef on demand.
             // `assign_inheritance_ids` is append-stable, so re-running it
@@ -6100,6 +6112,25 @@ impl ClassesPBCRepr {
             if classdef.borrow().minid.is_none() {
                 return Err(unported("class not numbered (assign_inheritance_ids)"));
             }
+        }
+
+        if transparent_ctor && hop.nb_args() == 1 {
+            let v_instance = {
+                let mut llops = hop.llops.borrow_mut();
+                crate::translator::rtyper::rclass::rtype_new_instance(
+                    &rtyper,
+                    Some(&classdef),
+                    &mut llops,
+                    Some(hop),
+                    false,
+                )?
+            };
+            hop.exception_cannot_occur()?;
+            return Ok(Some(v_instance));
+        }
+
+        if !init_is_impossible {
+            return Err(unported("class has __init__ (rpbc.py:1060-1067)"));
         }
 
         // upstream rpbc.py:1024-1035 — simple built-in exception special

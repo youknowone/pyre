@@ -843,11 +843,12 @@ pub enum OpKind {
     /// RPython `malloc(STRUCT, flavor='gc')` for a fixed-size GcStruct: the
     /// heap allocation of a boxed object (`runtime_object::lltype::malloc_typed`).
     /// Lowered to the `new_with_vtable` jitcode op (executor
-    /// `OpCode::NewWithVtable`). `owner` is the struct leaf (e.g.
-    /// `"W_FloatObject"`); the assembler resolves the size descriptor from it
-    /// via `bh_size_spec_from_callcontrol`, whose `path_hash(owner)` keys the
-    /// runtime `gc_cache._cache_size` Arc carrying the struct size + gc
-    /// type-id.
+    /// `OpCode::NewWithVtable`). `owner` is the crate-stripped nominal struct
+    /// path (e.g. `"floatobject::W_FloatObject"`); the assembler resolves the
+    /// size descriptor from it via `bh_size_spec_from_callcontrol`, whose
+    /// `path_hash(owner)` keys the runtime `gc_cache._cache_size` Arc carrying
+    /// the struct size + gc type-id.  Synthetic fixtures without a registered
+    /// path retain their exact bare owner.
     ///
     /// `vtable` is the type-pointer (the `&FLOAT_TYPE` / `&INT_TYPE` /
     /// `&COMPLEX_TYPE` static address) the runtime stamps into the fresh
@@ -3137,6 +3138,57 @@ pub fn remove_dead_aggregates(graph: &mut FunctionGraph) -> usize {
     total_removed
 }
 
+/// Resolve one registered struct layout without discarding nominal identity.
+///
+/// RPython indexes layouts by the live `lltype.Struct` object.  Pyre's
+/// corresponding identity is `StructId`; a bare leaf match is not admissible
+/// because two modules may define the same leaf.  Exact string hits remain
+/// valid for synthetic/test layouts that have no StructId registration.
+fn registered_struct_layout<'a>(
+    owner: &str,
+    struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> Option<&'a Vec<(String, ValueType)>> {
+    if let Some(exact) = struct_field_attrs.get(owner) {
+        return Some(exact);
+    }
+    let owner_id = majit_ir::descr::struct_id_for_name(owner)?;
+    let mut matches = struct_field_attrs.iter().filter_map(|(key, rows)| {
+        (majit_ir::descr::struct_id_for_name(key) == Some(owner_id)).then_some(rows)
+    });
+    let first = matches.next()?;
+    matches.all(|rows| rows == first).then_some(first)
+}
+
+/// The nominal struct identity carried by a resolved transparent constructor.
+///
+/// `front::mir` records Charon's full declaration path on `owner_path`.  The
+/// runtime descriptor namespace strips only this workspace's crate root, so
+/// preserve every remaining module segment instead of collapsing back to the
+/// leaf.  This is the Rust-source counterpart of RPython carrying the same
+/// `lltype.Struct` object from `malloc(STRUCT)` into every layout/descr lookup.
+fn synthetic_transparent_ctor_owner(
+    target: &CallTarget,
+    source_crate: Option<&str>,
+) -> Option<String> {
+    let CallTarget::SyntheticTransparentCtor {
+        name, owner_path, ..
+    } = target
+    else {
+        return None;
+    };
+    let mut segments = owner_path.as_slice();
+    if segments.first().is_some_and(|root| {
+        source_crate == Some(root.as_str()) || crate::local_crates::is_local_crate_root(root)
+    }) {
+        segments = &segments[1..];
+    }
+    if segments.is_empty() {
+        Some(name.clone())
+    } else {
+        Some(format!("{}::{name}", segments.join("::")))
+    }
+}
+
 /// Lower `core::ptr::write(raw as *mut T, T { fields... })` to field stores.
 ///
 /// This is the Rust-source spelling of RPython's ordinary alloc-then-init
@@ -3165,20 +3217,6 @@ pub fn lower_struct_ptr_writes(
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
 ) -> usize {
     use crate::flowspace::model::Variable;
-
-    fn registered_layout<'a>(
-        owner: &str,
-        struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    ) -> Option<&'a Vec<(String, ValueType)>> {
-        if let Some(exact) = struct_field_attrs.get(owner) {
-            return Some(exact);
-        }
-        let mut leaf_matches = struct_field_attrs
-            .iter()
-            .filter(|(key, _)| key.rsplit("::").next() == Some(owner));
-        let (_, only) = leaf_matches.next()?;
-        (leaf_matches.next().is_none()).then_some(only)
-    }
 
     fn producer_root(graph: &FunctionGraph, var: &Variable, depth: u32) -> Option<Variable> {
         if depth == 0 {
@@ -3224,6 +3262,46 @@ pub fn lower_struct_ptr_writes(
         destination: Variable,
         stores: Vec<(FieldDescriptor, LinkArg, ValueType)>,
         result: Option<Variable>,
+    }
+
+    // `checkgraph` validates SSI scope, but validity alone does not prove that
+    // a store observed while scanning the whole graph executes before the
+    // ptr::write.  Compute ordinary block dominators and require every source
+    // FieldWrite to dominate the call site before moving it there.
+    let block_count = graph.blocks.len();
+    let mut predecessors = vec![HashSet::new(); block_count];
+    for (source, block) in graph.blocks.iter().enumerate() {
+        for link in &block.exits {
+            predecessors[link.target.0].insert(source);
+        }
+    }
+    let all_blocks: HashSet<usize> = (0..block_count).collect();
+    let start = graph.startblock.0;
+    let mut dominators = vec![all_blocks.clone(); block_count];
+    dominators[start] = HashSet::from([start]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in 0..block_count {
+            if block == start {
+                continue;
+            }
+            let mut predecessor_iter = predecessors[block].iter().copied();
+            let mut next = if let Some(first) = predecessor_iter.next() {
+                let mut intersection = dominators[first].clone();
+                for predecessor in predecessor_iter {
+                    intersection.retain(|candidate| dominators[predecessor].contains(candidate));
+                }
+                intersection
+            } else {
+                HashSet::new()
+            };
+            next.insert(block);
+            if next != dominators[block] {
+                dominators[block] = next;
+                changed = true;
+            }
+        }
     }
 
     let mut rewrites = Vec::new();
@@ -3274,47 +3352,76 @@ pub fn lower_struct_ptr_writes(
                 .iter()
                 .flat_map(|block| &block.operations)
                 .find_map(|candidate| match (&candidate.result, &candidate.kind) {
-                    (
-                        Some(result),
-                        OpKind::Call {
-                            target: CallTarget::SyntheticTransparentCtor { name, .. },
-                            ..
-                        },
-                    ) if result == &aggregate => Some(name.as_str()),
+                    (Some(result), OpKind::Call { target, .. }) if result == &aggregate => {
+                        synthetic_transparent_ctor_owner(target, graph.name.split("::").next())
+                    }
                     _ => None,
                 });
-            if destination_owner.is_none() || destination_owner != aggregate_owner {
+            let same_owner = destination_owner
+                .zip(aggregate_owner.as_deref())
+                .is_some_and(|(destination, aggregate)| {
+                    destination == aggregate
+                        || majit_ir::descr::struct_id_for_name(destination)
+                            .zip(majit_ir::descr::struct_id_for_name(aggregate))
+                            .is_some_and(|(destination_id, aggregate_id)| {
+                                destination_id == aggregate_id
+                            })
+                });
+            if !same_owner {
                 continue;
             }
-            // KNOWN GAP: this scans EVERY block, and each matched store's
-            // `value` is spliced verbatim into the call's block below. Only
-            // the `base` is proven in scope (`producer_root`); the `value` is
-            // not. `checkgraph` (`flowspace/model.py`) resets its `vars` per
-            // block and errors on a cross-block use, so a store whose value is
-            // defined in a block that does not reach the call builds a graph
-            // the port's own checker rejects — and nothing in `front::mir`
-            // calls `checkgraph`, so it surfaces later in `translator`.
-            // Restricting the scan to the call's own block is the fail-closed
-            // fix, but it also drops the multi-block shape this pass exists
-            // for; the real fix is a dominance test on each `value`.
+            // `checkgraph` (`flowspace/model.py:598-608`) permits an operation
+            // to use only constants, its block's inputargs, or variables
+            // defined earlier in that block.  A FieldWrite found on another
+            // aggregate path may carry a predecessor-local Variable; splicing
+            // that Variable verbatim here would create invalid SSI even when
+            // its producer dominates this block.  Until the pass can rethread
+            // such a value through the incoming links, decline the whole
+            // rewrite unless every stored value is already in scope here.
+            let value_is_in_scope = |value: &LinkArg| match value {
+                LinkArg::Const(_) => true,
+                LinkArg::Value(value) => {
+                    block.inputargs.contains(value)
+                        || block.operations[..oi]
+                            .iter()
+                            .any(|candidate| candidate.result.as_ref() == Some(value))
+                }
+            };
             let stores: Vec<_> = graph
                 .blocks
                 .iter()
-                .flat_map(|block| &block.operations)
-                .filter_map(|candidate| match &candidate.kind {
+                .enumerate()
+                .flat_map(|(store_bi, store_block)| {
+                    store_block
+                        .operations
+                        .iter()
+                        .enumerate()
+                        .map(move |(store_oi, candidate)| (store_bi, store_oi, candidate))
+                })
+                .filter_map(|(store_bi, store_oi, candidate)| match &candidate.kind {
                     OpKind::FieldWrite {
                         base,
                         field,
                         value,
                         ty,
                     } if producer_root(graph, base, 16).as_ref() == Some(&aggregate) => {
-                        Some((field.clone(), value.clone(), ty.clone()))
+                        Some((store_bi, store_oi, field.clone(), value.clone(), ty.clone()))
                     }
                     _ => None,
                 })
                 .collect();
-            let Some(layout) = registered_layout(
-                destination_owner.expect("owner equality checked"),
+            if stores.iter().any(|(store_bi, store_oi, _, value, _)| {
+                let store_dominates_call = if *store_bi == bi {
+                    *store_oi < oi
+                } else {
+                    dominators[bi].contains(store_bi)
+                };
+                !store_dominates_call || !value_is_in_scope(value)
+            }) {
+                continue;
+            }
+            let Some(layout) = registered_struct_layout(
+                aggregate_owner.as_deref().expect("owner equality checked"),
                 struct_field_attrs,
             ) else {
                 continue;
@@ -3325,7 +3432,9 @@ pub fn lower_struct_ptr_writes(
             let mut ordered_stores = Vec::with_capacity(layout.len());
             let mut complete = true;
             for (name, _) in layout {
-                let mut matches = stores.iter().filter(|(field, _, _)| &field.name == name);
+                let mut matches = stores
+                    .iter()
+                    .filter(|(_, _, field, _, _)| &field.name == name);
                 let Some(store) = matches.next() else {
                     complete = false;
                     break;
@@ -3334,7 +3443,7 @@ pub fn lower_struct_ptr_writes(
                     complete = false;
                     break;
                 }
-                ordered_stores.push(store.clone());
+                ordered_stores.push((store.2.clone(), store.3.clone(), store.4.clone()));
             }
             if !complete {
                 continue;
@@ -3455,7 +3564,7 @@ pub fn fuse_boxing_alloc(
         struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     ) -> Option<Vec<(String, ValueType)>> {
         Some(
-            registered_layout(owner, struct_field_attrs)?
+            registered_struct_layout(owner, struct_field_attrs)?
                 .iter()
                 .filter(|(name, _)| !is_header_field(name))
                 .cloned()
@@ -3463,31 +3572,7 @@ pub fn fuse_boxing_alloc(
         )
     }
 
-    /// `owner`'s registered field layout, in struct-declaration order.
-    ///
-    /// The ctor carries the bare struct leaf (`W_FloatObject`) while the map is
-    /// keyed by the crate-stripped qualified path (`floatobject::W_FloatObject`),
-    /// so fall back to a leaf match when the exact key misses.
-    fn registered_layout<'a>(
-        owner: &str,
-        struct_field_attrs: &'a std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    ) -> Option<&'a Vec<(String, ValueType)>> {
-        if let Some(exact) = struct_field_attrs.get(owner) {
-            return Some(exact);
-        }
-        let mut leaf_matches = struct_field_attrs
-            .iter()
-            .filter(|(k, _)| k.rsplit("::").next() == Some(owner));
-        let (_, only) = leaf_matches.next()?;
-        if leaf_matches.next().is_some() {
-            // The layout owner is ambiguous. As with an unknown owner, leave
-            // `malloc_typed` residual instead of choosing one map row by
-            // HashMap iteration order.
-            return None;
-        }
-        Some(only)
-    }
-
+    // `owner`'s registered field layout, in struct-declaration order.
     let is_gc_malloc = |target: &CallTarget| -> bool {
         matches!(target, CallTarget::FunctionPath { segments }
             if segments.len() >= 2
@@ -3715,17 +3800,13 @@ pub fn fuse_boxing_alloc(
             .iter()
             .flat_map(|b| &b.operations)
             .find_map(|op| match (&op.result, &op.kind) {
-                (
-                    Some(r),
-                    OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { name, .. },
-                        ..
-                    },
-                ) if r == root => Some(name.clone()),
+                (Some(r), OpKind::Call { target, .. }) if r == root => {
+                    synthetic_transparent_ctor_owner(target, graph.name.split("::").next())
+                }
                 _ => None,
             });
         let Some(owner) = owner else { return false };
-        registered_layout(&owner, struct_field_attrs)
+        registered_struct_layout(&owner, struct_field_attrs)
             .is_some_and(|rows| rows.iter().all(|(name, _)| name != "w_class"))
     }
     struct Payload {
@@ -3970,13 +4051,9 @@ pub fn fuse_boxing_alloc(
                 .iter()
                 .flat_map(|b| &b.operations)
                 .find_map(|o| match (&o.result, &o.kind) {
-                    (
-                        Some(r),
-                        OpKind::Call {
-                            target: CallTarget::SyntheticTransparentCtor { name, .. },
-                            ..
-                        },
-                    ) if r == agg => Some(name.clone()),
+                    (Some(r), OpKind::Call { target, .. }) if r == agg => {
+                        synthetic_transparent_ctor_owner(target, graph.name.split("::").next())
+                    }
                     _ => None,
                 });
             let Some(owner) = owner else {
@@ -7254,6 +7331,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transparent_ctor_owner_preserves_nominal_path_and_strips_local_crate() {
+        let local = CallTarget::synthetic_transparent_struct_ctor(
+            vec!["pyre_object".into(), "intobject".into()],
+            "W_IntObject",
+        );
+        assert_eq!(
+            synthetic_transparent_ctor_owner(&local, Some("pyre_object")).as_deref(),
+            Some("intobject::W_IntObject")
+        );
+
+        let foreign = CallTarget::synthetic_transparent_struct_ctor(
+            vec!["foreign_crate".into(), "shadow".into()],
+            "W_IntObject",
+        );
+        assert_eq!(
+            synthetic_transparent_ctor_owner(&foreign, Some("pyre_object")).as_deref(),
+            Some("foreign_crate::shadow::W_IntObject")
+        );
+    }
+
     /// `CallTarget::SyntheticTransparentCtor::path_segments()` must
     /// return the full `(owner_path..., name)` join — `front/mir.rs`
     /// `Aggregate` / `ShallowInitBox` lowerings rely on the qualified
@@ -8021,30 +8119,200 @@ mod tests {
         );
     }
 
-    /// The four numeric boxing structs' field layouts, keyed by the
-    /// crate-stripped qualified path (`floatobject::W_FloatObject`) the front
-    /// end registers — exercising `fuse_boxing_alloc`'s leaf-fallback lookup
-    /// (the ctor carries only the bare `W_FloatObject` leaf).  Each row is the
-    /// full field layout including `ob_header`, matching what
-    /// `derive_program_metadata` builds.
+    #[test]
+    fn lower_struct_ptr_writes_declines_predecessor_local_store_value() {
+        // The aggregate is constructed in `entry`, but only the aggregate
+        // itself is threaded into `write_block`.  Re-emitting its field store
+        // there with `value` would introduce a cross-block Variable use that
+        // flowspace.checkgraph rejects.  The ptr::write must remain residual
+        // until the value is explicitly threaded through an inputarg.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let value = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let aggregate = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Payload"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("Payload".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: aggregate.clone(),
+                field: FieldDescriptor {
+                    name: "item".into(),
+                    owner_root: Some("Payload".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::Value(value),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let (write_block, carried) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(entry, write_block, vec![aggregate]);
+        let raw = graph
+            .push_op_var(write_block, OpKind::ConstRefNull, true)
+            .unwrap();
+        let destination = graph
+            .push_op_var(
+                write_block,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__cast_instance_intrinsic".into(), "Payload".into()],
+                    },
+                    args: vec![raw],
+                    result_ty: ValueType::Ref(Some("Payload".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            write_block,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "ptr".into(), "write".into()],
+                },
+                args: vec![destination, carried[0].clone()],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(write_block, None);
+
+        let attrs = std::collections::HashMap::from([(
+            "Payload".to_string(),
+            vec![("item".to_string(), ValueType::Int)],
+        )]);
+        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
+        assert!(graph.block(write_block).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments }, .. }
+                    if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+            )
+        }));
+    }
+
+    #[test]
+    fn lower_struct_ptr_writes_declines_nondominating_constant_store() {
+        // A literal value is valid in every block, but the store itself is
+        // conditional. Hoisting it to the merge would initialize objects that
+        // took the other arm, so dominance is required independently of SSI
+        // value scope.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let aggregate = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Payload"),
+                    args: vec![],
+                    result_ty: ValueType::Ref(Some("Payload".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (left, left_args) = graph.create_block_with_arg_vars(1);
+        let (right, right_args) = graph.create_block_with_arg_vars(1);
+        let (join, joined) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::from_variables(
+                    &graph,
+                    vec![aggregate.clone()],
+                    left,
+                    Some(ExitCase::Bool(true)),
+                ),
+                Link::from_variables(&graph, vec![aggregate], right, Some(ExitCase::Bool(false))),
+            ],
+        );
+        graph.push_op_var(
+            left,
+            OpKind::FieldWrite {
+                base: left_args[0].clone(),
+                field: FieldDescriptor {
+                    name: "item".into(),
+                    owner_root: Some("Payload".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                },
+                value: LinkArg::from(ConstValue::Int(7)),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_goto(left, join, vec![left_args[0].clone()]);
+        graph.set_goto(right, join, vec![right_args[0].clone()]);
+        let raw = graph.push_op_var(join, OpKind::ConstRefNull, true).unwrap();
+        let destination = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["__cast_instance_intrinsic".into(), "Payload".into()],
+                    },
+                    args: vec![raw],
+                    result_ty: ValueType::Ref(Some("Payload".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            join,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["core".into(), "ptr".into(), "write".into()],
+                },
+                args: vec![destination, joined[0].clone()],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(join, None);
+
+        let attrs = std::collections::HashMap::from([(
+            "Payload".to_string(),
+            vec![("item".to_string(), ValueType::Int)],
+        )]);
+        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
+    }
+
+    /// The four numeric boxing structs' complete field layouts. Synthetic
+    /// fixtures have no StructId registry, so they publish the exact owner
+    /// spelling carried by their constructor; production qualified aliases
+    /// resolve through `registered_struct_layout`'s StructId lookup.
     fn numeric_boxing_attrs() -> std::collections::HashMap<String, Vec<(String, ValueType)>> {
         std::collections::HashMap::from([
             (
-                "floatobject::W_FloatObject".to_string(),
+                "W_FloatObject".to_string(),
                 vec![
                     ("ob_header".to_string(), ValueType::Ref(None)),
                     ("floatval".to_string(), ValueType::Float),
                 ],
             ),
             (
-                "intobject::W_IntObject".to_string(),
+                "W_IntObject".to_string(),
                 vec![
                     ("ob_header".to_string(), ValueType::Ref(None)),
                     ("intval".to_string(), ValueType::Int),
                 ],
             ),
             (
-                "complexobject::W_ComplexObject".to_string(),
+                "W_ComplexObject".to_string(),
                 vec![
                     ("ob_header".to_string(), ValueType::Ref(None)),
                     ("real".to_string(), ValueType::Float),
@@ -8052,7 +8320,7 @@ mod tests {
                 ],
             ),
             (
-                "longobject::W_LongObject".to_string(),
+                "W_LongObject".to_string(),
                 vec![
                     ("ob_header".to_string(), ValueType::Ref(None)),
                     ("value".to_string(), ValueType::Ref(None)),
@@ -8212,6 +8480,10 @@ mod tests {
 
         let mut ambiguous_graph = graph.clone();
         let mut ambiguous_attrs = numeric_boxing_attrs();
+        let float_rows = ambiguous_attrs
+            .remove("W_FloatObject")
+            .expect("fixture float layout");
+        ambiguous_attrs.insert("floatobject::W_FloatObject".to_string(), float_rows);
         ambiguous_attrs.insert(
             "shadow::W_FloatObject".to_string(),
             vec![
@@ -9668,10 +9940,10 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(ret.clone()));
 
-        // Layout keyed by the crate-stripped qualified path; the ctor carries
-        // only the bare `W_SetObject` leaf, exercising the leaf-fallback lookup.
+        // Synthetic fixtures have no StructId registry, so use the ctor's
+        // exact owner spelling. Production qualified aliases resolve by id.
         let attrs = std::collections::HashMap::from([(
-            "setobject::W_SetObject".to_string(),
+            "W_SetObject".to_string(),
             vec![
                 ("ob_header".to_string(), ValueType::Ref(None)),
                 ("items".to_string(), ValueType::Ref(None)),
@@ -9869,9 +10141,9 @@ mod tests {
             graph
         }
 
-        // The header layouts are keyed by their crate-stripped qualified path
-        // while the ctor carries the bare leaf, so every row also exercises
-        // `registered_layout`'s leaf fallback.
+        // Synthetic fixtures have no StructId registry, so publish the exact
+        // owner spelling the ctor carries. Production aliases resolve through
+        // `registered_struct_layout`'s StructId lookup, never by leaf name.
         let one_word: &[&str] = &["ob_type"];
         let two_word: &[&str] = &["ob_type", "w_class"];
         let rows: [(&str, &str, Option<&[&str]>, WClass, usize); 6] = [
@@ -9922,20 +10194,18 @@ mod tests {
             let mut graph = cluster(header_owner, &w_class);
             let entry = graph.startblock;
             let mut attrs = std::collections::HashMap::from([(
-                "intobject::W_IntObject".to_string(),
+                "W_IntObject".to_string(),
                 vec![
                     ("ob_header".to_string(), ValueType::Ref(None)),
                     ("intval".to_string(), ValueType::Int),
                 ],
             )]);
             if let Some(names) = layout {
-                attrs.insert(
-                    format!("object::{header_owner}"),
-                    names
-                        .iter()
-                        .map(|name| ((*name).to_string(), ValueType::Ref(None)))
-                        .collect(),
-                );
+                let rows = names
+                    .iter()
+                    .map(|name| ((*name).to_string(), ValueType::Ref(None)))
+                    .collect();
+                attrs.insert(header_owner.to_string(), rows);
             }
             assert_eq!(
                 fuse_boxing_alloc(&mut graph, &attrs),

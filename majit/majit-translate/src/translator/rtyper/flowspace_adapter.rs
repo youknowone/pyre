@@ -2470,7 +2470,8 @@ pub fn translate_op(
                             return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
                         }
                     }
-                    // Fail-closed on an UNFUSED `lltype::malloc[_typed]`. A GC
+                    // Fail-closed on an UNFUSED
+                    // `lltype::malloc[_typed/_managed/_stable]`. A GC
                     // struct gets its `NewWithVtable` lowering before the rtyper
                     // runs only where `fuse_boxing_alloc` (`model.rs`) could
                     // resolve the cluster's header: a constant `ob_type`
@@ -2494,11 +2495,14 @@ pub fn translate_op(
                         && segments[segments.len() - 2] == "lltype"
                         && matches!(
                             segments[segments.len() - 1].as_str(),
-                            "malloc" | "malloc_typed" | "malloc_typed_managed"
+                            "malloc"
+                                | "malloc_typed"
+                                | "malloc_typed_managed"
+                                | "malloc_typed_stable"
                         )
                     {
                         return Err(TyperError::message(
-                            "`lltype::malloc[_typed/_managed]` survived fuse_boxing_alloc unfused; \
+                            "`lltype::malloc[_typed/_managed/_stable]` survived fuse_boxing_alloc unfused; \
                              the cluster's header did not resolve to a constant type \
                              pointer standing for its own `w_class`, so no safe \
                              malloc->new lowering could be proven"
@@ -2790,7 +2794,7 @@ pub fn translate_op(
                     // the field repr's interned classdef (rtyper
                     // convert_from_to has no common base → typer error), and
                     // two `()` values meeting at a join can never union.
-                    let host = if owner_path.is_empty() {
+                    let class_host = if owner_path.is_empty() {
                         // Match the aggregate-kind placeholder tag by its
                         // instantiation-stripped root so a per-shape tuple
                         // (`Tuple<f64,f64>`, `Tuple<BigInt,BigInt>`) interns
@@ -2904,6 +2908,12 @@ pub fn translate_op(
                             }
                         }
                     };
+                    // Keep the canonical class identity for annotation, but
+                    // retain that this is Rust `T { fields }`, not a semantic
+                    // Python `T(...)` call.  ClassesPBCRepr consumes this
+                    // wrapper by selecting only RPython's rtype_new_instance
+                    // step, so a registered app-level `__init__` cannot run.
+                    let host = HostObject::new_transparent_class_ctor(class_host);
                     let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
                     let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
                     call_args.push(callable);
@@ -5879,8 +5889,9 @@ mod tests {
     #[test]
     fn translate_op_call_synthetic_transparent_ctor_lowers_to_simple_call() {
         // Call::SyntheticTransparentCtor mirrors Rust's `Class { fields }`
-        // ctor — flowspace receives a `simple_call(class_const, fields)`
-        // shape just like FunctionPath; rtyper's InstanceRepr handles it.
+        // ctor.  Flowspace still receives `simple_call(class_const, fields)`,
+        // but its call-site wrapper keeps rtyping on rtype_new_instance and
+        // prevents a registered semantic `__init__` from being dispatched.
         let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
         let mut graph = LegacyGraph::new("translate_op_fixture");
         let vars = mint_vars(&mut graph, 11); // vars[0..11]
@@ -5905,6 +5916,12 @@ mod tests {
             panic!("ctor callable must be ConstValue::HostObject");
         };
         assert_eq!(host.qualname(), "Point");
+        assert_eq!(
+            host.transparent_class_target()
+                .expect("synthetic ctor must retain its call-site marker")
+                .qualname(),
+            "Point"
+        );
     }
 
     #[test]

@@ -82,6 +82,11 @@ pub(crate) struct MapOrSite {
     /// The `Option`'s payload `T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` field kind (the closure's unwrapped input).
     pub payload_ty: ValueType,
+    /// The concrete RPython instance class carried by a reference payload.
+    /// The synthesized tuple writer uses it to retain the field annotation
+    /// that `InstanceRepr._setup_repr` consumes
+    /// (`rpython/rtyper/rclass.py:501-509`).
+    pub payload_class_root: Option<String>,
     /// The `map_or` result `U` projected to a [`ValueType`] — the `call_once`
     /// result kind and the select result kind.
     pub result_ty: ValueType,
@@ -267,7 +272,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
     };
     // The closure's `Args` tuple `(payload,)` — the transparent-ctor + a
     // single `__pos_0` FieldWrite, the same shape `Rvalue::Aggregate` emits for
-    // a tuple (write ty `Ref(None)`).  The owner carries the per-shape `<X>`
+    // a tuple.  The owner carries the per-shape `<X>`
     // suffix (`Tuple<FrameDebugData>`) so it keys under the same classdef the
     // extracted `call_once` reads `.0` from at `resolve_place`.
     let tuple_owner = format!("Tuple{}", site.args_tuple_suffix);
@@ -280,6 +285,11 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
             result_ty: ValueType::Ref(Some(tuple_owner.clone())),
         },
     });
+    // Preserve the source instance annotation at the producing write.  This
+    // is the same ordinary narrowing used for pointer-valued call results;
+    // weakening the shared Tuple field would diverge from RPython's concrete
+    // `InstanceRepr` field setup (`rclass.py:501-509`).
+    let payload = emit_narrow(graph, then_bb, payload, &site.payload_class_root);
     graph.block_mut(then_bb).operations.push(SpaceOperation {
         result: None,
         kind: OpKind::FieldWrite {
@@ -292,7 +302,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
                 taken_by_address: false,
             },
             value: LinkArg::Value(payload),
-            ty: ValueType::Ref(None),
+            ty: site.payload_ty.clone(),
         },
     });
     let call_result = graph.alloc_value_var();
@@ -424,6 +434,7 @@ mod tests {
             some_owner: "core::option::Option::Some".into(),
             call_once_owner: "test::closure".into(),
             payload_ty: ValueType::Int,
+            payload_class_root: None,
             result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
@@ -578,6 +589,59 @@ mod tests {
             })
             .count();
         assert_eq!(narrow_casts, 2, "each diamond arm re-applies the narrowing");
+    }
+
+    #[test]
+    fn rewrite_preserves_reference_payload_class_in_closure_tuple() {
+        let mut g = FunctionGraph::new("test_map_or_payload_class");
+        let a = g.startblock;
+        let opt = g.push_op_var(a, OpKind::ConstRefNull, true).unwrap();
+        let default = g.push_op_var(a, OpKind::ConstInt(42), true).unwrap();
+        let env = g.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("map_or", Some("core::option::Option".into())),
+                    args: vec![opt, default, env],
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = g.create_block_with_arg_vars(1);
+        g.set_return(b, None);
+        g.set_goto(a, b, vec![result.clone()]);
+
+        let mut site = map_or_site(result);
+        site.payload_ty = ValueType::Ref(None);
+        site.payload_class_root = Some("PyObject".to_string());
+        site.args_tuple_suffix = "<*mut PyObject>".to_string();
+        assert_eq!(rewire_map_or_call_sites(&mut g, &[site]), 1);
+
+        let written = g
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. }
+                    if field.owner_root.as_deref() == Some("Tuple<*mut PyObject>") =>
+                {
+                    value.as_variable().cloned()
+                }
+                _ => None,
+            })
+            .expect("closure Args tuple payload write");
+        assert!(g.blocks.iter().flat_map(|block| &block.operations).any(|op| {
+            op.result.as_ref() == Some(&written)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[crate::runtime_names::shims::CAST_INSTANCE, "PyObject"]
+                )
+        }));
     }
 
     /// A call block whose last op is not the recorded result declines

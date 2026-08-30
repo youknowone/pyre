@@ -2241,21 +2241,23 @@ pub fn lower_fun_decl_with_static_addrs(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
-    // Derive the struct field-layout map the boxing-alloc fusion reads
-    // (`fuse_boxing_alloc`).  The whole-program build lowers each function
-    // through the `_with_attrs` variant with a single precomputed map; this
-    // stand-alone entry (used by the reader / tests) derives it per call from
-    // the same source of truth so the fusion fires identically.
-    let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
-    let jitdriver_receiver_roots =
-        crate::codewriter::jtransform::default_jitdriver_receiver_roots();
-    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
-        llbc,
-        fd,
-        static_addrs,
-        &jitdriver_receiver_roots,
-        &struct_field_attrs,
-    )
+    crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
+        // Derive the struct field-layout map the boxing-alloc fusion reads
+        // (`fuse_boxing_alloc`).  The whole-program build lowers each function
+        // through the `_with_attrs` variant with a single precomputed map; this
+        // stand-alone entry (used by the reader / tests) derives it per call from
+        // the same source of truth so the fusion fires identically.
+        let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
+        let jitdriver_receiver_roots =
+            crate::codewriter::jtransform::default_jitdriver_receiver_roots();
+        lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+            llbc,
+            fd,
+            static_addrs,
+            &jitdriver_receiver_roots,
+            &struct_field_attrs,
+        )
+    })
 }
 
 /// The `struct_field_attrs` projection of [`derive_program_metadata`] —
@@ -14090,6 +14092,44 @@ impl<'a> Lowering<'a> {
         ))
     }
 
+    /// The RPython instance class carried by an `Option<T>` payload when `T`
+    /// is a raw/reference pointer to a registered GC object.  `ValueType`
+    /// records only the register bank, so a `Ref(None)` payload needs its
+    /// source class recorded on the closure-rewrite site until the synthesized
+    /// writer can emit the ordinary instance-narrowing cast.  This preserves
+    /// the concrete field annotation that RPython's `InstanceRepr._setup_repr`
+    /// consumes (`rpython/rtyper/rclass.py:501-509`).
+    fn option_payload_instance_class_root(&self, option_ty: &TyRef) -> Option<String> {
+        let mut payload = tyref_node(option_ty, self.llbc)?
+            .as_object()?
+            .get("Adt")?
+            .get("generics")?
+            .get("types")?
+            .get(0)?;
+        loop {
+            let obj = payload.as_object()?;
+            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+                payload = self.llbc.dedup_body(id)?;
+                continue;
+            }
+            if let Some(parts) = obj
+                .get("HashConsedValue")
+                .and_then(serde_json::Value::as_array)
+                && parts.len() == 2
+            {
+                payload = &parts[1];
+                continue;
+            }
+            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
+                return Some(root);
+            }
+            let pointee = obj.get("Ref")?.as_array()?.get(1)?;
+            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
+            return raw_ptr_pointee_class_root(pointee, self.llbc)
+                .or_else(|| adt_node_class_root(pointee, self.llbc));
+        }
+    }
+
     /// The per-instantiation `Option` enum root for a residual-call
     /// destination `dest_ty` that is an `Option<*mut RegisteredStruct>`
     /// (`Option<PyObjectRef>`) or an `Option<SplitEligibleEnum>`
@@ -14165,34 +14205,7 @@ impl<'a> Lowering<'a> {
         if !self.tyref_is_niche_option_ptr(dest_ty) {
             return None;
         }
-        let mut payload = tyref_node(dest_ty, self.llbc)?
-            .as_object()?
-            .get("Adt")?
-            .get("generics")?
-            .get("types")?
-            .get(0)?;
-        loop {
-            let obj = payload.as_object()?;
-            if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-                payload = self.llbc.dedup_body(id)?;
-                continue;
-            }
-            if let Some(parts) = obj
-                .get("HashConsedValue")
-                .and_then(serde_json::Value::as_array)
-                && parts.len() == 2
-            {
-                payload = &parts[1];
-                continue;
-            }
-            if let Some(root) = raw_ptr_pointee_class_root(payload, self.llbc) {
-                return Some(root);
-            }
-            let pointee = obj.get("Ref")?.as_array()?.get(1)?;
-            let pointee = strip_ty_wrappers(pointee, self.llbc)?;
-            return raw_ptr_pointee_class_root(pointee, self.llbc)
-                .or_else(|| adt_node_class_root(pointee, self.llbc));
-        }
+        self.option_payload_instance_class_root(dest_ty)
     }
 
     /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
@@ -14764,6 +14777,7 @@ impl<'a> Lowering<'a> {
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let payload_class_root = self.option_payload_instance_class_root(recv_ty);
         // Closure env ADT → its `name_path` is the `call_once` inherent method
         // owner (`resolve_impl_owner_adt_def_id_free` records the same spelling
         // for the closure's transparent `call_once` body).
@@ -14782,6 +14796,7 @@ impl<'a> Lowering<'a> {
             some_owner,
             call_once_owner,
             payload_ty,
+            payload_class_root,
             result_ty,
             args_tuple_suffix,
             niche,
@@ -14864,6 +14879,7 @@ impl<'a> Lowering<'a> {
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let payload_class_root = self.option_payload_instance_class_root(recv_ty);
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
         let call_once_owner = env_td.item_meta.name_path();
@@ -14931,6 +14947,7 @@ impl<'a> Lowering<'a> {
             result_niche,
             call_once_owner,
             payload_ty,
+            payload_class_root,
             call_result_ty,
             args_tuple_suffix,
             niche,
@@ -16808,7 +16825,17 @@ impl<'a> Lowering<'a> {
             kind: OpKind::Call {
                 target: ctor_target,
                 args: Vec::new(),
-                result_ty: ValueType::Ref(Some(owner.to_string())),
+                // The call target is the enum BASE so the annotator constructs
+                // `SomeInstance(enum)` and runtime-tagged values can meet at a
+                // join.  The codewriter's `result_ty` has a separate job: it
+                // is the low-level STRUCT passed to `rewrite_op_malloc`.  That
+                // STRUCT must be the payload-carrying variant, whose flattened
+                // layout contains both the inherited tag and `__pos_0`.
+                // RPython already hands jtransform that concrete malloc type
+                // (`InstanceRepr._setup_repr` / `Transformer.rewrite_op_malloc`);
+                // this split restores the same information across pyre's
+                // synthetic pre-rtyper constructor seam.
+                result_ty: ValueType::Ref(Some(payload_owner.to_string())),
             },
         });
         // The `__discriminant` tag is always an `i64` (matching the

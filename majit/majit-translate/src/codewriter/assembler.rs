@@ -3835,7 +3835,23 @@ pub(crate) fn bh_size_spec_from_callcontrol(
         // structs (birthday paradox), whereas PyPy's `id(STRUCT)` never
         // aliases.  The rare hash-to-zero case (1 in 2^64) is handled
         // by `simple_descr_group_from_bh_size`'s no-identity branch.
-        type_id: majit_ir::descr::path_hash_for_gc_kind(layout_owner, is_gc_managed),
+        // `layout_owner` is the template spelling used to look up the one
+        // physical field layout.  The low-level STRUCT identity is still the
+        // concrete monomorphization (`Option<i64>::Some`, not
+        // `Option::Some`), exactly as RPython's `GcStruct` object remains
+        // distinct even when two reprs share a shape.  Field descriptors
+        // already preserve this identity in `fielddescrof`; allocations must
+        // use the same key or a freshly virtualized object and its first
+        // setfield acquire different parents.
+        type_id: if is_gc_managed {
+            majit_ir::descr::struct_id_for_name(owner)
+                .map(majit_ir::descr::StructId::as_u64)
+                .unwrap_or_else(|| {
+                    majit_ir::descr::path_hash_for_gc_kind(layout_owner, is_gc_managed)
+                })
+        } else {
+            majit_ir::descr::path_hash_for_gc_kind(layout_owner, is_gc_managed)
+        },
         vtable: 0,
         all_fielddescrs,
     })
@@ -6005,6 +6021,32 @@ mod tests {
             majit_ir::descr::ArrayFlag::Pointer
         );
         assert_eq!(spec.all_fielddescrs[1].index_in_parent, 1);
+    }
+
+    #[test]
+    fn instantiated_sum_allocation_keeps_its_concrete_struct_identity() {
+        use crate::call::CallControl;
+
+        let owner = "core::option::Option<i64>::Some";
+        let template_name = "core::option::Option::Some";
+        let template_id = majit_ir::descr::StructId::from_canonical(template_name);
+        let concrete_id = template_id.instantiate("<i64>");
+        let _registry = register_struct_ids_serialized(HashMap::from([(
+            template_name.to_string(),
+            Some(template_id),
+        )]));
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            template_name.to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+
+        let spec =
+            bh_size_spec_from_callcontrol(&cc, owner).expect("instantiated Option variant size");
+        assert_eq!(spec.type_id, concrete_id.as_u64());
+        assert_eq!(spec.all_fielddescrs.len(), 2);
     }
 
     /// A user enum whose path merely ends in `option::Option::Some` gets no

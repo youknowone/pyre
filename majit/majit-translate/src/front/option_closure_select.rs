@@ -94,6 +94,12 @@ pub(crate) struct ClosureSelectSite {
     /// The receiver `Option`'s payload `T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` read kind and the `(x,)` args-tuple element.
     pub payload_ty: ValueType,
+    /// The concrete RPython instance class carried by a reference payload.
+    /// `ValueType::Ref(None)` preserves only the register bank; the source
+    /// class is required when the synthesized `(x,)` writer recreates the
+    /// field annotation consumed by `InstanceRepr._setup_repr`
+    /// (`rpython/rtyper/rclass.py:501-509`).
+    pub payload_class_root: Option<String>,
     /// The type the closure's `call_once` returns, projected to a
     /// [`ValueType`]: `U` for `map`, `Option<U>` for `and_then`, `T` for
     /// `unwrap_or_else`, `Option<T>` for `or_else`.
@@ -282,7 +288,11 @@ fn rewire_one_closure_select_site(
                 graph,
                 then_bb,
                 env_in_then,
-                Some((payload, site.payload_ty.clone())),
+                Some((
+                    payload,
+                    site.payload_ty.clone(),
+                    site.payload_class_root.clone(),
+                )),
                 &site.call_once_owner,
                 site.call_result_ty.clone(),
                 &site.args_tuple_suffix,
@@ -502,7 +512,7 @@ pub(crate) fn emit_call_once(
     graph: &mut FunctionGraph,
     block: BlockId,
     env: Variable,
-    arg: Option<(Variable, ValueType)>,
+    arg: Option<(Variable, ValueType, Option<String>)>,
     call_once_owner: &str,
     result_ty: ValueType,
     args_tuple_suffix: &str,
@@ -525,7 +535,12 @@ pub(crate) fn emit_call_once(
             result_ty: ValueType::Ref(Some(tuple_owner.clone())),
         },
     });
-    if let Some((value, _value_ty)) = arg {
+    if let Some((value, value_ty, class_root)) = arg {
+        // RPython derives an instance field's low-level repr from the concrete
+        // annotation stored on that field (`rclass.py:501-509`).  Preserve the
+        // source payload class before this synthetic tuple write instead of
+        // widening every `Tuple<*mut T>.__pos_0` reader to OBJECTPTR.
+        let value = emit_narrow(graph, block, value, &class_root);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -538,7 +553,7 @@ pub(crate) fn emit_call_once(
                     taken_by_address: false,
                 },
                 value: LinkArg::Value(value),
-                ty: ValueType::Ref(None),
+                ty: value_ty,
             },
         });
     }
@@ -583,6 +598,7 @@ mod tests {
             some_owner: RECV_SOME.into(),
             call_once_owner: "test::closure".into(),
             payload_ty: ValueType::Int,
+            payload_class_root: None,
             call_result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
@@ -666,6 +682,47 @@ mod tests {
             matches!(t, CallTarget::FunctionPath { segments }
                 if segments == &["core", "ptr", "null_mut"].map(str::to_string))
         })
+    }
+
+    #[test]
+    fn call_once_tuple_write_preserves_reference_payload_class() {
+        let mut g = FunctionGraph::new("test_call_once_payload_class");
+        let block = g.startblock;
+        let env = g.push_op_var(block, OpKind::ConstInt(7), true).unwrap();
+        let payload = g.push_op_var(block, OpKind::ConstRefNull, true).unwrap();
+
+        emit_call_once(
+            &mut g,
+            block,
+            env,
+            Some((payload, ValueType::Ref(None), Some("PyObject".to_string()))),
+            "test::closure",
+            ValueType::Int,
+            "<*mut PyObject>",
+        );
+
+        let written = g.blocks[block.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. }
+                    if field.owner_root.as_deref() == Some("Tuple<*mut PyObject>") =>
+                {
+                    value.as_variable().cloned()
+                }
+                _ => None,
+            })
+            .expect("closure Args tuple payload write");
+        assert!(g.blocks[block.0].operations.iter().any(|op| {
+            op.result.as_ref() == Some(&written)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments },
+                        ..
+                    } if segments == &[crate::runtime_names::shims::CAST_INSTANCE, "PyObject"]
+                )
+        }));
     }
 
     #[test]

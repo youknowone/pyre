@@ -12659,6 +12659,49 @@ mod tests {
         ));
     }
 
+    /// A runtime-tagged Option is annotated at the enum base, but its malloc
+    /// type is the payload-carrying variant: that is the concrete low-level
+    /// struct whose flattened fields are `[base.__discriminant, __pos_0]`.
+    #[test]
+    fn option_base_ctor_allocates_the_payload_variant_layout() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("option_tagged_pair_malloc");
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let allocation_owner = "core::option::Option<i64>::Some".to_string();
+        let target = CallTarget::synthetic_transparent_ctor_with_owner(
+            vec!["core".to_string(), "option".to_string()],
+            "Option<i64>",
+        );
+        let result_ty = ValueType::Ref(Some(allocation_owner.clone()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: vec![],
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "option_tagged_pair_malloc",
+            &mut graph,
+        ) else {
+            panic!("runtime-tagged Option base ctor must lower to its physical shell malloc");
+        };
+        assert!(matches!(
+            ops.as_slice(),
+            [SpaceOperation {
+                result: Some(result),
+                kind: OpKind::New { owner },
+            }] if result == &result_var && owner == &allocation_owner
+        ));
+    }
+
     /// `fold_we_are_jitted_calls` rewrites the `we_are_jitted()`
     /// `direct_call` to the `_we_are_jitted` symbolic constant — the
     /// model-graph counterpart of RPython's rtyper `specialize_call`
