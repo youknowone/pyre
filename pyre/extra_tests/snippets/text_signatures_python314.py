@@ -1094,7 +1094,7 @@ EXPECTED_CODE_DOCS = {
     "__replace__": "The same as replace().",
     "_varname_from_oparg": (
         "(internal-only) Return the local variable name for the given oparg.\n\n"
-        "WARNING: this method is for internal use only and may change or go away."
+        "WARNING: this method is for internal use only and may change or go\naway."
     ),
 }
 for name, doc in EXPECTED_CODE_DOCS.items():

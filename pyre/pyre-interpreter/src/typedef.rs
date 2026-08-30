@@ -16242,7 +16242,7 @@ fn init_code_type(ns: PyObjectRef) {
                 "_varname_from_oparg",
                 |args| unsafe { crate::pycode::code_varname_from_oparg(args[0], args[1]) },
                 2,
-                "(internal-only) Return the local variable name for the given oparg.\n\nWARNING: this method is for internal use only and may change or go away.",
+                "(internal-only) Return the local variable name for the given oparg.\n\nWARNING: this method is for internal use only and may change or go\naway.",
             ),
         );
     }
