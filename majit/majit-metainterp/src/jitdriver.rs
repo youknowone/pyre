@@ -5287,27 +5287,34 @@ impl<S: JitState> JitDriver<S> {
         // and two is not. A self-interpreting workload still reads one operand
         // twice when the two-virtual ones are served.
         //
-        // Where that is NOT is measured, on the self-interpreter running the
-        // quine, by three discriminators over the same guards:
+        // What is wrong is the BRIDGE these entries compile, not the walk that
+        // records it. Measured on the self-interpreter running the quine:
         //
+        //   * `MAJIT_MAX_BRIDGES` bisects to one bridge — the first that
+        //     produces a wrong value — and it is exactly a two-virtual
+        //     guard-resume entry. Every bridge before it is sound.
+        //   * that entry's own resumed walk is sound too: the run still agrees
+        //     with the declining one three output bytes later, and the
+        //     divergence arrives at a LATER entry into the same compiled
+        //     bridge.
         //   * declining after the entry has replayed but before the walk runs
-        //     — so the replay's allocations and stores happened and the
-        //     blackhole arm then redid them — restores the correct output. The
-        //     replay is not what corrupts, and neither is applying it twice.
-        //   * letting the walk run and throwing the trace away, so no bridge
-        //     is ever compiled from it, still gives the wrong output. What the
-        //     compiled bridge does is not it either.
-        //   * stamping each materialized virtual's address onto its recorded
-        //     NEW, which `execute_and_record` does for every other allocation
-        //     the walk performs and this reader did not, leaves the output
-        //     byte-for-byte the same wrong bytes. An OpRef that names the
-        //     object without carrying its address is not it either.
+        //     restores the correct output, and stamping each materialized
+        //     virtual's address onto its recorded NEW — which
+        //     `execute_and_record` does for every other allocation the walk
+        //     performs and this reader did not — leaves the output
+        //     byte-for-byte the same wrong bytes. Neither the replay nor an
+        //     address-less OpRef is what corrupts.
         //
-        // So the defect is in the walk's own resumed execution, on a heap the
-        // replay left correct. The chained-virtual shape is what separates the
-        // two cases: with two virtuals one of them is reachable only as the
-        // other's field, and the walk resumes with nothing of its own naming
-        // it.
+        // The difference is visible in the two entries' recorded prologues.
+        // With ONE virtual, `setfields` writes its `value` field from an input
+        // arg, so every entry stores that failure's own value. With TWO it
+        // writes BOTH `value` fields from a decoded CONSTANT and only the
+        // innermost `next` from an input arg — so the second and every later
+        // entry restores the value the FIRST failure carried. That constant
+        // comes from the fieldnum the resume stream holds, so the question is
+        // why the encoder tags a chained virtual's field const where it tags
+        // an unchained one's boxed; it is not answerable from this end of the
+        // pipe.
         //
         // Sited here rather than in the ladder below because
         // `compile.py ResumeGuardDescr.handle_fail` runs ONE of resume.py's
