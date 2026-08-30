@@ -238,6 +238,98 @@ from pfsur import deep as got_deep
 assert got_deep is deep
 
 
+# A second package, so the rows below start from a fromlist state the ones
+# above have not already resolved.
+os.mkdir(os.path.join(root, "hflpkg2"))
+for name, body in [
+    ("__init__.py", "__all__ = ['a']\n"),
+    ("a.py", "A = 1\n"),
+    ("b.py", "B = 2\n"),
+]:
+    with open(os.path.join(root, "hflpkg2", name), "w") as f:
+        f.write(body)
+
+
+def drop(prefix):
+    for key in [k for k in sys.modules if k == prefix or k.startswith(prefix + ".")]:
+        del sys.modules[key]
+
+
+# `if not fromlist` is one truth test, and a stateful `__bool__` counts them.
+# A fast path that tests the list before consulting the module cache tests it
+# again in whichever importer it then falls through to, so the cold call --
+# the one that misses the cache -- is the row that separates them.
+class CountingList(list):
+    calls = 0
+
+    def __bool__(self):
+        type(self).calls += 1
+        return list.__len__(self) != 0
+
+
+__import__("hflpkg2", {}, {}, CountingList(["a"]), 0)
+assert CountingList.calls == 1, CountingList.calls
+CountingList.calls = 0
+__import__("hflpkg2", {}, {}, CountingList(["a"]), 0)
+assert CountingList.calls == 1, CountingList.calls
+
+
+# `elif x == '*'` is a comparison the item answers, not a read of its text: a
+# `str` subclass whose `__eq__` denies `'*'` is an ordinary name and leaves
+# `__all__` unexpanded.
+class NotStar(str):
+    def __eq__(self, other):
+        return False
+
+    def __hash__(self):
+        return str.__hash__(self)
+
+
+drop("hflpkg2")
+pkg2 = __import__("hflpkg2", {}, {}, [NotStar("*")], 0)
+assert not hasattr(pkg2, "a"), "a denying __eq__ still expanded __all__"
+
+# `from_name = f'{module.__name__}.{x}'` formats both operands, so a
+# `__format__` override on the item names the module that gets imported ...
+class FormatsToB(str):
+    def __format__(self, spec):
+        return "b"
+
+
+drop("hflpkg2")
+__import__("hflpkg2", {}, {}, [FormatsToB("zzz")], 0)
+assert "hflpkg2.b" in sys.modules, "the item's __format__ did not build the name"
+
+
+# ... and one that raises propagates instead of being swallowed the way a
+# missing submodule is.
+class FormatRaises(str):
+    def __format__(self, spec):
+        raise ValueError("boom")
+
+
+drop("hflpkg2")
+try:
+    __import__("hflpkg2", {}, {}, [FormatRaises("zzz")], 0)
+except ValueError as exc:
+    assert str(exc) == "boom", str(exc)
+else:
+    raise AssertionError("expected ValueError")
+
+
+# The package's own `__name__` is formatted by the same f-string.
+class FormatsToPkg(str):
+    def __format__(self, spec):
+        return "hflpkg2"
+
+
+drop("hflpkg2")
+import hflpkg2
+
+hflpkg2.__name__ = FormatsToPkg("wrongname")
+__import__("hflpkg2", {}, {}, ["b"], 0)
+assert "hflpkg2.b" in sys.modules, "the __name__ override was not formatted"
+
 sys.path.remove(root)
 shutil.rmtree(root, ignore_errors=True)
 print("OK")

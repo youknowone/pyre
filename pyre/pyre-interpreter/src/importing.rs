@@ -31,7 +31,7 @@ use std::path::Component;
 use crate::PyExecutionContext;
 use crate::{CodeObject, CompileOpts, Mode, PyFrame, compile_source_with_filename};
 use pyre_object::*;
-use rustpython_wtf8::Wtf8Buf;
+use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
 /// Module-local re-export of the host-OS surface.  Routes through
 /// `rustpython_host_env` when the `host_env` feature is enabled; when
@@ -5411,11 +5411,16 @@ pub fn dunder_import(
         // imports whatever the list adds.  No import lock is taken here:
         // `interp_import.py:19` records that CPython's fast path does not
         // take one either.
-        let have_fromlist =
-            !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
         if let Some(w_mod) = gcd_import_fast(name)? {
             let mod_slot = shadow_stack_len();
             let _ = pin_root(w_mod);
+            // `interp_import.py interp___import__` — the list is tested only
+            // once the cache hit is in hand.  Testing it before `_gcd_import` would
+            // call a stateful `__bool__` on the give-up path too, and the
+            // importer this falls through to makes the one test `__import__`
+            // owes it.
+            let have_fromlist =
+                !fromlist_missing && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?;
             if !have_fromlist {
                 let dotindex = rpython_str_find_char(name, '.', 0);
                 if dotindex < 0 {
@@ -5434,6 +5439,21 @@ pub fn dunder_import(
                 handle_fromlist_fast(shadow_stack_get(mod_slot), shadow_stack_get(fromlist_slot))?
             {
                 return Ok(w_handled);
+            } else {
+                // `interp_import.py interp___import__` returns from both arms
+                // of the package test; the `_handle_fromlist` it calls is
+                // always installed upstream.  While it is not, the native one stands
+                // in here.  Falling through to the slow path instead would
+                // resolve the same cached module a second time and test the
+                // list a second time, and `__import__` owes a stateful
+                // `__bool__` exactly one test.
+                handle_fromlist(
+                    shadow_stack_get(mod_slot),
+                    shadow_stack_get(fromlist_slot),
+                    false,
+                    execution_context,
+                )?;
+                return Ok(shadow_stack_get(mod_slot));
             }
         }
     }
@@ -5951,9 +5971,16 @@ fn handle_fromlist(
             return Err(crate::PyError::type_error(message));
         }
 
+        // `elif x == '*'` — a comparison the item answers, so a `str`
+        // subclass whose `__eq__` denies `'*'` is an ordinary name however
+        // its payload reads.  The literal is pinned before the call: `eq_w`
+        // runs that `__eq__` and both operands move under it.
+        //
         // `__all__` is expanded once; a name inside it that is itself `*` is an
         // ordinary name, not a second expansion.
-        if unsafe { pyre_object::w_str_get_value_opt(shadow_stack_get(x_slot)) } == Some("*") {
+        let star_slot = shadow_stack_len();
+        let _ = pin_root(pyre_object::w_str_new("*"));
+        if crate::baseobjspace::eq_w(shadow_stack_get(x_slot), shadow_stack_get(star_slot))? {
             if !recursive
                 && let Some(w_all) =
                     crate::baseobjspace::findattr_result(shadow_stack_get(mod_slot), "__all__")?
@@ -5972,14 +5999,23 @@ fn handle_fromlist(
             Err(err) => return Err(err),
         }
 
-        // `from_name = f'{module.__name__}.{x}'` — a formatted read.  A package
-        // object whose `__name__` is not a str is coerced the way the f-string
-        // coerces it, not handed to a str-only accessor: `sys.modules` can hold
-        // any object with a `__path__`.
+        // `from_name = f'{module.__name__}.{x}'` — both operands are
+        // formatted with an empty spec rather than read out of their storage,
+        // so a `__format__` override on either runs and a `ValueError` it
+        // raises propagates.  That also coerces a `__name__` that is not a
+        // str: `sys.modules` can hold any object with a `__path__`, and the
+        // f-string reaches it through `object.__format__` rather than a
+        // str-only accessor.
         let w_name = crate::baseobjspace::getattr_str(shadow_stack_get(mod_slot), "__name__")?;
-        let mut from_name = unsafe { crate::display::py_str_wtf8(w_name) }?;
+        let name_slot = shadow_stack_len();
+        let _ = pin_root(w_name);
+        let mut from_name =
+            crate::type_methods::format_value_dispatch(shadow_stack_get(name_slot), Wtf8::new(""))?;
         from_name.push_str(".");
-        from_name.push_wtf8(unsafe { pyre_object::w_str_get_wtf8(shadow_stack_get(x_slot)) });
+        from_name.push_wtf8(&crate::type_methods::format_value_dispatch(
+            shadow_stack_get(x_slot),
+            Wtf8::new(""),
+        )?);
         // The native importer names modules by `&str` throughout, so a child
         // whose name has no UTF-8 spelling can be neither found, cached nor
         // blocked here.  That is the outcome `_handle_fromlist` already
@@ -6035,6 +6071,20 @@ fn relative_import(
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    // `resolve_package_name` reads the caller's namespace, which runs a dict
+    // subclass's `__getitem__` and `warnings.warn`; the list handed to
+    // `absolute_import` below moves under that.  A null list and `None` are
+    // the same argument to `absolute_import`, so the pin can stand in.
+    let _roots = push_roots();
+    let fromlist_slot = shadow_stack_len();
+    let _ = pin_root(if w_fromlist.is_null() {
+        pyre_object::w_none()
+    } else {
+        w_fromlist
+    });
+
     // Get the package name from the calling module's globals.
     // PyPy: pkgname = globals.get('__package__') or globals.get('__name__')
     let package = resolve_package_name(w_globals)?.ok_or_else(|| {
@@ -6076,7 +6126,7 @@ fn relative_import(
         format!("{base}.{name}")
     };
 
-    absolute_import(&fqn, w_fromlist, execution_context)
+    absolute_import(&fqn, shadow_stack_get(fromlist_slot), execution_context)
 }
 
 /// Extract the package name from the calling module's globals namespace.
@@ -6084,9 +6134,19 @@ fn relative_import(
 /// PyPy: importing.py — checks __package__ first, falls back to __name__,
 /// strips the last component if __name__ has dots (module in a package).
 fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
     if w_globals.is_null() {
         return Ok(None);
     }
+
+    // Every lookup below runs Python -- a dict subclass's `__getitem__`, a
+    // `__spec__.parent` descriptor, `warnings.warn` -- so the namespace and
+    // each entry read out of it move under the call that follows them.  That
+    // includes the `&str` view into a str payload the `__name__` arm holds.
+    let _roots = push_roots();
+    let globals_slot = shadow_stack_len();
+    let _ = pin_root(w_globals);
 
     // `space.finditem_str` (baseobjspace.py) maps only KeyError to a
     // missing entry; any other `__getitem__` error (a dict-subclass globals
@@ -6094,32 +6154,39 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
     // the present case.
     // Python 3.14 importlib._bootstrap._calc___package__: an explicit
     // non-None __package__ wins; otherwise __spec__.parent is authoritative.
-    let package = crate::baseobjspace::finditem_str(w_globals, "__package__")?;
-    let spec = crate::baseobjspace::finditem_str(w_globals, "__spec__")?;
-    if let Some(pkg) = package
-        && !unsafe { pyre_object::is_none(pkg) }
-    {
-        if !unsafe { pyre_object::is_str(pkg) } {
-            return Err(crate::PyError::type_error(
-                "__package__ not set to a string",
+    let package = crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__package__")?;
+    let package_slot = shadow_stack_len();
+    let _ = pin_root(package.unwrap_or(pyre_object::w_none()));
+    let spec = crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__spec__")?;
+    let spec_slot = shadow_stack_len();
+    let _ = pin_root(spec.unwrap_or(pyre_object::w_none()));
+
+    if package.is_some() {
+        let pkg = shadow_stack_get(package_slot);
+        if !unsafe { pyre_object::is_none(pkg) } {
+            if !unsafe { pyre_object::is_str(pkg) } {
+                return Err(crate::PyError::type_error(
+                    "__package__ not set to a string",
+                ));
+            }
+            return Ok(Some(
+                unsafe { pyre_object::w_str_get_value(pkg) }.to_string(),
             ));
         }
-        return Ok(Some(
-            unsafe { pyre_object::w_str_get_value(pkg) }.to_string(),
-        ));
     }
-    if let Some(spec) = spec
-        && !unsafe { pyre_object::is_none(spec) }
-    {
-        let parent = crate::baseobjspace::getattr_str(spec, "parent")?;
-        if !unsafe { pyre_object::is_str(parent) } {
-            return Err(crate::PyError::type_error(
-                "__spec__.parent is not a string",
+    if spec.is_some() {
+        let w_spec = shadow_stack_get(spec_slot);
+        if !unsafe { pyre_object::is_none(w_spec) } {
+            let parent = crate::baseobjspace::getattr_str(w_spec, "parent")?;
+            if !unsafe { pyre_object::is_str(parent) } {
+                return Err(crate::PyError::type_error(
+                    "__spec__.parent is not a string",
+                ));
+            }
+            return Ok(Some(
+                unsafe { pyre_object::w_str_get_value(parent) }.to_string(),
             ));
         }
-        return Ok(Some(
-            unsafe { pyre_object::w_str_get_value(parent) }.to_string(),
-        ));
     }
 
     // _calc___package__ emits ImportWarning before the legacy __name__ /
@@ -6132,13 +6199,19 @@ fn resolve_package_name(w_globals: PyObjectRef) -> Result<Option<String>, crate:
     )?;
 
     // Fallback: __name__ (for modules inside packages)
-    if let Some(name_obj) = crate::baseobjspace::finditem_str(w_globals, "__name__")?
+    if let Some(name_obj) =
+        crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__name__")?
         && !name_obj.is_null()
         && unsafe { pyre_object::is_str(name_obj) }
     {
-        let name = unsafe { pyre_object::w_str_get_value(name_obj) };
+        let name_slot = shadow_stack_len();
+        let _ = pin_root(name_obj);
         // If the module has a __path__, it's a package — use __name__ as-is
-        if crate::baseobjspace::finditem_str(w_globals, "__path__")?.is_some() {
+        let has_path =
+            crate::baseobjspace::finditem_str(shadow_stack_get(globals_slot), "__path__")?
+                .is_some();
+        let name = unsafe { pyre_object::w_str_get_value(shadow_stack_get(name_slot)) };
+        if has_path {
             return Ok(Some(name.to_string()));
         }
         // Otherwise `rpartition('.')[0]` is also the empty string for a
@@ -6332,7 +6405,7 @@ pub fn import_from(module: PyObjectRef, name: &str) -> Result<PyObjectRef, crate
     // `_handle_fromlist` could not setattr onto). Read `__name__` off the object
     // rather than requiring it to be a module.
     //
-    // pyopcode.py:1152-1158 — `w_pkgname` starts at the default and is
+    // pyopcode.py import_from — `w_pkgname` starts at the default and is
     // overwritten by ONE `space.getattr(w_module, '__name__')`, whose result
     // both keys this lookup and names the package in the error below.  Reading
     // it twice runs a `__getattr__`- or descriptor-backed `__name__` twice,
