@@ -2740,6 +2740,7 @@ pub unsafe fn fset_func_closure(obj: PyObjectRef, closure: PyObjectRef) {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
+        let mut obj = obj;
         let func = obj as *mut Function;
         // function.py:504: if self.w_module is None
         if (*func).w_module.is_null() {
@@ -2752,7 +2753,14 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
                 // PY_NULL we fall back to `space.w_None` per the
                 // upstream attribute-not-found branch.
                 let name_key = pyre_object::w_str_new("__name__");
-                let result = crate::baseobjspace::call_method(w_globals, "get", &[name_key]);
+                // `function.py Function.fget___module__` stores the app-call
+                // result back into `self.w_module`.  The translated graph's
+                // pop-roots reloads `self`; mirror that writeback before the
+                // native path dereferences `func` again.
+                let result = pyre_object::with_roots!(obj =>
+                    crate::baseobjspace::call_method(w_globals, "get", &[name_key])
+                );
+                let func = obj as *mut Function;
                 function_write_barrier(obj);
                 (*func).w_module = if result.is_null() {
                     pyre_object::w_none()
@@ -2766,6 +2774,7 @@ pub unsafe fn fget___module__(obj: PyObjectRef) -> PyObjectRef {
             }
         }
         // function.py:509: return self.w_module
+        let func = obj as *mut Function;
         (*func).w_module
     }
 }

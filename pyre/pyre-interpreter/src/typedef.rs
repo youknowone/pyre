@@ -4334,9 +4334,21 @@ fn tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let value = crate::builtins::builtin_tuple(params.get(1..).unwrap_or(&[]))?;
     if let Some(sub) = subclass_to_tag(cls, &pyre_object::TUPLE_TYPE)? {
         let n = unsafe { pyre_object::w_tuple_len(value) };
-        let items: Vec<PyObjectRef> = (0..n)
-            .filter_map(|i| unsafe { pyre_object::w_tuple_getitem(value, i as i64) })
-            .collect();
+        // `w_tuple_getitem` re-boxes an inline payload on a specialised
+        // tuple, so each element is pinned as it is produced and the tuple is
+        // reloaded before the next item is read.
+        let tuple_roots = pyre_object::gc_roots::push_roots();
+        let tuple_slot = tuple_roots.publish(&[value]);
+        tuple_roots.normalize(tuple_slot, 1);
+        let mut rooted = pyre_object::gc_roots::RootedItems::new();
+        for i in 0..n {
+            if let Some(item) =
+                unsafe { pyre_object::w_tuple_getitem(tuple_roots.get(tuple_slot), i as i64) }
+            {
+                rooted.push(item);
+            }
+        }
+        let items = rooted.take();
         // The generated user-class layout selected by `typedef.py:174-227`,
         // never an arity-2 specialised tuple.
         let fresh = pyre_object::w_tuple_subclass_new_array_backed(items, sub);
@@ -22765,8 +22777,16 @@ fn bytes_split(args: &[PyObjectRef], forward: bool) -> Result<PyObjectRef, crate
                 }
             }
         };
-        let items: Vec<PyObjectRef> = parts.iter().map(|p| cut_bytes_like(pos[0], p)).collect();
-        Ok(pyre_object::w_list_new(items))
+        // `cut_bytes_like` allocates per piece, over the pieces already cut,
+        // and a plain `Vec` is not a root area (`build_list_storage`).
+        let recv_roots = pyre_object::gc_roots::push_roots();
+        let recv_slot = recv_roots.publish(&[pos[0]]);
+        recv_roots.normalize(recv_slot, 1);
+        let mut items = pyre_object::gc_roots::RootedItems::new();
+        for p in parts.iter() {
+            items.push(cut_bytes_like(recv_roots.get(recv_slot), p));
+        }
+        Ok(pyre_object::w_list_new(items.take()))
     })();
     if let Some(buffer) = sep_buffer {
         buffer.release();
@@ -23394,8 +23414,16 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // The gateway's `unwrap_spec(keepends=bool)` conversion runs before
     // `descr_splitlines` calls `_val`; observe any bytearray resize performed
     // by a re-entrant `__bool__`.
-    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-    let mut parts: Vec<PyObjectRef> = Vec::new();
+    // Own the scan bytes before the first cut: `bytes_like_data` borrows the
+    // receiver's payload, which a collection may relocate.  The receiver is
+    // rooted separately because `cut_bytes_like` preserves its concrete kind
+    // and sometimes its identity.
+    let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) }.to_vec();
+    let recv_roots = pyre_object::gc_roots::push_roots();
+    let recv_slot = recv_roots.publish(&[pos[0]]);
+    recv_roots.normalize(recv_slot, 1);
+    // Each `cut_bytes_like` allocates over the lines already cut.
+    let mut parts = pyre_object::gc_roots::RootedItems::new();
     let mut start = 0usize;
     let mut i = 0usize;
     while i < data.len() {
@@ -23405,7 +23433,7 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                 term_end += 1;
             }
             let end = if keepends { term_end } else { i };
-            parts.push(cut_bytes_like(pos[0], &data[start..end]));
+            parts.push(cut_bytes_like(recv_roots.get(recv_slot), &data[start..end]));
             start = term_end;
             i = term_end;
         } else {
@@ -23413,9 +23441,9 @@ fn bytes_method_splitlines(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         }
     }
     if start < data.len() {
-        parts.push(cut_bytes_like(pos[0], &data[start..]));
+        parts.push(cut_bytes_like(recv_roots.get(recv_slot), &data[start..]));
     }
-    Ok(pyre_object::w_list_new(parts))
+    Ok(pyre_object::w_list_new(parts.take()))
 }
 
 /// `stringmethods.py:descr_expandtabs` — replace each `\t` with spaces

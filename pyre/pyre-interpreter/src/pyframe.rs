@@ -5697,28 +5697,37 @@ pub fn pyobject_from_constant(constant: &crate::bytecode::ConstantData) -> PyObj
         // to the default `build_tuple` body (`eval.rs`, which calls
         // `build_tuple_from_refs`).
         ConstantData::Tuple { elements } => {
-            let mut items: Vec<PyObjectRef> = Vec::with_capacity(elements.len());
+            // The recursion mints an object per element, so the elements
+            // already built are pinned across it -- a plain `Vec` is not a
+            // root area (`build_list_storage`).
+            let mut items = pyre_object::gc_roots::RootedItems::new();
             for element in elements {
                 items.push(pyobject_from_constant(element));
             }
-            crate::runtime_ops::build_tuple_from_refs(&items)
+            crate::runtime_ops::build_tuple_from_refs(&items.take())
         }
         // `load_const_value`'s `Slice` arm (`pyopcode.rs`) — recurse over
         // `[start, stop, step]` before invoking `slice_constant` (`eval.rs`).
         ConstantData::Slice { elements } => {
-            let start = pyobject_from_constant(&elements[0]);
-            let stop = pyobject_from_constant(&elements[1]);
-            let step = pyobject_from_constant(&elements[2]);
-            pyre_object::w_slice_new(start, stop, step)
+            // Same hazard as the `Tuple` arm with three named operands: each
+            // recursion allocates over the ones already built, and
+            // `w_slice_new` allocates over all three.
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.base();
+            let _ = roots.pin_root(pyobject_from_constant(&elements[0]));
+            let _ = roots.pin_root(pyobject_from_constant(&elements[1]));
+            let _ = roots.pin_root(pyobject_from_constant(&elements[2]));
+            pyre_object::w_slice_new(roots.get(base), roots.get(base + 1), roots.get(base + 2))
         }
         // `load_const_value`'s `Frozenset` arm (`pyopcode.rs`) — recurse +
         // delegate to `frozenset_constant` (`eval.rs`).
         ConstantData::Frozenset { elements } => {
-            let mut items: Vec<PyObjectRef> = Vec::with_capacity(elements.len());
+            // As in the `Tuple` arm.
+            let mut items = pyre_object::gc_roots::RootedItems::new();
             for element in elements {
                 items.push(pyobject_from_constant(element));
             }
-            pyre_object::w_frozenset_from_items(&items)
+            pyre_object::w_frozenset_from_items(&items.take())
         }
         ConstantData::Complex { value } => {
             pyre_object::complexobject::w_complex_new(value.re, value.im)

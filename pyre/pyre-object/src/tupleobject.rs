@@ -675,6 +675,9 @@ pub unsafe fn w_tuple_len(obj: PyObjectRef) -> usize {
 }
 
 /// Snapshot the tuple's items as an owned `Vec<PyObjectRef>`.
+///
+/// The returned vector is a plain `Vec` and roots nothing: a caller that
+/// allocates while holding it owes the elements pins of its own.
 /// Polymorphic over all four variants — `Cls_ii` / `Cls_ff` re-box
 /// their inline payloads via `w_int_new` / `w_float_new`.
 ///
@@ -688,11 +691,17 @@ pub unsafe fn w_tuple_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
         let base = items_block_items_base(tuple.wrappeditems);
         return std::slice::from_raw_parts(base, n).to_vec();
     }
-    let mut out = Vec::with_capacity(n);
+    // The re-boxing path mints one object per element, so element 0 would sit
+    // in a plain `Vec` across element 1's allocation.  The specialised tuple
+    // itself is also reread for every box and must be reloaded after a move.
+    let tuple_roots = crate::gc_roots::push_roots();
+    let tuple_slot = tuple_roots.publish(&[obj]);
+    tuple_roots.normalize(tuple_slot, 1);
+    let mut out = crate::gc_roots::RootedItems::new();
     for i in 0..n {
-        out.push(w_tuple_getitem_known(obj, i));
+        out.push(w_tuple_getitem_known(tuple_roots.get(tuple_slot), i));
     }
-    out
+    out.take()
 }
 
 #[majit_macros::elidable]

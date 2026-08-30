@@ -1625,8 +1625,12 @@ pub fn set_current_exception(exc: PyObjectRef) {
 ///
 /// # Safety
 /// `w_type` must be a live exception class (`exception_is_valid_obj_as_class_w`).
-unsafe fn instantiate_raised_class(w_type: PyObjectRef) -> Result<PyObjectRef, PyError> {
-    let result = unsafe { crate::call_function(w_type, &[]) };
+unsafe fn instantiate_raised_class(mut w_type: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    // `pyopcode.py RAISE_VARARGS` keeps the exception class live across
+    // `space.call_function` so the wrong-result diagnostic can still name it.
+    let result = pyre_object::with_roots!(w_type => unsafe {
+        crate::call_function(w_type, &[])
+    });
     if result.is_null() {
         return Err(crate::call::take_call_error()
             .unwrap_or_else(|| PyError::type_error("exceptions must derive from BaseException")));
@@ -1683,7 +1687,7 @@ pub struct RaiseCause {
 /// `pyopcode.py:704-707`), delete this standalone fn, and either route
 /// the BH path through the inlined sequence or rewrite it to match
 /// RPython's inline shape.
-pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<RaiseCause, PyError> {
+pub fn normalize_raise_cause(mut cause: PyObjectRef) -> Result<RaiseCause, PyError> {
     if !unsafe { crate::baseobjspace::exception_is_valid_obj_as_class_w(cause) } {
         return Ok(RaiseCause {
             w_cause: cause,
@@ -1694,7 +1698,11 @@ pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<RaiseCause, PyError> 
     // pyre's answers `PY_NULL` with the error parked in the pending-call slot,
     // so an unchecked null would lose it and report the raise as having no
     // cause at all.
-    let result = unsafe { crate::call_function(cause, &[]) };
+    // Same `RAISE_VARARGS` livevar as upstream's `w_cause`: the result-type
+    // error below still reads the class after its constructor returned.
+    let result = pyre_object::with_roots!(cause => unsafe {
+        crate::call_function(cause, &[])
+    });
     if result.is_null() {
         return Err(crate::call::take_call_error().unwrap_or_else(|| {
             PyError::type_error("exception causes must derive from BaseException")

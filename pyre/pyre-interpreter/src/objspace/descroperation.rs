@@ -2155,13 +2155,22 @@ pub(crate) unsafe fn list_repeat(list: PyObjectRef, n: PyObjectRef) -> PyResult 
     // both the preallocation and its MemoryError edge without exposing
     // `Vec::try_reserve_exact` to source translation.
     let mut items: Vec<PyObjectRef> = crate::builtins::try_pyobject_vec_with_capacity(cap)?;
+    // `w_list_getitem` boxes on the Range/Integer/Float strategies, so a copy
+    // already made would sit unrooted in a plain `Vec` across the next box.
+    // The preallocation above stays for its MemoryError edge; the pins are
+    // what `build_list_storage` requires of the elements.
+    let list_roots = pyre_object::gc_roots::push_roots();
+    let list_slot = list_roots.publish(&[list]);
+    list_roots.normalize(list_slot, 1);
+    let mut rooted = pyre_object::gc_roots::RootedItems::new();
     for _ in 0..count {
         for i in 0..len {
-            if let Some(item) = w_list_getitem(list, i as i64) {
-                items.push(item);
+            if let Some(item) = w_list_getitem(list_roots.get(list_slot), i as i64) {
+                rooted.push(item);
             }
         }
     }
+    items.extend(rooted.take());
     Ok(w_list_new(items))
 }
 
@@ -2195,10 +2204,21 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
     let snapshot = w_list_items_copy_as_vec_mode(list, majit_metainterp::jit::we_are_jitted());
-    pyre_object::listobject::w_list_reserve_for_extend(list, cap - len);
+    // The snapshot is a plain `Vec` and roots nothing, and
+    // `w_list_reserve_for_extend` allocates: publish both the receiver -- a
+    // `W_List` header, one of the two kinds a minor collection relocates --
+    // and the snapshot, then address them through their slots.
+    let roots = pyre_object::gc_roots::push_roots();
+    let list_slot = roots.publish(&[list]);
+    let base = roots.publish(&snapshot);
+    roots.normalize(list_slot, 1 + snapshot.len());
+    pyre_object::listobject::w_list_reserve_for_extend(roots.get(list_slot), cap - len);
     for _ in 1..count {
-        for &item in &snapshot {
-            pyre_object::listobject::w_list_append_preallocated(list, item);
+        for k in 0..snapshot.len() {
+            pyre_object::listobject::w_list_append_preallocated(
+                roots.get(list_slot),
+                roots.get(base + k),
+            );
         }
     }
     Ok(())
