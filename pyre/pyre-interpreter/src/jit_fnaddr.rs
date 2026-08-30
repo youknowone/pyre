@@ -4079,10 +4079,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `jtransform.py:576-577 rewrite_op_int_floordiv =
     // _do_builtin_call` (which resolves the helper through
     // `support.py` `_ll_2_int_mod` / `:255` `_ll_2_int_floordiv`).
-    // The C-trunc residual call below is what the trace path sees;
-    // the Python-floor `ll_int_py_*` helpers stay available for the
-    // future route-(b) emitter (Python-bytecode `int.py_mod` /
-    // `int.py_div` direct calls) under the dotted-name keys.
+    // The C-trunc residual call below is what a Rust `/` / `%` in a
+    // descended body sees.  The Python-floor `ll_int_py_*` pair
+    // registered after it is route (b): `int_floordiv` / `int_mod`
+    // call the interpreter's `#[oopspec("int.py_div")]` twins, so the
+    // generated `//` / `%` descent records the same elidable
+    // `int.py_div` / `int.py_mod` call the hand fold did.
     //
     // `register_macro_helper_trace_fnaddr` strips the leading segment
     // from `full_path`; for a single-segment path (no `::`) the entire
@@ -4126,6 +4128,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "_ll_2_int_mod",
         majit_metainterp::blackhole::_ll_2_int_mod,
+    );
+    p2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::ll_int_py_div",
+        crate::objspace::descroperation::ll_int_py_div,
+    );
+    p2(
+        &mut entries,
+        "pyre_interpreter::objspace::descroperation::ll_int_py_mod",
+        crate::objspace::descroperation::ll_int_py_mod,
     );
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`

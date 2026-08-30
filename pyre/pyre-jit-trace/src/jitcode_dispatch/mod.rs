@@ -9645,25 +9645,6 @@ fn walker_int_eq_const<Sym: WalkSym>(
     r
 }
 
-/// Record `uint_lt(raw, const k)` and stamp its already-known concrete truth.
-/// Used to guard a machine shift count into `[0, k)`: the x86 SHL/SAR encoding
-/// masks the count mod 64, so a reused trace whose shift count leaves the range
-/// must bail to the generic (bignum-capable) leg rather than shift by `count &
-/// 63`. `uint_lt` folds the negative case in (a negative count reads as a huge
-/// unsigned value `>= k`).
-fn walker_uint_lt_const<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    raw: OpRef,
-    k: i64,
-    concrete_truth: i64,
-) -> OpRef {
-    let k_const = ctx.trace_ctx.const_int(k);
-    let r = ctx.trace_ctx.record_op(OpCode::UintLt, &[raw, k_const]);
-    ctx.trace_ctx
-        .set_opref_concrete(r, majit_ir::Value::Int(concrete_truth));
-    r
-}
-
 /// Record `float_eq(raw, const k)` and stamp its already-known concrete
 /// truth.  Used to build the float-div zero-divisor precondition guard
 /// walker-native (the JIT representation of `floatobject.py _floatdiv`'s

@@ -269,69 +269,6 @@ fn walker_read_long_payload<Sym: WalkSym>(
     payload
 }
 
-/// `intobject.py _make_ovf2long`: the tail every int arithmetic fold shares
-/// once its own guard has pinned the promoting branch — `GUARD_OVERFLOW` for
-/// the `BINARY_OP` arm, `GUARD_VALUE` on the operand for unary negate. The tail
-/// is the elidable raw-int bigint helper (`rbigint.py:717/788/873`) under
-/// `EF_ELIDABLE_OR_MEMORYERROR`, then the inline `W_LongObject` box around the
-/// payload it returns. `payload_fn` takes the two machine ints in
-/// `(raw, concrete)` pairs, which is also the shape the concrete-args vector
-/// wants.
-///
-/// The box needs no preceding fits_int guard. `newlong_from_rbigint`
-/// (objspace.py:316-320) demotes through `rbigint.toint()`, whose
-/// `numdigits() > MAX_DIGITS_THAT_CAN_FIT_IN_INT` test (rbigint.py) that
-/// guard already answers: the helper is the *exact* int-pair sum / difference /
-/// product, so a value that just overflowed a machine int cannot fit one back.
-/// The same fold is what lets `try_walker_specialize_binary_op_long_int_pow`
-/// skip its result-fits guard.
-fn walker_emit_ovf2long_box<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    payload_fn: *const (),
-    lhs: (OpRef, i64),
-    rhs: (OpRef, i64),
-    boxed_result_i64: i64,
-) -> Result<OpRef, DispatchError> {
-    let (lhs_raw, la) = lhs;
-    let (rhs_raw, rb) = rhs;
-    let payload_concrete =
-        unsafe { long_payload_of(boxed_result_i64 as usize as pyre_object::PyObjectRef) };
-    let concrete_args = [
-        majit_ir::Value::Int(payload_fn as usize as i64),
-        majit_ir::Value::Int(la),
-        majit_ir::Value::Int(rb),
-    ];
-    let payload = ctx.trace_ctx.call_typed_with_effect_pure_can_raise(
-        OpCode::CallR,
-        payload_fn,
-        &[lhs_raw, rhs_raw],
-        &[majit_ir::Type::Int, majit_ir::Type::Int],
-        majit_ir::Type::Ref,
-        majit_metainterp::ELIDABLE_OR_MEMERROR_EFFECT_INFO,
-        &concrete_args,
-        majit_ir::Value::Ref(majit_ir::GcRef(payload_concrete as usize)),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        payload,
-        majit_ir::Value::Ref(majit_ir::GcRef(payload_concrete as usize)),
-    );
-    if payload.inline_const_to_value().is_none() {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-    }
-    let result = crate::helpers::emit_box_long_inline(
-        ctx.trace_ctx,
-        payload,
-        crate::descr::w_long_size_descr(),
-        crate::descr::long_value_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        result,
-        majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-    );
-    Ok(result)
-}
-
 /// #57: walker-native speculative int specialization for the `BINARY_OP`
 /// helper residual_call (oopspec `BinaryOp`).  Re-derives
 /// the former int fast path's structure (`guard_class` + `getfield_gc_i` per
@@ -351,355 +288,6 @@ fn walker_emit_ovf2long_box<Sym: WalkSym>(
 /// not both concrete `W_IntObject`, or an unsupported helper arm is reached — the caller
 /// then falls through to the generic `CallMayForce` record so the
 /// Python-level `__op__` semantics are preserved.
-/// The raw machine int of an int/bool operand, for the specialized IR: guard
-/// the operand's exact class, then load `intval` out of the box.
-///
-/// A bool `space.newbool` produced this same walk arrives as the prebuilt
-/// `w_True` / `w_False` singleton behind its own truth guard, so both the class
-/// guard and the `intval` load read a constant and fold away — no side table
-/// has to reconnect the box to the truth it was built from.
-fn walker_int_operand_raw<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    operand_obj: pyre_object::PyObjectRef,
-    type_addr: i64,
-    intval_descr: majit_ir::DescrRef,
-) -> Result<OpRef, DispatchError> {
-    let raw = walker_unbox_int_typed(ctx, op_pc, operand, type_addr, intval_descr)?;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        operand,
-        walker_numeric_builtin_class(operand_obj),
-    )?;
-    Ok(raw)
-}
-
-pub(crate) fn try_walker_specialize_binary_op_int<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    op_tag: i64,
-    r_args: &[OpRef],
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<DispatchOutcome>, DispatchError> {
-    if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
-        return Ok(None);
-    }
-    let Some(bin_op) = pyre_interpreter::runtime_ops::binary_op_from_tag(op_tag) else {
-        return Ok(None);
-    };
-    use pyre_interpreter::bytecode::BinaryOperator;
-    // INT_BINOP_TABLE → (OpCode, has_overflow, needs_concrete_check).
-    // Defer TrueDivide (int/int → float, separate helper) / Power /
-    // Subscr to the generic leg (`_ => None`).
-    let (op_code, has_overflow, needs_check) = match bin_op {
-        BinaryOperator::Add | BinaryOperator::InplaceAdd => (OpCode::IntAddOvf, true, false),
-        BinaryOperator::Subtract | BinaryOperator::InplaceSubtract => {
-            (OpCode::IntSubOvf, true, false)
-        }
-        BinaryOperator::Multiply | BinaryOperator::InplaceMultiply => {
-            (OpCode::IntMulOvf, true, false)
-        }
-        BinaryOperator::FloorDivide | BinaryOperator::InplaceFloorDivide => {
-            (OpCode::IntFloorDiv, false, true)
-        }
-        BinaryOperator::Remainder | BinaryOperator::InplaceRemainder => {
-            (OpCode::IntMod, false, true)
-        }
-        BinaryOperator::And | BinaryOperator::InplaceAnd => (OpCode::IntAnd, false, false),
-        BinaryOperator::Or | BinaryOperator::InplaceOr => (OpCode::IntOr, false, false),
-        BinaryOperator::Xor | BinaryOperator::InplaceXor => (OpCode::IntXor, false, false),
-        BinaryOperator::Lshift | BinaryOperator::InplaceLshift => (OpCode::IntLshift, false, true),
-        BinaryOperator::Rshift | BinaryOperator::InplaceRshift => (OpCode::IntRshift, false, true),
-        _ => return Ok(None),
-    };
-
-    // boolobject.py descr_and/or/xor: when both operands are bool the
-    // And/Or/Xor result is a bool (`space.newbool`), not an int.  The op runs
-    // on the shared `intval` as for ints; only the boxing differs (picked
-    // below).  `walker_concrete_ref_object` reads the same source as
-    // `walker_int_specialization_operands`, so the flag stays consistent.
-    let result_is_bool = matches!(op_code, OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor)
-        && match (
-            walker_concrete_ref_object(ctx, r_args[0]),
-            walker_concrete_ref_object(ctx, r_args[1]),
-        ) {
-            (Some(l), Some(r)) => unsafe { pyre_object::is_bool(l) && pyre_object::is_bool(r) },
-            _ => false,
-        };
-
-    // Inspect the operands before executing the authentic helper.  A raising
-    // zero-divisor arm needs the helper-produced exception as its concrete
-    // shadow, but records no helper call in the trace.
-    let Some((lhs, rhs, lhs_obj, rhs_obj, la, rb)) =
-        walker_int_specialization_input_operands(ctx, r_args)
-    else {
-        return Ok(None);
-    };
-
-    if matches!(op_code, OpCode::IntFloorDiv | OpCode::IntMod) && rb == 0 {
-        let Some(Err(exc_i64)) = walker_execute_may_force_boxed_outcome(ctx, allboxes, call_descr)
-        else {
-            return Ok(None);
-        };
-        // The helper publishes through both the blackhole cell (drained by
-        // `execute_residual_call`) and the backend exception cells.  The
-        // latter belong to compiled execution; drain the trace-time publish
-        // before the walk continues into the Python handler, exactly as the
-        // generic residual executor's Err arm does.
-        if let Some(cb) = crate::callbacks::try_get() {
-            (cb.drain_backend_jit_exc)();
-        }
-        let exc = exc_i64 as usize as pyre_object::PyObjectRef;
-        let kind = pyre_object::interp_exceptions::ExcKind::ZeroDivisionError;
-        if !walker_recorded_builtin_raise_is_supported(exc, kind) {
-            return Ok(None);
-        }
-        let Some(ec) = walker_ensure_execution_context(ctx) else {
-            return Ok(None);
-        };
-
-        // Commit to the raising arm only after every decline.  Exact-class
-        // guards preserve builtin dispatch; GuardTrue(rhs == 0) is the branch
-        // guard a bridge can invert when the divisor changes mid-loop.
-        let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
-        let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-        let _lhs_raw = walker_unbox_int_typed(ctx, op_pc, lhs, lhs_type, lhs_descr)?;
-        walker_guard_exact_w_class(ctx, op_pc, lhs, walker_numeric_builtin_class(lhs_obj))?;
-        let rhs_raw = walker_unbox_int_typed(ctx, op_pc, rhs, rhs_type, rhs_descr)?;
-        walker_guard_exact_w_class(ctx, op_pc, rhs, walker_numeric_builtin_class(rhs_obj))?;
-        let rhs_zero = walker_int_eq_const(ctx, rhs_raw, 0, 1);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[rhs_zero])?;
-
-        return Ok(Some(walker_emit_recorded_builtin_raise(ctx, ec, exc, kind)));
-    }
-
-    let Some(boxed_result_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr) else {
-        return Ok(None);
-    };
-
-    // intobject.py range validation (mirror the former int fast path's
-    // needs_concrete_check): bail to the generic leg when the bare-IR-op
-    // emission would be unsound (zero / INT_MIN-overflow divisor, oversized
-    // / overflowing shift); large right-shift folds to a const.
-    if needs_check {
-        match op_code {
-            OpCode::IntFloorDiv | OpCode::IntMod => {
-                if la == i64::MIN && rb == -1 {
-                    return Ok(None);
-                }
-            }
-            OpCode::IntLshift => {
-                // `_lshift` enters its machine-word arm only for
-                // `0 <= count < LONG_BIT`.  A trace recorded outside that arm
-                // retains the generic helper: the negative-count exception and
-                // the large-count/zero special case belong to the other branch.
-                if !(0..i64::BITS as i64).contains(&rb) {
-                    return Ok(None);
-                }
-                let raw_value = la.wrapping_shl(rb as u32);
-                if (raw_value >> rb) != la {
-                    let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
-                    if boxed_result_obj == pyre_object::PY_NULL
-                        || !unsafe { pyre_object::is_long(boxed_result_obj) }
-                    {
-                        return Ok(None);
-                    }
-                }
-            }
-            OpCode::IntRshift => {
-                // A count >= LONG_BIT (or negative) folds to 0/-1 in
-                // intobject.py, but that fold would be baked into the
-                // reused trace and be wrong for an in-range count; route it to
-                // the generic leg instead. An in-range recorded count is
-                // specialized below behind a runtime range guard.
-                let Ok(shift) = u32::try_from(rb) else {
-                    return Ok(None);
-                };
-                if shift >= i64::BITS {
-                    return Ok(None);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // pyjitpl.py handle_possible_overflow_error follows the concrete
-    // Add/Sub/Mul outcome. The overflowing arm mirrors intobject.py:494
-    // _make_ovf2long: guard_overflow, call the elidable raw-int bigint helper
-    // (rbigint.py:717/788/873), and inline the W_LongObject box instead of
-    // falling through to the generic CallMayForceR BINARY_OP leg.
-    let overflows = has_overflow
-        && match op_code {
-            OpCode::IntAddOvf => la.checked_add(rb).is_none(),
-            OpCode::IntSubOvf => la.checked_sub(rb).is_none(),
-            OpCode::IntMulOvf => la.checked_mul(rb).is_none(),
-            _ => false,
-        };
-    if overflows {
-        let boxed_result_obj = boxed_result_i64 as usize as pyre_object::PyObjectRef;
-        if boxed_result_obj == pyre_object::PY_NULL
-            || !unsafe { pyre_object::is_long(boxed_result_obj) }
-        {
-            return Ok(None);
-        }
-    }
-
-    // --- emit the specialized IR (walker-native) ---
-    // bool and int share `intval`; guard each operand against its own vtable
-    // (BOOL_TYPE / INT_TYPE) so a bool unboxes through its own class.
-    let (lhs_type, lhs_descr) = crate::state::int_or_bool_unbox_type_descr(lhs_obj);
-    let (rhs_type, rhs_descr) = crate::state::int_or_bool_unbox_type_descr(rhs_obj);
-    let lhs_raw = walker_int_operand_raw(ctx, op_pc, lhs, lhs_obj, lhs_type, lhs_descr)?;
-    let rhs_raw = walker_int_operand_raw(ctx, op_pc, rhs, rhs_obj, rhs_type, rhs_descr)?;
-
-    if op_code == OpCode::IntLshift {
-        // `ll_int_lshift_ovf` checks overflow by shifting the machine result
-        // back and comparing it with the input.  Keep that literal shape: the
-        // count-range guard prevents the backend's masked shift semantics,
-        // then the round-trip guard selects either `_lshift`'s small-int result
-        // or `_ovf2long_lshift`'s bigint recovery.  In particular, no backend
-        // overflow flag is invented for an operation that PyPy does not model
-        // with one.
-        let in_range = walker_uint_lt_const(ctx, rhs_raw, i64::BITS as i64, 1);
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_range])?;
-
-        let raw_value = la.wrapping_shl(rb as u32);
-        let raw_result = ctx
-            .trace_ctx
-            .record_op(OpCode::IntLshift, &[lhs_raw, rhs_raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(raw_result, majit_ir::Value::Int(raw_value));
-        let shifted_back = ctx
-            .trace_ctx
-            .record_op(OpCode::IntRshift, &[raw_result, rhs_raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(shifted_back, majit_ir::Value::Int(raw_value >> rb));
-        let round_trips = ctx
-            .trace_ctx
-            .record_op(OpCode::IntEq, &[shifted_back, lhs_raw]);
-        let overflowed = (raw_value >> rb) != la;
-        ctx.trace_ctx
-            .set_opref_concrete(round_trips, majit_ir::Value::Int((!overflowed) as i64));
-
-        let result = if overflowed {
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[round_trips])?;
-            walker_emit_ovf2long_box(
-                ctx,
-                op_pc,
-                pyre_interpreter::objspace::descroperation::jit_bigint_lshift_int_int_result
-                    as *const (),
-                (lhs_raw, la),
-                (rhs_raw, rb),
-                boxed_result_i64,
-            )?
-        } else {
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[round_trips])?;
-            let boxed = walker_box_int(ctx, op_pc, raw_result, raw_value)?;
-            ctx.trace_ctx
-                .set_opref_concrete(boxed, box_int_concrete(raw_value, boxed_result_i64));
-            boxed
-        };
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-        return Ok(Some(DispatchOutcome::Continue));
-    }
-
-    if overflows {
-        let concrete_value = match op_code {
-            OpCode::IntAddOvf => la.wrapping_add(rb),
-            OpCode::IntSubOvf => la.wrapping_sub(rb),
-            OpCode::IntMulOvf => la.wrapping_mul(rb),
-            _ => unreachable!("overflow arm requires Add/Sub/Mul"),
-        };
-        let raw_result = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
-        ctx.trace_ctx
-            .set_opref_concrete(raw_result, majit_ir::Value::Int(concrete_value));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardOverflow, &[])?;
-
-        let payload_fn = match op_code {
-            OpCode::IntAddOvf => pyre_object::longobject::jit_bigint_add_int_int as *const (),
-            OpCode::IntSubOvf => pyre_object::longobject::jit_bigint_sub_int_int as *const (),
-            OpCode::IntMulOvf => pyre_object::longobject::jit_bigint_mul_int_int as *const (),
-            _ => unreachable!("overflow arm requires Add/Sub/Mul"),
-        };
-        let result = walker_emit_ovf2long_box(
-            ctx,
-            op_pc,
-            payload_fn,
-            (lhs_raw, la),
-            (rhs_raw, rb),
-            boxed_result_i64,
-        )?;
-        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-        return Ok(Some(DispatchOutcome::Continue));
-    }
-    let (raw_result, concrete_value) = match op_code {
-        OpCode::IntFloorDiv | OpCode::IntMod => {
-            walker_emit_int_div_domain_guards(ctx, op_pc, lhs_raw, rhs_raw, la, rb)?;
-            walker_emit_int_py_div_or_mod(
-                ctx,
-                lhs_raw,
-                rhs_raw,
-                la,
-                rb,
-                op_code == OpCode::IntFloorDiv,
-            )
-        }
-        OpCode::IntRshift => {
-            // The machine SAR masks the count mod 64, so guard the count into
-            // [0, LONG_BIT) — a reused trace bails rather than shifting by
-            // `count & 63`. (The recorded count is < LONG_BIT here: a count
-            // >= LONG_BIT const-folds to 0/-1 in the needs_check block above.)
-            let in_range = walker_uint_lt_const(ctx, rhs_raw, i64::BITS as i64, 1);
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_range])?;
-            let r = ctx
-                .trace_ctx
-                .record_op(OpCode::IntRshift, &[lhs_raw, rhs_raw]);
-            (r, majit_metainterp::eval_binop_i(OpCode::IntRshift, la, rb))
-        }
-        _ => {
-            let r = ctx.trace_ctx.record_op(op_code, &[lhs_raw, rhs_raw]);
-            (r, majit_metainterp::eval_binop_i(op_code, la, rb))
-        }
-    };
-    ctx.trace_ctx
-        .set_opref_concrete(raw_result, majit_ir::Value::Int(concrete_value));
-    if has_overflow {
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoOverflow, &[])?;
-    }
-    // A both-bool bitwise result boxes via `space.newbool` (boolobject.py:
-    // 74-76) so it keeps the bool type; `boxed_result_i64` is already the
-    // authentic W_Bool the forced residual produced.
-    let boxed = if result_is_bool {
-        match walker_newbool_guarded(ctx, op_pc, raw_result, concrete_value != 0, dst_bank)? {
-            Some(boxed) => boxed,
-            None => {
-                let boxed = crate::helpers::emit_trace_bool_value_from_truth(
-                    ctx.trace_ctx,
-                    raw_result,
-                    false,
-                );
-                ctx.trace_ctx.set_opref_concrete(
-                    boxed,
-                    majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-                );
-                boxed
-            }
-        }
-    } else {
-        let boxed = walker_box_int(ctx, op_pc, raw_result, concrete_value)?;
-        ctx.trace_ctx
-            .set_opref_concrete(boxed, box_int_concrete(concrete_value, boxed_result_i64));
-        boxed
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(DispatchOutcome::Continue))
-}
-
 /// rint.py `_ovf_zer` guards for a machine-int division: `int_eq(rhs,0)` →
 /// `guard_false` plus `(lhs==INT_MIN)&(rhs==-1)` → `guard_false`.  Both must
 /// precede the elidable `ll_int_py_div` / `ll_int_py_mod` call so a re-used
@@ -7050,8 +6638,7 @@ fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
 /// it always materializes the boxed bool the generic `compare_fn` would
 /// have produced (the retired MIFrame compare/jump fusion does not apply).
 ///
-/// Same gate + return contract as
-/// [`try_walker_specialize_binary_op_int`].
+/// Same result-writing contract as the neighbouring compare specializations.
 pub(crate) fn try_walker_specialize_compare_op_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8250,8 +7837,9 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
 
 /// #57 SLICE 3c: walker-native speculative float specialization for the
 /// `BINARY_OP` helper residual_call (oopspec `BinaryOp`), the float
-/// analogue of [`try_walker_specialize_binary_op_int`].  Re-derives
-/// the former float fast path's structure walker-native: per operand
+/// remaining float hand fold after the exact-int fold was retired in favour
+/// of [`try_walker_orthodox_binary_op`].  Re-derives the former float fast
+/// path's structure walker-native: per operand
 /// either `guard_class FLOAT` + `getfield_gc_pure_f`, or (int operand)
 /// `guard_class INT` + `getfield_gc_i` + `cast_int_to_float`; then
 /// `float_OP` and `wrapfloat`.
@@ -8260,8 +7848,8 @@ pub(crate) fn try_walker_specialize_compare_op_long<Sym: WalkSym>(
 /// `FloatMul` / `FloatTrueDiv`) are specialized — Power / FloorDivide /
 /// Remainder have no FLOAT_* opcode and defer to the generic
 /// `CALL_MAY_FORCE` leg (Power lowers to a `call_may_force` +
-/// `guard_no_exception` there).  Tried as a fallback only after the int
-/// specialization declines, so two-int operands keep int `__op__`
+/// `guard_no_exception` there).  Tried only after the generated exact-int
+/// descent declines, so two-int operands keep the interpreter body's integer
 /// arithmetic.
 pub(crate) fn try_walker_specialize_binary_op_float<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -9534,24 +9122,13 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     let result = match walk_outcome {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
             .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        // The body raised.  Its `Err` arm builds a `PyError` in the trace,
-        // and that host struct is not modelled faithfully: the descr carries
-        // no `kind` field and reads the `Wtf8Buf` message as one word at
-        // offset 0, so the compiled raise surfaced an empty `TypeError` for a
-        // `ZeroDivisionError` (`x // 0` after the loop compiled).  Until the
-        // front declines such a struct, a raising body is not descended: cut
-        // the tentative IR, drop the exception the sub-walk left behind, and
-        // let the fold behind this descent record the raise from the helper's
-        // own exception object.
-        DispatchOutcome::SubRaise { .. } => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] {}-RAISE pc={op_pc}", descent.decline_tag);
-            }
-            ctx.clear_last_exc_value();
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
+        // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
+        // `PyError` aggregate from supported literal-message raise paths and
+        // materialises the interpreter's `W_BaseException` through one opaque
+        // residual.  That is the exception value the ordinary inline-callee
+        // machinery propagates too, so preserve the sub-walk's `SubRaise`
+        // instead of rolling it back to a hand-written operator fold.
+        raised @ DispatchOutcome::SubRaise { .. } => return Ok(Some(raised)),
         _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
@@ -9657,14 +9234,16 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
     if !ctx.is_authoritative_executor || r_args.len() != 2 || dst_bank != 'r' {
         return Ok(None);
     }
-    // `//` and `%` stay with the `binary_op_int` fold for now.  The body's
-    // `int_floordiv` / `int_mod` lower the machine `Div` / `Rem` to a call of
-    // the `_ll_2_int_*` helper (the upstream shape), while the fold records
-    // `IntFloorDiv` / `IntMod`, which the optimizer strength-reduces for a
-    // constant divisor: measured 63 → 79 ops on `i // (i % 3)`.  Lowering
-    // `Div` / `Rem` to those ops in the front is the generator fix.
+    // `//` and `%` descend since `int_floordiv` / `int_mod` compute the
+    // floor result through the `#[oopspec("int.py_div")]` /
+    // `int.py_mod` twins of rint.py's `ll_int_py_div` / `ll_int_py_mod`:
+    // the body records the same elidable call the fold did, so the
+    // optimizer's constant-divisor strength reduction applies to both.
+    // Before that the body's `/` / `%` lowered to the truncating
+    // `_ll_2_int_*` residual plus the sign-correction branch, measured
+    // 63 → 79 ops on `i // (i % 3)`.
     //
-    // `**` stays with the fold too: `float_pow` reaches `f64::is_infinite`
+    // `**` stays with the fold: `float_pow` reaches `f64::is_infinite`
     // and the `float` constructor, neither lowered, so the sub-walk declined
     // at every `(n + 1.25) ** 1.5` of `synth/wasm_ca_trampoline_decline`.
     use pyre_interpreter::bytecode::BinaryOperator as B;
@@ -9672,6 +9251,8 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         Some(B::Add | B::InplaceAdd) => B::Add,
         Some(B::Subtract | B::InplaceSubtract) => B::Subtract,
         Some(B::Multiply | B::InplaceMultiply) => B::Multiply,
+        Some(B::FloorDivide | B::InplaceFloorDivide) => B::FloorDivide,
+        Some(B::Remainder | B::InplaceRemainder) => B::Remainder,
         Some(B::TrueDivide | B::InplaceTrueDivide) => B::TrueDivide,
         Some(B::Lshift | B::InplaceLshift) => B::Lshift,
         Some(B::Rshift | B::InplaceRshift) => B::Rshift,

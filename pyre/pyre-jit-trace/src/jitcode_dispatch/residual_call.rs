@@ -5308,42 +5308,33 @@ pub(crate) enum SpecializedBinop {
 /// Non-numeric operands stay an impure residual, so admitting them here would
 /// trigger the nested-residual 6421 abort storm.
 ///
-/// The accepted set is every tag a specialization table lowers with no runtime
-/// decline path left, so nothing survives as a residual.  Both tables key the
-/// in-place tag to the SAME arm as its plain form, so the two forms are
-/// admitted together:
+/// The accepted set is every tag handled either by the generated exact-int
+/// descent or by the remaining float specialization without an unsafe replay
+/// residual.  In-place tags select the same concrete builtin arithmetic as
+/// their plain forms, so the two forms are admitted together:
 ///
-/// - `Add` / `Subtract` / `Multiply` (+ in-place) — `IntAddOvf` / `IntSubOvf` /
-///   `IntMulOvf` in `try_walker_specialize_binary_op_int`, `FloatAdd` /
-///   `FloatSub` / `FloatMul` in `try_walker_specialize_binary_op_float`.  In
-///   both tables `needs_concrete_check` is false, so either argument width
-///   lowers unconditionally.
+/// - `Add` / `Subtract` / `Multiply` (+ in-place) — the generated
+///   `binary_value_from_tag` descent for exact ints, and `FloatAdd` /
+///   `FloatSub` / `FloatMul` in `try_walker_specialize_binary_op_float`.
 /// - `And` / `Or` / `Xor` (+ in-place) — `IntAnd` / `IntOr` / `IntXor`, also
 ///   unconditional, but *int-only*: the float table falls through to
 ///   `_ => return Ok(None)` for them.  Hence the separate
 ///   [`SpecializedBinop::PlainInt`] arm, which additionally demands both
 ///   operands be proven plain ints.
-/// - `FloorDivide` / `Remainder` (+ in-place) — `IntFloorDiv` / `IntMod`,
-///   int-only for the same reason (neither has a `FLOAT_*` opcode).  These two
-///   are the one accepted pair whose lowering *can* decline — on a zero divisor
-///   or on `i64::MIN` by `-1` — but a surviving residual is still replay-safe
-///   on its own merits: `int.__floordiv__` / `int.__mod__` read two immutable
-///   boxes and either allocate a fresh result or raise `ZeroDivisionError`,
-///   which commits nothing a replay would double.  The `plain_int` proof is
-///   what rules out a user `__mod__`.  `i % k` in an `if` is the common shape
-///   that would otherwise residualize the whole callee
-///   (`bench/synth/gc_bug_bridge_flavor_traceback_names`).
+/// - `FloorDivide` / `Remainder` (+ in-place) — exact-int-only generated
+///   descent.  Its success arm records the `int.py_div` / `int.py_mod`
+///   oopspec, and its zero-divisor arm propagates the materialised
+///   `W_BaseException` as `SubRaise`.  The `plain_int` proof rules out a user
+///   `__mod__`.
 ///
 /// Every other tag is excluded because its lowering can still decline and
 /// leave a residual that is NOT replay-safe on its own:
 ///
 /// - `TrueDivide` (+ in-place) — float-table only, and it declines a zero
 ///   divisor so the raising `descr_truediv` stays recorded.
-/// - `Lshift` (+ in-place) — the int table declines it outright (the reused
-///   trace would bake a count the x86 `SHL` masks mod 64, and the guarded form
-///   breaks the cranelift bridge).
-/// - `Rshift` (+ in-place) — declines a negative or `>= LONG_BIT` count rather
-///   than baking intobject.py's fold-to-`0`/`-1`.
+/// - shifts (+ in-place) — the generated descent handles exact-int sites, but
+///   this replay admission remains conservative around the count-dependent
+///   exception and large-count arms.
 /// - `Power` (+ in-place) — the int table has no arm; the float table inlines
 ///   `_pow` but keeps a cold-path residual for nan/inf/negative-base operands.
 /// - `Subscr`, `MatrixMultiply` (+ in-place) — no arm in either table.
@@ -9199,15 +9190,10 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         })? {
                             return Ok((outcome, op.next_pc));
                         }
-                        // int specialization first; float (incl. mixed int/float)
-                        // as a fallback so two-int operands keep int arithmetic.
-                        if let Some(outcome) = spec_gate(SpecFold::BinaryOpInt, || {
-                            try_walker_specialize_binary_op_int(
-                                ctx, op.pc, op_tag, &r_args, &allboxes, call_descr, dst, dst_bank,
-                            )
-                        })? {
-                            return Ok((outcome, op.next_pc));
-                        }
+                        // Float (including mixed int/float) remains a hand
+                        // fallback.  Exact int pairs have already been taken
+                        // whole by `binary_op_descent`, including overflow and
+                        // zero-division exception arms.
                         // longobject.py `_make_generic_descr_binop` and
                         // `descr_sub` use the rbigint.int_* family for
                         // mixed Long/Int operands.
