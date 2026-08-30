@@ -17,10 +17,11 @@
 try:
     import pypyjit
 
-    # The direct list-iterator fold closes at 306 operations.  PyPy keeps the
-    # same abort/segment counts at this limit as at the former 300-operation
-    # boundary, while still compiling the exact-list loop.
-    pypyjit.set_param("trace_limit=306")
+    # Sized to this branch's raw op count: one traced iteration records fewer
+    # ops here than on main (where the direct list-iterator fold closes at 306
+    # and the limit sits there), so the 0.8x segmenting cut needs a lower
+    # limit to be crossed at all.  See foriter_bridge_walk_keeps_the_iteration.
+    pypyjit.set_param("trace_limit=240")
     pypyjit.set_param("threshold=20")
 except ImportError:
     pass
