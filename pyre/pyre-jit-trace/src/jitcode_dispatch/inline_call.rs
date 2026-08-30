@@ -9207,6 +9207,156 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
     Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
+/// Why a `FOR_ITER` over a suspended generator was not resumed into the trace.
+///
+/// Named rather than counted so the corpus census answers WHICH precondition
+/// stands between the shape and the resume; `Admissible` is the row that
+/// measures the reachable population.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GeneratorResumeVerdict {
+    /// The `FOR_ITER` operand is not a suspended, resumable generator:
+    /// exhausted, already running, not yet started, frameless, or not a
+    /// generator at all (`generator_resume_fast_path`).
+    NotResumable,
+    /// `should_not_inline` — two or more `yield`s. Upstream gives this body
+    /// `generatorentry_driver`'s own merge point instead of inlining it.
+    SeveralYields,
+    /// The body owns cells or reads free variables. The seeded-frame inline
+    /// admits existing freevar cells but not fresh cellvar allocation, and the
+    /// resume has no seeding step of its own yet.
+    CellsOrFreevars,
+    /// The body carries an exception table beyond the synthetic wrapper 3.14
+    /// puts around every generator to convert an escaping `StopIteration`.
+    RealExceptionTable,
+    /// No jitcode is installed for the body, so there is nothing to walk.
+    NoJitcode,
+    /// The body's jitcode publishes no trace-entry offset for the resume
+    /// coordinate (`merge_entry_for`), so a walk has no place to start.
+    NoResumeEntry,
+    /// Every precondition holds.
+    Admissible,
+}
+
+impl GeneratorResumeVerdict {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotResumable => "not_resumable",
+            Self::SeveralYields => "several_yields",
+            Self::CellsOrFreevars => "cells_or_freevars",
+            Self::RealExceptionTable => "real_exception_table",
+            Self::NoJitcode => "no_jitcode",
+            Self::NoResumeEntry => "no_resume_entry",
+            Self::Admissible => "admissible",
+        }
+    }
+}
+
+/// Whether this code object's exception table is nothing but the synthetic
+/// entry 3.14 wraps every generator body in.
+///
+/// `codegen.py` emits one depth-zero, `lasti` entry spanning the whole body
+/// whose handler is the `CALL_INTRINSIC_1 INTRINSIC_STOPITERATION_ERROR` /
+/// `RERAISE` pair, so EVERY generator has a table and the plain
+/// "`exceptiontable` is empty" test the seeded inline uses refuses all of
+/// them.  An entry written for an actual `try` around the body either omits
+/// `lasti` at depth zero or carries a non-zero unwind depth — the same
+/// discriminator `code_yields_inside_try` reads.
+fn generator_table_is_only_the_stopiteration_wrapper(
+    code: &pyre_interpreter::CodeObject,
+) -> bool {
+    pyre_interpreter::pycode::decode_exceptiontable(&code.exceptiontable)
+        .all(|entry| entry.depth == 0 && entry.lasti)
+}
+
+/// Decide whether a `FOR_ITER` over `iter_obj` names a generator resume the
+/// tracer could walk instead of leaving the `jit_next` residual in place.
+///
+/// This is the admission half of the route, split out so the corpus census
+/// can ask the question without emitting anything.
+fn generator_resume_verdict(iter_obj: pyre_object::PyObjectRef) -> GeneratorResumeVerdict {
+    use GeneratorResumeVerdict as V;
+    let Some(shape) = (unsafe { pyre_interpreter::baseobjspace::generator_resume_fast_path(iter_obj) })
+    else {
+        return V::NotResumable;
+    };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(shape.w_pycode) }
+        as *const pyre_interpreter::CodeObject;
+    if raw.is_null() {
+        return V::NoJitcode;
+    }
+    let code = unsafe { &*raw };
+    if pyre_interpreter::baseobjspace::should_not_inline(code) {
+        return V::SeveralYields;
+    }
+    if !code.cellvars.is_empty() || !code.freevars.is_empty() {
+        return V::CellsOrFreevars;
+    }
+    if !generator_table_is_only_the_stopiteration_wrapper(code) {
+        return V::RealExceptionTable;
+    }
+    let w_pycode = shape.w_pycode as *const ();
+    let Some(pjc) = crate::state::pyjitcode_for_code(w_pycode) else {
+        return V::NoJitcode;
+    };
+    if crate::state::sub_jitcode_body_for_code(w_pycode).is_none() {
+        return V::NoJitcode;
+    }
+    // `execute_frame` documents execution as starting just after `last_instr`,
+    // and `resume_execute_frame` returns exactly `last_instr + 1` after
+    // pushing the sent value.
+    let resume_py_pc = shape.last_instr as usize + 1;
+    if pjc.merge_entry_for(resume_py_pc).is_none() {
+        return V::NoResumeEntry;
+    }
+    V::Admissible
+}
+
+/// `PYRE_GEN_CENSUS=1`: print one line per `FOR_ITER` whose operand is a
+/// generator, naming the verdict.  Reading the population is what says whether
+/// the resume route is worth its guards, and a decline reason cannot be read
+/// off `spec_gate`'s consulted/fired pair.
+fn gen_census_enabled() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PYRE_GEN_CENSUS").is_some());
+    *ON
+}
+
+/// Resume a suspended generator into the trace at a `FOR_ITER`, in place of
+/// the opaque `jit_next` residual.
+///
+/// Upstream reaches this without a route of its own: the tracer walks into
+/// `send_ex` (which takes `generatorentry_driver`'s merge point only when
+/// `should_not_inline`), through `_invoke_execute_frame` into
+/// `execute_frame`, and the generator's OWN loop header is crossed once
+/// because `should_unroll_one_iteration` (`interp_jit.py`) answers True for
+/// `CO_GENERATOR`.  The walk ends at `YIELD_VALUE`, where `dispatch`'s
+/// `except Yield` arm forces the virtualizable and returns the value.
+///
+/// Pyre has none of those three hooks reachable from the walker yet, so this
+/// currently decides admissibility and declines; the census names what the
+/// resume would have to serve.
+pub(crate) fn try_walker_specialize_generator_next<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+    let Some(iter_obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::generator::is_generator(iter_obj) } {
+        return Ok(None);
+    }
+    let verdict = generator_resume_verdict(iter_obj);
+    if gen_census_enabled() {
+        eprintln!("[gen-census] pc={} {}", op.pc, verdict.label());
+    }
+    Ok(None)
+}
+
 /// Forward dunder selected by `try_dispatch_binary_special` for a non-inplace
 /// BINARY_OP. In-place operators have a distinct `__i*__` then binary fallback
 /// protocol and therefore stay on the generic path until that protocol is
