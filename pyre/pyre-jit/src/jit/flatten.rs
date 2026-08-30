@@ -3238,9 +3238,58 @@ fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
             return Operand::descr(DescrOperand::CallDescrStub(stub.clone()));
         }
     }
+    // RPython `flatten.py emit_descr`: an ordinary FieldDescr carried by a
+    // graph operation is interned as-is.  Preserve the complete descriptor
+    // shape here; the integer register bank alone cannot reconstruct narrow
+    // fields such as `PyFrame.flags`.
+    //
+    // `BhDescr::Field` carries the display name and its owner separately so
+    // `bh_field_cache_key(owner, name)` can recover descr.py's FIELDNAME half
+    // of the `(STRUCT, fieldname)` cache key.  Leaving `owner` empty feeds the
+    // already-qualified display string (`PyFrame.PyFrame.flags` for the
+    // flattened host layout) back as FIELDNAME and mints a parallel
+    // descriptor.  Upstream carries the same FieldDescr object through this
+    // boundary; preserving both spellings is the Rust equivalent.
+    if let Some(field) = descr_ref.as_field_descr() {
+        let display_name = field.field_name();
+        let field_key = field.field_key();
+        let owner = if display_name == field_key {
+            ""
+        } else {
+            display_name
+                .strip_suffix(field_key)
+                .and_then(|prefix| prefix.strip_suffix('.'))
+                .unwrap_or("")
+        };
+        let parent = field.get_parent_descr().and_then(|parent| {
+            parent.as_size_descr().map(|size| {
+                std::sync::Arc::new(majit_translate::jitcode::BhSizeSpec {
+                    size: size.size(),
+                    type_id: size.cache_key(),
+                    vtable: size.vtable() as u64,
+                    is_gc_managed: size.is_gc_managed(),
+                    headerless: size.headerless(),
+                    all_fielddescrs: majit_translate::jitcode::bh_field_specs_from_size_descr(size),
+                })
+            })
+        });
+        return Operand::descr(DescrOperand::Bh(majit_translate::jitcode::BhDescr::Field {
+            offset: field.offset(),
+            field_size: field.field_size(),
+            field_type: field.field_type(),
+            field_flag: field.field_flag(),
+            is_field_signed: field.is_field_signed(),
+            is_immutable: field.is_immutable(),
+            is_quasi_immutable: descr_ref.is_quasi_immutable(),
+            index_in_parent: Some(field.index_in_parent()),
+            parent,
+            name: display_name.to_string(),
+            owner: owner.to_string(),
+        }));
+    }
     panic!(
         "flatten_descr_by_ptr: unmapped DescrByPtr {} — only vable \
-         array_field / array / static_field singletons + CallDescrStub \
+         array_field / array / static_field singletons, FieldDescr, and CallDescrStub \
          are recognised today",
         descr_ref.repr()
     )
@@ -7815,6 +7864,39 @@ mod tests {
                     assert_eq!(stub.arg_kinds, kinds);
                 }
                 other => panic!("expected DescrOperand::CallDescrStub, got {other:?}"),
+            },
+            other => panic!("expected Operand::Descr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flatten_field_descr_preserves_display_name_and_cache_key_owner() {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescr};
+
+        // descr.py keeps these two spellings separate: FIELDNAME keys
+        // cache[STRUCT], while `name` is only `%s.%s` for diagnostics.
+        let field: majit_ir::DescrRef = std::sync::Arc::new(
+            SimpleFieldDescr::new_with_name(
+                7,
+                48,
+                1,
+                majit_ir::Type::Int,
+                false,
+                ArrayFlag::Unsigned,
+                "PyFrame.PyFrame.flags".to_string(),
+                "PyFrame.flags".to_string(),
+            )
+            .with_index_in_parent(10),
+        );
+        let by_ptr = super::super::flow::DescrByPtr(field);
+
+        match flatten_descr_by_ptr(&by_ptr) {
+            Operand::Descr(rc) => match &*rc {
+                DescrOperand::Bh(BhDescr::Field { name, owner, .. }) => {
+                    assert_eq!(name, "PyFrame.PyFrame.flags");
+                    assert_eq!(owner, "PyFrame");
+                }
+                other => panic!("expected BhDescr::Field, got {other:?}"),
             },
             other => panic!("expected Operand::Descr, got {other:?}"),
         }

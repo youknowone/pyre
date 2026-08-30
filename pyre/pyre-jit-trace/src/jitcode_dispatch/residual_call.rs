@@ -5764,36 +5764,6 @@ fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
     true
 }
 
-/// Opt-in, where `opimpl_jit_force_quasi_immutable` (pyjitpl.py) forces
-/// unconditionally.
-///
-/// The blocker this gate was written for is closed: the flush leg declined for
-/// want of a latched operand-stack mirror, the walk fell back to legacy replay,
-/// and the R1 never-double guard then refused to hand back the FOR_ITER item
-/// the loop header had consumed -- one lost iteration per abort. The class-body
-/// site now latches that mirror and the latched-flush check accepts a consumed
-/// run rather than a single consumed TOS, and `fbw_foriter_item_dropped` is
-/// gated at zero so the loss cannot come back unseen.
-///
-/// What is left before the gate can go is a measurement, and it has been taken:
-/// over the 491 synthetic fixtures on dynasm, one binary and this env var
-/// apart, no program's answer changes and one counter row moves --
-/// `pickle_terminal_raise_resume` goes `loops_aborted` 1 -> 3.
-/// `fbw_rolled_back_with_effects`, `fbw_store_journal_rollback_failed` and
-/// `fbw_foriter_item_dropped` stay 0 everywhere. The gate is close to inert
-/// because `setattr_would_force_quasi_immut` answers only for a write that
-/// actually changes a quasi-immutable property.
-///
-/// It stays opt-in on that result rather than in spite of it. `loops_aborted`
-/// is a gated badness counter, so the two extra aborts have to be re-recorded
-/// on three backends as a rise; and they land on the one fixture already
-/// sitting on the wasm/dynasm 4x ratio knife-edge, where a run has been seen to
-/// report 4.6x. Removing the gate is a decision about paying that, not about
-/// whether the old blocker still stands.
-fn mapdict_qmut_force_enabled() -> bool {
-    std::env::var_os("PYRE_QMUT_MAPDICT_FORCE").is_some()
-}
-
 /// `nestedscope.py Cell.get` for the LOAD_DEREF residual.
 ///
 /// ```python
@@ -7992,7 +7962,6 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     // happened yet.
     if ctx.is_authoritative_executor
         && dst_bank == 'v'
-        && mapdict_qmut_force_enabled()
         && try_walker_force_quasi_immut_mapdict_write(
             ctx,
             op.pc,

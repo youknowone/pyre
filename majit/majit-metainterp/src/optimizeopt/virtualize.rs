@@ -2617,12 +2617,14 @@ fn field_slot_disagreement(
     };
     if !slot_holds_field(slot.as_ref(), field) {
         return Some(format!(
-            "field {:?} at offset {} claims slot {field_idx} of descr index {}, but that \
-             slot holds {:?} at offset {}",
+            "field {:?} (key {:?}) at offset {} claims slot {field_idx} of descr index {}, but \
+             that slot holds {:?} (key {:?}) at offset {}",
             field.field_name(),
+            field.field_key(),
             field.offset(),
             descr.index(),
             slot.field_name(),
+            slot.field_key(),
             slot.offset(),
         ));
     }

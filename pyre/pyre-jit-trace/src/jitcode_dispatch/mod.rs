@@ -1143,34 +1143,20 @@ fn finish_current_frame_execution<Sym: WalkSym>(
         return;
     }
     if !ctx.is_top_level && (concrete_frame.is_null() || unsafe { !(*concrete_frame).escaped() }) {
-        // RPython records this store on a virtual MIFrame and
+        // RPython records `PyFrame.finish_value` on a virtual MIFrame and
         // optimizeopt.virtualize removes the whole frame when it never
-        // escapes.  The walker has already selected the concrete path and can
-        // make the same distinction before recording: an unescaped inline
-        // frame has no observer after return.  Escaped inline frames and the
-        // portal red frame keep the real store below.
+        // escapes.  The recording-time carrier likewise has no observer.
         return;
     }
 
-    let flags_descr = crate::descr::pyframe_flags_descr();
-    let live_flags = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame, flags_descr.clone());
-    let finished_bit = ctx
-        .trace_ctx
-        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_FRAME_FINISHED));
-    let new_flags = ctx
-        .trace_ctx
-        .record_op(OpCode::IntOr, &[live_flags, finished_bit]);
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[frame, new_flags],
-        flags_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(frame, flags_descr.index(), new_flags);
-
-    if !concrete_frame.is_null() {
-        unsafe { (*concrete_frame).set_frame_finished_execution(true) };
-    }
+    // `PyFrame.finish_value`'s translated graph has already emitted the
+    // read/or/store on this callee's red frame before the return opcode.  Now
+    // that the inline sub-walk threads that frame, recording another store
+    // here duplicates the interpreter graph and can read the graph's
+    // post-store heapcache value against a still-pre-store concrete carrier.
+    // `execute_and_record` would have applied the graph store while tracing;
+    // mirror only that recording-time side effect here.
+    unsafe { (*concrete_frame).set_frame_finished_execution(true) };
 }
 
 fn recording_raise_keeps_existing_traceback<Sym: WalkSym>(
