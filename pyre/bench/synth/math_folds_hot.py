@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=2.4
+# Ubuntu run 33279264115: 0.7-1.2x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: spec-folds=math_ceil,math_fabs,math_float1,math_float2,math_floor,math_isclose,math_log_trig,math_trunc,math_sqrt,float_call
 # pyre-check: skip-cpython
 # This fixture carried a wasm allowance of 13, fitted to a darwin-arm64

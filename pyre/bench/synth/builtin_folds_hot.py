@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=12
+# pyre-check: max-pypy-ratio=4.4
+# Ubuntu run 33279264115: 1.7-2.2x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: skip-cpython
 # Fitted between the two arms.  With every fold in place the three runners read
 # 4.6x / 4.7x on darwin-arm64, 7.2x / 7.6x on ubuntu-24.04 and 9.2x / 10.0x on
@@ -20,8 +22,6 @@
 # stopped emitting a call at all: what is guarded is the ordering of the two
 # unboxed values, and under that ordering the answer is the winning operand's
 # own reference.  darwin-arm64 reads 2.0x / 2.2x where it read 4.6x / 4.7x.
-# The ceiling is unchanged: it was fitted to a reading from all three runners,
-# and only a reading from all three can replace it.
 #
 # pyre-check: spec-folds=builtin_fold1,builtin_fold2
 # This fixture carried a wasm allowance of 13 while every folded builtin still

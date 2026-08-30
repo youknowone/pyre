@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=24
+# pyre-check: max-pypy-ratio=19
+# Ubuntu run 33279264115: 4-9.5x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: skip-cpython
 # pyre-check: jitstats-band=guard_failures=8
 # Jitcounter decay scales every JitCounter entry down once per 32 minor

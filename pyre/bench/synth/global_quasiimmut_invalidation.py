@@ -1,9 +1,7 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=5.4
+# Ubuntu run 33279264115: 1.4-2.7x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # pyre-check: skip-cpython
-# No wasm allowance is needed: the steady state does not re-enter the
-# invalidated loop, and the wasm ratio reads 2.9x.
-# The pypy ceiling is twice the slowest ratio observed, 12.6x on the macos
-# runner.
 # cpython 0.21s vs pyre 0.07s (3.0x), and it is not gated on — only pypy is.
 # Nested compiled loop + a conditional loop-carried store to a MODULE
 # GLOBAL that is read after the (untaken) store.  The read-only global

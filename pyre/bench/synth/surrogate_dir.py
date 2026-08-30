@@ -1,9 +1,10 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=7.2
+# Ubuntu run 33279264115: 2.2-3.6x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # At the 100 it was recorded with, the loop never reached the JIT --
 # `loops_compiled=0` on every backend -- and pypy's side sat on the
 # execution floor, so the gate compared startup. At 1600 the loop compiles
-# and pypy's own execution is a measurement. The ceiling is four times the
-# slowest observed (1.8x), fitted on one host until the runners report.
+# and pypy's own execution is a measurement.
 
 import sys
 

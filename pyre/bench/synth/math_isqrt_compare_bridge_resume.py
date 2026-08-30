@@ -1,8 +1,6 @@
-# pyre-check: max-pypy-ratio=13
-# Tightened 18 -> 13 when `seeded_callee_resume` stopped requiring the
-# callee's own exception table: execution-only time here fell 3.4x against a
-# same-day build of the parent commit, so the previous headroom is kept and
-# then some -- the ceiling moves by less than the measured gain.
+# pyre-check: max-pypy-ratio=8
+# Ubuntu run 33279264115: 1.9-4x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 # A comparison helper (like test_math.testIsqrt's assertLessEqual/assertLess)
 # runs first on exact ints and then on bignums. The `<=`/`<` inside the helper
 # callee has CompareOp class/value guards that must attach a bridge at the
