@@ -271,7 +271,7 @@ cover the condition they diagnose.
 
 - Read sites: 1 — `majit/majit-backend/src/deadframe.rs`
 - Accessor: `seed_jitframe_pool_arm()`, behind `jitframe_pool_enabled()`
-- What it does: Selects which arm allocates the jitframe a compiled entry runs on, for backends that build frames out of the Rust heap rather than the GC nursery. `0` selects `FrameHeapOwner::OWNED`, one `calloc`/`free` pair per entry; anything else, including leaving it unset, selects the pooled per-thread free list. Read once and latched, so it names a strategy for the process rather than a per-entry state; `set_jitframe_pool` overrides it for a harness that can call in.
+- What it does: Selects which arm allocates the jitframe a compiled entry runs on, for backends that build frames out of the Rust heap rather than the GC nursery. `0` selects the owned arm, one `calloc`/`free` pair per entry; anything else, including leaving it unset, selects the pooled per-thread free list. Read once and latched, so it names a strategy for the process rather than a per-entry state; `set_jitframe_pool` overrides it for a harness that can call in.
 - Retirement condition: when the owned arm is retired — it exists to be differenced against the pooled one, and a build with no second arm has nothing to select.
 
 ### `MAJIT_PROBE_EXTRA`

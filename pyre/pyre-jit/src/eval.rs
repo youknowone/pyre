@@ -1990,17 +1990,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     spec_tuple_oo_ti.has_gc_ptrs = true;
     let spec_tuple_oo_tid = gc.register_type(spec_tuple_oo_ti);
     debug_assert_eq!(spec_tuple_oo_tid, SPECIALISED_TUPLE_OO_GC_TYPE_ID);
-    // Tell the cranelift backend which type id to use for the
-    // nursery allocations that it issues for jitframes. Without
-    // this, the backend's default u32::MAX sentinel would trip the
-    // allocation assert in run_compiled_code_inner, or — worse,
-    // before this fix — the backend's stale hard-coded `2` would
-    // collide with W_FLOAT_GC_TYPE_ID and GC would copy jitframes
-    // with the wrong TypeInfo (24-byte float payload instead of
-    // the real 64 + 8*depth layout), silently truncating every
-    // ref root slot past the first three bytes.
-    #[cfg(not(target_arch = "wasm32"))]
-    majit_metainterp::set_active_backend_jitframe_gc_type_id(jitframe_tid);
+    // `gc_ll_descr.malloc_jitframe` allocates under `JITFRAME`; the descr is
+    // told which registered type that is, once, before the table freezes.
+    gc.set_jitframe_type_id(jitframe_tid);
     // The orthodox (PYRE_WASM_CA) frame path allocates host-entry frames as
     // GC-managed JitFrames of this type so the collector forwards their Ref
     // item slots via the jf_gcmap custom trace.

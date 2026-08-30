@@ -35,16 +35,16 @@
 //!   objects do not move again, so a collection taken before the drop cannot
 //!   witness a drop that damages the frame. Only this ordering can.
 //!
-//! The third, `owned_deadframe_registry_roots_the_returned_frames_refs`, moves
-//! the collection past the point where the run RETURNS, and so covers the
-//! other deadframe constructor. `execute_token` mints its result with
-//! `LibcJitFrameDeadFrame::owning`, which OWNS the chain; by then the compiled
-//! epilogue's `gen_footer_shadowstack` has popped the frame off the JF shadow
-//! stack, so the reason the borrowed cases stayed traceable is gone. What is
-//! left is `LIVE_DEADFRAMES`, the registry `owning` inserts into and `Drop`
-//! removes from, published to the collector as a root source. That test walks
-//! the registry to show the frame is in it and walks the JF shadow stack to
-//! show it is in nothing else, and only then collects.
+//! The third, `owned_deadframe_root_slot_roots_the_returned_frames_refs`,
+//! moves the collection past the point where the run RETURNS, and so covers
+//! the other deadframe constructor. `execute_token` mints its result with
+//! `JitFrameDeadFrame::new`, which takes an owner-root slot for the frame; by
+//! then the compiled epilogue's `gen_footer_shadowstack` has popped the frame
+//! off the JF shadow stack, so the reason the borrowed cases stayed traceable
+//! is gone. What is left is that slot, walked by the collector's root phase
+//! with the rest of the owner roots. That test walks the roots to show the
+//! frame is named there and walks the JF shadow stack to show it is in nothing
+//! else, and only then collects.
 use parking_lot::Mutex;
 use std::cell::{Cell, UnsafeCell};
 use std::rc::Rc;
@@ -58,8 +58,8 @@ use majit_ir::{
     Type, Value,
 };
 
-/// `LIVE_DEADFRAMES`, the libc-jitframe registry and the published nursery
-/// state are process-global, so a collection driven by one test would walk
+/// The owner-root slots and the published nursery state are shared beyond one
+/// fixture, so a collection driven by one test would walk
 /// another test's frames. Run them one at a time regardless of the harness's
 /// parallel scheduling; poison-tolerant so one failure does not wedge the rest.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -136,12 +136,13 @@ fn read_slots(backend: &DynasmBackend, frame: &DeadFrame) -> [GcRef; PROBE_COUNT
     std::array::from_fn(|index| backend.get_ref_value(frame, index))
 }
 
-/// The off-GC-heap frame `deadframe` reads through.
+/// The frame `deadframe` reads through, at its current address.
 fn frame_addr_of(deadframe: &DeadFrame) -> usize {
     deadframe
-        .as_libc_jitframe()
-        .expect("the dynasm backend mints only the off-GC-heap deadframe variant")
-        .frame_addr()
+        .as_jitframe()
+        .expect("a collector with JITFRAME registered hands out nursery frames")
+        .jf_gcref()
+        .0
 }
 
 /// The jitframe addresses this thread's JF shadow stack currently holds.
@@ -155,11 +156,12 @@ fn jf_shadow_stack_addrs() -> Vec<usize> {
     addrs
 }
 
-/// The payload addresses `walk_live_deadframes` currently yields — the set
-/// `LibcJitFrameDeadFrame::owning` inserts into and its `Drop` removes from.
-fn live_deadframe_addrs() -> Vec<usize> {
+/// The addresses this thread's non-jitframe roots currently hold — the
+/// shadow stack and the owner-root slots, the latter being where
+/// `JitFrameDeadFrame::new` parks the frame it owns and `Drop` releases it.
+fn owner_root_addrs() -> Vec<usize> {
     let mut addrs = Vec::new();
-    majit_backend::libc_deadframe::walk_live_deadframes(&mut |addr| addrs.push(addr));
+    majit_gc::shadow_stack::walk_roots(|root| addrs.push(root.0));
     addrs
 }
 
@@ -282,14 +284,12 @@ struct Fixture {
 
 impl Fixture {
     fn build(helper: extern "C" fn(i64), token_number: u64) -> Fixture {
-        // Without this the collector cannot walk a libc-allocated jitframe at
-        // all, and every slot check below would pass vacuously.
-        majit_gc::shadow_stack::register_libc_jitframe_tracer(
-            majit_backend_dynasm::jitframe::jitframe_custom_trace,
-        );
-
         let mut gc = majit_gc::collector::MiniMarkGC::new();
         let probe_tid = gc.register_type(majit_gc::TypeInfo::simple(PROBE_SIZE));
+        // jitframe.py — the frame is a nursery object traced through
+        // `jf_gcmap`; a collector with a type table must carry JITFRAME.
+        let jitframe_tid = gc.register_type(majit_backend::jitframe::jitframe_type_info());
+        majit_gc::GcAllocator::set_jitframe_type_id(&mut gc, jitframe_tid);
         let mut allocated = [GcRef(0); PROBE_COUNT];
         for (index, slot) in allocated.iter_mut().enumerate() {
             let obj = gc.alloc_with_type(probe_tid, PROBE_SIZE);
@@ -478,12 +478,12 @@ fn dropping_a_borrowed_deadframe_leaves_the_running_frame_traceable() {
     check_common(&fixture, &frame, &observed, observed.roots_after);
 }
 
-/// `execute_token` hands back a deadframe minted by
-/// `LibcJitFrameDeadFrame::owning`, and `owning` is what enters the frame into
-/// `LIVE_DEADFRAMES`. By then `gen_footer_shadowstack` has popped the frame off
-/// the JF shadow stack, so that registry is the only root source naming it —
-/// asserted here both ways round, present in the registry and absent from the
-/// shadow stack, before anything is collected.
+/// `execute_token` hands back a deadframe minted by `JitFrameDeadFrame::new`,
+/// which takes an owner-root slot for the frame. By then
+/// `gen_footer_shadowstack` has popped the frame off the JF shadow stack, so
+/// that slot is the only root naming it — asserted here both ways round,
+/// present among the owner roots and absent from the shadow stack, before
+/// anything is collected.
 ///
 /// The collection is taken here and not inside the helper, and that ordering is
 /// the test: a minor collection promotes every surviving nursery object and
@@ -491,7 +491,7 @@ fn dropping_a_borrowed_deadframe_leaves_the_running_frame_traceable() {
 /// was still on the shadow stack would fix the probe addresses and leave this
 /// one with nothing left to forward.
 #[test]
-fn owned_deadframe_registry_roots_the_returned_frames_refs() {
+fn owned_deadframe_root_slot_roots_the_returned_frames_refs() {
     let _serial = SERIAL.lock();
     let fixture = Fixture::build(force_read_and_collect_nothing, 5003);
     let (frame, observed) = fixture.run();
@@ -507,28 +507,35 @@ fn owned_deadframe_registry_roots_the_returned_frames_refs() {
          absence check below would be about a different frame"
     );
 
-    let live = live_deadframe_addrs();
+    let live = owner_root_addrs();
     assert!(
         live.contains(&tip),
-        "the returned deadframe's frame {tip:#x} is not in LIVE_DEADFRAMES ({live:#x?}), \
-         so the collector's deadframe root arm never names it"
+        "the returned deadframe's frame {tip:#x} is not among the owner roots ({live:#x?}), \
+         so the collector's root phase never names it"
     );
     let on_stack = jf_shadow_stack_addrs();
     assert!(
         !on_stack.contains(&tip),
         "frame {tip:#x} is still on the JF shadow stack ({on_stack:#x?}), so the collection \
-         below would root it through the stack and say nothing about LIVE_DEADFRAMES"
+         below would root it through the stack and say nothing about the owner root"
     );
 
     majit_gc::collect_full();
     let roots_after = probe_snapshot();
     check_common(&fixture, &frame, &observed, roots_after);
 
-    drop(frame);
-    let live = live_deadframe_addrs();
+    // The frame moved with the collection; the slot names the new address.
+    let moved = frame_addr_of(&frame);
+    let live = owner_root_addrs();
     assert!(
-        !live.contains(&tip),
-        "dropping the deadframe left frame {tip:#x} in LIVE_DEADFRAMES ({live:#x?}), \
-         which would keep the collector tracing freed memory"
+        live.contains(&moved),
+        "after the collection the owner roots ({live:#x?}) no longer name the frame {moved:#x}"
+    );
+    drop(frame);
+    let live = owner_root_addrs();
+    assert!(
+        !live.contains(&moved),
+        "dropping the deadframe left frame {moved:#x} among the owner roots ({live:#x?}), \
+         which would keep a dead frame alive"
     );
 }

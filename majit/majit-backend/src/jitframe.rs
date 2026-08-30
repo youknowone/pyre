@@ -202,15 +202,14 @@ fn off_gc_layout(total: usize) -> Option<std::alloc::Layout> {
 ///
 /// `jitframe.py:48` allocates every frame through the GC, so upstream's
 /// compiled code always holds a frame that has a header behind it. Pyre also
-/// builds frames off the GC — the runner's entry frame, the realloc slowpath,
-/// and the JITFRAME nursery slowpath's fallback, the class
-/// `shadow_stack::register_libc_jitframe` tracks — and compiled code cannot
-/// tell the two apart. `_reload_frame_if_necessary`
-/// (`aarch64/assembler.py:967-980`) re-applies the non-array write-barrier
-/// fast path to the current frame after every collecting call, and that fast
-/// path loads the flag byte at `jit_wb_if_flag_byteofs`, which is *negative*
-/// (`gc.py:285-293` measures it from the object pointer, and the flags sit in
-/// the header at `obj-4`).
+/// builds frames off the GC — [`malloc_jitframe`] under a descr with no
+/// `JITFRAME` type id, the class `shadow_stack::register_libc_jitframe`
+/// tracks — and compiled code cannot tell the two apart.
+/// `_reload_frame_if_necessary` (`aarch64/assembler.py:967-980`) re-applies
+/// the non-array write-barrier fast path to the current frame after every
+/// collecting call, and that fast path loads the flag byte at
+/// `jit_wb_if_flag_byteofs`, which is *negative* (`gc.py:285-293` measures it
+/// from the object pointer, and the flags sit in the header at `obj-4`).
 ///
 /// Handing out a bare allocation base therefore puts that load outside the
 /// block: usually it reads unrelated bytes and, when they happen to carry
@@ -218,6 +217,10 @@ fn off_gc_layout(total: usize) -> Option<std::alloc::Layout> {
 /// lands at the start of a mapped region it faults outright. Reserving the
 /// header word makes the read in-bounds, and the zeroed flags give it the
 /// same answer a freshly nursery-allocated frame gives — no barrier.
+///
+/// The block comes off the thread's free list when
+/// [`crate::deadframe::jitframe_pool_enabled`] says so, and from the
+/// allocator otherwise; either way it is zeroed through `size_bytes`.
 ///
 /// Returns null when the allocation fails.
 pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
@@ -227,6 +230,14 @@ pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
     let Some(layout) = off_gc_layout(total) else {
         return std::ptr::null_mut();
     };
+    if let Some(base) = crate::deadframe::take_pooled_block(total) {
+        // A parked block keeps its own size slot; only the bytes this frame
+        // will read are cleared.
+        unsafe {
+            std::ptr::write_bytes(base.add(OFF_GC_SIZE_SLOT), 0, total - OFF_GC_SIZE_SLOT);
+            return base.add(OFF_GC_PREFIX) as *mut JitFrame;
+        }
+    }
     let base = unsafe { std::alloc::alloc_zeroed(layout) };
     if base.is_null() {
         return std::ptr::null_mut();
@@ -241,6 +252,7 @@ pub fn alloc_off_gc_jitframe(size_bytes: usize) -> *mut JitFrame {
 ///
 /// The frame pointer is not the block base — the size slot and the header word
 /// precede it — so this must be used instead of freeing the frame pointer.
+/// A block the thread's free list has room for is parked there instead.
 ///
 /// # Safety
 /// `frame` must have come from [`alloc_off_gc_jitframe`] and must no longer be
@@ -252,8 +264,226 @@ pub unsafe fn free_off_gc_jitframe(frame: *mut JitFrame) {
     unsafe {
         let base = (frame as *mut u8).sub(OFF_GC_PREFIX);
         let total = *(base as *const u64) as usize;
-        let layout = off_gc_layout(total).expect("off-GC jitframe size slot was corrupted");
-        std::alloc::dealloc(base, layout);
+        if crate::deadframe::give_back_pooled_block(base, total) {
+            return;
+        }
+        dealloc_off_gc_block(base, total);
+    }
+}
+
+/// Return an [`alloc_off_gc_jitframe`] block to the allocator.
+///
+/// # Safety
+/// `base` must be the block base and `total` the value of its size slot.
+pub(crate) unsafe fn dealloc_off_gc_block(base: *mut u8, total: usize) {
+    let layout = off_gc_layout(total).expect("off-GC jitframe size slot was corrupted");
+    unsafe { std::alloc::dealloc(base, layout) };
+}
+
+// ── The descr's frame allocation ────────────────────────────────────
+
+/// Zero-fill a frame the nursery handed back.
+///
+/// RPython's nursery is zeroed once per reset, so `lltype.malloc(JITFRAME)`
+/// returns cleared memory and `GuardNotForced` can read `jf_descr != 0`.
+/// Ours is not, so a fresh frame is cleared here.
+fn zeroed_nursery_frame(gcref: majit_ir::GcRef, size_bytes: usize) -> *mut JitFrame {
+    assert!(!gcref.is_null(), "JITFRAME nursery allocation failed");
+    unsafe { std::ptr::write_bytes(gcref.0 as *mut u8, 0, size_bytes) };
+    gcref.0 as *mut JitFrame
+}
+
+/// `llmodel.py:298` `frame = self.gc_ll_descr.malloc_jitframe(frame_info)`,
+/// reached through `GcLLDescription.malloc_jitframe` (gc.py:132) and
+/// `jitframe_allocate` (`jitframe.py:48`).
+///
+/// The descr decides where the frame lives: under its `JITFRAME` type id it
+/// is a nursery object the collector traces through `jitframe_trace` and may
+/// move; without one — an allocator with no type table, or [`HostHeapGc`]
+/// when nothing is installed — it is a host block the libc-jitframe tracer
+/// walks in place. The caller sees one frame pointer either way; what
+/// differs is only whether the deadframe that later owns it takes a root
+/// slot ([`jitframe_is_gc_object`]) and whether a store into it needs a
+/// barrier ([`jitframe_write_barrier`]).
+///
+/// The nursery arm may collect, so the caller must have its inputs rooted.
+/// `size_bytes` is the payload size ([`JitFrame::alloc_size`]).
+pub fn malloc_jitframe(gc: &mut dyn majit_gc::GcAllocator, size_bytes: usize) -> *mut JitFrame {
+    match gc.jitframe_type_id() {
+        Some(type_id) => {
+            zeroed_nursery_frame(gc.alloc_nursery_typed(type_id, size_bytes), size_bytes)
+        }
+        None => malloc_host_jitframe(size_bytes),
+    }
+}
+
+/// [`malloc_jitframe`] for a caller holding unrooted references on the Rust
+/// stack: the nursery arm falls back to the old generation instead of
+/// collecting. `llmodel.py:140`'s realloc slow path and the compiled-entry
+/// frame are built this way.
+pub fn malloc_jitframe_no_collect(
+    gc: &mut dyn majit_gc::GcAllocator,
+    size_bytes: usize,
+) -> *mut JitFrame {
+    match gc.jitframe_type_id() {
+        Some(type_id) => zeroed_nursery_frame(
+            gc.alloc_nursery_no_collect_typed(type_id, size_bytes),
+            size_bytes,
+        ),
+        None => malloc_host_jitframe(size_bytes),
+    }
+}
+
+/// The host-heap arm of [`malloc_jitframe`]: an off-GC block, registered so
+/// the collector's root walk finds its ref slots.
+fn malloc_host_jitframe(size_bytes: usize) -> *mut JitFrame {
+    let frame = alloc_off_gc_jitframe(size_bytes);
+    assert!(!frame.is_null(), "JITFRAME host allocation failed");
+    majit_gc::shadow_stack::register_libc_jitframe(frame as usize);
+    frame
+}
+
+/// Release a frame from [`malloc_jitframe`] that no compiled code, shadow
+/// stack or deadframe still names.
+///
+/// A GC object is left to the collector — RPython never frees a frame — so
+/// only the host arm does anything.
+///
+/// # Safety
+/// `frame` must have come from [`malloc_jitframe`] under this descr and be
+/// unreachable.
+pub unsafe fn free_jitframe(gc: &dyn majit_gc::GcAllocator, frame: *mut JitFrame) {
+    if jitframe_is_gc_object(gc) {
+        return;
+    }
+    unsafe { free_host_jitframe(frame) };
+}
+
+/// The host arm of [`free_jitframe`], for an owner that already knows its
+/// frame is a host block.
+///
+/// # Safety
+/// As [`free_jitframe`].
+pub unsafe fn free_host_jitframe(frame: *mut JitFrame) {
+    majit_gc::shadow_stack::unregister_libc_jitframe(frame as usize);
+    unsafe { free_off_gc_jitframe(frame) };
+}
+
+/// Whether this descr's frames are collector objects — the moving,
+/// header-carrying kind that must be held through a root slot — as opposed
+/// to host blocks. One descr answers this the same way for every frame it
+/// ever built.
+#[inline]
+pub fn jitframe_is_gc_object(gc: &dyn majit_gc::GcAllocator) -> bool {
+    gc.jitframe_type_id().is_some()
+}
+
+/// `llop.gc_writebarrier(lltype.Void, frame)` (`llmodel.py`) for a raw store
+/// into a frame from [`malloc_jitframe`].
+///
+/// Upstream emits the barrier unconditionally because every frame is a GC
+/// object; here a host block has no header for a barrier to mark, so the
+/// descr's arm decides.
+pub fn jitframe_write_barrier(gc: &mut dyn majit_gc::GcAllocator, frame: *mut JitFrame) {
+    if jitframe_is_gc_object(gc) {
+        gc.write_barrier(majit_ir::GcRef(frame as usize));
+    }
+}
+
+/// Refuse an install whose descr cannot allocate frames the collector can
+/// trace.
+///
+/// `jitframe.py` registers `JITFRAME`'s custom trace hook as part of
+/// translating the frontend, so the shape is settled before any compiled code
+/// exists. Same ordering here, made a precondition: a collector with a type
+/// table must arrive with its `JITFRAME` id set (`set_jitframe_type_id`),
+/// and the id must name a `JITFRAME` — an id minted for another shape would
+/// have the collector copy frames under the wrong layout. A collector without
+/// a table is exempt: it has no shape to name, and its frames are host
+/// blocks. Registering here instead would mint an id in a table the frontend
+/// may already have frozen (`gctypelayout.py:393-398`).
+pub fn check_jitframe_descr(gc: &dyn majit_gc::GcAllocator) {
+    if !gc.has_type_registry() {
+        return;
+    }
+    let Some(id) = gc.jitframe_type_id() else {
+        panic!(
+            "installing a collector with a type registry requires the JITFRAME type id: \
+             register majit_backend::jitframe::jitframe_type_info() on that collector \
+             and pass the id to GcAllocator::set_jitframe_type_id() BEFORE the install"
+        );
+    };
+    assert_eq!(
+        gc.type_size(id),
+        Some(jitframe_type_info().size),
+        "JITFRAME type id {id} does not name a JITFRAME in the collector being installed"
+    );
+}
+
+/// The descr in force when no collector is installed: `GcLLDescr_boehm`
+/// (gc.py:151), which `get_ll_description(None)` (gc.py:653) selects.
+///
+/// Non-moving, no type table, `supports_guard_gc_type = False`. Its only
+/// job is [`malloc_jitframe`]'s host arm; compiled code under it allocates
+/// nothing else, because a backend without a collector never turns
+/// `new_via_gc` on, so every other allocation entry is unreachable and says
+/// so.
+pub struct HostHeapGc;
+
+impl HostHeapGc {
+    fn no_heap() -> ! {
+        panic!("HostHeapGc allocates only jitframes; no collector is installed")
+    }
+}
+
+impl majit_gc::GcAllocator for HostHeapGc {
+    fn alloc_nursery(&mut self, _size: usize) -> majit_ir::GcRef {
+        Self::no_heap()
+    }
+    fn alloc_nursery_no_collect(&mut self, _size: usize) -> majit_ir::GcRef {
+        Self::no_heap()
+    }
+    fn alloc_varsize(
+        &mut self,
+        _base_size: usize,
+        _item_size: usize,
+        _length: usize,
+    ) -> majit_ir::GcRef {
+        Self::no_heap()
+    }
+    fn alloc_varsize_no_collect(
+        &mut self,
+        _base_size: usize,
+        _item_size: usize,
+        _length: usize,
+    ) -> majit_ir::GcRef {
+        Self::no_heap()
+    }
+    fn write_barrier(&mut self, _obj: majit_ir::GcRef) {}
+    fn jit_remember_young_pointer_from_array(&mut self, _obj: majit_ir::GcRef) {}
+    fn remember_young_pointer_from_array2(
+        &mut self,
+        _obj: majit_ir::GcRef,
+        _index: usize,
+        _card: u32,
+    ) {
+    }
+    fn collect_nursery(&mut self) {}
+    fn collect_full(&mut self) {}
+    fn nursery_free(&self) -> *mut u8 {
+        Self::no_heap()
+    }
+    fn nursery_free_addr(&self) -> usize {
+        Self::no_heap()
+    }
+    fn nursery_top(&self) -> *const u8 {
+        Self::no_heap()
+    }
+    fn nursery_top_addr(&self) -> usize {
+        Self::no_heap()
+    }
+    fn max_nursery_object_size(&self) -> usize {
+        0
     }
 }
 

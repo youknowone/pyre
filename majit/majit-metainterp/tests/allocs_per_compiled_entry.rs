@@ -310,20 +310,16 @@ fn install_gc() {
     // this thread holds. The meter owns its process (`harness = false`), so it
     // holds the GIL for the whole run and never has to hand it back.
     majit_gc::gc_sync::register_thread();
-    // The cranelift backend requires the JITFRAME id before the install — its
-    // absence is what the doc above calls "with no GC at all it falls back to a
-    // `Vec<i64>`", now a refusal rather than a fallback. Registering the shape
-    // on the singleton and publishing its id is what `eval.rs build_gc` does.
-    // Only under this cfg: the dynasm backend's frame source is settled
-    // separately, and publishing for it would move the frame this file
-    // measures.
-    #[cfg(feature = "cranelift")]
-    {
-        let jitframe_tid = majit_gc::gc_sync::gc_op(|gc| {
-            majit_gc::GcAllocator::register_type(gc, majit_backend::jitframe::jitframe_type_info())
-        });
-        majit_backend_cranelift::set_jitframe_gc_type_id(jitframe_tid);
-    }
+    // Both backends require the descr's JITFRAME id before the install
+    // (`check_jitframe_descr`): a collector with a type table allocates every
+    // entry frame under that shape, which is the production frame source this
+    // file meters. Registering the shape on the singleton and telling the
+    // descr its id is what `eval.rs build_gc` does.
+    majit_gc::gc_sync::gc_op(|gc| {
+        let jitframe_tid =
+            majit_gc::GcAllocator::register_type(gc, majit_backend::jitframe::jitframe_type_info());
+        majit_gc::GcAllocator::set_jitframe_type_id(gc, jitframe_tid);
+    });
     #[cfg(feature = "cranelift")]
     majit_backend_cranelift::install_gc_standalone();
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
@@ -584,11 +580,10 @@ fn main() {
 
 /// Heap allocations per warm compiled-code entry, as measured by this file.
 ///
-/// **PER BACKEND, and the two disagree.** The backend is part of the key
-/// because it owns the last rows below; pinning one number for both would make
-/// whichever leg ran second fail with a message about a regression that is
-/// really a configuration difference. The figure was briefly one number for
-/// both, before cranelift's frame moved to the nursery.
+/// One number for both backends: since `malloc_jitframe` allocates against
+/// the descr, the entry frame is a nursery bump on either backend and the
+/// remaining rows are backend-neutral. The figure was per-backend while
+/// dynasm still built its entry frame off the GC.
 ///
 /// Four of the allocations are shared by both backends:
 ///
@@ -624,13 +619,16 @@ fn main() {
 /// scalars only — which `CounterState` is — gets neither, and falls back to the
 /// allocating `JitState` defaults. A state that clears that gate pays 4 fewer.
 ///
-/// `dynasm` adds one, for 5:
+/// `dynasm` adds NOTHING, and its four are the four shared rows above.
 ///
-/// | n | site |
-/// |---|------|
-/// | 1 | `majit_backend::jitframe::alloc_off_gc_jitframe` — the JITFRAME itself (`llmodel.py malloc_jitframe`, the ONE allocation upstream makes per entry) |
+/// It used to add three. The three that went:
 ///
-/// It used to add three. The two that went:
+/// - `majit_backend::jitframe::alloc_off_gc_jitframe`, the JITFRAME itself.
+///   `malloc_jitframe` allocates under the descr's JITFRAME type id, and this
+///   fixture registers the shape ([`install_gc`]), so the frame is a
+///   `nursery_free` bump (`jitframe.py:48-52`) and costs the process
+///   allocator nothing — the same row cranelift lost when its frame moved to
+///   the nursery.
 ///
 /// - `raw_values`, a copy of every jitframe slot taken because
 ///   `DynasmBackend::execute_token` freed the frame before returning.
@@ -647,15 +645,8 @@ fn main() {
 ///   type moved down into `majit-backend` and `DeadFrame` holds it by value in
 ///   a variant of its own.
 ///
-/// `cranelift` adds NOTHING, and its four are the four shared rows above.
-///
-/// There is no cranelift row for the frame itself, and that is the difference
-/// between the two backends. `run_compiled_code_inner` takes the JITFRAME from
-/// the nursery under its registered type id, which is `jitframe.py:48-52`
-/// `jitframe_allocate` — a bump of `nursery_free`, so the frame costs the
-/// process allocator nothing. dynasm's `execute_token` (`runner.rs`)
-/// allocates its entry frame off the GC unconditionally, so it keeps paying
-/// for one; installing a GC does not move its figure.
+/// `cranelift` adds NOTHING either — the backends agree now that both take
+/// the entry frame from `malloc_jitframe` against the same descr.
 ///
 /// It used to add four. The four that went:
 ///
@@ -684,4 +675,4 @@ fn main() {
 ///   `run_compiled_code_inner`, reached because this fixture had no GC at all;
 ///   see [`install_gc`]. The branch itself remains for a backend running
 ///   without a collector.
-const ALLOCS_PER_ENTRY: usize = if cfg!(feature = "cranelift") { 4 } else { 5 };
+const ALLOCS_PER_ENTRY: usize = 4;

@@ -1138,6 +1138,32 @@ pub trait GcAllocator: Send {
         false
     }
 
+    /// Tell the descr which registered type is `JITFRAME`.
+    ///
+    /// `jitframe.py` declares `JITFRAME` as a static `GcStruct` and
+    /// `GcLLDescription.malloc_jitframe` (gc.py:132) allocates it by that
+    /// name; the descr never has to be told. Here the shape is registered on
+    /// the collector at frontend build time (`jitframe_type_info()`), so the
+    /// id it received is handed to the descr once, right after that
+    /// registration and before `freeze_types`. The default drops the id: an
+    /// allocator with no type table has no shape to name, and its frames are
+    /// built on the host heap instead (see `jitframe_type_id`).
+    fn set_jitframe_type_id(&mut self, id: u32) {
+        let _ = id;
+    }
+
+    /// The `JITFRAME` type id this descr allocates frames under, or `None`
+    /// for an allocator with no type table.
+    ///
+    /// `None` is what makes a frame a host-heap block rather than a GC
+    /// object: `GcLLDescr_boehm` (gc.py:151) is the closest upstream shape,
+    /// a non-moving descr whose frames need no root slot and no barrier. The
+    /// backends read this through `majit_backend::jitframe::malloc_jitframe`
+    /// and never branch on it themselves.
+    fn jitframe_type_id(&self) -> Option<u32> {
+        None
+    }
+
     /// llsupport/gc.py:162 / gc.py:318 `supports_guard_gc_type` flag.
     /// `GcLLDescr_boehm` sets it to `False`; `GcLLDescr_framework` sets
     /// it to `True`. Relayed to `cpu.supports_guard_gc_type` via
@@ -1591,6 +1617,12 @@ impl GcAllocator for GcHandle {
     }
     fn has_type_registry(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.has_type_registry())
+    }
+    fn set_jitframe_type_id(&mut self, id: u32) {
+        gc_sync::gc_op(|gc| gc.set_jitframe_type_id(id))
+    }
+    fn jitframe_type_id(&self) -> Option<u32> {
+        gc_sync::gc_query_reentrant(|gc| gc.jitframe_type_id())
     }
     fn supports_guard_gc_type(&self) -> bool {
         gc_sync::gc_query_reentrant(|gc| gc.supports_guard_gc_type())

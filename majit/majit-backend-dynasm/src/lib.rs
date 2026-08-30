@@ -44,7 +44,7 @@ pub mod x86;
 // Cranelift uses JIT_EXC_VALUE / JIT_EXC_TYPE atomics (compiler.rs).
 // Dynasm uses the same pattern for structural equivalence.
 
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Whether `MAJIT_LOG` is set, cached at first access.
 ///
@@ -93,7 +93,6 @@ static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 // Holds the pending exception's `typeptr` (an immortal static `PyType`), never a
 // managed object, so it is deliberately not GC-rooted.
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
-static JITFRAME_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 /// Stands in for the slot array before any slot is written, so the base a
 /// compiled entry receives is always a readable address rather than null.
 /// `llmodel.py:319-322` does the same in untranslated runs, handing the entry a
@@ -163,22 +162,6 @@ pub fn jit_exc_value_addr() -> usize {
 /// `pos_exc_value` whenever the propagate path drains the global exception.
 pub fn jit_exc_type_addr() -> usize {
     &JIT_EXC_TYPE as *const _ as usize
-}
-
-/// Override the JITFRAME type id used by dynasm nursery slow paths.
-///
-/// The frontend registers `jitframe_type_info()` on its active GC before
-/// running JIT code; dynasm must allocate recursive callee jitframes with
-/// that same type so the collector traces them with `jitframe_trace`.
-pub fn set_jitframe_gc_type_id(id: u32) {
-    JITFRAME_GC_TYPE_ID.store(id, Ordering::Release);
-}
-
-pub(crate) fn jitframe_gc_type_id() -> Option<u32> {
-    match JITFRAME_GC_TYPE_ID.load(Ordering::Acquire) {
-        u32::MAX => None,
-        id => Some(id),
-    }
 }
 
 /// Write a thread-local slot that compiled entrypoints may read back.
