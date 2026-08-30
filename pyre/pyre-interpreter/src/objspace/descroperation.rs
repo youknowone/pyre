@@ -871,11 +871,7 @@ unsafe fn int_floordiv(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let vb = BigInt::from(vb);
         return Ok(bigint_result(bigint_floordiv_nonzero(&va, &vb)));
     }
-    let q = va / vb;
-    let r = va % vb;
-    // Adjust: if remainder is nonzero and signs of operands differ, subtract 1.
-    let q = if r != 0 && (r ^ vb) < 0 { q - 1 } else { q };
-    Ok(w_int_new(q))
+    Ok(w_int_new(ll_int_py_div(va, vb)))
 }
 
 unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -891,9 +887,34 @@ unsafe fn int_mod(a: PyObjectRef, b: PyObjectRef) -> PyResult {
         let vb = BigInt::from(vb);
         return Ok(bigint_result(bigint_modulo_nonzero(&va, &vb)));
     }
-    let r = va % vb;
-    let r = if r != 0 && (r ^ vb) < 0 { r + vb } else { r };
-    Ok(w_int_new(r))
+    Ok(w_int_new(ll_int_py_mod(va, vb)))
+}
+
+/// rint.py `ll_int_py_div`: the floor quotient, from the truncating machine
+/// quotient plus a sign correction.  The `int.py_div` oopspec makes the call
+/// an elidable residual the optimizer strength-reduces for a constant
+/// divisor (`rewrite.py optimize_call_int_py_div`), which is what the
+/// generated `//` descent needs to match the retired hand fold's trace.
+/// Both callers check `y != 0` and `x != INT_MIN || y != -1` first, so the
+/// `wrapping_*` never wrap.
+#[majit_macros::oopspec("int.py_div(x, y)")]
+pub(crate) fn ll_int_py_div(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_div(y);
+    let p = r.wrapping_mul(y);
+    let u = if y < 0 {
+        p.wrapping_sub(x)
+    } else {
+        x.wrapping_sub(p)
+    };
+    r.wrapping_add(u >> (i64::BITS - 1))
+}
+
+/// rint.py `ll_int_py_mod`, the remainder companion of [`ll_int_py_div`].
+#[majit_macros::oopspec("int.py_mod(x, y)")]
+pub(crate) fn ll_int_py_mod(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_rem(y);
+    let u = if y < 0 { r.wrapping_neg() } else { r };
+    r.wrapping_add(y & (u >> (i64::BITS - 1)))
 }
 
 // ── Long (BigInt) arithmetic operations ─────────────────────────────
