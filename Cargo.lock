@@ -2974,7 +2974,6 @@ dependencies = [
  "libc",
  "libffi",
  "linkme",
- "lz4_flex",
  "majit-gc",
  "majit-ir",
  "majit-macros",
