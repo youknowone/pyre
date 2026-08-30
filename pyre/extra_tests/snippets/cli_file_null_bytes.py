@@ -56,7 +56,9 @@ with tempfile.TemporaryDirectory() as directory:
     lines = stderr.splitlines()
     reported = "SyntaxError: source code cannot contain null bytes"
     assert reported in lines, stderr
-    assert lines[lines.index(reported) - 1] == "    x = '", stderr
+    reported_index = lines.index(reported)
+    assert reported_index > 0, stderr
+    assert lines[reported_index - 1] == "    x = '", stderr
     assert "\0" not in stderr, stderr
 
 print("OK")
