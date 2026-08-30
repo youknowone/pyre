@@ -4972,6 +4972,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         u16::MAX
     };
     let inline_depth = ctx.session.borrow().framestack.len();
+
+    // A strict straight-line callee at the top inline level is seeded with
+    // its own frame red so guards can carry a real two-frame snapshot.  A
+    // callee needing fresh cellvar allocation is not seeded — the seed block
+    // below breaks out to the ordinary single-frame inline for it — so exclude
+    // it here too, or the preflight would decline a CALL that path still
+    // serves.  A constructor is seeded like any other callee: the discard of
+    // `__init__`'s result is `descr_call`'s, and pyre records that as its own
+    // resume level (`crate::ctor_continuation`) rather than by refusing to
+    // seed and re-executing the CALL.
+    //
+    // Computed here rather than beside its first use in the seed block, because
+    // `seeded_callee_resume` below asks the same question and is 200 lines
+    // earlier.
+    let strict_seed = strict_inlinable
+        && inline_depth < fbw_max_multiframe_depth()
+        && callee_code.cellvars.is_empty();
     let contains_raise = body_facts.contains_raise;
     // A callee that raises inline needs the cross-frame bridge the carrier
     // drain builds once a guard inside the compiled chain fails.  The drain
@@ -5130,8 +5147,19 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 // anywhere.  The screen exemption below is unaffected: it is
                 // reached only when `branchy_handler_scan` is `Some`, which
                 // itself requires `has_exception_table`.
-                let seeded_callee_resume =
-                    callable_guard_op.is_constant() && inline_depth < 2 && try_multiframe;
+                // `try_multiframe` is `!strict_inlinable`, so asking for it
+                // alone refuses the SIMPLEST callee by construction: a
+                // straight-line leaf passes `callee_fast_path_inlinable`, is
+                // therefore strict, and is therefore never multiframe-eligible,
+                // while a branchier body with the same effects is admitted.
+                // What the term is standing in for is the warrant below — the
+                // callee owns a seeded frame, so an in-callee guard carries the
+                // callee's OWN resume coordinate rather than collapsing to the
+                // caller's CALL boundary — and `strict_seed` seeds one too.
+                // The two routes are an either/or, not a ladder.
+                let seeded_callee_resume = callable_guard_op.is_constant()
+                    && inline_depth < 2
+                    && (try_multiframe || strict_seed);
                 foriter_dirty_seeded_resume_admit = entry_is_call_boundary && seeded_callee_resume;
                 foriter_dirty_bound = entry_is_call_boundary
                     && (bound_method.is_some() || seeded_callee_resume)
@@ -5331,18 +5359,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         );
         return resolved_inline_decline(op.pc, line!());
     }
-    // A strict straight-line callee at the top inline level is seeded with
-    // its own frame red so guards can carry a real two-frame snapshot.  A
-    // callee needing fresh cellvar allocation is not seeded — the seed block
-    // below breaks out to the ordinary single-frame inline for it — so exclude
-    // it here too, or the preflight would decline a CALL that path still
-    // serves.  A constructor is seeded like any other callee: the discard of
-    // `__init__`'s result is `descr_call`'s, and pyre records that as its own
-    // resume level (`crate::ctor_continuation`) rather than by refusing to
-    // seed and re-executing the CALL.
-    let strict_seed = strict_inlinable
-        && inline_depth < fbw_max_multiframe_depth()
-        && callee_code.cellvars.is_empty();
     // Preflight the caller frame BEFORE the seed below records a virtual
     // PyFrame.  A CALL covered by a try/catch marker must remain residual so
     // its post-call catch resume routes an exception; returning after frame
@@ -5359,7 +5375,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     } else {
         None
     };
-    if foriter_dirty_bound && !try_multiframe {
+    // The same question `seeded_callee_resume` asked, re-asked after
+    // `precomputed_parent_frame` has already been computed for
+    // `try_multiframe || strict_seed`.  Widening only the first site moves the
+    // admission and then declines here one gate later.
+    if foriter_dirty_bound && !(try_multiframe || strict_seed) {
         return resolved_inline_decline(op.pc, line!());
     }
     if !strict_inlinable && !try_multiframe {
@@ -7106,6 +7126,26 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // rewinds to the OUTER frame's entry (`trace.rs`, "legacy drop
             // kept"), re-running every effect the walk already executed —
             // `threading.Thread.start` calling `_start_joinable_thread` twice.
+            // A FOR_ITER-route admission promises a rewind to the enclosing
+            // CALL, and `VableEscapedDuringResidualCall` does not take it: its
+            // recovery lives in `trace.rs` (blackhole adopt, else the escape-pc
+            // rewind) and denies nothing.  So the next attempt rebuilds the
+            // identical framestack, admits the identical callee and reaches the
+            // identical abort, until `MAX_TRACE_ABORT_COUNT` fires
+            // `disable_noninlinable_function` on the ENCLOSING green key — the
+            // loop is gone, not merely un-inlined.  Deny the CALLEE instead, so
+            // the next attempt residualizes the call and the loop still
+            // compiles.  Recovery is untouched; only the next attempt changes.
+            //
+            // Scoped to the two FOR_ITER admissions on purpose.  This is the
+            // corpus's most common abort, and a deny wherever it appears would
+            // re-record a large part of the suite for a promise those other
+            // admissions never made.
+            if matches!(e, DispatchError::VableEscapedDuringResidualCall { .. })
+                && (foriter_deferred_admit || foriter_dirty_seeded_resume_admit)
+            {
+                return Err(fbw_decline_inline_callee(ctx, op.pc, Some(callee_code_key)));
+            }
             if matches!(
                 e,
                 DispatchError::AbortPermanentMarkerReached { .. }
