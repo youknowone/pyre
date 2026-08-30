@@ -5,10 +5,10 @@
 `framework.py` brackets every operation that can reach the collector,
 `shadowstack.py` emits the `gc_push_roots` / `gc_pop_roots` pair, and
 `expand_pop_roots` turns the pop into one `gc_restore_root` per variable.
-The graph-wide `shadowcolor` stage is now automatic as well.  Until the
-framework transformer's marker-insertion handlers are ported, native
-interpreter paths retain their existing `push_roots` brackets and this gate
-stops those brackets being taken on trust.  See the module docs on
+The graph-wide framework marker insertion and `shadowcolor` stages are now
+automatic. Native interpreter paths are also compiled directly by rustc, so
+they retain their existing source `push_roots` brackets and this gate stops
+those brackets being taken on trust. See the module docs on
 `majit-translate/src/memory/gctransform/mod.rs` for that current port boundary.
 
 Two of the reported numbers are invariants at zero and are held there.  The

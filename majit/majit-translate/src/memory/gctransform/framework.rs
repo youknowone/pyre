@@ -17,10 +17,12 @@
 //! current operation's own arguments — *"moving GCs don't borrow, so the caller
 //! does not need to keep the arguments alive"*.
 //!
-//! pyre has no such rewrite, so the same question has to be answered by
-//! analysis.  It is answered over the *resolved* ULLBC call graph: a Call
-//! terminator names its callee as `Fun::Regular(FunDeclId)`, so closing over
-//! callers cannot be widened by two functions sharing a leaf name.
+//! The flowspace rewrite below uses the already-ported `CollectAnalyzer` and
+//! emits the same markers. The remainder of this file is the native-Rust audit
+//! for source paths compiled directly by rustc: it answers the reachability
+//! question over the *resolved* ULLBC call graph. A Call terminator names its
+//! callee as `Fun::Regular(FunDeclId)`, so closing over callers cannot be
+//! widened by two functions sharing a leaf name.
 //!
 //! # What actually collects
 //!
@@ -45,6 +47,217 @@
 //! So the seeds below are *dispatch* entry points, never allocators.
 
 use std::collections::{HashMap, HashSet};
+
+use crate::flowspace::model::{GraphKey, GraphRef, Hlvalue, SpaceOperation, Variable};
+use crate::translator::backendopt::collectanalyze::CollectAnalyzer;
+use crate::translator::backendopt::graphanalyze::GraphAnalyzer;
+use crate::translator::backendopt::support::var_needsgc;
+use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::translator::TranslationContext;
+use crate::translator::unsimplify::varoftype;
+
+/// `framework.py::BaseFrameworkGCTransformer`'s marker-insertion half.
+///
+/// The collector-specific operation rewrites still live beside their runtime
+/// helpers.  This carrier owns the part every moving framework GC shares:
+/// `CollectAnalyzer` decides whether an operation can collect and
+/// `get_livevars_for_roots` computes the GC variables that have a use after
+/// that operation. `ShadowStackFrameworkGCTransformer.push_roots` then spells
+/// the answer as `gc_push_roots` / `gc_pop_roots` for `shadowcolor.py`.
+pub struct BaseFrameworkGCTransformer<'t> {
+    collect_analyzer: CollectAnalyzer<'t>,
+    seen_graphs: HashSet<GraphKey>,
+    /// `BaseGCTransformer.num_pushs`: number of individual roots emitted in
+    /// the naive marker form, before shadow colouring coalesces their slots.
+    pub num_pushs: usize,
+}
+
+impl<'t> BaseFrameworkGCTransformer<'t> {
+    pub fn new(translator: &'t TranslationContext) -> Self {
+        Self {
+            collect_analyzer: CollectAnalyzer::new(translator),
+            seen_graphs: HashSet::new(),
+            num_pushs: 0,
+        }
+    }
+
+    /// `BaseFrameworkGCTransformer.get_livevars_for_roots` for a moving GC.
+    ///
+    /// `livevars` is the transform block's ordered list of GC variables that
+    /// have become live so far.  Moving GCs do not borrow current-operation
+    /// arguments, so the ordinary case keeps only variables used later.  The
+    /// `weakref_create` handler is upstream's one `keep_current_args=True`
+    /// caller: its referent must survive the allocation even when that is its
+    /// last graph use.
+    fn get_livevars_for_roots(
+        livevars: &[Variable],
+        var_last_needed_in: &HashMap<Variable, usize>,
+        operation: &SpaceOperation,
+        index: usize,
+        keep_current_args: bool,
+    ) -> Vec<Variable> {
+        let mut roots: Vec<Variable> = livevars
+            .iter()
+            .filter(|var| {
+                var_last_needed_in
+                    .get(*var)
+                    .is_some_and(|last| *last > index)
+            })
+            .cloned()
+            .collect();
+        if keep_current_args {
+            for arg in &operation.args {
+                let Hlvalue::Variable(var) = arg else {
+                    continue;
+                };
+                if var_needsgc(var)
+                    && var_last_needed_in
+                        .get(var)
+                        .is_some_and(|last| *last == index)
+                    && !roots.contains(var)
+                {
+                    roots.push(var.clone());
+                }
+            }
+        }
+        roots
+    }
+
+    fn marker(opname: &str, roots: &[Variable]) -> SpaceOperation {
+        SpaceOperation::new(
+            opname,
+            roots.iter().cloned().map(Hlvalue::Variable).collect(),
+            Hlvalue::Variable(varoftype(LowLevelType::Void, None)),
+        )
+    }
+
+    /// Operations whose `framework.py gct_*` handler calls `push_roots`
+    /// independently of `CollectAnalyzer.analyze(spaceop)`.
+    ///
+    /// Most rows also carry `LL_OPERATIONS[opname].canmallocgc` and therefore
+    /// agree with the analyzer. The explicit list is still load-bearing for
+    /// `gct_gc_obtain_free_space`, the `gct_gc_get_rpy_*` family and the
+    /// type-id helpers: upstream lowers those LLOps to collecting helper calls
+    /// even though their original descriptors have `canmallocgc=False`.
+    /// The three `gc_thread_*` brackets are conditional on thread-hook
+    /// function pointers that this transformer does not expose; they remain
+    /// ordinary LLOps until that root-walker surface is ported rather than
+    /// silently taking the enabled-hook branch.
+    fn handler_pushes_roots(opname: &str) -> bool {
+        matches!(
+            opname,
+            "gc__collect"
+                | "gc__collect_step"
+                | "gc_heap_stats"
+                | "do_malloc_fixedsize"
+                | "do_malloc_fixedsize_clear"
+                | "do_malloc_varsize"
+                | "do_malloc_varsize_clear"
+                | "weakref_create"
+                | "gc_identityhash"
+                | "gc_id"
+                | "gc_obtain_free_space"
+                | "gc_get_rpy_roots"
+                | "gc_get_rpy_referents"
+                | "gc_get_rpy_memory_usage"
+                | "gc_get_rpy_type_index"
+                | "gc_is_rpy_instance"
+                | "gc_dump_rpy_heap"
+                | "gc_typeids_z"
+                | "gc_typeids_list"
+        )
+    }
+
+    /// `BaseGCTransformer.transform_block` plus
+    /// `BaseFrameworkGCTransformer.gct_direct_call` and the collecting LLOp
+    /// handlers, restricted to the root markers they all have in common.
+    fn transform_block(&mut self, block: &crate::flowspace::model::BlockRef) {
+        let (inputargs, operations, exits) = {
+            let block = block.borrow();
+            (
+                block.inputargs.clone(),
+                block.operations.clone(),
+                block.exits.clone(),
+            )
+        };
+
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "RPython keys var_last_needed_in by Variable identity; its hash excludes annotation/concretetype cells"
+        )]
+        let mut var_last_needed_in: HashMap<Variable, usize> = HashMap::new();
+        for (index, operation) in operations.iter().enumerate() {
+            for arg in &operation.args {
+                if let Hlvalue::Variable(var) = arg
+                    && var_needsgc(var)
+                {
+                    var_last_needed_in.insert(var.clone(), index);
+                }
+            }
+        }
+        for link in exits {
+            for arg in &link.borrow().args {
+                if let Some(Hlvalue::Variable(var)) = arg
+                    && var_needsgc(var)
+                {
+                    var_last_needed_in.insert(var.clone(), operations.len() + 1);
+                }
+            }
+        }
+
+        // Moving-GC `compute_borrowed_vars` returns false for every variable,
+        // so all GC-pointer inputargs begin in `self.livevars`.
+        let mut livevars: Vec<Variable> = inputargs
+            .into_iter()
+            .filter_map(|value| match value {
+                Hlvalue::Variable(var) if var_needsgc(&var) => Some(var),
+                _ => None,
+            })
+            .collect();
+        let mut rewritten = Vec::with_capacity(operations.len());
+        for (index, operation) in operations.into_iter().enumerate() {
+            let can_collect = self.collect_analyzer.analyze(&operation, None, &())
+                || Self::handler_pushes_roots(&operation.opname);
+            if can_collect {
+                let roots = Self::get_livevars_for_roots(
+                    &livevars,
+                    &var_last_needed_in,
+                    &operation,
+                    index,
+                    operation.opname == "weakref_create",
+                );
+                self.num_pushs += roots.len();
+                rewritten.push(Self::marker("gc_push_roots", &roots));
+                rewritten.push(operation.clone());
+                // Emitted even for an empty live set: shadowcolor.py's
+                // move_pushes_earlier relies on the matching delimiter.
+                rewritten.push(Self::marker("gc_pop_roots", &roots));
+            } else {
+                rewritten.push(operation.clone());
+            }
+            if let Hlvalue::Variable(result) = &operation.result
+                && var_needsgc(result)
+            {
+                livevars.push(result.clone());
+            }
+        }
+        block.borrow_mut().operations = rewritten;
+    }
+
+    /// `BaseGCTransformer.transform_graph`: insert the naive root markers once
+    /// per reachable block. `shadowstack.py` invokes `shadowcolor.py` only
+    /// after every graph has passed through this method.
+    pub fn transform_graph(&mut self, graph: &GraphRef) {
+        let key = GraphKey::of(graph);
+        if !self.seen_graphs.insert(key) {
+            return;
+        }
+        let blocks = graph.borrow().iterblocks();
+        for block in blocks {
+            self.transform_block(&block);
+        }
+    }
+}
 
 /// A resolved ULLBC call graph: which function calls which.
 pub struct CallGraph {
@@ -758,6 +971,200 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::flowspace::model::{Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Link};
+    use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget, Struct};
+
+    fn gc_var(name: &str) -> Variable {
+        let var = Variable::named(name);
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc_with_hints(name, vec![], vec![])),
+        }))));
+        var
+    }
+
+    fn signed_var(name: &str) -> Variable {
+        let var = Variable::named(name);
+        var.set_concretetype(Some(LowLevelType::Signed));
+        var
+    }
+
+    fn single_block_graph(
+        name: &str,
+        input: Variable,
+        operations: Vec<SpaceOperation>,
+        returned: Variable,
+    ) -> GraphRef {
+        let start = Block::shared(vec![Hlvalue::Variable(input)]);
+        start.borrow_mut().operations = operations;
+        let graph = FunctionGraph::new(name, start.clone());
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(returned)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        Rc::new(RefCell::new(graph))
+    }
+
+    #[test]
+    fn collecting_operation_is_bracketed_with_gc_values_live_after_it() {
+        let root = gc_var("root");
+        let stats = signed_var("stats");
+        let returned = gc_var("returned");
+        let graph = single_block_graph(
+            "live_after",
+            root.clone(),
+            vec![
+                SpaceOperation::new("gc_heap_stats", vec![], Hlvalue::Variable(stats)),
+                SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(root.clone())],
+                    Hlvalue::Variable(returned.clone()),
+                ),
+            ],
+            returned,
+        );
+        let translator = TranslationContext::new();
+        let mut transformer = BaseFrameworkGCTransformer::new(&translator);
+
+        transformer.transform_graph(&graph);
+
+        let operations = graph.borrow().startblock.borrow().operations.clone();
+        assert_eq!(
+            operations
+                .iter()
+                .map(|operation| operation.opname.as_str())
+                .collect::<Vec<_>>(),
+            ["gc_push_roots", "gc_heap_stats", "gc_pop_roots", "same_as"]
+        );
+        assert_eq!(operations[0].args, vec![Hlvalue::Variable(root.clone())]);
+        assert_eq!(operations[2].args, vec![Hlvalue::Variable(root)]);
+        assert_eq!(transformer.num_pushs, 1);
+    }
+
+    #[test]
+    fn handler_bracket_is_not_lost_when_llop_canmallocgc_is_false() {
+        let root = gc_var("root");
+        let space = signed_var("space");
+        let returned = gc_var("returned");
+        let graph = single_block_graph(
+            "handler_override",
+            root.clone(),
+            vec![
+                SpaceOperation::new(
+                    "gc_obtain_free_space",
+                    vec![Hlvalue::Constant(Constant::with_concretetype(
+                        ConstValue::Int(4096),
+                        LowLevelType::Signed,
+                    ))],
+                    Hlvalue::Variable(space),
+                ),
+                SpaceOperation::new(
+                    "same_as",
+                    vec![Hlvalue::Variable(root.clone())],
+                    Hlvalue::Variable(returned.clone()),
+                ),
+            ],
+            returned,
+        );
+        let translator = TranslationContext::new();
+        let mut analyzer = CollectAnalyzer::new(&translator);
+        assert!(
+            !analyzer.analyze(&graph.borrow().startblock.borrow().operations[0], None, &()),
+            "the regression is specifically the handler/analyzer distinction"
+        );
+        let mut transformer = BaseFrameworkGCTransformer::new(&translator);
+
+        transformer.transform_graph(&graph);
+
+        let operations = graph.borrow().startblock.borrow().operations.clone();
+        assert_eq!(operations[0].opname, "gc_push_roots");
+        assert_eq!(operations[0].args, vec![Hlvalue::Variable(root.clone())]);
+        assert_eq!(operations[2].opname, "gc_pop_roots");
+        assert_eq!(operations[2].args, vec![Hlvalue::Variable(root)]);
+    }
+
+    #[test]
+    fn moving_gc_drops_a_collecting_operations_last_use_argument() {
+        let referent = gc_var("referent");
+        let identity = signed_var("identity");
+        let graph = single_block_graph(
+            "moving_does_not_borrow",
+            referent.clone(),
+            vec![SpaceOperation::new(
+                "gc_identityhash",
+                vec![Hlvalue::Variable(referent)],
+                Hlvalue::Variable(identity.clone()),
+            )],
+            identity,
+        );
+        let translator = TranslationContext::new();
+        let mut transformer = BaseFrameworkGCTransformer::new(&translator);
+
+        transformer.transform_graph(&graph);
+
+        let operations = graph.borrow().startblock.borrow().operations.clone();
+        assert_eq!(operations[0].opname, "gc_push_roots");
+        assert!(operations[0].args.is_empty());
+        assert_eq!(operations[2].opname, "gc_pop_roots");
+        assert!(operations[2].args.is_empty());
+    }
+
+    #[test]
+    fn weakref_create_keeps_its_last_use_argument_alive() {
+        let referent = gc_var("referent");
+        let weakref = gc_var("weakref");
+        let graph = single_block_graph(
+            "weakref_argument",
+            referent.clone(),
+            vec![SpaceOperation::new(
+                "weakref_create",
+                vec![Hlvalue::Variable(referent.clone())],
+                Hlvalue::Variable(weakref.clone()),
+            )],
+            weakref,
+        );
+        let translator = TranslationContext::new();
+        let mut transformer = BaseFrameworkGCTransformer::new(&translator);
+
+        transformer.transform_graph(&graph);
+
+        let operations = graph.borrow().startblock.borrow().operations.clone();
+        assert_eq!(
+            operations[0].args,
+            vec![Hlvalue::Variable(referent.clone())]
+        );
+        assert_eq!(operations[2].args, vec![Hlvalue::Variable(referent)]);
+    }
+
+    #[test]
+    fn graph_is_transformed_only_once() {
+        let root = gc_var("root");
+        let stats = signed_var("stats");
+        let graph = single_block_graph(
+            "once",
+            root,
+            vec![SpaceOperation::new(
+                "gc_heap_stats",
+                vec![],
+                Hlvalue::Variable(stats.clone()),
+            )],
+            stats,
+        );
+        let translator = TranslationContext::new();
+        let mut transformer = BaseFrameworkGCTransformer::new(&translator);
+
+        transformer.transform_graph(&graph);
+        transformer.transform_graph(&graph);
+
+        assert_eq!(graph.borrow().startblock.borrow().operations.len(), 3);
+    }
 
     /// One artefact's graph: `(def_id, name, line)` per function, plus edges.
     fn part(fns: &[(u64, &str, u64)], edges: &[(u64, u64)]) -> CallGraph {

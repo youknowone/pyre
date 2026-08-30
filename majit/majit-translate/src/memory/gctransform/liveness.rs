@@ -3,9 +3,10 @@
 //!
 //! Upstream reads the answer straight off the flow graph with
 //! `hop.livevars_after_op()`, then brackets the operation with
-//! `push_roots` / `pop_roots`. Until the framework marker-insertion handlers
-//! are ported, this audit computes the same live set over the ULLBC body and
-//! reports the operations where the existing source bracket is *missing*.
+//! `push_roots` / `pop_roots`. The flowspace transformer now performs that
+//! insertion automatically for translated graphs. Native interpreter paths
+//! also run as rustc-compiled Rust, so this audit computes the corresponding
+//! live set over ULLBC and reports where their source bracket is *missing*.
 //!
 //! # One deliberate divergence from upstream
 //!
@@ -81,10 +82,9 @@ pub struct ScanStats {
     /// [`Self::short_brackets`].
     pub withheld_bracket_short: usize,
     /// Those whose pinned set could not be read: a body holding a statement or
-    /// terminator this reader could not parse, an `enter_roots_frame` whose
-    /// slots are filled by later stores rather than named in an argument, or a
-    /// pin whose argument does not trace back to a set.  Neither graded nor
-    /// claimed clean -- a set read short would accuse correct code.
+    /// terminator this reader could not parse, a scope-local slot overwrite,
+    /// or a pin whose argument does not trace back to a set.  Neither graded
+    /// nor claimed clean -- a set read short would accuse correct code.
     pub withheld_contents_opaque: usize,
     /// Of [`Self::withheld_bracket_short`], those missing a root the body
     /// produced itself, which no caller's bracket can be covering.
@@ -405,9 +405,8 @@ fn chase_pinned(l: u64, defs: &HashMap<u64, PinSrc>, out: &mut HashSet<u64>, dep
 /// The free functions and the scope-local `pin_root` / `publish` forms.
 /// `scan` models the matching `RootScope` Drop at the same time, so a method
 /// pin cannot leak into calls after its guard was truncated.  Scope-local
-/// `set` / `save_run` overwrite coloured slots and remain opaque until the
-/// analysis carries a slot-to-root map; guessing there could claim false
-/// coverage.
+/// `set` overwrites a coloured slot and remains opaque until the analysis
+/// carries a slot-to-root map; guessing there could claim false coverage.
 fn is_pin_fn(name: &str) -> bool {
     name.ends_with("::pin_root")
         || name.ends_with("::pin_roots")
@@ -694,15 +693,7 @@ pub fn scan(
             let Some(name) = cg.names.get(id) else {
                 continue;
             };
-            if name.ends_with("gc_roots::enter_roots_frame") {
-                // The coloured form reserves slots and stores the roots into
-                // them afterwards, so there is no argument to read a set off.
-                opaque_contents = true;
-                continue;
-            }
-            if name.contains("gc_roots::<Impl>")
-                && (name.ends_with("::set") || name.ends_with("::save_run"))
-            {
+            if name.contains("gc_roots::<Impl>") && name.ends_with("::set") {
                 // These overwrite an existing coloured slot.  Without a
                 // slot→root map, retaining the old root or replacing the
                 // wrong one could both claim false coverage.
@@ -1195,7 +1186,6 @@ mod tests {
         assert!(is_pin_fn("pyre_object::gc_roots::pin_roots"));
         assert!(is_pin_fn("pyre_object::gc_roots::publish_roots"));
         assert!(!is_pin_fn("pyre_object::gc_roots::push_roots"));
-        assert!(!is_pin_fn("pyre_object::gc_roots::enter_roots_frame"));
     }
 
     /// `pin_roots(&[a, b])` lowers to an array build, a borrow, and the call.

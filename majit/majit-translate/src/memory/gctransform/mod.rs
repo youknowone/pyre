@@ -14,11 +14,14 @@
 //! [`shadowcolor`] after the framework transformer has emitted
 //! `gc_push_roots` / `gc_pop_roots` markers.
 //!
-//! The marker-insertion half of `framework.py` has not landed yet.  Native
-//! interpreter paths therefore retain their existing `push_roots` brackets,
-//! and [`liveness`] checks those brackets over the extracted ULLBC.  That is a
-//! current port boundary, not an implementation-language exception: once the
-//! framework handlers are ported, they feed the same automatic graph stage.
+//! [`framework`] now supplies the marker-insertion half for translated
+//! flowspace graphs: `CollectAnalyzer` classifies each operation and
+//! `get_livevars_for_roots` derives its root set from graph liveness. Native
+//! interpreter paths compiled directly by rustc still retain their existing
+//! source `push_roots` brackets, and [`liveness`] checks those brackets over
+//! the extracted ULLBC; the graph transform and the native audit therefore
+//! cover their respective execution paths without a source-level colouring
+//! approximation.
 pub mod framework;
 pub mod liveness;
 pub mod shadowcolor;

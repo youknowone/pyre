@@ -36,9 +36,11 @@
 //! Upstream writes no bracket by hand. The transformer inserts
 //! `push_roots` / `pop_roots` around the operations that can collect,
 //! across the whole translated graph, so an author cannot forget one and a
-//! reviewer never has to look for it. pyre has no such pass over Rust
-//! code: every bracket is written by hand, and their count is the size of
-//! what an automatic transform would replace. From the repo root,
+//! reviewer never has to look for it. pyre now performs the same insertion
+//! and colouring over translated flowspace graphs. The interpreter source
+//! also runs directly as rustc-compiled Rust, where those graph operations do
+//! not exist; that native execution path retains hand-written brackets, and
+//! their count is the size of the native audit surface. From the repo root,
 //! excluding this module:
 //!
 //! ```text
@@ -54,8 +56,9 @@
 //! is `MiniMarkGC::do_collect_oldgen_nonmoving`, which leaves the nursery
 //! byte-for-byte intact. Both exist because an unrooted [`PyObjectRef`] on
 //! the Rust stack of a bytecode handler would dangle across a moving
-//! minor. Ordinary moving-nursery allocation for the interpreter waits on
-//! the pass, not on this module.
+//! minor. Translated moving-nursery allocation is covered by the automatic
+//! graph pass; the native path remains on the born-old/nonmoving contract and
+//! these source brackets.
 //!
 //! ## State
 //!
@@ -557,31 +560,6 @@ impl RootScope {
         // SAFETY: `stack_slot` is this thread's live root-stack cell.
         normalize_published_slot(unsafe { &*self.stack_slot }, index);
     }
-
-    /// One bracket's whole `gc_save_root` series against an
-    /// [`enter_roots_frame`] frame: `expand_one_push_roots` emits one save per
-    /// live variable, and this performs that series over already-reserved
-    /// slots.
-    ///
-    /// Stores every value before resolving forwarding for any of them, which
-    /// is the split [`pin_roots`] exists to preserve: the forwarding query is
-    /// itself a safepoint, so querying after the first store would let a
-    /// foreign collection run while the later values are still invisible.
-    /// Upstream needs no such split -- its `gc_save_root` is a bare store, and
-    /// nothing between two of them can collect.
-    #[majit_macros::dont_look_inside]
-    pub fn save_run(&self, saves: &[(usize, PyObjectRef)]) {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        for &(index, root) in saves {
-            // SAFETY: same cell; `slot` bounds-checks `index`.
-            unsafe { *(*self.stack_slot).slot(index) = root };
-        }
-        for &(index, _) in saves {
-            // SAFETY: `stack_slot` is this thread's live root-stack cell.
-            normalize_published_slot(unsafe { &*self.stack_slot }, index);
-        }
-    }
 }
 
 impl Drop for RootScope {
@@ -596,42 +574,6 @@ impl Drop for RootScope {
         // the steady-state case for an empty bracket.
         shadow_stack_cell_truncate(self.stack_slot, self.save_point);
     }
-}
-
-/// `gc_enter_roots_frame` (`shadowcolor.py add_enter_leave_roots_frame`):
-/// open one bracket that owns `numcolors` slots for a whole function, instead
-/// of one bracket per collecting operation.
-///
-/// `numcolors` is a colour count, not a save count: `allocate_registers` runs
-/// a register allocator over the graph, so two roots share a slot whenever
-/// their live ranges do not overlap, and the frame is as wide as the roots
-/// that are live at once. Every `gc_save_root` afterwards addresses
-/// `base() + colour` and overwrites whatever the previous bracket left there.
-///
-/// The reserved slots are cleared. The shadow stack is append-only and
-/// [`RootScope`]'s drop only rewinds `top`, so a slot handed out here can
-/// still hold the word some earlier, already-popped bracket published; a
-/// walker reaching it would trace a corpse. Upstream does not clear, because
-/// `make_bitmask` tells its walker which entries of a fixed frame are unused;
-/// pyre walks exactly `len()` slots and has no mask to consult, so the clear
-/// is that statement made directly. A null slot is what every root consumer
-/// already answers to -- `seed_major_root` records that the only tests
-/// upstream performs on a root word are non-null and `is_in_nursery`.
-// Not `dont_look_inside`, for the reason [`push_roots`] gives: the residual-
-// call classifier would encode the two-word `RootScope` as a one-word `ref`.
-pub fn enter_roots_frame(numcolors: usize) -> RootScope {
-    let scope = RootScope::new();
-    #[cfg(debug_assertions)]
-    assert_shadow_stack_not_walking();
-    // SAFETY: `stack_slot` is this thread's live cell, and `incr_stack`
-    // returns the slot it just claimed after growing the buffer if it must.
-    unsafe {
-        let stack = &*scope.stack_slot;
-        for _ in 0..numcolors {
-            *stack.incr_stack() = std::ptr::null_mut();
-        }
-    }
-    scope
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
@@ -1124,14 +1066,14 @@ pub fn clear_prebuilt_roots_dirty() {
 /// local the graph will read next. Application code therefore names its
 /// receiver and its argument as plain locals and never sees a root stack.
 ///
-/// pyre's interpreter is compiled by rustc, so there is no graph for a
-/// `hop.genop` to write into and the bracket has to be written at the source
-/// level ([`crate::gc_roots`] module docs). This macro is that bracket: it
-/// publishes `$local`s as one livevar set, runs `$body`, and then assigns each
-/// forwarded word back into its own local. What it buys over hand-written
-/// slot arithmetic is `gc_restore_root`'s guarantee -- after the bracket the
-/// local *is* the live word, so there is no stale binding left in scope for a
-/// later read to find, and no slot index to get wrong.
+/// The flowspace translator now inserts and colours this bracket from graph
+/// liveness, just as PyPy does. Native interpreter code is also compiled
+/// directly by rustc, so source paths on that execution side still use this
+/// macro. It publishes `$local`s as one livevar set, runs `$body`, and then
+/// assigns each forwarded word back into its own local. What it buys over
+/// hand-written slot arithmetic is `gc_restore_root`'s guarantee -- after the
+/// bracket the local *is* the live word, so there is no stale binding left in
+/// scope for a later read to find, and no slot index to get wrong.
 ///
 /// Every `$local` must be a `mut` binding, because the restore assigns to it.
 ///
@@ -1205,7 +1147,7 @@ mod tests {
     /// its own livevar set and pops it again, so the depth inside the second
     /// bracket is the same as inside the first and neither outlives it.
     #[test]
-    fn without_the_attribute_each_bracket_is_its_own_frame() {
+    fn hand_written_brackets_each_open_their_own_frame() {
         fn two_brackets(mut a: PyObjectRef, mut b: PyObjectRef) -> (usize, usize) {
             let first = crate::with_roots!(a, b => shadow_stack_len());
             let between = shadow_stack_len();
@@ -1218,202 +1160,6 @@ mod tests {
         assert_eq!(first, before + 2, "the bracket publishes both livevars");
         assert_eq!(between, before, "and pops them before the next one opens");
         assert_eq!(shadow_stack_len(), before);
-    }
-
-    /// `postprocess_graph`: the same body under `#[gc_roots]` holds ONE frame,
-    /// two colours wide, for the whole function. The depth no longer drops
-    /// between brackets, because there is no second push/pop pair to make it.
-    #[test]
-    fn the_attribute_collapses_both_brackets_into_one_frame() {
-        #[pyre_macros::gc_roots]
-        fn two_brackets(mut a: PyObjectRef, mut b: PyObjectRef) -> (usize, usize) {
-            let first = crate::with_roots!(a, b => shadow_stack_len());
-            let between = shadow_stack_len();
-            let second = crate::with_roots!(a, b => shadow_stack_len());
-            let _ = (a, b, second);
-            (first, between)
-        }
-        let before = shadow_stack_len();
-        let (first, between) = two_brackets(dummy(0x10), dummy(0x20));
-        assert_eq!(first, before + 2, "one frame, one colour per distinct root");
-        assert_eq!(between, first, "and it stays open across both brackets");
-        assert_eq!(shadow_stack_len(), before, "the frame guard still pops it");
-    }
-
-    /// A chain of guard arms that leave the function takes one frame per arm,
-    /// so the path that reaches no bracket reserves nothing and the path that
-    /// reaches one reserves only its own. This is the placement the
-    /// hand-written brackets use: `push_roots()` inside the arm, not ahead of
-    /// the chain that selects it.
-    #[test]
-    fn each_diverging_guard_arm_takes_its_own_frame() {
-        #[pyre_macros::gc_roots]
-        fn dispatch(mut a: PyObjectRef, which: u8) -> usize {
-            if which == 1 {
-                return crate::with_roots!(a => shadow_stack_len());
-            }
-            if which == 2 {
-                return crate::with_roots!(a => shadow_stack_len());
-            }
-            shadow_stack_len()
-        }
-        let before = shadow_stack_len();
-        assert_eq!(dispatch(dummy(0x10), 0), before, "no arm taken, no frame");
-        assert_eq!(
-            dispatch(dummy(0x10), 1),
-            before + 1,
-            "one colour, one frame"
-        );
-        assert_eq!(
-            dispatch(dummy(0x10), 2),
-            before + 1,
-            "the second arm does not stack a frame the first arm opened"
-        );
-        assert_eq!(shadow_stack_len(), before);
-    }
-
-    /// `move_pushes_earlier`: a root the body never rebinds is saved once, in
-    /// the prologue ahead of the loop, and each bracket reads the slot rather
-    /// than re-saving the local. That is what the hand-written brackets do
-    /// when they call `shadow_stack_get(slot)` at every use, and it is why a
-    /// value the collector forwarded mid-loop is the one the body sees: the
-    /// slot is the live word, the local is a copy of an older one.
-    #[test]
-    fn a_hoisted_root_is_saved_once_and_every_bracket_reads_the_slot() {
-        #[pyre_macros::gc_roots]
-        fn walk(mut a: PyObjectRef, n: usize) -> Vec<PyObjectRef> {
-            let mut seen = Vec::new();
-            for i in 0..n {
-                if i == 1 {
-                    // Forward the root the way a moving collector's walker
-                    // does, leaving the local naming the old address.
-                    shadow_stack_set(shadow_stack_len() - 1, dummy(0x2222));
-                }
-                seen.push(crate::with_roots!(a => a));
-            }
-            seen
-        }
-        let before = shadow_stack_len();
-        assert_eq!(
-            walk(dummy(0x10), 3),
-            vec![dummy(0x10), dummy(0x2222), dummy(0x2222)],
-            "a re-saved local would have clobbered the forwarded slot"
-        );
-        assert_eq!(shadow_stack_len(), before);
-    }
-
-    /// A `let` root bound once and never reassigned hoists like a parameter:
-    /// the union-classinfo walk binds its argument tuple that way, and the
-    /// hand-written bracket pins it once ahead of the loop.
-    #[test]
-    fn a_let_bound_root_hoists_when_it_is_bound_once() {
-        #[pyre_macros::gc_roots]
-        fn walk(seed: PyObjectRef, n: usize) -> Vec<PyObjectRef> {
-            let mut args = seed;
-            let mut seen = Vec::new();
-            for i in 0..n {
-                if i == 1 {
-                    shadow_stack_set(shadow_stack_len() - 1, dummy(0x3333));
-                }
-                seen.push(crate::with_roots!(args => args));
-            }
-            seen
-        }
-        let before = shadow_stack_len();
-        assert_eq!(
-            walk(dummy(0x10), 3),
-            vec![dummy(0x10), dummy(0x3333), dummy(0x3333)]
-        );
-        assert_eq!(shadow_stack_len(), before);
-    }
-
-    /// The other direction: a root the body assigns is not constant between
-    /// the prologue and the bracket, so its save may not be hoisted. Reading
-    /// the slot there would answer with the value the parameter used to hold.
-    #[test]
-    fn a_reassigned_root_keeps_its_per_bracket_save() {
-        #[pyre_macros::gc_roots]
-        fn reassign(mut a: PyObjectRef, b: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
-            let first = crate::with_roots!(a => a);
-            a = b;
-            let second = crate::with_roots!(a => a);
-            (first, second)
-        }
-        let before = shadow_stack_len();
-        assert_eq!(
-            reassign(dummy(0x10), dummy(0x20)),
-            (dummy(0x10), dummy(0x20)),
-            "the second bracket must publish the new binding, not reload the old"
-        );
-        assert_eq!(shadow_stack_len(), before);
-    }
-
-    /// `add_enter_leave_roots_frame`: the enter goes as late as possible, so a
-    /// call that never reaches a bracket never reserves a colour. A frame at
-    /// the top of the body would charge the fast path for the slow path's
-    /// roots, which is the regression this placement exists to avoid.
-    #[test]
-    fn the_frame_is_entered_only_on_the_branch_that_brackets() {
-        #[pyre_macros::gc_roots]
-        fn maybe(mut a: PyObjectRef, slow: bool) -> usize {
-            if slow {
-                crate::with_roots!(a => ());
-                let _ = a;
-                shadow_stack_len()
-            } else {
-                shadow_stack_len()
-            }
-        }
-        let before = shadow_stack_len();
-        assert_eq!(
-            maybe(dummy(0x10), false),
-            before,
-            "the fast path enters no frame"
-        );
-        assert_eq!(maybe(dummy(0x10), true), before + 1, "the slow path does");
-        assert_eq!(shadow_stack_len(), before);
-    }
-
-    /// `expand_one_pop_roots` restores through the slot, so a value the body
-    /// caused to move is the one the local names afterwards. Simulated by
-    /// overwriting the slot from inside the bracket, which is what a moving
-    /// collector's walker does to it.
-    #[test]
-    fn the_attribute_restores_each_local_from_its_own_colour() {
-        #[pyre_macros::gc_roots]
-        fn relocate(mut a: PyObjectRef, mut b: PyObjectRef) -> (PyObjectRef, PyObjectRef) {
-            crate::with_roots!(a, b => {
-                let base = shadow_stack_len() - 2;
-                shadow_stack_set(base, dummy(0x1111));
-                shadow_stack_set(base + 1, dummy(0x2222));
-            });
-            (a, b)
-        }
-        let before = shadow_stack_len();
-        assert_eq!(
-            relocate(dummy(0x10), dummy(0x20)),
-            (dummy(0x1111), dummy(0x2222))
-        );
-        assert_eq!(shadow_stack_len(), before);
-    }
-
-    /// A frame reserves its colours cleared. The shadow stack is append-only
-    /// and a popped bracket leaves its words behind, so an unwritten colour
-    /// would otherwise hand the walker the previous bracket's root.
-    #[test]
-    fn a_reserved_colour_reads_null_over_a_popped_brackets_word() {
-        let before = shadow_stack_len();
-        {
-            let scope = push_roots();
-            let _ = scope.pin_root(dummy(0xdead));
-            assert_eq!(scope.get(before), dummy(0xdead));
-        }
-        assert_eq!(shadow_stack_len(), before);
-        let frame = enter_roots_frame(1);
-        assert!(
-            frame.get(frame.base()).is_null(),
-            "reserved colour is cleared"
-        );
     }
 
     #[test]

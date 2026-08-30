@@ -48,20 +48,6 @@ use syn::{
     parse_macro_input, parse_quote, spanned::Spanned,
 };
 
-mod gc_roots;
-
-/// `shadowcolor.py postprocess_graph` for one function: collapse the
-/// per-operation `with_roots!` brackets in the body into a single coloured
-/// root frame.  See `gc_roots.rs` for what each upstream pass becomes here.
-#[proc_macro_attribute]
-pub fn gc_roots(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let func = parse_macro_input!(item as ItemFn);
-    match gc_roots::expand(func) {
-        Ok(ts) => ts.into(),
-        Err(err) => err.to_compile_error().into(),
-    }
-}
-
 #[proc_macro_attribute]
 pub fn pyre_function(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);

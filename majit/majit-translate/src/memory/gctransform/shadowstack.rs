@@ -8,8 +8,9 @@
 //! `shadowcolor.py` pipeline to every graph.
 
 use crate::flowspace::model::{GraphRef, Hlvalue};
+use crate::translator::translator::TranslationContext;
 
-use super::shadowcolor;
+use super::{framework::BaseFrameworkGCTransformer, shadowcolor};
 
 /// `shadowstack.py::ShadowStackRootWalker`'s postprocessing state.
 ///
@@ -48,18 +49,19 @@ impl ShadowStackRootWalker {
 /// Graph-lifecycle owner corresponding to
 /// `ShadowStackFrameworkGCTransformer` plus
 /// `BaseGCTransformer.inline_helpers_and_postprocess`.
-#[derive(Clone)]
 #[expect(
     clippy::upper_case_acronyms,
     reason = "strict port of the upstream ShadowStackFrameworkGCTransformer symbol"
 )]
-pub struct ShadowStackFrameworkGCTransformer {
+pub struct ShadowStackFrameworkGCTransformer<'t> {
+    framework: BaseFrameworkGCTransformer<'t>,
     root_walker: ShadowStackRootWalker,
 }
 
-impl ShadowStackFrameworkGCTransformer {
-    pub fn new(c_const_gcdata: Hlvalue) -> Self {
+impl<'t> ShadowStackFrameworkGCTransformer<'t> {
+    pub fn new(translator: &'t TranslationContext, c_const_gcdata: Hlvalue) -> Self {
         Self {
+            framework: BaseFrameworkGCTransformer::new(translator),
             root_walker: ShadowStackRootWalker::new(c_const_gcdata),
         }
     }
@@ -72,10 +74,14 @@ impl ShadowStackFrameworkGCTransformer {
     /// call site preserves the exact upstream ordering and gives the
     /// helper-inliner port one place to connect later.
     pub fn inline_helpers_and_postprocess(
-        &self,
+        &mut self,
         graphs: &[GraphRef],
     ) -> Result<(), Box<dyn std::error::Error>> {
         for graph in graphs {
+            // `BaseFrameworkGCTransformer.transform_graph` first emits the
+            // naive push/pop markers. Helper inlining follows upstream here,
+            // then the root walker colours and expands those markers.
+            self.framework.transform_graph(graph);
             let any_inlining = false;
             self.root_walker.postprocess_graph(graph, any_inlining)?;
         }
@@ -91,7 +97,7 @@ mod tests {
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph, Hlvalue, SpaceOperation, Variable,
     };
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 
     use super::*;
 
@@ -111,10 +117,7 @@ mod tests {
         start.borrow_mut().operations = if with_roots {
             vec![
                 marker("gc_push_roots", vec![root.clone()]),
-                marker(
-                    "direct_call",
-                    vec![Hlvalue::Constant(Constant::new(ConstValue::Int(0)))],
-                ),
+                marker("int_add", vec![]),
                 marker("gc_pop_roots", vec![root.clone()]),
             ]
         } else {
@@ -133,7 +136,8 @@ mod tests {
         let first = graph("first", true);
         let second = graph("second", false);
         let c_gcdata = Hlvalue::Constant(Constant::new(ConstValue::Int(0)));
-        let transformer = ShadowStackFrameworkGCTransformer::new(c_gcdata);
+        let translator = TranslationContext::new();
+        let mut transformer = ShadowStackFrameworkGCTransformer::new(&translator, c_gcdata);
 
         transformer
             .inline_helpers_and_postprocess(&[first.clone(), second.clone()])
@@ -155,5 +159,59 @@ mod tests {
             second.borrow().startblock.borrow().operations[0].opname,
             "int_add"
         );
+    }
+
+    #[test]
+    fn collecting_operation_is_automatically_marked_then_coloured() {
+        let root = Variable::named("root");
+        root.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc_with_hints("Root", vec![], vec![])),
+        }))));
+        let stats = Variable::named("stats");
+        stats.set_concretetype(Some(LowLevelType::Signed));
+        let returned = Variable::named("returned");
+        returned.set_concretetype(root.concretetype());
+        let start = Block::shared(vec![Hlvalue::Variable(root.clone())]);
+        start.borrow_mut().operations = vec![
+            SpaceOperation::new("gc_heap_stats", vec![], Hlvalue::Variable(stats)),
+            SpaceOperation::new(
+                "same_as",
+                vec![Hlvalue::Variable(root)],
+                Hlvalue::Variable(returned.clone()),
+            ),
+        ];
+        let graph = FunctionGraph::new("automatic", start.clone());
+        start.closeblock(vec![
+            crate::flowspace::model::Link::new(
+                vec![Hlvalue::Variable(returned)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = Rc::new(RefCell::new(graph));
+        let translator = TranslationContext::new();
+        let mut transformer = ShadowStackFrameworkGCTransformer::new(
+            &translator,
+            Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+        );
+
+        transformer
+            .inline_helpers_and_postprocess(std::slice::from_ref(&graph))
+            .unwrap();
+
+        let opnames: Vec<String> = graph
+            .borrow()
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|operation| operation.opname.clone())
+            .collect();
+        assert!(opnames.contains(&"gc_enter_roots_frame".to_string()));
+        assert!(opnames.contains(&"gc_save_root".to_string()));
+        assert!(opnames.contains(&"gc_restore_root".to_string()));
+        assert!(!opnames.contains(&"gc_push_roots".to_string()));
+        assert!(!opnames.contains(&"gc_pop_roots".to_string()));
     }
 }
