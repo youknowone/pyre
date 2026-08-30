@@ -2428,7 +2428,12 @@ impl BhDescr {
     pub fn switch_lookup(&self, value: i64) -> Option<usize> {
         match self {
             BhDescr::Switch { dict, .. } => dict.get(&value).copied(),
-            _ => None,
+            // `blackhole.py bhimpl_switch` and `pyjitpl.py opimpl_switch`
+            // both assert that the d-arg is a SwitchDictDescr before treating
+            // a missing key as the default branch.  Returning `None` for a
+            // different descriptor silently conflates a corrupt descriptor
+            // index with an ordinary case miss.
+            _ => panic!("BhDescr::switch_lookup called on {self:?}"),
         }
     }
 
@@ -2610,6 +2615,16 @@ mod tests {
         dict.insert(3, 20);
         descr.attach(dict);
         assert_eq!(descr.to_string(), "<SwitchDictDescr {1: 10, 3: 20, 7: 30}>");
+    }
+
+    #[test]
+    fn switch_lookup_rejects_a_non_switch_descriptor() {
+        let descr = BhDescr::VableField { index: 0 };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { descr.switch_lookup(7) }))
+                .is_err(),
+            "a non-Switch descriptor was silently treated as a case miss",
+        );
     }
 
     #[test]

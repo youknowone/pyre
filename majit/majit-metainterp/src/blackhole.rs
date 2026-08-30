@@ -3973,6 +3973,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_executor_int_signext_rejects_nonpositive_width() {
+        for numbytes in [0, -1] {
+            assert!(
+                std::panic::catch_unwind(|| { exec_binop(OpCode::IntSignext, 0x80, numbytes) })
+                    .is_err(),
+                "IntSignext silently accepted numbytes={numbytes}",
+            );
+        }
+    }
+
     // ── ConvertFloatBytesToLonglong / ConvertLonglongBytesToFloat roundtrip ──
 
     #[test]

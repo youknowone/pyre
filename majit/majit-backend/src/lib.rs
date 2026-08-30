@@ -2466,6 +2466,21 @@ fn bh_read_int_at_mem(base: i64, offset: i64, size: usize, signed: bool) -> i64 
     }
 }
 
+#[inline]
+fn checked_str_char(value: i64) -> u8 {
+    u8::try_from(value)
+        .unwrap_or_else(|_| panic!("bh_strsetitem: character code {value} is outside 0..=255"))
+}
+
+#[inline]
+fn checked_unicode_char(value: i64) -> u32 {
+    assert!(
+        (0..=0x10ffff).contains(&value),
+        "bh_unicodesetitem: character code {value} is outside 0..=0x10ffff",
+    );
+    value as u32
+}
+
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///
 /// Mirrors rpython/jit/backend/model.py AbstractCPU.
@@ -3486,10 +3501,14 @@ pub trait Backend: Send {
     /// model.py: bh_strsetitem(string_ptr, index, value)
     fn bh_strsetitem(&self, string_ptr: i64, index: i64, value: i64) {
         assert!(index >= 0 && index < self.bh_strlen(string_ptr));
+        // `llmodel.py LLtypeMixin.bh_strsetitem` converts through `chr`,
+        // which rejects values outside the low-level Char domain.  A plain
+        // Rust `as u8` silently truncated the very bad value PyPy reports.
+        let value = checked_str_char(value);
         let chars = 2 * std::mem::size_of::<usize>();
         unsafe {
             ((string_ptr as usize).wrapping_add(chars + index as usize) as *mut u8)
-                .write_unaligned(value as u8)
+                .write_unaligned(value)
         }
     }
     /// model.py: bh_newstr(length)
@@ -3644,11 +3663,12 @@ pub trait Backend: Send {
     /// model.py: bh_unicodesetitem(string_ptr, index, value)
     fn bh_unicodesetitem(&self, string_ptr: i64, index: i64, value: i64) {
         assert!(index >= 0 && index < self.bh_unicodelen(string_ptr));
+        // `LLtypeMixin.bh_unicodesetitem` uses `unichr`, whose accepted
+        // low-level UniChar domain is 0..=MAXUNICODE (surrogates included).
+        let value = checked_unicode_char(value);
         let chars = 2 * std::mem::size_of::<usize>();
         let offset = chars + index as usize * std::mem::size_of::<u32>();
-        unsafe {
-            ((string_ptr as usize).wrapping_add(offset) as *mut u32).write_unaligned(value as u32)
-        }
+        unsafe { ((string_ptr as usize).wrapping_add(offset) as *mut u32).write_unaligned(value) }
     }
     /// model.py: bh_newunicode(length)
     fn bh_newunicode(&self, length: i64) -> i64 {
@@ -4189,6 +4209,22 @@ impl Drop for JittedGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blackhole_string_writes_reject_out_of_range_character_codes() {
+        assert_eq!(checked_str_char(0), 0);
+        assert_eq!(checked_str_char(255), 255);
+        for value in [-1, 256] {
+            assert!(std::panic::catch_unwind(|| checked_str_char(value)).is_err());
+        }
+
+        assert_eq!(checked_unicode_char(0), 0);
+        assert_eq!(checked_unicode_char(0xd800), 0xd800);
+        assert_eq!(checked_unicode_char(0x10ffff), 0x10ffff);
+        for value in [-1, 0x11_0000] {
+            assert!(std::panic::catch_unwind(|| checked_unicode_char(value)).is_err());
+        }
+    }
 
     /// `unroll.py disable_retracing_if_max_retrace_guards` writes the raw
     /// field — `targeting_jitcell_token.retraced_count = sys.maxint` — and
