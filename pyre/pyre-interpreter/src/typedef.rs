@@ -2183,6 +2183,7 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "filter" => pyre_object::functional::is_filter,
         "zip" => pyre_object::functional::is_zip,
         "itertools.count" => pyre_object::interp_itertools::is_count,
+        "itertools.repeat" => pyre_object::interp_itertools::is_repeat,
         // `GeneratorIterator`, `Coroutine` and `AsyncGenerator` share one
         // Rust payload, but PyPy gives each its own TypeDef and gateway
         // receiver check.  Keep the predicates kind-specific: accepting any
@@ -30741,24 +30742,66 @@ fn repeat_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(w_str_from_wtf8(text))
 }
 
+/// [3.14-spec] CPython `repeat_slots` publishes `Py_tp_getattro`, while PyPy's
+/// `W_Repeat.typedef` inherits object lookup.  Expose that observable type-dict
+/// entry through the same object-space operation without changing PyPy's
+/// repeat storage, iteration, or source order.
 fn init_repeat_type(ns: PyObjectRef) {
+    // Source order follows PyPy `W_Repeat.typedef`: constructor, iteration,
+    // length hint, next, repr, and terminal doc.  CPython 3.14's observable
+    // `__getattribute__` slot entry is the sole inserted operation.
     let entries = [
-        ("__new__", make_new_descr(repeat_descr_new)),
+        (
+            "__new__",
+            make_new_descr_with_doc(
+                repeat_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
+        ),
         (
             "__iter__",
-            make_builtin_function_with_arity("__iter__", crate::baseobjspace::iter_self_method, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__iter__",
+                crate::baseobjspace::iter_self_method,
+                1,
+                "Implement iter(self).",
+            ),
         ),
         (
             "__length_hint__",
-            make_builtin_function_with_arity("__length_hint__", repeat_descr_length_hint, 1),
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__length_hint__",
+                repeat_descr_length_hint,
+                1,
+                "Private method returning an estimate of len(list(it)).",
+            ),
         ),
         (
             "__next__",
-            make_builtin_function_with_arity("__next__", crate::baseobjspace::iter_next_method, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__next__",
+                crate::baseobjspace::iter_next_method,
+                1,
+                "Implement next(self).",
+            ),
         ),
         (
             "__repr__",
-            make_builtin_function_with_arity("__repr__", repeat_descr_repr, 1),
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__repr__",
+                repeat_descr_repr,
+                1,
+                "Return repr(self).",
+            ),
+        ),
+        (
+            "__getattribute__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__getattribute__",
+                count_descr_getattribute,
+                2,
+                "Return getattr(self, name).",
+            ),
         ),
         (
             "__doc__",
@@ -30769,6 +30812,16 @@ fn init_repeat_type(ns: PyObjectRef) {
     ];
     for (name, value) in entries {
         unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, value) };
+    }
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__iter__", "($self, /)"),
+        ("__length_hint__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("__repr__", "($self, /)"),
+        ("__getattribute__", "($self, name, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 

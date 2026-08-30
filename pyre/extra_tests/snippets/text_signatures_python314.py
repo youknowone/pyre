@@ -127,7 +127,18 @@ TYPE_EXPECTED = {
 for cls, signature in TYPE_EXPECTED.items():
     assert cls.__text_signature__ == signature, cls
 
-for cls in (int, str, bytes, bytearray, dict, range, slice, super, type):
+for cls in (
+    int,
+    str,
+    bytes,
+    bytearray,
+    dict,
+    range,
+    slice,
+    super,
+    type,
+    itertools.repeat,
+):
     assert cls.__text_signature__ is None, cls
 
 
@@ -167,6 +178,64 @@ for name, args in {
         )
     else:
         raise AssertionError(name)
+
+
+# itertools_repeat_metadata_python314
+
+REPEAT_EXPECTED = {
+    "__new__": (
+        "builtin_function_or_method",
+        "Create and return a new object.  See help(type) for accurate signature.",
+        "($type, *args, **kwargs)",
+    ),
+    "__repr__": ("wrapper_descriptor", "Return repr(self).", "($self, /)"),
+    "__getattribute__": (
+        "wrapper_descriptor",
+        "Return getattr(self, name).",
+        "($self, name, /)",
+    ),
+    "__iter__": ("wrapper_descriptor", "Implement iter(self).", "($self, /)"),
+    "__next__": ("wrapper_descriptor", "Implement next(self).", "($self, /)"),
+    "__length_hint__": (
+        "method_descriptor",
+        "Private method returning an estimate of len(list(it)).",
+        "($self, /)",
+    ),
+}
+
+for name, (carrier, doc, signature) in REPEAT_EXPECTED.items():
+    descriptor = itertools.repeat.__dict__[name]
+    assert type(descriptor).__name__ == carrier, name
+    assert descriptor.__doc__ == doc, name
+    assert descriptor.__text_signature__ == signature, name
+
+assert "__reduce__" not in itertools.repeat.__dict__
+
+for name, args in {
+    "__repr__": ({},),
+    "__getattribute__": ({}, "x"),
+    "__iter__": ({},),
+    "__next__": ({},),
+}.items():
+    try:
+        itertools.repeat.__dict__[name](*args)
+    except TypeError as exc:
+        assert str(exc) == (
+            f"descriptor '{name}' requires a 'itertools.repeat' object "
+            "but received a 'dict'"
+        )
+    else:
+        raise AssertionError(name)
+
+try:
+    itertools.repeat.__dict__["__length_hint__"]({})
+except TypeError as exc:
+    assert str(exc) == (
+        "descriptor '__length_hint__' for 'itertools.repeat' objects "
+        "doesn't apply to a 'dict' object"
+    )
+else:
+    raise AssertionError("__length_hint__")
 
 
 # bytearray_text_signatures_python314
