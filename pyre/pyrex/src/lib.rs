@@ -10,9 +10,7 @@ use lexopt::ValueExt;
 use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
-use pyre_interpreter::{
-    Mode, PyDisplay, PyErrorKind, PyExecutionContext, compile_source_with_filename,
-};
+use pyre_interpreter::{CompileOpts, Mode, PyDisplay, PyErrorKind, PyExecutionContext};
 use pyre_jit::eval::eval_with_jit;
 
 mod repl;
@@ -1298,13 +1296,15 @@ fn setup_exec_context() -> Rc<PyExecutionContext> {
 /// rewrite the `-c` / REPL empty entry into the absolute cwd.
 /// `add_main_module` / `set_main_loader` — seed `__main__.__loader__`.
 ///
-/// BuiltinImporter is the initial setting for every `__main__`; a script run by
-/// path replaces it with a `SourceFileLoader` bound to that file. `-m` is not
-/// covered here: `runpy._run_module_as_main` installs the module's own loader.
-/// Must run after the importlib bootstrap, which is what supplies both classes.
+/// BuiltinImporter is the initial setting for every `__main__`; a source script
+/// replaces it with `SourceFileLoader`, and a `.pyc` script with
+/// `SourcelessFileLoader`, bound to that file. `-m` is not covered here:
+/// `runpy._run_module_as_main` installs the module's own loader. Must run after
+/// the importlib bootstrap, which is what supplies all three classes.
 pub(crate) fn seed_main_loader(
     w_main_globals: pyre_object::PyObjectRef,
     script_file: Option<&str>,
+    sourceless: bool,
     ec_ptr: *const pyre_interpreter::PyExecutionContext,
 ) {
     use pyre_interpreter::baseobjspace::getattr_str;
@@ -1316,7 +1316,15 @@ pub(crate) fn seed_main_loader(
     };
 
     let loader = match script_file {
-        Some(path) => load("importlib._bootstrap_external", "SourceFileLoader").and_then(|ty| {
+        Some(path) => load(
+            "importlib._bootstrap_external",
+            if sourceless {
+                "SourcelessFileLoader"
+            } else {
+                "SourceFileLoader"
+            },
+        )
+        .and_then(|ty| {
             pyre_interpreter::call::call_function_impl_result(
                 ty,
                 &[
@@ -2393,9 +2401,13 @@ fn report_or_end_on_main_error(
     report_main_error_for_inspect(e);
 }
 
-fn eval_source_in_main(
-    read_source: impl FnOnce() -> String,
-    mode: Mode,
+enum MainProgram<'a> {
+    Source(Box<dyn FnOnce() -> String + 'a>, Mode),
+    Bytecode(pyre_object::PyObjectRef),
+}
+
+fn eval_program_in_main(
+    program: MainProgram<'_>,
     filename: &str,
     main_file: Option<&str>,
     execution_context: Rc<PyExecutionContext>,
@@ -2405,6 +2417,7 @@ fn eval_source_in_main(
     run_code: bool,
 ) -> Option<MainSession> {
     let ec_ptr = Rc::as_ptr(&execution_context);
+    let sourceless = matches!(program, MainProgram::Bytecode(_));
     // The frame below takes the context by value; the prompt needs it too.
     let session_context = Rc::clone(&execution_context);
 
@@ -2453,7 +2466,7 @@ fn eval_source_in_main(
     } else {
         main_file
     };
-    seed_main_loader(canonical, script_file, ec_ptr);
+    seed_main_loader(canonical, script_file, sourceless, ec_ptr);
     import_site(no_site, canonical, ec_ptr);
 
     // `main.c pymain_header`, which runs once startup is complete -- after
@@ -2474,38 +2487,54 @@ fn eval_source_in_main(
         }
     }
 
-    // Read and compiled only once startup is complete, which is the order
+    // Source is read and compiled only once startup is complete, which is the order
     // `pymain_run_python` runs in: `site` is imported by interpreter
     // initialisation, ahead of every path that reaches user source.  A program
     // that will not open, or will not compile, still gets it -- the report
     // below goes through `sys.excepthook`, which `site` is entitled to have
     // replaced, and the failure still finalizes on its way out.
-    let source = read_source();
-    let source = source.as_str();
-    let code = match compile_source_with_filename(source, mode, filename) {
-        Ok(code) => code,
-        Err(e) => {
-            // Render the `File "…", line N` + source + caret + `SyntaxError:`
-            // banner for the malformed source, matching an interactive run.
-            // A main file that will not compile is reported by the same
-            // `PyErr_Print` every other top-level failure is, so the hook sees
-            // it too and the stdlib renderer is what offers the keyword the
-            // author meant.
-            let mut err = pyre_interpreter::compile_err_to_syntax_error(e, source, mode);
-            if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
-                pyre_interpreter::eprint_syntax_error(&err);
-            }
-            // The source never ran, but the interpreter it would have run in is
-            // up, and that is what `-i` asked to be left at.
-            if prompt_requested(run_code) {
-                return finish_or_inspect(true, session_context, canonical, main_module);
-            }
-            end_after_startup_failure(canonical, ec_ptr, 1);
+    let mut source = None;
+    let frame = match program {
+        MainProgram::Bytecode(code) => {
+            PyFrame::new_with_context_and_globals_obj(code, execution_context, canonical)
+        }
+        MainProgram::Source(read_source, mode) => {
+            let text = read_source();
+            let code = match pyre_interpreter::syntax_warnings::compile_with_codegen_warnings(
+                &text,
+                mode,
+                filename,
+                CompileOpts {
+                    optimize: importing::optimize_flag(),
+                    debug_ranges: importing::code_debug_ranges_flag(),
+                    int_max_str_digits: pyre_interpreter::module::sys::state::int_max_str_digits()
+                        .max(0) as usize,
+                    ..Default::default()
+                },
+            ) {
+                Ok(code) => code,
+                Err(pyre_interpreter::syntax_warnings::SourceCompileError::Compile(e)) => {
+                    let mut err = pyre_interpreter::compile_err_to_syntax_error(e, &text, mode);
+                    if !pyre_interpreter::error::print_exception_via_excepthook(&mut err) {
+                        pyre_interpreter::eprint_syntax_error(&err);
+                    }
+                    if prompt_requested(run_code) {
+                        return finish_or_inspect(true, session_context, canonical, main_module);
+                    }
+                    end_after_startup_failure(canonical, ec_ptr, 1);
+                }
+                Err(pyre_interpreter::syntax_warnings::SourceCompileError::Warning(error)) => {
+                    let inspect = prompt_requested(run_code);
+                    report_or_end_on_main_error(error, inspect, canonical, ec_ptr);
+                    return finish_or_inspect(inspect, session_context, canonical, main_module);
+                }
+            };
+            source = Some(text);
+            PyFrame::new_with_context_and_globals(code, execution_context, canonical)
         }
     };
 
-    let mut frame = match PyFrame::new_with_context_and_globals(code, execution_context, canonical)
-    {
+    let mut frame = match frame {
         Ok(frame) => frame,
         Err(e) => {
             pyre_interpreter::eprint_exception(&e, true);
@@ -2532,7 +2561,9 @@ fn eval_source_in_main(
     // own path and a stdin run keeps `<stdin>`, which is the same distinction
     // `__file__` above already makes. Registration is cosmetic, so a failure
     // must not stop the command.
-    if filename == "<string>" {
+    if filename == "<string>"
+        && let Some(source) = source.as_deref()
+    {
         let _ = repl::register_interactive_code(
             canonical,
             ec_ptr,
@@ -2594,6 +2625,19 @@ fn read_script_source(
     }
 }
 
+/// `app_main.py:run_command_line` only folds the filename case on Windows
+/// before recognizing `.pyc`; POSIX keeps its case-sensitive path semantics.
+fn script_path_is_pyc(path: &str) -> bool {
+    #[cfg(windows)]
+    {
+        path.to_ascii_lowercase().ends_with(".pyc")
+    }
+    #[cfg(not(windows))]
+    {
+        path.ends_with(".pyc")
+    }
+}
+
 fn run_script_path(
     filename: &str,
     no_site: bool,
@@ -2625,7 +2669,7 @@ fn run_script_path(
             // reads the main module finds it already there.  This target has no
             // source file of its own to bind, and runpy rebinds the attribute to
             // the package's own loader when it runs `__main__` below.
-            seed_main_loader(canonical, None, ec_ptr);
+            seed_main_loader(canonical, None, false, ec_ptr);
             import_site(no_site, canonical, ec_ptr);
             let outcome = runpy_run_module_as_main(canonical, ec_ptr, "__main__", false);
             // Asked after the entry point has run, the way the source-file and
@@ -2641,15 +2685,42 @@ fn run_script_path(
         Ok(false) => {
             let main_file = absolute_script_path(filename);
             let filename = main_file.as_deref().unwrap_or(filename);
-            eval_source_in_main(
-                // The resolved path rather than the argv spelling: the read is
-                // deferred until `site` has been imported, so a `sitecustomize`
-                // that changes the working directory would otherwise resolve a
-                // relative argv against the new one -- opening a different
-                // same-named file than the one `__file__` names, or none.  The
-                // file a run opens and the file it reports are the same file.
-                || read_script_source(filename, binary_name, canonical, ec_ptr),
-                Mode::Exec,
+            let program = if script_path_is_pyc(filename) {
+                let bytes = match importing::read_source_bytes(Path::new(filename)) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        eprintln!("{binary_name}: cannot open '{filename}': {e}");
+                        end_after_startup_failure(canonical, ec_ptr, 2);
+                    }
+                };
+                let code = match importing::load_pyc_script(&bytes) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        let inspect = prompt_requested(run_code);
+                        report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
+                        return finish_or_inspect(
+                            inspect,
+                            execution_context,
+                            canonical,
+                            main_module,
+                        );
+                    }
+                };
+                MainProgram::Bytecode(code)
+            } else {
+                MainProgram::Source(
+                    // The resolved path rather than the argv spelling: the read is
+                    // deferred until `site` has been imported, so a `sitecustomize`
+                    // that changes the working directory would otherwise resolve a
+                    // relative argv against the new one -- opening a different
+                    // same-named file than the one `__file__` names, or none.  The
+                    // file a run opens and the file it reports are the same file.
+                    Box::new(|| read_script_source(filename, binary_name, canonical, ec_ptr)),
+                    Mode::Exec,
+                )
+            };
+            eval_program_in_main(
+                program,
                 filename,
                 main_file.as_deref(),
                 execution_context,
@@ -2697,9 +2768,8 @@ fn run_source(
         eprintln!("pyre: importlib bootstrap failed: {}", e.message_text());
     }
 
-    eval_source_in_main(
-        || source.to_string(),
-        mode,
+    eval_program_in_main(
+        MainProgram::Source(Box::new(|| source.to_string()), mode),
         filename,
         main_file.as_deref(),
         execution_context,

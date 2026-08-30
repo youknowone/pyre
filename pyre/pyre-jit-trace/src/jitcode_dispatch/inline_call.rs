@@ -5561,6 +5561,26 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // operands into the new callee frame. The element count needs no
             // guard of its own: `code` above pins `co_freevars`, and a closure
             // always has exactly that many cells.
+            //
+            // `specialisedtupleobject.py` stores an object pair inline as
+            // `W_SpecialisedTupleObject_oo.value0/value1`; only the ordinary
+            // `W_TupleObject` has `wrappeditems`.  The two structs deliberately
+            // put those fields at the same offset.  Treating an `_oo` closure
+            // as array-backed therefore reads `value0` as the array pointer,
+            // then reads the first cell's `w_class` and value as the two
+            // closure entries.  Select and guard the concrete storage class
+            // before emitting either upstream layout's reads, exactly as the
+            // positional-default path below does.
+            let closure_ob_type = unsafe { (*concrete_closure).ob_type };
+            let closure_is_pair_object = std::ptr::eq(
+                closure_ob_type,
+                &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
+            );
+            if !closure_is_pair_object
+                && !std::ptr::eq(closure_ob_type, &pyre_object::pyobject::TUPLE_TYPE)
+            {
+                return resolved_inline_decline(op.pc, line!());
+            }
             let closure_op = crate::state::opimpl_getfield_gc_r(
                 ctx.trace_ctx,
                 callable_guard_op,
@@ -5570,24 +5590,43 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 closure_op,
                 majit_ir::Value::Ref(majit_ir::GcRef(concrete_closure as usize)),
             );
-            let items_op = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                closure_op,
-                crate::descr::tuple_wrappeditems_descr(),
-            );
+            walker_guard_class(ctx, op.pc, closure_op, closure_ob_type as i64)?;
             freevar_cell_ops.clear();
-            for (i, &cell) in concrete_freevar_cells.iter().enumerate() {
-                let index_op = ctx.trace_ctx.const_int(i as i64);
-                let cell_op = crate::state::trace_items_block_getitem_value_pure(
+            if closure_is_pair_object {
+                debug_assert_eq!(concrete_freevar_cells.len(), 2);
+                for (i, &cell) in concrete_freevar_cells.iter().enumerate() {
+                    let descr = if i == 0 {
+                        crate::descr::specialised_tuple_oo_value0_descr()
+                    } else {
+                        crate::descr::specialised_tuple_oo_value1_descr()
+                    };
+                    let cell_op =
+                        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, closure_op, descr);
+                    ctx.trace_ctx.try_set_opref_concrete(
+                        cell_op,
+                        majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
+                    );
+                    freevar_cell_ops.push(cell_op);
+                }
+            } else {
+                let items_op = crate::state::opimpl_getfield_gc_r(
                     ctx.trace_ctx,
-                    items_op,
-                    index_op,
+                    closure_op,
+                    crate::descr::tuple_wrappeditems_descr(),
                 );
-                ctx.trace_ctx.try_set_opref_concrete(
-                    cell_op,
-                    majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
-                );
-                freevar_cell_ops.push(cell_op);
+                for (i, &cell) in concrete_freevar_cells.iter().enumerate() {
+                    let index_op = ctx.trace_ctx.const_int(i as i64);
+                    let cell_op = crate::state::trace_items_block_getitem_value_pure(
+                        ctx.trace_ctx,
+                        items_op,
+                        index_op,
+                    );
+                    ctx.trace_ctx.try_set_opref_concrete(
+                        cell_op,
+                        majit_ir::Value::Ref(majit_ir::GcRef(cell as usize)),
+                    );
+                    freevar_cell_ops.push(cell_op);
+                }
             }
         }
     }

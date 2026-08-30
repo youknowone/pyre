@@ -27,7 +27,9 @@ fn generate_suggestions(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if !unsafe { is_exact_type(candidates, &LIST_TYPE) } {
         return Err(crate::PyError::type_error("candidates must be a list"));
     }
-    let items = unsafe { w_list_items_copy_as_vec(candidates) };
+    let items = unsafe {
+        w_list_items_copy_as_vec_mode(candidates, majit_metainterp::jit::we_are_jitted())
+    };
     for element in &items {
         if !unsafe { is_str(*element) } {
             return Err(crate::PyError::type_error(

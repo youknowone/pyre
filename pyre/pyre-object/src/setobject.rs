@@ -436,22 +436,34 @@ pub fn w_frozenset_new() -> PyObjectRef {
     }
 }
 
+/// Allocate a populated set-like from a slice of elements (deduped).
+///
+/// A `&[PyObjectRef]` is not a root area, so the caller's words go stale at
+/// the first insert: `w_set_add` hashes with `space.hash_w`, a collection
+/// point that may run a user `__hash__`, and the set's own table can grow.
+/// The whole slice is therefore published as one livevar set before the
+/// constructor allocates, and both the set and each element are read back
+/// out of their slots per insert.
+fn set_from_items(new_set: impl FnOnce() -> PyObjectRef, items: &[PyObjectRef]) -> PyObjectRef {
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.publish(items);
+    roots.normalize(base, items.len());
+    let set = base + items.len();
+    let _ = roots.pin_root(new_set());
+    for i in 0..items.len() {
+        unsafe { w_set_add(roots.get(set), roots.get(base + i)) };
+    }
+    roots.get(set)
+}
+
 /// Allocate a populated set from a slice of elements (deduped).
 pub fn w_set_from_items(items: &[PyObjectRef]) -> PyObjectRef {
-    let s = w_set_new();
-    for &item in items {
-        unsafe { w_set_add(s, item) };
-    }
-    s
+    set_from_items(w_set_new, items)
 }
 
 /// Allocate a populated frozenset from a slice of elements (deduped).
 pub fn w_frozenset_from_items(items: &[PyObjectRef]) -> PyObjectRef {
-    let s = w_frozenset_new();
-    for &item in items {
-        unsafe { w_set_add(s, item) };
-    }
-    s
+    set_from_items(w_frozenset_new, items)
 }
 
 /// Insert an element. No-op when already present.

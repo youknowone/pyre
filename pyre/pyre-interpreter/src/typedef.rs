@@ -2797,29 +2797,6 @@ pub fn make_builtin_type_with_bases_and_overridetypedef(
     make_builtin_type_with_bases_and_layout_owner(name, init, bases, layout_pytype, overridetypedef)
 }
 
-/// [`make_builtin_type_with_bases_and_overridetypedef`] with an explicit
-/// interpreter TypeDef
-/// identity for a concrete class that introduces its own instance Layout.
-///
-/// PyPy `setup_builtin_type` receives the concrete `instancetypedef` even for
-/// a TypeDef with multiple declared bases.  Most multi-base builtins introduce
-/// no interpreter class and use the wrapper above; concrete owners such as
-/// `interp_group.W_BaseExceptionGroup` take this path.
-pub fn make_builtin_type_with_bases_and_layout(
-    name: &str,
-    init: impl FnOnce(PyObjectRef),
-    bases: &[PyObjectRef],
-    layout_pytype: *const PyType,
-) -> PyObjectRef {
-    make_builtin_type_with_bases_and_layout_owner(
-        name,
-        init,
-        bases,
-        layout_pytype,
-        std::ptr::null(),
-    )
-}
-
 pub(crate) fn make_builtin_type_with_bases_and_layout_owner(
     name: &str,
     init: impl FnOnce(PyObjectRef),
@@ -3136,6 +3113,16 @@ pub(crate) fn make_new_descr(
     func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
 ) -> PyObjectRef {
     crate::gateway::make_builtin_function_as_builtin("__new__", func)
+}
+
+/// Docstring-carrying [`make_new_descr`].  PyPy's `interp2app` registration
+/// for constructors preserves the gateway function's app-visible `__doc__`;
+/// this explicit literal is the Rust equivalent for a builtin carrier.
+pub(crate) fn make_new_descr_with_doc(
+    func: fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    docstring: &'static str,
+) -> PyObjectRef {
+    crate::gateway::make_builtin_function_as_builtin_with_doc("__new__", func, docstring)
 }
 
 /// Signature-aware [`make_new_descr`] for builtin constructors with keyword
@@ -3469,6 +3456,15 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(annotations) = crate::baseobjspace::finditem_str(w_dict, "__annotations__")? {
         return Ok(annotations);
     }
+    // [3.14-spec] PyPy has no lazy module-annotation cache to invalidate;
+    // RustPython `PyModule::__annotations__` carries CPython 3.14's PEP 649
+    // adaptation on the ordinary module dict and declines to cache while
+    // `__spec__._initializing` is true.  This is observable in
+    // `test_type_annotations.TypeAnnotationTests.test_partially_executed_module`:
+    // a circular importer sees the partial mapping, while the completed
+    // module's next read must evaluate all annotations afresh.
+    let is_initializing =
+        module_is_initializing(pyre_object::gc_roots::shadow_stack_get(dict_slot));
     let annotations = match crate::baseobjspace::finditem_str(
         pyre_object::gc_roots::shadow_stack_get(dict_slot),
         "__annotate__",
@@ -3495,13 +3491,36 @@ fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     };
     let annotations_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(annotations);
-    let key = pyre_object::w_str_new("__annotations__");
-    crate::baseobjspace::setitem(
-        pyre_object::gc_roots::shadow_stack_get(dict_slot),
-        key,
-        pyre_object::gc_roots::shadow_stack_get(annotations_slot),
-    )?;
+    if !is_initializing {
+        let key = pyre_object::w_str_new("__annotations__");
+        crate::baseobjspace::setitem(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            key,
+            pyre_object::gc_roots::shadow_stack_get(annotations_slot),
+        )?;
+    }
     Ok(pyre_object::gc_roots::shadow_stack_get(annotations_slot))
+}
+
+/// RustPython `PyModule::is_initializing`: inspect the importlib-owned spec
+/// without making failures in optional metadata observable through an
+/// otherwise valid `module.__annotations__` read.
+fn module_is_initializing(w_dict: PyObjectRef) -> bool {
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = roots.base();
+    let _ = roots.pin_root(w_dict);
+    if let Ok(Some(spec)) = crate::baseobjspace::finditem_str(roots.get(dict_slot), "__spec__") {
+        let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(spec);
+        if let Ok(initializing) =
+            crate::baseobjspace::getattr_str(roots.get(spec_slot), "_initializing")
+        {
+            let initializing_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(initializing);
+            return crate::baseobjspace::is_true(roots.get(initializing_slot)).unwrap_or(false);
+        }
+    }
+    false
 }
 
 fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -5515,14 +5534,21 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(list_descr_new),
+            make_new_descr_with_doc(
+                list_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", list_descr_init),
+            crate::gateway::make_builtin_function_with_doc(
+                "__init__",
+                list_descr_init,
+                "Initialize self.  See help(type(self)) for accurate signature.",
+            ),
         )
     };
     unsafe {
@@ -5574,10 +5600,11 @@ fn init_list_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "append",
-            crate::make_method_descriptor_with_arity(
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
                 "append",
                 crate::type_methods::list_method_append,
                 2,
+                "Append object to the end of the list.",
             ),
         )
     };
@@ -6629,15 +6656,17 @@ fn init_str_type(ns: PyObjectRef) {
                 "__add__",
                 |args| {
                     crate::type_methods::arity_slot(args, 1)?;
-                    // Self-contained concat: returning NotImplemented for a
-                    // non-str operand lets the `+` operator emit the
-                    // "can only concatenate" message, and avoids the
-                    // recursion that delegating back to `add` would cause
-                    // (descroperation::add re-dispatches to this dunder).
+                    // CPython 3.14 `PyUnicode_Concat` is also the observable
+                    // `str.__add__` slot wrapper: a direct descriptor call
+                    // raises its concat-specific error.  The `+` operator
+                    // preserves PyPy `_call_binop_impl` reflected dispatch in
+                    // `descroperation::add` before reaching the same error.
                     if unsafe { pyre_object::is_str(args[1]) } {
                         unsafe { crate::objspace::descroperation::str_concat(args[0], args[1]) }
                     } else {
-                        Ok(pyre_object::w_not_implemented())
+                        Err(unsafe {
+                            crate::objspace::descroperation::str_concat_type_error(args[1])
+                        })
                     }
                 },
                 2,
@@ -12133,7 +12162,7 @@ fn init_type_type(ns: PyObjectRef) {
     // returns the tuple).  Bound as a regular method, so `cls` is at args[0].
     // `mro()` takes its receiver and nothing else; the declared count is what
     // rejects a surplus argument before the body indexes `args[0]`.
-    let mro_method = make_builtin_function_with_arity(
+    let mro_method = crate::gateway::make_builtin_function_with_arity_and_doc(
         "mro",
         |args| {
             let cls = args[0];
@@ -12145,6 +12174,7 @@ fn init_type_type(ns: PyObjectRef) {
             }))
         },
         1,
+        "Return a type's method resolution order.",
     );
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "mro", mro_method) };
 
@@ -18676,7 +18706,7 @@ fn init_int_type(ns: PyObjectRef) {
     // int.__index__ / __int__ / __trunc__ / __floor__ / __ceil__ —
     // `_self_unaryop` → `self.int(space)`: exact ints preserve identity;
     // subclasses and bools are normalized by `int_as_plain_int`.
-    for method in ["__index__", "__int__", "__trunc__", "__floor__", "__ceil__"] {
+    for method in ["__index__", "__int__"] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
@@ -18685,12 +18715,35 @@ fn init_int_type(ns: PyObjectRef) {
             )
         };
     }
+    for (method, doc) in [
+        ("__trunc__", "Truncating an Integral returns itself."),
+        ("__floor__", "Flooring an Integral returns itself."),
+        ("__ceil__", "Ceiling of an Integral returns itself."),
+    ] {
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                ns,
+                method,
+                crate::gateway::make_builtin_function_with_arity_and_doc(
+                    method,
+                    |args| Ok(int_as_plain_int(args)),
+                    1,
+                    doc,
+                ),
+            )
+        };
+    }
     // int.conjugate — identity (bool → int)
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "conjugate",
-            make_builtin_function_with_arity("conjugate", |args| Ok(int_as_plain_int(args)), 1),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "conjugate",
+                |args| Ok(int_as_plain_int(args)),
+                1,
+                "Returns self, the complex conjugate of any int.",
+            ),
         )
     };
     // int.as_integer_ratio — (self, 1)
@@ -18758,7 +18811,13 @@ fn init_int_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "denominator",
-            make_getset_descriptor(denom_getter),
+            make_getset_property_named_doc(
+                denom_getter,
+                pyre_object::PY_NULL,
+                pyre_object::PY_NULL,
+                "the denominator of a rational number in lowest terms",
+                "denominator",
+            ),
         )
     };
     // Unary / conversion slots exposed as callable dunders.  These have
@@ -19221,7 +19280,7 @@ fn init_complex_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__complex__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__complex__",
                 |args| {
                     // PyPy `W_ComplexObject.descr_complex` creates a base
@@ -19243,6 +19302,7 @@ fn init_complex_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_complex_new(re, im))
                 },
                 1,
+                "Convert this value to exact type complex.",
             ),
         )
     };
@@ -21315,7 +21375,12 @@ fn init_bytes_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__bytes__",
-            make_builtin_function_with_arity("__bytes__", bytes_method_bytes, 1),
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__bytes__",
+                bytes_method_bytes,
+                1,
+                "Convert this value to exact type bytes.",
+            ),
         )
     };
     unsafe {
@@ -22744,6 +22809,22 @@ fn bytes_method_join(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
                 crate::builtins::sequence_fast(iterable, "can only join an iterable")?
             }
         };
+        // `StringMethods.descr_join` asks `_join_return_one` before entering
+        // `_str_join_many_items`.  `W_BytesObject._join_return_one` accepts
+        // only an exact `bytes` item (including when the separator itself is
+        // a user subclass); `W_BytearrayObject._join_return_one` is always
+        // false because its mutable result must be fresh.
+        if items.len() == 1
+            && unsafe { pyre_object::bytesobject::is_bytes(args[0]) }
+            && unsafe {
+                pyre_object::pyobject::is_exact_type(
+                    items[0],
+                    &pyre_object::bytesobject::BYTES_TYPE,
+                )
+            }
+        {
+            return Ok(items[0]);
+        }
         let mut out: Vec<u8> = Vec::new();
         for (i, &item) in items.iter().enumerate() {
             if i > 0 {
@@ -23291,38 +23372,75 @@ fn bytes_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         )));
     }
     crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
-    let tabsize = match pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
-    {
-        Some(t) if !t.is_null() => crate::builtins::space_index_w(t)?,
-        _ => 8,
-    };
+    // [3.14-spec] PyPy `StringMethods.descr_expandtabs` uses
+    // `@unwrap_spec(tabsize=int)`, while CPython's `stringlib_expandtabs`
+    // clinic wrapper uses `PyLong_AsInt`.  The latter is observable before
+    // the body even for an empty receiver, so narrow through the shared
+    // index-protocol C-int converter here.
+    let tabsize = i64::from(
+        match pos
+            .get(1)
+            .copied()
+            .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
+        {
+            Some(t) if !t.is_null() => crate::baseobjspace::index_c_int_w(t)?,
+            _ => 8,
+        },
+    );
     // `unwrap_spec(tabsize=int)` converts before `descr_expandtabs` calls
     // `_val`; a re-entrant `__index__` can therefore resize a bytearray and
     // the method must read the resulting value.
     let data = unsafe { pyre_object::bytesobject::bytes_like_data(pos[0]) };
-    let mut out: Vec<u8> = Vec::with_capacity(data.len());
-    let mut col: i64 = 0;
-    for &b in data {
-        match b {
-            b'\t' => {
-                if tabsize > 0 {
-                    let incr = tabsize - (col % tabsize);
-                    col += incr;
-                    out.resize(out.len() + incr as usize, b' ');
-                }
-            }
-            b'\n' | b'\r' => {
-                out.push(b);
-                col = 0;
-            }
-            _ => {
-                out.push(b);
-                col += 1;
-            }
+    // `StringMethods.descr_expandtabs`: split at tabs, append the first
+    // token, then compute each following indentation from the previous token
+    // (back to its last CR/LF).  RPython's builder turns an unsatisfiable
+    // allocation into MemoryError; reserve fallibly so Rust does the same
+    // instead of aborting the interpreter.
+    let tokens: Vec<&[u8]> = data.split(|&b| b == b'\t').collect();
+    let overflow = || crate::PyError::overflow_error("new string is too long");
+    if tabsize > 0 {
+        let token_count = i64::try_from(tokens.len()).map_err(|_| overflow())?;
+        token_count.checked_mul(tabsize).ok_or_else(overflow)?;
+    }
+    let tabindent = |token: &[u8]| -> usize {
+        if tabsize <= 0 {
+            return 0;
         }
+        let mut distance = 0i64;
+        let mut offset = token.len();
+        while offset > 0 {
+            let b = token[offset - 1];
+            if b == b'\n' || b == b'\r' {
+                break;
+            }
+            distance += 1;
+            offset -= 1;
+        }
+        distance = (tabsize - (distance % tabsize)) % tabsize;
+        if distance == 0 {
+            tabsize as usize
+        } else {
+            distance as usize
+        }
+    };
+    let mut total = tokens.first().map_or(0, |token| token.len());
+    let mut index = 1usize;
+    while index < tokens.len() {
+        total = total
+            .checked_add(tabindent(tokens[index - 1]))
+            .and_then(|n| n.checked_add(tokens[index].len()))
+            .ok_or_else(overflow)?;
+        index += 1;
+    }
+    let mut out = crate::builtins::try_vec_with_capacity(total)?;
+    if let Some(first) = tokens.first() {
+        out.extend_from_slice(first);
+    }
+    let mut index = 1usize;
+    while index < tokens.len() {
+        out.resize(out.len() + tabindent(tokens[index - 1]), b' ');
+        out.extend_from_slice(tokens[index]);
+        index += 1;
     }
     Ok(new_bytes_like(pos[0], &out))
 }
@@ -25111,7 +25229,11 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", bytearray_descr_init),
+            crate::gateway::make_builtin_function_with_doc(
+                "__init__",
+                bytearray_descr_init,
+                "Initialize self.  See help(type(self)) for accurate signature.",
+            ),
         )
     };
     unsafe {
@@ -25129,7 +25251,6 @@ fn init_bytearray_type(ns: PyObjectRef) {
     for (name, function, arity) in [
         ("__repr__", bytearray_descr_repr as DunderFn, 1),
         ("__str__", bytearray_descr_repr, 1),
-        ("__reduce__", bytearray_descr_reduce, 1),
         ("__reduce_ex__", bytearray_descr_reduce_ex, 2),
         ("__alloc__", bytearray_descr_alloc, 1),
         ("resize", bytearray_descr_resize, 2),
@@ -25142,6 +25263,18 @@ fn init_bytearray_type(ns: PyObjectRef) {
             )
         };
     }
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__reduce__",
+            crate::gateway::make_builtin_function_with_arity_and_doc(
+                "__reduce__",
+                bytearray_descr_reduce,
+                1,
+                "Return state information for pickling.",
+            ),
+        )
+    };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
@@ -25160,12 +25293,13 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__mod__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__mod__",
                 |args| unsafe {
                     crate::objspace::std::formatting::bytes_format_percent(args[0], args[1])
                 },
                 2,
+                "Return self%value.",
             ),
         )
     };
@@ -25173,7 +25307,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__rmod__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__rmod__",
                 |args| {
                     if unsafe { pyre_object::is_bytearray(args[1]) } {
@@ -25185,6 +25319,7 @@ fn init_bytearray_type(ns: PyObjectRef) {
                     }
                 },
                 2,
+                "Return value%self.",
             ),
         )
     };
@@ -26285,10 +26420,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__reduce__",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "__reduce__",
                 setlike_gateway(frozen, set_gateway_reduce, frozenset_gateway_reduce),
                 1,
+                "Return state information for pickling.",
             ),
         )
     };
@@ -26450,9 +26586,10 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "union",
-            make_builtin_function(
+            crate::gateway::make_builtin_function_with_doc(
                 "union",
                 setlike_gateway(frozen, set_gateway_union, frozenset_gateway_union),
+                "Return a new set with elements from the set and all others.",
             ),
         )
     };
@@ -26460,13 +26597,14 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection",
-            make_builtin_function(
+            crate::gateway::make_builtin_function_with_doc(
                 "intersection",
                 setlike_gateway(
                     frozen,
                     set_gateway_intersection,
                     frozenset_gateway_intersection,
                 ),
+                "Return a new set with elements common to the set and all others.",
             ),
         )
     };
@@ -26499,10 +26637,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "issubset",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "issubset",
                 setlike_gateway(frozen, set_gateway_issubset, frozenset_gateway_issubset),
                 2,
+                "Report whether another set contains this set.",
             ),
         )
     };
@@ -26510,10 +26649,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "issuperset",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "issuperset",
                 setlike_gateway(frozen, set_gateway_issuperset, frozenset_gateway_issuperset),
                 2,
+                "Report whether this set contains another set.",
             ),
         )
     };
@@ -26521,10 +26661,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "isdisjoint",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "isdisjoint",
                 setlike_gateway(frozen, set_gateway_isdisjoint, frozenset_gateway_isdisjoint),
                 2,
+                "Return True if two sets have a null intersection.",
             ),
         )
     };
@@ -26534,10 +26675,11 @@ fn init_setlike_common(ns: PyObjectRef, frozen: bool) {
             "copy",
             // `setobject.py descr_copy` — a shallow copy, taking the
             // storage over rather than hashing the elements again.
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "copy",
                 setlike_gateway(frozen, set_gateway_copy, frozenset_gateway_copy),
                 1,
+                "Return a shallow copy of a set.",
             ),
         )
     };
@@ -27503,7 +27645,7 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "clear",
-            make_builtin_function_with_arity(
+            crate::gateway::make_builtin_function_with_arity_and_doc(
                 "clear",
                 |args| {
                     crate::type_methods::require_set_receiver(args, "clear", true)?;
@@ -27512,6 +27654,7 @@ fn init_set_type(ns: PyObjectRef) {
                     Ok(pyre_object::w_none())
                 },
                 1,
+                "Remove all elements from this set.",
             ),
         )
     };
@@ -27534,22 +27677,30 @@ fn init_set_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "difference_update",
-            make_builtin_function("difference_update", |args| {
-                crate::type_methods::require_set_receiver(args, "difference_update", true)?;
-                crate::type_methods::reject_kwargs(args, "difference_update")?;
-                set_method_difference_update(args)
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "difference_update",
+                |args| {
+                    crate::type_methods::require_set_receiver(args, "difference_update", true)?;
+                    crate::type_methods::reject_kwargs(args, "difference_update")?;
+                    set_method_difference_update(args)
+                },
+                "Update the set, removing elements found in others.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "intersection_update",
-            make_builtin_function("intersection_update", |args| {
-                crate::type_methods::require_set_receiver(args, "intersection_update", true)?;
-                crate::type_methods::reject_kwargs(args, "intersection_update")?;
-                set_method_intersection_update(args)
-            }),
+            crate::gateway::make_builtin_function_with_doc(
+                "intersection_update",
+                |args| {
+                    crate::type_methods::require_set_receiver(args, "intersection_update", true)?;
+                    crate::type_methods::reject_kwargs(args, "intersection_update")?;
+                    set_method_intersection_update(args)
+                },
+                "Update the set, keeping only elements found in it and all others.",
+            ),
         )
     };
     unsafe {

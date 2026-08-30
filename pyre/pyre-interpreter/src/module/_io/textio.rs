@@ -1073,6 +1073,9 @@ impl W_TextIOWrapper {
         {
             return Ok(());
         }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let _ = pyre_object::gc_roots::pin_root(stream);
+        let stream_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let payload = unsafe { &mut *(stream as *mut Self) };
         // The buffer is read below for the probes `descr_init` runs against it,
         // so a wrapper without one has nothing to attach rather than a null to
@@ -1090,7 +1093,30 @@ impl W_TextIOWrapper {
             return Ok(());
         };
         let codec = Self::lookup_text_codec(&encoding)?;
-        payload.set_encoder_decoder(codec)?;
+        let _ = pyre_object::gc_roots::pin_root(codec);
+        let codec_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        // `app_main.create_stdio` constructs the standard streams through
+        // `_io.open`, whose codec lookup publishes the canonical spelling
+        // (`UTF-8` -> `utf-8`, `latin1` -> `iso8859-1`).  A directly-created
+        // TextIOWrapper still retains the caller's spelling; only this deferred
+        // standard-stream path performs the canonicalisation.
+        let canonical_name = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(codec_slot),
+            "name",
+        )
+        .ok()
+        .filter(|name| unsafe { pyre_object::is_str(*name) });
+        let canonical_slot = canonical_name.map(|name| {
+            let _ = pyre_object::gc_roots::pin_root(name);
+            pyre_object::gc_roots::shadow_stack_len() - 1
+        });
+        let payload =
+            unsafe { &mut *(pyre_object::gc_roots::shadow_stack_get(stream_slot) as *mut Self) };
+        if let Some(slot) = canonical_slot {
+            payload.w_encoding = pyre_object::gc_roots::shadow_stack_get(slot);
+            payload.publish_refs();
+        }
+        payload.set_encoder_decoder(pyre_object::gc_roots::shadow_stack_get(codec_slot))?;
         // The rest of the `descr_init` tail `allocate_stdio` also had to defer:
         // the seekable/telling pair and the `read1` probe both call into the
         // buffer, which is why they wait for the same moment the codec does.

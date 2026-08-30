@@ -9,7 +9,8 @@ pub static BYTEARRAY_TYPE: PyType = crate::pyobject::new_pytype("bytearray");
 
 /// Python bytearray object.
 ///
-/// Layout: `[ob_type | data | exports]`
+/// Layout: `[ob_header | data | length | alloc | logical_offset | exports |
+/// w_dict | w_weakreflifeline | w_slots]`
 #[repr(C)]
 pub struct W_BytearrayObject {
     pub ob_header: PyObject,
@@ -54,6 +55,9 @@ pub struct W_BytearrayObject {
     /// Mapdict `dict`/`weakref` SPECIAL slots for user subclasses.
     pub w_dict: PyObjectRef,
     pub w_weakreflifeline: PyObjectRef,
+    /// PyPy `BaseUserClassMapdict` indexed slot storage for a user subclass.
+    /// Exact bytearrays and subclasses with no populated slots keep `PY_NULL`.
+    pub w_slots: PyObjectRef,
 }
 
 /// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
@@ -92,6 +96,8 @@ pub const BYTEARRAY_W_DICT_OFFSET: usize = std::mem::offset_of!(W_BytearrayObjec
 /// `W_BytearrayObject.w_weakreflifeline` — mapdict's `weakref` SPECIAL slot.
 pub const BYTEARRAY_W_WEAKREFLIFELINE_OFFSET: usize =
     std::mem::offset_of!(W_BytearrayObject, w_weakreflifeline);
+/// `W_BytearrayObject.w_slots` — `BaseUserClassMapdict` indexed slot storage.
+pub const BYTEARRAY_W_SLOTS_OFFSET: usize = std::mem::offset_of!(W_BytearrayObject, w_slots);
 
 impl crate::lltype::GcType for W_BytearrayObject {
     fn type_id() -> u32 {
@@ -130,6 +136,7 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
         exports: 0,
         w_dict: PY_NULL,
         w_weakreflifeline: PY_NULL,
+        w_slots: PY_NULL,
     };
     let raw =
         crate::gc_hook::try_gc_alloc_stable_raw(W_BYTEARRAY_GC_TYPE_ID, W_BYTEARRAY_OBJECT_SIZE);
@@ -198,6 +205,7 @@ pub fn w_bytearray_subclass_from_bytes(bytes: &[u8], w_class: PyObjectRef) -> Py
         exports: 0,
         w_dict: PY_NULL,
         w_weakreflifeline: PY_NULL,
+        w_slots: PY_NULL,
     };
     let obj = if raw.is_null() {
         crate::lltype::malloc_typed(payload) as PyObjectRef
@@ -227,6 +235,26 @@ pub unsafe fn w_bytearray_getdict(obj: PyObjectRef) -> PyObjectRef {
 pub unsafe fn w_bytearray_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
     unsafe { (*(obj as *mut W_BytearrayObject)).w_dict = w_dict };
     crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+}
+
+/// Read one app-level `__slots__` entry from a `bytearray` subclass.
+///
+/// PyPy's `BaseUserClassMapdict.getslotvalue` indexes the instance-owned
+/// storage by `Member.index`; `PY_NULL` is the unbound-slot sentinel.
+pub unsafe fn w_bytearray_slot_get(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    let slots = unsafe { (*(obj as *const W_BytearrayObject)).w_slots };
+    unsafe { crate::slots::slot_get(slots, index) }
+}
+
+/// Write one app-level `__slots__` entry on a `bytearray` subclass.
+pub unsafe fn w_bytearray_slot_set(obj: PyObjectRef, index: usize, value: PyObjectRef) {
+    crate::slot_set_direct!(obj, index, value, W_BytearrayObject, w_slots)
+}
+
+/// Clear one app-level `__slots__` entry on a `bytearray` subclass.
+pub unsafe fn w_bytearray_slot_del(obj: PyObjectRef, index: usize) -> bool {
+    let slots = unsafe { (*(obj as *const W_BytearrayObject)).w_slots };
+    unsafe { crate::slots::slot_del(slots, index) }
 }
 
 #[inline]

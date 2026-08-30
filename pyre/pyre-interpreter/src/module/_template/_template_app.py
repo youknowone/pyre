@@ -137,15 +137,6 @@ class Template:
             'can only concatenate string.templatelib.Template '
             f'(not "{type(other).__name__}") to string.templatelib.Template')
 
-    def __radd__(self, other):
-        if isinstance(other, Template):
-            return Template._make(
-                _concat_boundary(other._strings, self._strings),
-                other._interpolations + self._interpolations)
-        raise TypeError(
-            'can only concatenate string.templatelib.Template '
-            f'(not "{type(other).__name__}") to string.templatelib.Template')
-
     def __repr__(self):
         return (f'Template(strings={self._strings!r}, '
                 f'interpolations={self._interpolations!r})')

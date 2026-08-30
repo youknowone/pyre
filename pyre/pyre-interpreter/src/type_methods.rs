@@ -114,7 +114,7 @@ pub(crate) fn reject_kwargs(args: &[PyObjectRef], name: &str) -> Result<(), crat
 
 /// [`reject_kwargs`] for a method whose declaring class is fixed rather than
 /// read off the receiver — see [`arity_no_args_of`].
-fn reject_kwargs_of(
+pub(crate) fn reject_kwargs_of(
     owner: Option<&str>,
     args: &[PyObjectRef],
     name: &str,
@@ -606,8 +606,14 @@ pub fn list_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 // EmptyListStrategy._extend_from_list delegates to the
                 // donor's copy_into; BaseRangeListStrategy shares its
                 // immutable erased tuple rather than appending boxed ints.
-                pyre_object::listobject::w_list_setslice(list, 0, 0, other)
-                    .expect("range copy_into an empty exact list");
+                pyre_object::listobject::w_list_setslice_mode(
+                    list,
+                    0,
+                    0,
+                    other,
+                    majit_metainterp::jit::we_are_jitted(),
+                )
+                .expect("range copy_into an empty exact list");
                 return Ok(w_none());
             }
             pyre_object::listobject::w_list_reserve_for_extend(list, n);
@@ -3793,6 +3799,7 @@ pub(crate) fn encode_utf8_with_errors(
                     index,
                     error_end,
                     "surrogates not allowed",
+                    EncodeErrorOwner::UnicodeObject,
                 )?;
                 match rep {
                     EncodeReplacement::Str(rcps) => {
@@ -4173,6 +4180,7 @@ fn encode_narrow(
                     start,
                     end,
                     range_msg,
+                    EncodeErrorOwner::UnicodeObject,
                 )?;
                 match rep {
                     EncodeReplacement::Str(rcps) => {
@@ -4340,6 +4348,7 @@ fn encode_utf16_32_impl(
                     index,
                     index + 1,
                     "surrogates not allowed",
+                    EncodeErrorOwner::UnicodeObject,
                 )?;
                 match rep {
                     EncodeReplacement::Str(rcps) => {
@@ -4612,17 +4621,21 @@ fn call_decode_error_handler(
     // in: the reread object (unicodeobject.c insize), or the one it started
     // on (`multibytecodec_decerror`'s `size`).
     let length = new_bytes.as_ref().map_or(data.len(), Vec::len) as i64;
-    // `call_errorhandler` keeps the negative fold in the `else` clause of the
-    // conversion, so it runs only for a position that converted.  One that did
-    // not convert is refused by the conversion's own error rather than folded:
-    // folding would land on 0 for a one-unit input and hand the same span back
-    // to the handler forever, and the error a position outside the machine
-    // integer raises is what a caller observes -- `OverflowError`, not the
-    // `IndexError` a substituted -1 sentinel would reach the bounds test with.
-    let newpos = match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4))?
-    {
-        n if n < 0 => n + length,
-        n => n,
+    // `multibytecodec_decerror` substitutes -1 for a position outside the
+    // machine integer and lets the bounds test below report it.  [3.14-spec]
+    // `unicode_decode_call_errorhandler` propagates the `PyLong_AsSsize_t`
+    // failure instead: 3.14.2 answers `OverflowError` for ascii, utf-8,
+    // latin-1 and charmap, and `IndexError: position -1 ...` for the
+    // multibyte engines, while PyPy 7.3.20 folds on both.  The negative fold
+    // stays in the conversion's `else` clause either way, so it runs only for
+    // a position that converted: folding a failure would land on 0 for a
+    // one-unit input and hand the same span back to the handler without end.
+    let folds_overflow = !matches!(resume_in, DecodeResume::RereadObject);
+    let newpos = match crate::baseobjspace::int_w(pyre_object::gc_roots::shadow_stack_get(sp + 4)) {
+        Ok(n) if n < 0 => n + length,
+        Ok(n) => n,
+        Err(error) if folds_overflow && error.kind == crate::PyErrorKind::OverflowError => -1,
+        Err(error) => return Err(error),
     };
     if newpos < 0 || newpos > length {
         return Err(crate::PyError::new(
@@ -4639,6 +4652,18 @@ fn call_decode_error_handler(
         _ => None,
     };
     Ok((newpos as usize, resume))
+}
+
+/// Which upstream owns the encode error-handler call, mirroring
+/// [`DecodeResume`] on the decode side.  The two disagree over a handler
+/// position that does not fit the machine integer.
+pub(crate) enum EncodeErrorOwner {
+    /// `unicode_encode_call_errorhandler` — every codec in `unicodeobject.c`,
+    /// including `charmap_encode` and the win32 code-page encoder.
+    UnicodeObject,
+    /// `multibytecodec_encerror` — the CJK engines.
+    #[cfg(not(target_arch = "wasm32"))]
+    MultibyteCodec,
 }
 
 /// Replacement returned by a custom encode error handler: either a str
@@ -4665,6 +4690,7 @@ pub(crate) fn call_registered_encode_error_handler(
     start: usize,
     end: usize,
     reason: &str,
+    owner: EncodeErrorOwner,
 ) -> Result<(EncodeReplacement, usize), crate::PyError> {
     let w_handler = crate::module::_codecs::lookup_registered_error(err_mode).ok_or_else(|| {
         crate::PyError::new(
@@ -4710,12 +4736,15 @@ pub(crate) fn call_registered_encode_error_handler(
     // newpos folds against the source CHARACTER length and resumes into the
     // original code-point sequence.
     let length = char_len as i64;
-    // The negative fold applies only to a position that converted, exactly as
-    // in the decode branch above, and one that did not is refused by the
-    // conversion's own error rather than folded.
-    let newpos = match crate::baseobjspace::int_w(w_newpos)? {
-        n if n < 0 => n + length,
-        n => n,
+    // The same split as the decode branch above: `multibytecodec_encerror`
+    // folds an unrepresentable position to -1, `unicode_encode_call_errorhandler`
+    // refuses it with its own `OverflowError`.
+    let folds_overflow = !matches!(owner, EncodeErrorOwner::UnicodeObject);
+    let newpos = match crate::baseobjspace::int_w(w_newpos) {
+        Ok(n) if n < 0 => n + length,
+        Ok(n) => n,
+        Err(error) if folds_overflow && error.kind == crate::PyErrorKind::OverflowError => -1,
+        Err(error) => return Err(error),
     };
     if newpos < 0 || newpos > length {
         return Err(crate::PyError::new(
@@ -4876,6 +4905,16 @@ fn decode_utf32_impl(
     final_: bool,
 ) -> Result<(Wtf8Buf, usize, i32), crate::PyError> {
     let (big_endian, mut pos, byteorder) = resolve_bom(data, true, fixed_be);
+    // [3.14-spec] PyPy `str_decode_utf_32_helper` reports its caller-supplied
+    // `public_encoding_name` (normally `utf32`).
+    // `PyUnicode_DecodeUTF32Stateful` at v3.14.6 selects the effective
+    // `utf-32-le` / `utf-32-be` name after BOM resolution; that name is
+    // observable as `UnicodeDecodeError.encoding`.
+    let codec = if fixed_be.is_none() && matches!(codec, "utf32" | "utf-32") {
+        if big_endian { "utf-32-be" } else { "utf-32-le" }
+    } else {
+        codec
+    };
     // A custom error handler may replace exc.object; the loop then resumes
     // from the new bytes (`buf`), re-evaluating `len` each iteration.
     let mut buf: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(data);
@@ -4913,7 +4952,11 @@ fn decode_utf32_impl(
             );
             continue;
         } else if ch >= 0x110000 {
-            pos = run32!(pos, len, "code point not in range(0x110000)");
+            // [3.14-spec] PyPy's helper hands `len(s)` to the handler here;
+            // `PyUnicode_DecodeUTF32Stateful` at v3.14.6 sets `endinpos` to
+            // exactly the offending four-byte unit. Preserve the exception's
+            // observable `.end` and the resume point custom handlers receive.
+            pos = run32!(pos, pos + 4, "code point not in range(0x110000)");
             continue;
         }
         out.push(CodePoint::from_u32(ch).unwrap());
@@ -6296,14 +6339,21 @@ pub fn str_method_expandtabs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
     crate::builtins::kwarg_reject_unknown(kwargs, &["tabsize"], "expandtabs")?;
     crate::builtins::kwarg_reject_duplicate(kwargs, "expandtabs", "tabsize", pos.get(1).is_some())?;
     let s = unsafe { w_str_get_wtf8(pos[0]) };
-    let tabsize = match pos
-        .get(1)
-        .copied()
-        .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
-    {
-        Some(t) => crate::builtins::space_index_w(t)?,
-        None => 8,
-    };
+    // [3.14-spec] PyPy `W_UnicodeObject.descr_expandtabs` unwraps a machine
+    // `int`; CPython `unicode_expandtabs` declares an Argument Clinic `int`
+    // and therefore calls `PyLong_AsInt` before inspecting even an empty
+    // receiver.  Keep PyPy's method body below, but narrow this observable
+    // argument boundary to a C int.
+    let tabsize = i64::from(
+        match pos
+            .get(1)
+            .copied()
+            .or_else(|| crate::builtins::kwarg_get(kwargs, "tabsize"))
+        {
+            Some(t) => crate::baseobjspace::index_c_int_w(t)?,
+            None => 8,
+        },
+    );
     // Tabs advance to the next multiple of `tabsize` measured from the
     // start of the current line (the column resets on `\n` / `\r`); a
     // non-positive `tabsize` drops tabs entirely. The expanded length is

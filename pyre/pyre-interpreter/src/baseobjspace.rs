@@ -4036,8 +4036,9 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
     let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let value = pyre_object::gc_roots::shadow_stack_get(value_slot);
     let w_other = if obj == value {
-        pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec(
+        pyre_object::listobject::w_list_new(pyre_object::listobject::w_list_items_copy_as_vec_mode(
             value,
+            majit_metainterp::jit::we_are_jitted(),
         ))
     } else if pyre_object::is_list(value) {
         value
@@ -4061,8 +4062,14 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         let s_hi = stop.max(start).max(0) as usize;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_other = pyre_object::gc_roots::shadow_stack_get(other_slot);
-        pyre_object::listobject::w_list_setslice(obj, s_lo, s_hi, w_other)
-            .expect("w_other is always a valid list");
+        pyre_object::listobject::w_list_setslice_mode(
+            obj,
+            s_lo,
+            s_hi,
+            w_other,
+            majit_metainterp::jit::we_are_jitted(),
+        )
+        .expect("w_other is always a valid list");
         return Ok(w_none());
     }
     // Extended slice: `pypy/objspace/std/listobject.py
@@ -4687,6 +4694,19 @@ pub fn is_(w_one: PyObjectRef, w_two: PyObjectRef) -> PyObjectRef {
     w_bool_from(is_w(w_one, w_two))
 }
 
+/// `ObjSpace.id` (`baseobjspace.py`): ask the object for its immutable unique
+/// id first, then use the moving collector's stable identity hash.
+///
+/// This is the interpreter operation, without the `builtins.id` audit event;
+/// internal users such as `pycode._convert_const` call this layer directly in
+/// PyPy too.
+pub fn id(w_obj: PyObjectRef) -> PyObjectRef {
+    match crate::function::immutable_unique_id(w_obj) {
+        Some(w_id) => w_id,
+        None => w_int_new(pyre_object::gc_hook::gc_identity_hash(w_obj as usize) as i64),
+    }
+}
+
 /// `W_TypeObject.flag_sequence_bug_compat` — set on exactly the builtin
 /// sequence types (list/tuple/bytes/bytearray/str); subclasses do not
 /// inherit it, so this is an exact type-object identity check.  Used by
@@ -5108,10 +5128,10 @@ pub fn getdict(obj: PyObjectRef) -> PyResult {
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
 /// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
-/// Native `str` and `list` subclasses carry their PyPy-shaped indexed storage
-/// on the payload object itself. Other fixed Rust payloads still fall back to
-/// an exposed instance `__dict__` when their type has one. `None`/`false`
-/// means the receiver has no writable storage.
+/// Native subclasses with an object-resident `w_slots` field carry their
+/// PyPy-shaped indexed storage on the payload object itself. Other fixed Rust
+/// payloads still fall back to an exposed instance `__dict__` when their type
+/// has one. `None`/`false` means the receiver has no writable storage.
 pub(crate) fn native_slot_get(
     obj: PyObjectRef,
     name: &str,
@@ -5128,6 +5148,11 @@ pub(crate) fn native_slot_get(
     }
     if unsafe { pyre_object::is_str(obj) } {
         return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_get(obj, index as usize) });
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        return Ok(unsafe {
+            pyre_object::bytearrayobject::w_bytearray_slot_get(obj, index as usize)
+        });
     }
     if unsafe { pyre_object::is_float(obj) } {
         return Ok(unsafe { pyre_object::floatobject::w_float_slot_get(obj, index as usize) });
@@ -5170,6 +5195,10 @@ pub(crate) fn native_slot_set(
     }
     if unsafe { pyre_object::is_str(obj) } {
         unsafe { pyre_object::unicodeobject::w_str_slot_set(obj, index as usize, value) };
+        return Ok(true);
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        unsafe { pyre_object::bytearrayobject::w_bytearray_slot_set(obj, index as usize, value) };
         return Ok(true);
     }
     if unsafe { pyre_object::is_float(obj) } {
@@ -5215,6 +5244,11 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
     }
     if unsafe { pyre_object::is_str(obj) } {
         return Ok(unsafe { pyre_object::unicodeobject::w_str_slot_del(obj, index as usize) });
+    }
+    if unsafe { pyre_object::bytearrayobject::is_bytearray(obj) } {
+        return Ok(unsafe {
+            pyre_object::bytearrayobject::w_bytearray_slot_del(obj, index as usize)
+        });
     }
     if unsafe { pyre_object::is_float(obj) } {
         return Ok(unsafe { pyre_object::floatobject::w_float_slot_del(obj, index as usize) });
@@ -5543,6 +5577,9 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
         }
         return None;
     }
+    if crate::module::r#struct::W_Struct::from_obj(obj).is_some() {
+        return crate::module::r#struct::W_Struct::getweakref(obj);
+    }
     let w_type = crate::typedef::r#type(obj)?;
     if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
         crate::objspace::std::mapdict::getweakref(obj)
@@ -5595,6 +5632,9 @@ pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), 
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
     {
         unsafe { pyre_object::interp_array::w_array_setweakref(obj, weakreflifeline) };
+        return Ok(());
+    }
+    if crate::module::r#struct::W_Struct::setweakref(obj, weakreflifeline) {
         return Ok(());
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -5658,6 +5698,9 @@ pub fn delweakref(obj: PyObjectRef) {
             .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
     {
         unsafe { pyre_object::interp_array::w_array_setweakref(obj, PY_NULL) };
+        return;
+    }
+    if crate::module::r#struct::W_Struct::delweakref(obj) {
         return;
     }
     let w_type = match crate::typedef::r#type(obj) {
@@ -9257,6 +9300,7 @@ pub fn charbuf_w(obj: PyObjectRef) -> Result<Vec<u8>, PyError> {
 pub(crate) struct SimpleBufferBytes {
     _roots: pyre_object::gc_roots::RootScope,
     data: Vec<u8>,
+    itemsize: i64,
     native_owner_slot: Option<usize>,
     native_export_active: bool,
     release_view_slot: Option<usize>,
@@ -9265,6 +9309,13 @@ pub(crate) struct SimpleBufferBytes {
 impl SimpleBufferBytes {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.data
+    }
+
+    /// `Py_buffer.itemsize` / `BufferView.getitemsize` captured with the
+    /// export.  Consumers such as `array.frombytes` distinguish a byte buffer
+    /// from a typed exporter even though both expose the same raw byte run.
+    pub(crate) fn itemsize(&self) -> i64 {
+        self.itemsize
     }
 
     /// `PyBuffer_Release`: release errors are unraisable and must not replace
@@ -9357,6 +9408,7 @@ fn buffer_bytes(
             return Ok(Some(SimpleBufferBytes {
                 _roots: roots,
                 data: crate::builtins::memoryview_gather_bytes(r_obj),
+                itemsize: pyre_object::memoryview::w_memoryview_view(r_obj).itemsize(),
                 native_owner_slot: None,
                 native_export_active: false,
                 release_view_slot: None,
@@ -9366,9 +9418,21 @@ fn buffer_bytes(
     let native_export_active = unsafe { crate::builtins::buffer_export_incref(r_obj) };
     match crate::typedef::buffer_as_bytes_like(r_obj) {
         Ok(Some(w_bytes)) => {
+            let mut itemsize = if unsafe { pyre_object::interp_array::is_array(r_obj) } {
+                unsafe { pyre_object::interp_array::w_array_itemsize(r_obj) as i64 }
+            } else {
+                1
+            };
+            #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
+            if let Some((_, _, _, _, c_itemsize, _)) =
+                crate::module::_ctypes::cdata::cdata_buffer_view(r_obj)
+            {
+                itemsize = c_itemsize as i64;
+            }
             return Ok(Some(SimpleBufferBytes {
                 _roots: roots,
                 data: unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec(),
+                itemsize,
                 native_owner_slot: native_export_active.then_some(obj_slot),
                 native_export_active,
                 release_view_slot: None,
@@ -9416,6 +9480,7 @@ fn buffer_bytes(
             let buffer = SimpleBufferBytes {
                 _roots: roots,
                 data: Vec::new(),
+                itemsize: 1,
                 native_owner_slot: None,
                 native_export_active: false,
                 release_view_slot: Some(view_slot),
@@ -9429,6 +9494,7 @@ fn buffer_bytes(
         Ok(Some(SimpleBufferBytes {
             _roots: roots,
             data: crate::builtins::memoryview_gather_bytes(r_view),
+            itemsize: pyre_object::memoryview::w_memoryview_view(r_view).itemsize(),
             native_owner_slot: None,
             native_export_active: false,
             release_view_slot: Some(view_slot),
@@ -14735,8 +14801,20 @@ pub fn index_int_w_preserve_negative(obj: PyObjectRef) -> Result<i64, PyError> {
 /// object carrying both dunders would be read from the wrong one, and one
 /// carrying only `__int__` would be accepted where 3.14 raises TypeError.
 pub fn index_c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
-    let value = int_w(space_index(obj)?)?;
-    i32::try_from(value).map_err(|_| PyError::overflow_error("expected a 32-bit integer"))
+    let w_index = space_index(obj)?;
+    let too_large = || PyError::overflow_error("Python int too large to convert to C int");
+    let value = unsafe {
+        if pyre_object::is_long(w_index) {
+            let big = pyre_object::w_long_get_value(w_index);
+            if pyre_object::longobject::jit_bigint_to_i64_fits(big) == 0 {
+                return Err(too_large());
+            }
+            pyre_object::longobject::jit_bigint_to_i64_value(big)
+        } else {
+            int_w(w_index)?
+        }
+    };
+    i32::try_from(value).map_err(|_| too_large())
 }
 
 /// `objspace.honor__builtins__` default is False — the frame builtin is
@@ -16106,10 +16184,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 }
             } else if pyre_object::interp_array::is_array(seq) {
                 if (idx as usize) < pyre_object::interp_array::w_array_len(seq) {
-                    Some(pyre_object::interp_array::w_array_unpack_item(
-                        seq,
-                        idx as usize,
-                    ))
+                    // [3.14-spec] `arrayiter_next` at v3.14.6 advances its
+                    // cursor as part of the getitem argument, even when an
+                    // invalid unicode value makes that getitem raise.
+                    (*iter_ptr).index += 1;
+                    return crate::module::array::array_w_getitem(seq, idx as usize, false);
                 } else {
                     None
                 }

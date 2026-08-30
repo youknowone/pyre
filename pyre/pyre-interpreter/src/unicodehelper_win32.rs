@@ -391,6 +391,7 @@ fn encode_errors(
             pos,
             pos + 1,
             ENCODE_REASON,
+            crate::type_methods::EncodeErrorOwner::UnicodeObject,
         )?;
         match replacement {
             crate::type_methods::EncodeReplacement::Bytes(bytes) => {

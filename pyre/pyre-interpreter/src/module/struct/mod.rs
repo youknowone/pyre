@@ -1073,9 +1073,30 @@ pub struct W_Struct {
     /// ["format", "size"]`.
     format: PyObjectRef,
     size: i64,
+    /// `typedef.make_weakref_descr(W_Struct)` injects `_lifeline_` directly
+    /// onto the wrapped object; keep that edge on the typed payload too.
+    w_weakreflifeline: PyObjectRef,
 }
 
 impl W_Struct {
+    pub(crate) fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
+        let lifeline = W_Struct::from_obj(obj)?.w_weakreflifeline;
+        (!lifeline.is_null()).then_some(lifeline)
+    }
+
+    pub(crate) fn setweakref(obj: PyObjectRef, lifeline: PyObjectRef) -> bool {
+        let Some(this) = W_Struct::from_obj(obj) else {
+            return false;
+        };
+        this.w_weakreflifeline = lifeline;
+        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        true
+    }
+
+    pub(crate) fn delweakref(obj: PyObjectRef) -> bool {
+        W_Struct::setweakref(obj, PY_NULL)
+    }
+
     /// CPython 3.14 `ENSURE_STRUCT_IS_READY` — every operation other than the
     /// `size` getter rejects an object allocated with `Struct.__new__` but not
     /// initialized yet.
@@ -1127,6 +1148,7 @@ impl W_Struct {
             },
             format: w_str_new(""),
             size: -1,
+            w_weakreflifeline: PY_NULL,
         })
     }
 
@@ -1622,6 +1644,17 @@ crate::py_module! {
         let struct_type = type_object();
         let struct_dict = unsafe { pyre_object::w_type_get_dict_ptr(struct_type) } as PyObjectRef;
         unsafe {
+            // [3.14-spec] PyPy's `W_Struct.typedef` installs the public
+            // `make_weakref_descr(W_Struct)` descriptor, while CPython 3.14's
+            // `_struct.Struct` accepts `weakref.ref()` through its native
+            // weak-list offset but exposes no `__weakref__` attribute.
+            // Measured on 3.14.2: `"__weakref__" in vars(_struct.Struct)` is
+            // False while `weakref.ref(_struct.Struct("i"))` succeeds; pypy3
+            // 7.3.20 reports True for the same membership test.  Keep PyPy's
+            // object-owned lifeline and omit only that observable descriptor
+            // spelling; `W_Struct` carries no JIT or immutability hint over
+            // the weakref lifeline.
+            pyre_object::w_type_set_weakrefable(struct_type, true);
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 struct_dict,
                 "pack_into",

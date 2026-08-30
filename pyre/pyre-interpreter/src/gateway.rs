@@ -1305,6 +1305,19 @@ pub fn make_builtin_function_as_builtin(name: &'static str, func: BuiltinCodeFn)
     crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
 }
 
+/// Docstring-carrying [`make_builtin_function_as_builtin`].  PyPy's
+/// `interp2app` keeps the app-visible docstring on the gateway `BuiltinCode`;
+/// builtin `__new__` carriers need the same storage while retaining their
+/// `BuiltinFunction` identity for `copyreg` parity.
+pub fn make_builtin_function_as_builtin_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
+    crate::function_new_builtin(code as *const (), name.to_string(), pyre_object::PY_NULL)
+}
+
 /// Signature-aware [`make_builtin_function_as_builtin`].  Builtin `__new__`
 /// descriptors need the builtin-function carrier for `copyreg` parity while
 /// still routing keyword-only arguments through the gateway binder.
@@ -1481,6 +1494,31 @@ pub fn make_method_descriptor_with_arity(
     arity: u16,
 ) -> PyObjectRef {
     let code = builtin_code_new_with_arity(name, func, arity);
+    crate::function_new_method_descriptor(code as *const (), name.to_string())
+}
+
+/// Fixed-arity [`make_method_descriptor_with_doc`].  This keeps the
+/// CPython-compatible `method_descriptor` carrier while preserving the
+/// docstring that PyPy's `interp2app` reads from the wrapped function.
+pub fn make_method_descriptor_with_arity_and_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    arity: u16,
+    docstring: &'static str,
+) -> PyObjectRef {
+    debug_assert!(arity <= 4);
+    let code = builtin_code_new_full(name, func, Some(docstring), arity, std::ptr::null());
+    crate::function_new_method_descriptor(code as *const (), name.to_string())
+}
+
+/// Build a CPython-compatible variadic method descriptor carrying the
+/// app-visible docstring supplied by PyPy's `interp2app` registration.
+pub fn make_method_descriptor_with_doc(
+    name: &'static str,
+    func: BuiltinCodeFn,
+    docstring: &'static str,
+) -> PyObjectRef {
+    let code = builtin_code_new_with_doc(name, func, Some(docstring));
     crate::function_new_method_descriptor(code as *const (), name.to_string())
 }
 

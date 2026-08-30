@@ -1284,7 +1284,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             return entries.next_valid_slot(from);
         }
         self.next_entry_slot(
-            &*crate::dictmultiobject::w_module_dict_get_storage(w_dict),
+            crate::dictmultiobject::w_module_dict_module_storage(w_dict),
             from,
         )
     }
@@ -1294,7 +1294,7 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
             return entries.prev_valid_slot(before);
         }
         self.prev_entry_slot(
-            &*crate::dictmultiobject::w_module_dict_get_storage(w_dict),
+            crate::dictmultiobject::w_module_dict_module_storage(w_dict),
             before,
         )
     }
@@ -1412,6 +1412,12 @@ pub unsafe fn remove_cell(w_dict: PyObjectRef, name: &str) {
         (*(w_dict as *const crate::pyobject::PyObject)).ob_type,
         &crate::dictmultiobject::MODULE_DICT_TYPE,
     ) {
+        return;
+    }
+    // The body runs only under `isinstance(strategy, ModuleDictStrategy)`.
+    // Past `switch_to_object_strategy` the erased slots hold the object
+    // strategy and an `ObjectDictStorage`, and no cell is left to unwrap.
+    if crate::dictmultiobject::w_module_dict_is_object_strategy(w_dict) {
         return;
     }
     let strategy = crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict);

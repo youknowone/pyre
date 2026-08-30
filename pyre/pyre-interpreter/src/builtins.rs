@@ -2900,9 +2900,6 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__gt__", memoryview_gt, 2),
         ("__ge__", memoryview_ge, 2),
         ("count", memoryview_count, 2),
-        ("tolist", memoryview_tolist, 1),
-        ("toreadonly", memoryview_toreadonly, 1),
-        ("release", memoryview_release, 1),
         ("__enter__", memoryview_enter, 1),
         ("__hash__", memoryview_hash, 1),
         ("_pypy_raw_address", memoryview_raw_address, 1),
@@ -2911,6 +2908,29 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
             ns_slot,
             name,
             make_builtin_function_with_arity(name, f, arity),
+        );
+    }
+    for (name, f, doc) in [
+        (
+            "tolist",
+            memoryview_tolist as MvFn,
+            "Return the data in the buffer as a list of elements.",
+        ),
+        (
+            "toreadonly",
+            memoryview_toreadonly,
+            "Return a readonly version of the memoryview.",
+        ),
+        (
+            "release",
+            memoryview_release,
+            "Release the underlying buffer exposed by the memoryview object.",
+        ),
+    ] {
+        type_ns_store(
+            ns_slot,
+            name,
+            crate::gateway::make_builtin_function_with_arity_and_doc(name, f, 1, doc),
         );
     }
     // Nothing references the two classmethod carriers until they are wrapped
@@ -2967,10 +2987,18 @@ pub(crate) fn init_memoryview_type(ns: PyObjectRef) {
         ("__delitem__", memoryview_delitem),
         ("tobytes", memoryview_tobytes),
         ("hex", memoryview_hex),
-        ("cast", memoryview_cast),
     ] {
         type_ns_store(ns_slot, name, make_builtin_function(name, f));
     }
+    type_ns_store(
+        ns_slot,
+        "cast",
+        crate::gateway::make_builtin_function_with_doc(
+            "cast",
+            memoryview_cast,
+            "Cast a memoryview to a new format or shape.",
+        ),
+    );
     // memoryobject.py:777-788 — `format` / `itemsize` / … are
     // `GetSetProperty(W_MemoryView.w_get_*)`.  `fget` is called
     // `(descriptor, receiver)`.
@@ -4181,12 +4209,80 @@ fn input_eof_error() -> crate::PyError {
     error
 }
 
-/// `pypy/module/__builtin__/app_io.py input` — non-readline path.
+/// `app_io.py _is_std_tty`: only the two `fileno()` calls are protected by
+/// the broad app-level `except`; the equality and `stdin.isatty()` operations
+/// retain their ordinary Python dispatch and errors.
+fn input_streams_are_std_tty(
+    stdin: PyObjectRef,
+    stdout: PyObjectRef,
+) -> Result<bool, crate::PyError> {
+    // `fileno()`, the `__eq__` behind the comparisons and `isatty()` are
+    // ordinary Python calls, so both streams are read back from their slots
+    // rather than kept in the words this was entered with.
+    let roots = pyre_object::gc_roots::push_roots();
+    let stdin_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(stdin);
+    let stdout_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(stdout);
+    let fileno = |stream| -> Option<PyObjectRef> {
+        let method = crate::baseobjspace::getattr_str(stream, "fileno").ok()?;
+        crate::call_and_check(method, &[]).ok()
+    };
+    let Some(infileno) = fileno(roots.get(stdin_slot)) else {
+        return Ok(false);
+    };
+    let infileno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(infileno);
+    let Some(outfileno) = fileno(roots.get(stdout_slot)) else {
+        return Ok(false);
+    };
+    let outfileno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(outfileno);
+
+    // `w_int_new` allocates, and an argument list is evaluated left to right,
+    // so the wrapped number is built before the slot it is compared against
+    // is read.
+    let zero = pyre_object::w_int_new(0);
+    if !crate::baseobjspace::eq_w(roots.get(infileno_slot), zero)? {
+        return Ok(false);
+    }
+    let isatty = crate::baseobjspace::getattr_str(roots.get(stdin_slot), "isatty")?;
+    let isatty = crate::call_and_check(isatty, &[])?;
+    if !crate::baseobjspace::is_true(isatty)? {
+        return Ok(false);
+    }
+    let one = pyre_object::w_int_new(1);
+    crate::baseobjspace::eq_w(roots.get(outfileno_slot), one)
+}
+
+/// `app_io.py _write_prompt`: call the live stream's `write`, then flush when
+/// the live object exposes a `flush` attribute.
+fn input_write_prompt(stdout: PyObjectRef, prompt: PyObjectRef) -> Result<(), crate::PyError> {
+    // The attribute lookups and `write` are ordinary Python calls; keep the
+    // stream and the prompt in slots across them.
+    let roots = pyre_object::gc_roots::push_roots();
+    let stdout_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(stdout);
+    let prompt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(prompt);
+    let write = crate::baseobjspace::getattr_str(roots.get(stdout_slot), "write")?;
+    crate::call_and_check(write, &[roots.get(prompt_slot)])?;
+    match crate::baseobjspace::getattr_str(roots.get(stdout_slot), "flush") {
+        Ok(flush) => {
+            crate::call_and_check(flush, &[])?;
+        }
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+/// `pypy/module/__builtin__/app_io.py input`.
 ///
-/// The tty/readline hook remains owned by `sys.__raw_input__`; when it is not
-/// installed (the normal Pyre configuration), this is the literal app-level
-/// sequence: fetch the three live `sys` streams, flush stderr, write and flush
-/// the prompt, call `stdin.readline()`, then strip one trailing newline.
+/// The tty/readline hook remains owned by `sys.__raw_input__`; otherwise this
+/// is the literal app-level sequence: fetch the three live `sys` streams,
+/// flush stderr, write and flush the prompt, call `stdin.readline()`, then
+/// strip one trailing newline.
 fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (pos, kwargs) = split_builtin_kwargs(args);
     if has_real_kwargs(kwargs) {
@@ -4201,23 +4297,36 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         )));
     }
 
-    let prompt = pos
-        .first()
-        .copied()
-        .unwrap_or_else(|| pyre_object::w_str_new(""));
+    let prompt_arg = pos.first().copied();
+    let prompt = prompt_arg.unwrap_or_else(|| pyre_object::w_str_new(""));
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let prompt_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(prompt);
+
+    // app_io.py `input`: the attempt is audited before consulting any of the
+    // live standard streams, and a hook may reject it.
+    // [3.14-spec] PyPy's default argument has already become `''` here;
+    // `builtin_input_impl` at the pinned v3.14.6 tag passes `Py_None` when the
+    // caller omitted the prompt.  Preserve that observable audit argument
+    // while retaining PyPy's event order and `audit` owner.
+    let audit_prompt = if prompt_arg.is_some() {
+        pyre_object::gc_roots::shadow_stack_get(prompt_slot)
+    } else {
+        w_none()
+    };
+    crate::module::sys::vm::audit("builtins.input", &[audit_prompt])?;
+
     let Some(sys) = crate::importing::get_interpreter_sys_module() else {
         return Err(crate::PyError::runtime_error("lost sys.stdin"));
     };
-
-    let _roots = pyre_object::gc_roots::push_roots();
-    let root = pyre_object::gc_roots::shadow_stack_len();
-    let sys = pyre_object::gc_roots::pin_root(sys);
-    let _ = pyre_object::gc_roots::pin_root(prompt);
+    let sys_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(sys);
 
     // `bltinmodule.c builtin_input_impl`: an absent — or `None` — standard
     // stream is a `RuntimeError`, not an attribute error from the stream call.
     let stream = |name: &str| -> Result<PyObjectRef, crate::PyError> {
-        let sys = pyre_object::gc_roots::shadow_stack_get(root);
+        let sys = pyre_object::gc_roots::shadow_stack_get(sys_slot);
         let lost = || crate::PyError::runtime_error(format!("lost sys.{name}"));
         match crate::baseobjspace::getattr_str(sys, name) {
             Ok(value) if unsafe { pyre_object::is_none(value) } => Err(lost()),
@@ -4228,7 +4337,7 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     };
 
     let stdin = stream("stdin")?;
-    let stdin = pyre_object::gc_roots::pin_root(stdin);
+    let _ = pyre_object::gc_roots::pin_root(stdin);
     let stdin_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let stdout = stream("stdout")?;
     let _ = pyre_object::gc_roots::pin_root(stdout);
@@ -4248,37 +4357,89 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         &[],
     )?;
 
+    // app_io.py readline hook: resolve it before converting the prompt, as the
+    // `hasattr(sys, '__raw_input__') and _is_std_tty(...)` condition does.
+    let raw_input_slot = match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(sys_slot),
+        "__raw_input__",
+    ) {
+        Ok(raw_input) => {
+            let _ = pyre_object::gc_roots::pin_root(raw_input);
+            Some(pyre_object::gc_roots::shadow_stack_len() - 1)
+        }
+        Err(error) if error.kind == crate::PyErrorKind::AttributeError => None,
+        Err(error) => return Err(error),
+    };
+    let raw_input_std_tty = if raw_input_slot.is_some() {
+        input_streams_are_std_tty(
+            pyre_object::gc_roots::shadow_stack_get(stdin_slot),
+            pyre_object::gc_roots::shadow_stack_get(stdout_slot),
+        )?
+    } else {
+        false
+    };
+
     // app_io.py `_write_prompt`: `str(prompt)`, `stdout.write`, then an
     // optional `stdout.flush`.
-    let prompt_text = builtin_str(&[pyre_object::gc_roots::shadow_stack_get(root + 1)])?;
+    let prompt_text = builtin_str(&[pyre_object::gc_roots::shadow_stack_get(prompt_slot)])?;
     let _ = pyre_object::gc_roots::pin_root(prompt_text);
     let prompt_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let stdout_write = crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(stdout_slot),
-        "write",
-    )?;
-    let _ = pyre_object::gc_roots::pin_root(stdout_write);
-    let write_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    crate::call_and_check(
-        pyre_object::gc_roots::shadow_stack_get(write_slot),
-        &[pyre_object::gc_roots::shadow_stack_get(prompt_slot)],
-    )?;
-    match crate::baseobjspace::getattr_str(
-        pyre_object::gc_roots::shadow_stack_get(stdout_slot),
-        "flush",
-    ) {
-        Ok(flush) => {
-            let _ = pyre_object::gc_roots::pin_root(flush);
-            crate::call_and_check(
-                pyre_object::gc_roots::shadow_stack_get(
-                    pyre_object::gc_roots::shadow_stack_len() - 1,
-                ),
-                &[],
-            )?;
-        }
-        Err(error) if error.kind == crate::PyErrorKind::AttributeError => {}
-        Err(error) => return Err(error),
+    let prompt_has_nul = unsafe {
+        pyre_object::w_str_get_wtf8(pyre_object::gc_roots::shadow_stack_get(prompt_slot))
     }
+    .as_bytes()
+    .contains(&0);
+
+    // [3.14-spec] `app_io.py input` / `_is_std_tty` sends the prompt through
+    // `_write_prompt`, so PyPy accepts an embedded NUL even on the standard
+    // terminal.  `test_builtin.PtyTests.test_input_tty_null_in_prompt` in
+    // the pinned 3.14 suite requires ValueError before the prompt is written.
+    // Keep PyPy's standard-stream probe and ordinary stream path; only reject
+    // the caller-visible prompt shape at the point its TTY branch would hand
+    // the string to `sys.__raw_input__`.  No JIT/GC/storage hint governs
+    // `app_io.py input`, `_is_std_tty`, or `_write_prompt` (the module is
+    // explicitly NOT_RPYTHON), and this value has no pyre-jit/majit readers.
+    // Without a readline hook PyPy never probes fileno.  The sole additional
+    // probe is the 3.14 NUL case above; ordinary prompts retain PyPy's stream
+    // side-effect order.
+    let std_tty = if raw_input_slot.is_some() {
+        raw_input_std_tty
+    } else if prompt_has_nul {
+        input_streams_are_std_tty(
+            pyre_object::gc_roots::shadow_stack_get(stdin_slot),
+            pyre_object::gc_roots::shadow_stack_get(stdout_slot),
+        )?
+    } else {
+        false
+    };
+    if std_tty && prompt_has_nul {
+        return Err(crate::PyError::value_error(
+            "input: prompt string cannot contain null characters",
+        ));
+    }
+
+    // Blank the ordinary prompt, then let the readline hook render the
+    // caller's prompt itself.
+    if std_tty && let Some(raw_input_slot) = raw_input_slot {
+        let empty = pyre_object::w_str_new("");
+        input_write_prompt(pyre_object::gc_roots::shadow_stack_get(stdout_slot), empty)?;
+        let result = crate::call_and_check(
+            pyre_object::gc_roots::shadow_stack_get(raw_input_slot),
+            &[pyre_object::gc_roots::shadow_stack_get(prompt_slot)],
+        )?;
+        let _ = pyre_object::gc_roots::pin_root(result);
+        let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+        crate::module::sys::vm::audit(
+            "builtins.input/result",
+            &[pyre_object::gc_roots::shadow_stack_get(result_slot)],
+        )?;
+        return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
+    }
+
+    input_write_prompt(
+        pyre_object::gc_roots::shadow_stack_get(stdout_slot),
+        pyre_object::gc_roots::shadow_stack_get(prompt_slot),
+    )?;
 
     // app_io.py `line = stdin.readline()` and strip one LF.
     let readline = crate::baseobjspace::getattr_str(
@@ -4299,13 +4460,20 @@ fn builtin_input(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if text.as_bytes().is_empty() {
         return Err(input_eof_error());
     }
-    if text.as_bytes().last() == Some(&b'\n') {
+    let result = if text.as_bytes().last() == Some(&b'\n') {
         let body = rustpython_wtf8::Wtf8::from_bytes(&text.as_bytes()[..text.len() - 1])
             .expect("removing ASCII LF preserves WTF-8");
-        Ok(pyre_object::w_str_from_wtf8_managed(body.to_wtf8_buf()))
+        pyre_object::w_str_from_wtf8_managed(body.to_wtf8_buf())
     } else {
-        Ok(line)
-    }
+        line
+    };
+    let result_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(result);
+    crate::module::sys::vm::audit(
+        "builtins.input/result",
+        &[pyre_object::gc_roots::shadow_stack_get(result_slot)],
+    )?;
+    Ok(pyre_object::gc_roots::shadow_stack_get(result_slot))
 }
 
 fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -12176,6 +12344,64 @@ fn source_byte_location(source: &str, byte_index: usize) -> (usize, usize) {
     (lineno, byte_index - line_start + 1)
 }
 
+/// Build the located parser error for a diagnostic whose grammar reduction
+/// has already selected both its message and source range.
+///
+/// This deliberately bypasses RustPython's `CompileError::from_ruff_parse_error`:
+/// that constructor is for raw Ruff failures and runs source-wide recovery
+/// rules.  PyPy `BaseParser.check_version`, like CPython's `CHECK_VERSION`, is
+/// already the final parser reduction and must not be reclassified by them.
+pub(crate) fn syntax_error_from_source_range(
+    message: &str,
+    source: &str,
+    range: ruff_text_size::TextRange,
+) -> crate::PyError {
+    let (lineno, byte_offset) = source_byte_location(source, range.start().to_usize());
+    let (end_lineno, end_byte_offset) = source_byte_location(source, range.end().to_usize());
+    let offset = syntax_error_character_offset(source, lineno, byte_offset);
+    let end_offset = syntax_error_character_offset(source, end_lineno, end_byte_offset);
+    let text = source.split_inclusive('\n').nth(lineno - 1);
+    let mut error = crate::PyError::syntax_error_located(
+        message,
+        Wtf8::new("<unknown>"),
+        lineno as i64,
+        offset as i64,
+        end_lineno as i64,
+        end_offset as i64,
+        text,
+    );
+    stamp_parser_syntax_metadata(&mut error, source);
+    error
+}
+
+/// `pegen.c _PyPegen_set_syntax_error_metadata` for an error emitted by a
+/// parser reduction rather than by later code generation.
+fn stamp_parser_syntax_metadata(error: &mut crate::PyError, source: &str) {
+    // The exception is materialised and pinned before the tuple elements are
+    // built: until it is stamped it lives only in this Rust `PyError`, which
+    // the collector does not scan.  Each element is likewise pinned as it is
+    // made and reloaded at the end.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(error.to_exc_object());
+    let source_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
+    let zero_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(0));
+    let zero = pyre_object::gc_roots::shadow_stack_get(zero_slot);
+    let metadata = pyre_object::w_tuple_new(vec![
+        zero,
+        zero,
+        pyre_object::gc_roots::shadow_stack_get(source_slot),
+    ]);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_syntax_metadata(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            metadata,
+        );
+    }
+}
+
 /// Byte index of the one-based character column a parser diagnostic reports,
 /// which is what indexes back into the source it was parsed from.  A column
 /// past the end of its line lands on the line's end.
@@ -12393,6 +12619,117 @@ fn binary_call_generator_error_span(source: &str) -> Option<(usize, usize)> {
             continue 'for_index;
         }
         return Some((for_index, for_index + 3));
+    }
+    None
+}
+
+/// `python-in-rpython.gram` `invalid_arguments` / `invalid_kwarg` select the
+/// keyword name through its `=` when a bare comprehension follows a keyword
+/// value: `f(name = value for value in iterable)`. Ruff rejects the same input
+/// before retaining that invalid-rule choice, so recover the literal grammar
+/// shape from its unchecked token stream.
+fn keyword_generator_assignment_span(source: &str) -> Option<(usize, usize)> {
+    use rustpython_compiler::ast::token::TokenKind;
+
+    let parsed = crate::compile::parser::parse_unchecked_source(
+        source,
+        rustpython_compiler::ast::PySourceType::Python,
+    );
+    let significant: Vec<_> = parsed
+        .tokens()
+        .iter()
+        .filter_map(|token| {
+            let (kind, range) = token.as_tuple();
+            (!matches!(
+                kind,
+                TokenKind::Comment
+                    | TokenKind::Newline
+                    | TokenKind::NonLogicalNewline
+                    | TokenKind::EndOfFile
+                    | TokenKind::Indent
+                    | TokenKind::Dedent
+            ))
+            .then_some((kind, range))
+        })
+        .collect();
+
+    let mut stack = Vec::new();
+    let mut depths = Vec::with_capacity(significant.len());
+    for &(kind, _) in &significant {
+        depths.push(stack.len());
+        match kind {
+            TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => stack.push(kind),
+            TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    for (for_index, &(kind, _)) in significant.iter().enumerate() {
+        if kind != TokenKind::For || depths[for_index] == 0 {
+            continue;
+        }
+        let depth = depths[for_index];
+        let Some(open_index) = (0..for_index)
+            .rev()
+            .find(|&index| significant[index].0 == TokenKind::Lpar && depths[index] + 1 == depth)
+        else {
+            continue;
+        };
+        let plain_function_parameters = open_index >= 2
+            && significant[open_index - 1].0 == TokenKind::Name
+            && significant[open_index - 2].0 == TokenKind::Def;
+        let typed_function_parameters = (open_index >= 1
+            && significant[open_index - 1].0 == TokenKind::Rsqb)
+            .then(|| {
+                (0..open_index).rev().find(|&index| {
+                    significant[index].0 == TokenKind::Lsqb && depths[index] == depths[open_index]
+                })
+            })
+            .flatten()
+            .is_some_and(|bracket| {
+                bracket >= 2
+                    && significant[bracket - 1].0 == TokenKind::Name
+                    && significant[bracket - 2].0 == TokenKind::Def
+            });
+        if plain_function_parameters || typed_function_parameters {
+            continue;
+        }
+
+        // These parentheses must belong to a call. Parenthesized invalid
+        // comprehensions are owned by `invalid_named_expression`, whose span
+        // includes the value rather than stopping at `=`.
+        let open_start = significant[open_index].1.start().to_usize();
+        let Some(previous) = source[..open_start]
+            .bytes()
+            .rev()
+            .find(|byte| !byte.is_ascii_whitespace())
+        else {
+            continue;
+        };
+        if !(previous.is_ascii_alphanumeric()
+            || previous == b'_'
+            || matches!(previous, b')' | b']' | b'}' | b'\'' | b'"'))
+        {
+            continue;
+        }
+
+        let argument_start = (open_index + 1..for_index)
+            .rev()
+            .find(|&index| significant[index].0 == TokenKind::Comma && depths[index] == depth)
+            .map_or(open_index + 1, |index| index + 1);
+        let argument = &significant[argument_start..for_index];
+        if argument.len() < 3
+            || argument[0].0 != TokenKind::Name
+            || argument[1].0 != TokenKind::Equal
+        {
+            continue;
+        }
+        return Some((
+            argument[0].1.start().to_usize(),
+            argument[1].1.end().to_usize(),
+        ));
     }
     None
 }
@@ -13186,16 +13523,64 @@ fn fstring_comment_diagnostic(message: &str, source: &str) -> Option<&'static st
     if message == "f-string: unterminated string" {
         return Some("'{' was never closed");
     }
-    if message != "Expected an expression" {
-        return None;
-    }
     if source.contains("{)#") {
         Some("f-string: unmatched ')'")
-    } else if source.contains('\n') {
+    } else if source.contains('\n') && fstring_field_contains_only_comments(source) {
         Some("f-string: valid expression required before '}'")
     } else {
         None
     }
+}
+
+/// Whether the first replacement field has no token other than whitespace and
+/// comments before its closing brace.  PyPy's f-string tokenizer enters the
+/// ordinary expression tokenizer for the field; comments therefore disappear
+/// before `python.gram:invalid_replacement_field` decides that it is empty.
+fn fstring_field_contains_only_comments(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let Some(quote) = bytes.iter().enumerate().find_map(|(index, byte)| {
+        if !matches!(*byte, b'\'' | b'"') {
+            return None;
+        }
+        let mut prefix = index;
+        while prefix > 0 && bytes[prefix - 1].is_ascii_alphabetic() {
+            prefix -= 1;
+        }
+        bytes[prefix..index]
+            .iter()
+            .any(|byte| byte.eq_ignore_ascii_case(&b'f'))
+            .then_some(index)
+    }) else {
+        return false;
+    };
+    let quote_byte = bytes[quote];
+    let triple = bytes[quote..].starts_with(&[quote_byte, quote_byte, quote_byte]);
+    let mut cursor = quote + if triple { 3 } else { 1 };
+    loop {
+        let Some(relative_open) = bytes[cursor..].iter().position(|byte| *byte == b'{') else {
+            return false;
+        };
+        cursor += relative_open;
+        if bytes.get(cursor + 1) == Some(&b'{') {
+            cursor += 2;
+        } else {
+            cursor += 1;
+            break;
+        }
+    }
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            byte if byte.is_ascii_whitespace() => cursor += 1,
+            b'#' => {
+                while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                    cursor += 1;
+                }
+            }
+            b'}' => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// CPython's tokenizer keeps the opening-delimiter stack while lexing an
@@ -13257,6 +13642,8 @@ fn fstring_mismatched_delimiter(source: &str) -> Option<(String, usize)> {
                         stack.pop();
                     } else if closer == b'}' {
                         break;
+                    } else {
+                        return Some((format!("f-string: unmatched '{}'", closer as char), cursor));
                     }
                 }
                 _ => {}
@@ -13268,11 +13655,176 @@ fn fstring_mismatched_delimiter(source: &str) -> Option<(String, usize)> {
     None
 }
 
+/// The empty replacement marker in a nested f-string.  Its recursive parser
+/// fails before the outer field consumes the nested literal as an expression,
+/// so it takes precedence over any delimiter the outer recovery later sees.
+fn nested_empty_fstring_field_span(source: &str) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    for quote in 1..bytes.len() {
+        if !matches!(bytes[quote], b'\'' | b'"') {
+            continue;
+        }
+        let mut prefix = quote;
+        while prefix > 0 && bytes[prefix - 1].is_ascii_alphabetic() {
+            prefix -= 1;
+        }
+        if !bytes[prefix..quote]
+            .iter()
+            .any(|byte| byte.eq_ignore_ascii_case(&b'f'))
+        {
+            continue;
+        }
+        let triple = bytes[quote..].starts_with(&[bytes[quote], bytes[quote], bytes[quote]]);
+        let mut cursor = quote + if triple { 3 } else { 1 };
+        if bytes.get(cursor) != Some(&b'{') || bytes.get(cursor + 1) == Some(&b'{') {
+            continue;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b':') {
+            return Some((cursor, cursor + 1));
+        }
+    }
+    None
+}
+
+/// Locate an unparenthesized lambda inside an f-string field.  PyPy
+/// `fstring_find_expr` sends the whole field expression through its recursive
+/// eval parser, whose lambda-without-parentheses rule wins over the outer
+/// f-string separator.  Ruff's recovered outer expression loses that choice.
+#[derive(Clone, Copy)]
+enum FstringLambdaDiagnostic {
+    Unparenthesized((usize, usize)),
+    InvalidExpression,
+}
+
+fn unparenthesized_fstring_lambda_span(source: &str) -> Option<FstringLambdaDiagnostic> {
+    let bytes = source.as_bytes();
+    let (start, end) = last_fstring_content_range(source)?;
+    let mut cursor = start;
+    let mut in_field = false;
+    let mut field_start = start;
+    let mut segment_start = start;
+    let mut stack = Vec::new();
+    while cursor < end {
+        match bytes[cursor] {
+            b'{' if !in_field && bytes.get(cursor + 1) == Some(&b'{') => cursor += 2,
+            b'{' if !in_field => {
+                in_field = true;
+                cursor += 1;
+                field_start = cursor;
+                segment_start = cursor;
+            }
+            b'\'' | b'"' if in_field => {
+                let quote = bytes[cursor];
+                cursor += 1;
+                while cursor < end && bytes[cursor] != quote {
+                    cursor += if bytes[cursor] == b'\\' { 2 } else { 1 };
+                }
+                cursor += usize::from(cursor < end);
+            }
+            opener @ (b'(' | b'[' | b'{') if in_field => {
+                stack.push(opener);
+                cursor += 1;
+            }
+            b')' | b']' if in_field && !stack.is_empty() => {
+                stack.pop();
+                cursor += 1;
+            }
+            b'}' if in_field && !stack.is_empty() => {
+                stack.pop();
+                cursor += 1;
+            }
+            b'}' if in_field => {
+                in_field = false;
+                cursor += 1;
+            }
+            b',' if in_field && stack.is_empty() => {
+                cursor += 1;
+                segment_start = cursor;
+            }
+            b'l' if in_field
+                && stack.is_empty()
+                && bytes[cursor..].starts_with(b"lambda")
+                && bytes
+                    .get(cursor.wrapping_sub(1))
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                && bytes
+                    .get(cursor + b"lambda".len())
+                    .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_') =>
+            {
+                let starts_segment = bytes[segment_start..cursor]
+                    .iter()
+                    .all(u8::is_ascii_whitespace);
+                let colon = bytes[cursor + b"lambda".len()..end]
+                    .iter()
+                    .position(|byte| *byte == b':')?
+                    + cursor
+                    + b"lambda".len();
+                let span = (cursor, colon + 1);
+                if starts_segment {
+                    return Some(FstringLambdaDiagnostic::Unparenthesized(span));
+                }
+                // CPython's second f-string error pass treats a unary prefix
+                // at the beginning of the whole field as an invalid field
+                // expression.  A prefix after a comma, or a binary-expression
+                // prefix, instead belongs to the ordinary delimiter recovery.
+                let field_prefix = bytes[field_start..cursor].trim_ascii();
+                if matches!(field_prefix, b"+" | b"-" | b"~" | b"not" | b"*" | b"**") {
+                    return Some(FstringLambdaDiagnostic::InvalidExpression);
+                }
+                return None;
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+/// Find `$` where the tokenizer sees it as source rather than string/comment
+/// contents.  This is used only to restore source-order precedence after a
+/// later diagnostic-recovery pass has selected an earlier-looking message.
+fn dollar_token_span(source: &str) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'#' => {
+                while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                    cursor += 1;
+                }
+            }
+            quote @ (b'\'' | b'"') => {
+                let triple = bytes[cursor..].starts_with(&[quote, quote, quote]);
+                cursor += if triple { 3 } else { 1 };
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\\' {
+                        cursor = (cursor + 2).min(bytes.len());
+                    } else if triple && bytes[cursor..].starts_with(&[quote, quote, quote]) {
+                        cursor += 3;
+                        break;
+                    } else if !triple && bytes[cursor] == quote {
+                        cursor += 1;
+                        break;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+            }
+            b'$' => return Some((cursor, cursor + 1)),
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
 /// Whether the parser's raw byte lies on a physical line containing an
-/// f-prefixed string token.  CPython's tokenizer retains that prefix when it
-/// specializes unterminated-string diagnostics; Ruff's unclosed-string error
-/// drops it.
-fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
+/// interpolated string token carrying `marker`.  CPython's tokenizer retains
+/// the f/t prefix when it specializes unterminated-string diagnostics; Ruff's
+/// unclosed-string error drops it.
+fn unclosed_error_is_interpolated_string(source: &str, raw_index: usize, marker: u8) -> bool {
     let bytes = source.as_bytes();
     let raw_index = raw_index.min(bytes.len());
     let line_start = bytes[..raw_index]
@@ -13299,11 +13851,324 @@ fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
             };
         if bytes[prefix..quote]
             .iter()
-            .any(|byte| byte.eq_ignore_ascii_case(&b'f'))
+            .any(|byte| byte.eq_ignore_ascii_case(&marker))
             && (prefix..=token_head_end).contains(&raw_index)
         {
             return true;
         }
+    }
+    false
+}
+
+fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
+    unclosed_error_is_interpolated_string(source, raw_index, b'f')
+}
+
+fn unclosed_error_is_tstring(source: &str, raw_index: usize) -> bool {
+    unclosed_error_is_interpolated_string(source, raw_index, b't')
+}
+
+fn source_has_tstring(source: &str) -> bool {
+    let mut lexer =
+        crate::compile::parser::lexer::lex(source, crate::compile::parser::Mode::Module);
+    loop {
+        let kind = lexer.next_token();
+        if matches!(kind, rustpython_compiler::TokenKind::TStringStart) {
+            return true;
+        }
+        if kind.is_eof() {
+            return false;
+        }
+    }
+}
+
+fn last_interpolated_string_content_range(source: &str, marker: u8) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    let mut last = None;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'#' {
+            while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+            continue;
+        }
+        if !matches!(bytes[cursor], b'\'' | b'"') {
+            cursor += 1;
+            continue;
+        }
+        let quote = cursor;
+        let mut prefix = quote;
+        while prefix > 0 && bytes[prefix - 1].is_ascii_alphabetic() {
+            prefix -= 1;
+        }
+        let prefix_bytes = &bytes[prefix..quote];
+        let is_interpolated = (prefix == 0
+            || (!bytes[prefix - 1].is_ascii_alphanumeric() && bytes[prefix - 1] != b'_'))
+            && ((prefix_bytes.len() == 1 && prefix_bytes[0].eq_ignore_ascii_case(&marker))
+                || (prefix_bytes.len() == 2
+                    && prefix_bytes
+                        .iter()
+                        .any(|byte| byte.eq_ignore_ascii_case(&marker))
+                    && prefix_bytes
+                        .iter()
+                        .any(|byte| byte.eq_ignore_ascii_case(&b'r'))));
+        let quote_byte = bytes[quote];
+        let triple = bytes[quote..].starts_with(&[quote_byte, quote_byte, quote_byte]);
+        let content_start = quote + if triple { 3 } else { 1 };
+        cursor = content_start;
+        let mut closed = false;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+            } else if triple && bytes[cursor..].starts_with(&[quote_byte, quote_byte, quote_byte]) {
+                closed = true;
+                break;
+            } else if !triple && bytes[cursor] == quote_byte {
+                closed = true;
+                break;
+            } else {
+                cursor += 1;
+            }
+        }
+        if is_interpolated {
+            last = Some((content_start, cursor));
+        }
+        if !closed {
+            break;
+        }
+        cursor += if triple { 3 } else { 1 };
+    }
+    last
+}
+
+fn last_tstring_content_range(source: &str) -> Option<(usize, usize)> {
+    last_interpolated_string_content_range(source, b't')
+}
+
+fn last_fstring_content_range(source: &str) -> Option<(usize, usize)> {
+    last_interpolated_string_content_range(source, b'f')
+}
+
+fn tstring_blank_unclosed_field(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let Some((start, end)) = last_tstring_content_range(source) else {
+        return false;
+    };
+    let Some(open) = bytes[start..end].iter().rposition(|byte| *byte == b'{') else {
+        return false;
+    };
+    let open = start + open;
+    bytes[open + 1..end].iter().all(u8::is_ascii_whitespace)
+        && (open == start || bytes[open - 1] != b'{')
+}
+
+/// Inspect the outermost replacement field without attempting to reparse its
+/// expression.  The parser has already established the diagnostic family;
+/// this recovers only the invalid-rule token that Ruff's message discarded.
+fn tstring_field_shape(source: &str) -> (bool, bool, bool) {
+    let bytes = source.as_bytes();
+    let Some((start, end)) = last_tstring_content_range(source) else {
+        return (false, false, false);
+    };
+    let mut cursor = start;
+    let mut in_field = false;
+    let mut in_format = false;
+    let mut stack = Vec::new();
+    let mut top_level_semicolon = false;
+    let mut nested_invalid_start = false;
+    while cursor < end {
+        match bytes[cursor] {
+            b'{' if !in_field && bytes.get(cursor + 1) == Some(&b'{') => cursor += 2,
+            b'{' if !in_field => {
+                in_field = true;
+                in_format = false;
+                cursor += 1;
+            }
+            b'\'' | b'"' if in_field => {
+                let quote = bytes[cursor];
+                cursor += 1;
+                while cursor < end && bytes[cursor] != quote {
+                    cursor += if bytes[cursor] == b'\\' { 2 } else { 1 };
+                }
+                cursor += usize::from(cursor < end);
+            }
+            opener @ (b'(' | b'[' | b'{') if in_field && !in_format => {
+                stack.push(opener);
+                cursor += 1;
+            }
+            b')' | b']' if in_field && !in_format && !stack.is_empty() => {
+                stack.pop();
+                cursor += 1;
+            }
+            b'}' if in_field && !in_format && !stack.is_empty() => {
+                stack.pop();
+                cursor += 1;
+            }
+            b';' if in_field && !in_format && stack.is_empty() => {
+                top_level_semicolon = true;
+                cursor += 1;
+            }
+            b':' if in_field && !in_format && stack.is_empty() => {
+                in_format = true;
+                cursor += 1;
+            }
+            b'{' if in_field && in_format => {
+                let mut next = cursor + 1;
+                while next < end && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                nested_invalid_start |= next < end
+                    && matches!(
+                        bytes[next],
+                        b';' | b'=' | b'!' | b':' | b'}' | b',' | b'/' | b'%' | b'&' | b'|'
+                    );
+                cursor += 1;
+            }
+            b'}' if in_field => {
+                in_field = false;
+                in_format = false;
+                cursor += 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    (
+        top_level_semicolon,
+        in_field && in_format,
+        nested_invalid_start,
+    )
+}
+
+/// Diagnose a semicolon in the replacement field following a completed debug
+/// field.  PyPy `fstring_find_expr` leaves the expression loop at the first
+/// top-level field separator; `;` is not one, so the recursive expression
+/// parser selects either its empty/invalid-start rule or the separator list.
+/// Ruff instead reports the opening brace as merely missing its close.
+fn fstring_debug_followup_diagnostic(source: &str) -> Option<&'static str> {
+    let bytes = source.as_bytes();
+    let (start, end) = last_fstring_content_range(source)?;
+    let mut cursor = start;
+    while cursor < end {
+        if bytes[cursor] != b'{' {
+            cursor += 1;
+            continue;
+        }
+        if bytes.get(cursor + 1) == Some(&b'{') {
+            cursor += 2;
+            continue;
+        }
+        cursor += 1;
+        let expression_start = cursor;
+        let mut stack = Vec::new();
+        let mut in_format_spec = false;
+        while cursor < end {
+            match bytes[cursor] {
+                b'\'' | b'"' => {
+                    let quote = bytes[cursor];
+                    cursor += 1;
+                    while cursor < end && bytes[cursor] != quote {
+                        cursor += if bytes[cursor] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                opener @ (b'(' | b'[' | b'{') if !in_format_spec => stack.push(opener),
+                b')' | b']' if !in_format_spec && !stack.is_empty() => {
+                    stack.pop();
+                }
+                b'}' if !in_format_spec && !stack.is_empty() => {
+                    stack.pop();
+                }
+                b':' if !in_format_spec && stack.is_empty() => in_format_spec = true,
+                b';' if !in_format_spec && stack.is_empty() => {
+                    let expression = source[expression_start..cursor].trim();
+                    return Some(if matches!(expression, "" | "+" | "-" | "~") {
+                        "f-string: expecting a valid expression after '{'"
+                    } else {
+                        "f-string: expecting '=', or '!', or ':', or '}'"
+                    });
+                }
+                b'}' if stack.is_empty() => break,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        cursor += usize::from(cursor < end);
+    }
+    None
+}
+
+fn tstring_debug_missing_conversion(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let Some((start, end)) = last_tstring_content_range(source) else {
+        return false;
+    };
+    for equals in start..end {
+        if bytes[equals] != b'=' {
+            continue;
+        }
+        let mut bang = equals + 1;
+        while bang < end && bytes[bang].is_ascii_whitespace() {
+            bang += 1;
+        }
+        if bytes.get(bang) != Some(&b'!') {
+            continue;
+        }
+        let mut close = bang + 1;
+        while close < end && bytes[close].is_ascii_whitespace() {
+            close += 1;
+        }
+        if bytes.get(close) == Some(&b'}') {
+            return true;
+        }
+    }
+    false
+}
+
+/// CPython tokenizer state for an unclosed t-string replacement field.  An
+/// open field which has not entered its format-specifier part reports the
+/// unmatched `{`; after a top-level `:` the t-string itself is unterminated.
+/// Doubled braces are literal text, and brackets inside the expression keep a
+/// dict/slice colon from being mistaken for the format separator.
+fn unclosed_tstring_replacement_field(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let Some((mut cursor, end)) = last_tstring_content_range(source) else {
+        return false;
+    };
+    while cursor < end {
+        if bytes[cursor] != b'{' {
+            cursor += 1;
+            continue;
+        }
+        if bytes.get(cursor + 1) == Some(&b'{') {
+            cursor += 2;
+            continue;
+        }
+        cursor += 1;
+        let mut stack = Vec::new();
+        let mut in_format_spec = false;
+        while cursor < end {
+            match bytes[cursor] {
+                b'\'' | b'"' => {
+                    let inner_quote = bytes[cursor];
+                    cursor += 1;
+                    while cursor < end && bytes[cursor] != inner_quote {
+                        cursor += if bytes[cursor] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                opener @ (b'(' | b'[' | b'{') => stack.push(opener),
+                b')' | b']' if !stack.is_empty() => {
+                    stack.pop();
+                }
+                b'}' if !stack.is_empty() => {
+                    stack.pop();
+                }
+                b'}' => return false,
+                b':' if stack.is_empty() => in_format_spec = true,
+                _ => {}
+            }
+            cursor += 1;
+        }
+        return !in_format_spec;
     }
     false
 }
@@ -13315,10 +14180,11 @@ fn unclosed_error_is_fstring(source: &str, raw_index: usize) -> bool {
 /// parser-level distinction through its `compile_command` path; pyre consumes
 /// RustPython's parser, so keep its exact error-shape classification here.
 ///
-/// `allow_incomplete` carries the mode the flag was passed with, because
-/// `PyPARSE_ALLOW_INCOMPLETE_INPUT` is read by the parser that the mode
-/// selects and the three parsers do not stop at the same place.  `None` is the
-/// flag left off, where every failure is an ordinary `SyntaxError`.
+/// `mode` is kept even when incomplete-input handling is disabled: CPython's
+/// invalid-target reductions are part of the file/input grammar, while the
+/// eval grammar rejects the same source with plain `invalid syntax`.
+/// `PyPARSE_ALLOW_INCOMPLETE_INPUT` is likewise read by the parser selected by
+/// that mode, and the three parsers do not stop at the same place.
 fn compile_err_to_syntax_error_maybe_incomplete(
     e: crate::compile::CompileError,
     source: &str,
@@ -13593,6 +14459,20 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             ParseErrorType::OtherError(message) if message == "Expected a statement" => {
                 "invalid syntax".to_owned()
             }
+            // `parser::parse_missing_identifier` uses this private parser
+            // wording after a trailing attribute dot (`foo.`).  PyPy
+            // `PythonParser._parse` and CPython 3.14's `primary` grammar rule
+            // both expose the ordinary syntax diagnostic for that source, so
+            // keep the normalization attached to the exact structured error
+            // instead of rewriting arbitrary messages.
+            ParseErrorType::OtherError(message) if message == "Expected an identifier" => {
+                "invalid syntax".to_owned()
+            }
+            ParseErrorType::OtherError(message)
+                if message.starts_with("Expected an identifier, but found a keyword ") =>
+            {
+                "invalid syntax".to_owned()
+            }
             // `ast.c` reports these three through `ast_error`, lower-case and
             // with `follows` where ruff writes `cannot follow`.
             ParseErrorType::PositionalAfterKeywordArgument => {
@@ -13611,6 +14491,17 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             // renaming this one does not touch `a[x for x in y]`.
             ParseErrorType::UnparenthesizedGeneratorExpression => {
                 "Generator expression must be parenthesized".to_owned()
+            }
+            // Ruff's parser capitalizes this semantic diagnostic.  The real
+            // pypy3 oracle and CPython 3.14's `invalid_starred_expression`
+            // grammar rule both expose the lower-case spelling for a starred
+            // expression rejected while parsing (for example
+            // ``((*x), y) = 1, 2``). Keep this structured parse arm distinct
+            // from codegen's ``InvalidStarExpr``: CPython's in-tree
+            // `test_unpack_ex` gives that other path the "can't use starred
+            // expression here" spelling for shapes such as ``x = *a``.
+            ParseErrorType::InvalidStarredExpressionUsage => {
+                "cannot use starred expression here".to_owned()
             }
             // `tok_get_normal_mode` says what it found rather than what it
             // wanted: a backslash is a continuation only when the newline is
@@ -13644,12 +14535,90 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     {
         msg = "invalid syntax".to_owned();
     }
-    let unterminated_fstring = match &e {
-        crate::compile::CompileError::Parse(parse_error) => {
-            unclosed_error_is_fstring(source, parse_error.raw_location.start().to_usize())
+    if msg.eq_ignore_ascii_case("Bytes literal cannot be mixed with non-bytes literals") {
+        msg = if source_has_tstring(source) {
+            "cannot mix t-string literals with string or bytes literals"
+        } else {
+            "cannot mix bytes and nonbytes literals"
         }
-        _ => false,
+        .to_owned();
+    }
+    let raw_parse_start = match &e {
+        crate::compile::CompileError::Parse(parse_error) => {
+            Some(parse_error.raw_location.start().to_usize())
+        }
+        _ => None,
     };
+    let late_dollar_span = if msg == "parameter without a default follows parameter with a default"
+        && let Some((start, end)) = dollar_token_span(source)
+        && crate::compile::parser::parse(
+            &source[..start],
+            crate::compile::parser::Mode::Module.into(),
+        )
+        .is_ok()
+    {
+        msg = "invalid syntax".to_owned();
+        Some((start, end))
+    } else {
+        None
+    };
+    if msg == "invalid syntax"
+        && let Some(raw_index) = raw_parse_start
+        && source.as_bytes().get(raw_index) == Some(&b'$')
+        && last_fstring_content_range(source)
+            .is_some_and(|(start, end)| (start..end).contains(&raw_index))
+    {
+        msg = "f-string: expecting '=', or '!', or ':', or '}'".to_owned();
+    }
+    let lambda = if msg == "invalid syntax" {
+        unparenthesized_fstring_lambda_span(source)
+    } else {
+        None
+    };
+    let lambda_span = match lambda {
+        Some(FstringLambdaDiagnostic::Unparenthesized(span)) => Some(span),
+        _ => None,
+    };
+    if lambda_span.is_some() {
+        msg = "f-string: lambda expressions are not allowed without parentheses".to_owned();
+    } else if matches!(lambda, Some(FstringLambdaDiagnostic::InvalidExpression)) {
+        msg = "f-string: expecting a valid expression after '{'".to_owned();
+    }
+    // [3.14-spec] CPython's `invalid_conversion_character` grammar action
+    // reports the complete Unicode identifier and its character-sized span.
+    // PyPy `fstring_find_expr` performs the same conversion check after
+    // consuming one character, but its 3.11 diagnostic does not name it.  Keep
+    // that field-scanner ownership while adapting the observable to 3.14.
+    let mut conversion_span = None;
+    if matches!(
+        msg.as_str(),
+        "f-string: invalid conversion character" | "t-string: invalid conversion character"
+    ) && let Some(start) = raw_parse_start
+        && let Some(first) = source.get(start..).and_then(|tail| tail.chars().next())
+        && !first.is_ascii()
+        && rustpython_unicode::identifier::is_start(first)
+    {
+        let mut end = start + first.len_utf8();
+        for character in source[end..].chars() {
+            if !rustpython_unicode::identifier::is_continue(character) {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        let prefix = msg.split_once(':').map_or("f-string", |(prefix, _)| prefix);
+        msg = format!(
+            "{prefix}: invalid conversion character '{}': expected 's', 'r', or 'a'",
+            &source[start..end]
+        );
+        conversion_span = Some((start, end));
+    }
+    let unterminated_fstring =
+        raw_parse_start.is_some_and(|raw_index| unclosed_error_is_fstring(source, raw_index));
+    let source_ends_in_tstring = last_tstring_content_range(source)
+        .is_some_and(|(_, content_end)| content_end == source.len());
+    let unterminated_tstring = raw_parse_start
+        .is_some_and(|raw_index| unclosed_error_is_tstring(source, raw_index))
+        || (msg.starts_with("unterminated ") && source_ends_in_tstring);
     if unterminated_fstring {
         if msg.starts_with("unterminated triple-quoted string literal") {
             msg = msg.replacen(
@@ -13661,6 +14630,24 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             msg = msg.replacen(
                 "unterminated string literal",
                 "unterminated f-string literal",
+                1,
+            );
+        }
+    } else if unterminated_tstring {
+        if msg.starts_with("unterminated string literal")
+            && unclosed_tstring_replacement_field(source)
+        {
+            msg = "'{' was never closed".to_owned();
+        } else if msg.starts_with("unterminated triple-quoted string literal") {
+            msg = msg.replacen(
+                "unterminated triple-quoted string literal",
+                "unterminated triple-quoted t-string literal",
+                1,
+            );
+        } else if msg.starts_with("unterminated string literal") {
+            msg = msg.replacen(
+                "unterminated string literal",
+                "unterminated t-string literal",
                 1,
             );
         }
@@ -13683,14 +14670,47 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     if let Some(comment_error) = fstring_comment_diagnostic(&msg, source) {
         msg = comment_error.to_owned();
     }
-    let delimiter_error = fstring_mismatched_delimiter(source);
+    let nested_empty_field_span = nested_empty_fstring_field_span(source);
+    if nested_empty_field_span.is_some() {
+        msg = "f-string: valid expression required before ':'".to_owned();
+    }
+    let delimiter_error = nested_empty_field_span
+        .is_none()
+        .then(|| fstring_mismatched_delimiter(source))
+        .flatten();
     if let Some((delimiter_message, _)) = &delimiter_error {
         msg = delimiter_message.clone();
     }
     if msg == "f-string: expecting `}`" {
         msg = "f-string: expecting '}'".to_owned();
+    } else if msg == "t-string: expecting `}`" {
+        msg = "t-string: expecting '}'".to_owned();
+    } else if msg == "t-string: single `}` is not allowed" {
+        msg = "t-string: single '}' is not allowed".to_owned();
     } else if msg == "f-string: expecting '}', or format specs" && source.contains(":{{") {
         msg = "f-string: expecting a valid expression after '{'".to_owned();
+    }
+    if msg == "f-string: expecting '}'"
+        && let Some(diagnostic) = fstring_debug_followup_diagnostic(source)
+    {
+        msg = diagnostic.to_owned();
+    }
+    let (tstring_semicolon, tstring_unclosed_format, tstring_nested_invalid) =
+        tstring_field_shape(source);
+    if msg == "t-string: expecting a valid expression after '{'"
+        && tstring_blank_unclosed_field(source)
+    {
+        msg = "t-string: expecting '}'".to_owned();
+    } else if msg == "t-string: expecting '}'" && tstring_semicolon {
+        msg = "t-string: expecting '=', or '!', or ':', or '}'".to_owned();
+    } else if msg == "t-string: expecting '}'" && tstring_unclosed_format {
+        msg = "t-string: expecting '}', or format specs".to_owned();
+    } else if msg == "t-string: invalid conversion character"
+        && tstring_debug_missing_conversion(source)
+    {
+        msg = "t-string: missing conversion character".to_owned();
+    } else if msg == "invalid syntax" && tstring_nested_invalid {
+        msg = "t-string: expecting a valid expression after '{'".to_owned();
     }
     if msg == "f-string: expecting a valid expression after '{'" {
         let bytes = source.as_bytes();
@@ -13770,6 +14790,13 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         msg = replacement.clone();
     }
     let assignment_span = assignment_error.map(|(_, start, end)| (start, end));
+    let keyword_generator_span = (msg == "invalid syntax")
+        .then(|| keyword_generator_assignment_span(source))
+        .flatten()
+        .filter(|(start, _)| raw_parse_start.is_none_or(|error_start| *start <= error_start));
+    if keyword_generator_span.is_some() {
+        msg = "invalid syntax. Maybe you meant '==' or ':=' instead of '='?".to_owned();
+    }
     let prefix_error = match &e {
         crate::compile::CompileError::Parse(parse_error) => {
             incompatible_string_prefix_error(source, parse_error.raw_location.start().to_usize())
@@ -13787,19 +14814,26 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     let escape_span = escape_error
         .filter(|escape| escape.message == msg)
         .map(|escape| escape.span);
+    let leading_indent_span = leading_unexpected_indent_span(source);
     // The overrides above assign `msg` in sequence, so the last one to fire is
-    // the message being reported; this chain is that same precedence read
-    // backwards, so the span and the message always name the same construct.
-    // Both halves of a pair do fire together -- an incompatible string prefix
-    // in an assignment target reaches the prefix scan and the shape test, and
-    // `bu'x' = 1` is why the prefix span has to win.
-    let diagnostic_span = escape_span
+    // the message being reported; after the tokenizer's leading-indentation
+    // correction, this chain reads that precedence backwards so the span and
+    // message name the same construct. Both halves of a pair can fire together:
+    // an incompatible string prefix in an assignment target reaches the prefix
+    // scan and the shape test, and `bu'x' = 1` is why the prefix span wins.
+    let diagnostic_span = leading_indent_span
+        .or(escape_span)
         .or(literal_span)
+        .or(nested_empty_field_span)
+        .or(conversion_span)
         .or(prefix_span)
+        .or(keyword_generator_span)
         .or(assignment_span)
-        .or(generator_span)
-        .or(scope_span)
         .or(fstring_span)
+        .or(scope_span)
+        .or(lambda_span)
+        .or(late_dollar_span)
+        .or(generator_span)
         .or(delimiter_span);
     let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
         (
@@ -13885,30 +14919,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // suggestion off earlier on a long file, and it keeps the line numbers the
     // helper reports absolute instead of relative to the slice.
     if parser_error {
-        // The exception is materialised and pinned before the tuple elements
-        // are built: until it is stamped it lives only in this Rust `PyError`,
-        // which the collector does not scan, so an allocation below could sweep
-        // it.  Each element is likewise pinned as it is made and reloaded at the
-        // end, the discipline `syntax_error_located` uses for the details tuple.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(error.to_exc_object());
-        let source_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(source));
-        let zero_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(0));
-        let zero = pyre_object::gc_roots::shadow_stack_get(zero_slot);
-        let metadata = pyre_object::w_tuple_new(vec![
-            zero,
-            zero,
-            pyre_object::gc_roots::shadow_stack_get(source_slot),
-        ]);
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_syntax_metadata(
-                pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                metadata,
-            );
-        }
+        stamp_parser_syntax_metadata(&mut error, source);
     }
     error
 }
@@ -13922,6 +14933,45 @@ enum IndentFault {
     TabsAndSpaces,
     /// `IndentationError`: a dedent that lands between two enclosing levels.
     UnmatchedDedent,
+}
+
+/// The first real token starts an indented top-level logical line.
+///
+/// [3.14-spec] CPython's tokenizer rejects this before its parser sees the
+/// expression. Ruff can instead continue to an unclosed bracket or a generic
+/// expression error, so recover the tokenizer's earlier position. PyPy uses
+/// the same token-first shape normally, although after an explicit line
+/// continuation its parser can report the later unclosed delimiter instead.
+/// A continuation-only physical line contributes no token and is skipped, as
+/// in `ASTHelpers_Test.test_literal_eval_syntax_errors`.
+fn leading_unexpected_indent_span(source: &str) -> Option<(usize, usize)> {
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let bytes = line.as_bytes();
+        let mut indent = 0usize;
+        let mut has_effective_indent = false;
+        while indent < bytes.len() && matches!(bytes[indent], b' ' | b'\t' | b'\x0c') {
+            // CPython `tok_get_normal_mode` resets both indentation columns
+            // at a formfeed. Whitespace before it therefore cannot make the
+            // first logical line indented; whitespace after it still can.
+            has_effective_indent = if bytes[indent] == b'\x0c' {
+                false
+            } else {
+                true
+            };
+            indent += 1;
+        }
+        let content = line[indent..].trim_end_matches(['\r', '\n']);
+        if content.is_empty() || content.starts_with('#') || content == "\\" {
+            line_start += line.len();
+            continue;
+        }
+        return has_effective_indent.then(|| {
+            let index = line_start + indent - 1;
+            (index, index)
+        });
+    }
+    None
 }
 
 /// The first indentation the tokenizer would reject, and why.
@@ -14085,6 +15135,9 @@ fn syntax_error_subclass(
         ),
         _ => ("IndentationError", plain.map(str::to_owned)),
     };
+    if leading_unexpected_indent_span(source).is_some() {
+        return Some(indentation(Some("unexpected indent")));
+    }
     match &parse_err.error {
         ParseErrorType::OtherError(msg)
             if (msg.starts_with("Missing parentheses in call to 'print'")
@@ -14218,60 +15271,48 @@ fn source_as_str(
     filename: &rustpython_wtf8::Wtf8,
     flags: &mut i64,
 ) -> Result<String, crate::PyError> {
-    let text = source_text(source, funcname, what, filename, flags)?;
-    // A null ends the C string the tokenizer would read, so the source is
-    // refused whole rather than at the character.  The error carries no
-    // position for the same reason: nothing was tokenized to have one, and a
-    // reported line would invite a fix to that line instead of to the string.
-    if *flags & PYCF_ACCEPT_NULL_BYTES == 0 && text.contains('\0') {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::SyntaxError,
+    let text_source = unsafe { pyre_object::is_str(source) };
+    let bytes = unsafe {
+        if text_source {
+            // A text source is encoded strictly and coding-cookie detection is
+            // disabled, matching PyPy's unicode branch.
+            *flags |= PYCF_IGNORE_COOKIE;
+            crate::type_methods::encode_object(source, "utf-8", "strict")?
+        } else if pyre_object::bytesobject::is_bytes(source) {
+            pyre_object::bytesobject::bytes_like_data(source).to_vec()
+        } else {
+            let buffer = match crate::baseobjspace::simple_buffer_bytes(source) {
+                Ok(Some(buffer)) => buffer,
+                Ok(None) => {
+                    return Err(crate::PyError::type_error(format!(
+                        "{funcname}() arg 1 must be a {what} object"
+                    )));
+                }
+                Err(error) if error.kind == crate::PyErrorKind::TypeError => {
+                    return Err(crate::PyError::type_error(format!(
+                        "{funcname}() arg 1 must be a {what} object"
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
+            let bytes = buffer.as_bytes().to_vec();
+            buffer.release();
+            bytes
+        }
+    };
+
+    // `source_as_str` applies this after its three branches, so it covers a
+    // text, a bytes and a buffer source alike, and its diagnostic is
+    // deliberately unlocated.  The located wording belongs to
+    // `pyparse.PegParser.parse_source`, which only a source file reaches.
+    if *flags & PYCF_ACCEPT_NULL_BYTES == 0 && bytes.contains(&0) {
+        return Err(crate::PyError::syntax_error(
             "source code string cannot contain null bytes",
         ));
     }
-    Ok(text)
-}
-
-fn source_text(
-    source: PyObjectRef,
-    funcname: &str,
-    what: &str,
-    filename: &rustpython_wtf8::Wtf8,
-    flags: &mut i64,
-) -> Result<String, crate::PyError> {
-    unsafe {
-        if pyre_object::is_str(source) {
-            // A text source is encoded strictly and coding-cookie detection is
-            // disabled, matching PyPy's unicode branch.
-            let bytes = crate::type_methods::encode_object(source, "utf-8", "strict")?;
-            *flags |= PYCF_IGNORE_COOKIE;
-            return Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"));
-        }
-        if pyre_object::bytesobject::is_bytes(source) {
-            return crate::compile::decode_source_bytes(
-                pyre_object::bytesobject::bytes_like_data(source),
-                filename,
-                *flags & PYCF_IGNORE_COOKIE != 0,
-            );
-        }
+    if text_source {
+        return Ok(String::from_utf8(bytes).expect("strict utf-8 encode yields valid utf-8"));
     }
-
-    let buffer = match crate::baseobjspace::simple_buffer_bytes(source) {
-        Ok(Some(buffer)) => buffer,
-        Ok(None) => {
-            return Err(crate::PyError::type_error(format!(
-                "{funcname}() arg 1 must be a {what} object"
-            )));
-        }
-        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
-            return Err(crate::PyError::type_error(format!(
-                "{funcname}() arg 1 must be a {what} object"
-            )));
-        }
-        Err(error) => return Err(error),
-    };
-    let bytes = buffer.as_bytes().to_vec();
-    buffer.release();
     crate::compile::decode_source_bytes(&bytes, filename, *flags & PYCF_IGNORE_COOKIE != 0)
 }
 
@@ -14331,15 +15372,19 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let filename_text = crate::gateway::fsdecode_filename_wtf8(&filename_bytes);
     let (filename, filename_bytes) = crate::pycode::split_code_filename_bytes(filename_bytes, None);
     let mode = crate::baseobjspace::text_w(mode_obj)?;
-    // flags / dont_inherit / optimize are positional-or-keyword ints
-    // (unwrap_spec flags=int, dont_inherit=int, optimize=int).
+    // flags / optimize are positional-or-keyword ints.
     let mut flags = match bind_pos_or_kw(pos, kwargs, 3, "flags", "compile", 4)? {
         Some(v) => crate::baseobjspace::gateway_int_w(v)?,
         None => 0,
     };
     let dont_inherit = match bind_pos_or_kw(pos, kwargs, 4, "dont_inherit", "compile", 5)? {
-        Some(v) => crate::baseobjspace::gateway_int_w(v)?,
-        None => 0,
+        // [3.14-spec] PyPy's unwrap_spec still requires an integer here, but
+        // CPython `builtin_compile_impl` accepts any truth-testable object.
+        // `test_compile_filename_refleak` makes the difference observable with
+        // a __bool__ that raises ValueError.  The surrounding flag merge and
+        // compiler ownership remain PyPy's `compiling.py:compile` path.
+        Some(v) => crate::baseobjspace::is_true(v)?,
+        None => false,
     };
     let mut optimize = match bind_pos_or_kw(pos, kwargs, 5, "optimize", "compile", 6)? {
         Some(v) => crate::baseobjspace::gateway_int_w(v)?,
@@ -14374,7 +15419,7 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
     // dont_inherit=0 folds in the caller's __future__ flags
     // (getcodeflags: `co_flags & compiler_flags`).
-    if dont_inherit == 0 {
+    if !dont_inherit {
         let caller_frame = crate::eval::CURRENT_FRAME.with(|current| current.get());
         if !caller_frame.is_null() {
             let ec = crate::call::getexecutioncontext();
@@ -14388,14 +15433,30 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         }
     }
 
+    let only_ast = flags & PYCF_ONLY_AST != 0;
+    let func_type_mode = mode == "func_type";
+    if func_type_mode && !only_ast {
+        return Err(crate::PyError::value_error(
+            "compile() mode 'func_type' requires flag PyCF_ONLY_AST",
+        ));
+    }
     let mode = match mode {
         "exec" => crate::compile::Mode::Exec,
         "eval" => crate::compile::Mode::Eval,
         "single" => crate::compile::Mode::Single,
+        // PyPy `compiling.py` admits this start rule only at the public AST
+        // boundary.  Ruff's codegen Mode has no corresponding bytecode mode;
+        // the ONLY_AST branch below dispatches before this placeholder can
+        // reach either parser or code generation.
+        "func_type" => crate::compile::Mode::Eval,
         _ => {
             return Err(crate::PyError::new(
                 crate::PyErrorKind::ValueError,
-                "compile() mode must be 'exec', 'eval' or 'single'",
+                if only_ast {
+                    "compile() mode must be 'exec', 'eval', 'single' or 'func_type'"
+                } else {
+                    "compile() mode must be 'exec', 'eval' or 'single'"
+                },
             ));
         }
     };
@@ -14443,11 +15504,20 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     let opts = crate::compile::CompileOpts {
         optimize: optimize as u8,
         debug_ranges: crate::importing::code_debug_ranges_flag(),
+        int_max_str_digits: crate::module::sys::state::int_max_str_digits().max(0) as usize,
         allow_top_level_await: flags & PYCF_ALLOW_TOP_LEVEL_AWAIT != 0,
         dont_imply_dedent: flags & PYCF_DONT_IMPLY_DEDENT != 0,
         future_features: crate::CodeFlags::from_bits_truncate((flags & COMPILER_FLAGS) as u32),
         ..Default::default()
     };
+    if only_ast && let Some(source) = source_str.as_deref() {
+        // PyPy's tokenizer calls `misc.syntax_warning` while it is building
+        // an app-visible AST.  The ordinary code path runs both scans inside
+        // `compile_with_codegen_warnings`; ONLY_AST has no codegen boundary,
+        // so keep the tokenizer order explicitly here.
+        crate::syntax_warnings::emit_tokenizer_syntax_warnings(source, &filename)?;
+        crate::syntax_warnings::emit_escape_warnings(source, &filename)?;
+    }
     if flags & PYCF_ONLY_AST != 0 {
         // CPython 3.14 bltinmodule.c:847 / pythonrun.c:1524:
         // plain ONLY_AST runs syntax-only preprocessing; OPTIMIZED_AST
@@ -14456,7 +15526,21 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // Kept for the incomplete-input retry below, which the tree builder's
         // own `opts` has been moved into by then.
         let retry_opts = opts.clone();
-        let result = if source_is_ast {
+        let result = if func_type_mode && source_is_ast {
+            // PyPy `compiling.py` returns an AST input unchanged for
+            // ONLY_AST, including FunctionType.  At the pinned CPython 3.14.6,
+            // `PyAst_CheckMode` asserts because this path supplies func_type's
+            // mode 3 to its 0..=2 table, so there is no successful 3.14
+            // observable that displaces the PyPy owner path.
+            Ok(source)
+        } else if func_type_mode {
+            crate::module::_ast::convert::parse_func_type_to_object(
+                source_str
+                    .as_deref()
+                    .expect("non-AST func_type source has decoded text"),
+                feature_version,
+            )
+        } else if source_is_ast {
             // [3.14-spec] CPython `_PyAST_obj2mod` validates the root for the
             // requested mode and `_PyAST_mod2obj` publishes a fresh tree even
             // for plain ONLY_AST.  PyPy `compile_to_ast` returns its input
@@ -14497,7 +15581,8 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             // reaches code generation, and it runs only for a source that has
             // already failed under the flag -- which is `codeop` and that
             // helper, nothing else.
-            if flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0
+            if !func_type_mode
+                && flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0
                 && let Some(text) = source_str.as_deref()
                 && let Err(structured) =
                     crate::compile::compile_source_with_opts(text, mode, &filename, retry_opts)
@@ -14512,17 +15597,18 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         });
     }
     let code = if let Some(source) = source_str.as_deref() {
-        // The escape warnings precede code generation, and a filter that
-        // escalates one replaces the compile with that error.
-        crate::syntax_warnings::emit_escape_warnings(source, &filename)?;
-        crate::compile::compile_source_with_opts(source, mode, &filename, opts).map_err(|e| {
-            compile_err_to_syntax_error_maybe_incomplete(
-                e,
-                source,
-                mode,
-                flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
-            )
-        })
+        crate::syntax_warnings::compile_with_codegen_warnings(source, mode, &filename, opts)
+            .map_err(|error| match error {
+                crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                    compile_err_to_syntax_error_maybe_incomplete(
+                        error,
+                        source,
+                        mode,
+                        flags & PYCF_ALLOW_INCOMPLETE_INPUT != 0,
+                    )
+                }
+                crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+            })
     } else {
         crate::module::_ast::convert::compile_object(source, &filename, mode, opts)
     }
@@ -14641,9 +15727,24 @@ pub(crate) fn exec_or_eval(
             } else {
                 crate::compile::Mode::Exec
             };
-            crate::syntax_warnings::emit_escape_warnings(&source, "<string>")?;
-            let code = crate::compile::compile_source(&source, mode)
-                .map_err(|e| compile_err_to_syntax_error(e, &source, mode))?;
+            let code = crate::syntax_warnings::compile_with_codegen_warnings(
+                &source,
+                mode,
+                "<string>",
+                crate::compile::CompileOpts {
+                    optimize: crate::importing::optimize_flag(),
+                    debug_ranges: crate::importing::code_debug_ranges_flag(),
+                    int_max_str_digits: crate::module::sys::state::int_max_str_digits().max(0)
+                        as usize,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| match error {
+                crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                    compile_err_to_syntax_error_maybe_incomplete(error, &source, mode, false)
+                }
+                crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+            })?;
             (crate::box_code_object(code), false)
         }
     };
@@ -15463,11 +16564,7 @@ fn builtin_id(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // move, so answering with the raw pointer would give such an object two
     // different ids over its lifetime, and every structure keyed on `id()`
     // would lose track of it.
-    let obj = args[0];
-    let w_res = match crate::function::immutable_unique_id(obj) {
-        Some(w_id) => w_id,
-        None => w_int_new(pyre_object::gc_hook::gc_identity_hash(obj as usize) as i64),
-    };
+    let w_res = crate::baseobjspace::id(args[0]);
     // `operation.py space.audit("builtins.id", [w_res])`, emitted after the
     // id is computed so a hook sees the value the call is about to return.
     if crate::module::sys::vm::audit_hooks_armed() {
@@ -16801,7 +17898,10 @@ pub(crate) fn sort_list_in_place(
         // slice through the visible list.
         let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
         let saved_allocated = pyre_object::listobject::w_list_allocated(list);
-        let saved = pyre_object::listobject::w_list_items_copy_as_vec(list);
+        let saved = pyre_object::listobject::w_list_items_copy_as_vec_mode(
+            list,
+            majit_metainterp::jit::we_are_jitted(),
+        );
         let _roots = pyre_object::gc_roots::push_roots();
         let item_base = pyre_object::gc_roots::shadow_stack_len();
         for item in saved {
@@ -21612,6 +22712,32 @@ mod tests {
             Some((start, start + 3))
         );
         assert_eq!(binary_call_generator_error_span("f(4, x for x in y)"), None);
+    }
+
+    #[test]
+    fn keyword_generator_assignment_selects_name_through_equal() {
+        for source in [
+            "dict(a = i for i in range(10))",
+            "f(1, a=i for i in values)",
+            "factory()(a = item for item in values)",
+            "dict(\n a = item\n for item in values)",
+        ] {
+            let equal = source.find('=').unwrap();
+            let start = source[..equal].rfind('a').unwrap();
+            assert_eq!(
+                keyword_generator_assignment_span(source),
+                Some((start, equal + 1))
+            );
+        }
+        for source in [
+            "f(a=(i for i in values))",
+            "(a = i for i in values)",
+            "f(a=[i for i in values])",
+            "def f(a=i for i in values): pass",
+            "def f[T](a=i for i in values): pass",
+        ] {
+            assert_eq!(keyword_generator_assignment_span(source), None);
+        }
     }
 
     #[test]

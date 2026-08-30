@@ -77,3 +77,17 @@ src = """
 from __future__ import print_function
 """
 compile(src, 'test.py', 'exec')
+
+
+# Ruff's parser reports a missing attribute name using an internal
+# "Expected an identifier" diagnostic.  PyPy and CPython expose plain
+# "invalid syntax", including when the expression follows print or exec.
+for src in (
+    "foo.",
+    "foo.if",
+    "print (foo.)",
+    "if True:\n    exec (foo.)",
+):
+    with assert_raises(SyntaxError) as ae:
+        compile(src, "test.py", "exec")
+    assert ae.exception.msg == "invalid syntax"

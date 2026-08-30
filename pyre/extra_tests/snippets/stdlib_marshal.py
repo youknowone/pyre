@@ -78,6 +78,22 @@ class MarshalTests(unittest.TestCase):
     def test_shared_reference(self):
         shared = [1, 2]
         loaded = self.dump_then_load([shared, shared])
+        self.assertEqual(loaded, [shared, shared])
+        self.assertIs(loaded[0], loaded[1])
+
+    def test_shared_unboxed_list_items(self):
+        # PyPy marshal_list snapshots getitems() before writing. Its
+        # AbstractUnwrappedStrategy.getitems_copy reuses a wrapper for
+        # consecutive equal storage entries, so the reference table sees the
+        # same object even when the list strategy stores it unboxed.
+        for shared in (1_000_000, 1.25, b"marshal", "marshal" * 20):
+            loaded = self.dump_then_load([shared, shared])
+            self.assertEqual(loaded, [shared, shared])
+            self.assertIs(loaded[0], loaded[1])
+
+        shared = 1.25
+        loaded = self.dump_then_load([shared, shared, 1])
+        self.assertEqual(loaded, [shared, shared, 1])
         self.assertIs(loaded[0], loaded[1])
 
     def test_file_api(self):

@@ -28,7 +28,7 @@ use std::path::Path;
 use std::path::Component;
 
 use crate::PyExecutionContext;
-use crate::{CodeObject, Mode, PyFrame, compile_source_with_filename};
+use crate::{CodeObject, CompileOpts, Mode, PyFrame, compile_source_with_filename};
 use pyre_object::*;
 use rustpython_wtf8::Wtf8Buf;
 
@@ -719,7 +719,17 @@ pub fn install_builtin_modules() {
     pyre_install_module!(_contextvars);
     pyre_install_module!(_codecs);
     #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_cn);
+    #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_codecs_jp);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_iso2022);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_hk);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_kr);
+    #[cfg(not(target_arch = "wasm32"))]
+    pyre_install_module!(_codecs_tw);
     #[cfg(not(target_arch = "wasm32"))]
     pyre_install_module!(_multibytecodec);
     // moduledef.py: `applevel_name = os.name` installs the one posix module
@@ -3591,6 +3601,13 @@ pub fn code_debug_ranges_flag() -> bool {
     SYS_CODE_DEBUG_RANGES.load(Ordering::Relaxed)
 }
 
+/// PyPy `app_main.py:execfile` entry used when the command-line script name
+/// ends in `.pyc`.  The actual header and marshal ownership remains in `_imp`,
+/// alongside importlib's copy of the same protocol.
+pub fn load_pyc_script(bytes: &[u8]) -> Result<pyre_object::PyObjectRef, crate::PyError> {
+    crate::module::imp::interp_imp::load_pyc_script(bytes)
+}
+
 pub fn unbuffered_flag() -> bool {
     SYS_UNBUFFERED.load(Ordering::Relaxed)
 }
@@ -4063,8 +4080,26 @@ fn parent_package_path(parent: PyObjectRef) -> Result<Option<Vec<PathBuf>>, crat
 // ── parse_source_module ──────────────────────────────────────────────
 // PyPy equivalent: importing.py `parse_source_module(space, pathname, source)`
 
-fn parse_source_module(pathname: &str, source: &str) -> Result<CodeObject, String> {
-    compile_source_with_filename(source, Mode::Exec, pathname).map_err(|e| e.to_string())
+fn parse_source_module(
+    pathname: &str,
+    source: &str,
+) -> Result<CodeObject, crate::syntax_warnings::SourceCompileError> {
+    // PyPy `PythonAstCompiler.compile` runs the same string-literal warning
+    // pass for imported source as for `compile()`.  RustPython exposes parsing
+    // separately, so keep pyre's shared warning pass in front of this file
+    // compiler too; otherwise an invalid escape warns under `-c` but silently
+    // disappears when the identical source is loaded from a `.py` file.
+    crate::syntax_warnings::compile_with_codegen_warnings(
+        source,
+        Mode::Exec,
+        pathname,
+        CompileOpts {
+            optimize: optimize_flag(),
+            debug_ranges: code_debug_ranges_flag(),
+            int_max_str_digits: crate::module::sys::state::int_max_str_digits().max(0) as usize,
+            ..Default::default()
+        },
+    )
 }
 
 // ── exec_code_module ─────────────────────────────────────────────────
@@ -4316,13 +4351,17 @@ fn load_source_module(
     {
         Some(w_code) => (w_code, false),
         None => {
-            let code = parse_source_module(&pathname_str, &source).map_err(|e| {
-                let mut message =
-                    rustpython_wtf8::Wtf8Buf::from_string("cannot compile '".to_string());
-                message.push_wtf8(&path_text);
-                message.push_str(&format!("': {e}"));
-                crate::PyError::new(crate::PyErrorKind::ImportError, message)
-            })?;
+            let code =
+                parse_source_module(&pathname_str, &source).map_err(|error| match error {
+                    crate::syntax_warnings::SourceCompileError::Compile(error) => {
+                        let mut message =
+                            rustpython_wtf8::Wtf8Buf::from_string("cannot compile '".to_string());
+                        message.push_wtf8(&path_text);
+                        message.push_str(&format!("': {error}"));
+                        crate::PyError::new(crate::PyErrorKind::ImportError, message)
+                    }
+                    crate::syntax_warnings::SourceCompileError::Warning(error) => error,
+                })?;
             (crate::box_code_object(code), cache_key.is_some())
         }
     };

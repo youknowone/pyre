@@ -13,7 +13,7 @@
 //! will not work in the future." sentence the warning carries.
 
 use crate::PyError;
-use crate::compile::{ast, parser};
+use crate::compile::{CodeObject, CompileOpts, Mode, ast, parser};
 use ast::visitor::Visitor;
 use ruff_text_size::TextRange;
 use rustpython_wtf8::Wtf8;
@@ -36,6 +36,153 @@ fn line_offset_at(source: &str, offset: usize) -> (usize, usize) {
     let line_start = prefix.rfind('\n').map_or(0, |index| index + 1);
     let column = source[line_start..offset].chars().count() + 1;
     (lineno, column)
+}
+
+fn is_ascii_identifier_char(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+/// Whether the text after a numeric token is one of the keywords that may
+/// legally follow it, which is what decides the warning.
+///
+/// [3.14-spec] `pytokenizer._lookahead` compares the keyword's letters and
+/// stops there, and its `o` arm reads a single character, so PyPy warns for
+/// `1andromeda` and `1orx` as well.  3.14.2 `lookahead` additionally requires
+/// the name to end, and warns only where the arm reads a single character in
+/// both — the `i` one, which is why `1ifx`, `1inx` and `1isx` still warn.
+/// Measured on 3.14.2 for all eight keywords, glued and separated.
+fn numeric_keyword_suffix(rest: &[u8]) -> bool {
+    let ends_the_name = |keyword: &[u8]| {
+        !rest
+            .get(keyword.len())
+            .is_some_and(|&byte| byte >= 0x80 || is_ascii_identifier_char(byte))
+    };
+    [b"if".as_slice(), b"in", b"is"]
+        .iter()
+        .any(|keyword| rest.starts_with(keyword))
+        || [b"and".as_slice(), b"else", b"for", b"or", b"not"]
+            .iter()
+            .any(|keyword| rest.starts_with(keyword) && ends_the_name(keyword))
+}
+
+fn consume_decimal_digits(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        match bytes[index] {
+            b'0'..=b'9' => index += 1,
+            b'_' if bytes
+                .get(index + 1)
+                .is_some_and(|byte| byte.is_ascii_digit()) =>
+            {
+                index += 2;
+            }
+            _ => break,
+        }
+    }
+    index
+}
+
+fn consume_radix_digits(bytes: &[u8], mut index: usize, is_digit: impl Fn(u8) -> bool) -> usize {
+    while index < bytes.len() {
+        if is_digit(bytes[index]) {
+            index += 1;
+        } else if bytes.get(index) == Some(&b'_')
+            && bytes.get(index + 1).is_some_and(|&byte| is_digit(byte))
+        {
+            index += 2;
+        } else {
+            break;
+        }
+    }
+    index
+}
+
+fn consume_exponent(bytes: &[u8], index: usize) -> usize {
+    if !matches!(bytes.get(index), Some(b'e' | b'E')) {
+        return index;
+    }
+    let mut cursor = index + 1;
+    if matches!(bytes.get(cursor), Some(b'+' | b'-')) {
+        cursor += 1;
+    }
+    if bytes.get(cursor).is_some_and(|byte| byte.is_ascii_digit()) {
+        consume_decimal_digits(bytes, cursor)
+    } else {
+        index
+    }
+}
+
+fn number_literal_end(bytes: &[u8], start: usize) -> Option<(&'static str, usize)> {
+    if bytes.get(start) == Some(&b'.') {
+        if !bytes
+            .get(start + 1)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        let mut index = consume_decimal_digits(bytes, start + 1);
+        index = consume_exponent(bytes, index);
+        if matches!(bytes.get(index), Some(b'j' | b'J')) {
+            return Some(("imaginary", index + 1));
+        }
+        return Some(("decimal", index));
+    }
+
+    if !bytes.get(start).is_some_and(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    if bytes.get(start) == Some(&b'0') {
+        match bytes.get(start + 1) {
+            Some(b'x' | b'X') => {
+                let end = consume_radix_digits(bytes, start + 2, |byte| byte.is_ascii_hexdigit());
+                return Some(("hexadecimal", end));
+            }
+            Some(b'o' | b'O') => {
+                let end =
+                    consume_radix_digits(bytes, start + 2, |byte| matches!(byte, b'0'..=b'7'));
+                return Some(("octal", end));
+            }
+            Some(b'b' | b'B') => {
+                let end =
+                    consume_radix_digits(bytes, start + 2, |byte| matches!(byte, b'0' | b'1'));
+                return Some(("binary", end));
+            }
+            _ => {}
+        }
+    }
+
+    let mut index = consume_decimal_digits(bytes, start);
+    if bytes.get(index) == Some(&b'.') {
+        index = consume_decimal_digits(bytes, index + 1);
+    }
+    index = consume_exponent(bytes, index);
+    if matches!(bytes.get(index), Some(b'j' | b'J')) {
+        return Some(("imaginary", index + 1));
+    }
+    Some(("decimal", index))
+}
+
+fn skip_quoted_string(bytes: &[u8], mut index: usize) -> usize {
+    let quote = bytes[index];
+    let triple = bytes.get(index + 1) == Some(&quote) && bytes.get(index + 2) == Some(&quote);
+    let quote_len = if triple { 3 } else { 1 };
+    index += quote_len;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if triple
+            && bytes.get(index) == Some(&quote)
+            && bytes.get(index + 1) == Some(&quote)
+            && bytes.get(index + 2) == Some(&quote)
+        {
+            return index + 3;
+        } else if !triple && bytes[index] == quote {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    index
 }
 
 /// The byte bounds of a quoted literal's content, with the prefix letters and
@@ -267,6 +414,364 @@ fn warn_invalid_escape_sequence(
         pyre_object::PY_NULL,
     )
     .map_err(|err| escalate(err, source, filename, offset, escape))
+}
+
+/// A source compile can fail in the parser/compiler itself, or because the
+/// warnings filter promoted a code-generator `SyntaxWarning` to an exception.
+/// PyPy's `PythonAstCompiler.compile` preserves that distinction: the warning
+/// machinery's exception escapes unchanged instead of being flattened into a
+/// compiler `SyntaxError`.
+pub enum SourceCompileError {
+    Compile(crate::compile::CompileError),
+    Warning(PyError),
+}
+
+/// Emit one of RustPython codegen's syntax warnings through PyPy's application
+/// warning machinery.  RustPython `Compiler::check_compare` and its sibling
+/// checks call this at the same code-generation boundary as PyPy
+/// `PythonCodeGenerator._check_compare`.
+fn warn_codegen_syntax(
+    source: &str,
+    filename: &str,
+    lineno: usize,
+    offset: usize,
+    message: &str,
+) -> Result<(), PyError> {
+    if !crate::module::_warnings::state_is_readable() {
+        return Ok(());
+    }
+    let Some(category) = crate::builtins::lookup_exc_class("SyntaxWarning") else {
+        return Ok(());
+    };
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let category_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(category);
+    let message_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(message));
+    let filename_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(filename));
+
+    crate::module::_warnings::do_warn_explicit(
+        pyre_object::gc_roots::shadow_stack_get(category_slot),
+        pyre_object::gc_roots::shadow_stack_get(message_slot),
+        pyre_object::gc_roots::shadow_stack_get(filename_slot),
+        lineno as i64,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    )
+    .map_err(|err| {
+        if err.exc_object.is_null()
+            || crate::builtins::lookup_exc_class("SyntaxWarning").is_none_or(|category| {
+                !matches!(
+                    crate::baseobjspace::isinstance(err.exc_object, category),
+                    Ok(true)
+                )
+            })
+        {
+            return err;
+        }
+        let text = source
+            .split('\n')
+            .nth(lineno.saturating_sub(1))
+            .map(|line| format!("{}\n", line.trim_end_matches('\r')));
+        PyError::syntax_error_located(
+            message,
+            Wtf8::new(filename),
+            lineno as i64,
+            offset as i64,
+            lineno as i64,
+            offset as i64,
+            text.as_deref(),
+        )
+    })
+}
+
+/// Whether the letters before a quote open an interpolated literal, whose
+/// replacement fields `pytokenizer` tokenizes as ordinary source.
+fn is_interpolated_prefix(run: &[u8]) -> bool {
+    run.len() <= 2
+        && run
+            .iter()
+            .all(|byte| matches!(byte.to_ascii_lowercase(), b'f' | b't' | b'r'))
+        && run
+            .iter()
+            .any(|byte| matches!(byte.to_ascii_lowercase(), b'f' | b't'))
+}
+
+/// The `}` closing a replacement field opened at `start`, or `limit`.
+fn replacement_field_end(bytes: &[u8], start: usize, limit: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < limit {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                index = skip_quoted_string(bytes, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' => {
+                if depth == 0 {
+                    return index;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    limit
+}
+
+/// Where a replacement field's expression ends: its `!` conversion or its `:`
+/// format spec, whichever comes first outside brackets and strings.
+fn replacement_expression_end(bytes: &[u8], start: usize, limit: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < limit {
+        match bytes[index] {
+            b'\'' | b'"' => {
+                index = skip_quoted_string(bytes, index);
+                continue;
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            // `!=` is an operator, not a conversion.
+            b'!' if depth == 0 && bytes.get(index + 1) != Some(&b'=') => return index,
+            b':' if depth == 0 => return index,
+            _ => {}
+        }
+        index += 1;
+    }
+    limit
+}
+
+/// Scan one replacement field: its expression, then the replacement fields
+/// its format spec carries.  The spec's own text is literal and is not a
+/// token stream, so nothing between those fields is scanned.
+fn scan_replacement_field(
+    source: &str,
+    filename: &str,
+    start: usize,
+    end: usize,
+) -> Result<(), PyError> {
+    let bytes = source.as_bytes();
+    let expression_end = replacement_expression_end(bytes, start, end);
+    scan_tokenizer_warnings(source, filename, start, expression_end)?;
+    let mut index = expression_end;
+    while index < end {
+        if bytes[index] == b'{' {
+            let inner_end = replacement_field_end(bytes, index + 1, end);
+            scan_replacement_field(source, filename, index + 1, inner_end)?;
+            index = inner_end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Skip an interpolated literal, scanning each replacement field on the way.
+/// Returns the index just past the closing quote.
+fn scan_interpolated_string(
+    source: &str,
+    filename: &str,
+    quote_index: usize,
+) -> Result<usize, PyError> {
+    let bytes = source.as_bytes();
+    let quote = bytes[quote_index];
+    let triple =
+        bytes.get(quote_index + 1) == Some(&quote) && bytes.get(quote_index + 2) == Some(&quote);
+    let mut index = quote_index + if triple { 3 } else { 1 };
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = (index + 2).min(bytes.len());
+        } else if triple && bytes[index..].starts_with(&[quote, quote, quote]) {
+            return Ok(index + 3);
+        } else if !triple && bytes[index] == quote {
+            return Ok(index + 1);
+        } else if bytes[index] == b'{' && bytes.get(index + 1) == Some(&b'{') {
+            index += 2;
+        } else if bytes[index] == b'}' && bytes.get(index + 1) == Some(&b'}') {
+            index += 2;
+        } else if bytes[index] == b'{' {
+            let field_end = replacement_field_end(bytes, index + 1, bytes.len());
+            scan_replacement_field(source, filename, index + 1, field_end)?;
+            index = field_end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(index)
+}
+
+/// Emit tokenizer-level numeric-literal warnings before parsing.
+///
+/// PyPy's `pytokenizer.generate_tokens` warns when a valid numeric token runs
+/// directly into a keyword (`1or`, `9and`, `0x1if`, ...).  RustPython
+/// `VirtualMachine::emit_tokenizer_syntax_warnings` performs the same byte
+/// scan before entering Ruff's parser, whose recovered tree otherwise loses
+/// the token boundary that owns the warning.
+pub fn emit_tokenizer_syntax_warnings(source: &str, filename: &str) -> Result<(), PyError> {
+    scan_tokenizer_warnings(source, filename, 0, source.len())
+}
+
+/// [`emit_tokenizer_syntax_warnings`] over one byte range.  A replacement
+/// field re-enters here: an interpolated literal's expressions are tokenized
+/// like any other source, while its literal text never is.
+fn scan_tokenizer_warnings(
+    source: &str,
+    filename: &str,
+    start: usize,
+    end: usize,
+) -> Result<(), PyError> {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    while index < end {
+        match bytes[index] {
+            b'#' => {
+                while index < end && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'\'' | b'"' => {
+                index = skip_quoted_string(bytes, index);
+            }
+            byte if byte >= 0x80 || byte == b'_' || byte.is_ascii_alphabetic() => {
+                let name_start = index;
+                index += 1;
+                while index < end
+                    && (bytes[index] >= 0x80 || is_ascii_identifier_char(bytes[index]))
+                {
+                    index += 1;
+                }
+                if index < end
+                    && matches!(bytes[index], b'\'' | b'"')
+                    && is_interpolated_prefix(&bytes[name_start..index])
+                {
+                    index = scan_interpolated_string(source, filename, index)?;
+                }
+            }
+            b'.' | b'0'..=b'9' => {
+                let Some((kind, token_end)) = number_literal_end(bytes, index) else {
+                    index += 1;
+                    continue;
+                };
+                if token_end > index && numeric_keyword_suffix(&bytes[token_end..]) {
+                    let (lineno, column) = line_offset_at(source, index);
+                    warn_codegen_syntax(
+                        source,
+                        filename,
+                        lineno,
+                        column,
+                        &format!("invalid {kind} literal"),
+                    )?;
+                }
+                index = token_end.max(index + 1);
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(())
+}
+
+/// Compile application source while retaining the code generator's warning
+/// callback.  The plain RustPython `compile` entry point intentionally drops
+/// that channel; its VM uses this same callback-and-stashed-exception shape in
+/// `VirtualMachine::compile_with_opts`.
+pub fn compile_with_codegen_warnings(
+    source: &str,
+    mode: Mode,
+    filename: &str,
+    opts: CompileOpts,
+) -> Result<CodeObject, SourceCompileError> {
+    crate::module::thread::ensure_runtime_thread();
+    let source = crate::compile::universal_newline(source);
+    emit_tokenizer_syntax_warnings(&source, filename).map_err(SourceCompileError::Warning)?;
+    emit_escape_warnings(&source, filename).map_err(SourceCompileError::Warning)?;
+    let escalated = core::cell::Cell::new(None);
+    let mut handler = |location: crate::compile::SourceLocation, message: String| {
+        warn_codegen_syntax(
+            &source,
+            filename,
+            location.line.get(),
+            location.character_offset.get(),
+            &message,
+        )
+        .map_err(|error| {
+            escalated.set(Some(error));
+            // This marker is intercepted below; the warning exception itself
+            // is never flattened into this codegen error.
+            crate::compile::codegen::error::CodegenError {
+                location: Some(location),
+                end_location: None,
+                error: crate::compile::codegen::error::CodegenErrorType::SyntaxError(String::new()),
+                source_path: filename.to_owned(),
+            }
+        })
+    };
+    let result = crate::compile::rp_compile_with_syntax_warning_handler(
+        &source,
+        mode,
+        filename,
+        opts,
+        &mut handler,
+    );
+    match escalated.take() {
+        Some(error) => Err(SourceCompileError::Warning(error)),
+        None => result.map_err(SourceCompileError::Compile),
+    }
+}
+
+/// RustPython `_ast::compile_object`: an AST supplied to `compile()` goes
+/// through the same code-generator warning callback as source text.  In
+/// particular `warn_control_flow_in_finally` (PEP 765) runs after AST
+/// validation and before preprocessing, so compiling an object tree emits the
+/// same warning as compiling the source that produced it.
+pub fn compile_ast_with_codegen_warnings(
+    module: ast::Mod,
+    source_file: rustpython_compiler::core::SourceFile,
+    source: &str,
+    filename: &str,
+    mode: Mode,
+    opts: CompileOpts,
+) -> Result<CodeObject, SourceCompileError> {
+    crate::module::thread::ensure_runtime_thread();
+    let escalated = core::cell::Cell::new(None);
+    let mut handler = |location: crate::compile::SourceLocation, message: String| {
+        warn_codegen_syntax(
+            source,
+            filename,
+            location.line.get(),
+            location.character_offset.get(),
+            &message,
+        )
+        .map_err(|error| {
+            escalated.set(Some(error));
+            crate::compile::codegen::error::CodegenError {
+                location: Some(location),
+                end_location: None,
+                error: crate::compile::codegen::error::CodegenErrorType::SyntaxError(String::new()),
+                source_path: filename.to_owned(),
+            }
+        })
+    };
+    let result = rustpython_compiler::codegen::compile::compile_top_with_syntax_warning_handler(
+        module,
+        source_file,
+        mode,
+        opts,
+        Some(&mut handler),
+    );
+    match escalated.take() {
+        Some(error) => Err(SourceCompileError::Warning(error)),
+        None => result
+            .map_err(crate::compile::CompileError::from)
+            .map_err(SourceCompileError::Compile),
+    }
 }
 
 struct EscapeWarningVisitor<'a> {

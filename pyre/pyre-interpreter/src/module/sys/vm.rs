@@ -3674,9 +3674,10 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
 /// real W_File-backed `TextIOWrapper`; pyre routes writes through Rust's
 /// stdout/stderr (the same sink as `print`) so output ordering is preserved,
 /// storing the read/write surface as instance attributes.
-/// `initstdio`'s test for the default error handler: UTF-8 mode, or the legacy
-/// C/POSIX locale, asks for `surrogateescape`; every other locale settles for
-/// the `strict` that `TextIOWrapper(errors=None)` takes.
+/// `app_main.py initstdio`'s test for the default error handler: UTF-8 mode,
+/// or a locale selected by the platform policy, asks for `surrogateescape`;
+/// every other locale settles for the `strict` that
+/// `TextIOWrapper(errors=None)` takes.
 ///
 /// Windows answers yes outright. `initstdio` reaches that through UTF-8 mode,
 /// which PyPy runs the whole platform in -- `sys.flags.utf8_mode` reads 1 there
@@ -3703,7 +3704,19 @@ fn locale_asks_for_surrogateescape() -> bool {
             // took rather than the variables that asked for it.
             rustpython_host_env::locale::setlocale(libc::LC_CTYPE, Some(c""));
             let effective = rustpython_host_env::locale::setlocale(libc::LC_CTYPE, None);
-            matches!(effective.as_deref(), None | Some(b"C") | Some(b"POSIX"))
+            // [3.14-spec] CPython `config_get_stdio_errors` also consults
+            // `_Py_IsLocaleCoercionTarget`; its target table is C.UTF-8,
+            // C.utf8 and UTF-8.  PyPy `app_main.initstdio` owns the control
+            // flow here, while those observable stdio errors follow 3.14.
+            matches!(
+                effective.as_deref(),
+                None
+                    | Some(b"C")
+                    | Some(b"POSIX")
+                    | Some(b"C.UTF-8")
+                    | Some(b"C.utf8")
+                    | Some(b"UTF-8")
+            )
         }
         // No locale database at all -- wasm32, and the sandbox, whose
         // `_locale.setlocale` answers `C` for every category.

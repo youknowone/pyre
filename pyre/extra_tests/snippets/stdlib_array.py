@@ -1,3 +1,5 @@
+import gc
+import sys
 from array import _array_reconstructor, array
 from io import BytesIO
 from pickle import dumps, loads
@@ -38,6 +40,771 @@ def test_float_with_integer_input():
 
 
 test_float_with_integer_input()
+
+# PyPy's W_Array.descr_append converts before setlen.  CPython 3.14's ins1
+# preserves that ordering but validates once before resize and converts again
+# for the actual slot, so both callbacks and their intervening mutations are
+# observable.
+append_target = array("i", [1])
+
+
+class GrowingAppendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        gc.collect()
+        append_target.append(2)
+        return 3
+
+
+growing_append_item = GrowingAppendItem()
+append_target.append(growing_append_item)
+assert growing_append_item.calls == 2
+assert append_target == array("i", [1, 3, 2])
+
+append_target = array("i", [1])
+
+
+class ClearingAppendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        del append_target[:]
+        return 3
+
+
+clearing_append_item = ClearingAppendItem()
+append_target.append(clearing_append_item)
+assert clearing_append_item.calls == 2
+assert append_target == array("i")
+
+append_target = array("i", [1])
+append_view = memoryview(append_target)
+
+
+class ExportedAppendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        return 3
+
+
+exported_append_item = ExportedAppendItem()
+with assert_raises(BufferError):
+    append_target.append(exported_append_item)
+assert exported_append_item.calls == 1
+assert append_target == array("i", [1])
+append_view.release()
+
+
+class AppendArraySubclass(array):
+    pass
+
+
+with assert_raises(TypeError) as error:
+    AppendArraySubclass("i").append(v=1)
+assert str(error.exception) == "array.append() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").append()
+assert str(error.exception) == "array.append() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").append(1, 2)
+assert str(error.exception) == "array.append() takes exactly one argument (2 given)"
+
+# PyPy W_Array.extend raw-copies a same-kind array before falling back to
+# _fromiterable, and that fallback mints the iterator before its first append.
+# CPython 3.14 shares append's two-conversion ins1 path for every streamed item.
+extend_target = array("i", [1])
+
+
+class GrowingExtendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        extend_target.append(2)
+        gc.collect()
+        return 3
+
+
+growing_extend_item = GrowingExtendItem()
+extend_target.extend([growing_extend_item])
+assert growing_extend_item.calls == 2
+assert extend_target == array("i", [1, 3, 2])
+
+extend_target = array("i", [1])
+
+
+class ClearingExtendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        del extend_target[:]
+        return 3
+
+
+clearing_extend_item = ClearingExtendItem()
+extend_target.extend([clearing_extend_item])
+assert clearing_extend_item.calls == 2
+assert extend_target == array("i")
+
+
+class RawArraySubclass(array):
+    def __iter__(self):
+        raise AssertionError("same-kind array extend must copy raw storage")
+
+
+extend_target = array("i", [1])
+extend_target.extend(RawArraySubclass("i", [2]))
+assert extend_target == array("i", [1, 2])
+
+exported_extend = array("i", [1])
+exported_extend_view = memoryview(exported_extend)
+with assert_raises(TypeError) as error:
+    exported_extend.extend(array("h"))
+assert str(error.exception) == "can only extend with array of same kind"
+assert exported_extend.extend(array("i")) is None
+assert exported_extend.extend([]) is None
+
+
+class EmptyExtendIterator:
+    def __init__(self):
+        self.events = []
+
+    def __iter__(self):
+        self.events.append("iter")
+        return self
+
+    def __next__(self):
+        self.events.append("next")
+        raise StopIteration
+
+
+empty_extend_iterator = EmptyExtendIterator()
+assert exported_extend.extend(empty_extend_iterator) is None
+assert empty_extend_iterator.events == ["iter", "next"]
+
+
+class ExportedExtendItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        return 2
+
+
+exported_extend_item = ExportedExtendItem()
+with assert_raises(BufferError):
+    exported_extend.extend([exported_extend_item])
+assert exported_extend_item.calls == 1
+assert exported_extend == array("i", [1])
+exported_extend_view.release()
+
+with assert_raises(TypeError) as error:
+    array("i").extend()
+assert str(error.exception) == "extend() takes exactly 1 positional argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").extend([], [])
+assert str(error.exception) == "extend() takes at most 1 argument (2 given)"
+with assert_raises(TypeError) as error:
+    RawArraySubclass("i").extend(iterable=[])
+assert str(error.exception) == "extend() takes exactly 1 positional argument (0 given)"
+
+# PyPy W_Array.descr_insert converts the value before growing and shifting.
+# CPython 3.14's ins1 retains that order, then converts once more for the
+# destination slot; both callbacks and the pre-conversion length are visible.
+insert_target = array("i", [1, 2])
+
+
+class GrowingInsertItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        if self.calls == 1:
+            insert_target.append(9)
+        else:
+            insert_target.append(8)
+        return 7
+
+
+growing_insert_item = GrowingInsertItem()
+insert_target.insert(-1, growing_insert_item)
+assert growing_insert_item.calls == 2
+assert insert_target == array("i", [1, 7, 2, 8])
+
+insert_target = array("i", [1])
+insert_view = None
+
+
+class ExportingInsertItem:
+    def __index__(self):
+        global insert_view
+        insert_view = memoryview(insert_target)
+        return 2
+
+
+with assert_raises(BufferError):
+    insert_target.insert(0, ExportingInsertItem())
+assert insert_target == array("i", [1])
+insert_view.release()
+
+insert_target = array("i", [1, 2])
+
+
+class ClearingInsertItem:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        if self.calls == 2:
+            insert_target.clear()
+        return 7
+
+
+clearing_insert_item = ClearingInsertItem()
+with assert_raises(IndexError) as error:
+    insert_target.insert(0, clearing_insert_item)
+assert str(error.exception) == "array assignment index out of range"
+assert clearing_insert_item.calls == 2
+assert insert_target == array("i")
+
+# PyPy's W_ArrayBase.descr_index supplies the optional bounds to
+# index_count_array.  CPython 3.14 keeps the same observable positional search
+# but makes the public bounds positional-only.
+bounded = array("i", [1, 2, 1, 3])
+assert bounded.index(1, 1) == 2
+assert bounded.index(1, 1, 3) == 2
+with assert_raises(TypeError) as error:
+    bounded.index(1, start=1)
+assert str(error.exception) == "array.index() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    bounded.index(x=1)
+assert str(error.exception) == "array.index() takes no keyword arguments"
+
+
+class ArraySubclass(array):
+    pass
+
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i", [1]).index(1, start=0)
+assert str(error.exception) == "array.index() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    bounded.index()
+assert str(error.exception) == "index expected at least 1 argument, got 0"
+with assert_raises(TypeError) as error:
+    bounded.index(1, 0, 4, 5)
+assert str(error.exception) == "index expected at most 3 arguments, got 4"
+with assert_raises(TypeError) as error:
+    bounded.index(1, None)
+assert str(error.exception) == (
+    "slice indices must be integers or have an __index__ method"
+)
+with assert_raises(TypeError) as error:
+    bounded.index(1, 0, None)
+assert str(error.exception) == (
+    "slice indices must be integers or have an __index__ method"
+)
+
+
+# interp2app unwraps bounds before W_ArrayBase.descr_index reads self.len.
+reentered = array("i", [1])
+
+
+class GrowingStart:
+    def __index__(self):
+        reentered.append(2)
+        return -1
+
+
+assert reentered.index(2, GrowingStart()) == 1
+assert reentered == array("i", [1, 2])
+
+
+class CollectingNeedle:
+    def __eq__(self, other):
+        gc.collect()
+        return other == 2
+
+
+assert array("i", [1, 2]).index(CollectingNeedle()) == 1
+
+growing_search = array("i", [1])
+
+
+class GrowingNeedle:
+    def __eq__(self, other):
+        if other == 1:
+            growing_search.append(2)
+            return False
+        return other == 2
+
+
+# PyPy's index_count_array source reads arr.len at its loop boundary.  The
+# installed PyPy oracle snapshots this case, while CPython 3.14's
+# array_array_index_impl explicitly re-reads Py_SIZE(self) and finds the new
+# item.  Keep the PyPy loop shape and take the 3.14 observable result.
+assert growing_search.index(GrowingNeedle()) == 1
+
+shrinking = array("i", [1, 2])
+
+
+class ShrinkingNeedle:
+    def __eq__(self, other):
+        del shrinking[:]
+        return False
+
+
+with assert_raises(ValueError):
+    shrinking.index(ShrinkingNeedle())
+assert shrinking == array("i")
+
+# PyPy's unwrap_spec gateway converts insert/pop indexes before their method
+# bodies inspect the receiver.  The callbacks can therefore resize or collect
+# the array before its effective length is read.
+inserted = array("i", [1, 2])
+
+
+class GrowingInsertIndex:
+    def __index__(self):
+        inserted.append(3)
+        gc.collect()
+        return -1
+
+
+inserted.insert(GrowingInsertIndex(), 9)
+assert inserted == array("i", [1, 2, 9, 3])
+
+popped = array("i", [1, 2])
+
+
+class GrowingPopIndex:
+    def __index__(self):
+        popped.append(3)
+        gc.collect()
+        return -1
+
+
+assert popped.pop(GrowingPopIndex()) == 3
+assert popped == array("i", [1, 2])
+
+cleared = array("i", [1, 2])
+
+
+class ClearingPopIndex:
+    def __index__(self):
+        del cleared[:]
+        return 0
+
+
+with assert_raises(IndexError) as error:
+    cleared.pop(ClearingPopIndex())
+assert str(error.exception) == "pop from empty array"
+assert cleared == array("i")
+
+
+class HugeArrayIndex:
+    def __index__(self):
+        return 1 << 100
+
+
+for method in (
+    lambda: array("i").insert(HugeArrayIndex(), 1),
+    lambda: array("i", [1]).pop(HugeArrayIndex()),
+):
+    with assert_raises(OverflowError) as error:
+        method()
+    assert str(error.exception) == "Python int too large to convert to C ssize_t"
+
+with assert_raises(TypeError) as error:
+    array("i").insert(i=0, x=1)
+assert str(error.exception) == "array.insert() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i", [1]).pop(i=0)
+assert str(error.exception) == "array.pop() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").insert(0)
+assert str(error.exception) == "insert expected 2 arguments, got 1"
+with assert_raises(TypeError) as error:
+    array("i", [1]).pop(0, 1)
+assert str(error.exception) == "pop expected at most 1 argument, got 2"
+
+conversion_order = []
+exported = array("i", [1])
+exported_view = memoryview(exported)
+
+
+class ExportingIndex:
+    def __index__(self):
+        conversion_order.append("index")
+        return 0
+
+
+class ExportingValue:
+    def __index__(self):
+        conversion_order.append("value")
+        return 2
+
+
+with assert_raises(BufferError):
+    exported.insert(ExportingIndex(), ExportingValue())
+assert conversion_order == ["index", "value"]
+conversion_order.clear()
+with assert_raises(BufferError):
+    exported.pop(ExportingIndex())
+assert conversion_order == ["index"]
+exported_view.release()
+
+# PyPy's descr_remove delegates through its live-length index_count_array
+# search and then descr_pop.  Equality can mutate the receiver at both sides
+# of that boundary, so the receiver and needle must remain rooted and live.
+remove_growing = array("i", [1, 2])
+remove_calls = []
+
+
+class GrowingRemoveNeedle:
+    def __eq__(self, other):
+        remove_calls.append(other)
+        if other == 1:
+            remove_growing.append(3)
+            gc.collect()
+            return False
+        return other == 3
+
+
+remove_growing.remove(GrowingRemoveNeedle())
+assert remove_calls == [1, 2, 3]
+assert remove_growing == array("i", [1, 2])
+
+remove_cleared_false = array("i", [1, 2])
+
+
+class ClearingFalseNeedle:
+    def __eq__(self, other):
+        del remove_cleared_false[:]
+        return False
+
+
+with assert_raises(ValueError) as error:
+    remove_cleared_false.remove(ClearingFalseNeedle())
+assert str(error.exception) == "array.remove(x): x not in array"
+assert remove_cleared_false == array("i")
+
+remove_cleared_true = array("i", [1, 2])
+
+
+class ClearingTrueNeedle:
+    def __eq__(self, other):
+        del remove_cleared_true[:]
+        return True
+
+
+# CPython 3.14 array_del_slice treats the now-empty matched range as a
+# successful no-op; PyPy's descr_pop raises here, so the 3.14 result wins.
+assert remove_cleared_true.remove(ClearingTrueNeedle()) is None
+assert remove_cleared_true == array("i")
+
+remove_exported = array("i", [1])
+remove_view = memoryview(remove_exported)
+remove_export_events = []
+
+
+class ExportedRemoveNeedle:
+    def __eq__(self, other):
+        remove_export_events.append(other)
+        return True
+
+
+with assert_raises(BufferError):
+    remove_exported.remove(ExportedRemoveNeedle())
+assert remove_export_events == [1]
+assert remove_exported == array("i", [1])
+remove_view.release()
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i", [1]).remove(x=1)
+assert str(error.exception) == "array.remove() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").remove()
+assert str(error.exception) == "array.remove() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").remove(1, 2)
+assert str(error.exception) == "array.remove() takes exactly one argument (2 given)"
+
+# PyPy's index_count_array shares one live-length loop between its index-like
+# searches and count.  CPython 3.14 likewise re-reads Py_SIZE(self) at every
+# array_array_count_impl iteration, so comparison may grow or shrink the
+# receiver without leaving a stale raw-buffer bound behind.
+count_growing = array("i", [1, 2])
+count_calls = []
+
+
+class GrowingCountNeedle:
+    def __eq__(self, other):
+        count_calls.append(other)
+        if other == 1:
+            count_growing.append(3)
+            gc.collect()
+        return other == 3
+
+
+assert count_growing.count(GrowingCountNeedle()) == 1
+assert count_calls == [1, 2, 3]
+assert count_growing == array("i", [1, 2, 3])
+
+count_cleared_false = array("i", [1, 2])
+
+
+class ClearingFalseCountNeedle:
+    def __eq__(self, other):
+        del count_cleared_false[:]
+        return False
+
+
+assert count_cleared_false.count(ClearingFalseCountNeedle()) == 0
+assert count_cleared_false == array("i")
+
+count_cleared_true = array("i", [1, 2])
+
+
+class ClearingTrueCountNeedle:
+    def __eq__(self, other):
+        del count_cleared_true[:]
+        return True
+
+
+assert count_cleared_true.count(ClearingTrueCountNeedle()) == 1
+assert count_cleared_true == array("i")
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i", [1]).count(x=1)
+assert str(error.exception) == "array.count() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").count()
+assert str(error.exception) == "array.count() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").count(1, 2)
+assert str(error.exception) == "array.count() takes exactly one argument (2 given)"
+
+# PyPy's W_ArrayBase.descr_fromlist accepts only lists and restores the old
+# length around fromsequence failures.  CPython 3.14 additionally reads list
+# subclasses directly and rejects a size change after each converted item.
+fromlist_target = array("i", [9])
+with assert_raises(TypeError) as error:
+    fromlist_target.fromlist((1, 2))
+assert str(error.exception) == "arg must be list"
+assert fromlist_target == array("i", [9])
+
+with assert_raises(TypeError):
+    fromlist_target.fromlist([1, "bad", 2])
+assert fromlist_target == array("i", [9])
+
+
+class DirectListSubclass(list):
+    def __iter__(self):
+        raise AssertionError("fromlist must read list storage directly")
+
+
+fromlist_target.fromlist(DirectListSubclass([1, 2]))
+assert fromlist_target == array("i", [9, 1, 2])
+
+growing_fromlist_source = []
+
+
+class GrowingFromlistItem:
+    def __index__(self):
+        growing_fromlist_source.append(2)
+        gc.collect()
+        return 1
+
+
+growing_fromlist_source.append(GrowingFromlistItem())
+fromlist_target = array("i", [9])
+with assert_raises(RuntimeError) as error:
+    fromlist_target.fromlist(growing_fromlist_source)
+assert str(error.exception) == "list changed size during iteration"
+assert fromlist_target == array("i", [9])
+
+shrinking_fromlist_source = []
+
+
+class ShrinkingFromlistItem:
+    def __index__(self):
+        shrinking_fromlist_source.clear()
+        return 1
+
+
+shrinking_fromlist_source.append(ShrinkingFromlistItem())
+fromlist_target = array("i", [9])
+with assert_raises(RuntimeError) as error:
+    fromlist_target.fromlist(shrinking_fromlist_source)
+assert str(error.exception) == "list changed size during iteration"
+assert fromlist_target == array("i", [9])
+
+# Destination sizing precedes item conversion.  Re-entrant growth therefore
+# remains after the pre-sized slot, while a clear makes that slot non-live.
+reentered_fromlist = array("i", [9])
+
+
+class AppendingFromlistItem:
+    def __index__(self):
+        reentered_fromlist.append(7)
+        return 1
+
+
+reentered_fromlist.fromlist([AppendingFromlistItem()])
+assert reentered_fromlist == array("i", [9, 1, 7])
+
+reentered_fromlist = array("i", [9])
+
+
+class ClearingFromlistItem:
+    def __index__(self):
+        del reentered_fromlist[:]
+        return 1
+
+
+reentered_fromlist.fromlist([ClearingFromlistItem()])
+assert reentered_fromlist == array("i")
+
+# Type/empty-list handling happens before a resize check.  A non-empty list is
+# the first case that needs to grow the exported array.
+exported_fromlist = array("i", [9])
+exported_fromlist_view = memoryview(exported_fromlist)
+with assert_raises(TypeError) as error:
+    exported_fromlist.fromlist(())
+assert str(error.exception) == "arg must be list"
+assert exported_fromlist.fromlist([]) is None
+with assert_raises(BufferError):
+    exported_fromlist.fromlist([1])
+assert exported_fromlist == array("i", [9])
+exported_fromlist_view.release()
+
+with assert_raises(TypeError) as error:
+    ArraySubclass("i").fromlist(list=[])
+assert str(error.exception) == "array.fromlist() takes no keyword arguments"
+with assert_raises(TypeError) as error:
+    array("i").fromlist()
+assert str(error.exception) == "array.fromlist() takes exactly one argument (0 given)"
+with assert_raises(TypeError) as error:
+    array("i").fromlist([], [])
+assert str(error.exception) == "array.fromlist() takes exactly one argument (2 given)"
+
+# PyPy decode_index4(w_idx, self) and CPython 3.14 array_subscr /
+# array_ass_subscr read the receiver length after an index conversion.  The
+# callback can resize and collect the receiver, so negative indexes follow the
+# new tail on get, set, and delete.
+indexed = array("i", [1, 2])
+
+
+class GrowingSubscriptionIndex:
+    def __index__(self):
+        indexed.append(3)
+        gc.collect()
+        return -1
+
+
+assert indexed[GrowingSubscriptionIndex()] == 3
+assert indexed == array("i", [1, 2, 3])
+
+indexed = array("i", [1, 2])
+indexed[GrowingSubscriptionIndex()] = 9
+assert indexed == array("i", [1, 2, 9])
+
+indexed = array("i", [1, 2])
+del indexed[GrowingSubscriptionIndex()]
+assert indexed == array("i", [1, 2])
+
+for operation in ("get", "delete"):
+    indexed = array("i", [1, 2])
+
+    class ClearingSubscriptionIndex:
+        def __index__(self):
+            indexed.clear()
+            return 0
+
+    with assert_raises(IndexError) as error:
+        if operation == "get":
+            indexed[ClearingSubscriptionIndex()]
+        else:
+            del indexed[ClearingSubscriptionIndex()]
+    expected = (
+        "array index out of range"
+        if operation == "get"
+        else "array assignment index out of range"
+    )
+    assert str(error.exception) == expected
+    assert indexed == array("i")
+
+# PyPy decode_index4 keeps the original operand for overflow reporting.
+# Python 3.14's array boundary selects IndexError and has its own no-index-slot
+# TypeError, while an existing __index__ slot still runs normally.
+class HugeSubscriptionIndex:
+    def __index__(self):
+        return 1 << 200
+
+
+for key, source_type in ((1 << 200, "int"), (HugeSubscriptionIndex(), "HugeSubscriptionIndex")):
+    for operation in ("get", "set", "delete"):
+        indexed = array("i", [1, 2])
+        with assert_raises(IndexError) as error:
+            if operation == "get":
+                indexed[key]
+            elif operation == "set":
+                indexed[key] = 9
+            else:
+                del indexed[key]
+        assert str(error.exception) == (
+            f"cannot fit '{source_type}' into an index-sized integer"
+        )
+        assert indexed == array("i", [1, 2])
+
+for operation in ("get", "set", "delete"):
+    indexed = array("i", [1, 2])
+    with assert_raises(TypeError) as error:
+        if operation == "get":
+            indexed[None]
+        elif operation == "set":
+            indexed[None] = 9
+        else:
+            del indexed[None]
+    assert str(error.exception) == "array indices must be integers"
+    assert indexed == array("i", [1, 2])
+
+# W_SliceObject.unpack likewise runs every bound conversion before
+# adjust_indices reads self.len.  A newly appended last item is therefore the
+# item selected by a -1 lower bound.
+class GrowingSliceStart:
+    def __index__(self):
+        sliced.append(3)
+        gc.collect()
+        return -1
+
+
+sliced = array("i", [1, 2])
+assert sliced[GrowingSliceStart() :] == array("i", [3])
+assert sliced == array("i", [1, 2, 3])
+
+sliced = array("i", [1, 2])
+sliced[GrowingSliceStart() :] = array("i", [9])
+assert sliced == array("i", [1, 2, 9])
+
+sliced = array("i", [1, 2])
+del sliced[GrowingSliceStart() :]
+assert sliced == array("i", [1, 2])
 
 # slice assignment step overflow behaviour test
 T = "I"
@@ -160,3 +927,360 @@ partial = array("i")
 with assert_raises(ValueError):
     partial.fromfile(BytesIO(b"\x01\x00\x00\x00X"), 2)
 assert partial == array("i")
+
+# PyPy's @unwrap_spec(n=int) completes before descr_fromfile reads itemsize;
+# the count and read callbacks may both mutate the rooted receiver.
+fromfile_target = array("i", [1])
+
+
+class GrowingFromfileCount:
+    def __index__(self):
+        fromfile_target.append(2)
+        gc.collect()
+        return 1
+
+
+class ReenteringReader:
+    def read(self, size):
+        assert size == array("i").itemsize
+        fromfile_target.append(3)
+        gc.collect()
+        return array("i", [4]).tobytes()
+
+
+fromfile_target.fromfile(ReenteringReader(), GrowingFromfileCount())
+assert fromfile_target == array("i", [1, 2, 3, 4])
+
+for count in (1 << 200, -(1 << 200)):
+    with assert_raises(OverflowError) as error:
+        array("i").fromfile(BytesIO(), count)
+    assert str(error.exception) == "Python int too large to convert to C ssize_t"
+
+
+class MustNotRead:
+    def __init__(self):
+        self.called = False
+
+    def read(self, size):
+        self.called = True
+        return b""
+
+
+for typecode in ("h", "q"):
+    product_overflow = array(typecode)
+    unread = MustNotRead()
+    with assert_raises(MemoryError) as error:
+        product_overflow.fromfile(
+            unread, sys.maxsize // product_overflow.itemsize + 1
+        )
+    assert str(error.exception) == ""
+    assert not unread.called
+
+# As in PyPy, frombytes processes an aligned result before the EOF check.  The
+# 3.14 boundary treats both short and over-long reads as unequal and reports
+# its byte-oriented EOFError sentence after retaining every complete item.
+short_read = array("i")
+with assert_raises(EOFError) as error:
+    short_read.fromfile(BytesIO(array("i", [5]).tobytes()), 2)
+assert str(error.exception) == "read() didn't return enough bytes"
+assert short_read == array("i", [5])
+
+
+class OverReader:
+    def read(self, size):
+        return array("i", [6, 7]).tobytes()
+
+
+over_read = array("i")
+with assert_raises(EOFError) as error:
+    over_read.fromfile(OverReader(), 1)
+assert str(error.exception) == "read() didn't return enough bytes"
+assert over_read == array("i", [6, 7])
+
+# PyPy descr_frombytes acquires BUF_SIMPLE, so memoryview and array exporters
+# participate alongside bytes/bytearray.  The 3.14 boundary additionally
+# requires the exporter's own itemsize to be one.
+buffer_array = array("B")
+buffer_array.frombytes(memoryview(b"\x01\x02"))
+buffer_array.frombytes(array("B", [3, 4]))
+assert buffer_array == array("B", [1, 2, 3, 4])
+
+with assert_raises(BufferError) as error:
+    array("B").frombytes(memoryview(b"\x01\x02\x03\x04")[::2])
+assert str(error.exception) == "memoryview: underlying buffer is not C-contiguous"
+
+for typed_source in (array("i", [1]), memoryview(array("i", [1]))):
+    with assert_raises(TypeError) as error:
+        array("B").frombytes(typed_source)
+    assert str(error.exception) == "a bytes-like object is required"
+
+# `_frombytes` validates byte alignment and the zero-length fast path before
+# attempting a resize, even while the receiver is exporting a view.
+exported_frombytes = array("i", [1])
+exported_frombytes_view = memoryview(exported_frombytes)
+exported_frombytes.frombytes(b"")
+with assert_raises(ValueError) as error:
+    exported_frombytes.frombytes(b"x")
+assert str(error.exception) == "bytes length not a multiple of item size"
+assert exported_frombytes == array("i", [1])
+exported_frombytes_view.release()
+
+self_frombytes = array("B", [1, 2])
+with assert_raises(BufferError) as error:
+    self_frombytes.frombytes(self_frombytes)
+assert str(error.exception) == "cannot resize an array that is exporting buffers"
+assert self_frombytes == array("B", [1, 2])
+
+# PEP 688 exporters use the same acquired view and paired release callback.
+release_target = array("B")
+
+
+class ReleasingByteExporter:
+    def __buffer__(self, flags):
+        return memoryview(b"\x05")
+
+    def __release_buffer__(self, view):
+        release_target.append(6)
+
+
+release_target.frombytes(ReleasingByteExporter())
+assert release_target == array("B", [5, 6])
+
+# `fromunicode` validates its unicode argument and receiver kind before the
+# resize boundary.  Empty input follows PyPy's no-append path and remains
+# valid while a buffer export is alive.
+exported_nonunicode = array("i", [1])
+exported_nonunicode_view = memoryview(exported_nonunicode)
+with assert_raises(TypeError) as error:
+    exported_nonunicode.fromunicode(1)
+assert str(error.exception) == "fromunicode() argument must be str, not int"
+with assert_raises(ValueError) as error:
+    exported_nonunicode.fromunicode("x")
+assert (
+    str(error.exception)
+    == "fromunicode() may only be called on unicode type arrays ('u' or 'w')"
+)
+exported_nonunicode_view.release()
+
+exported_unicode = array("u")
+exported_unicode_view = memoryview(exported_unicode)
+assert exported_unicode.fromunicode("") is None
+with assert_raises(TypeError) as error:
+    exported_unicode.fromunicode(1)
+assert str(error.exception) == "fromunicode() argument must be str, not int"
+with assert_raises(BufferError) as error:
+    exported_unicode.fromunicode("x")
+assert str(error.exception) == "cannot resize an array that is exporting buffers"
+exported_unicode_view.release()
+exported_unicode.fromunicode("x")
+assert exported_unicode.tounicode() == "x"
+
+# PyPy `W_ArrayBase.descr_repr` reads `space.type(self).getname(space)`: the
+# exact builtin uses its public `__name__` (`array`, not its qualified TypeDef
+# registration name `array.array`), and a subclass uses its current name.
+# There is no separate `__str__` entry in either upstream; object
+# stringification falls back to the same repr slot.
+assert "__str__" not in array.__dict__
+assert repr(array("i")) == "array('i')"
+assert repr(array("i", [1, 2])) == "array('i', [1, 2])"
+assert repr(array("u", "x")) == "array('u', 'x')"
+
+
+class NamedArray(array):
+    pass
+
+
+empty_named = NamedArray("i")
+items_named = NamedArray("i", [1, 2])
+unicode_named = NamedArray("u", "x")
+assert repr(empty_named) == "NamedArray('i')"
+assert repr(items_named) == "NamedArray('i', [1, 2])"
+assert repr(unicode_named) == "NamedArray('u', 'x')"
+assert str(items_named) == "NamedArray('i', [1, 2])"
+assert repr([items_named]) == "[NamedArray('i', [1, 2])]"
+
+NamedArray.__name__ = "RenamedArray"
+assert repr(empty_named) == "RenamedArray('i')"
+assert repr(items_named) == "RenamedArray('i', [1, 2])"
+
+
+class OverrideReprArray(array):
+    def __repr__(self):
+        return "OVERRIDDEN ARRAY REPR"
+
+    def __str__(self):
+        return "OVERRIDDEN ARRAY STR"
+
+
+overridden_repr = OverrideReprArray("i", [1])
+assert repr(overridden_repr) == "OVERRIDDEN ARRAY REPR"
+assert repr([overridden_repr]) == "[OVERRIDDEN ARRAY REPR]"
+assert str(overridden_repr) == "OVERRIDDEN ARRAY STR"
+# Calling the base descriptor directly still formats the storage with the
+# concrete class name, rather than redispatching the override.
+assert array.__repr__(overridden_repr) == "OverrideReprArray('i', [1])"
+
+
+class OnlyReprArray(array):
+    def __repr__(self):
+        return "ONLY ARRAY REPR"
+
+
+only_repr = OnlyReprArray("i", [1])
+assert repr(only_repr) == "ONLY ARRAY REPR"
+assert str(only_repr) == "ONLY ARRAY REPR"
+
+# A fresh array owns no raw allocation.  Rust's empty-Vec dangling sentinel
+# must not leak through PyPy's public `_buffer_as_unsigned` equivalent.
+fresh_buffer_info = array("i")
+assert fresh_buffer_info.buffer_info() == (0, 0)
+fresh_buffer_info.frombytes(b"")
+assert fresh_buffer_info.buffer_info() == (0, 0)
+fresh_buffer_info.append(1)
+buffer_address, buffer_length = fresh_buffer_info.buffer_info()
+assert buffer_address > 0
+assert buffer_length == 1
+
+
+def raw_unicode_array(typecode, *codepoints):
+    value = array(typecode)
+    value.frombytes(b"".join(code.to_bytes(4, sys.byteorder) for code in codepoints))
+    return value
+
+
+# PyPy's `W_Array.w_getitem` validates raw unicode storage.  CPython 3.14
+# reaches the same boundary through `PyUnicode_FromOrdinal`, whose exact
+# ValueError is the public contract.  Every item-producing operation must use
+# that boundary rather than silently turning an invalid scalar into "".
+invalid_item_message = "chr() arg not in range(0x110000)"
+for unicode_typecode in ("u", "w"):
+    for operation in (
+        lambda value: value[0],
+        lambda value: value.tolist(),
+        lambda value: list(value),
+        lambda value: value.count("x"),
+        lambda value: value.index("x"),
+        lambda value: value.remove("x"),
+        lambda value: "x" in value,
+    ):
+        invalid_unicode = raw_unicode_array(unicode_typecode, 0x110000)
+        with assert_raises(ValueError) as error:
+            operation(invalid_unicode)
+        assert str(error.exception) == invalid_item_message
+        assert invalid_unicode.tobytes() == (0x110000).to_bytes(4, sys.byteorder)
+
+    # `arrayiter_next` advances its cursor as it calls the item getter: the
+    # malformed slot raises once, then the following valid slot is still next.
+    invalid_unicode = raw_unicode_array(unicode_typecode, 0x110000, ord("A"))
+    invalid_iterator = iter(invalid_unicode)
+    with assert_raises(ValueError) as error:
+        next(invalid_iterator)
+    assert str(error.exception) == invalid_item_message
+    assert next(invalid_iterator) == "A"
+    with assert_raises(StopIteration):
+        next(invalid_iterator)
+
+    # The generic reverse-sequence iterator follows both upstreams here: an
+    # item error clears its source instead of leaving the earlier slot live.
+    reverse_invalid = raw_unicode_array(unicode_typecode, ord("A"), 0x110000)
+    reverse_iterator = reversed(reverse_invalid)
+    with assert_raises(ValueError) as error:
+        next(reverse_iterator)
+    assert str(error.exception) == invalid_item_message
+    with assert_raises(StopIteration):
+        next(reverse_iterator)
+
+    # Both upstreams compare same-kind unicode arrays as raw integers, so an
+    # invalid stored scalar remains comparable without being boxed as str.
+    invalid_left = raw_unicode_array(unicode_typecode, 0x110000)
+    invalid_equal = raw_unicode_array(unicode_typecode, 0x110000)
+    invalid_greater = raw_unicode_array(unicode_typecode, 0x110001)
+    assert invalid_left == invalid_equal
+    assert invalid_left < invalid_greater
+    all_bits = raw_unicode_array(unicode_typecode, 0xFFFFFFFF)
+    zero = raw_unicode_array(unicode_typecode, 0)
+    if unicode_typecode == "u":
+        assert all_bits < zero  # signed wchar_t
+    else:
+        assert all_bits > zero  # unsigned Py_UCS4
+
+    # `pop` obtains the item before attempting the resize.  The ValueError
+    # therefore wins even with a live export, and neither failure mutates it.
+    invalid_unicode = raw_unicode_array(unicode_typecode, 0x110000)
+    invalid_export = memoryview(invalid_unicode)
+    with assert_raises(ValueError) as error:
+        invalid_unicode.pop()
+    assert str(error.exception) == invalid_item_message
+    assert len(invalid_unicode) == 1
+    invalid_export.release()
+
+# Different descriptors take the ordinary item-boxing comparison path.
+invalid_u = raw_unicode_array("u", 0x110000)
+invalid_w = raw_unicode_array("w", 0x110000)
+with assert_raises(ValueError) as error:
+    invalid_u == invalid_w
+assert str(error.exception) == invalid_item_message
+assert array("u", "A") != array("I", [ord("A")])
+with assert_raises(TypeError):
+    array("u", "A") < array("I", [ord("A")])
+
+# `u.tounicode()` follows PyPy's wchar conversion: surrogates survive, while
+# the first value above U+10ffff reports the wide-char ValueError verbatim.
+with assert_raises(ValueError) as error:
+    array("i").tounicode()
+assert str(error.exception) == (
+    "tounicode() may only be called on unicode type arrays ('u' or 'w')"
+)
+assert raw_unicode_array("u", 0xD800).tounicode() == "\ud800"
+invalid_u = raw_unicode_array("u", 0x110000)
+invalid_wide_message = (
+    "character U+110000 is not in range [U+0000; U+10ffff]"
+)
+for operation in (lambda: invalid_u.tounicode(), lambda: repr(invalid_u)):
+    with assert_raises(ValueError) as error:
+        operation()
+    assert str(error.exception) == invalid_wide_message
+
+# `w.tounicode()` is the native UTF-32 decoder in 3.14: it consumes a BOM,
+# rejects surrogates, and publishes the selected endian codec and four-byte
+# failure span on UnicodeDecodeError.
+assert array("w", "\ufeffA").tounicode() == "A"
+native_utf32 = "utf-32-" + ("le" if sys.byteorder == "little" else "be")
+for codepoint, reason in (
+    (0xD800, "code point in surrogate code point range(0xd800, 0xe000)"),
+    (0x110000, "code point not in range(0x110000)"),
+):
+    invalid_bytes = (
+        ord("A").to_bytes(4, sys.byteorder)
+        + codepoint.to_bytes(4, sys.byteorder)
+        + ord("B").to_bytes(4, sys.byteorder)
+    )
+    invalid_w = array("w")
+    invalid_w.frombytes(invalid_bytes)
+    for operation in (lambda: invalid_w.tounicode(), lambda: repr(invalid_w)):
+        with assert_raises(UnicodeDecodeError) as error:
+            operation()
+        exception = error.exception
+        assert exception.encoding == native_utf32
+        assert exception.object == invalid_bytes
+        assert exception.start == 4
+        assert exception.end == 8
+        assert exception.reason == reason
+
+# A reversed BOM changes both decoding order and the codec name carried by
+# the error; the native-order array storage is deliberately treated as bytes
+# by `PyUnicode_DecodeUTF32` at this boundary.
+opposite_order = "big" if sys.byteorder == "little" else "little"
+opposite_bytes = (0xFEFF).to_bytes(4, opposite_order) + (0x110000).to_bytes(
+    4, opposite_order
+)
+opposite_w = array("w")
+opposite_w.frombytes(opposite_bytes)
+with assert_raises(UnicodeDecodeError) as error:
+    opposite_w.tounicode()
+assert error.exception.encoding == "utf-32-" + (
+    "be" if opposite_order == "big" else "le"
+)
+assert error.exception.object == opposite_bytes
+assert error.exception.start == 4
+assert error.exception.end == 8

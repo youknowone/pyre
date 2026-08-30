@@ -148,20 +148,50 @@ fn unicode_char_w(w: PyObjectRef) -> Result<u32, PyError> {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Core mutation helpers.
+// Element unpacking.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Append one packed value (`append` / single-element `extend`).
-fn array_append(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
-    array_check_resize(obj)?;
-    let tc = unsafe { arr::w_array_typecode(obj) };
-    let mut buf: Bytes = [0u8; 8];
-    let n = pack_into(tc, w_value, &mut buf)?;
-    let vec = unsafe { arr::w_array_vec_mut(obj) };
-    vec.extend_from_slice(&buf[..n]);
-    Ok(())
+/// PyPy `W_Array.w_getitem`: box one live array element, with the raw-integer
+/// mode `compare_arrays` uses for unicode items.
+///
+/// [3.14-spec] PyPy reports its array-specific out-of-range sentence here.
+/// `arraymodule.c` `u_getitem` / `w_getitem` at v3.14.6 instead call
+/// `PyUnicode_FromOrdinal`, whose observable error is the `chr()` sentence
+/// below. Keep PyPy's `integer_instead_of_char` shape: same-descriptor array
+/// comparisons use it to compare even malformed raw code points without
+/// trying to construct a Python string.
+pub(crate) fn array_w_getitem(
+    obj: PyObjectRef,
+    index: usize,
+    integer_instead_of_char: bool,
+) -> PyResult {
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+    if matches!(typecode, b'u' | b'w') {
+        let itemsize = unsafe { arr::w_array_itemsize(obj) };
+        let offset = index * itemsize;
+        let bytes = unsafe { arr::w_array_bytes(obj) };
+        let code = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        if integer_instead_of_char {
+            // PyPy casts the `u` wchar_t through `lltype.Signed`, matching
+            // v3.14.6's `u_compareitems(wchar_t)`. The 3.14 `w` descriptor is
+            // Py_UCS4 and therefore keeps the full unsigned value.
+            let value = if typecode == b'u' {
+                i32::from_ne_bytes(code.to_ne_bytes()) as i64
+            } else {
+                code as i64
+            };
+            return Ok(pyre_object::w_int_new(value));
+        }
+        let point = CodePoint::from_u32(code)
+            .ok_or_else(|| PyError::value_error("chr() arg not in range(0x110000)"))?;
+        let mut one = Wtf8Buf::new();
+        one.push(point);
+        return Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(one));
+    }
+    Ok(unsafe { arr::w_array_unpack_item(obj, index) })
 }
 
+// Core mutation helpers.
 fn array_check_resize(obj: PyObjectRef) -> Result<(), PyError> {
     if unsafe { arr::w_array_exports(obj) } != 0 {
         Err(PyError::new(
@@ -173,15 +203,77 @@ fn array_check_resize(obj: PyObjectRef) -> Result<(), PyError> {
     }
 }
 
-/// Extend from any iterable, packing each element (`descr_extend`).
+/// Append one item through the public 3.14 `ins1` conversion sequence.
+///
+/// PyPy `W_Array.descr_append` converts `w_x` before `setlen`.
+/// [3.14-spec] CPython v3.14.6 `Modules/arraymodule.c` `ins1` preserves that
+/// ordering, but validates once at index -1, resizes from the length captured
+/// before validation, then converts once more for the actual slot.  `append`
+/// and `array_iter_extend` share this helper so callbacks see the same receiver
+/// state on both paths.
+fn array_append_value(obj: PyObjectRef, w_value: PyObjectRef) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_value]);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let old_len = unsafe { arr::w_array_len(obj) };
+    let itemsize = unsafe { arr::w_array_itemsize(obj) };
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+
+    let mut validated: Bytes = [0; 8];
+    pack_into(
+        typecode,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        &mut validated,
+    )?;
+
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    array_check_resize(obj)?;
+    let new_len = old_len
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(itemsize))
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    if new_len > vec.len() {
+        vec.try_reserve(new_len - vec.len())
+            .map_err(|_| PyError::memory_error(""))?;
+    }
+    vec.resize(new_len, 0);
+
+    let mut packed: Bytes = [0; 8];
+    let packed_len = pack_into(
+        typecode,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        &mut packed,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    if old_len < unsafe { arr::w_array_len(obj) } {
+        // CPython writes through the pointer captured after resize even when
+        // the second conversion resized the receiver.  Preserve the visible
+        // slot write while it remains live, without reproducing a stale raw
+        // write when the callback cleared the receiver.
+        let start = old_len * itemsize;
+        let vec = unsafe { arr::w_array_vec_mut(obj) };
+        vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
+    }
+    Ok(())
+}
+
+/// Extend from any iterable (`W_Array.extend` / `_fromiterable`).
 fn array_extend_iterable(
     obj: PyObjectRef,
     w_iterable: PyObjectRef,
     reject_different_array: bool,
 ) -> Result<(), PyError> {
-    array_check_resize(obj)?;
-    // A fast path for same-typecode arrays: raw byte concat.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_iterable]);
+
+    // PyPy `W_Array.extend` handles an array source before `_fromiterable`:
+    // compare the descriptors, size once, then raw-copy the source.  Like its
+    // `oldlen` / `new` loop, keep the original source length when self is also
+    // the iterable and copy from the resized receiver's leading range.
+    let w_iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if unsafe { arr::is_array(w_iterable) } {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
         let dst_tc = unsafe { arr::w_array_typecode(obj) };
         let src_tc = unsafe { arr::w_array_typecode(w_iterable) };
         if dst_tc != src_tc {
@@ -191,25 +283,66 @@ fn array_extend_iterable(
                 ));
             }
         } else {
-            let src_bytes = unsafe { arr::w_array_bytes(w_iterable) }.to_vec();
+            let src_len = unsafe { arr::w_array_bytes(w_iterable) }.len();
+            // CPython `array_do_extend` treats an empty source as a true
+            // no-op, so it succeeds even while the receiver exports a buffer.
+            if src_len == 0 {
+                return Ok(());
+            }
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            array_check_resize(obj)?;
+            let dst_len = unsafe { arr::w_array_bytes(obj) }.len();
+            let new_len = dst_len
+                .checked_add(src_len)
+                .ok_or_else(|| PyError::memory_error(""))?;
+            if std::ptr::eq(obj, w_iterable) {
+                let vec = unsafe { arr::w_array_vec_mut(obj) };
+                vec.try_reserve(src_len)
+                    .map_err(|_| PyError::memory_error(""))?;
+                vec.resize(new_len, 0);
+                // PyPy copies `srcbuf[0:new]` into the newly sized receiver;
+                // CPython `array_do_extend` does the same with `memcpy`.
+                // The source and destination byte ranges are adjacent.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        vec.as_ptr(),
+                        vec.as_mut_ptr().add(dst_len),
+                        src_len,
+                    )
+                };
+                return Ok(());
+            }
+
+            // The objects are distinct and no Python runs between these two
+            // borrows, so resizing the destination cannot move the source.
+            let src_bytes = unsafe { arr::w_array_bytes(w_iterable) };
             let vec = unsafe { arr::w_array_vec_mut(obj) };
-            vec.extend_from_slice(&src_bytes);
+            vec.try_reserve(src_len)
+                .map_err(|_| PyError::memory_error(""))?;
+            vec.extend_from_slice(src_bytes);
             return Ok(());
         }
     }
-    // The iterator is minted here and nothing else refers to it, while `next`
-    // and `array_append` both run Python.  An iterator and an array are stable
-    // allocations, so neither address goes stale; what the scope buys is that
-    // an unmarked block is not swept out from under the loop.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj = pyre_object::gc_roots::pin_root(obj);
+
+    // PyPy `_fromiterable` and CPython `array_iter_extend` mint the iterator
+    // before attempting any resize.  Consequently an empty iterable remains
+    // a no-op under a live export, and iterator side effects precede the first
+    // per-item resize check.
+    let w_iterable = pyre_object::gc_roots::shadow_stack_get(base + 1);
     let w_iter = crate::baseobjspace::iter(w_iterable)?;
     let w_iter = pyre_object::gc_roots::pin_root(w_iter);
     loop {
         match crate::baseobjspace::next(w_iter) {
-            Ok(w_item) => array_append(obj, w_item)?,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Ok(w_item) => {
+                let obj = pyre_object::gc_roots::shadow_stack_get(base);
+                array_append_value(obj, w_item)?;
+            }
+            Err(e) => {
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     Ok(())
@@ -217,14 +350,23 @@ fn array_extend_iterable(
 
 /// Append raw bytes (`frombytes`); length must be a multiple of itemsize.
 fn array_frombytes(obj: PyObjectRef, bytes: &[u8]) -> Result<(), PyError> {
-    array_check_resize(obj)?;
     let isz = unsafe { arr::w_array_itemsize(obj) };
     if !bytes.len().is_multiple_of(isz) {
         return Err(PyError::value_error(
             "bytes length not a multiple of item size",
         ));
     }
+    // PyPy `_frombytes` returns before `setlen` when the copied buffer is
+    // empty; CPython's `frombytes` likewise skips `array_resize` for n == 0.
+    // An empty append therefore succeeds under an outstanding export, and a
+    // malformed length above wins over that export's resize error.
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    array_check_resize(obj)?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.try_reserve(bytes.len())
+        .map_err(|_| PyError::memory_error(""))?;
     vec.extend_from_slice(bytes);
     Ok(())
 }
@@ -350,17 +492,34 @@ fn array_descr_new(args: &[PyObjectRef]) -> PyResult {
 
 /// `fromunicode` — append code points of a str to a `'u'` array.
 fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError> {
-    array_check_resize(obj)?;
+    // [3.14-spec] Argument Clinic's `unicode` converter runs before
+    // `array_array_fromunicode_impl`, whereas PyPy's `descr_fromunicode`
+    // checks the receiver typecode before entering `fromsequence`.
+    if !unsafe { pyre_object::is_str(w_str) } {
+        return Err(PyError::type_error(format!(
+            "fromunicode() argument must be str, not {}",
+            crate::type_methods::clinic_arg_type_name(w_str)
+        )));
+    }
     if !matches!(unsafe { arr::w_array_typecode(obj) }, b'u' | b'w') {
         return Err(PyError::value_error(
-            "fromunicode() may only be called on unicode type arrays",
+            "fromunicode() may only be called on unicode type arrays ('u' or 'w')",
         ));
     }
-    if !unsafe { pyre_object::is_str(w_str) } {
-        return Err(PyError::type_error("fromunicode() argument must be str"));
-    }
     let s = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_str) };
+    let count = s.code_points().count();
+    // PyPy's `fromsequence` performs no resize for an empty unicode string;
+    // CPython's same-size `array_resize` also accepts it under a live export.
+    if count == 0 {
+        return Ok(());
+    }
+    array_check_resize(obj)?;
+    let byte_count = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| PyError::memory_error(""))?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.try_reserve(byte_count)
+        .map_err(|_| PyError::memory_error(""))?;
     for cp in s.code_points() {
         vec.extend_from_slice(&cp.to_u32().to_ne_bytes());
     }
@@ -371,9 +530,45 @@ fn array_fromunicode(obj: PyObjectRef, w_str: PyObjectRef) -> Result<(), PyError
 // Indexing.
 // ──────────────────────────────────────────────────────────────────────
 
-/// Normalize an integer index against `len`, raising IndexError out of range.
-fn index_in_range(w_index: PyObjectRef, len: usize, what: &str) -> Result<usize, PyError> {
-    let mut i = crate::builtins::getindex_w(w_index)?;
+/// Normalize an integer index against the receiver's live length.
+///
+/// PyPy `decode_index4(w_idx, self)` and CPython 3.14
+/// `array_subscr` / `array_ass_subscr` both run `__index__` before reading the
+/// length used for negative-index adjustment and bounds.  The conversion can
+/// resize and collect either input, so own both through that boundary and read
+/// the receiver back before consulting its length.
+fn index_in_range(obj: PyObjectRef, w_index: PyObjectRef, what: &str) -> Result<usize, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_index]);
+    let w_index = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    if unsafe {
+        !pyre_object::pyobject::is_int_or_long(w_index)
+            && crate::baseobjspace::lookup(w_index, "__index__").is_none()
+    } {
+        // PyPy `ObjSpace.decode_index4` enters `getindex_w` only after the
+        // slice branch.  [3.14-spec] `arraymodule.c::array_subscr` and
+        // `array_ass_subscr` give the array-specific sentence to an operand
+        // with no index slot; an existing slot's own failure still escapes.
+        return Err(PyError::type_error("array indices must be integers"));
+    }
+    let w_indexed = crate::baseobjspace::space_index(w_index)?;
+    let mut i = match int_w(w_indexed) {
+        Ok(i) => i,
+        Err(error) if error.kind == PyErrorKind::OverflowError => {
+            // PyPy `ObjSpace.getindex_w` names the original operand when the
+            // converted integer does not fit.  [3.14-spec]
+            // `PyNumber_AsSsize_t(item, PyExc_IndexError)` changes only the
+            // exception class selected by the array subscription boundary.
+            return Err(PyError::new(
+                PyErrorKind::IndexError,
+                format!("cannot fit '{}' into an index-sized integer", unsafe {
+                    crate::baseobjspace::object_functionstr_type_name(w_index)
+                }),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    let len = unsafe { arr::w_array_len(pyre_object::gc_roots::shadow_stack_get(base)) };
     if i < 0 {
         i += len as i64;
     }
@@ -386,36 +581,38 @@ fn index_in_range(w_index: PyObjectRef, len: usize, what: &str) -> Result<usize,
     Ok(i as usize)
 }
 
-/// slice element count for `(start, stop, step)`.
-fn slice_length(start: i64, stop: i64, step: i64) -> i64 {
-    if step > 0 {
-        if stop > start {
-            (stop - start - 1) / step + 1
-        } else {
-            0
-        }
-    } else if start > stop {
-        (start - stop - 1) / (-step) + 1
-    } else {
-        0
-    }
+/// PyPy `W_SliceObject.unpack` followed by `adjust_indices(..., self.len)`.
+/// Bound conversions may resize the array, so the live length is deliberately
+/// read only after all three have completed.
+fn array_slice_indices(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Result<(i64, i64, i64, i64), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, key]);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let (start, stop, step) = crate::sliceobject::slice_unpack(
+        unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
+        unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
+        unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
+    )?;
+    let len = unsafe { arr::w_array_len(pyre_object::gc_roots::shadow_stack_get(base)) } as i64;
+    Ok(crate::sliceobject::slice_adjust_indices(
+        start, stop, step, len,
+    ))
 }
 
 fn array_getitem(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__getitem__")?;
-    let obj = args[0];
-    let key = args[1];
-    let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
-    let tc = unsafe { arr::w_array_typecode(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if unsafe { pyre_object::sliceobject::is_slice(key) } {
-        let (start, stop, step) = crate::sliceobject::indices3(
-            unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
-            len as i64,
-        )?;
-        let n = slice_length(start, stop, step);
+        let (start, _, step, n) = array_slice_indices(obj, key)?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let isz = unsafe { arr::w_array_itemsize(obj) };
+        let tc = unsafe { arr::w_array_typecode(obj) };
         let src = unsafe { arr::w_array_bytes(obj) }.to_vec();
         let mut out: Vec<u8> = Vec::with_capacity(n as usize * isz);
         let mut i = start;
@@ -428,18 +625,18 @@ fn array_getitem(args: &[PyObjectRef]) -> PyResult {
         }
         return Ok(arr::w_array_from_bytes(tc, isz as u8, out));
     }
-    let i = index_in_range(key, len, "array")?;
-    Ok(unsafe { arr::w_array_unpack_item(obj, i) })
+    let i = index_in_range(obj, key, "array")?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    array_w_getitem(obj, i, false)
 }
 
 fn array_setitem(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 3, "array.__setitem__")?;
-    let obj = args[0];
-    let key = args[1];
-    let w_value = args[2];
-    let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
-    let tc = unsafe { arr::w_array_typecode(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let w_value = pyre_object::gc_roots::shadow_stack_get(base + 2);
     if unsafe { pyre_object::sliceobject::is_slice(key) } {
         // `array_ass_subscr` names the operand it was handed; an array of
         // another kind passed that test and is refused by `PyErr_BadArgument`
@@ -450,18 +647,16 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
                 unsafe { pyre_object::type_name_of(w_value) }
             )));
         }
+        let tc = unsafe { arr::w_array_typecode(obj) };
         if unsafe { arr::w_array_typecode(w_value) } != tc {
             return Err(PyError::type_error(
                 "bad argument type for built-in operation",
             ));
         }
-        let (start, stop, step) = crate::sliceobject::indices3(
-            unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
-            len as i64,
-        )?;
-        let n = slice_length(start, stop, step);
+        let (start, stop, step, n) = array_slice_indices(obj, key)?;
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let w_value = pyre_object::gc_roots::shadow_stack_get(base + 2);
+        let isz = unsafe { arr::w_array_itemsize(obj) };
         let src = unsafe { arr::w_array_bytes(w_value) }.to_vec();
         let src_len = src.len() / isz;
         if step == 1 {
@@ -492,12 +687,20 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
         }
         return Ok(pyre_object::w_none());
     }
-    let i = index_in_range(key, len, "array")?;
+    let i = index_in_range(obj, key, "array assignment")?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let tc = unsafe { arr::w_array_typecode(obj) };
+    let isz = unsafe { arr::w_array_itemsize(obj) };
     let mut buf: Bytes = [0u8; 8];
     // pack_into may run user code (`__index__`/`__int__`/`__float__`) that
     // resizes the array mid-assignment (gh-142555); re-validate the slot
     // against the current length before writing.
-    let n = pack_into(tc, w_value, &mut buf)?;
+    let n = pack_into(
+        tc,
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &mut buf,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     let end = i * isz + n;
     if end > vec.len() {
@@ -512,24 +715,21 @@ fn array_setitem(args: &[PyObjectRef]) -> PyResult {
 
 fn array_delitem(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__delitem__")?;
-    let obj = args[0];
-    let key = args[1];
-    let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let key = pyre_object::gc_roots::shadow_stack_get(base + 1);
     if unsafe { pyre_object::sliceobject::is_slice(key) } {
-        let (start, stop, step) = crate::sliceobject::indices3(
-            unsafe { pyre_object::sliceobject::w_slice_get_start(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_stop(key) },
-            unsafe { pyre_object::sliceobject::w_slice_get_step(key) },
-            len as i64,
-        )?;
-        let n = slice_length(start, stop, step);
+        let (start, _, step, n) = array_slice_indices(obj, key)?;
         if n == 0 {
             // No elements removed: leave the backing storage (and any exported
             // views over it) untouched rather than rebuilding the buffer.
             return Ok(pyre_object::w_none());
         }
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
         array_check_resize(obj)?;
+        let len = unsafe { arr::w_array_len(obj) };
+        let isz = unsafe { arr::w_array_itemsize(obj) };
         // Collect element indices to drop, then rebuild the buffer.
         let mut drop_set: Vec<usize> = Vec::with_capacity(n as usize);
         let mut i = start;
@@ -554,8 +754,10 @@ fn array_delitem(args: &[PyObjectRef]) -> PyResult {
         *vec = out;
         return Ok(pyre_object::w_none());
     }
-    let i = index_in_range(key, len, "array")?;
+    let i = index_in_range(obj, key, "array assignment")?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     array_check_resize(obj)?;
+    let isz = unsafe { arr::w_array_itemsize(obj) };
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     vec.drain(i * isz..i * isz + isz);
     Ok(pyre_object::w_none())
@@ -610,47 +812,148 @@ fn check_arity_range(
 }
 
 fn array_append_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.append")?;
-    array_append(args[0], args[1])?;
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "append")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.append() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+
+    array_append_value(args[0], args[1])?;
     Ok(pyre_object::w_none())
 }
 
 fn array_extend_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.extend")?;
-    array_extend_iterable(args[0], args[1], true)?;
+    let (positional, kwargs) = crate::builtins::split_builtin_kwargs(args);
+    let positional_given = if positional.is_empty() {
+        0
+    } else {
+        positional.len() - 1
+    };
+    let supplied = positional_given + crate::builtins::real_kwarg_count(kwargs);
+    // [3.14-spec] CPython v3.14.6 `array_array_extend`'s positional-only
+    // clinic gateway checks the required positional count before diagnosing
+    // its blank keyword slot; PyPy's interp2app gateway reports its own owner.
+    if positional_given == 0 {
+        return Err(PyError::type_error(
+            "extend() takes exactly 1 positional argument (0 given)",
+        ));
+    }
+    if supplied > 1 {
+        return Err(PyError::type_error(format!(
+            "extend() takes at most 1 argument ({supplied} given)"
+        )));
+    }
+    array_extend_iterable(positional[0], positional[1], true)?;
     Ok(pyre_object::w_none())
 }
 
+/// The ssize gateway for `array.insert` / `array.pop` / `array.fromfile`.
+///
+/// PyPy's `W_ArrayBase.descr_insert` and `descr_pop` use `@unwrap_spec(...=int)`
+/// and `descr_fromfile` uses `@unwrap_spec(n=int)` before entering the method
+/// body.  CPython 3.14 exposes the narrower `__index__` protocol and its
+/// Py_ssize_t overflow wording, so keep PyPy's gateway-before-body ordering
+/// while applying the 3.14 observable contract.
+fn array_ssize_index_w(w_index: PyObjectRef) -> Result<i64, PyError> {
+    let w_index = crate::baseobjspace::space_index(w_index)?;
+    crate::baseobjspace::int_w(w_index).map_err(|error| {
+        if error.kind == PyErrorKind::OverflowError
+            && error.message_text() == "int too large to convert to int"
+        {
+            PyError::overflow_error("Python int too large to convert to C ssize_t")
+        } else {
+            error
+        }
+    })
+}
+
 fn array_insert_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 3, "array.insert")?;
-    let obj = args[0];
-    array_check_resize(obj)?;
-    let len = unsafe { arr::w_array_len(obj) };
-    let isz = unsafe { arr::w_array_itemsize(obj) };
-    let tc = unsafe { arr::w_array_typecode(obj) };
-    // Clamp index like list.insert.
-    let mut i = crate::builtins::getindex_w(args[1])?;
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "insert")?;
+    crate::type_methods::arity_exact_unpack(args, "insert", 2)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    // `@unwrap_spec(idx=int)` runs before PyPy's `descr_insert` reads len.
+    let mut i = array_ssize_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let old_len = unsafe { arr::w_array_len(obj) };
     if i < 0 {
-        i += len as i64;
+        i += old_len as i64;
         if i < 0 {
             i = 0;
         }
     }
-    if i > len as i64 {
-        i = len as i64;
+    if i > old_len as i64 {
+        i = old_len as i64;
     }
-    let mut buf: Bytes = [0u8; 8];
-    let n = pack_into(tc, args[2], &mut buf)?;
+    let i = i as usize;
+
+    // PyPy `W_Array.descr_insert` converts `w_val` before `setlen`, then moves
+    // the tail and writes that converted value.  [3.14-spec] CPython v3.14.6
+    // `arraymodule.c::ins1` exposes the same pre-resize validation as append,
+    // but validates a second time after resizing and moving the tail.  Keep
+    // PyPy's gateway/index structure and reproduce that observable two-call
+    // sequence.  In particular, a first conversion may mutate the receiver;
+    // the resize still targets the length captured before it ran.
+    let tc = unsafe { arr::w_array_typecode(obj) };
+    let itemsize = unsafe { arr::w_array_itemsize(obj) };
+    let mut validated: Bytes = [0u8; 8];
+    pack_into(
+        tc,
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &mut validated,
+    )?;
+
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    array_check_resize(obj)?;
+    let new_bytes = old_len
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(itemsize))
+        .ok_or_else(|| PyError::memory_error(""))?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
-    let at = i as usize * isz;
-    vec.splice(at..at, buf[..n].iter().copied());
+    if new_bytes > vec.len() {
+        vec.try_reserve(new_bytes - vec.len())
+            .map_err(|_| PyError::memory_error(""))?;
+    }
+    vec.resize(new_bytes, 0);
+    let start = i * itemsize;
+    let end = old_len * itemsize;
+    if i != old_len {
+        vec.copy_within(start..end, start + itemsize);
+    }
+
+    let mut packed: Bytes = [0u8; 8];
+    let packed_len = pack_into(
+        tc,
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        &mut packed,
+    )?;
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    if i >= unsafe { arr::w_array_len(obj) } {
+        return Err(PyError::new(
+            PyErrorKind::IndexError,
+            "array assignment index out of range",
+        ));
+    }
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
     Ok(pyre_object::w_none())
 }
 
 fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity_range(args, 1, 2, "array.pop")?;
-    let obj = args[0];
-    array_check_resize(obj)?;
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "pop")?;
+    crate::type_methods::arity_at_most(args, "pop", 1)?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    // `@unwrap_spec(i=int)` runs before PyPy's `descr_pop`, including for an
+    // empty receiver.  Re-read the receiver after this user-code boundary.
+    let mut i = if args.len() >= 2 {
+        array_ssize_index_w(pyre_object::gc_roots::shadow_stack_get(base + 1))?
+    } else {
+        -1
+    };
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
     let len = unsafe { arr::w_array_len(obj) };
     if len == 0 {
         return Err(PyError::new(
@@ -658,11 +961,6 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
             "pop from empty array".to_string(),
         ));
     }
-    let mut i = if args.len() >= 2 {
-        crate::builtins::getindex_w(args[1])?
-    } else {
-        -1
-    };
     if i < 0 {
         i += len as i64;
     }
@@ -673,61 +971,123 @@ fn array_pop_method(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let isz = unsafe { arr::w_array_itemsize(obj) };
-    let w_val = unsafe { arr::w_array_unpack_item(obj, i as usize) };
+    let w_val = array_w_getitem(obj, i as usize, false)?;
+    // PyPy `W_Array.descr_pop` boxes the item before `setlen` checks exports;
+    // v3.14.6 `array_array_pop_impl` likewise calls `getarrayitem` before
+    // `array_del_slice`. An invalid unicode value therefore wins over a live
+    // export, and either error leaves the array untouched.
+    array_check_resize(obj)?;
     let vec = unsafe { arr::w_array_vec_mut(obj) };
     vec.drain(i as usize * isz..i as usize * isz + isz);
     Ok(w_val)
 }
 
 fn array_remove_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.remove")?;
-    let obj = args[0];
-    array_check_resize(obj)?;
-    let idx = array_find(obj, args[1])?;
-    match idx {
-        Some(i) => {
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "remove")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.remove() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let idx = array_index_count(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        false,
+    )?;
+    match usize::try_from(idx) {
+        Ok(i) => {
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            // [3.14-spec] CPython `array_array_remove_impl` hands the matched
+            // index to `array_del_slice`; if `__eq__` already shrank the array
+            // past it, deletion is an empty successful slice.  PyPy's
+            // `W_ArrayBase.descr_remove` instead calls `descr_pop`, whose
+            // bounds check raises.  Preserve the 3.14 observable no-op.
+            if i >= unsafe { arr::w_array_len(obj) } {
+                return Ok(pyre_object::w_none());
+            }
+            // PyPy reaches its resize through `descr_pop` only after the
+            // comparison search.  CPython likewise runs comparisons before
+            // `array_del_slice` rejects an exported receiver.
+            array_check_resize(obj)?;
             let isz = unsafe { arr::w_array_itemsize(obj) };
             let vec = unsafe { arr::w_array_vec_mut(obj) };
             vec.drain(i * isz..i * isz + isz);
             Ok(pyre_object::w_none())
         }
-        None => Err(PyError::value_error("array.remove(x): x not in array")),
+        Err(_) => Err(PyError::value_error("array.remove(x): x not in array")),
     }
 }
 
-/// First index whose element equals `w_value`, via `==`.
-fn array_find(obj: PyObjectRef, w_value: PyObjectRef) -> Result<Option<usize>, PyError> {
-    let len = unsafe { arr::w_array_len(obj) };
-    for i in 0..len {
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
-        if crate::baseobjspace::eq_w(w_item, w_value)? {
-            return Ok(Some(i));
+/// First matching index, or the total number of matches, via `==`.
+fn array_index_count(obj: PyObjectRef, w_value: PyObjectRef, count: bool) -> Result<i64, PyError> {
+    // PyPy `index_count_array` shares this loop between index-like searches
+    // and count.  The receiver and needle stay red/live, and `arr.len` is
+    // checked at every loop boundary because equality is user code that may
+    // resize and collect either object.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[obj, w_value]);
+    let mut cnt = 0i64;
+    let mut i = 0;
+    loop {
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        if i >= unsafe { arr::w_array_len(obj) } {
+            break;
         }
+        let w_item = array_w_getitem(obj, i, false)?;
+        let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        if crate::baseobjspace::eq_w(w_item, w_value)? {
+            if count {
+                cnt += 1;
+            } else {
+                return Ok(i as i64);
+            }
+        }
+        i += 1;
     }
-    Ok(None)
+    Ok(if count { cnt } else { -1 })
 }
 
 fn array_index_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity_range(args, 2, 4, "array.index")?;
-    let obj = args[0];
-    let len = unsafe { arr::w_array_len(obj) } as i64;
+    // PyPy's `W_ArrayBase.descr_index` keeps the search itself in
+    // `index_count_array`, with `start`/`stop` unwrapped as indexes.  Keep
+    // that shape below.  [3.14-spec] CPython 3.14's `array.array.index`
+    // exposes those arguments as positional-only, however, and its
+    // PyArg_UnpackTuple gateway reports the bare method name at the arity
+    // boundary.  Reject the trailing kwargs marker before it can be mistaken
+    // for `start` or `stop`.
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "index")?;
+    crate::type_methods::arity_between(args, "index", 1, 3)?;
     // Optional start/stop, unwrapped via __index__, clamped like descr_index.
-    // Their `__index__` is user code and `args` is the gateway's stack copy,
-    // so the searched-for value is read back from the shadow stack: the caller
-    // may have passed a list, which a minor moves.
+    // PyPy's interp2app gateway unwraps both bounds before `descr_index` reads
+    // `self.len`.  Their `__index__` is user code: it can resize the array and
+    // collect, so every later argument and the receiver itself is read back
+    // from the rooted gateway stack copy.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::pin_roots(args);
     let mut start = if args.len() >= 3 {
-        crate::builtins::getindex_w(args[2])?
+        crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
+            base + 2,
+        ))?
     } else {
         0
     };
+    // [3.14-spec] CPython `array_array_index_impl` uses PY_SSIZE_T_MAX for an
+    // omitted stop and re-reads Py_SIZE(self) on every iteration, so growth
+    // from `__eq__` remains searchable.  PyPy's `index_count_array` has the
+    // same live `while i < arr.len` source shape, although the installed
+    // PyPy oracle snapshots this re-entrant case.
     let mut stop = if args.len() >= 4 {
-        crate::builtins::getindex_w(args[3])?
+        crate::sliceobject::eval_slice_index_not_none(pyre_object::gc_roots::shadow_stack_get(
+            base + 3,
+        ))?
     } else {
-        len
+        i64::MAX
     };
-    let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let len = unsafe { arr::w_array_len(obj) } as i64;
     if start < 0 {
         start += len;
         if start < 0 {
@@ -740,12 +1100,19 @@ fn array_index_method(args: &[PyObjectRef]) -> PyResult {
             stop = 0;
         }
     }
-    if stop > len {
-        stop = len;
-    }
     let mut i = start;
     while i < stop {
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i as usize) };
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        // `index_count_array` reads PyPy's separately allocated raw buffer;
+        // shrinking `self.len` from `__eq__` leaves that storage addressable.
+        // pyre's Vec length is the storage bound, so uphold
+        // `w_array_unpack_item`'s safety contract explicitly.  CPython 3.14
+        // likewise stops the search when comparison shrinks the array.
+        if i >= unsafe { arr::w_array_len(obj) } as i64 {
+            break;
+        }
+        let w_item = array_w_getitem(obj, i as usize, false)?;
+        let w_value = pyre_object::gc_roots::shadow_stack_get(base + 1);
         if crate::baseobjspace::eq_w(w_item, w_value)? {
             return Ok(pyre_object::w_int_new(i));
         }
@@ -772,17 +1139,16 @@ fn array_buffer(args: &[PyObjectRef]) -> PyResult {
 }
 
 fn array_count_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.count")?;
-    let obj = args[0];
-    let len = unsafe { arr::w_array_len(obj) };
-    let mut count = 0i64;
-    for i in 0..len {
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
-        if crate::baseobjspace::eq_w(w_item, args[1])? {
-            count += 1;
-        }
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "count")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.count() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
     }
-    Ok(pyre_object::w_int_new(count))
+    Ok(pyre_object::w_int_new(array_index_count(
+        args[0], args[1], true,
+    )?))
 }
 
 fn array_reverse_method(args: &[PyObjectRef]) -> PyResult {
@@ -813,20 +1179,121 @@ fn array_tolist_method(args: &[PyObjectRef]) -> PyResult {
     let len = unsafe { arr::w_array_len(obj) };
     let mut items = Vec::with_capacity(len);
     for i in 0..len {
-        items.push(unsafe { arr::w_array_unpack_item(obj, i) });
+        items.push(array_w_getitem(obj, i, false)?);
     }
     Ok(pyre_object::w_list_new(items))
 }
 
 fn array_fromlist_method(args: &[PyObjectRef]) -> PyResult {
-    check_arity(args, 2, "array.fromlist")?;
-    // `array_array_fromlist` opens at `PyList_Check`, so a tuple or any other
-    // iterable is refused rather than consumed.
+    crate::type_methods::reject_kwargs_of(Some("array"), args, "fromlist")?;
+    if args.len() != 2 {
+        return Err(PyError::type_error(format!(
+            "array.fromlist() takes exactly one argument ({} given)",
+            args.len().saturating_sub(1)
+        )));
+    }
+    // PyPy `W_ArrayBase.descr_fromlist` rejects non-lists before entering
+    // `fromsequence`, then restores the old length if conversion fails.
     if !unsafe { pyre_object::is_list(args[1]) } {
         return Err(PyError::type_error("arg must be list"));
     }
-    array_extend_iterable(args[0], args[1], true)?;
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let item_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(PY_NULL);
+    let obj = pyre_object::gc_roots::shadow_stack_get(base);
+    let w_list = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let n = unsafe { pyre_object::listobject::w_list_len(w_list) };
+    if n == 0 {
+        return Ok(pyre_object::w_none());
+    }
+
+    // Both PyPy `W_Array.fromsequence` and CPython
+    // `array_array_fromlist_impl` size the destination before converting any
+    // item.  That makes an existing export fail here, while an export created
+    // by an item's `__index__` does not block writing the already-sized slot.
+    array_check_resize(obj)?;
+    let itemsize = unsafe { arr::w_array_itemsize(obj) };
+    let old_bytes = unsafe { arr::w_array_bytes(obj) }.to_vec();
+    let added = n
+        .checked_mul(itemsize)
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let new_len = old_bytes
+        .len()
+        .checked_add(added)
+        .ok_or_else(|| PyError::memory_error(""))?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.try_reserve(added)
+        .map_err(|_| PyError::memory_error(""))?;
+    vec.resize(new_len, 0);
+
+    for i in 0..n {
+        let w_list = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        let Some(w_item) = (unsafe { pyre_object::listobject::w_list_getitem(w_list, i as i64) })
+        else {
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            array_restore_fromlist(obj, &old_bytes)?;
+            return Err(PyError::runtime_error("list changed size during iteration"));
+        };
+        pyre_object::gc_roots::shadow_stack_set(item_slot, w_item);
+
+        // [3.14-spec] CPython `array_array_fromlist_impl` uses PyList_GET_ITEM
+        // even for list subclasses and checks the live list size after each
+        // conversion.  PyPy's `fromsequence` can instead fall through to
+        // `_fromiterable` for a subclass and its installed oracle snapshots
+        // list-size changes.  Keep PyPy's pre-size/rollback structure, but use
+        // the 3.14 observable direct-list gateway and mutation error.
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let len_before = unsafe { arr::w_array_len(obj) };
+        let slot = len_before
+            .checked_sub(n)
+            .and_then(|base| base.checked_add(i));
+        let typecode = unsafe { arr::w_array_typecode(obj) };
+        let mut packed: Bytes = [0; 8];
+        let packed_len = match pack_into(
+            typecode,
+            pyre_object::gc_roots::shadow_stack_get(item_slot),
+            &mut packed,
+        ) {
+            Ok(packed_len) => packed_len,
+            Err(error) => {
+                let obj = pyre_object::gc_roots::shadow_stack_get(base);
+                array_restore_fromlist(obj, &old_bytes)?;
+                return Err(error);
+            }
+        };
+
+        let obj = pyre_object::gc_roots::shadow_stack_get(base);
+        let live_len = unsafe { arr::w_array_len(obj) };
+        if let Some(slot) = slot {
+            if slot < live_len {
+                let start = slot * itemsize;
+                let vec = unsafe { arr::w_array_vec_mut(obj) };
+                vec[start..start + itemsize].copy_from_slice(&packed[..packed_len]);
+            }
+        }
+
+        let w_list = pyre_object::gc_roots::shadow_stack_get(base + 1);
+        if unsafe { pyre_object::listobject::w_list_len(w_list) } != n {
+            let obj = pyre_object::gc_roots::shadow_stack_get(base);
+            array_restore_fromlist(obj, &old_bytes)?;
+            return Err(PyError::runtime_error("list changed size during iteration"));
+        }
+    }
     Ok(pyre_object::w_none())
+}
+
+fn array_restore_fromlist(obj: PyObjectRef, old_bytes: &[u8]) -> Result<(), PyError> {
+    // PyPy `W_ArrayBase.descr_fromlist` calls `setlen(s)` on every conversion
+    // failure.  pyre's logical length is the Vec byte length, so restore the
+    // corresponding pre-call byte prefix.  Respect a buffer export created by
+    // conversion just as a fresh resize would.
+    array_check_resize(obj)?;
+    let vec = unsafe { arr::w_array_vec_mut(obj) };
+    vec.clear();
+    vec.extend_from_slice(old_bytes);
+    Ok(())
 }
 
 fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
@@ -837,14 +1304,36 @@ fn array_tobytes_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.frombytes")?;
-    if !unsafe { pyre_object::bytesobject::is_bytes_like(args[1]) } {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    // PyPy `descr_frombytes` enters `bufferstr_w` / `acquire_readbuf` and
+    // copies a BUF_SIMPLE view before `_frombytes`.  Use the same paired
+    // acquisition rather than narrowing the public method to bytes and
+    // bytearray.
+    let source = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let Some(buffer) = crate::baseobjspace::simple_buffer_bytes(source)? else {
         return Err(PyError::type_error(format!(
             "a bytes-like object is required, not '{}'",
-            crate::type_methods::arg_type_name(args[1])
+            crate::type_methods::arg_type_name(source)
         )));
+    };
+    // [3.14-spec] `arraymodule.c::frombytes` rejects a typed Py_buffer even
+    // though PyPy's `bufferstr_w` accepts its raw bytes.  The itemsize check is
+    // observable for `memoryview(array('i'))` and `array('i')` exporters.
+    if buffer.itemsize() != 1 {
+        let error = PyError::type_error("a bytes-like object is required");
+        buffer.release();
+        return Err(error);
     }
-    let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(args[1]) }.to_vec();
-    array_frombytes(args[0], &bytes)?;
+    let bytes = buffer.as_bytes().to_vec();
+    // [3.14-spec] CPython keeps the Py_buffer export active through
+    // `array_resize`, so `a.frombytes(a)` raises BufferError for an itemsize-1
+    // array.  PyPy releases its copied buffer before `_frombytes`; retaining
+    // this lease is the minimal lifetime difference forced by that visible
+    // result.  Release errors remain unraisable and never replace `result`.
+    let result = array_frombytes(pyre_object::gc_roots::shadow_stack_get(base), &bytes);
+    buffer.release();
+    result?;
     Ok(pyre_object::w_none())
 }
 
@@ -860,32 +1349,40 @@ fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
 
 fn array_fromfile_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 3, "array.fromfile")?;
-    let obj = args[0];
-    let count = crate::builtins::getindex_w(args[2])?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(args);
+    roots.normalize(base, args.len());
+    // PyPy `W_ArrayBase.descr_fromfile` runs its `@unwrap_spec(n=int)` gateway
+    // before reading `self.itemsize`.  The callback may resize and collect the
+    // receiver or file, so every input is reloaded from the published slots.
+    let count = array_ssize_index_w(roots.get(base + 2))?;
     if count < 0 {
         return Err(PyError::value_error("negative count"));
     }
-    let size = unsafe { arr::w_array_itemsize(obj) }
-        .checked_mul(count as usize)
+    let obj = roots.get(base);
+    let size = (unsafe { arr::w_array_itemsize(obj) } as i64)
+        .checked_mul(count)
         .ok_or_else(|| PyError::memory_error(""))?;
-    let w_bytes = call_method(args[1], "read", &[pyre_object::w_int_new(size as i64)])?;
+    // `ovfcheck(self.itemsize * n)` is a signed Py_ssize_t operation in PyPy;
+    // do not let a product in usize's upper half wrap when it is boxed below.
+    let size_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_int_new(size));
+    let w_bytes = call_method(roots.get(base + 1), "read", &[roots.get(size_slot)])?;
     if !unsafe { pyre_object::is_bytes(w_bytes) } {
         return Err(PyError::type_error("read() didn't return bytes"));
     }
     let bytes = unsafe { pyre_object::bytesobject::bytes_like_data(w_bytes) }.to_vec();
-    // CPython 3.14 calls `frombytes` before reporting a short read.  A
-    // non-item-aligned result therefore raises ValueError without appending;
-    // PyPy's source has the same call order despite its EOF-focused comment.
-    array_frombytes(obj, &bytes)?;
-    if bytes.len() < size {
-        let mut error = PyError::value_error("not enough items in file");
-        if let Some(cls) = crate::builtins::lookup_exc_class("EOFError") {
-            let exc_args = [cls, pyre_object::w_str_new("not enough items in file")];
-            if let Ok(exc) = crate::builtins::exc_exception_new(&exc_args) {
-                error.exc_object = exc;
-            }
-        }
-        return Err(error);
+    // PyPy `descr_fromfile` calls `_frombytes` before reporting its short-read
+    // EOF, so an aligned prefix is appended and a non-aligned result fails in
+    // `_frombytes` first.  [3.14-spec] `array_array_fromfile_impl` makes any
+    // length unequal to the request an EOF (including an over-read) and uses
+    // the byte-oriented sentence below.
+    array_frombytes(roots.get(base), &bytes)?;
+    if bytes.len() != size as usize {
+        return Err(PyError::new(
+            PyErrorKind::EOFError,
+            "read() didn't return enough bytes",
+        ));
     }
     Ok(pyre_object::w_none())
 }
@@ -899,19 +1396,41 @@ fn array_tofile_method(args: &[PyObjectRef]) -> PyResult {
 
 fn array_tounicode_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.tounicode")?;
-    let obj = args[0];
-    if !matches!(unsafe { arr::w_array_typecode(obj) }, b'u' | b'w') {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj = pyre_object::gc_roots::pin_root(args[0]);
+    let typecode = unsafe { arr::w_array_typecode(obj) };
+    if !matches!(typecode, b'u' | b'w') {
+        // [3.14-spec] PyPy `descr_tounicode` names only type `u`; v3.14.6
+        // `array_array_tounicode_impl` exposes both unicode typecodes in the
+        // public sentence now that `w` is part of the module surface.
         return Err(PyError::value_error(
-            "tounicode() may only be called on unicode type arrays",
+            "tounicode() may only be called on unicode type arrays ('u' or 'w')",
         ));
     }
-    let len = unsafe { arr::w_array_len(obj) };
     let bytes = unsafe { arr::w_array_bytes(obj) };
-    let mut wb = Wtf8Buf::new();
-    for i in 0..len {
-        let cp = u32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-        let point = CodePoint::from_u32(cp)
-            .ok_or_else(|| PyError::value_error("character out of range"))?;
+    if typecode == b'w' {
+        // `array_array_tounicode_impl` at v3.14.6 routes `w` through the
+        // native-order UTF-32 decoder. Reuse PyPy's
+        // `str_decode_utf_32_helper` port so BOM consumption, surrogate
+        // rejection, error spans, and byte-order-specific codec names stay
+        // identical to the public codec rather than growing a second loop.
+        let (decoded, _, _) = crate::type_methods::decode_utf16_32_helper(
+            bytes, true, None, "utf-32", "strict", true,
+        )?;
+        return Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(decoded));
+    }
+
+    // PyPy `descr_tounicode` uses `wcharpsize2utf8`, which admits lone
+    // surrogates and raises for the first value above U+10ffff. The same
+    // shape implements `PyUnicode_FromWideChar`, used for `u` by v3.14.6.
+    let mut wb = Wtf8Buf::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let code = u32::from_ne_bytes(chunk.try_into().unwrap());
+        let point = CodePoint::from_u32(code).ok_or_else(|| {
+            PyError::value_error(format!(
+                "character U+{code:x} is not in range [U+0000; U+10ffff]"
+            ))
+        })?;
         wb.push(point);
     }
     Ok(pyre_object::unicodeobject::w_str_from_wtf8_managed(wb))
@@ -930,17 +1449,24 @@ fn array_fromunicode_method(args: &[PyObjectRef]) -> PyResult {
 fn array_contains_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 2, "array.__contains__")?;
     Ok(pyre_object::w_bool_from(
-        array_find(args[0], args[1])?.is_some(),
+        array_index_count(args[0], args[1], false)? >= 0,
     ))
 }
 
 fn array_buffer_info_method(args: &[PyObjectRef]) -> PyResult {
     check_arity(args, 1, "array.buffer_info")?;
     let obj = args[0];
-    let addr = unsafe { arr::w_array_bytes(obj) }.as_ptr() as i64;
+    let addr = unsafe { arr::w_array_buffer_address(obj) } as u64;
     let len = unsafe { arr::w_array_len(obj) } as i64;
+    // PyPy boxes `_buffer_as_unsigned` as an unsigned integer; keep a pointer
+    // whose top bit is set non-negative rather than narrowing it through i64.
+    let w_addr = if addr <= i64::MAX as u64 {
+        pyre_object::w_int_new(addr as i64)
+    } else {
+        pyre_object::longobject::w_long_new(BigInt::from(addr))
+    };
     Ok(pyre_object::w_tuple_new(vec![
-        pyre_object::w_int_new(addr),
+        w_addr,
         pyre_object::w_int_new(len),
     ]))
 }
@@ -975,17 +1501,35 @@ fn array_copy_method(args: &[PyObjectRef]) -> PyResult {
 /// `display::py_repr` so an array nested in a list / error / tuple formats
 /// the same way.
 pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyError> {
-    let tc = unsafe { arr::w_array_typecode(obj) } as char;
-    let len = unsafe { arr::w_array_len(obj) };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let current_obj = || pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    // PyPy `W_ArrayBase.descr_repr` obtains
+    // `space.type(self).getname(space)`: the Python-visible `__name__`, not
+    // the TypeDef's module-qualified registration name.  In particular the
+    // builtin TypeDef is registered as `array.array` but formats as `array`,
+    // while a subclass keeps its live (and assignable) `__name__`.
+    let w_type = crate::typedef::r#type(current_obj())
+        .expect("an array instance must have a Python type object");
+    let class_name = unsafe {
+        pyre_object::w_str_get_value(pyre_object::w_type_get_name_obj(w_type.as_ptr())).to_string()
+    };
+    let tc = unsafe { arr::w_array_typecode(current_obj()) } as char;
+    let len = unsafe { arr::w_array_len(current_obj()) };
     if len == 0 {
         return Ok(rustpython_wtf8::Wtf8Buf::from_string(format!(
-            "array('{tc}')"
+            "{class_name}('{tc}')"
         )));
     }
     let mut out = rustpython_wtf8::Wtf8Buf::new();
-    out.push_str(&format!("array('{tc}', "));
+    out.push_str(&format!("{class_name}('{tc}', "));
     if matches!(tc, 'u' | 'w') {
-        let s = array_tounicode_method(&[obj])?;
+        // [3.14-spec] PyPy `descr_repr` catches this ValueError and prints a
+        // `<character ...>` placeholder. v3.14.6 `array_repr` propagates any
+        // failure from `array_array_tounicode_impl`, including the structured
+        // UTF-32 error for `w`.
+        let s = array_tounicode_method(&[current_obj()])?;
         out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(s)? });
         out.push_str(")");
         return Ok(out);
@@ -995,7 +1539,7 @@ pub fn array_repr_wtf8(obj: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, PyE
         if i != 0 {
             out.push_str(", ");
         }
-        let w_item = unsafe { arr::w_array_unpack_item(obj, i) };
+        let w_item = array_w_getitem(current_obj(), i, false)?;
         out.push_wtf8(&unsafe { crate::display::py_repr_wtf8(w_item)? });
     }
     out.push_str("])");
@@ -1025,9 +1569,16 @@ fn array_richcompare(a: PyObjectRef, b: PyObjectRef, op: u8) -> PyResult {
         return Ok(pyre_object::w_bool_from(true));
     }
     let n = la.min(lb);
+    let typecode_a = unsafe { arr::w_array_typecode(a) };
+    let typecode_b = unsafe { arr::w_array_typecode(b) };
+    // PyPy `compare_arrays` requests `integer_instead_of_char` so malformed
+    // unicode storage remains comparable. [3.14-spec] v3.14.6 does that raw
+    // comparison only when both descriptors match; differing typecodes take
+    // `getarrayitem` and can therefore raise while boxing an invalid scalar.
+    let integer_instead_of_char = typecode_a == typecode_b && matches!(typecode_a, b'u' | b'w');
     for i in 0..n {
-        let ea = unsafe { arr::w_array_unpack_item(a, i) };
-        let eb = unsafe { arr::w_array_unpack_item(b, i) };
+        let ea = array_w_getitem(a, i, integer_instead_of_char)?;
+        let eb = array_w_getitem(b, i, integer_instead_of_char)?;
         match op {
             0 => {
                 if !crate::baseobjspace::is_true(compare(ea, eb, CompareOp::Eq)?)? {
@@ -1442,7 +1993,7 @@ fn array_reconstructor(args: &[PyObjectRef]) -> PyResult {
                 pyre_object::longobject::w_long_new(BigInt::from(raw))
             }
         };
-        array_append(obj, w_item)?;
+        array_append_value(obj, w_item)?;
     }
     Ok(obj)
 }
@@ -1546,7 +2097,6 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "__delitem__", array_delitem, 2);
     m(ns, "__contains__", array_contains_method, 2);
     m(ns, "__repr__", array_repr_method, 1);
-    m(ns, "__str__", array_repr_method, 1);
     m(ns, "__eq__", array_eq_method, 2);
     m(ns, "__ne__", array_ne_method, 2);
     m(ns, "__lt__", array_lt_method, 2);
@@ -1559,10 +2109,38 @@ pub fn init_array_type(ns: PyObjectRef) {
     m(ns, "__rmul__", array_mul_method, 2);
     m(ns, "__imul__", array_imul_method, 2);
     m(ns, "__reduce_ex__", array_reduce_ex_method, 2);
-    m(ns, "append", array_append_method, 2);
-    m(ns, "extend", array_extend_method, 2);
-    m(ns, "insert", array_insert_method, 3);
-    m(ns, "remove", array_remove_method, 2);
+    // `append` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "append",
+            crate::make_builtin_function("append", array_append_method),
+        )
+    };
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "extend",
+            crate::make_builtin_function("extend", array_extend_method),
+        )
+    };
+    // `insert` uses the PyArg_UnpackTuple arity wording and the fixed
+    // `array.insert` keyword owner, both supplied by its gateway body.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "insert",
+            crate::make_builtin_function("insert", array_insert_method),
+        )
+    };
+    // `remove` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "remove",
+            crate::make_builtin_function("remove", array_remove_method),
+        )
+    };
     // `index` accepts optional start/stop.
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
@@ -1571,13 +2149,27 @@ pub fn init_array_type(ns: PyObjectRef) {
             crate::make_builtin_function("index", array_index_method),
         )
     };
-    m(ns, "count", array_count_method, 2);
+    // `count` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "count",
+            crate::make_builtin_function("count", array_count_method),
+        )
+    };
     m(ns, "clear", array_clear_method, 1);
     m(ns, "__release_buffer__", array_release_buffer, 2);
     m(ns, "__buffer__", array_buffer, 2);
     m(ns, "reverse", array_reverse_method, 1);
     m(ns, "tolist", array_tolist_method, 1);
-    m(ns, "fromlist", array_fromlist_method, 2);
+    // `fromlist` owns its CPython 3.14 fixed-owner keyword/arity gateway.
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "fromlist",
+            crate::make_builtin_function("fromlist", array_fromlist_method),
+        )
+    };
     m(ns, "tobytes", array_tobytes_method, 1);
     m(ns, "frombytes", array_frombytes_method, 2);
     m(ns, "tofile", array_tofile_method, 2);

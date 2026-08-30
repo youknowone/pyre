@@ -2,6 +2,8 @@ import sys
 
 from testutils import assert_raises, skip_if_unsupported
 
+assert bytes.__bytes__.__doc__ == "Convert this value to exact type bytes."
+
 # new
 assert bytes([1, 2, 3])
 assert bytes((1, 2, 3))
@@ -298,6 +300,24 @@ with assert_raises(TypeError):
     b"".join((b"km", "kl"))
 
 assert b"abc".join((b"123", b"xyz")) == b"123abcxyz"
+
+# PyPy `W_BytesObject._join_return_one` preserves an exact bytes item when
+# it is the iterable's sole element, even for a bytes-subclass separator.
+join_item = bytes(bytearray(b"single"))
+assert b"".join([join_item]) is join_item
+assert b" -- ".join([join_item]) is join_item
+
+
+class JoinBytes(bytes):
+    pass
+
+
+assert JoinBytes(b" -- ").join([join_item]) is join_item
+join_subclass_item = JoinBytes(b"single")
+joined_subclass_item = b"".join([join_subclass_item])
+assert joined_subclass_item == b"single"
+assert type(joined_subclass_item) is bytes
+assert joined_subclass_item is not join_subclass_item
 
 
 # endswith startswith

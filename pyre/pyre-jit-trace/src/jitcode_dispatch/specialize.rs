@@ -7902,7 +7902,12 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     // it gets its own emit rather than an element load: the payload is
     // variable-width UTF-8 and a fixed-stride read would be wrong the moment
     // the string is not ASCII.
-    if unsafe { pyre_object::is_exact_type(list_obj, &pyre_object::STR_TYPE) } {
+    // `is_exact_type` only checks the shared payload `ob_type`; a str subclass
+    // carries that same value and distinguishes itself through `w_class`.
+    // Admit exactly the shape the replay guard below will pin, so recording a
+    // subclass cannot manufacture a guard which its own concrete operand
+    // already fails.
+    if unsafe { pyre_object::is_str(list_obj) && walker_exact_builtin_class(list_obj).is_some() } {
         return spec_gate(SpecFold::SubscrStr, || {
             try_walker_specialize_subscr_str(
                 ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,

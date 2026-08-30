@@ -1950,6 +1950,19 @@ impl PyError {
         where_desc: &rustpython_wtf8::Wtf8,
         w_object: PyObjectRef,
     ) {
+        self.write_unraisable_with_traceback(space, where_desc, w_object, false);
+    }
+
+    /// `error.py OperationError.write_unraisable`, including the
+    /// `with_traceback` spelling selected by callers such as
+    /// `interp_magic.write_unraisable`.
+    pub fn write_unraisable_with_traceback(
+        &mut self,
+        space: PyObjectRef,
+        where_desc: &rustpython_wtf8::Wtf8,
+        w_object: PyObjectRef,
+        with_traceback: bool,
+    ) {
         let w_value = self
             .normalize_exception(space)
             .unwrap_or_else(|_| self.to_exc_object());
@@ -1979,6 +1992,8 @@ impl PyError {
             Wtf8Buf::new()
         } else if where_desc.as_bytes().starts_with(b"Exception ignored ") {
             where_desc.to_wtf8_buf()
+        } else if with_traceback {
+            crate::display::wtf8_format!("Exception ignored ", where_desc)
         } else {
             crate::display::wtf8_format!("Exception ignored in: ", where_desc)
         };

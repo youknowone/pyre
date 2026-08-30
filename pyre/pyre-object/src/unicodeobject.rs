@@ -735,6 +735,23 @@ pub fn intern_str_value(value: &str) -> PyObjectRef {
     intern_wtf8_value(Wtf8::new(value))
 }
 
+/// `ObjSpace.get_interned_str` — return the canonical exact `str` already
+/// interned for `value`, without interning a previously unseen value.
+///
+/// PyPy's marshal `_marshal_unicode` performs this lookup before `write_ref`.
+/// That distinction matters for an `AsciiListStrategy`: reading an element
+/// wraps its unboxed UTF-8 payload in a fresh `W_UnicodeObject`, but an
+/// identifier that is already interned must still use the canonical object as
+/// the marshal reference-table key.
+#[majit_macros::dont_look_inside]
+pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
+    STRING_INTERN_TABLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(value)
+        .map(|slot| **slot as PyObjectRef)
+}
+
 /// CPython 3.14 `PyUnicode_CHECK_INTERNED`: true only when `obj` itself is the
 /// canonical value stored in the process-wide intern table.
 ///
@@ -1493,6 +1510,19 @@ mod tests {
         let a = box_str_constant(Wtf8::new("pyre"));
         let b = box_str_constant(Wtf8::new("pyre"));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_get_interned_wtf8_is_lookup_only_and_returns_canonical_object() {
+        let missing = Wtf8::new("__pyre_lookup_only_missing_4f52d7d0__");
+        assert!(get_interned_wtf8(missing).is_none());
+        assert!(get_interned_wtf8(missing).is_none());
+
+        let value = Wtf8::new("__pyre_lookup_only_present_43aa7891__");
+        let canonical = intern_wtf8_value(value);
+        let fresh = w_str_new(value.as_str().unwrap());
+        assert_ne!(canonical, fresh);
+        assert_eq!(get_interned_wtf8(value), Some(canonical));
     }
 
     #[test]

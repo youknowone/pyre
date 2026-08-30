@@ -2194,7 +2194,7 @@ pub(crate) unsafe fn list_inplace_repeat(list: PyObjectRef, n: PyObjectRef) -> R
     // Snapshot the original items so the growing list is not re-read while
     // the copies are appended.  Holding the refs across `w_list_append` is
     // the same idiom `list_method_extend` uses for its iterable branch.
-    let snapshot = w_list_items_copy_as_vec(list);
+    let snapshot = w_list_items_copy_as_vec_mode(list, majit_metainterp::jit::we_are_jitted());
     pyre_object::listobject::w_list_reserve_for_extend(list, cap - len);
     for _ in 1..count {
         for &item in &snapshot {
@@ -3232,6 +3232,41 @@ unsafe fn try_numeric_unaryop_override(
     Ok(Some(crate::call::call_function_impl_result(method, &[a])?))
 }
 
+/// Invoke only the right operand's reflected special method.
+///
+/// PyPy `_call_binop_impl` normally reaches this after the left implementation
+/// returns `NotImplemented`.  CPython 3.14 `PyUnicode_Concat`, however, raises
+/// the observable sequence-concatenation error when called as `str.__add__`.
+/// The `+` operator must therefore skip that descriptor while retaining
+/// PyPy's reflected-method call and its GC-safe operand lifetime.
+unsafe fn try_reflected_binary_special(
+    lhs: &mut PyObjectRef,
+    rhs: &mut PyObjectRef,
+    rdunder: &str,
+) -> Result<Option<PyObjectRef>, PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let operands = roots.publish(&[*lhs, *rhs]);
+    let operand = |index| roots.get(operands + index);
+    let result = if let Some(method) = lookup_type_special(operand(1), rdunder) {
+        let method_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(method);
+        try_call_special(roots.get(method_slot), &[operand(1), operand(0)])?
+    } else {
+        None
+    };
+    *lhs = operand(0);
+    *rhs = operand(1);
+    Ok(result)
+}
+
+pub(crate) unsafe fn str_concat_type_error(rhs: PyObjectRef) -> PyError {
+    let name = crate::typedef::r#type(rhs).map_or_else(
+        || "object".to_owned(),
+        |w_type| crate::baseobjspace::type_fully_qualified_name(w_type.as_ptr()),
+    );
+    PyError::type_error(format!("can only concatenate str (not \"{name}\") to str"))
+}
+
 pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
     unsafe {
         let numeric_override = needs_numeric_binop_dispatch(a, b, "__add__", "__radd__");
@@ -3266,6 +3301,21 @@ pub fn add(mut a: PyObjectRef, mut b: PyObjectRef) -> PyResult {
                 return Ok(result);
             }
             return str_concat(a, b);
+        }
+        if is_str(a) {
+            let str_type = crate::typedef::gettypefor(&pyre_object::STR_TYPE);
+            let uses_builtin_add = str_type
+                .is_some_and(|str_type| !dunder_overridden(a, "__add__", str_type.as_ptr()));
+            if uses_builtin_add {
+                if let Some(result) = try_reflected_binary_special(&mut a, &mut b, "__radd__")? {
+                    return Ok(result);
+                }
+                // [3.14-spec] PyPy `W_UnicodeObject.descr_add` returns
+                // NotImplemented here and `_make_binop_impl` would emit its
+                // generic operator error.  CPython `PyUnicode_Concat` instead
+                // exposes the fully-qualified rhs type in this concat error.
+                return Err(str_concat_type_error(b));
+            }
         }
         if is_list(a) && is_list(b) {
             if needs_seq_binop_dispatch(a, b, SeqBase::List, "__add__", "__radd__")

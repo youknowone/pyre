@@ -1,154 +1,135 @@
-//! PyPy `_multibytecodec`: wrappers for its vendored cjkcodecs engine.
+//! PyPy `_multibytecodec`, with its cjkcodecs engines ported to Rust.
+
+mod cjkcodecs;
 
 use pyre_object::*;
-use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
-use std::ffi::c_void;
+use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
-const MBERR_TOOFEW: isize = -2;
-const MBERR_INTERNAL: isize = -3;
-const MBERR_NOMEMORY: isize = -4;
-const MBENC_FLUSH: isize = 1;
-const MBENC_RESET: isize = 2;
-
-#[cfg(windows)]
-type CjkWchar = u16;
-#[cfg(not(windows))]
-type CjkWchar = u32;
-
-unsafe extern "C" {
-    fn pypy_cjkcodec_shift_jis() -> *const c_void;
-    fn pypy_cjkcodec_cp932() -> *const c_void;
-    fn pypy_cjkcodec_euc_jp() -> *const c_void;
-    fn pypy_cjkcodec_shift_jis_2004() -> *const c_void;
-    fn pypy_cjkcodec_euc_jis_2004() -> *const c_void;
-    fn pypy_cjkcodec_euc_jisx0213() -> *const c_void;
-    fn pypy_cjkcodec_shift_jisx0213() -> *const c_void;
-
-    fn pypy_cjk_dec_new(codec: *const c_void) -> *mut c_void;
-    fn pypy_cjk_dec_init(state: *mut c_void, input: *mut i8, len: isize) -> isize;
-    fn pypy_cjk_dec_free(state: *mut c_void);
-    fn pypy_cjk_dec_chunk(state: *mut c_void) -> isize;
-    fn pypy_cjk_dec_outbuf(state: *mut c_void) -> *const CjkWchar;
-    fn pypy_cjk_dec_outlen(state: *mut c_void) -> isize;
-    fn pypy_cjk_dec_inbuf_remaining(state: *mut c_void) -> isize;
-    fn pypy_cjk_dec_inbuf_consumed(state: *mut c_void) -> isize;
-    fn pypy_cjk_dec_replace_on_error(
-        state: *mut c_void,
-        replacement: *const CjkWchar,
-        replacement_len: isize,
-        new_end: isize,
-    ) -> isize;
-
-    fn pypy_cjk_enc_new(codec: *const c_void) -> *mut c_void;
-    fn pypy_cjk_enc_init(state: *mut c_void, input: *mut CjkWchar, len: isize) -> isize;
-    fn pypy_cjk_enc_free(state: *mut c_void);
-    fn pypy_cjk_enc_chunk(state: *mut c_void, flags: isize) -> isize;
-    fn pypy_cjk_enc_reset(state: *mut c_void) -> isize;
-    fn pypy_cjk_enc_outbuf(state: *mut c_void) -> *const i8;
-    fn pypy_cjk_enc_outlen(state: *mut c_void) -> isize;
-    fn pypy_cjk_enc_inbuf_remaining(state: *mut c_void) -> isize;
-    fn pypy_cjk_enc_inbuf_consumed(state: *mut c_void) -> isize;
-    fn pypy_cjk_enc_replace_on_error(
-        state: *mut c_void,
-        replacement: *const i8,
-        replacement_len: isize,
-        new_end: isize,
-    ) -> isize;
+fn codec_supported(name: &str) -> bool {
+    cjkcodecs::Codec::from_name(name).is_some()
 }
 
-fn codec_ptr(name: &str) -> Option<*const c_void> {
-    // `c_codecs.py`'s complete `_codecs_jp` getter table.
-    let ptr = unsafe {
-        match name {
-            "shift_jis" => pypy_cjkcodec_shift_jis(),
-            "cp932" => pypy_cjkcodec_cp932(),
-            "euc_jp" => pypy_cjkcodec_euc_jp(),
-            "shift_jis_2004" => pypy_cjkcodec_shift_jis_2004(),
-            "euc_jis_2004" => pypy_cjkcodec_euc_jis_2004(),
-            "euc_jisx0213" => pypy_cjkcodec_euc_jisx0213(),
-            "shift_jisx0213" => pypy_cjkcodec_shift_jisx0213(),
-            _ => return None,
-        }
+fn export_rust_codec_state(state_sink_slot: Option<usize>, state: &[u8; 8]) {
+    let Some(slot) = state_sink_slot else {
+        return;
     };
-    (!ptr.is_null()).then_some(ptr)
-}
-
-struct DecState(*mut c_void);
-impl Drop for DecState {
-    fn drop(&mut self) {
-        unsafe { pypy_cjk_dec_free(self.0) };
+    let sink = pyre_object::gc_roots::shadow_stack_get(slot);
+    let output = unsafe { pyre_object::bytearrayobject::w_bytearray_data_mut(sink) };
+    if output.len() == state.len() {
+        output.copy_from_slice(state);
     }
 }
 
-struct EncState(*mut c_void);
-impl Drop for EncState {
-    fn drop(&mut self) {
-        unsafe { pypy_cjk_enc_free(self.0) };
-    }
-}
-
-#[cfg(windows)]
-fn text_to_wchars(text: &Wtf8) -> (Vec<CjkWchar>, Vec<usize>) {
-    let mut units = Vec::new();
-    let mut boundaries = vec![0];
-    for cp in text.code_points() {
-        let value = cp.to_u32();
-        if value <= 0xffff {
-            units.push(value as u16);
-        } else {
-            let value = value - 0x10000;
-            units.push(0xd800 | ((value >> 10) as u16));
-            units.push(0xdc00 | ((value & 0x3ff) as u16));
+fn decode_rust_codec_with_state(
+    codec: cjkcodecs::Codec,
+    name: &str,
+    input: &[u8],
+    errors: &str,
+    final_input: bool,
+    initial_state: Option<&[u8; 8]>,
+    state_sink: Option<PyObjectRef>,
+) -> Result<(Wtf8Buf, usize, [u8; 8]), crate::PyError> {
+    // Preserve the opaque state bytes exactly as PyPy's shared engine's
+    // setstate/getstate pair does, while rooting the app-level bytearray across
+    // Python error handlers.  HZ and the later ISO-2022 entries use these bytes;
+    // the remaining entries leave them untouched.
+    let roots = pyre_object::gc_roots::push_roots();
+    let state_sink_slot = state_sink.map(|sink| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(sink);
+        slot
+    });
+    let mut state = initial_state.copied().unwrap_or([0; 8]);
+    let input = input.to_vec();
+    let mut output = Wtf8Buf::new();
+    let mut position = 0;
+    while position < input.len() {
+        let result = cjkcodecs::decode_one(codec, &input[position..], &mut state);
+        export_rust_codec_state(state_sink_slot, &state);
+        match result {
+            cjkcodecs::DecodeOne::Char(value, consumed) => {
+                output.push(
+                    CodePoint::from_u32(value)
+                        .expect("PyPy cjkcodecs mapping contains a Unicode code point"),
+                );
+                position += consumed;
+            }
+            cjkcodecs::DecodeOne::Pair(first, second, consumed) => {
+                output.push(CodePoint::from_u32(first).unwrap());
+                output.push(CodePoint::from_u32(second).unwrap());
+                position += consumed;
+            }
+            cjkcodecs::DecodeOne::Skip(consumed) => position += consumed,
+            cjkcodecs::DecodeOne::Incomplete if !final_input => break,
+            result => {
+                let (reason, error_size) = match result {
+                    cjkcodecs::DecodeOne::Incomplete => {
+                        ("incomplete multibyte sequence", input.len() - position)
+                    }
+                    cjkcodecs::DecodeOne::Illegal(size) => ("illegal multibyte sequence", size),
+                    cjkcodecs::DecodeOne::Char(..)
+                    | cjkcodecs::DecodeOne::Pair(..)
+                    | cjkcodecs::DecodeOne::Skip(..) => {
+                        unreachable!()
+                    }
+                };
+                let end = position.saturating_add(error_size).min(input.len());
+                match errors {
+                    "strict" => {
+                        return Err(crate::typedef::unicode_decode_error(
+                            name, &input, position, end, reason,
+                        ));
+                    }
+                    "ignore" => position = end,
+                    "replace" => {
+                        output.push(CodePoint::from_u32(0xfffd).unwrap());
+                        position = end;
+                    }
+                    _ => {
+                        let mut replacement = Wtf8Buf::new();
+                        let new_position =
+                            crate::type_methods::call_registered_multibyte_decode_error_handler(
+                                errors,
+                                name,
+                                &input,
+                                position,
+                                end,
+                                reason,
+                                &mut replacement,
+                            )?;
+                        output.push_wtf8(&replacement);
+                        position = new_position;
+                    }
+                }
+            }
         }
-        boundaries.push(units.len());
     }
-    (units, boundaries)
+    Ok((output, position, state))
 }
 
-#[cfg(not(windows))]
-fn text_to_wchars(text: &Wtf8) -> (Vec<CjkWchar>, Vec<usize>) {
-    let units: Vec<u32> = text.code_points().map(|cp| cp.to_u32()).collect();
-    let boundaries = (0..=units.len()).collect();
-    (units, boundaries)
-}
-
-fn wchar_consumed_to_codepoints(boundaries: &[usize], consumed: usize) -> usize {
-    match boundaries.binary_search(&consumed) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
-    }
-}
-
-/// [`wchar_consumed_to_codepoints`] rounded the other way: the first code point
-/// that starts at or after `consumed`.
-fn wchar_codepoints_covering(boundaries: &[usize], consumed: usize) -> usize {
-    match boundaries.binary_search(&consumed) {
-        Ok(index) | Err(index) => index,
-    }
-}
-
-#[cfg(windows)]
-fn wchars_to_text(units: &[CjkWchar]) -> Wtf8Buf {
-    let mut out = Wtf8Buf::new();
-    for decoded in char::decode_utf16(units.iter().copied()) {
-        match decoded {
-            Ok(ch) => out.push_char(ch),
-            Err(err) => out.push(CodePoint::from_u32(err.unpaired_surrogate() as u32).unwrap()),
-        }
-    }
-    out
-}
-
-#[cfg(not(windows))]
-fn wchars_to_text(units: &[CjkWchar]) -> Wtf8Buf {
-    let mut out = Wtf8Buf::new();
-    for &unit in units {
-        // Every unit here came from a mapping table or from a replacement the
-        // error handler already produced as text, so it is a code point.
-        // Skipping a unit that is not would drop a character silently.
-        out.push(CodePoint::from_u32(unit).expect("cjkcodecs unit is a code point"));
-    }
-    out
+fn decode_impl_with_state(
+    name: &str,
+    input: &[u8],
+    errors: &str,
+    final_input: bool,
+    initial_state: Option<&[u8; 8]>,
+    state_sink: Option<PyObjectRef>,
+) -> Result<(Wtf8Buf, usize, [u8; 8]), crate::PyError> {
+    let codec = cjkcodecs::Codec::from_name(name).ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            "no such codec is supported.",
+        )
+    })?;
+    decode_rust_codec_with_state(
+        codec,
+        name,
+        input,
+        errors,
+        final_input,
+        initial_state,
+        state_sink,
+    )
 }
 
 fn decode_impl(
@@ -157,101 +138,168 @@ fn decode_impl(
     errors: &str,
     final_input: bool,
 ) -> Result<(Wtf8Buf, usize), crate::PyError> {
-    let codec = codec_ptr(name).ok_or_else(|| {
+    let (output, consumed, _) =
+        decode_impl_with_state(name, input, errors, final_input, None, None)?;
+    Ok((output, consumed))
+}
+
+/// PyPy `c_codecs.multibytecodec_encerror`: a rettype 'u' replacement is not
+/// bytes yet, it goes
+/// back through the same codec.  "strict" so a replacement the codec cannot
+/// encode raises there instead of re-entering the error handler.
+///
+/// As PyPy's `c_codecs.encode(copystate=encodebuf)` does, the sub-encode starts
+/// from the outer engine state and copies its resulting state back.
+fn encode_replacement_text(
+    name: &str,
+    w_text: PyObjectRef,
+    state: &[u8; 8],
+    state_sink: Option<PyObjectRef>,
+) -> Result<(Vec<u8>, [u8; 8]), crate::PyError> {
+    let (output, _, next_state) =
+        encode_impl_with_state(name, w_text, "strict", true, Some(state), state_sink)?;
+    Ok((output, next_state))
+}
+
+fn encode_rust_codec_with_state(
+    codec: cjkcodecs::Codec,
+    name: &str,
+    w_input: PyObjectRef,
+    errors: &str,
+    final_input: bool,
+    initial_state: Option<&[u8; 8]>,
+    state_sink: Option<PyObjectRef>,
+) -> Result<(Vec<u8>, usize, [u8; 8]), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let input_slot = roots.base();
+    let _ = roots.pin_root(w_input);
+    let state_sink_slot = state_sink.map(|sink| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(sink);
+        slot
+    });
+    let w_input = roots.get(input_slot);
+    if unsafe { !pyre_object::is_str(w_input) } {
+        return Err(crate::PyError::type_error("encoder argument must be str"));
+    }
+    // Materialize code points before an error handler can run and move the
+    // input object.  PyPy's encoder advances in Py_UNICODE units; pyre strings
+    // expose code-point indexes, matching the observable error spans.
+    let points: Vec<u32> = unsafe { pyre_object::w_str_get_wtf8(w_input) }
+        .code_points()
+        .map(CodePoint::to_u32)
+        .collect();
+    let mut state = initial_state.copied().unwrap_or([0; 8]);
+    let mut output = Vec::new();
+    let mut position = 0;
+    while position < points.len() {
+        let result = cjkcodecs::encode_one(codec, &points[position..], final_input, &mut state);
+        export_rust_codec_state(state_sink_slot, &state);
+        match result {
+            cjkcodecs::EncodeOne::Bytes(bytes, length, consumed) => {
+                output.extend_from_slice(&bytes[..length]);
+                position += consumed;
+            }
+            cjkcodecs::EncodeOne::Incomplete if !final_input => break,
+            result => {
+                let error_size = match result {
+                    cjkcodecs::EncodeOne::Illegal(size) => size,
+                    cjkcodecs::EncodeOne::Incomplete => points.len() - position,
+                    cjkcodecs::EncodeOne::Bytes(..) => unreachable!(),
+                };
+                let end = position.saturating_add(error_size).min(points.len());
+                let (replacement, new_position) = match errors {
+                    "strict" => {
+                        return Err(crate::typedef::unicode_encode_error(
+                            name,
+                            roots.get(input_slot),
+                            position as i64,
+                            end as i64,
+                            "illegal multibyte sequence",
+                        ));
+                    }
+                    "ignore" => (Vec::new(), end),
+                    "replace" => {
+                        let (bytes, next_state) = encode_replacement_text(
+                            name,
+                            w_str_new("?"),
+                            &state,
+                            state_sink_slot.map(pyre_object::gc_roots::shadow_stack_get),
+                        )?;
+                        state = next_state;
+                        export_rust_codec_state(state_sink_slot, &state);
+                        (bytes, end)
+                    }
+                    _ => {
+                        let (replacement, new_position) =
+                            crate::type_methods::call_registered_encode_error_handler(
+                                errors,
+                                name,
+                                roots.get(input_slot),
+                                points.len(),
+                                position,
+                                end,
+                                "illegal multibyte sequence",
+                                crate::type_methods::EncodeErrorOwner::MultibyteCodec,
+                            )?;
+                        let bytes = match replacement {
+                            crate::type_methods::EncodeReplacement::Bytes(bytes) => bytes,
+                            crate::type_methods::EncodeReplacement::Str(points) => {
+                                let mut text = Wtf8Buf::new();
+                                for point in points {
+                                    text.push(CodePoint::from_u32(point).unwrap());
+                                }
+                                let (bytes, next_state) = encode_replacement_text(
+                                    name,
+                                    w_str_from_wtf8_managed(text),
+                                    &state,
+                                    state_sink_slot.map(pyre_object::gc_roots::shadow_stack_get),
+                                )?;
+                                state = next_state;
+                                export_rust_codec_state(state_sink_slot, &state);
+                                bytes
+                            }
+                        };
+                        (bytes, new_position)
+                    }
+                };
+                output.extend_from_slice(&replacement);
+                position = new_position;
+            }
+        }
+    }
+    if final_input {
+        if let Some((bytes, length)) = cjkcodecs::encode_reset(codec, &mut state) {
+            output.extend_from_slice(&bytes[..length]);
+            export_rust_codec_state(state_sink_slot, &state);
+        }
+    }
+    Ok((output, position, state))
+}
+
+fn encode_impl_with_state(
+    name: &str,
+    w_input: PyObjectRef,
+    errors: &str,
+    final_input: bool,
+    initial_state: Option<&[u8; 8]>,
+    state_sink: Option<PyObjectRef>,
+) -> Result<(Vec<u8>, usize, [u8; 8]), crate::PyError> {
+    let codec = cjkcodecs::Codec::from_name(name).ok_or_else(|| {
         crate::PyError::new(
             crate::PyErrorKind::LookupError,
             "no such codec is supported.",
         )
     })?;
-    // `c_codecs.py:108-114` raises before binding the state, and
-    // `pypy_cjk_dec_free` (multibytecodec.c:41) dereferences its argument, so
-    // the null check has to happen before the RAII wrapper owns the pointer.
-    let raw = unsafe { pypy_cjk_dec_new(codec) };
-    if raw.is_null() {
-        return Err(crate::PyError::memory_error(""));
-    }
-    let state = DecState(raw);
-    let mut owned_input = input.to_vec();
-    if unsafe {
-        pypy_cjk_dec_init(
-            state.0,
-            owned_input.as_mut_ptr().cast::<i8>(),
-            owned_input.len() as isize,
-        )
-    } < 0
-    {
-        return Err(crate::PyError::memory_error(""));
-    }
-    loop {
-        let result = unsafe { pypy_cjk_dec_chunk(state.0) };
-        if result == 0 || (!final_input && result == MBERR_TOOFEW) {
-            break;
-        }
-        let (reason, error_size) = if result > 0 {
-            ("illegal multibyte sequence", result as usize)
-        } else if result == MBERR_TOOFEW {
-            (
-                "incomplete multibyte sequence",
-                unsafe { pypy_cjk_dec_inbuf_remaining(state.0) }.max(0) as usize,
-            )
-        } else if result == MBERR_NOMEMORY {
-            return Err(crate::PyError::memory_error(""));
-        } else {
-            debug_assert_eq!(result, MBERR_INTERNAL);
-            return Err(crate::PyError::runtime_error("internal codec error"));
-        };
-        let start = unsafe { pypy_cjk_dec_inbuf_consumed(state.0) }.max(0) as usize;
-        let end = start.saturating_add(error_size).min(input.len());
-        // `c_codecs.py multibytecodec_decerror`: the three built-in
-        // modes answer inline, anything else goes to the registered handler,
-        // which also names the position decoding resumes at.
-        let (replacement, resume_end): (Vec<CjkWchar>, usize) = match errors {
-            "strict" => {
-                return Err(crate::typedef::unicode_decode_error(
-                    name, input, start, end, reason,
-                ));
-            }
-            "ignore" => (Vec::new(), end),
-            "replace" => (vec![0xfffd], end),
-            _ => {
-                let mut text = Wtf8Buf::new();
-                // `multibytecodec_decerror` folds the returned position against
-                // the buffer decoding started on and goes on decoding that one,
-                // so a handler that put different bytes on `exc.object` neither
-                // redirects it nor widens the range a position may name.
-                let newpos = crate::type_methods::call_registered_multibyte_decode_error_handler(
-                    errors, name, input, start, end, reason, &mut text,
-                )?;
-                (text_to_wchars(&text).0, newpos)
-            }
-        };
-        let result = unsafe {
-            pypy_cjk_dec_replace_on_error(
-                state.0,
-                replacement.as_ptr(),
-                replacement.len() as isize,
-                resume_end as isize,
-            )
-        };
-        if result == MBERR_NOMEMORY {
-            return Err(crate::PyError::memory_error(""));
-        }
-    }
-    let consumed = unsafe { pypy_cjk_dec_inbuf_consumed(state.0) }.max(0) as usize;
-    let output_len = unsafe { pypy_cjk_dec_outlen(state.0) }.max(0) as usize;
-    let output = unsafe { std::slice::from_raw_parts(pypy_cjk_dec_outbuf(state.0), output_len) };
-    Ok((wchars_to_text(output), consumed.min(input.len())))
-}
-
-/// `c_codecs.py:293-296`: a rettype 'u' replacement is not bytes yet, it goes
-/// back through the same codec.  "strict" so a replacement the codec cannot
-/// encode raises there instead of re-entering the error handler.
-///
-/// The sub-encode runs on a fresh engine rather than a copy of the outer one
-/// (`copystate`), which the seven stateless `_codecs_jp` codecs cannot tell
-/// apart; a shift-state codec would need the state carried across.
-fn encode_replacement_text(name: &str, w_text: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
-    Ok(encode_impl(name, w_text, "strict", true)?.0)
+    encode_rust_codec_with_state(
+        codec,
+        name,
+        w_input,
+        errors,
+        final_input,
+        initial_state,
+        state_sink,
+    )
 }
 
 fn encode_impl(
@@ -260,138 +308,8 @@ fn encode_impl(
     errors: &str,
     final_input: bool,
 ) -> Result<(Vec<u8>, usize), crate::PyError> {
-    if unsafe { !pyre_object::is_str(w_input) } {
-        return Err(crate::PyError::type_error("encoder argument must be str"));
-    }
-    // A registered error handler runs Python between iterations of the loop
-    // below, which still names this string in the error it reports and hands
-    // it to the handler again, so it is held on the shadow stack and reread
-    // from there rather than kept as a Rust local across the call.
-    let roots = pyre_object::gc_roots::push_roots();
-    let input_slot = roots.base();
-    let _ = roots.pin_root(w_input);
-    let input = unsafe { pyre_object::w_str_get_wtf8(roots.get(input_slot)) };
-    let (mut units, boundaries) = text_to_wchars(input);
-    let codec = codec_ptr(name).ok_or_else(|| {
-        crate::PyError::new(
-            crate::PyErrorKind::LookupError,
-            "no such codec is supported.",
-        )
-    })?;
-    // Same ownership order as `decode_impl`: `pypy_cjk_enc_free`
-    // (multibytecodec.c:174) dereferences its argument.
-    let raw = unsafe { pypy_cjk_enc_new(codec) };
-    if raw.is_null() {
-        return Err(crate::PyError::memory_error(""));
-    }
-    let state = EncState(raw);
-    if unsafe { pypy_cjk_enc_init(state.0, units.as_mut_ptr(), units.len() as isize) } < 0 {
-        return Err(crate::PyError::memory_error(""));
-    }
-    let flags = if final_input {
-        MBENC_FLUSH | MBENC_RESET
-    } else {
-        0
-    };
-    loop {
-        let result = unsafe { pypy_cjk_enc_chunk(state.0, flags) };
-        if result == 0 || (!final_input && result == MBERR_TOOFEW) {
-            break;
-        }
-        let (reason, error_units) = if result > 0 {
-            ("illegal multibyte sequence", result as usize)
-        } else if result == MBERR_TOOFEW {
-            (
-                "incomplete multibyte sequence",
-                unsafe { pypy_cjk_enc_inbuf_remaining(state.0) }.max(0) as usize,
-            )
-        } else if result == MBERR_NOMEMORY {
-            return Err(crate::PyError::memory_error(""));
-        } else {
-            debug_assert_eq!(result, MBERR_INTERNAL);
-            return Err(crate::PyError::runtime_error("internal codec error"));
-        };
-        let start_units = unsafe { pypy_cjk_enc_inbuf_consumed(state.0) }.max(0) as usize;
-        let error_units_end = start_units.saturating_add(error_units).min(units.len());
-        // The engine measures the error in wchar units, and where `wchar_t` is
-        // 16 bits an astral code point is two of them.  The span an error
-        // handler works in is code points, so a unit that is only half of one
-        // widens to the whole code point, and the engine resumes there.
-        let start = wchar_consumed_to_codepoints(&boundaries, start_units);
-        let end = wchar_codepoints_covering(&boundaries, error_units_end);
-        let end_units = boundaries[end];
-        // `c_codecs.py multibytecodec_encerror`: `ignore` splices in
-        // nothing (rettype 'b'), `replace` and a str from a registered handler
-        // are re-encoded through the same codec first (rettype 'u'), and bytes
-        // from a handler are spliced in verbatim.  A handler also names the
-        // position to resume at as a code-point index, so it goes back through
-        // `boundaries` to reach the wchar unit the engine restarts on.
-        let (replacement, resume_units): (Vec<u8>, usize) = match errors {
-            "strict" => {
-                return Err(crate::typedef::unicode_encode_error(
-                    name,
-                    roots.get(input_slot),
-                    start as i64,
-                    end as i64,
-                    reason,
-                ));
-            }
-            "ignore" => (Vec::new(), end_units),
-            "replace" => (encode_replacement_text(name, w_str_new("?"))?, end_units),
-            _ => {
-                let (replacement, newpos) =
-                    crate::type_methods::call_registered_encode_error_handler(
-                        errors,
-                        name,
-                        roots.get(input_slot),
-                        boundaries.len() - 1,
-                        start,
-                        end,
-                        reason,
-                    )?;
-                let bytes = match replacement {
-                    crate::type_methods::EncodeReplacement::Bytes(bytes) => bytes,
-                    crate::type_methods::EncodeReplacement::Str(points) => {
-                        let mut text = Wtf8Buf::new();
-                        for point in points {
-                            text.push(CodePoint::from_u32(point).unwrap());
-                        }
-                        encode_replacement_text(name, w_str_from_wtf8_managed(text))?
-                    }
-                };
-                (bytes, boundaries[newpos])
-            }
-        };
-        let result = unsafe {
-            pypy_cjk_enc_replace_on_error(
-                state.0,
-                replacement.as_ptr().cast::<i8>(),
-                replacement.len() as isize,
-                resume_units as isize,
-            )
-        };
-        if result == MBERR_NOMEMORY {
-            return Err(crate::PyError::memory_error(""));
-        }
-    }
-    if final_input {
-        loop {
-            let result = unsafe { pypy_cjk_enc_reset(state.0) };
-            if result == 0 {
-                break;
-            }
-            if result == MBERR_NOMEMORY {
-                return Err(crate::PyError::memory_error(""));
-            }
-            return Err(crate::PyError::runtime_error("internal codec error"));
-        }
-    }
-    let consumed_units = unsafe { pypy_cjk_enc_inbuf_consumed(state.0) }.max(0) as usize;
-    let consumed = wchar_consumed_to_codepoints(&boundaries, consumed_units.min(units.len()));
-    let output_len = unsafe { pypy_cjk_enc_outlen(state.0) }.max(0) as usize;
-    let output = unsafe {
-        std::slice::from_raw_parts(pypy_cjk_enc_outbuf(state.0).cast::<u8>(), output_len).to_vec()
-    };
+    let (output, consumed, _) =
+        encode_impl_with_state(name, w_input, errors, final_input, None, None)?;
     Ok((output, consumed))
 }
 
@@ -400,7 +318,7 @@ pub(crate) fn getcodec(args: &[PyObjectRef]) -> crate::PyResult {
         return Err(crate::PyError::type_error("getcodec() missing codec name"));
     };
     let name = crate::baseobjspace::text_w(w_name)?;
-    if codec_ptr(name).is_none() {
+    if !codec_supported(name) {
         return Err(crate::PyError::new(
             crate::PyErrorKind::LookupError,
             "no such codec is supported.",
@@ -423,15 +341,99 @@ pub(crate) fn getcodec(args: &[PyObjectRef]) -> crate::PyResult {
     crate::call::call_function_impl_result(cls, &[w_name])
 }
 
-fn raw_encode(args: &[PyObjectRef]) -> crate::PyResult {
+/// Publish the four positional arguments of a `_encode`/`_decode` entry point
+/// as one livevar set.
+///
+/// `text_w`, `is_true`, the buffer acquisition and [`codec_call_control`] all
+/// run Python, and the gateway's argument slice is not a root area, so every
+/// later argument is read back from its slot instead.
+fn publish_codec_args(
+    roots: &pyre_object::gc_roots::RootScope,
+    args: &[PyObjectRef],
+    entry_point: &str,
+) -> Result<usize, crate::PyError> {
     let (positional, _) = crate::builtins::split_builtin_kwargs(args);
     if positional.len() < 4 {
-        return Err(crate::PyError::type_error("_encode() requires 4 arguments"));
+        return Err(crate::PyError::type_error(format!(
+            "{entry_point}() requires 4 arguments"
+        )));
     }
-    let name = crate::baseobjspace::text_w(positional[0])?;
-    let errors = crate::baseobjspace::text_w(positional[2])?;
-    let final_input = crate::baseobjspace::is_true(positional[3])?;
-    let (output, consumed) = encode_impl(name, positional[1], errors, final_input)?;
+    let base = roots.publish(&positional[..4]);
+    roots.normalize(base, 4);
+    Ok(base)
+}
+
+/// Acquire the decoder input and copy it out.  `SimpleBufferBytes` has no
+/// `Drop`, so the export stays active until `release`, and a `bytearray` that
+/// is decoded twice would refuse to resize.
+fn codec_input_bytes(w_input: PyObjectRef) -> Result<Vec<u8>, crate::PyError> {
+    let buffer = crate::baseobjspace::simple_buffer_bytes(w_input)?.ok_or_else(|| {
+        crate::PyError::type_error(format!(
+            "a bytes-like object is required, not '{}'",
+            crate::type_methods::arg_type_name(w_input)
+        ))
+    })?;
+    let input = buffer.as_bytes().to_vec();
+    buffer.release();
+    Ok(input)
+}
+
+fn raw_encode(args: &[PyObjectRef]) -> crate::PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_encode")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
+    let (output, consumed) = encode_impl(name, roots.get(base + 1), errors, final_input)?;
+    Ok(w_tuple_new(vec![
+        pyre_object::bytesobject::w_bytes_from_bytes(&output),
+        w_int_new(consumed as i64),
+    ]))
+}
+
+fn codec_call_control(
+    w_control: PyObjectRef,
+) -> Result<(bool, [u8; 8], PyObjectRef), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let control_slot = roots.base();
+    let w_control = roots.pin_root(w_control);
+    if unsafe { !pyre_object::is_tuple(w_control) || pyre_object::w_tuple_len(w_control) != 2 } {
+        return Err(crate::PyError::type_error(
+            "codec control must be a (final, state) tuple",
+        ));
+    }
+    let w_final = unsafe { pyre_object::w_tuple_getitem(w_control, 0) }
+        .expect("a two-item codec control has a first item");
+    let final_input = crate::baseobjspace::is_true(w_final)?;
+    // `is_true` may execute Python.  Read the state back from the rooted,
+    // possibly forwarded control tuple after that call.
+    let w_state = unsafe { pyre_object::w_tuple_getitem(roots.get(control_slot), 1) }
+        .expect("a two-item codec control has a second item");
+    if unsafe { !pyre_object::is_bytearray(w_state) } {
+        return Err(crate::PyError::type_error(
+            "codec state must be an exact bytearray",
+        ));
+    }
+    let state: [u8; 8] = unsafe { pyre_object::bytearrayobject::w_bytearray_data(w_state) }
+        .try_into()
+        .map_err(|_| crate::PyError::value_error("codec state must contain exactly 8 bytes"))?;
+    Ok((final_input, state, w_state))
+}
+
+fn raw_encode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_encode_stateful")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let (final_input, state, w_state) = codec_call_control(roots.get(base + 3))?;
+    let (output, consumed, _) = encode_impl_with_state(
+        name,
+        roots.get(base + 1),
+        errors,
+        final_input,
+        Some(&state),
+        Some(w_state),
+    )?;
     Ok(w_tuple_new(vec![
         pyre_object::bytesobject::w_bytes_from_bytes(&output),
         w_int_new(consumed as i64),
@@ -439,24 +441,58 @@ fn raw_encode(args: &[PyObjectRef]) -> crate::PyResult {
 }
 
 fn raw_decode(args: &[PyObjectRef]) -> crate::PyResult {
-    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
-    if positional.len() < 4 {
-        return Err(crate::PyError::type_error("_decode() requires 4 arguments"));
-    }
-    let name = crate::baseobjspace::text_w(positional[0])?;
-    let input = crate::baseobjspace::simple_buffer_bytes(positional[1])?.ok_or_else(|| {
-        crate::PyError::type_error(format!(
-            "a bytes-like object is required, not '{}'",
-            crate::type_methods::arg_type_name(positional[1])
-        ))
-    })?;
-    let errors = crate::baseobjspace::text_w(positional[2])?;
-    let final_input = crate::baseobjspace::is_true(positional[3])?;
-    let (output, consumed) = decode_impl(name, input.as_bytes(), errors, final_input)?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_decode")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let input = codec_input_bytes(roots.get(base + 1))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let final_input = crate::baseobjspace::is_true(roots.get(base + 3))?;
+    let (output, consumed) = decode_impl(name, &input, errors, final_input)?;
     Ok(w_tuple_new(vec![
         pyre_object::unicodeobject::w_str_from_wtf8_managed(output),
         w_int_new(consumed as i64),
     ]))
+}
+
+fn raw_decode_stateful(args: &[PyObjectRef]) -> crate::PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = publish_codec_args(&roots, args, "_decode_stateful")?;
+    let name = crate::baseobjspace::text_w(roots.get(base))?;
+    let input = codec_input_bytes(roots.get(base + 1))?;
+    let errors = crate::baseobjspace::text_w(roots.get(base + 2))?;
+    let (final_input, state, w_state) = codec_call_control(roots.get(base + 3))?;
+    let (output, consumed, _) = decode_impl_with_state(
+        name,
+        &input,
+        errors,
+        final_input,
+        Some(&state),
+        Some(w_state),
+    )?;
+    Ok(w_tuple_new(vec![
+        pyre_object::unicodeobject::w_str_from_wtf8_managed(output),
+        w_int_new(consumed as i64),
+    ]))
+}
+
+fn raw_initial_state(args: &[PyObjectRef]) -> crate::PyResult {
+    let (positional, _) = crate::builtins::split_builtin_kwargs(args);
+    if positional.len() < 2 {
+        return Err(crate::PyError::type_error(
+            "_initial_state() requires 2 arguments",
+        ));
+    }
+    let name = crate::baseobjspace::text_w(positional[0])?;
+    let decoder = crate::baseobjspace::is_true(positional[1])?;
+    let codec = cjkcodecs::Codec::from_name(name).ok_or_else(|| {
+        crate::PyError::new(
+            crate::PyErrorKind::LookupError,
+            "no such codec is supported.",
+        )
+    })?;
+    Ok(pyre_object::bytesobject::w_bytes_from_bytes(
+        &cjkcodecs::initial_state(codec, decoder),
+    ))
 }
 
 crate::py_module! {
@@ -464,7 +500,10 @@ crate::py_module! {
     functions: {
         "__getcodec" / 1 = getcodec,
         "_encode" / 4 = raw_encode,
+        "_encode_stateful" / 4 = raw_encode_stateful,
         "_decode" / 4 = raw_decode,
+        "_decode_stateful" / 4 = raw_decode_stateful,
+        "_initial_state" / 2 = raw_initial_state,
     },
     extra_init: |ns| {
         // The app classes close over the two engine entry points. Install
@@ -474,6 +513,18 @@ crate::py_module! {
             .expect("_multibytecodec._encode is installed");
         let decode = unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(ns, "_decode") }
             .expect("_multibytecodec._decode is installed");
+        let encode_stateful = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(ns, "_encode_stateful")
+        }
+        .expect("_multibytecodec._encode_stateful is installed");
+        let decode_stateful = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(ns, "_decode_stateful")
+        }
+        .expect("_multibytecodec._decode_stateful is installed");
+        let initial_state = unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(ns, "_initial_state")
+        }
+        .expect("_multibytecodec._initial_state is installed");
         crate::importing::appleveldef_install_seeded(
             ns,
             include_str!("app_multibytecodec.py"),
@@ -486,7 +537,13 @@ crate::py_module! {
                 "MultibyteStreamReader",
                 "MultibyteStreamWriter",
             ],
-            &[("_encode", encode), ("_decode", decode)],
+            &[
+                ("_encode", encode),
+                ("_decode", decode),
+                ("_encode_stateful", encode_stateful),
+                ("_decode_stateful", decode_stateful),
+                ("_initial_state", initial_state),
+            ],
         )?;
     },
 }

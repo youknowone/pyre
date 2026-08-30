@@ -2927,9 +2927,46 @@ pub fn descr_function_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             "arg 3 (name) must be None or string",
         ));
     };
+    // [3.14-spec] `function.py Function.descr_function__new__` derives the
+    // closure contract from `PyCode.co_freevars`, then refuses anything but an
+    // exact tuple (`TypeError("invalid closure")`) and refuses a closure at all
+    // for a code object with no free variables (`ValueError("no closure
+    // needed")`).  Measured on 3.14.2: `FunctionType(f.__code__, {}, None,
+    // None, ())` returns a function whose `__closure__` reads back as `()`, and
+    // a `tuple` subclass is accepted and read back as that subclass.  The two
+    // widenings only decide what may be stored once, at construction; the
+    // `closure?[*]` hint (function.py:34) governs rebinding the field and the
+    // immutability of the cells it holds, and every accepted element is still
+    // checked to be a `Cell` below.
+    let nfreevars = unsafe { (&(*code_ptr).freevars).len() };
     let closure = if w_closure.is_null() || unsafe { pyre_object::is_none(w_closure) } {
+        if nfreevars != 0 {
+            return Err(crate::PyError::type_error("arg 5 (closure) must be tuple"));
+        }
         PY_NULL
     } else {
+        if !unsafe { pyre_object::is_tuple(w_closure) } {
+            return Err(crate::PyError::type_error(
+                "arg 5 (closure) must be None or tuple",
+            ));
+        }
+        let nclosure = unsafe { pyre_object::w_tuple_len(w_closure) };
+        if nclosure != nfreevars {
+            return Err(crate::PyError::value_error(format!(
+                "{} requires closure of length {nfreevars}, not {nclosure}",
+                unsafe { &(*code_ptr).obj_name }
+            )));
+        }
+        for index in 0..nclosure {
+            let cell = unsafe { pyre_object::w_tuple_getitem(w_closure, index as i64) }
+                .expect("closure tuple index is in bounds");
+            if !unsafe { pyre_object::is_cell(cell) } {
+                return Err(crate::PyError::type_error(format!(
+                    "arg 5 (closure) expected cell, found {}",
+                    crate::type_methods::arg_type_name(cell)
+                )));
+            }
+        }
         w_closure
     };
     // `function.py self.w_func_globals = w_globals` stores the dict

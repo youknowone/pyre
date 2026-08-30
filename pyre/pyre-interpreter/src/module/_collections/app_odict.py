@@ -117,9 +117,12 @@ class OrderedDict(dict):
             return '...'
         currently_in_repr[self] = 1
         try:
-            # Python 3.14 changed OrderedDict's display to the ordinary
-            # insertion-ordered dict spelling.  The temporary dict also keeps
-            # the surrounding recursion marker effective for self-values.
+            # [3.14-spec] CPython `odict_repr` displays the ordinary
+            # insertion-ordered dict spelling, while PyPy
+            # `app_odict.OrderedDict.__repr__` displays `list(self.items())`.
+            # Keep PyPy's app-level recursion protocol and change only the
+            # observable payload spelling; the temporary dict leaves the
+            # surrounding identity marker effective for self-values.
             return '%s(%r)' % (self.__class__.__name__, dict(self))
         finally:
             try:

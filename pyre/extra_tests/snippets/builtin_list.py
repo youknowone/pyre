@@ -1,5 +1,16 @@
 from testutils import assert_raises
 
+assert (
+    list.__new__.__doc__
+    == "Create and return a new object.  See help(type) for accurate signature."
+)
+assert (
+    list.__init__.__doc__
+    == "Initialize self.  See help(type(self)) for accurate signature."
+)
+assert list.append.__doc__ == "Append object to the end of the list."
+assert type(list.append).__name__ == "method_descriptor"
+
 x = [1, 2, 3]
 assert x[0] == 1
 assert x[1] == 2

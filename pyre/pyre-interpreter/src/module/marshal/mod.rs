@@ -308,6 +308,20 @@ fn write_object(
     // every current object rooted even for marshal versions without a ref
     // table, then reload containers before each child fetch.
     let obj_root = Rooted::new(obj);
+    // PyPy `marshal_impl._marshal_unicode` asks
+    // `ObjSpace.get_interned_str` before `write_ref`.  An AsciiListStrategy
+    // materializes a fresh wrapper on each getitem, so keying the reference
+    // table by that transient wrapper loses sharing for an interned value.
+    // Canonicalize only values already present in the intern table; ordinary
+    // strings must not become interned merely because they are marshalled.
+    let canonical_str_root = if version >= 3
+        && unsafe { is_exact_type(obj_root.get(), &pyre_object::STR_TYPE) }
+    {
+        unicodeobject::get_interned_wtf8(unsafe { w_str_get_wtf8(obj_root.get()) }).map(Rooted::new)
+    } else {
+        None
+    };
+    let obj_root = canonical_str_root.unwrap_or(obj_root);
     let obj = obj_root.get();
 
     if !is_singleton(obj)
@@ -420,16 +434,25 @@ fn write_object(
                 write_object(out, item, refs, version, depth - 1)?;
             }
         } else if !is_heap_type && is_list(obj) {
-            let len = w_list_len(obj);
+            // PyPy marshal_list snapshots `w_list.getitems()[:]` before
+            // writing. Besides insulating traversal from mutation, this
+            // preserves AbstractUnwrappedStrategy.getitems_copy's wrapper
+            // reuse for consecutive identical unboxed storage entries.
+            // Rooted uses the marshal call's outer root bracket. A nested
+            // RootScope here would discard WriterRefs' longer-lived slots
+            // when it dropped after recursive writes.
+            let snapshot: Vec<_> = w_list_items_copy_as_vec(obj_root.get())
+                .into_iter()
+                .map(Rooted::new)
+                .collect();
+            let len = snapshot.len();
             out.write_u8(b'[');
             out.write_u32(
                 len.try_into()
                     .map_err(|_| PyError::value_error("object too large to marshal"))?,
             );
-            for index in 0..len {
-                let item = w_list_getitem(obj_root.get(), index as i64)
-                    .ok_or_else(|| PyError::value_error("unmarshallable object"))?;
-                write_object(out, item, refs, version, depth - 1)?;
+            for item in snapshot {
+                write_object(out, item.get(), refs, version, depth - 1)?;
             }
         } else if !is_heap_type && is_dict(obj) {
             out.write_u8(b'{');

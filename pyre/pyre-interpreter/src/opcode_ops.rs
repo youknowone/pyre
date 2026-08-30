@@ -199,7 +199,10 @@ pub fn unary_positive_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> 
 pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     unsafe {
         if pyre_object::is_list(value) {
-            let items = pyre_object::w_list_items_copy_as_vec(value);
+            let items = pyre_object::w_list_items_copy_as_vec_mode(
+                value,
+                majit_metainterp::jit::we_are_jitted(),
+            );
             return Ok(pyre_object::w_tuple_new(items));
         }
     }
@@ -623,7 +626,10 @@ pub fn set_update_value(set: PyObjectRef, iterable: PyObjectRef) -> Result<(), P
             }
         } else if pyre_object::is_list(set) {
             if pyre_object::is_list(iterable) {
-                let items = pyre_object::w_list_items_copy_as_vec(iterable);
+                let items = pyre_object::w_list_items_copy_as_vec_mode(
+                    iterable,
+                    majit_metainterp::jit::we_are_jitted(),
+                );
                 for item in items {
                     pyre_object::w_list_append(set, item);
                 }

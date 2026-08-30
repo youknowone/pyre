@@ -22,6 +22,7 @@ exits 0 — the upstream files guard on `os.fork`, `/tmp`, `/bin/sh` and so on.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import traceback
 import types
@@ -37,9 +38,11 @@ def _skip(reason: str = "") -> None:
 
 
 class _RaisesContext:
-    def __init__(self, expected):
+    def __init__(self, expected, match=None):
         self.expected = expected
+        self.match = match
         self.value = None
+        self.type = None
 
     def __enter__(self):
         return self
@@ -48,21 +51,52 @@ class _RaisesContext:
         if exc_type is None:
             raise AssertionError(f"DID NOT RAISE {self.expected!r}")
         if issubclass(exc_type, self.expected):
+            if self.match is not None and re.search(self.match, str(exc_value)) is None:
+                raise AssertionError(
+                    f"{self.match!r} does not match {str(exc_value)!r}"
+                )
             self.value = exc_value
+            self.type = exc_type
             return True
         return False
 
 
+class _ExceptionInfo:
+    """The small `py.test.raises` result surface PyPy's app-level tests use."""
+
+    def __init__(self, value):
+        self.value = value
+        self.type = type(value)
+
+
 def _raises(expected, *args, **kwargs):
     """`raises(Exc)` as a context manager, `raises(Exc, func, *a, **kw)` direct."""
+    match = kwargs.pop("match", None)
     if not args:
-        return _RaisesContext(expected)
+        return _RaisesContext(expected, match)
     func, rest = args[0], args[1:]
     try:
         func(*rest, **kwargs)
     except expected as exc:
-        return exc
+        if match is not None and re.search(match, str(exc)) is None:
+            raise AssertionError(f"{match!r} does not match {str(exc)!r}")
+        return _ExceptionInfo(exc)
     raise AssertionError(f"DID NOT RAISE {expected!r}")
+
+
+class _Mark:
+    def skipif(self, condition, *, reason=""):
+        def decorate(func):
+            if not condition:
+                return func
+
+            def skipped(*args, **kwargs):
+                _skip(reason)
+
+            skipped.__name__ = func.__name__
+            return skipped
+
+        return decorate
 
 
 def _install_pytest_shim() -> None:
@@ -71,12 +105,19 @@ def _install_pytest_shim() -> None:
     shim.skip = _skip
     shim.fail = lambda msg="": (_ for _ in ()).throw(AssertionError(msg))
     shim.Skipped = Skipped
+    shim.mark = _Mark()
     sys.modules["pytest"] = shim
 
 
 def _load(path: Path) -> types.ModuleType:
     spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
+    # PyPy's app-level test collector publishes these helpers as globals;
+    # `pypy/objspace/std/test/apptest_*.py` therefore deliberately does not
+    # import them.  Keep the upstream source untouched and reproduce that
+    # collector contract here.
+    module.raises = _raises
+    module.skip = _skip
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module

@@ -1212,6 +1212,7 @@ fn charmap_encode_impl(
                         start,
                         end,
                         "character maps to <undefined>",
+                        crate::type_methods::EncodeErrorOwner::UnicodeObject,
                     )?;
                 match replacement {
                     crate::type_methods::EncodeReplacement::Bytes(bytes) => {
