@@ -3533,6 +3533,95 @@ fn inline_call_recursion_writes_subreturn_into_caller_dst_register() {
 }
 
 #[test]
+fn inline_call_subwalk_uses_heap_frames_past_the_old_host_stack_cap() {
+    // The retired recursive walker declined at depth 65.  Build a 96-frame
+    // chain so this test can only finish when `run_sub_jitcode_walk` drives an
+    // explicit heap stack and delivers each SubReturn to its parent CALL.
+    const DEPTH: usize = 96;
+    let ret = *insns_opname_to_byte().get("ref_return/r").unwrap();
+    let inline = *insns_opname_to_byte().get("inline_call_r_r/dR>r").unwrap();
+
+    let mut bodies = Vec::with_capacity(DEPTH);
+    for index in 0..DEPTH {
+        let code: &'static [u8] = if index + 1 == DEPTH {
+            Box::leak(vec![ret, 0].into_boxed_slice())
+        } else {
+            let next = index + 1;
+            Box::leak(
+                vec![
+                    inline,
+                    (next & 0xff) as u8,
+                    (next >> 8) as u8,
+                    1,
+                    0,
+                    0,
+                    ret,
+                    0,
+                ]
+                .into_boxed_slice(),
+            )
+        };
+        bodies.push(SubJitCodeBody {
+            code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
+        });
+    }
+    let lookup = move |index: usize| bodies.get(index).cloned();
+    let descr_pool: Vec<DescrRef> = (0..DEPTH).map(make_jitcode_descr).collect();
+
+    let root_code = [inline, 0, 0, 1, 0, 0, ret, 0];
+    let mut trace_ctx = fresh_trace_ctx();
+    let mut regs_r = distinct_const_refs(&mut trace_ctx, 1);
+    let expected = regs_r[0];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut walk_ctx = WalkContext {
+        callee_shadow: None,
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &mut regs_r,
+        registers_i: &mut [],
+        registers_f: &mut [],
+        concrete_registers_r: &mut [],
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut trace_ctx,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        outer_active_boxes: Vec::new(),
+        pending_guard_snapshot_error: None,
+        vstack_boxes: Vec::new(),
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_reorder_saved: None,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    fbw_finish_payload_reset();
+    let (outcome, end_pc) = walk(&root_code, 0, &mut walk_ctx).unwrap();
+    assert_eq!(outcome, DispatchOutcome::Terminate);
+    assert_eq!(end_pc, root_code.len());
+    drop(walk_ctx);
+    assert_eq!(regs_r[0], expected);
+    assert_eq!(fbw_finish_payload_take(), Some((expected, Type::Ref)));
+}
+
+#[test]
 fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     // Acceptance: caller's `inline_call_r_i/dR>i`
     // recurses into a synthetic callee whose body is `int_return

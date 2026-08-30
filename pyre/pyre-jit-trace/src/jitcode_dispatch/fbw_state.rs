@@ -17,38 +17,6 @@
 
 use super::*;
 
-/// Host-stack budget for canonical-helper descent
-/// ([`run_sub_jitcode_walk`]), counted in nested `walk()` activations.
-///
-/// RPython has no counterpart because it needs none: `MetaInterp` keeps every
-/// inlined frame in `framestack` and drives them from one loop, so its descent
-/// costs heap. Pyre's walker recurses on the host stack — each level is a
-/// `walk()` activation owning a `WalkContext` and five freshly allocated
-/// register banks — and a helper body that descends into a helper body has
-/// nothing bounding the chain but the process stack. Overflowing it kills the
-/// process with no abort, no trace and no jitstats line, which is the one
-/// failure mode the walk is otherwise built to avoid.
-///
-/// The bound is therefore a backstop, not a tuning knob. The deepest chain the
-/// whole `bench/synth` corpus reaches is FOUR levels — swept 2026-08-24, 452
-/// fixtures, zero declines at a cap of 4 — so the default sits 16x above it.
-/// Reaching it declines at the caller's own opcode boundary the same way an
-/// arity mismatch does. `PYRE_FBW_MAX_SUBWALK_DEPTH` lowers it, which is how
-/// the decline path is exercised without constructing a pathological helper
-/// chain: at a cap of 1/2/3 `bound_method_builtin_fold.py` declines 1842 times
-/// at depth 2/3/4 and its output stays byte-identical, which is both the
-/// arming proof and the proof that a decline costs correctness nothing.
-pub(crate) fn fbw_max_subwalk_depth() -> usize {
-    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DEPTH.get_or_init(|| {
-        std::env::var("PYRE_FBW_MAX_SUBWALK_DEPTH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64)
-            .clamp(1, 64)
-    })
-}
-
 /// Maximum inline depth the multiframe guard-snapshot path
 /// (`walker_capture_multi_frame_inline_snapshot`) unrolls a straight-line
 /// value-returning callee CHAIN before folding to the `CALL_ASSEMBLER` tail.

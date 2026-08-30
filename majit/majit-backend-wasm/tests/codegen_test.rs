@@ -5353,7 +5353,7 @@ fn guard_value_parks_its_operand_past_every_exits_fail_args() {
 /// A bridge executes in its source token's frame, whose offsets froze when that
 /// token was compiled, and `compile_bridge` refuses a bridge whose
 /// `frame_value_slots` exceeds `source_frame.value_slots` — a refusal
-/// `declined_bridge_guards` makes permanent, so the guard blackholes for the
+/// the guard descriptor makes permanent, so the guard blackholes for the
 /// rest of the run.  A source loop that spills nothing must therefore already
 /// carry the GUARD_VALUE counter slot: promoting a value is the ordinary way a
 /// bridge acquires one, and the two traces below have the same value area, so a

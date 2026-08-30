@@ -595,7 +595,7 @@ thread_local! {
     /// The current bridge trace's full-body walk hit a deterministic
     /// structural decline.  The walker only knows `(w_code, start_pc)`; the
     /// bridge launcher still has the originating guard descr and consumes this
-    /// bit to populate `MetaInterp::declined_bridge_guards`.
+    /// bit so the bridge launcher marks the originating guard descriptor.
     static FBW_BRIDGE_DECLINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 

@@ -1204,7 +1204,7 @@ pub fn next_value_pos(inputargs: &[InputArg], ops: &[Op]) -> u32 {
 /// trace whose own guards spill nothing. A bridge runs in its source token's
 /// frame, whose offsets froze when that token was compiled, and `compile_bridge`
 /// refuses a bridge whose `frame_value_slots` exceeds `source_frame.value_slots`
-/// — a refusal `declined_bridge_guards` makes permanent, so the guard blackholes
+/// — a refusal the guard descr makes permanent, so the guard blackholes
 /// for the rest of the run. Reserving only when THIS trace spills would let a
 /// loop with no GUARD_VALUE freeze a frame one slot too narrow for the first
 /// bridge that promotes a value, which is the ordinary way a bridge acquires
