@@ -220,9 +220,9 @@ cover the condition they diagnose.
 
 ### `MAJIT_GC_NURSERY_POISON`
 
-- Read sites: 2 — `majit/majit-gc/src/nursery.rs`, `majit/majit-gc/src/oldgen.rs`
-- Accessor: `new()`
-- What it does: fill recycled nursery and old-gen memory with a poison word instead of zeroes, so an allocation path that relies on its memory arriving zeroed fails where it reads rather than later. The two reads initialise `poison_on_reset` (`nursery.rs`) and `poison_on_alloc` (`oldgen.rs`). The nursery half of this is upstream's `gc_nursery_debug` (`PYPY_GC_NURSERY_DEBUG`), which selects `arena_reset` mode 3; that name is read separately and additively, so either spelling turns the fill on and neither turns the other off.
+- Read sites: 3 — `majit/majit-gc/src/nursery.rs`, `majit/majit-gc/src/oldgen.rs`, `majit/majit-gc/src/shadow_stack.rs`
+- Accessor: `gc_nursery_poison_enabled()`
+- What it does: fill recycled nursery and old-gen memory with a poison word instead of zeroes, so an allocation path that relies on its memory arriving zeroed fails where it reads rather than later. Two reads initialise `poison_on_reset` (`nursery.rs`) and `poison_on_alloc` (`oldgen.rs`); the third gates the pre-registration poison scan in `push_resume_ref_roots`, which asks per call, so the accessor caches the lookup. The nursery half of this is upstream's `gc_nursery_debug` (`PYPY_GC_NURSERY_DEBUG`), which selects `arena_reset` mode 3; that name is read separately and additively, so either spelling turns the fill on and neither turns the other off.
 - Retirement condition: **UNRECORDED** — owed by this gate's owner.
 
 ### `MAJIT_GC_STRESS`

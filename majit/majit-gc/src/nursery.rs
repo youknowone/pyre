@@ -157,7 +157,7 @@ impl Nursery {
         let start = alloc_arena(size);
         let top = unsafe { start.add(size) };
         let ptrs = Box::new(NurseryPtrs { free: start, top });
-        let poison_on_reset = std::env::var_os("MAJIT_GC_NURSERY_POISON").is_some();
+        let poison_on_reset = crate::gc_nursery_poison_enabled();
         Nursery {
             start,
             size,
