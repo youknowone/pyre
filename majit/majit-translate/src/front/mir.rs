@@ -4955,18 +4955,18 @@ impl<'a> Lowering<'a> {
                         Some((owner_root, field_name, _field_ty, owner_id)) => {
                             // Rust type-checks every assignment against the
                             // projected place's substituted field type.  A
-                            // raw pointer to a named ADT is therefore the
-                            // same typed nullable instance slot as a field
+                            // reference or raw pointer to a named ADT is
+                            // therefore the same instance slot as a field
                             // initialized by an aggregate: preserve that
                             // class on ordinary `self.field = value` writes
-                            // too.  Otherwise one classdef-less raw value
+                            // too.  Otherwise one pointer-shaped value
                             // generalizes the session-global ClassDef attr to
-                            // the root object repr before a later getattr is
-                            // rtyped.  RPython's SomeNone union instead keeps
-                            // the declared SomeInstance class and merely sets
-                            // `can_be_None`.
+                            // the raw-pointer repr before a later getattr is
+                            // rtyped.  RPython keeps the declared
+                            // SomeInstance class on every assignment (and a
+                            // nullable pointer merely sets `can_be_None`).
                             value =
-                                self.narrow_typed_nullable_field_value(bb_id, value, Some(dest_ty));
+                                self.narrow_typed_instance_field_value(bb_id, value, Some(dest_ty));
                             (
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
@@ -5014,25 +5014,21 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Preserve the declared class of a raw-pointer field value.
+    /// Preserve the declared class of an instance-typed field value.
     ///
-    /// RPython represents a nullable instance attribute as
-    /// `SomeInstance(classdef, can_be_None=True)`.  Rust spells the same slot
-    /// as `*mut/*const NamedAdt`, but a producer such as `null_mut()` begins as
-    /// a classdef-less pointer.  The Rust field type-check is the proof needed
-    /// to narrow that producer before `setattr`; this is an identity cast for
-    /// non-null values and a typed null for null values.
-    fn narrow_typed_nullable_field_value(
+    /// RPython represents an instance attribute as `SomeInstance(classdef)`;
+    /// when nullable, the same annotation simply carries `can_be_None=True`.
+    /// Rust spells those slots as `&NamedAdt` or `*mut/*const NamedAdt`, whose
+    /// producer initially has pointer annotation.  The Rust field type-check
+    /// is the proof needed to narrow that producer before `setattr`; this is
+    /// an identity cast for non-null values and a typed null for null values.
+    fn narrow_typed_instance_field_value(
         &mut self,
         bb_id: BlockId,
         value: LinkArg,
         declared_ty: Option<&TyRef>,
     ) -> LinkArg {
-        let Some(root) = declared_ty.and_then(|ty| {
-            tyref_node(ty, self.llbc)
-                .and_then(|n| strip_ty_wrappers(n, self.llbc))
-                .and_then(|n| raw_ptr_pointee_class_root(n, self.llbc))
-        }) else {
+        let Some(root) = declared_ty.and_then(|ty| tyref_class_root(ty, self.llbc)) else {
             return value;
         };
         self.narrow_value_to_instance_root(bb_id, value, &root)
@@ -5787,7 +5783,7 @@ impl<'a> Lowering<'a> {
                         continue;
                     }
                     let value = self
-                        .narrow_typed_nullable_field_value(
+                        .narrow_typed_instance_field_value(
                             bb_id,
                             LinkArg::Value(value),
                             declared_ty,
@@ -34464,6 +34460,53 @@ mod tests {
             );
         }
         assert!(writes >= 2, "expected both PyError context-field writes");
+    }
+
+    /// `W_DictObject.dstrategy` is PyPy's ordinary instance attribute.  Rust
+    /// carries the singleton strategy through `&'static DictStrategyRef`, but
+    /// assigning that reference must still feed `setattr` a classed instance;
+    /// otherwise the field's constructor annotation and setter annotation meet
+    /// as `SomeInstance(DictStrategyRef) ∪ SomePtr`.
+    #[test]
+    #[ignore]
+    fn dict_strategy_setter_retains_instance_class() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph =
+            super::lower_function(&llbc, "pyre_object::dictmultiobject::w_dict_set_strategy")
+                .expect("lower w_dict_set_strategy");
+        let value = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. } if field.name == "dstrategy" => match value
+                {
+                    LinkArg::Value(value) => Some(value.clone()),
+                    LinkArg::Const(_) => None,
+                },
+                _ => None,
+            })
+            .expect("W_DictObject.dstrategy write");
+        assert!(
+            graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                op.result.as_ref() == Some(&value)
+                    && matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments },
+                            ..
+                        } if segments.first().map(String::as_str)
+                            == Some("__cast_instance_intrinsic")
+                            && segments.last().is_some_and(|root| root.ends_with("DictStrategyRef"))
+                    )
+            }),
+            "dstrategy assignment must retain the declared DictStrategyRef class"
+        );
     }
 
     /// `split_builtin_kwargs` returns `&args[..args.len() - 1]` after proving
