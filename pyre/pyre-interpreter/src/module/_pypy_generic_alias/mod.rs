@@ -14,4 +14,9 @@ crate::py_module! {
             &pyre_object::UNION_TYPE,
         ),
     },
+    functions: {
+        "_create_union" / 2 = |args| {
+            crate::_pypy_generic_alias::create_union(args[0], args[1])
+        },
+    },
 }
