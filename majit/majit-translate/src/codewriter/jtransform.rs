@@ -618,6 +618,22 @@ pub(crate) fn jit_marker_key_from_target(
     }
 }
 
+/// The false result `can_enter_jit` leaves behind (`rewrite_can_enter_jits`
+/// runs after `make_jitcodes`, so the portal jitcode never enters through it).
+/// Upstream's result is `Constant(False)`, a Bool; stamping the same
+/// concretetype here lets the `bool` hop `set_branch` wrapped around the
+/// condition rewrite to an identity instead of `int_is_true`, so the
+/// constant exitswitch fold after rewriting still sees the constant.
+fn can_enter_jit_false_result(result: &crate::flowspace::model::Variable) -> SpaceOperation {
+    result.set_concretetype(Some(
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+    ));
+    SpaceOperation {
+        result: Some(result.clone()),
+        kind: OpKind::ConstInt(0),
+    }
+}
+
 /// Split a run of [`Variable`]s into (ints, refs, floats) per upstream
 /// `make_three_lists` (`jtransform.py`). Void values are
 /// dropped, matching the upstream filter; Unknown defaults to `Ref`.
@@ -6916,10 +6932,9 @@ impl<'a> Transformer<'a> {
             && !jd.active
         {
             return Some(match (key, result) {
-                (JitMarkerKey::CanEnterJit, Some(result)) => vec![SpaceOperation {
-                    result: Some(result.clone()),
-                    kind: OpKind::ConstInt(0),
-                }],
+                (JitMarkerKey::CanEnterJit, Some(result)) => {
+                    vec![can_enter_jit_false_result(result)]
+                }
                 _ => Vec::new(),
             });
         }
@@ -6953,10 +6968,7 @@ impl<'a> Transformer<'a> {
                 if key == JitMarkerKey::CanEnterJit
                     && let Some(result) = result
                 {
-                    ops.push(SpaceOperation {
-                        result: Some(result.clone()),
-                        kind: OpKind::ConstInt(0),
-                    });
+                    ops.push(can_enter_jit_false_result(result));
                 }
                 Some(ops)
             }
