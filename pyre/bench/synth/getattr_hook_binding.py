@@ -58,5 +58,48 @@ def main():
         i += 1
     print('loop', total)
 
+    # The same fold is guarded by the receiver map and type version.  Stores
+    # that invalidate either one must switch away from the recorded hook on
+    # the very next iteration.
+    class Mutable:
+        def __getattr__(self, name):
+            return "hook"
+
+    obj = Mutable()
+    seen = None
+    for i in range(30000):
+        seen = obj.later
+        if i == 15000:
+            obj.later = "instance"
+    assert seen == "instance"
+
+    class Replaced:
+        @classmethod
+        def __getattr__(cls, name):
+            return "first"
+
+    obj = Replaced()
+    seen = None
+    for i in range(30000):
+        seen = obj.later
+        if i == 15000:
+            Replaced.__getattr__ = classmethod(lambda cls, name: "second")
+    assert seen == "second"
+
+    # A non-string key devolves mapdict.  Every devolved instance of the class
+    # shares that map terminator, so the fold must consult the live dict rather
+    # than treating a pinned map as proof that the name is absent.
+    obj = Mutable()
+    obj.__dict__[1] = "devolve"
+    obj.present = "real"
+    for _ in range(12000):
+        assert obj.present == "real"
+        assert obj.missing == "hook"
+    for i in range(12000):
+        value = obj.later
+        if i == 6000:
+            obj.later = "assigned"
+    assert value == "assigned"
+
 
 main()

@@ -28,3 +28,36 @@ def main():
 
 main()
 
+
+# Exhaustion is an MRO question even when StopIteration is not the first base.
+# Keep it beside the hot iterator protocol it exercises instead of in a second
+# parity driver.
+class SV(StopIteration, ValueError):
+    pass
+
+
+class VS(ValueError, StopIteration):
+    pass
+
+
+class MixedStop:
+    def __init__(self, n, stop_type):
+        self.n = n
+        self.stop_type = stop_type
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.n <= 0:
+            raise self.stop_type("done")
+        self.n -= 1
+        return self.n
+
+
+for _ in range(3000):
+    for stop_type in (SV, VS):
+        assert list(MixedStop(3, stop_type)) == [2, 1, 0]
+        assert tuple(MixedStop(3, stop_type)) == (2, 1, 0)
+        assert sum(MixedStop(3, stop_type)) == 3
+        assert next(MixedStop(0, stop_type), "done") == "done"

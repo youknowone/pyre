@@ -16,6 +16,22 @@ class Counter:
         self._value = value
 
 
+class OverridingProperty(property):
+    def __get__(self, obj, objtype=None):
+        return "override-get"
+
+    def __set__(self, obj, value):
+        obj.recorded = "override-set"
+
+    def __delete__(self, obj):
+        obj.recorded = "override-del"
+
+
+class PropertySubclassOwner:
+    recorded = None
+    value = OverridingProperty(lambda self: "wrapped")
+
+
 def main():
     counter = Counter()
     total = 0
@@ -30,6 +46,16 @@ def main():
     # PyPy 3.11 has not yet gained property.__name__; keep the synthetic
     # output version-neutral while the dedicated 3.14 parity test covers it.
     print(prop.fget.__name__, prop.__doc__)
+
+    # The property fold is exact-type only.  A subclass keeps the same layout
+    # but must still dispatch through its overridden descriptor methods.
+    owner = PropertySubclassOwner()
+    for _ in range(20000):
+        assert owner.value == "override-get"
+    owner.value = 1
+    assert owner.recorded == "override-set"
+    del owner.value
+    assert owner.recorded == "override-del"
 
 
 main()

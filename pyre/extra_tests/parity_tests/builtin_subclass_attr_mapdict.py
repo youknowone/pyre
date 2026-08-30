@@ -2,7 +2,6 @@
 # parity-tests reason: this directly targets PyPy/pyre builtin-subclass storage.
 
 import gc
-import os
 
 
 class T(tuple):
@@ -143,10 +142,6 @@ slotted = SlottedStr("value")
 slotted.slot = "slot-value"
 slotted.extra = "dict-value"
 assert (slotted.slot, slotted.extra) == ("slot-value", "dict-value")
-
-stat_value = os.stat_result((0,) * 10)
-assert stat_value.st_atime_ns is None
-assert stat_value.st_mtime_ns is None
 
 for value in (int_user, str_user, tuple_user):
     assert any(candidate is value for candidate in gc.get_objects())

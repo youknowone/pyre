@@ -45,6 +45,30 @@ def outer(m):
     yield -1
 
 
+def terminal(n):
+    total = 0
+    for i in range(n):
+        total += i
+    if n < 0:
+        yield None
+    return total
+
+
+async def async_terminal(n):
+    total = 0
+    for i in range(n):
+        total += i
+    return total
+
+
+def returned(resumable):
+    try:
+        resumable.send(None)
+    except StopIteration as stop:
+        return stop.value
+    raise AssertionError("terminal value was yielded")
+
+
 def drive_send():
     g = echo()
     out = [g.send(None)]
@@ -103,4 +127,7 @@ assert sent == [0, 1, 3, 6], sent
 assert throwed == [2, 3, 16, 17], throwed
 assert delegated == [4950, 9], delegated
 assert closed == 1, closed
+expected = 19_999_900_000
+assert returned(terminal(200_000)) == expected
+assert returned(async_terminal(200_000)) == expected
 print("PASS")
