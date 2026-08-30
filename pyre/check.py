@@ -5082,6 +5082,12 @@ def parse_args():
         help="use existing release backend binaries instead of running cargo build",
     )
     parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="build and stamp each backend's release artefacts, then exit "
+        "without measuring anything",
+    )
+    parser.add_argument(
         "--wasm-engine",
         choices=["wasmtime", "wasmi"],
         default="wasmtime",
@@ -5142,6 +5148,12 @@ def parse_args():
     )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
+    if args.build_only and args.no_build:
+        # The pair asks for a run that neither builds nor measures. Refuse
+        # rather than pick one: a CI split names them in two separate steps,
+        # and a copy-paste that lands both on one step should say so here
+        # instead of quietly doing whichever the code happens to test first.
+        parser.error("--build-only and --no-build are mutually exclusive")
     # Answered here, ahead of the backend resolution below: the check is over
     # the fixture files, and nothing about it needs a backend to exist.
     if args.check_headers:
@@ -5255,6 +5267,24 @@ def main():
                 "Unset PYRE_WASM_MODULE to run the module this build produced.",
             )
         chk._set_pyre(backend, pyre_bin)
+
+    if args.build_only:
+        # Stop here, with every artefact built, existence-checked and stamped
+        # by `build_backend`. A caller splits the run in two so that a build
+        # and a measurement are timed apart -- which is otherwise impossible,
+        # because one invocation reports one duration for both.
+        #
+        # This costs the second invocation one extra `build_inputs_fingerprint`
+        # (under a second against a multi-minute build) and nothing else. The
+        # build-window witness is opened and closed inside `build_backend`, so
+        # it does not span the split, and the stamps the freshness gate reads
+        # are files. Splitting in fact exercises that gate harder than a single
+        # run does: the process that measures is no longer the process that
+        # built, so every run reads a stamp across a process boundary instead
+        # of trusting one it wrote itself.
+        print()
+        print(f"built and stamped: {', '.join(backends)}")
+        sys.exit(0)
 
     print()
     print(bold("pyre pre-merge check"))
