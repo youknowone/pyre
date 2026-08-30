@@ -3033,6 +3033,7 @@ pub(crate) fn helper_kind_writes_live_heap(helper: majit_ir::RuntimeHelperKind) 
             | majit_ir::RuntimeHelperKind::SetCurrentException
             | majit_ir::RuntimeHelperKind::StoreDeref
             | majit_ir::RuntimeHelperKind::SetAddMethod
+            | majit_ir::RuntimeHelperKind::BareSuperFromFrame
     )
 }
 
@@ -7409,22 +7410,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     {
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
-    // Ahead of the re-route below, which is what a decline here falls back to.
+    // Ahead of the `bare_super_call` re-route, which sits with the other
+    // substitutions below and is what a decline here falls through to.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
         && spec_gate(SpecFold::BareSuperVirtual, || {
             try_walker_specialize_bare_super_virtual(ctx, code, op, &r_args, dst)
-        })?
-        .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
-    }
-    if ctx.is_authoritative_executor
-        && dst_bank == 'r'
-        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BareSuperCall, || {
-            try_walker_specialize_bare_super_call(ctx, code, op, &r_args, dst)
         })?
         .is_some()
     {
@@ -7594,17 +7586,31 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     // code, moves no frame-entry odometer, and can do anything.  Keeping the
     // marker is what makes the substitution invisible to the rollback rules
     // rather than merely survivable by them.
-    let set_add_subst = if ctx.is_authoritative_executor
+    //
+    // The zero-argument `super()` re-route is the second arm of the same shape
+    // and is spelled here rather than with the folds above precisely so it can
+    // reuse this tail: its leaf can run a `__class__` property, so it needs the
+    // concrete execution, the raise transcription and the force bracket that
+    // only the generic path performs.  The two arms are mutually exclusive by
+    // callable -- `set.add` bound method against the `super` type -- so the
+    // order between them is free; `set_add` is asked first only because it is
+    // the cheaper recognition.
+    let direct_subst = if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
     {
-        spec_gate(SpecFold::SetAddMethod, || {
+        match spec_gate(SpecFold::SetAddMethod, || {
             try_walker_specialize_set_add_method(ctx, code, op, &r_args)
-        })?
+        })? {
+            Some(subst) => Some(subst),
+            None => spec_gate(SpecFold::BareSuperCall, || {
+                try_walker_specialize_bare_super_call(ctx, code, op, &r_args)
+            })?,
+        }
     } else {
         None
     };
-    let (funcptr, descr, allboxes) = match set_add_subst {
+    let (funcptr, descr, allboxes) = match direct_subst {
         Some(subst) => (subst.funcptr, subst.descr, subst.allboxes),
         None => (funcptr, descr, allboxes),
     };

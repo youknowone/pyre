@@ -12075,24 +12075,6 @@ pub fn builtin_super_from_frame(
     ))
 }
 
-/// [`builtin_super_from_frame`] for a caller that must not run Python.
-///
-/// `None` where the full entry point would either raise or reach
-/// [`super_check`]'s `__class__` lookup, which a property answers with
-/// arbitrary code.  The meta-tracer executes this concretely while recording,
-/// where running Python could force the virtualizable it is recording against
-/// and where a raise it then declined would run those side effects twice, so
-/// it takes only the settled half and leaves the rest to the generic residual.
-pub fn builtin_super_from_frame_python_free(
-    frame_ptr: *mut crate::pyframe::PyFrame,
-) -> Option<PyObjectRef> {
-    let (w_class, w_self) = super_operands_from_frame(frame_ptr).ok()?;
-    let obj_type = super_check_python_free(w_class, w_self)?;
-    Some(pyre_object::descriptor::w_super_new(
-        w_class, obj_type, w_self,
-    ))
-}
-
 /// The `(__class__ cell, arg[0])` pair zero-argument `super()` is built from.
 ///
 /// Every raising arm here reads frame state and runs no Python, so a caller

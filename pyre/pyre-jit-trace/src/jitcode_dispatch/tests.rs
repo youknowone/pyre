@@ -445,6 +445,39 @@ fn the_substituted_set_add_descr_still_reads_as_a_live_heap_write() {
     );
 }
 
+/// The zero-argument `super()` substitution has the same two obligations, and
+/// for it they are load-bearing on a shape the corpus runs: the leaf reaches
+/// `_super_check`'s `__class__` lookup, which a property answers with arbitrary
+/// Python.  The `Ref` result clears the `Void` write proxy, so the helper tag
+/// is again the only thing that keeps the call on the executed-effect
+/// odometer; and the effect has to stay may-force, because that is what puts
+/// `select_residual_call_opcode` on the branch that emits the vrefs bracket and
+/// the trailing `GuardNotForced` this substitution relies on.
+#[test]
+fn the_substituted_bare_super_descr_is_a_may_force_live_heap_write() {
+    let descr = super::specialize::bare_super_from_frame_descr();
+    let call_descr = descr
+        .as_call_descr()
+        .expect("the substitution installs a call descr");
+    assert_eq!(
+        call_descr.result_type(),
+        Type::Ref,
+        "the proxy comes back as the result, so the Void write proxy is blind to it"
+    );
+    assert!(
+        super::residual_call::helper_kind_writes_live_heap(
+            call_descr.get_extra_info().runtime_helper
+        ),
+        "an untagged descr lets a nested abort rewind past a `__class__` property that ran"
+    );
+    assert!(
+        call_descr
+            .get_extra_info()
+            .check_forces_virtual_or_virtualizable(),
+        "a non-forcing effect would drop the vrefs bracket and the GuardNotForced"
+    );
+}
+
 #[test]
 fn specialised_pair_unpack_recognises_the_float_layout() {
     use super::specialize::{SpecialisedPairKind, specialised_pair_kind};

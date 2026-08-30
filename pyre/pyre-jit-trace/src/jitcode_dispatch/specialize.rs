@@ -3196,46 +3196,49 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
 /// Zero-argument `super()` reached as a call, i.e. the `LOAD_GLOBAL super` +
 /// `CALL` spelling a name binding produces rather than `LOAD_SUPER_ATTR`.
 ///
-/// Both spellings force the virtualizable — `codewriter.rs` binds
-/// `load_super_attr_fn` with `CallFlavor::MayForce`, because a descriptor
-/// `__get__` may run Python — so this is not about removing a force.  What
-/// differs is where the force happens.  `LOAD_SUPER_ATTR` forces inside a
-/// may-force residual that carries the red frame as an operand, which the
-/// walker models.  The call spelling reaches `builtin_super`'s zero-argument
-/// tail, whose `ExecutionContext::gettopframe()` runs `force_frame` INSIDE an
-/// opaque `bh_call_fn`; that clears `TOKEN_TRACING_RESCALL` and
-/// `tracing_after_residual_call` reads it back as
+/// A substitution, not a fold: the call stays a may-force residual, still
+/// guarded and still concrete-executed by the shared tail in
+/// `dispatch_residual_call_iRd_kind`, so the force and exception guards, the
+/// heapcache invalidation and the dst writeback are the ones the generic path
+/// already emits.  What changes is the target.
+///
+/// The generic `bh_call_fn` this replaces reaches `builtin_super`'s
+/// zero-argument tail, whose `ExecutionContext::gettopframe()` runs
+/// `force_frame` INSIDE an opaque residual; that clears
+/// `TOKEN_TRACING_RESCALL` and `tracing_after_residual_call` reads it back as
 /// `VableEscapedDuringResidualCall`.  The frame `gettopframe` answers with is
-/// the one being traced, so that residual always escapes and the loop always
-/// aborts.
+/// the one being traced, so that residual always escapes, the walk always
+/// aborts, and after `MAX_TRACE_ABORT_COUNT` of them the merge point is
+/// stamped `JC_DONT_TRACE_HERE` for the rest of the process.
 ///
-/// So the emission is a re-route: name
-/// [`crate::helpers::jit_bare_super_from_frame`] — the same `descriptor.py
-/// _super_from_frame` half `bh_load_super_attr_fn` calls — as a may-force
-/// residual taking the walk's own frame box.  The force still happens; it moves
-/// to the channel the walker can see, which is the difference between an
-/// escape and an ordinary forced residual.
+/// [`crate::helpers::jit_bare_super_from_frame`] is the same `descriptor.py
+/// _super_from_frame` half `bh_load_super_attr_fn` calls, and it takes the
+/// frame as an operand.  Naming it directly is what lets the name-bound
+/// spelling take the route `LOAD_SUPER_ATTR` already takes: there is nothing
+/// for the callee to rediscover, so nothing forces the way `gettopframe` does.
 ///
-/// Only the receivers `super_check` settles without running Python are folded.
-/// [`pyre_interpreter::builtins::builtin_super_from_frame_python_free`] answers
-/// `None` for the rest, and they keep the generic residual.
+/// Every receiver is admitted, including the ones `_super_check` can only
+/// settle by asking Python.  Restricting it to the settled half is what an
+/// earlier version did, and the decline is what cost the abort — the fall-back
+/// was the escaping residual, so a `__class__` property was paid for with the
+/// whole trace.  The shared tail is what makes the wider admission safe: it
+/// brackets the call with `vable_and_vrefs_before_residual_call`, transcribes a
+/// raise into `last_exc_value` the way `execute_raised` does, and counts the
+/// call on the executed-effect odometer (through
+/// [`majit_ir::RuntimeHelperKind::BareSuperFromFrame`]) so a nested abort
+/// cannot rewind past a property that has already run.  Executing at record
+/// time and THEN declining is the one shape that would double it, and it is
+/// what site E of `bare_super_frame_escape.py` pins.
 ///
-/// The walk executes its residuals concretely, and this one would otherwise run
-/// `super_check`'s `__class__` lookup — arbitrary code, which is free to force
-/// the very virtualizable being recorded against and whose side effects a
-/// decline would then repeat under the generic residual.  Restricting the fold
-/// to the settled half makes the recording-time call a read: it cannot force,
-/// so it owes no `vrefs_before/after_residual_call` bracket around itself, and
-/// it cannot raise, so there is no exception to carry.  The runtime leaf still
-/// runs the whole entry point, which is what the trailing `GuardNotForced` and
-/// `GuardNoException` are for.
+/// The virtual fold ([`try_walker_specialize_bare_super_virtual`]) runs ahead
+/// of this and answers without any call at all where it can; this is what its
+/// declines fall through to.
 pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DirectResidualSubst>, DispatchError> {
     // `super()` with no user arguments arrives as `[callable, null_or_self]`.
     if r_args.len() != 2 {
         return Ok(None);
@@ -3252,15 +3255,11 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let Some((frame_box, frame_ptr)) = walker_executing_frame_box(ctx) else {
+    let Some((frame_box, _frame_ptr)) = walker_executing_frame_box(ctx) else {
         return Ok(None);
     };
-    // Ahead of every emission, so a decline leaves the trace untouched.
-    let Some(proxy) = pyre_interpreter::builtins::builtin_super_from_frame_python_free(
-        frame_ptr as *mut pyre_interpreter::PyFrame,
-    ) else {
-        return Ok(None);
-    };
+
+    // ── tentative commit ──
     // Pin the callable the way the constructor folds do, so rebinding the
     // global `super` side-exits instead of keeping this route.
     let callable_op = r_args[0];
@@ -3273,34 +3272,38 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
             .heap_cache_mut()
             .replace_box(callable_op, expected);
     }
-    residual_call::maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
-    // `MOST_GENERAL`, not a fresh `EffectInfo`: the leaf is the whole entry
-    // point, whose `super_check` arm can run a `__class__` property, so no
-    // read/write descr set describes it.  A constructed `EffectInfo` inherits
-    // EMPTY sets, which claims the opposite and lets the optimizer keep cached
-    // fields across the call.  `RandomEffects` outranks
-    // `ForcesVirtualOrVirtualizable`, so this keeps the may-force reading the
-    // `GuardNotForced` below depends on.
-    let result = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallMayForceR,
-        crate::helpers::jit_bare_super_from_frame as *const (),
-        &[frame_box],
-        &[majit_ir::Type::Ref],
-        majit_ir::Type::Ref,
-        majit_ir::EffectInfo::MOST_GENERAL,
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        result,
-        majit_ir::Value::Ref(majit_ir::GcRef(proxy as usize)),
-    );
-    // The dst is written before both guards, the ordering
-    // `_opimpl_residual_call*` keeps so the dst slot's OpRef rides their
-    // snapshots.
-    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', result)?;
-    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-    Ok(Some(()))
+    let funcptr = ctx
+        .trace_ctx
+        .const_int(crate::helpers::jit_bare_super_from_frame as *const () as i64);
+    Ok(Some(DirectResidualSubst {
+        funcptr,
+        descr: bare_super_from_frame_descr(),
+        allboxes: vec![funcptr, frame_box],
+    }))
+}
+
+/// The descr the zero-argument `super()` substitution installs: `(Ref) -> Ref`,
+/// `MOST_GENERAL`, tagged [`majit_ir::RuntimeHelperKind::BareSuperFromFrame`].
+///
+/// `MOST_GENERAL`, not a constructed `EffectInfo`: the leaf is the whole entry
+/// point, whose `_super_check` arm can run a `__class__` property, so no
+/// read/write descr set describes it and an empty one would claim the opposite,
+/// letting the optimizer keep cached fields across the call.  `RandomEffects`
+/// outranks `ForcesVirtualOrVirtualizable`, which is what keeps
+/// `select_residual_call_opcode` on the may-force branch and the trailing
+/// `GuardNotForced` meaningful.
+///
+/// The helper tag on top of it is the executed-effect odometer's only reader
+/// here — see the variant's own documentation.
+pub(crate) fn bare_super_from_frame_descr() -> DescrRef {
+    majit_metainterp::make_call_descr_with_effect(
+        &[Type::Ref],
+        Type::Ref,
+        majit_ir::EffectInfo {
+            runtime_helper: majit_ir::RuntimeHelperKind::BareSuperFromFrame,
+            ..majit_ir::EffectInfo::MOST_GENERAL
+        },
+    )
 }
 
 /// `mapdict.py LOAD_ATTR_caching` full-body-walker fast path for a
@@ -14828,13 +14831,16 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// The substituted residual [`try_walker_specialize_set_add_method`] hands
-/// back: the funcbox, the minted `(Ref, Ref) -> Ref` MayForce call descr, and
-/// the `[funcbox, receiver, value]` arglist.  The generic residual path
-/// records and executes it exactly as it would the call it replaces, so the
+/// The substituted residual a re-routing arm hands back: the funcbox, a minted
+/// MayForce call descr, and the arglist that goes with them (the funcbox
+/// first, as the generic path builds it).  The generic residual path records
+/// and executes it exactly as it would the call it replaces, so the
 /// force/exception guards, the heapcache invalidation and the result
 /// writeback all stay where they are.
-pub(crate) struct SetAddDirectResidual {
+///
+/// Two arms produce one: [`try_walker_specialize_set_add_method`] and
+/// [`try_walker_specialize_bare_super_call`].
+pub(crate) struct DirectResidualSubst {
     pub(crate) funcptr: OpRef,
     pub(crate) descr: DescrRef,
     pub(crate) allboxes: Vec<OpRef>,
@@ -14878,7 +14884,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
-) -> Result<Option<SetAddDirectResidual>, DispatchError> {
+) -> Result<Option<DirectResidualSubst>, DispatchError> {
     if r_args.len() != 3 {
         return Ok(None);
     }
@@ -14961,7 +14967,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     let funcptr = ctx
         .trace_ctx
         .const_int(pyre_interpreter::runtime_ops::jit_set_add_method as *const () as i64);
-    Ok(Some(SetAddDirectResidual {
+    Ok(Some(DirectResidualSubst {
         funcptr,
         descr: set_add_method_descr(),
         allboxes: vec![funcptr, self_ref, r_args[2]],

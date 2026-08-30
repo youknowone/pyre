@@ -1134,6 +1134,23 @@ pub enum RuntimeHelperKind {
     /// [`RuntimeHelperKind::LoadConst`] and [`RuntimeHelperKind::LoadGlobal`]
     /// carry.
     SuperAttrUnwrap,
+    /// `jit_bare_super_from_frame(frame)` — the target the walker substitutes
+    /// for a traced zero-argument `super()` that arrives as a call rather than
+    /// as LOAD_SUPER_ATTR (`try_walker_specialize_bare_super_call`).  It is the
+    /// `descriptor.py _super_from_frame` half `bh_load_super_attr_fn` already
+    /// calls, named directly so the frame travels as an operand; the generic
+    /// `bh_call_fn` it replaces reaches `builtin_super`'s zero-argument tail,
+    /// whose `gettopframe()` forces the traced virtualizable from inside an
+    /// opaque residual and aborts the walk.
+    ///
+    /// It RETURNS the proxy (`Ref`) while `_super_check` may run a `__class__`
+    /// property, i.e. arbitrary Python, so it is a value-returning call the
+    /// `Void`-result write proxy cannot see — the same standing as
+    /// [`RuntimeHelperKind::SetAddMethod`], and the reason the tag exists.
+    /// Without it the substitution would replace a `CallFn` the
+    /// `writes_live_heap` discriminator counts with a descr it does not, and a
+    /// nested abort would rewind past a property that has already run.
+    BareSuperFromFrame,
     /// `bh_delete_attr_fn(obj, code, name_idx)` — the plain DELETE_ATTR
     /// residual (`lower_delete_attr_hlop_to_insn` → `space.delattr`), the
     /// deletion counterpart of [`StoreAttr`](RuntimeHelperKind::StoreAttr).
