@@ -5746,6 +5746,56 @@ mod tests {
     }
 
     #[test]
+    fn qualified_builtin_cast_ignores_a_same_leaf_registry_function() {
+        // RPython carries the actual `float` object in the flowspace
+        // Constant, so `BUILTIN_TYPER[float]` cannot be captured by an
+        // unrelated function with the same `__name__`.  Pyre's MIR carrier
+        // is a path; the explicit `__builtin__` owner is how the cast path
+        // preserves that object identity across the flat CallRegistry.
+        use crate::flowspace::argument::Signature;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("qualified_builtin_cast_fixture");
+        let vars = mint_vars(&mut graph, 3);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+
+        let registry = empty_call_registry();
+        registry.get_or_register(
+            FunctionPathKey::from_segments(["float"]),
+            Signature::new(vec!["value".into()], None, None),
+        );
+        let op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["__builtin__".into(), "float".into()],
+                },
+                args: vec![vars[1].clone()],
+                result_ty: ValueType::Float,
+            },
+        };
+
+        let translated = translate_op(&op, &value_map, &registry)
+            .expect("qualified builtin cast must resolve through HOST_ENV");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("FunctionPath callable must be ConstValue::HostObject");
+        };
+        let expected = HOST_ENV
+            .lookup_builtin("float")
+            .expect("HOST_ENV bootstrap must register __builtin__.float");
+        assert_eq!(host, &expected);
+        assert!(
+            !host.is_user_function(),
+            "the same-leaf registry function must not capture the builtin cast"
+        );
+    }
+
+    #[test]
     fn translate_op_call_function_path_resolves_host_module_attr_for_lltype_cast() {
         // Multi-segment FunctionPath unregistered in CallRegistry
         // falls back to Layer 3 (HOST_ENV.import_module + module_get).

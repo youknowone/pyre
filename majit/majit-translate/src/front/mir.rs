@@ -19976,8 +19976,10 @@ fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
 /// ptr` / `ptr → int` resolve the `lltype.cast_*` module attr
 /// (`["rpython", "rtyper", "lltypesystem", "lltype", …]` per
 /// `flowspace_adapter` Branch 3b); `int → float` / `float → int` resolve
-/// the bare `float` / `int` builtins (single-segment `HOST_ENV.\
-/// lookup_builtin`).
+/// the `__builtin__.float` / `__builtin__.int` objects.  Keeping the builtin
+/// owner in the path preserves the callable identity that keys
+/// `rbuiltin.py::BUILTIN_TYPER`; a bare leaf can collide with an unrelated
+/// Rust function named `float` or `int` in the flat call registry.
 fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
     let (s, d) = (value_type_bank(src), value_type_bank(dst));
     let lltype = |name: &str| -> Vec<String> {
@@ -19993,9 +19995,12 @@ fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
         (0, 1) => Some(lltype("cast_int_to_ptr")),
         (1, 0) => Some(lltype("cast_ptr_to_int")),
         // int → float / float → int — `float(v)` / `int(v)`, whose
-        // rtyper delegates to `rtype_float` / `rtype_int`.
-        (0, 2) => Some(vec!["float".to_string()]),
-        (2, 0) => Some(vec!["int".to_string()]),
+        // rtyper delegates to `rtype_float` / `rtype_int`.  The explicit
+        // `__builtin__` owner is the flowspace Constant's host identity, not
+        // a new namespace: `HOST_ENV.import_module("__builtin__")` returns
+        // the same singleton objects that key `BUILTIN_TYPER`.
+        (0, 2) => Some(vec!["__builtin__".to_string(), "float".to_string()]),
+        (2, 0) => Some(vec!["__builtin__".to_string(), "int".to_string()]),
         // No host callable for the remaining pairs (e.g. ref↔float, or any
         // pair touching Void/State/Unknown): alias the operand.
         _ => None,
@@ -26779,14 +26784,26 @@ fn collapse_panic_message_chains(graph: &mut FunctionGraph) -> usize {
 mod tests {
     use super::harden_duplicate_leaf_metadata;
     use super::{
-        DecodedConst, FnPtrFamily, cast_kind_is_raw_ptr, cast_pointer_marker_op,
-        charon_const_generic_to_string, charon_type_value_to_ast_string, decode_literal,
-        fn_ptr_family_for, json_ty_is_thin_pointer_element, json_ty_scalar_element_spelling,
-        push_ptr_to_unsigned_cast, shaped_array_parts, simplify_lowered_graph, tyref_array_suffix,
-        tyref_is_raw_byte_ptr,
+        DecodedConst, FnPtrFamily, cast_call_segments, cast_kind_is_raw_ptr,
+        cast_pointer_marker_op, charon_const_generic_to_string, charon_type_value_to_ast_string,
+        decode_literal, fn_ptr_family_for, json_ty_is_thin_pointer_element,
+        json_ty_scalar_element_spelling, push_ptr_to_unsigned_cast, shaped_array_parts,
+        simplify_lowered_graph, tyref_array_suffix, tyref_is_raw_byte_ptr,
     };
     use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
     use majit_charon_reader::{Llbc, ullbc::TyRef};
+
+    #[test]
+    fn numeric_bank_crossing_casts_preserve_the_builtin_owner() {
+        assert_eq!(
+            cast_call_segments(&ValueType::Int, &ValueType::Float),
+            Some(vec!["__builtin__".into(), "float".into()])
+        );
+        assert_eq!(
+            cast_call_segments(&ValueType::Float, &ValueType::Int),
+            Some(vec!["__builtin__".into(), "int".into()])
+        );
+    }
 
     /// A block emptied *after* the head `eliminate_empty_blocks` must still
     /// be rewired past, so the values riding the link into it do not survive

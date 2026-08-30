@@ -3749,7 +3749,7 @@ impl<'a> Transformer<'a> {
         // the helper address/effect descriptor and unsigned rounding on the
         // upstream path; it is removed when jtransform consumes the rtyped
         // graph directly.
-        if matches!(target, CallTarget::FunctionPath { segments } if segments == &["float"])
+        if matches!(target, CallTarget::FunctionPath { segments } if segments == &["__builtin__", "float"])
             && args.len() == 1
             && matches!(result_ty, ValueType::Float)
             && variable_has_declared_unsigned_type(graph, &args[0])
@@ -10671,7 +10671,7 @@ mod tests {
             .push_op_var(
                 graph.startblock,
                 OpKind::Call {
-                    target: CallTarget::function_path(["float"]),
+                    target: CallTarget::function_path(["__builtin__", "float"]),
                     args: vec![arg],
                     result_ty: ValueType::Float,
                 },
