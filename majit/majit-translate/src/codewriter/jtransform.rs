@@ -3821,6 +3821,20 @@ impl<'a> Transformer<'a> {
         {
             return RewriteResult::Identity(args[0].clone());
         }
+        // Root pins and reloads are GC-transformer-level operations that
+        // upstream's codewriter never sees: `framework.py` `push_roots` /
+        // `pop_roots` run after jtransform. The JIT does not distinguish an
+        // object from its post-move address, so both operations are aliases of
+        // the object they publish or reload and emit no jitcode op.
+        if let CallTarget::FunctionPath { segments } = target
+            && let [.., crate_name, module, leaf] = segments.as_slice()
+            && crate_name == crate::runtime_names::crates::OBJECT
+            && module == "gc_roots"
+            && matches!(leaf.as_str(), "pin_root" | "reload_top_root")
+            && args.len() == 1
+        {
+            return RewriteResult::Identity(args[0].clone());
+        }
         // A zero-arg transparent `Tuple` constructor is the unit value `()` —
         // the MIR return-place aggregate of a `-> ()` function (e.g.
         // `w_list_append`).  It carries no payload and no runtime
@@ -12542,6 +12556,54 @@ mod tests {
         match rewritten {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// Root pins/reloads are inserted below the codewriter upstream, so both
+    /// source-level spellings alias their operand and contribute no operation.
+    #[test]
+    fn gc_root_pin_and_reload_elide_to_operand_alias() {
+        for leaf in ["pin_root", "reload_top_root"] {
+            let config = GraphTransformConfig::default();
+            let mut transformer = Transformer::new(&config);
+            let mut graph = FunctionGraph::new(format!("gc_roots_{leaf}"));
+            let entry = graph.startblock;
+            let arg = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let result_var = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+            let target =
+                CallTarget::function_path([crate::runtime_names::crates::OBJECT, "gc_roots", leaf]);
+            let result_ty = ValueType::Ref(None);
+            let op = SpaceOperation {
+                result: Some(result_var),
+                kind: OpKind::Call {
+                    target: target.clone(),
+                    args: vec![arg.clone()],
+                    result_ty: result_ty.clone(),
+                },
+            };
+
+            let rewritten = transformer.rewrite_op_direct_call(
+                &op,
+                &target,
+                std::slice::from_ref(&arg),
+                &result_ty,
+                &format!("gc_roots_{leaf}"),
+                &mut graph,
+            );
+            assert!(matches!(rewritten, RewriteResult::Identity(alias) if alias == arg));
+
+            graph.blocks[entry.0].operations.push(op);
+            let exceptblock = graph.exceptblock;
+            transformer.optimize_block(
+                &mut graph,
+                entry.0,
+                &format!("gc_roots_{leaf}"),
+                exceptblock,
+            );
+            assert!(
+                graph.blocks[entry.0].operations.is_empty(),
+                "{leaf} must emit no operation"
+            );
         }
     }
 

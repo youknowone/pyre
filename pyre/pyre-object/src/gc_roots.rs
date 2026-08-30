@@ -717,6 +717,18 @@ pub fn pin_root(root: PyObjectRef) -> PyObjectRef {
     with_shadow_stack(|stack| normalize_published_slot(stack, index))
 }
 
+/// Reload the current top shadow-stack entry after a call that may have moved
+/// it. `root` names the value the top slot was published with; the runtime read
+/// ignores that copy, while the codewriter folds this call to the argument
+/// because a GC move is invisible in the JIT view.
+#[inline]
+#[must_use = "a top root may have moved; use the reloaded live word"]
+#[majit_macros::dont_look_inside]
+pub fn reload_top_root(root: PyObjectRef) -> PyObjectRef {
+    let _ = root;
+    majit_gc::shadow_stack::top_ref().0 as PyObjectRef
+}
+
 /// Publish a complete translated livevar set before performing any
 /// forwarding query.  RPython's `push_roots(hop)` writes every live GCREF to
 /// the root stack as one pre-allocation phase; calling [`pin_root`] repeatedly
