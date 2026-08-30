@@ -1,8 +1,7 @@
-# CPython-suite gap: the suite never inspects the traceback of a
-# non-StopIteration exception raised out of __next__ by a hot FOR_ITER.
-# parity-tests reason: FOR_ITER's mismatch arm re-raises a value that already
-# carries this frame's traceback node, so the re-raise must not record a second
-# one.
+# CPython-suite gap: the suite does not drive or inspect a non-StopIteration
+# exception raised from `__next__` by a hot FOR_ITER.
+# parity-tests reason: the mismatch arm must neither replay the advance nor
+# duplicate the traceback node when it forwards the exception.
 
 try:
     import pypyjit
@@ -14,6 +13,33 @@ except ImportError:
 import dis
 import sys
 import traceback
+
+
+walk_advances = []
+
+
+class WalkBoom:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        walk_advances.append(1)
+        return self.missing
+
+
+def show(value):
+    return value
+
+
+rounds_seen = []
+for round_no in range(6):
+    walk_advances.clear()
+    try:
+        show([value for value in WalkBoom()])
+    except AttributeError:
+        pass
+    rounds_seen.append((round_no, len(walk_advances)))
+assert rounds_seen == [(i, 1) for i in range(6)], rounds_seen
 
 
 class Boom:

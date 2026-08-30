@@ -8,33 +8,12 @@
 # survives.
 # pyre-check: regresses-under: PYRE_FBW_NO_ADOPT_RESIDUAL_LOCALS=1 -- without the adopt the walk keeps the box the local held before the call, and both traced iterations lose the write
 
-"""A write made through ``f_locals`` by a *called* function must be visible to
-the caller's next read, including on the iteration the caller's loop is traced.
+"""A callee's write through the caller's ``f_locals`` survives tracing.
 
-``setter`` reaches up with ``sys._getframe(1)`` and stores into the caller's
-fast local.  Executing that call forces the caller's virtualizable, and the
-store then lands on the frame the force just wrote.  The tracer walks a copy of
-that frame and holds each local as a box, so unless it reads the stored slot
-back out of the array, the value it carries -- and the value its loop closes on
--- is the one the local held before the call.
-
-The bound matters, and it has to clear TWO recordings.  The write is lost only
-on an iteration where the loop is being recorded, so a loop that stops short
-witnesses nothing.  The first recording calls ``setter`` for real: that call
-forces the caller's virtualizable, and the store lands on the frame the force
-just wrote.  The second, reached much later, inlines ``setter`` instead, so the
-store itself is the residual and nothing forces at all -- the proxy's own force
-is gated on the live frame's ``vable_token``, which is zero while the walk is
-tracing.  The two lose the write through different paths and are pinned here at
-iterations 1040 and 2105, so the bound sits well past the later of them.
-
-Both are reached only because ``adopt_residual_locals_writes`` reads the slot
-back; the passing run says nothing about that on its own, since a script that
-stopped reaching either iteration would pass too.  The ``regresses-under``
-header is what separates the two: with the adopt switched off this script must
-report ``2 of 4000, first: [(1040, 1039), (2105, 2104)]`` and exit non-zero, so
-a change that stops reaching the shape is reported here rather than read as a
-pass.
+``setter`` forces the caller and writes its fast-local array while the tracer
+holds a boxed copy. ``adopt_residual_locals_writes`` must read the slot back for
+both the concretely called and later inlined recordings. The bound reaches both;
+the ``regresses-under`` arm proves the shape remains live.
 """
 
 import sys

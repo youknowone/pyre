@@ -1,6 +1,6 @@
-# CPython-suite gap: no suite test deopts inside a helper called by a hot `__init__`.
-# parity-tests reason: this guards the resume chain's SHAPE when the constructor
-# continuation is not the innermost paused level.
+# CPython-suite gap: no suite test deopts in or below a hot inlined `__init__`.
+# parity-tests reason: this guards the constructor continuation both adjacent
+# to the resumed frame and one helper frame deeper.
 
 """A class call returns the instance when the deopt happens one frame deeper.
 
@@ -29,6 +29,30 @@ ROUNDS = 4000
 # Rare enough that the loop is long compiled before the second arm is first
 # taken, so that arm is reached through a guard failure rather than by tracing.
 RARE = 997
+
+
+class DirectBadOnRarePath:
+    def __init__(self, n):
+        self.n = n
+        if n < 0:
+            return n
+        return None
+
+
+direct_raised = 0
+direct_built = 0
+for i in range(ROUNDS):
+    value = -i if i % RARE == RARE - 1 else i
+    try:
+        obj = DirectBadOnRarePath(value)
+    except TypeError:
+        direct_raised += 1
+    else:
+        assert isinstance(obj, DirectBadOnRarePath)
+        assert obj.n == value
+        direct_built += 1
+assert direct_raised == ROUNDS // RARE
+assert direct_built == ROUNDS - direct_raised
 
 
 def classify(n):
