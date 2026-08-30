@@ -132,6 +132,20 @@ impl UnicodeArray {
         }
     }
 
+    /// Generalize the block's cards before its items are permuted in place.
+    ///
+    /// A move stores no new reference, so [`Self::barrier`] does not answer for
+    /// it: the referenced set is unchanged and only which card page holds each
+    /// pointer moves. A minor reaches a carded array through its dirty pages
+    /// alone, so a young pointer shifted into a clean page would not be
+    /// scanned. The list side spells this `list_before_move_barrier`.
+    #[inline]
+    fn before_move_barrier(&self) {
+        if !self.block.is_null() {
+            crate::gc_hook::try_gc_write_barrier_before_move(self.block as *mut u8);
+        }
+    }
+
     pub fn push(&mut self, value: *const Wtf8Buf) {
         let _roots = crate::gc_roots::push_roots();
         let value_slot = crate::gc_roots::shadow_stack_len();
@@ -171,6 +185,7 @@ impl UnicodeArray {
         let _ = crate::gc_roots::pin_root(value as PyObjectRef);
         self.assert_room(1);
         self.barrier();
+        self.before_move_barrier();
         unsafe {
             let p = self.base().add(index);
             std::ptr::copy(p, p.add(1), self.len - index);
@@ -191,6 +206,7 @@ impl UnicodeArray {
     pub fn remove(&mut self, index: usize) -> *const Wtf8Buf {
         assert!(index < self.len);
         let value = self.as_slice()[index];
+        self.before_move_barrier();
         unsafe {
             let p = self.base().add(index);
             std::ptr::copy(p.add(1), p, self.len - index - 1);
@@ -229,6 +245,7 @@ impl UnicodeArray {
             self.capacity(),
         );
         self.barrier();
+        self.before_move_barrier();
         unsafe {
             let base = self.base();
             std::ptr::copy(
@@ -252,6 +269,7 @@ impl UnicodeArray {
         if count == 0 {
             return;
         }
+        self.before_move_barrier();
         unsafe {
             let base = self.base();
             std::ptr::copy(
