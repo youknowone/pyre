@@ -10874,6 +10874,10 @@ pub unsafe fn bound_method_attr_fast_path(
 /// because property and a user `__get__` may run Python while a plain value,
 /// function, staticmethod or classmethod has a reducible binding.
 ///
+/// This form recomputes `_super_check`, so it answers only for the receivers
+/// that check settles.  [`super_attr_proxy_fast_path`] is the form for a proxy
+/// that already exists, where the answer is a stored field instead.
+///
 /// # Safety
 /// `start_type` and `self_obj` must be valid object pointers (null tolerated).
 pub unsafe fn super_attr_fast_path(
@@ -10881,17 +10885,14 @@ pub unsafe fn super_attr_fast_path(
     self_obj: PyObjectRef,
     name: &str,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, bool)> {
-    // `getattr_str_impl` reaches its super branch only for a name it has not
-    // already answered itself: that branch is guarded `name != "__class__"`,
-    // and the terminal `__dict__` read sits above it.
-    if name == "__class__" || name == "__dict__" {
-        return None;
-    }
     if start_type.is_null() || self_obj.is_null() || !is_type(start_type) {
         return None;
     }
     let objtype = crate::builtins::super_check_python_free(start_type, self_obj)?;
     let class_mode = is_type(self_obj) && std::ptr::eq(objtype, self_obj);
+    if !class_mode && !super_attr_instance_mode_is_pinnable(self_obj) {
+        return None;
+    }
     // In instance mode the tracer pins the class by guarding the receiver's
     // `w_class` slot, so only a receiver whose class IS that slot can be
     // reproduced.  An exception carrying the generic stub resolves its class
@@ -10901,14 +10902,107 @@ pub unsafe fn super_attr_fast_path(
     if !class_mode && !std::ptr::eq(objtype, (*self_obj).w_class) {
         return None;
     }
+    let (version_tag, w_descr) = super_attr_suffix_lookup(objtype, start_type, name)?;
+    Some((objtype, version_tag, w_descr, class_mode))
+}
+
+/// [`super_attr_fast_path`] for an attribute load on a `W_Super` that already
+/// exists -- `su = super(...); su.name`, the spelling a name binding produces
+/// and `LOAD_SUPER_ATTR` never sees.
+///
+/// The difference is where `objtype` comes from.  `W_Super.getattribute` walks
+/// the `w_objtype` stored at construction and does not recompute it;
+/// `super_getattribute_wtf8` records why, which is that recomputing
+/// `type(w_self)` loses an apparent `__class__` supplied by a transparent
+/// proxy.  A proxy therefore hands the walk its answer and `_super_check` never
+/// runs again -- so this form admits the receivers
+/// [`crate::builtins::super_check_python_free`] cannot settle, and in exchange
+/// the caller owes a guard on the field it read, in place of the
+/// receiver-derived proof the other form gets from that check.
+///
+/// Returns `(version_tag, w_descr, class_mode)`; `objtype` is the caller's,
+/// read off the proxy.
+///
+/// # Safety
+/// The three proxy fields must be valid object pointers (null tolerated).
+pub unsafe fn super_attr_proxy_fast_path(
+    start_type: PyObjectRef,
+    objtype: PyObjectRef,
+    self_obj: PyObjectRef,
+    name: &str,
+) -> Option<(u64, PyObjectRef, bool)> {
+    // A null receiver is the unbound `super(C)` proxy, which
+    // `super_getattribute_wtf8` leaves to `object_getattr_miss`.
+    if start_type.is_null() || self_obj.is_null() || objtype.is_null() {
+        return None;
+    }
+    if !is_type(start_type) || !is_type(objtype) {
+        return None;
+    }
+    let class_mode = std::ptr::eq(self_obj, objtype);
+    if !class_mode && !super_attr_instance_mode_is_pinnable(self_obj) {
+        return None;
+    }
+    // The emitted body settles the slot-wrapper binding against the receiver's
+    // class and pins the `w_class` slot to hold it.  That slot is what
+    // `typedef::type` answers for every receiver except an exception still
+    // carrying the generic stub, whose class comes from the kind registry and
+    // would not be held.
+    if !class_mode
+        && !crate::typedef::r#type(self_obj)
+            .is_some_and(|actual| std::ptr::eq(actual.as_ptr(), (*self_obj).w_class))
+    {
+        return None;
+    }
+    let (version_tag, w_descr) = super_attr_suffix_lookup(objtype, start_type, name)?;
+    Some((version_tag, w_descr, class_mode))
+}
+
+/// Whether an instance-mode answer for this receiver survives the guards the
+/// emitted body can write.
+///
+/// `W_Super.getattribute` picks class mode by `w_self is w_objtype` and the
+/// trace decides that once, at recording time; what holds the decision later is
+/// the receiver's class guard.  Between two TYPE receivers that guard proves
+/// too little -- `type` is its own class, so a replayed receiver that IS the
+/// walked type passes the guard a different type wrote and would take the
+/// class-mode arm the recorded body does not have.  A receiver that is not a
+/// type cannot be the type the walk answers with, whatever else it is, which is
+/// why declining here is the whole check.
+///
+/// Class mode itself is unaffected: there the receiver is pinned to `objtype`
+/// by value.
+///
+/// # Safety
+/// `self_obj` must be a valid, non-null object pointer.
+unsafe fn super_attr_instance_mode_is_pinnable(self_obj: PyObjectRef) -> bool {
+    !is_type(self_obj)
+}
+
+/// The MRO suffix walk both `super` fast paths end in: descriptor.py
+/// `W_Super.getattribute` over `objtype`'s MRO, skipping everything up to and
+/// including `start_type`.
+///
+/// # Safety
+/// `objtype` must be a valid type object; `start_type` a valid object pointer.
+unsafe fn super_attr_suffix_lookup(
+    objtype: PyObjectRef,
+    start_type: PyObjectRef,
+    name: &str,
+) -> Option<(u64, PyObjectRef)> {
+    // `getattr_str_impl` reaches its super branch only for a name it has not
+    // already answered itself: that branch is guarded `name != "__class__"`,
+    // and the terminal `__dict__` read sits above it.
+    if name == "__class__" || name == "__dict__" {
+        return None;
+    }
     // typeobject.py: an uncacheable type cannot pin the lookup.
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(objtype);
     if version_tag == 0 {
         return None;
     }
-    // descriptor.py `W_Super.getattribute`: `su_objtype`'s MRO, skipping
-    // everything up to and including `su_type`.  A null mro answers `None`
-    // there rather than falling back to `compute_mro`.
+    // A null mro answers `None` there rather than falling back to
+    // `compute_mro`.
     let mro_ptr = w_type_get_mro(objtype);
     if mro_ptr.is_null() {
         return None;
@@ -10928,10 +11022,7 @@ pub unsafe fn super_attr_fast_path(
             break;
         }
     }
-    if w_descr.is_null() {
-        return None;
-    }
-    Some((objtype, version_tag, w_descr, class_mode))
+    (!w_descr.is_null()).then_some((version_tag, w_descr))
 }
 
 /// Whether `get(w_descr, descr_obj, objtype)` returns `w_descr` unchanged,

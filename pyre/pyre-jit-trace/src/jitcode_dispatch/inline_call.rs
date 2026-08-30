@@ -8135,8 +8135,14 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
     };
     let concrete_cls = unsafe { pyre_object::descriptor::w_super_get_type(concrete_proxy) };
     let concrete_self = unsafe { pyre_object::descriptor::w_super_get_obj(concrete_proxy) };
-    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
-        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
+    let objtype = unsafe { pyre_object::descriptor::w_super_get_obj_type(concrete_proxy) };
+    let Some((_version_tag, w_descr, class_mode)) = (unsafe {
+        pyre_interpreter::baseobjspace::super_attr_proxy_fast_path(
+            concrete_cls,
+            objtype,
+            concrete_self,
+            name,
+        )
     }) else {
         return Ok(None);
     };
@@ -8174,6 +8180,7 @@ pub(crate) fn try_walker_inline_super_proxy_property_get<Sym: WalkSym>(
         proxy_w_class,
         concrete_self,
         concrete_cls,
+        objtype,
     )?;
     super::specialize::walker_emit_super_attr_lookup_guards(
         ctx,

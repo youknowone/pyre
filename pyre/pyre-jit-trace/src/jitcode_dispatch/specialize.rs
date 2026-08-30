@@ -5029,18 +5029,30 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
         }
 
         // Pin the Python-level class exactly: a subclass reaching the same
-        // physical layout has its own MRO suffix after `cls`.
+        // physical layout has its own MRO suffix after `cls`, and the
+        // slot-wrapper binding was settled against this class.  It also decides
+        // instance mode against class mode, whose arm above pins the receiver
+        // to `objtype` itself.
+        //
+        // In the opcode spelling this constant IS `objtype`, because
+        // `super_attr_fast_path` declines a receiver whose `w_class` is
+        // anything else -- there this guard is what proves the class the walk
+        // used.  A proxy proves that from its own `w_objtype` field instead,
+        // and its receiver's class may be unrelated.
+        let self_class_const = ctx
+            .trace_ctx
+            .const_ref(unsafe { (*concrete_self).w_class } as i64);
         let w_class_op =
             walker_record_getfield_gc_r_uncached(ctx, self_obj, crate::descr::w_class_descr());
         walker_emit_fold_guard_with_snapshot(
             ctx,
             op_pc,
             OpCode::GuardValue,
-            &[w_class_op, objtype_const],
+            &[w_class_op, self_class_const],
         )?;
         ctx.trace_ctx
             .heap_cache_mut()
-            .replace_box(w_class_op, objtype_const);
+            .replace_box(w_class_op, self_class_const);
     }
 
     // typeobject.py `promote(self.version_tag())`.  Every class the suffix
@@ -5104,11 +5116,17 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
     };
     let concrete_cls = unsafe { pyre_object::descriptor::w_super_get_type(concrete_proxy) };
     let concrete_self = unsafe { pyre_object::descriptor::w_super_get_obj(concrete_proxy) };
-    // `super_attr_fast_path` refuses a null receiver (the unbound `super(C)`
-    // proxy), `__class__` / `__dict__`, an uncacheable type and a name no MRO
-    // suffix answers -- every shape this must not emit.
-    let Some((objtype, _version_tag, w_descr, class_mode)) = (unsafe {
-        pyre_interpreter::baseobjspace::super_attr_fast_path(concrete_cls, concrete_self, name)
+    let objtype = unsafe { pyre_object::descriptor::w_super_get_obj_type(concrete_proxy) };
+    // `super_attr_proxy_fast_path` refuses a null receiver (the unbound
+    // `super(C)` proxy), `__class__` / `__dict__`, an uncacheable type and a
+    // name no MRO suffix answers -- every shape this must not emit.
+    let Some((_version_tag, w_descr, class_mode)) = (unsafe {
+        pyre_interpreter::baseobjspace::super_attr_proxy_fast_path(
+            concrete_cls,
+            objtype,
+            concrete_self,
+            name,
+        )
     }) else {
         return Ok(None);
     };
@@ -5123,6 +5141,7 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
         proxy_w_class,
         concrete_self,
         concrete_cls,
+        objtype,
     )?;
     let value_op = walker_emit_super_attr_result(
         ctx,
@@ -5141,12 +5160,16 @@ pub(crate) fn try_walker_specialize_load_attr_on_super<Sym: WalkSym>(
 }
 
 /// Guard an already-built `super` proxy as the exact builtin implementation
-/// and expose its two live lookup operands to the trace.
+/// and expose its three live lookup operands to the trace.
 ///
 /// Both the Python-free result fold and the property-getter inline use this
 /// prefix.  Descriptor classification happens before entry, so no caller can
 /// decline after these guards merely because the selected descriptor needs a
 /// different binding path.
+///
+/// `w_objtype` is guarded here and the two returned operands are not, because
+/// the callers pin those through
+/// [`walker_emit_super_attr_lookup_guards`], which the opcode spelling shares.
 pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -5154,6 +5177,7 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     proxy_w_class: pyre_object::PyObjectRef,
     concrete_self: pyre_object::PyObjectRef,
     concrete_cls: pyre_object::PyObjectRef,
+    concrete_objtype: pyre_object::PyObjectRef,
 ) -> Result<(OpRef, OpRef), DispatchError> {
     let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
@@ -5171,6 +5195,29 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
         concrete_cls,
     );
     let self_op = walker_read_super_field(ctx, obj, crate::descr::super_obj_descr(), concrete_self);
+    // `w_objtype` is the class the suffix walk answers with, and on a proxy it
+    // is a stored word rather than something derived from the receiver, so it
+    // is pinned where it is read.  This is the whole of the proof for the
+    // receivers `_super_check` needs Python to settle: their `w_class` says
+    // nothing about the class the proxy resolved.
+    let objtype_op = walker_read_super_field(
+        ctx,
+        obj,
+        crate::descr::super_obj_type_descr(),
+        concrete_objtype,
+    );
+    if !objtype_op.is_constant() {
+        let objtype_const = ctx.trace_ctx.const_ref(concrete_objtype as i64);
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[objtype_op, objtype_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(objtype_op, objtype_const);
+    }
     Ok((self_op, cls_op))
 }
 

@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=150
-# pyre-check: spec-folds=bare_super_call
+# pyre-check: spec-folds=bare_super_call,load_attr_on_super
 # The declining twin of `zero_arg_name_bound_super_attr.py`: same base class,
 # same method, same loop, same `s = super()` name binding.  The one difference
 # is the receiver.
@@ -40,19 +40,24 @@
 # alone, so no `.jitstats` baseline is read or written for it.  This is the
 # gated half.
 #
-# What is left is a different fold: `load_attr_on_super consulted=1 fired=0`.
-# The proxy is built, but the `s.val(acc)` read off it declines because
-# `super_attr_fast_path` is asked about a receiver whose `type()` is not the
-# `objtype` the proxy resolved -- and that is the whole remaining gap, 0.32s
-# here against 0.06s for the `Child()` receiver, which folds both.  The
-# `Rebound` shape in `bare_super_frame_escape.py` takes this same re-route with
-# an ordinary receiver and reads 0.07s.
+# The `s.val(acc)` read off the proxy is the second fold in the header, and it
+# reaches this receiver for a reason the first one does not: `W_Super`
+# getattribute walks the `w_objtype` `_super_check` stored, and the proxy is
+# holding it, so nothing has to re-derive a class from `type(self)`.  It cost
+# 0.32s here to decline -- against 0.17s now, and 0.06s for the same file with
+# `Child()` as the receiver.
+#
+# What separates those last two is not a fold.  `_super_check` on this receiver
+# IS a `getattr(obj, "__class__")`, once per iteration, and the re-route runs it
+# concretely because that is what the semantics are; the `Child()` receiver
+# settles the same question by walking installed MROs and pays nothing.
 #
 # The ceiling is a level record, not a fitted number.  pypy's execution-only
 # time here lands at the measurement floor, so it clamps and no ratio gate is
-# applied: locally that reads `~52.7x` on dynasm and `~72.9x` on cranelift.
-# 150 is the cranelift number carried with room, for the host where the clamp
-# does not apply.  Re-fit it from the leg that ENFORCES it if one ever does.
+# applied: locally that reads `~22.5x` on dynasm and `~39.3x` on cranelift,
+# from `~52.7x` and `~72.9x` when the read declined.  150 is the cranelift
+# number carried with room, for the host where the clamp does not apply.
+# Re-fit it from the leg that ENFORCES it if one ever does.
 N = 1000000
 
 
