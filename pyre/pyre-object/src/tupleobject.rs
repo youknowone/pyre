@@ -321,11 +321,18 @@ fn w_tuple_new_array_backed_impl(
         let _ = crate::gc_roots::pin_root(item);
     }
 
+    // `w_class` is a livevar of this frame for the same reason the items are:
+    // every header below is written *after* the mallocs, so the class word this
+    // frame was handed can already name an evacuated slot. Pin it too, and
+    // build each header out of the slot the collector rewrites.
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+
     // The only allocations that may collect: the type's lazy instantiate
     // map and the tuple header. Both run while every item is pinned.
-    let header = PyObject {
+    let header = || PyObject {
         ob_type: &TUPLE_TYPE as *const PyType,
-        w_class,
+        w_class: crate::gc_roots::shadow_stack_get(class_slot),
     };
     let (type_id, object_size) = if user_layout {
         (W_TUPLE_USER_GC_TYPE_ID.get(), W_TUPLE_USER_OBJECT_SIZE)
@@ -348,6 +355,7 @@ fn w_tuple_new_array_backed_impl(
     let raw_slot = if raw.is_null() {
         None
     } else {
+        let header = header();
         unsafe {
             write_tuple_layout(
                 raw,
@@ -426,6 +434,7 @@ fn w_tuple_new_array_backed_impl(
         // The header went in before the root was published; only the items
         // block is still outstanding. Nothing below can collect, so the
         // remembered tuple keeps the block from here on.
+        let header = header();
         unsafe {
             write_tuple_layout(
                 raw,
@@ -440,7 +449,7 @@ fn w_tuple_new_array_backed_impl(
     if user_layout {
         crate::lltype::malloc_typed(W_TupleObjectUser {
             base: W_TupleObject {
-                ob_header: header,
+                ob_header: header(),
                 hash: AtomicI64::new(TUPLE_HASH_UNSET),
                 wrappeditems: items_block,
                 w_dict: PY_NULL,
@@ -450,7 +459,7 @@ fn w_tuple_new_array_backed_impl(
         }) as PyObjectRef
     } else {
         Box::into_raw(Box::new(W_TupleObject {
-            ob_header: header,
+            ob_header: header(),
             hash: AtomicI64::new(TUPLE_HASH_UNSET),
             wrappeditems: items_block,
             w_dict: PY_NULL,
