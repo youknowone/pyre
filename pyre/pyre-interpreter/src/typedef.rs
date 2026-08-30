@@ -3220,6 +3220,7 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             "descriptor '__init__' of 'module' object needs an argument",
         ));
     }
+    let self_ = module_require(positional[0], "__init__", false)?;
     let given = positional.len().saturating_sub(1);
     if given > 2 {
         return Err(crate::PyError::type_error(format!(
@@ -3262,7 +3263,6 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             "module() missing required argument 'name' (pos 1)",
         ));
     };
-    let self_ = positional[0];
     if !unsafe { pyre_object::is_str(w_name) } {
         let received = if unsafe { pyre_object::is_none(w_name) } {
             "None".to_string()
@@ -3304,17 +3304,31 @@ fn module_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 /// `_frozen_importlib._module_repr`, which implements the spec/file/name
 /// precedence shared by CPython 3.14.
 fn module_descr_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__")?;
+    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__repr__", false)?;
     Ok(pyre_object::w_str_from_wtf8_managed(module_repr_string(
         module,
     )?))
 }
 
-fn module_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
+fn module_require(
+    obj: PyObjectRef,
+    name: &str,
+    method_descriptor: bool,
+) -> Result<PyObjectRef, crate::PyError> {
     if obj.is_null() || !unsafe { pyre_object::is_module(obj) } {
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '{name}' for 'module' objects doesn't apply to this object"
-        )));
+        let received = if obj.is_null() {
+            "NULL".to_string()
+        } else {
+            type_name_of(obj)
+        };
+        let message = if method_descriptor {
+            format!(
+                "descriptor '{name}' for 'module' objects doesn't apply to a '{received}' object"
+            )
+        } else {
+            format!("descriptor '{name}' requires a 'module' object but received a '{received}'")
+        };
+        return Err(crate::PyError::type_error(message));
     }
     Ok(obj)
 }
@@ -3409,7 +3423,11 @@ pub(crate) fn module_repr_string(module: PyObjectRef) -> Result<Wtf8Buf, crate::
 /// module-specific AttributeError wording, so the descriptor is the direct
 /// entry point into that same implementation.
 fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__getattribute__")?;
+    let module = module_require(
+        args.first().copied().unwrap_or(PY_NULL),
+        "__getattribute__",
+        false,
+    )?;
     // The descriptor is reachable with any name `getattr` accepts, so it
     // takes the same WTF-8 split rather than demanding a `&str` view a
     // lone-surrogate name cannot give.
@@ -3422,7 +3440,7 @@ fn module_descr_getattribute(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 
 /// module.py `Module.descr_module__dir__`.
 fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__")?;
+    let module = module_require(args.first().copied().unwrap_or(PY_NULL), "__dir__", true)?;
     // module.py:164 — deliberately perform ordinary attribute lookup rather
     // than reading `self.w_dict`: a ModuleType subclass may shadow
     // `__dict__`, in which case the resulting non-dict is a TypeError.
@@ -3452,7 +3470,11 @@ fn module_descr_dir(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 }
 
 fn module_annotations_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotations__",
+        false,
+    )?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3522,7 +3544,11 @@ fn module_is_initializing(w_dict: PyObjectRef) -> Result<bool, crate::PyError> {
 }
 
 fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotations__",
+        false,
+    )?;
     let value = args[2];
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
@@ -3545,7 +3571,11 @@ fn module_annotations_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotations__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotations__",
+        false,
+    )?;
     let w_dict = unsafe { pyre_object::w_module_get_w_dict(module) };
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3567,7 +3597,11 @@ fn module_annotations_del(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotate__",
+        false,
+    )?;
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
     let _ = roots.pin_root(unsafe { pyre_object::w_module_get_w_dict(module) });
@@ -3586,7 +3620,11 @@ fn module_annotate_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
 }
 
 fn module_annotate_set(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let module = module_require(args.get(1).copied().unwrap_or(PY_NULL), "__annotate__")?;
+    let module = module_require(
+        args.get(1).copied().unwrap_or(PY_NULL),
+        "__annotate__",
+        false,
+    )?;
     let value = args[2];
     if !unsafe { pyre_object::is_none(value) } && !crate::baseobjspace::callable_w(value) {
         return Err(crate::PyError::type_error(
@@ -3629,30 +3667,50 @@ fn init_module_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(module_descr_new),
+            make_new_descr_with_doc(
+                module_descr_new,
+                "Create and return a new object.  See help(type) for accurate signature.",
+            ),
         )
     };
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", module_descr_init),
+            crate::gateway::make_builtin_function_with_doc(
+                "__init__",
+                module_descr_init,
+                "Initialize self.  See help(type(self)) for accurate signature.",
+            ),
         )
     };
-    for (name, function, arity) in [
+    for (name, function, arity, doc) in [
         (
             "__repr__",
             module_descr_repr as crate::gateway::BuiltinCodeFn,
             1,
+            "Return repr(self).",
         ),
-        ("__getattribute__", module_descr_getattribute, 2),
-        ("__dir__", module_descr_dir, 1),
+        (
+            "__getattribute__",
+            module_descr_getattribute,
+            2,
+            "Return getattr(self, name).",
+        ),
+        (
+            "__dir__",
+            module_descr_dir,
+            1,
+            "__dir__() -> list\nspecialized dir() implementation",
+        ),
     ] {
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ns,
                 name,
-                make_builtin_function_with_arity(name, function, arity),
+                crate::gateway::make_builtin_function_with_arity_and_doc(
+                    name, function, arity, doc,
+                ),
             )
         };
     }
@@ -3664,6 +3722,18 @@ fn init_module_type(ns: PyObjectRef) {
                 pyre_object::MEMBER_MODULE_DICT,
                 "__dict__".to_owned(),
                 pyre_object::PY_NULL,
+            ),
+        )
+    };
+    // `Module.typedef` places the public type doc after `__dict__` and
+    // before the annotations descriptor. Keep that structural order while
+    // using the 3.14 wording (which omits PyPy's signature preamble).
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "__doc__",
+            pyre_object::w_str_new(
+                "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
             ),
         )
     };
@@ -3689,15 +3759,30 @@ fn init_module_type(ns: PyObjectRef) {
             ),
         )
     };
-    unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
-            "__doc__",
-            pyre_object::w_str_new(
-                "Create a module object.\n\nThe name must be a string; the optional doc argument can have any type.",
-            ),
-        )
-    };
+    // PyPy `Module.typedef` supplies these Function carriers and their
+    // registration order. [3.14-spec] Attach the measured Argument Clinic
+    // signatures through the same Function.w_text_signature field.
+    for (name, text_signature) in [
+        ("__new__", "($type, *args, **kwargs)"),
+        ("__init__", "($self, /, *args, **kwargs)"),
+        ("__repr__", "($self, /)"),
+        ("__getattribute__", "($self, name, /)"),
+        ("__dir__", "($self, /)"),
+    ] {
+        let function = unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+            .expect("module TypeDef callable was just installed");
+        let roots = pyre_object::gc_roots::push_roots();
+        let function_slot = roots.base();
+        let _ = roots.pin_root(function);
+        let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_str_new(text_signature));
+        unsafe {
+            crate::function::fset_func_text_signature(
+                pyre_object::gc_roots::shadow_stack_get(function_slot),
+                pyre_object::gc_roots::shadow_stack_get(signature_slot),
+            )
+        };
+    }
 }
 
 fn singleton_receiver(

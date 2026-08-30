@@ -12,6 +12,37 @@ with assert_raises(AttributeError):
     _ = ns.c
 
 
+def _module_type_receiver_contract():
+    for name, args, message in (
+        (
+            "__repr__",
+            ({},),
+            "descriptor '__repr__' requires a 'module' object but received a 'dict'",
+        ),
+        (
+            "__getattribute__",
+            ({}, "name"),
+            "descriptor '__getattribute__' requires a 'module' object but received a 'dict'",
+        ),
+        (
+            "__dir__",
+            ({},),
+            "descriptor '__dir__' for 'module' objects doesn't apply to a 'dict' object",
+        ),
+        (
+            "__init__",
+            ({}, "name"),
+            "descriptor '__init__' requires a 'module' object but received a 'dict'",
+        ),
+    ):
+        with assert_raises(TypeError) as raised:
+            getattr(types.ModuleType, name)(*args)
+        assert str(raised.exception) == message
+
+
+_module_type_receiver_contract()
+
+
 def _function_type_kwdefaults():
     def source(a, /, b, *, c):
         return a + b + c

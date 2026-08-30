@@ -1057,6 +1057,33 @@ for owner, signature in EXPECTED_TYPES.items():
     assert owner.__text_signature__ == signature, (owner, owner.__text_signature__)
 
 
+# module_text_signatures_python314
+
+EXPECTED_MODULE_METHODS = {
+    "__new__": "($type, *args, **kwargs)",
+    "__init__": "($self, /, *args, **kwargs)",
+    "__repr__": "($self, /)",
+    "__getattribute__": "($self, name, /)",
+    "__dir__": "($self, /)",
+}
+check_descriptors(types.ModuleType, EXPECTED_MODULE_METHODS)
+
+EXPECTED_MODULE_DOCS = {
+    "__new__": "Create and return a new object.  See help(type) for accurate signature.",
+    "__init__": "Initialize self.  See help(type(self)) for accurate signature.",
+    "__repr__": "Return repr(self).",
+    "__getattribute__": "Return getattr(self, name).",
+    "__dir__": "__dir__() -> list\nspecialized dir() implementation",
+}
+for name, doc in EXPECTED_MODULE_DOCS.items():
+    assert getattr(types.ModuleType, name).__doc__ == doc, name
+
+assert str(inspect.signature(types.ModuleType.__new__)) == "(*args, **kwargs)"
+assert str(inspect.signature(types.ModuleType.__init__)) == "(self, /, *args, **kwargs)"
+assert str(inspect.signature(types.ModuleType.__getattribute__)) == "(self, name, /)"
+assert str(inspect.signature(types.ModuleType.__dir__)) == "(self, /)"
+
+
 # cell_text_signatures_python314
 
 EXPECTED_CELL_METHODS = {
