@@ -715,6 +715,18 @@ fn configure_root_only_jit_stats() {
         // can concurrently read or mutate the process environment.
         unsafe { std::env::set_var("PYRE_MAJIT_STATS_ANCESTOR", "1") };
     }
+    if !print_here {
+        // `majit_trace::Logger` prints its own `=== JIT Statistics ===` block
+        // from `Drop`, and it reads the environment rather than this policy.
+        // Clearing what turns it on is how the policy reaches it: a descendant
+        // then writes nothing of pyre's own to stderr, which is what
+        // `test_large_pool` asserts of the script it runs through
+        // `assert_python_ok`.
+        unsafe {
+            std::env::remove_var("MAJIT_STATS");
+            std::env::remove_var("MAJIT_LOG");
+        }
+    }
 }
 
 /// Diagnostics that have to read the descr universe *after* it has finished
