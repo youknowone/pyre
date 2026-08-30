@@ -2998,10 +2998,21 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         // virtualizable.py:134-137: array items
         for array in &self.array_fields {
             let arr_len = unsafe { bhimpl_arraylen_vable(vable_ptr as *const u8, array) };
+            // `lst = getattr(virtualizable, ARRAYFIELD)` is bound outside the
+            // item loop upstream, where the GC transform roots it and forwards
+            // it across whatever the reader does.  A bare base pointer is not
+            // such a root, and a `Ref` item's reader materializes the guard's
+            // virtuals, which allocates and can move the array underneath it.
+            // So the base is bound once only where the reader cannot allocate,
+            // and a `Ref` array resolves per item.
+            let base = (array.item_type != Type::Ref)
+                .then(|| unsafe { vable_array_write_base(vable_ptr, array) });
             for j in 0..arr_len {
                 let value = reader.next_value_of_type(array.item_type);
+                let (data_ptr, owner_ptr) =
+                    base.unwrap_or_else(|| unsafe { vable_array_write_base(vable_ptr, array) });
                 unsafe {
-                    vable_write_array_item(vable_ptr, array, j, value);
+                    vable_write_array_item_at(vable_ptr, array, data_ptr, owner_ptr, j, value);
                 }
             }
         }
@@ -3104,6 +3115,30 @@ pub(crate) unsafe fn vable_read_array_item(
     }
 }
 
+/// The two pointers an item write needs: where the items start, and which
+/// block the write barrier names.
+///
+/// `owner_ptr` is the block base the GC would know, i.e. before the items
+/// offset — the barrier argument.  `data_ptr` is items-adjusted and is not a
+/// valid object address, so the two only coincide where there is no items
+/// offset to undo.
+pub(crate) unsafe fn vable_array_write_base(
+    vable_ptr: *mut u8,
+    array: &VableArrayInfo,
+) -> (*mut u8, *mut u8) {
+    unsafe {
+        let data_ptr = bhimpl_arraybase_vable(vable_ptr, array) as *mut u8;
+        let owner_ptr = match array.storage {
+            VableArrayStorage::EmbeddedArray { .. } => data_ptr,
+            VableArrayStorage::DirectPointer => {
+                *(vable_ptr.add(array.field_offset) as *const *mut u8)
+            }
+            VableArrayStorage::RustVec { .. } => std::ptr::null_mut(),
+        };
+        (data_ptr, owner_ptr)
+    }
+}
+
 /// Write a value to a virtualizable array item.
 /// blackhole.py:1390-1403 bhimpl_setarrayitem_vable_* parity.
 pub(crate) unsafe fn vable_write_array_item(
@@ -3113,22 +3148,30 @@ pub(crate) unsafe fn vable_write_array_item(
     value: i64,
 ) {
     unsafe {
+        let (data_ptr, owner_ptr) = vable_array_write_base(vable_ptr, array);
+        vable_write_array_item_at(vable_ptr, array, data_ptr, owner_ptr, index, value);
+    }
+}
+
+/// Write one item of a virtualizable array whose base is already resolved.
+///
+/// Split out of [`vable_write_array_item`] so a caller walking a whole array
+/// can bind the base once, the way `virtualizable.py:134-137` binds `lst`
+/// outside its item loop.  Resolving it per item costs an indirect call for
+/// `RustVec` storage and two loads for the others.
+pub(crate) unsafe fn vable_write_array_item_at(
+    vable_ptr: *mut u8,
+    array: &VableArrayInfo,
+    data_ptr: *mut u8,
+    owner_ptr: *mut u8,
+    index: usize,
+    value: i64,
+) {
+    unsafe {
         // Stride from the field's array descriptor: a pointer array is
         // `size_of::<usize>()` (4 bytes on wasm32) while an `i64` payload
         // array is a fixed 8, regardless of word width.
         let item_size = array.item_size;
-        let data_ptr = bhimpl_arraybase_vable(vable_ptr, array) as *mut u8;
-        // `owner_ptr` is the block base the GC would know, i.e. before the
-        // items offset — the barrier argument.  `data_ptr` is items-adjusted
-        // and is not a valid object address, so the two only coincide where
-        // there is no items offset to undo.
-        let owner_ptr = match array.storage {
-            VableArrayStorage::EmbeddedArray { .. } => data_ptr,
-            VableArrayStorage::DirectPointer => {
-                *(vable_ptr.add(array.field_offset) as *const *mut u8)
-            }
-            VableArrayStorage::RustVec { .. } => std::ptr::null_mut(),
-        };
         if !data_ptr.is_null() {
             let dest = data_ptr.add(index * item_size);
             if array.item_type == Type::Ref {
