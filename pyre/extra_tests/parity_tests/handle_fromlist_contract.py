@@ -23,6 +23,12 @@ for name, body in [
     ("a.py", "A = 1\n"),
     ("b.py", "B = 2\n"),
     ("c.py", "C = 3\n"),
+    # Written up front rather than beside the assertion that imports it: on
+    # Windows a directory's last-write time is not updated in time for the
+    # next stat of it, so the mtime-keyed `FileFinder` cache does not notice a
+    # file created after the package's finder was built and the submodule is
+    # not found at all.
+    ("d.py", "import nonexistent_module_xyz\n"),
 ]:
     with open(os.path.join(root, "hflpkg", name), "w") as f:
         f.write(body)
@@ -42,8 +48,6 @@ assert __import__("hflpkg", {}, {}, ["zzz"], 0).__name__ == "hflpkg"
 
 # A submodule whose own body raises ModuleNotFoundError for a *different* name
 # is a real failure, not a name the fromlist may skip.
-with open(os.path.join(root, "hflpkg", "d.py"), "w") as f:
-    f.write("import nonexistent_module_xyz\n")
 try:
     __import__("hflpkg", {}, {}, ["d"], 0)
 except ModuleNotFoundError as exc:
