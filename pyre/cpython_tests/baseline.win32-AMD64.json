@@ -25,6 +25,18 @@
       "dynasm": "PASS",
       "reason": "Windows-only module: the shared IMPORTERROR is what a POSIX host sees for import msvcrt"
     },
+    "test.test_multiprocessing_main_handling": {
+      "dynasm": "PASS",
+      "provenance": {
+        "dynasm": {
+          "binary": "pyre-dynasm.exe",
+          "jit": true,
+          "mode": "script",
+          "stdlib_version": "3.14.6"
+        }
+      },
+      "reason": "multiprocessing.get_all_start_methods() is ['spawn'] here, so MultiProcessingCmdLineMixin.setUp skipTests every ForkCmdLineTest and ForkServerCmdLineTest case -- 26 of the 39 -- and the 13 SpawnCmdLineTest cases pass. A POSIX host runs all three classes and the shared FAIL is what it records"
+    },
     "test.test_site": {
       "dynasm": "PASS",
       "provenance": {
