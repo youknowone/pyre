@@ -2414,7 +2414,7 @@ fn report_or_end_on_main_error(
 
 enum MainProgram<'a> {
     Source(Box<dyn FnOnce() -> String + 'a>, Mode),
-    Bytecode(pyre_object::PyObjectRef),
+    Bytecode(Box<dyn FnOnce() -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> + 'a>),
 }
 
 fn eval_program_in_main(
@@ -2506,7 +2506,15 @@ fn eval_program_in_main(
     // replaced, and the failure still finalizes on its way out.
     let mut source = None;
     let frame = match program {
-        MainProgram::Bytecode(code) => {
+        MainProgram::Bytecode(load_bytecode) => {
+            let code = match load_bytecode() {
+                Ok(code) => code,
+                Err(error) => {
+                    let inspect = prompt_requested(run_code);
+                    report_or_end_on_main_error(error, inspect, canonical, ec_ptr);
+                    return finish_or_inspect(inspect, session_context, canonical, main_module);
+                }
+            };
             PyFrame::new_with_context_and_globals_obj(code, execution_context, canonical)
         }
         MainProgram::Source(read_source, mode) => {
@@ -2697,27 +2705,22 @@ fn run_script_path(
             let main_file = absolute_script_path(filename);
             let filename = main_file.as_deref().unwrap_or(filename);
             let program = if script_path_is_pyc(filename) {
-                let bytes = match importing::read_source_bytes(Path::new(filename)) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        eprintln!("{binary_name}: cannot open '{filename}': {e}");
-                        end_after_startup_failure(canonical, ec_ptr, 2);
-                    }
-                };
-                let code = match importing::load_pyc_script(&bytes) {
-                    Ok(code) => code,
-                    Err(e) => {
-                        let inspect = prompt_requested(run_code);
-                        report_or_end_on_main_error(e, inspect, canonical, ec_ptr);
-                        return finish_or_inspect(
-                            inspect,
-                            execution_context,
-                            canonical,
-                            main_module,
-                        );
-                    }
-                };
-                MainProgram::Bytecode(code)
+                // Deferred for the reason the source read below is, and for one
+                // more that is this arm's alone: the unmarshalled code object is
+                // a GC object living in a Rust local, and `import_site` runs
+                // Python between here and the frame that roots it.  A collection
+                // in that window reclaims the code, and the module the script
+                // then builds carries references into freed storage.
+                MainProgram::Bytecode(Box::new(move || {
+                    let bytes = match importing::read_source_bytes(Path::new(filename)) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            eprintln!("{binary_name}: cannot open '{filename}': {e}");
+                            end_after_startup_failure(canonical, ec_ptr, 2);
+                        }
+                    };
+                    importing::load_pyc_script(&bytes)
+                }))
             } else {
                 MainProgram::Source(
                     // The resolved path rather than the argv spelling: the read is
