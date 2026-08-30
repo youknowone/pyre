@@ -771,7 +771,11 @@ pub fn complete_struct_or_union(
 
     // As in C, a structure whose size would be zero is one byte instead; a
     // manually-specified total size of zero is still honoured.
-    let alignedsize = ((byteoffsetmax + alignment - 1) & !(alignment - 1)).max(1);
+    // The rounding is machine-word arithmetic: `newtype.py` computes it in
+    // RPython `Signed`, which wraps.  A `char[sys.maxsize]` field rounds
+    // `MAX + 1 - 1` at alignment one and has to come back as `MAX`.
+    let alignedsize =
+        (byteoffsetmax.wrapping_add(alignment).wrapping_sub(1) & !(alignment - 1)).max(1);
     let totalsize = if totalsize < 0 {
         alignedsize
     } else {
