@@ -2,19 +2,50 @@
 //!
 //! Each benchmark compiles and executes a small Python script through the
 //! full interpreter + JIT pipeline, measuring end-to-end execution time.
+//!
+//! The per-iteration body mirrors the `pyrex` launcher's `run_source` shape
+//! (`pyrex/src/lib.rs`): compile, build the `__main__` frame over a fresh
+//! execution context, alias that frame's globals as the `__main__` module
+//! dict, then hand the frame to `eval_with_jit`.  Process-global startup the
+//! launcher performs once (`real_main`) is hoisted into [`startup`] so the
+//! measured region contains only per-run work.
 
 use std::rc::Rc;
+use std::sync::Once;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use pyre_interpreter::call::{register_build_class, set_build_class_exec_ctx, set_last_exec_ctx};
+use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
+use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
 use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
-use pyre_jit::eval::eval_with_jit;
+use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
 
-/// Suppress print() output during benchmarks.
-fn silence_print() {
-    pyre_interpreter::set_print_hook(|_| {});
+static STARTUP: Once = Once::new();
+
+/// Process-global startup, performed once for the whole benchmark binary.
+///
+/// `pyrex::real_main` performs each of these before the first user statement;
+/// they are process-global, so repeating them per iteration would measure
+/// startup rather than execution.
+fn startup() {
+    STARTUP.call_once(|| {
+        // Benchmark scripts print nothing, but a hook must be installed for
+        // any that later do — writing to stdout from a benchmark would make
+        // the timings depend on the terminal.
+        pyre_interpreter::set_print_hook(|_| {});
+        pyre_interpreter::stack_check::set_recursion_limit(5000)
+            .expect("startup recursion limit must be applicable");
+        init_jit_hooks();
+        register_build_class();
+
+        let cwd = std::env::current_dir().expect("benchmark cwd must be readable");
+        importing::init_sys_path(&cwd, cwd.as_os_str());
+        // Nothing here imports `site`, so perform the post-site `sys.path[0]`
+        // insert directly.
+        importing::add_sys_path_0();
+        importing::set_sys_argv(&[std::ffi::OsString::from("pyre-bench")]);
+    });
 }
 
 /// Execute a Python source string through the full interpreter + JIT pipeline.
@@ -22,16 +53,23 @@ fn run_python(source: &str, filename: &str) {
     let code = compile_source_with_filename(source, Mode::Exec, filename)
         .expect("benchmark script must compile");
 
-    register_build_class();
-
     let execution_context = Rc::new(PyExecutionContext::default());
-    set_build_class_exec_ctx(Rc::as_ptr(&execution_context));
+    // `threadlocals.py enter_thread` — the ExecutionContext slot belongs to
+    // the OS-thread locals and every launcher installs it before running
+    // anything.
     set_last_exec_ctx(Rc::as_ptr(&execution_context));
 
     let mut frame = PyFrame::new_with_context(code, execution_context)
         .expect("benchmark frame creation must succeed");
 
-    let _ = eval_with_jit(&mut frame);
+    // Reuse the canonical globals dict as the `__main__` module's dict so
+    // `globals()` / `function.__globals__` share one identity (`run_source`
+    // parity).
+    let canonical = frame.get_w_globals();
+    let main_module = pyre_object::w_module_new_aliasing_dict("__main__", canonical);
+    importing::set_sys_module("__main__", main_module);
+
+    eval_with_jit(&mut frame, None).expect("benchmark script must run without raising");
 }
 
 // ---------------------------------------------------------------------------
@@ -126,34 +164,21 @@ main()
 // ---------------------------------------------------------------------------
 
 fn bench_interpreter(c: &mut Criterion) {
-    silence_print();
-    pyre_jit::eval::init_jit_hooks();
-    pyre_interpreter::stack_check::set_recursion_limit(5000)
-        .expect("startup recursion limit must be applicable");
+    startup();
 
-    c.bench_function("int_loop", |b| {
-        b.iter(|| run_python(INT_LOOP, "int_loop.py"));
-    });
-
-    c.bench_function("fib_loop", |b| {
-        b.iter(|| run_python(FIB_LOOP, "fib_loop.py"));
-    });
-
-    c.bench_function("fib_recursive", |b| {
-        b.iter(|| run_python(FIB_RECURSIVE, "fib_recursive.py"));
-    });
-
-    c.bench_function("inline_helper", |b| {
-        b.iter(|| run_python(INLINE_HELPER, "inline_helper.py"));
-    });
-
-    c.bench_function("nested_loop", |b| {
-        b.iter(|| run_python(NESTED_LOOP, "nested_loop.py"));
-    });
-
-    c.bench_function("float_loop", |b| {
-        b.iter(|| run_python(FLOAT_LOOP, "float_loop.py"));
-    });
+    for (name, source) in [
+        ("int_loop", INT_LOOP),
+        ("fib_loop", FIB_LOOP),
+        ("fib_recursive", FIB_RECURSIVE),
+        ("inline_helper", INLINE_HELPER),
+        ("nested_loop", NESTED_LOOP),
+        ("float_loop", FLOAT_LOOP),
+    ] {
+        let filename = format!("{name}.py");
+        c.bench_function(name, |b| {
+            b.iter(|| run_python(source, &filename));
+        });
+    }
 }
 
 criterion_group!(benches, bench_interpreter);
