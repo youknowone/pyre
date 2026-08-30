@@ -498,9 +498,8 @@ pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
 /// trace during minor collection. `code` is included because
 /// `BuiltinCode` is now allocated through `malloc_typed`
 /// (`gateway.rs`'s `builtin_code_new_full`) and therefore lives in the GC
-/// heap; the PyCode path remains raw/immortal and the walker's
-/// `is_in_nursery` check (`majit-gc/src/collector.rs`) leaves those
-/// entries alone.
+/// heap; `PyCode` is likewise a normal movable GC object, so tracing this slot
+/// is what forwards it when a minor collection moves it.
 /// `function.py:47 _immutable_fields_ = ['code?', ...]` matches PyPy's
 /// Function.code? — an immutable GC reference traced as part of the
 /// closure / defs_w / w_kw_defs / w_module set.
@@ -637,6 +636,13 @@ pub enum FunctionName {
 /// `w_code` is the code wrapper the new function keeps in its `code` slot; it
 /// owns the borrowed `co_name` and the shared realized `co_qualname`.
 pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectRef) -> PyObjectRef {
+    // `PyCode` is a normal movable `W_Root` in `pycode.py`. Keep both inputs
+    // in the shadow stack across lazy name/qualname realization and Function
+    // allocation, and reload the code pointer before every use.
+    let roots = pyre_object::gc_roots::push_roots();
+    let root_base = roots.publish(&[w_code, w_func_globals_obj]);
+    roots.normalize(root_base, 2);
+    let w_code = roots.get(root_base);
     let code_ptr = unsafe { crate::w_code_get_ptr(w_code) } as *const crate::CodeObject;
     let name = if code_ptr.is_null() {
         FunctionName::Owned(String::new())
@@ -653,24 +659,24 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     // `__qualname__` alone (`pyopcode.py:1457` stamps it at construction).
     // Realize it BEFORE the function so the one allocation that can collect
     // runs while no unrooted function is live.
-    unsafe { crate::pycode::w_code_qualname_obj(w_code) };
+    unsafe { crate::pycode::w_code_qualname_obj(roots.get(root_base)) };
+    let w_code = roots.get(root_base);
     let func = function_new_impl(
         &FUNCTION_TYPE,
         w_code as *const (),
         name,
-        w_func_globals_obj,
+        roots.get(root_base + 1),
         PY_NULL,
         true,
     );
     // `pick_builtin_obj` inside the constructor is a collection point, so read
-    // the realized qualname back through the Box-immortal code wrapper (whose
-    // slot the raw-root walker forwards) rather than through a stale pre-call
-    // copy.  This second call is a plain cache hit.
-    let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
+    // the realized values back through the forwarded code root rather than a
+    // stale pre-call copy. These calls are plain cache hits.
+    let w_name = unsafe { crate::pycode::w_code_name_obj(roots.get(root_base)) };
     if !w_name.is_null() {
         unsafe { function_set_name_obj(func, w_name) };
     }
-    let w_qualname = unsafe { crate::pycode::w_code_qualname_obj(w_code) };
+    let w_qualname = unsafe { crate::pycode::w_code_qualname_obj(roots.get(root_base)) };
     if !w_qualname.is_null() {
         unsafe { function_set_qualname(func, w_qualname) };
     }
@@ -698,8 +704,7 @@ pub(crate) fn function_new_impl(
     // the `lltype::malloc_typed` call below. `closure`, `code`, and
     // `w_func_globals_obj` are PyObjectRef-shaped GC roots across the
     // alloc — `BuiltinCode` lives in the GC heap (`gateway.rs`'s
-    // `builtin_code_new_full` malloc_typed) and `PyCode` is currently
-    // raw/immortal; the
+    // `builtin_code_new_full` malloc_typed) and `PyCode` is movable; the
     // walker's `is_in_nursery` filter (`majit-gc/src/collector.rs`)
     // is what makes the heterogeneous case safe. `name_ptr` is allocated
     // below via `malloc_raw` (non-GC) and stored into the struct as

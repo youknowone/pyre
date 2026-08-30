@@ -1786,6 +1786,7 @@ fn capture_coroutine_origin(ec: *const PyExecutionContext) -> PyObjectRef {
         let lineno_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(unsafe { (*anchor.live()).fget_f_lineno() });
         let funcname_slot = pyre_object::gc_roots::shadow_stack_len();
+        let w_code = unsafe { (*anchor.live()).fget_f_code() };
         let _ = pyre_object::gc_roots::pin_root(unsafe { crate::pycode::w_code_name_obj(w_code) });
         let summary = w_tuple_new(vec![
             pyre_object::gc_roots::shadow_stack_get(filename_slot),
@@ -4924,9 +4925,9 @@ impl PyFrame {
                     crate::baseobjspace::generator_frame_is_finished(
                         roots.get(gen_slot),
                         &mut *frame_anchor.live(),
+                        true,
                     )
                 };
-                crate::baseobjspace::generator_close_finalizer_boundary();
                 return Ok(());
             }
             // pyframe.py:815-820: a dead `f_generator_wref` simply skips the
@@ -4943,6 +4944,39 @@ impl PyFrame {
 
         self.clear_references();
         Ok(())
+    }
+
+    /// Whether the graph behind an edge `_PyFrame_ClearExceptCode` is about to
+    /// release contains an app-level finalizer.  A false answer proves that a
+    /// prompt-finalization collection cannot run Python code.
+    #[majit_macros::dont_look_inside]
+    pub(crate) fn cleared_references_have_pending_finalizer(&self) -> bool {
+        if !majit_gc::gc_has_pending_finalizers() {
+            return false;
+        }
+
+        let mut released = Vec::with_capacity(locals_w!(self).len() + 4);
+        for index in 0..locals_w!(self).len() {
+            let value = locals_w!(self)[index];
+            if !value.is_null() {
+                released.push(majit_ir::GcRef(value as usize));
+            }
+        }
+        if !self.w_yielding_from.is_null() {
+            released.push(majit_ir::GcRef(self.w_yielding_from as usize));
+        }
+        if !self.f_backref.is_null() {
+            released.push(majit_ir::GcRef(self.f_backref as usize));
+        }
+        if let Some(debug) = self.getdebug_data() {
+            released.extend(
+                [debug.w_locals, debug.w_extra_locals, debug.w_f_trace]
+                    .into_iter()
+                    .filter(|value| !value.is_null())
+                    .map(|value| majit_ir::GcRef(value as usize)),
+            );
+        }
+        majit_gc::subgraph_has_pending_finalizer(&released)
     }
 
     /// Clear the frame-owned reference region after its owner has already

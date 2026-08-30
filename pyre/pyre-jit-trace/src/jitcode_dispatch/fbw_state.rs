@@ -2403,28 +2403,32 @@ thread_local! {
     /// residual calls re-enter the JIT the callee does reach its own threshold,
     /// just on the ordinary counter rather than at once.
     ///
-    /// A raw address is a sound permanent key only because `w_code_new`
-    /// (`pycode.rs`) allocates every `PyCode` with `Box::into_raw` and nothing
-    /// frees it: the address is unique for the process and never moves.
-    /// Upstream can key on the object because a `JitCell` holds its greens and
-    /// `should_remove_jitcell` (`warmstate.py`) prunes dead ones; this set
-    /// has neither, so it relies on that immortality.  `eval.rs`'s `PyCode`
-    /// registration names the change that would end it — switching `w_code_new`
-    /// to `try_gc_alloc_stable`.  At that point a reclaimed address can be
-    /// handed to a later code object and this set must gain a removal path or
-    /// a key that outlives the allocation.
+    /// The stored key is `PyCode.code_ptr`, not the movable wrapper address.
+    /// Top-level `CodeObject` bodies are permanent `Box::into_raw` owners and
+    /// nested bodies borrow from that permanent graph (`pycode.rs`), so this
+    /// process-lifetime memo cannot accidentally deny a later wrapper which
+    /// reused a collected PyCode address.  The warm-state cell still receives
+    /// the wrapper green below; this raw owner key is only for this memo.
     static FBW_HAZARDOUS_INLINE_DENY: std::cell::RefCell<std::collections::HashSet<usize>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 pub(crate) fn fbw_hazardous_inline_denied(callee_code_key: usize) -> bool {
-    FBW_HAZARDOUS_INLINE_DENY.with(|c| c.borrow().contains(&callee_code_key))
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(callee_code_key as pyre_object::PyObjectRef) as usize
+    };
+    raw_code != 0 && FBW_HAZARDOUS_INLINE_DENY.with(|c| c.borrow().contains(&raw_code))
 }
 
 fn fbw_deny_hazardous_inline(callee_code_key: usize) {
-    FBW_HAZARDOUS_INLINE_DENY.with(|c| {
-        c.borrow_mut().insert(callee_code_key);
-    });
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(callee_code_key as pyre_object::PyObjectRef) as usize
+    };
+    if raw_code != 0 {
+        FBW_HAZARDOUS_INLINE_DENY.with(|c| {
+            c.borrow_mut().insert(raw_code);
+        });
+    }
 }
 
 /// Whether the active inline sub-walk is the remaining hazard class the blanket

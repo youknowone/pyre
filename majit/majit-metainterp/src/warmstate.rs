@@ -245,10 +245,21 @@ impl BaseJitCell {
     /// inserting cells through the typed-key path
     /// (`WarmEnterState::ensure_cell_for_key`).
     pub fn comparekey_matches(&self, other: &GreenKey) -> bool {
-        match &self.comparekey {
-            Some(stored) => stored == other,
-            None => false,
+        let Some(stored) = &self.comparekey else {
+            return false;
+        };
+        if stored.values.len() != other.values.len() || stored.types != other.types {
+            return false;
         }
+        for index in 0..stored.values.len() {
+            let stored_value = self
+                .retained_greens
+                .current_value(index, stored.values[index]);
+            if !majit_ir::equal_whatever(stored.types[index], stored_value, other.values[index]) {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn is_tracing(&self) -> bool {
@@ -1507,7 +1518,7 @@ impl WarmEnterState {
     /// `aborted_tracing` and the pyre-local abort ceiling do not participate.
     pub fn decline_tracing(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
-            cell.flags &= !jc_flags::JC_TRACING;
+            cell.flags &= !JcFlags::JC_TRACING;
             cell.state = BaseJitCellState::NotHot;
         }
     }
@@ -5053,8 +5064,8 @@ mod tests {
         let cell = ws.get_cell(key).expect("decline keeps the warm-state cell");
         assert_eq!(cell.abort_count, 0);
         assert_eq!(cell.state, BaseJitCellState::NotHot);
-        assert_eq!(cell.flags & jc_flags::JC_TRACING, 0);
-        assert_eq!(cell.flags & jc_flags::JC_DONT_TRACE_HERE, 0);
+        assert_eq!(cell.flags & JcFlags::JC_TRACING, 0);
+        assert_eq!(cell.flags & JcFlags::JC_DONT_TRACE_HERE, 0);
         assert!(ws.can_inline_callable(key));
     }
 
@@ -5600,13 +5611,26 @@ mod tests {
     // live would move a count, but cannot forge these addresses.
     static RETAIN_LOG: parking_lot::Mutex<Vec<i64>> = parking_lot::Mutex::new(Vec::new());
     static RELEASE_LOG: parking_lot::Mutex<Vec<i64>> = parking_lot::Mutex::new(Vec::new());
+    static CURRENT_REF_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-    fn test_retain(value: i64) {
+    fn test_retain(value: i64) -> usize {
         RETAIN_LOG.lock().push(value);
+        value as usize
     }
 
-    fn test_release(value: i64) {
-        RELEASE_LOG.lock().push(value);
+    fn test_current(handle: usize) -> i64 {
+        const REF_GREEN: i64 = 0x5EED_0001;
+        if handle as i64 == REF_GREEN {
+            let current = CURRENT_REF_GREEN.load(std::sync::atomic::Ordering::SeqCst);
+            if current != 0 {
+                return current;
+            }
+        }
+        handle as i64
+    }
+
+    fn test_release(handle: usize) {
+        RELEASE_LOG.lock().push(handle as i64);
     }
 
     /// warmstate.py:568-573 — a cell's stored green key OWNS its `Ref`
@@ -5624,10 +5648,12 @@ mod tests {
     /// 4. dropping the cell releases exactly what it retained.
     #[test]
     fn stored_green_key_owns_its_ref_referents() {
-        majit_ir::set_ref_resolver(test_retain, test_release);
+        majit_ir::set_ref_resolver(test_retain, test_current, test_release);
 
         const REF_GREEN: i64 = 0x5EED_0001;
+        const MOVED_REF_GREEN: i64 = 0x5EED_1001;
         const INT_GREEN: i64 = 0x5EED_0002;
+        CURRENT_REF_GREEN.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let key = GreenKey::with_types(
             vec![7, INT_GREEN, REF_GREEN, 0],
@@ -5664,6 +5690,19 @@ mod tests {
             assert!(
                 !RELEASE_LOG.lock().contains(&REF_GREEN),
                 "nothing may be released while the cell that owns it is alive"
+            );
+
+            CURRENT_REF_GREEN.store(MOVED_REF_GREEN, std::sync::atomic::Ordering::SeqCst);
+            let moved_key = GreenKey::with_types(
+                vec![7, INT_GREEN, MOVED_REF_GREEN, 0],
+                vec![Type::Int, Type::Int, Type::Ref, Type::Ref],
+            );
+            let cell = ws
+                .lookup_chain(key.get_uhash())
+                .expect("the retained cell stays in its original identity-hash bucket");
+            assert!(
+                cell.comparekey_matches(&moved_key),
+                "comparekey must read the collector-forwarded owner-root value"
             );
         }
 

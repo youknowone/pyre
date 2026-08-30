@@ -339,6 +339,18 @@ fn pyre_object_gc_identity_hash_trampoline(addr: usize) -> usize {
     majit_gc::gc_id_or_identityhash(addr)
 }
 
+fn retain_green_ref(value: i64) -> usize {
+    majit_gc::shadow_stack::acquire_owner_root(majit_ir::GcRef(value as usize))
+}
+
+fn current_green_ref(handle: usize) -> i64 {
+    majit_gc::shadow_stack::get_owner_root(handle).0 as i64
+}
+
+fn release_green_ref(handle: usize) {
+    majit_gc::shadow_stack::release_owner_root(handle);
+}
+
 fn pyre_object_gc_write_barrier_trampoline(obj: *mut u8) {
     majit_gc::gc_write_barrier(majit_ir::GcRef(obj as usize));
 }
@@ -2801,10 +2813,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // guard below.  This keeps the net register-call count up to
     // `W_MODULE_DICT_GC_TYPE_ID = 48` unchanged (one explicit
     // registration here, one fewer from the loop), so no downstream
-    // hardcoded tid shifts. `w_code_new` allocates the wrapper in stable
-    // oldgen. Its Rust-owned cache vectors require the custom walk, and their
-    // allocations are released with the wrapper just as PyPy's list fields
-    // are reclaimed with its `PyCode`.
+    // hardcoded tid shifts. `w_code_new` allocates the wrapper as a normal
+    // movable GC object. Its Rust-owned cache vectors require the custom walk,
+    // and their allocations are released with the wrapper just as PyPy's list
+    // fields are reclaimed with its `PyCode`.
     let w_code_tid = gc.register_type(
         TypeInfo::object_subclass_with_custom_trace(
             std::mem::size_of::<pyre_interpreter::pycode::PyCode>(),
@@ -6014,20 +6026,13 @@ unsafe fn jitcode_constants_root_walker_area(
 /// The `code_ptr -> wrapper` half of the population the comment above
 /// describes, registered separately so a failing root names it.
 ///
-/// Same minor-collection skip and the same justification for it: a wrapper is
-/// placed by `malloc_typed_stable`, so it is not a nursery object and a minor
-/// collection has nothing to do here.  `PYRE_PROBE14=1` tests that claim
-/// directly rather than by its relocation consequence.
+/// PyCode is an ordinary nursery object, so this area participates in every
+/// minor collection and writes the forwarded wrapper address back into the
+/// raw-CodeObject compatibility registry.
 unsafe fn jitcode_code_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) {
-    if !pyre_object::tagged_int::CAN_BE_TAGGED
-        && majit_gc::shadow_stack::extra_root_walk_kind()
-            == majit_gc::shadow_stack::ExtraRootWalkKind::Minor
-    {
-        return;
-    }
     unsafe { pyre_jit_trace::state::walk_jitcode_code_roots_area(data, visitor) };
 }
 
@@ -8155,6 +8160,11 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
+    // `warmstate.py JitCell.__init__` stores every green as an ordinary field
+    // on a GC object, so a Ref green is both owned and forwarded with the
+    // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
+    // same field semantics; `comparekey_matches` reads the current slot value.
+    majit_ir::set_ref_resolver(retain_green_ref, current_green_ref, release_green_ref);
     pyre_interpreter::call::register_eval_override(eval_with_jit);
     // `get_printable_location` was ported for JitDriver parity with no runtime
     // consumer; the compile census is that consumer. The green tuple carries

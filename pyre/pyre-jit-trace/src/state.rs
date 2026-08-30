@@ -953,15 +953,11 @@ pub fn install_codeless_jitcode(payload: std::sync::Arc<crate::PyJitCode>) -> i3
 /// wrapper is recovered from its `payload.code_ptr` via the live-wrapper
 /// registry.
 ///
-/// PyCode wrappers use stable GC allocation, so the visitor marks each
-/// wrapper but never needs to rewrite `LIVE_CODE_WRAPPERS`.  The registered
-/// pyre-jit area invokes this walk for major marking and, when tagged ints are
-/// disabled, skips it for minor collections: stable wrappers and constants
-/// cannot be nursery objects.  Tagged-int normalization can materialize a
-/// moving constant, so that configuration conservatively walks the combined
-/// area during minor collections too.  Keeping this walk on the same
-/// per-mutator area as the jitcode constants preserves the owner: RPython
-/// reaches both through `MetaInterpStaticData.jitcodes`.
+/// PyCode wrappers are ordinary movable GC objects. The visitor therefore
+/// forwards each `LIVE_CODE_WRAPPERS` value in place on minor collections as
+/// well as marking it on majors. Keeping this walk on the same per-mutator
+/// area as the jitcode constants preserves the owner: RPython reaches both
+/// through `MetaInterpStaticData.jitcodes`.
 pub fn walk_jitcode_code_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     METAINTERP_SD.with(|state| {
         walk_jitcode_code_roots_in(&state.borrow(), visitor);
@@ -975,44 +971,45 @@ fn walk_jitcode_code_roots_in(
     use std::sync::atomic::Ordering::Relaxed;
     let probe = probe14_enabled();
     for (jitcode_index, jc) in sd.jitcodes.iter().enumerate() {
-        let wrapper =
-            pyre_interpreter::live_code_wrapper(jc.payload.code_ptr as *const ()) as usize;
-        if wrapper == 0 {
-            continue;
-        }
-        if probe {
-            PROBE14_CODE_SLOTS.fetch_add(1, Relaxed);
-            probe14_note_nursery(
-                "CODE WRAPPER",
-                wrapper,
-                jc.payload.jitcode.name(),
-                jitcode_index,
-            );
-        }
-        let mut root = majit_ir::GcRef(wrapper);
-        visitor(&mut root);
-        if probe && root.0 != wrapper {
-            let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
-            if n <= 20 {
-                eprintln!(
-                    "[probe14] RELOCATION DISCARDED #{n}: code wrapper 0x{wrapper:x} -> 0x{:x} \
-                     (jitcode {jitcode_index}/{}) -- the `code_ptr -> wrapper` registry still \
-                     holds the old address",
-                    root.0,
-                    sd.jitcodes.len(),
-                );
-            }
-        }
+        pyre_interpreter::pycode::walk_live_code_wrapper(
+            jc.payload.code_ptr as *const (),
+            &mut |wrapper| {
+                let old = *wrapper as usize;
+                if old == 0 {
+                    return;
+                }
+                if probe {
+                    PROBE14_CODE_SLOTS.fetch_add(1, Relaxed);
+                    probe14_note_nursery(
+                        "CODE WRAPPER",
+                        old,
+                        jc.payload.jitcode.name(),
+                        jitcode_index,
+                    );
+                }
+                let root = unsafe {
+                    &mut *(wrapper as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef)
+                };
+                visitor(root);
+                if probe && root.0 != old {
+                    let n = PROBE14_RELOCATED.fetch_add(1, Relaxed) + 1;
+                    if n <= 20 {
+                        eprintln!(
+                            "[probe14] RELOCATION KEPT #{n}: code wrapper 0x{old:x} -> 0x{:x} \
+                             (jitcode {jitcode_index}/{})",
+                            root.0,
+                            sd.jitcodes.len(),
+                        );
+                    }
+                }
+            },
+        );
     }
 }
 
-/// Report a root that sits in the nursery at walk time.
-///
-/// Both halves of this area document an invariant that forbids it — the code
-/// wrappers because `malloc_typed_stable` places them outside the nursery, the
-/// constants because with tagged ints disabled they are old-gen or immortal —
-/// and the minor-collection skip is justified by exactly that.  One counter-
-/// example refutes the skip.
+/// Report whether either JitCode-owned population reaches the nursery. This is
+/// expected for newly-created movable code wrappers and runtime constants; the
+/// counters verify that the corresponding root walk sees them before reset.
 fn probe14_note_nursery(kind: &str, addr: usize, name: &str, jitcode_index: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     if !majit_gc::gc_is_nursery_object(addr) {

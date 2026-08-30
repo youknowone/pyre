@@ -7417,6 +7417,9 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
     if !unsafe { pyre_interpreter::is_code(w_code) } {
         return Ok(None);
     }
+    let code_roots = pyre_object::gc_roots::push_roots();
+    let code_slot = code_roots.base();
+    let w_code = code_roots.pin_root(w_code);
     let code_ptr =
         unsafe { pyre_interpreter::w_code_get_ptr(w_code) } as *const pyre_interpreter::CodeObject;
     if code_ptr.is_null() {
@@ -7425,13 +7428,14 @@ pub(crate) fn try_walker_specialize_make_function<Sym: WalkSym>(
 
     // Realizing the name/qualname are the fold's collection points (they
     // allocate once per code object and hit the cache afterwards), so they run
-    // here, while the only live pointers are the `Box::into_raw`'d code wrapper
-    // and its `CodeObject` — neither of which the collector relocates.
+    // here. `CodeObject` is a permanent `Box`, while its ordinary `PyCode`
+    // wrapper is kept in the shadow stack and reloaded between the two calls.
     let w_name = unsafe { pyre_interpreter::pycode::w_code_name_obj(w_code) };
     if w_name.is_null() {
         return Ok(None);
     }
-    let w_qualname = unsafe { pyre_interpreter::pycode::w_code_qualname_obj(w_code) };
+    let w_qualname =
+        unsafe { pyre_interpreter::pycode::w_code_qualname_obj(code_roots.get(code_slot)) };
     if w_qualname.is_null() {
         return Ok(None);
     }
