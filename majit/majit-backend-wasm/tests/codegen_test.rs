@@ -4020,16 +4020,14 @@ fn host_loop_inputargs() -> Vec<InputArg> {
     ]
 }
 
-/// The complement of the decline below. With the same owner, guard and bridge
-/// but no invalidation, nothing short-circuits the inline arm: the bridge
-/// resumes at the loop header, so it takes the arm that merges on the spot and
-/// reaches the install. On the host that install cannot complete — there is no
-/// wasm host, so the owner's module was never materialized and the rebuild
-/// refuses — which is what `bridge_diag(37)` records. So this does not assert
-/// an accepted inline (only a wasm host can produce one); it pins that the
-/// invalidation decline is the ONLY thing separating the two tests.
+/// The complement of the invalidation decline below. With the same valid owner,
+/// guard and bridge, a header-resuming region reaches the inline candidate but
+/// waits for the same entry-count trip as every other region. This pins the
+/// cost gate before any wasm host is involved: the host-only install trial must
+/// not run until the bridge has proved hot enough to pay for rebuilding its
+/// whole owner module.
 #[test]
-fn a_valid_owner_reaches_the_inline_trial() {
+fn a_valid_header_owner_defers_the_inline_trial() {
     use majit_backend::Backend;
 
     let _serialized = HOST_COMPILE_LOCK.lock();
@@ -4055,8 +4053,8 @@ fn a_valid_owner_reaches_the_inline_trial() {
     let declines_before = majit_backend_wasm::bridge_diag(50);
     let deferred_before = majit_backend_wasm::bridge_diag(54);
     let trials_before = majit_backend_wasm::bridge_diag(37);
-    // A merge is only considered once there is a callback to defer the
-    // outside-loop half to; the guest publishes the real one.
+    // A merge is only considered once there is a callback to act on the
+    // entry-count trip; the guest publishes the real one.
     majit_backend_wasm::set_inline_trip_helper_slot(1);
     backend
         .compile_bridge(
@@ -4075,14 +4073,14 @@ fn a_valid_owner_reaches_the_inline_trial() {
         declines_before,
         "a valid owner is not declined by the invalidation arm"
     );
-    assert_eq!(
-        majit_backend_wasm::bridge_diag(54),
-        deferred_before,
-        "a header-resuming region is not the half that waits on a trip"
-    );
     assert!(
-        majit_backend_wasm::bridge_diag(37) > trials_before,
-        "the inline trial reached the merged install"
+        majit_backend_wasm::bridge_diag(54) > deferred_before,
+        "a header-resuming region waits on the entry-count trip"
+    );
+    assert_eq!(
+        majit_backend_wasm::bridge_diag(37),
+        trials_before,
+        "the deferred region has not tried to rebuild the owner yet"
     );
 }
 

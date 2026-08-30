@@ -4322,7 +4322,8 @@ impl majit_backend::Backend for WasmBackend {
                         ));
                     };
                     self.collect_constants_from_ops(ops);
-                    if outside_loop && codegen::has_invalidation_guard(ops) {
+                    let has_invalidation_guard = codegen::has_invalidation_guard(ops);
+                    if has_invalidation_guard && outside_loop {
                         // A quasi-immutable fold's dependencies are registered
                         // once, against whatever flag the token names when this
                         // compile returns — the bridge's own, because deferring
@@ -4332,23 +4333,29 @@ impl majit_backend::Backend for WasmBackend {
                         // while its dependencies still hold the bridge's: a
                         // field mutated before the trip would be forgotten, and
                         // one mutated after would leave the fold in place. The
-                        // eager arm below has no such window — it merges before
-                        // this compile returns, so the flag it records is the
-                        // one the dependencies then attach to.
+                        // eager invalidation arm below has no such window — it
+                        // merges before this compile returns, so the flag it
+                        // records is the one the dependencies then attach to.
                         diag_bump(56);
                         decline("defer_invalidation_guard");
-                    } else if outside_loop {
+                    } else if !has_invalidation_guard {
                         // Eligible, but not yet worth its owner re-emission:
                         // arm the bridge's entry counter and merge when it
-                        // trips. Everything else about this compile is the
-                        // ordinary out-of-line path below.
+                        // trips. This applies equally to a header-resuming
+                        // region: INLINE_TRIP_THRESHOLD is calibrated from
+                        // bridge entries, and eager header merging otherwise
+                        // bypasses that cost decision entirely. Everything else
+                        // about this compile is the ordinary out-of-line path
+                        // below.
                         defer_inline = Some((owner, merged_fail_index));
                         diag_bump(54);
                         decline("deferred");
                     } else {
-                        // A region resuming at the loop header sits on the
-                        // body's fall-through and was measured and shipped
-                        // merged on the spot, so it stays that way.
+                        // Deferral would register this region's dependencies
+                        // against its temporary bridge flag. A header region
+                        // can instead merge before this compile returns, so
+                        // its dependencies attach to the owner's flag from the
+                        // outset. The outside-loop case was declined above.
                         let region = codegen::InlinedBridge {
                             source_fail_index: merged_fail_index,
                             outside_loop,
