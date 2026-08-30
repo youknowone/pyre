@@ -101,7 +101,7 @@ bitflags::bitflags! {
         /// the first pointer written into the object clears this flag and
         /// appends the object to `prebuilt_root_objects`. That is what lets
         /// marking skip an object still carrying it
-        /// (incminimark.py:2782-2798) and lets `_rrc_major_free` read it as
+        /// (`IncrementalMiniMarkGC.visit`) and lets `_rrc_major_free` read it as
         /// "immortal, never traced so far".
         ///
         /// The invariant holds only where *every* pointer store into such an
@@ -147,11 +147,12 @@ bitflags::bitflags! {
         /// The object is already on a finalizer queue.
         ///
         /// Not an incminimark flag -- bit 13 is `_GCFLAG_FIRST_UNUSED`
-        /// (incminimark.py:169) there, so this claims the first free bit and
+        /// (`_GCFLAG_FIRST_UNUSED`) there, so this claims the first free bit and
         /// disturbs no RPython position.  incminimark keeps the registered set
         /// purely in its two deques and never asks the question, because
         /// `register_finalizer` is contracted to be called at most once per
-        /// object.  That contract is checked only untranslated (`rgc.py:648-649`
+        /// object.  That contract is checked only untranslated
+        /// (`FinalizerQueue._untranslated_register_finalizer`,
         /// `assert not self._already_registered(obj)`); translated, a second
         /// registration silently appends a second deque entry and the finalizer
         /// runs again on the following major collection.  This flag lets the

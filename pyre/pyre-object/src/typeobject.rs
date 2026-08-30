@@ -84,9 +84,9 @@ impl TpFlags {
     }
 }
 
-/// typeobject.py:19 `PATMA_SEQUENCE`.
+/// `typeobject.py PATMA_SEQUENCE`.
 pub const PATMA_SEQUENCE: i64 = TpFlags::PY_TPFLAGS_SEQUENCE.as_int();
-/// typeobject.py:20 `PATMA_MAPPING`.
+/// `typeobject.py PATMA_MAPPING`.
 pub const PATMA_MAPPING: i64 = TpFlags::PY_TPFLAGS_MAPPING.as_int();
 
 /// `pypy/interpreter/typedef.py TypeDef` metadata used by

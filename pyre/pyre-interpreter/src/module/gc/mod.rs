@@ -73,8 +73,9 @@ static GC_THRESHOLD: [AtomicI64; 3] =
 /// empty, which is what `do_get_objects` already answers for it.
 const NUM_GENERATIONS: i64 = 3;
 
-/// `hook.py:284-288` takes the four states from `incminimark`, where they are
-/// declared and compared against it, and numbers its own one past the last.
+/// `hook.py W_GcCollectStepStats` takes the four states from `incminimark`,
+/// where they are declared and compared against it, and numbers its own one
+/// past the last.
 const STATE_SCANNING: u8 = GcStepTransition::STATE_SCANNING;
 const STATE_MARKING: u8 = GcStepTransition::STATE_MARKING;
 const STATE_SWEEPING: u8 = GcStepTransition::STATE_SWEEPING;
