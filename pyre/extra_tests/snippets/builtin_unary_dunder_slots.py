@@ -68,11 +68,26 @@ assert -DelegatesNeg(5) == -5
 assert +DelegatesPos(5) == 5
 assert ~DelegatesInv(5) == -6
 
-# Non-goal: only the numeric slots are structural.  A plain object whose
-# `__neg__` delegates to `int.__neg__` still recurses, because the tail of
-# `neg_inner` is `try_instance_unaryop`.  `abs` closed that hole by ending in
-# `abs_bad_operand` instead; these three did not, and widening them is a
-# separate change.
+# A receiver that is not an instance of the slot's own type is rejected by the
+# descriptor, before the structural body could reach `try_instance_unaryop` and
+# recurse back through the override.
+for base, op in ((int, "__neg__"), (int, "__pos__"), (int, "__invert__"),
+                 (float, "__neg__"), (complex, "__neg__")):
+    namespace = {}
+    exec(
+        "class Bad:\n"
+        f"    def {op}(self): return {base.__name__}.{op}(self)\n",
+        namespace,
+    )
+    try:
+        getattr(namespace["Bad"](), op)()
+    except TypeError as error:
+        assert str(error) == (
+            f"descriptor '{op}' requires a '{base.__name__}' object "
+            "but received a 'Bad'"
+        ), error
+    else:
+        raise AssertionError(f"{base.__name__}.{op} accepted a foreign receiver")
 
 # The slots reject a missing operand rather than indexing an empty argument
 # list.
