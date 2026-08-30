@@ -1018,8 +1018,12 @@ pub fn init_typeobjects() {
                 &pyre_object::descriptor::SUPER_TYPE as *const PyType,
             ) as usize,
         );
-        let generator_type =
-            new_typeobject_with_base("generator", init_generator_type, object_type);
+        let generator_type = new_typeobject_with_base_and_layout(
+            "generator",
+            init_generator_type,
+            object_type,
+            &pyre_object::generator::GENERATOR_TYPE as *const PyType,
+        );
         // `Py_TPFLAGS_DISALLOW_INSTANTIATION` — a generator is produced
         // only by calling a generator function, never by `generator()`,
         // so `tp_new` is NULL and pickling refuses it.
@@ -1032,8 +1036,12 @@ pub fn init_typeobjects() {
             &pyre_object::generator::GENERATOR_TYPE as *const PyType as usize,
             generator_type as usize,
         );
-        let coroutine_type =
-            new_typeobject_with_base("coroutine", init_coroutine_type, object_type);
+        let coroutine_type = new_typeobject_with_base_and_layout(
+            "coroutine",
+            init_coroutine_type,
+            object_type,
+            &pyre_object::generator::COROUTINE_TYPE as *const PyType,
+        );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(coroutine_type);
             pyre_object::w_type_set_acceptable_as_base_class(coroutine_type, false);
@@ -1043,8 +1051,12 @@ pub fn init_typeobjects() {
             &pyre_object::generator::COROUTINE_TYPE as *const PyType as usize,
             coroutine_type as usize,
         );
-        let async_generator_type =
-            new_typeobject_with_base("async_generator", init_async_generator_type, object_type);
+        let async_generator_type = new_typeobject_with_base_and_layout(
+            "async_generator",
+            init_async_generator_type,
+            object_type,
+            &pyre_object::generator::ASYNC_GENERATOR_TYPE as *const PyType,
+        );
         unsafe {
             pyre_object::w_type_set_disallow_instantiation(async_generator_type);
             pyre_object::w_type_set_acceptable_as_base_class(async_generator_type, false);
@@ -2160,6 +2172,14 @@ fn method_owner(type_name: &str) -> Option<&'static crate::gateway::MethodOwner>
         "map" => pyre_object::functional::is_map,
         "filter" => pyre_object::functional::is_filter,
         "zip" => pyre_object::functional::is_zip,
+        // `GeneratorIterator`, `Coroutine` and `AsyncGenerator` share one
+        // Rust payload, but PyPy gives each its own TypeDef and gateway
+        // receiver check.  Keep the predicates kind-specific: accepting any
+        // member of the shared layout would make an unbound descriptor from
+        // one TypeDef callable on either of the other two.
+        "generator" => pyre_object::generator::is_generator,
+        "coroutine" => pyre_object::generator::is_coroutine,
+        "async_generator" => pyre_object::generator::is_async_generator,
         "property" => pyre_object::descriptor::is_property,
         "super" => pyre_object::descriptor::is_super,
     }
@@ -11845,6 +11865,15 @@ pub(crate) fn cpython_type_layout(w_type: PyObjectRef) -> Option<(i64, i64)> {
         (8 * word, 0)
     } else if is(&pyre_object::functional::ENUMERATE_TYPE) {
         (9 * word, 0)
+    } else if is(&pyre_object::generator::GENERATOR_TYPE)
+        || is(&pyre_object::generator::COROUTINE_TYPE)
+        || is(&pyre_object::generator::ASYNC_GENERATOR_TYPE)
+    {
+        // CPython 3.14t `_PyGenObject_HEAD` through
+        // `_PyInterpreterFrame.localsplus`: the free-threaded object header
+        // adds two words and `tlbc_index` fills the frame's existing padding.
+        // The flexible locals/cells/value-stack slots are pointer-sized.
+        (21 * word, word)
     } else if is(&pyre_object::weakref::WEAKREF_LAYOUT_TYPE) {
         // CPython 3.14 `PyWeakReference`: object header, doubly-linked
         // weakref list, callback, hash/cache word and vectorcall slot, plus
@@ -28966,44 +28995,156 @@ fn generator_readonly_attribute(args: &[PyObjectRef]) -> crate::PyResult {
     )))
 }
 
+/// CPython 3.14 `gen_sizeof`, over PyPy's generator-owned `pycode`.
+fn generator_descr_sizeof(args: &[PyObjectRef]) -> crate::PyResult {
+    crate::type_methods::arity_no_args(args, "__sizeof__")?;
+    let generator = args[0];
+    let w_code = unsafe { pyre_object::generator::w_generator_get_pycode(generator) };
+    let code = unsafe { &*(crate::pycode::w_code_get_ptr(w_code) as *const crate::CodeObject) };
+    // `_PyFrame_NumSlotsForCodeObject`: locals-plus followed by the maximum
+    // operand stack. `pyframe::ncells` excludes cellvars that alias locals,
+    // matching CPython's `co_nlocalsplus` rather than blindly summing names.
+    let slots = code
+        .varnames
+        .len()
+        .checked_add(crate::pyframe::ncells(code))
+        .and_then(|value| value.checked_add(code.max_stackdepth as usize))
+        .ok_or_else(crate::builtins::reservation_failed)?;
+    let basicsize = cpython_type_layout(gettypeobject(&pyre_object::generator::GENERATOR_TYPE))
+        .expect("generator has CPython layout metadata")
+        .0 as usize;
+    let bytes = slots
+        .checked_mul(std::mem::size_of::<usize>())
+        .and_then(|value| basicsize.checked_add(value))
+        .ok_or_else(crate::builtins::reservation_failed)?;
+    Ok(w_int_new(bytes as i64))
+}
+
 /// PyPy `generator.py GeneratorIterator.typedef`, augmented only by the
 /// concrete slots Python 3.14 exposes on `types.GeneratorType`.
 fn init_generator_type(ns: PyObjectRef) {
-    unsafe { pyre_object::w_dict_setitem_str(ns, "__doc__", w_none()) };
-    for (name, function, arity) in [
-        ("__repr__", generator_descr_repr as DunderFn, 1),
-        ("__next__", crate::baseobjspace::generator_next_method, 1),
-        ("send", crate::baseobjspace::generator_send_method, 2),
-        ("close", crate::baseobjspace::generator_close_method, 1),
-        ("__iter__", crate::baseobjspace::iter_self_method, 1),
-        ("__del__", crate::baseobjspace::generator_close_method, 1),
+    // Preserve `GeneratorIterator.typedef`'s shared order first.  CPython
+    // 3.14's extra finalizer/size/generic-alias entries follow those methods,
+    // ahead of PyPy's descriptor block and terminal `__doc__`.
+    for (name, function, arity, doc) in [
+        (
+            "__repr__",
+            generator_descr_repr as DunderFn,
+            1,
+            "Return repr(self).",
+        ),
+        (
+            "__next__",
+            crate::baseobjspace::generator_next_method,
+            1,
+            "Implement next(self).",
+        ),
     ] {
-        let function = if name == "__next__" {
-            crate::gateway::make_builtin_function_with_arity_and_doc(
+        unsafe {
+            pyre_object::w_dict_setitem_str_no_proxy(
+                ns,
                 name,
-                function,
-                arity,
-                "Implement next(self).",
+                crate::gateway::make_slot_wrapper_with_arity_and_doc(name, function, arity, doc),
             )
-        } else {
-            make_builtin_function_with_arity(name, function, arity)
         };
-        unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, name, function) };
     }
     unsafe {
-        pyre_object::w_dict_setitem_str(
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "send",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "send",
+                crate::baseobjspace::generator_send_method,
+                2,
+                "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "throw",
-            make_builtin_function("throw", crate::baseobjspace::generator_throw_method),
-        );
-        pyre_object::w_dict_setitem_str(
+            crate::gateway::make_method_descriptor_with_doc(
+                "throw",
+                crate::baseobjspace::generator_throw_method,
+                "throw(value)\nthrow(type[,value[,tb]])\n\nRaise exception in generator, return next yielded value or raise\nStopIteration.\nthe (type, val, tb) signature is deprecated, \nand may be removed in a future version of Python.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "close",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "close",
+                crate::baseobjspace::generator_close_method,
+                1,
+                "close() -> raise GeneratorExit inside generator.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__iter__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__iter__",
+                crate::baseobjspace::iter_self_method,
+                1,
+                "Implement iter(self).",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__del__",
+            crate::gateway::make_slot_wrapper_with_arity_and_doc(
+                "__del__",
+                crate::baseobjspace::generator_close_method,
+                1,
+                "Called when the instance is about to be destroyed.",
+            ),
+        )
+    };
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
+            ns,
+            "__sizeof__",
+            crate::gateway::make_method_descriptor_with_arity_and_doc(
+                "__sizeof__",
+                generator_descr_sizeof,
+                1,
+                "gen.__sizeof__() -> size of gen in memory, in bytes",
+            ),
+        )
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let function_slot = roots.base();
+    let _ = roots.pin_root(crate::gateway::make_builtin_function_with_arity_and_doc(
+        "__class_getitem__",
+        crate::_pypy_generic_alias::generic_alias_class_getitem,
+        2,
+        "See PEP 585",
+    ));
+    let signature_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_str_new("($type, object, /)"));
+    unsafe {
+        crate::function::fset_func_text_signature(
+            roots.get(function_slot),
+            roots.get(signature_slot),
+        )
+    };
+    let classmethod_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::function::w_classmethod_new(
+        roots.get(function_slot),
+    ));
+    unsafe {
+        pyre_object::w_dict_setitem_str_no_proxy(
             ns,
             "__class_getitem__",
-            pyre_object::function::w_classmethod_new(make_builtin_function(
-                "__class_getitem__",
-                crate::_pypy_generic_alias::generic_alias_class_getitem,
-            )),
-        );
+            roots.get(classmethod_slot),
+        )
     }
     for (name, getter) in [
         ("gi_running", generator_get_running as DunderFn),
@@ -29053,6 +29194,18 @@ fn init_generator_type(ns: PyObjectRef) {
                 make_getset_property_full(get, set, delete, PY_NULL, PY_NULL, Some(name)),
             )
         };
+    }
+    unsafe { pyre_object::w_dict_setitem_str_no_proxy(ns, "__doc__", w_none()) };
+    for (name, text_signature) in [
+        ("__repr__", "($self, /)"),
+        ("__next__", "($self, /)"),
+        ("send", "($self, object, /)"),
+        ("close", "($self, /)"),
+        ("__iter__", "($self, /)"),
+        ("__del__", "($self, /)"),
+        ("__sizeof__", "($self, /)"),
+    ] {
+        set_type_callable_text_signature(ns, name, text_signature);
     }
 }
 

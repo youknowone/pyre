@@ -1119,6 +1119,41 @@ for owner, methods in EXPECTED_SINGLETON_DOCS.items():
         assert getattr(owner, name).__doc__ == doc, (owner, name)
 
 
+# generator_type_text_signatures_python314
+
+EXPECTED_GENERATOR_METHODS = {
+    "__repr__": "($self, /)",
+    "__next__": "($self, /)",
+    "send": "($self, object, /)",
+    "close": "($self, /)",
+    "__iter__": "($self, /)",
+    "__del__": "($self, /)",
+    "__sizeof__": "($self, /)",
+    "__class_getitem__": "($type, object, /)",
+}
+check_descriptors(types.GeneratorType, EXPECTED_GENERATOR_METHODS)
+assert types.GeneratorType.throw.__text_signature__ is None
+
+EXPECTED_GENERATOR_DOCS = {
+    "__repr__": "Return repr(self).",
+    "__next__": "Implement next(self).",
+    "send": "send(value) -> send 'value' into generator,\nreturn next yielded value or raise StopIteration.",
+    "throw": (
+        "throw(value)\nthrow(type[,value[,tb]])\n\n"
+        "Raise exception in generator, return next yielded value or raise\n"
+        "StopIteration.\nthe (type, val, tb) signature is deprecated, \n"
+        "and may be removed in a future version of Python."
+    ),
+    "close": "close() -> raise GeneratorExit inside generator.",
+    "__iter__": "Implement iter(self).",
+    "__del__": "Called when the instance is about to be destroyed.",
+    "__sizeof__": "gen.__sizeof__() -> size of gen in memory, in bytes",
+    "__class_getitem__": "See PEP 585",
+}
+for name, doc in EXPECTED_GENERATOR_DOCS.items():
+    assert getattr(types.GeneratorType, name).__doc__ == doc, name
+
+
 # module_text_signatures_python314
 
 EXPECTED_MODULE_METHODS = {

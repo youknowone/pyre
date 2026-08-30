@@ -1,5 +1,6 @@
 import _ast
 import platform
+import sys
 import types
 
 from testutils import assert_raises
@@ -72,6 +73,85 @@ def _singleton_type_receiver_contract():
 
 
 _singleton_type_receiver_contract()
+
+
+def _generator_type_contract():
+    def empty_generator():
+        yield None
+
+    def local_generator(a, b, c):
+        x = a + b
+        yield x + c
+
+    def closure_factory(value):
+        def closure_generator():
+            yield value
+
+        return closure_generator
+
+    def cell_generator(value):
+        def read_cell():
+            return value
+
+        yield read_cell
+
+    shared_order = [
+        "__repr__",
+        "__next__",
+        "send",
+        "throw",
+        "close",
+        "__iter__",
+        "gi_running",
+        "gi_suspended",
+        "gi_frame",
+        "gi_code",
+        "gi_yieldfrom",
+        "__name__",
+        "__qualname__",
+        "__doc__",
+    ]
+    if sys.implementation.name == "pyre":
+        assert [
+            name for name in types.GeneratorType.__dict__ if name in shared_order
+        ] == shared_order
+    if hasattr(types, "ClassMethodDescriptorType"):
+        assert type(types.GeneratorType.__repr__) is types.WrapperDescriptorType
+        assert type(types.GeneratorType.send) is types.MethodDescriptorType
+        assert (
+            type(types.GeneratorType.__dict__["__class_getitem__"])
+            is types.ClassMethodDescriptorType
+        )
+
+    for function, args in (
+        (empty_generator, ()),
+        (local_generator, (1, 2, 3)),
+        (closure_factory(1), ()),
+        (cell_generator, (1,)),
+    ):
+        generator = function(*args)
+        if hasattr(generator, "__sizeof__"):
+            code = generator.gi_code
+            nlocalsplus = (
+                code.co_nlocals
+                + sum(name not in code.co_varnames for name in code.co_cellvars)
+                + len(code.co_freevars)
+            )
+            expected = types.GeneratorType.__basicsize__ + (
+                nlocalsplus + code.co_stacksize
+            ) * tuple.__itemsize__
+            assert generator.__sizeof__() == expected
+        generator.close()
+
+    if sys.implementation.name != "pypy":
+        with assert_raises(TypeError) as raised:
+            types.GeneratorType.send({}, None)
+        assert str(raised.exception) == (
+            "descriptor 'send' for 'generator' objects doesn't apply to a 'dict' object"
+        )
+
+
+_generator_type_contract()
 
 
 def _function_type_kwdefaults():
