@@ -4005,6 +4005,29 @@ pub(crate) fn fbw_callee_body_replay_scan(
                             // residual still reaches
                             // `fbw_abort_nested_unjournaled_residual`.
                             | majit_ir::RuntimeHelperKind::LoadSuperAttr
+                            // `store_attr` is the write twin of the `load_attr`
+                            // deferral directly above, and it earns it the same
+                            // way: which slot the name resolves to, and whether
+                            // writing it runs Python, are properties of the
+                            // receiver's runtime class, not of this body.  At
+                            // trace time `try_walker_specialize_store_attr`
+                            // answers both from the pinned class and erases the
+                            // residual into a mapdict slot write, exactly as the
+                            // read arm folds `self.v` to a slot read; the write
+                            // it applies bumps the executed-effect odometer
+                            // (`store_attr_direct`), so the forward-flush gate
+                            // sees it and no rewind claims to undo it.  An
+                            // operand the specialization cannot prove leaves the
+                            // residual standing and reaches
+                            // `fbw_abort_nested_unjournaled_residual` like every
+                            // other deferred helper, so the store never runs
+                            // unfolded.
+                            //
+                            // Declining instead cost the whole call: one
+                            // `self.calls += 1` in a one-line callee measured
+                            // 13,886 instructions per iteration against 8.4 for
+                            // the identical store written directly in the loop.
+                            | majit_ir::RuntimeHelperKind::StoreAttr
                     );
                 if defer_helper {
                     deferred_call = true;
