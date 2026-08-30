@@ -3488,15 +3488,18 @@ fn format_char(num: &BigInt, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
             "Alternate form (#) not allowed with integer format specifier 'c'",
         ));
     }
-    if pyre_object::jit_bigint_to_i64_fits(num) == 0 {
+    // The code is read through `PyLong_AsLong`, so it is a C `long` -- 32 bits
+    // on Windows -- that bounds it, and overflowing that is reported as the
+    // conversion failing rather than as a code point out of range.
+    let code = (pyre_object::jit_bigint_to_i64_fits(num) != 0)
+        .then(|| pyre_object::jit_bigint_to_i64_value(num))
+        .filter(|code| core::ffi::c_long::try_from(*code).is_ok());
+    let Some(code) = code else {
         return Err(crate::PyError::overflow_error(
             "Python int too large to convert to C long",
         ));
-    }
-    let cp = match u32::try_from(pyre_object::jit_bigint_to_i64_value(num))
-        .ok()
-        .and_then(CodePoint::from_u32)
-    {
+    };
+    let cp = match u32::try_from(code).ok().and_then(CodePoint::from_u32) {
         Some(cp) => cp,
         None => {
             return Err(crate::PyError::overflow_error(
