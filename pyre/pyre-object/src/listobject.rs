@@ -683,15 +683,6 @@ impl W_ListObject {
         value
     }
 
-    unsafe fn object_pop(&mut self) -> PyObjectRef {
-        assert!(self.length_relaxed() > 0);
-        let base = items_block_items_base(self.items);
-        let value = *base.add(self.length_relaxed() - 1);
-        *base.add(self.length_relaxed() - 1) = PY_NULL;
-        self.set_length_relaxed(self.length_relaxed() - 1);
-        value
-    }
-
     unsafe fn object_reverse(&mut self) {
         // A permutation moves pointers across card pages without storing any
         // new reference, so it owes the same barrier as the shifts above.
@@ -2263,6 +2254,16 @@ pub fn ll_list_obj_set_len(l: &mut W_ListObject, n: usize) {
     l.set_length_relaxed(n);
 }
 
+/// `ll_getitem_fast` for the Object strategy: a GC-ref read at a
+/// known-in-bounds index (`ll_pop_default`'s read, rlist.py).
+#[majit_macros::oopspec("list.obj_getitem(l, index)")]
+pub fn ll_list_obj_getitem_fast(l: &W_ListObject, index: usize) -> PyObjectRef {
+    unsafe {
+        let base = items_block_items_base(l.items);
+        *base.add(index)
+    }
+}
+
 /// `ll_setitem_fast` for the Object strategy: a GC-ref store at a
 /// known-in-bounds index (the spare-capacity append's element write).
 /// The element is a GC pointer, but — unlike the runtime helper that once
@@ -3706,7 +3707,18 @@ pub unsafe fn w_list_pop_end_inner(obj: PyObjectRef) -> PyObjectRef {
             }
         }
         ListStrategy::Float => w_float_new(list.float_items.pop()),
-        ListStrategy::Object => list.object_pop(),
+        // `AbstractUnwrappedStrategy.pop_end` (listobject.py) under an identity
+        // `wrap`, rtyped as `ll_pop_default` (rlist.py): read, null the vacated
+        // GC slot, shrink. Decomposed through the `ll_list_obj_*` leaves, like
+        // the Integer arm, so the orthodox pop fold can descend it.
+        ListStrategy::Object => {
+            let length = ll_list_obj_length(list);
+            let index = length - 1;
+            let item = ll_list_obj_getitem_fast(list, index);
+            ll_list_obj_setitem_fast(list, index, PY_NULL);
+            ll_list_obj_set_len(list, index);
+            item
+        }
         ListStrategy::Bytes => w_bytes_from_block(list.bytes_items.pop()),
         ListStrategy::Ascii => w_str_from_storage(list.ascii_items.pop() as *mut _),
     }
